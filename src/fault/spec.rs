@@ -190,6 +190,27 @@ impl FaultRunSpec {
     }
 }
 
+impl FaultRunArtifactSpec {
+    pub fn required_names() -> Vec<String> {
+        [
+            "run-spec.yaml",
+            "run-spec.json",
+            "run-events.jsonl",
+            "run-metadata.json",
+            "workload-plan.json",
+            "history.jsonl",
+            "workload-summary.json",
+            "recommit-report.json",
+            "checker-pre-recommit-report.json",
+            "checker-report.json",
+            "fault-evidence.json",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+}
+
 impl FaultRunFaultSpec {
     fn from_fault(
         index: usize,
@@ -255,22 +276,7 @@ impl FaultRunSelectionSpec {
 impl Default for FaultRunArtifactSpec {
     fn default() -> Self {
         Self {
-            required: [
-                "run-spec.yaml",
-                "run-spec.json",
-                "run-events.jsonl",
-                "run-metadata.json",
-                "workload-plan.json",
-                "history.jsonl",
-                "workload-summary.json",
-                "recommit-report.json",
-                "checker-pre-recommit-report.json",
-                "checker-report.json",
-                "fault-evidence.json",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+            required: Self::required_names(),
             event_stream: "run-events.jsonl".to_string(),
         }
     }
