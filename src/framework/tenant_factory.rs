@@ -86,17 +86,6 @@ impl TenantTemplate {
     }
 
     pub fn manifest(&self) -> Result<String> {
-        let mut scheduling = Map::new();
-        if let Some(node_selector) = &self.node_selector {
-            scheduling.insert("nodeSelector".to_string(), json!(node_selector));
-        }
-        if self.spread_across_hosts {
-            scheduling.insert(
-                "affinity".to_string(),
-                fault_tenant_pod_anti_affinity(&self.name),
-            );
-        }
-
         let mut pool = Map::new();
         pool.insert("name".to_string(), json!("primary"));
         pool.insert("servers".to_string(), json!(self.servers));
@@ -105,20 +94,24 @@ impl TenantTemplate {
             json!({
                 "volumesPerServer": self.volumes_per_server,
                 "volumeClaimTemplate": {
-                    "spec": {
-                        "accessModes": ["ReadWriteOnce"],
-                        "resources": {
-                            "requests": {
-                                "storage": self.storage_request,
-                            }
-                        },
-                        "storageClassName": self.storage_class,
-                    }
+                    "accessModes": ["ReadWriteOnce"],
+                    "resources": {
+                        "requests": {
+                            "storage": self.storage_request,
+                        }
+                    },
+                    "storageClassName": self.storage_class,
                 }
             }),
         );
-        if !scheduling.is_empty() {
-            pool.insert("scheduling".to_string(), Value::Object(scheduling));
+        if let Some(node_selector) = &self.node_selector {
+            pool.insert("nodeSelector".to_string(), json!(node_selector));
+        }
+        if self.spread_across_hosts {
+            pool.insert(
+                "affinity".to_string(),
+                fault_tenant_pod_anti_affinity(&self.name),
+            );
         }
 
         let mut env = vec![json!({
@@ -202,10 +195,16 @@ mod tests {
         let value: serde_json::Value = serde_yaml_ng::from_str(&manifest).expect("valid yaml");
         assert_eq!(
             value
-                .pointer("/spec/pools/0/scheduling/nodeSelector/rustfs-storage")
+                .pointer("/spec/pools/0/nodeSelector/rustfs-storage")
                 .and_then(serde_json::Value::as_str),
             Some("true")
         );
+        assert!(
+            value
+                .pointer("/spec/pools/0/persistence/volumeClaimTemplate/spec")
+                .is_none()
+        );
+        assert!(value.pointer("/spec/pools/0/scheduling").is_none());
     }
 
     #[test]
@@ -225,5 +224,25 @@ mod tests {
         assert!(manifest.contains("storage: 100Gi"));
         assert!(!manifest.contains("rustfs-storage"));
         assert!(!manifest.contains("RUSTFS_UNSAFE_BYPASS_DISK_CHECK"));
+
+        let value: serde_json::Value = serde_yaml_ng::from_str(&manifest).expect("valid yaml");
+        assert_eq!(
+            value
+                .pointer("/spec/pools/0/persistence/volumeClaimTemplate/storageClassName")
+                .and_then(serde_json::Value::as_str),
+            Some("fast-csi")
+        );
+        assert_eq!(
+            value
+                .pointer("/spec/pools/0/affinity/podAntiAffinity/requiredDuringSchedulingIgnoredDuringExecution/0/topologyKey")
+                .and_then(serde_json::Value::as_str),
+            Some("kubernetes.io/hostname")
+        );
+        assert!(
+            value
+                .pointer("/spec/pools/0/persistence/volumeClaimTemplate/spec")
+                .is_none()
+        );
+        assert!(value.pointer("/spec/pools/0/scheduling").is_none());
     }
 }
