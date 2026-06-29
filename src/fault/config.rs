@@ -124,7 +124,7 @@ impl FaultTestConfig {
             DEFAULT_FAULT_NAMESPACE,
         );
         let scenario = env_or(&get_env, "RUSTFS_FAULT_TEST_SCENARIO", "io-eio");
-        let default_percent = if scenario == "disk-full" { 100 } else { 20 };
+        let default_percent = default_percent_for_scenario(&scenario);
         let workload = FaultWorkloadProfile::new(
             env_usize(
                 &get_env,
@@ -296,6 +296,10 @@ impl FaultTestConfig {
         )
         .expect("fault test config")
     }
+}
+
+pub fn default_percent_for_scenario(scenario: &str) -> u8 {
+    if scenario == "disk-full" { 100 } else { 20 }
 }
 
 pub(crate) fn validate_rustfs_volume_path(value: &str) -> Result<()> {

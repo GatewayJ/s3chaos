@@ -26,6 +26,10 @@ RUSTFS_POD_COUNT="${RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT:-4}"
 RUSTFS_VOLUME_PATH="${RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH:-/data/rustfs0}"
 RUSTFS_POD_STABLE_WINDOW_SECONDS="${RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS:-60}"
 BUILD_JOBS="${RUSTFS_FAULT_TEST_BUILD_JOBS:-1}"
+CHAOS_MESH_VERSION="${RUSTFS_FAULT_TEST_CHAOS_MESH_VERSION:-2.8.3}"
+CHAOS_DAEMON_RUNTIME="${RUSTFS_FAULT_TEST_CHAOS_DAEMON_RUNTIME:-containerd}"
+CHAOS_DAEMON_SOCKET_PATH="${RUSTFS_FAULT_TEST_CHAOS_DAEMON_SOCKET_PATH:-/run/k3s/containerd/containerd.sock}"
+CHAOS_DASHBOARD_PORT="${RUSTFS_FAULT_TEST_CHAOS_DASHBOARD_PORT:-2333}"
 
 FAULT_CONTEXT="${RUSTFS_FAULT_TEST_EXPECTED_CONTEXT:-}"
 FAULT_NAMESPACE="${RUSTFS_FAULT_TEST_NAMESPACE:-rustfs-fault-test}"
@@ -44,6 +48,12 @@ Commands:
   preflight [scenario]  Validate the current real-cluster environment.
   run <scenario>        Run one destructive scenario with health guards.
   list                  List catalog scenarios.
+  suite-template        Print a YAML FaultSuite template.
+  suite-validate <file> Validate a YAML FaultSuite contract.
+  suite-run <file>      Run a destructive YAML FaultSuite sequentially.
+  dashboard-install     Install/upgrade Chaos Mesh with Dashboard enabled.
+  dashboard-port-forward [port]
+                        Port-forward the Chaos Mesh Dashboard locally.
   cleanup               Remove managed Chaos and the owned fault namespace.
 
 RUSTFS_FAULT_TEST_EXPECTED_CONTEXT is optional. When unset, the current
@@ -181,9 +191,17 @@ fault_catalog_json() {
   require_command cargo
   require_command jq
   if [[ -z "$FAULT_CATALOG_JSON" ]]; then
-    FAULT_CATALOG_JSON="$(CARGO_BUILD_JOBS="$BUILD_JOBS" cargo run --quiet --manifest-path "$MANIFEST" --bin s3chaos -- fault-catalog-json)"
+    FAULT_CATALOG_JSON="$(s3chaos_cli fault-catalog-json)"
   fi
   printf '%s\n' "$FAULT_CATALOG_JSON"
+}
+
+s3chaos_cli() {
+  if [[ -n "$FAULT_TEST_BINARY" && -x "$FAULT_TEST_BINARY" ]]; then
+    "$FAULT_TEST_BINARY" "$@"
+  else
+    CARGO_BUILD_JOBS="$BUILD_JOBS" cargo run --quiet --manifest-path "$MANIFEST" --bin s3chaos -- "$@"
+  fi
 }
 
 catalog_scenario_query() {
@@ -319,16 +337,24 @@ non_fault_tenants_are_ready() {
 
 prepare_fault_binary() {
   local scenario="$1" run_root="$2"
+  preflight "$scenario"
+  build_fault_binary "$run_root" "scenario=$scenario"
+  preflight "$scenario"
+  echo "s3chaos fault-run binary ready"
+}
+
+build_fault_binary() {
+  local run_root="$1" label="$2"
   local build_messages="$run_root/fault-build.jsonl"
   local -a build_command=(
-    cargo test --manifest-path "$MANIFEST" --test faults --no-run
+    cargo build --manifest-path "$MANIFEST" --bin s3chaos
     --message-format=json-render-diagnostics
   )
 
   BUILD_JOBS="$(trim_value "$BUILD_JOBS")"
   require_positive_integer RUSTFS_FAULT_TEST_BUILD_JOBS "$BUILD_JOBS"
-  preflight "$scenario"
-  echo "preparing fault-test binary with jobs=$BUILD_JOBS and lowest host priority"
+  mkdir -p "$run_root"
+  echo "preparing s3chaos binary for $label with jobs=$BUILD_JOBS and lowest host priority"
   if command -v ionice >/dev/null 2>&1; then
     CARGO_BUILD_JOBS="$BUILD_JOBS" nice -n 19 ionice -c3 "${build_command[@]}" \
       >"$build_messages" 2>"$run_root/fault-build.log"
@@ -339,16 +365,13 @@ prepare_fault_binary() {
   FAULT_TEST_BINARY="$(jq -r '
     select(
       .reason == "compiler-artifact"
-      and .target.name == "faults"
-      and (.target.kind | index("test"))
+      and .target.name == "s3chaos"
+      and (.target.kind | index("bin"))
     )
     | .executable // empty
   ' "$build_messages" | tail -n 1)"
-  [[ -x "$FAULT_TEST_BINARY" ]] || die "faults test binary was not produced; see $run_root/fault-build.log"
+  [[ -x "$FAULT_TEST_BINARY" ]] || die "s3chaos fault-run binary was not produced; see $run_root/fault-build.log"
   printf '%s\n' "$FAULT_TEST_BINARY" >"$run_root/fault-test-binary.path"
-
-  preflight "$scenario"
-  echo "fault-test binary ready"
 }
 
 chaos_deployment_ready() {
@@ -376,6 +399,43 @@ require_chaos_ready() {
   daemon_ready="$(chaos_daemon_ready)"
   [[ "$deployment_ready" == "true" ]] || die "Chaos Mesh controller-manager is not fully Ready"
   [[ "$daemon_ready" == "true" ]] || die "Chaos Mesh chaos-daemon is not fully Ready"
+}
+
+install_chaos_dashboard() {
+  require_command helm
+  require_command kubectl
+  resolve_fault_context
+
+  helm repo add chaos-mesh https://charts.chaos-mesh.org >/dev/null 2>&1 \
+    || helm repo add chaos-mesh https://charts.chaos-mesh.org --force-update >/dev/null
+  helm repo update chaos-mesh >/dev/null
+  helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
+    -n "$CHAOS_NAMESPACE" --create-namespace --version "$CHAOS_MESH_VERSION" \
+    --set "chaosDaemon.runtime=$CHAOS_DAEMON_RUNTIME" \
+    --set "chaosDaemon.socketPath=$CHAOS_DAEMON_SOCKET_PATH" \
+    --set dashboard.create=true \
+    --set dashboard.securityMode=true \
+    --set dashboard.service.type=ClusterIP \
+    --wait --timeout 10m
+
+  kubectl_ns "$CHAOS_NAMESPACE" rollout status deployment/chaos-dashboard --timeout=120s
+  kubectl_ns "$CHAOS_NAMESPACE" get service chaos-dashboard
+  echo "Chaos Mesh Dashboard is installed in namespace $CHAOS_NAMESPACE with securityMode=true"
+  echo "Run: $0 dashboard-port-forward ${CHAOS_DASHBOARD_PORT}"
+}
+
+port_forward_chaos_dashboard() {
+  local port="${1:-$CHAOS_DASHBOARD_PORT}"
+  require_command kubectl
+  require_positive_integer RUSTFS_FAULT_TEST_CHAOS_DASHBOARD_PORT "$port"
+  resolve_fault_context
+  kubectl_ns "$CHAOS_NAMESPACE" get service chaos-dashboard >/dev/null \
+    || die "Chaos Mesh Dashboard service chaos-dashboard was not found in namespace $CHAOS_NAMESPACE"
+
+  echo "Chaos Mesh Dashboard: http://127.0.0.1:$port"
+  echo "Authentication remains controlled by Chaos Mesh Dashboard RBAC/securityMode."
+  echo "Press Ctrl-C to stop the port-forward."
+  kubectl_ns "$CHAOS_NAMESPACE" port-forward service/chaos-dashboard "$port:2333"
 }
 
 require_storage_class() {
@@ -509,144 +569,12 @@ health_is_safe() {
   return 0
 }
 
-find_artifact() {
-  find "$1" -name "$2" -type f -print -quit
-}
-
-validate_run_spec_equivalence() {
-  local scenario="$1" run_spec="$2" run_spec_yaml="$3"
-  require_command cargo
-  CARGO_BUILD_JOBS="$BUILD_JOBS" cargo run --quiet --manifest-path "$MANIFEST" --bin s3chaos -- \
-    fault-run-spec-equal "$run_spec" "$run_spec_yaml" >/dev/null \
-    || die "$scenario run spec JSON/YAML artifacts diverged"
-}
-
 validate_scenario_artifacts() {
   local scenario="$1" artifacts="$2" run_root="$3"
-  local metadata run_spec run_spec_yaml events plan evidence prechecker checker summary recommit seed disruptions recommitted committed
-  metadata="$(find_artifact "$artifacts" run-metadata.json)"
-  run_spec="$(find_artifact "$artifacts" run-spec.json)"
-  run_spec_yaml="$(find_artifact "$artifacts" run-spec.yaml)"
-  events="$(find_artifact "$artifacts" run-events.jsonl)"
-  plan="$(find_artifact "$artifacts" workload-plan.json)"
-  evidence="$(find_artifact "$artifacts" fault-evidence.json)"
-  prechecker="$(find_artifact "$artifacts" checker-pre-recommit-report.json)"
-  checker="$(find_artifact "$artifacts" checker-report.json)"
-  summary="$(find_artifact "$artifacts" workload-summary.json)"
-  recommit="$(find_artifact "$artifacts" recommit-report.json)"
-  [[ -f "$metadata" ]] || die "$scenario did not produce run-metadata.json"
-  [[ -f "$run_spec" ]] || die "$scenario did not produce run-spec.json"
-  [[ -f "$run_spec_yaml" ]] || die "$scenario did not produce run-spec.yaml"
-  [[ -f "$events" ]] || die "$scenario did not produce run-events.jsonl"
-  [[ -f "$plan" ]] || die "$scenario did not produce workload-plan.json"
-  [[ -f "$evidence" ]] || die "$scenario did not produce fault-evidence.json"
-  [[ -f "$prechecker" ]] || die "$scenario did not produce checker-pre-recommit-report.json"
-  [[ -f "$checker" ]] || die "$scenario did not produce checker-report.json"
-  [[ -f "$summary" ]] || die "$scenario did not produce workload-summary.json"
-  [[ -f "$recommit" ]] || die "$scenario did not produce recommit-report.json"
-
-  jq -e --arg scenario "$scenario" --argjson objects "$WORKLOAD_OBJECTS" --argjson concurrency "$WORKLOAD_CONCURRENCY" '
-    .scenario == $scenario
-    and (.run_id | length) > 0
-    and (.rustfs_image | length) > 0
-    and (.storage_class | length) > 0
-    and (.context | length) > 0
-    and .workload_objects == $objects
-    and .workload_concurrency == $concurrency
-  ' "$metadata" >/dev/null || die "$scenario run metadata is incomplete"
-  jq -e --argjson objects "$WORKLOAD_OBJECTS" --argjson concurrency "$WORKLOAD_CONCURRENCY" '
-    .object_count == $objects
-    and .concurrency == $concurrency
-    and ([.size_distribution[].object_count] | add) == $objects
-    and ([.size_distribution[] | (.size_bytes * .object_count)] | add) == .total_payload_bytes
-  ' "$plan" >/dev/null || die "$scenario workload plan does not match the required profile"
-  jq -e \
-    --arg scenario "$scenario" \
-    --argjson objects "$WORKLOAD_OBJECTS" \
-    --argjson concurrency "$WORKLOAD_CONCURRENCY" \
-    --argjson pod_count "$RUSTFS_POD_COUNT" \
-    --argjson stable_window "$RUSTFS_POD_STABLE_WINDOW_SECONDS" \
-    --arg volume_path "$RUSTFS_VOLUME_PATH" \
-    '
-    def has_required_artifact($name): (.artifacts.required | index($name)) != null;
-    .apiVersion == "rustfs.com/fault-test/v1alpha1"
-    and .kind == "FaultRun"
-    and .scenario.name == $scenario
-    and .workload.object_count == $objects
-    and .workload.concurrency == $concurrency
-    and .recovery.expected_rustfs_pod_count == $pod_count
-    and .recovery.stable_pod_window_seconds == $stable_window
-    and .artifacts.event_stream == "run-events.jsonl"
-    and all([
-      "run-spec.yaml",
-      "run-spec.json",
-      "run-events.jsonl",
-      "run-metadata.json",
-      "workload-plan.json",
-      "history.jsonl",
-      "workload-summary.json",
-      "recommit-report.json",
-      "checker-pre-recommit-report.json",
-      "checker-report.json",
-      "fault-evidence.json"
-    ][]; has_required_artifact(.))
-    and (.faults | length) > 0
-    and all(.faults[];
-      (.duration_seconds > 0)
-      and (.conflict_domain | length) > 0
-      and (.selection.value > 0)
-      and (if .target.kind == "rustfs-volume" then
-        .target.path == $volume_path
-      else
-        (.target.path == null)
-      end)
-    )
-  ' "$run_spec" >/dev/null || die "$scenario run spec does not match the selected contract"
-  validate_run_spec_equivalence "$scenario" "$run_spec" "$run_spec_yaml"
-  jq -s -e '
-    any(.[]; .stage == "run" and .status == "started")
-    and any(.[]; .stage == "run" and .status == "succeeded")
-    and any(.[]; .stage == "checker-final" and .status == "succeeded")
-  ' "$events" >/dev/null || die "$scenario run events are incomplete"
-  jq -e '.injected == true and .active_during_workload == true and .recovered == true' "$evidence" >/dev/null || die "$scenario fault evidence is incomplete"
-  jq -e '(.active_snapshots | length) > 0 and (.workload_snapshots | length) > 0' "$evidence" >/dev/null || die "$scenario fault evidence snapshots are missing"
-  jq -e '
-    (.missing_committed_objects | length) == 0
-    and ((.unavailable_committed_objects // []) | length) == 0
-    and ((.unknown_committed_read_failures // []) | length) == 0
-    and (.hash_mismatches | length) == 0
-    and (.successful_corrupted_reads | length) == 0
-    and (.unexpected_visible_deleted_objects | length) == 0
-    and ((.final_list_warning_count // (.list_warnings | length)) == 0)
-    and (.list_warnings | length) == 0
-    and .tenant_recovered == true
-    and .passed == true
-  ' "$prechecker" >/dev/null || die "$scenario pre-recommit checker verdict failed"
-  jq -e '
-    (.missing_committed_objects | length) == 0
-    and ((.unavailable_committed_objects // []) | length) == 0
-    and ((.unknown_committed_read_failures // []) | length) == 0
-    and (.hash_mismatches | length) == 0
-    and (.successful_corrupted_reads | length) == 0
-    and (.unexpected_visible_deleted_objects | length) == 0
-    and ((.final_list_warning_count // (.list_warnings | length)) == 0)
-    and (.list_warnings | length) == 0
-    and .tenant_recovered == true
-    and .passed == true
-  ' "$checker" >/dev/null || die "$scenario checker verdict failed"
-  jq -e '
-    .attempted == .committed
-    and .failed == 0
-    and .harness_errors == 0
-    and (.attempts | length) == .attempted
-  ' "$recommit" >/dev/null || die "$scenario recovery recommit report contains failed attempts"
-
-  seed="$(jq -r '.seed' "$plan")"
-  disruptions="$(jq -r '.client_disruptions' "$evidence")"
-  recommitted="$(jq -r '.committed' "$recommit")"
-  committed="$(jq -r '.committed_puts' "$checker")"
-  printf '%s\t%s\t0\t%s\t%s\t%s\t0\t0\t0\t0\ttrue\n' \
-    "$scenario" "$seed" "$disruptions" "$recommitted" "$committed" >>"$run_root/validation-summary.tsv"
+  local summary_row
+  summary_row="$(s3chaos_cli fault-validate-artifacts "$scenario" "$artifacts" --validation-summary-tsv)" \
+    || die "$scenario artifacts did not pass Rust contract validation"
+  printf '%s\n' "$summary_row" >>"$run_root/validation-summary.tsv"
 }
 
 write_runner_failure_summary() {
@@ -698,7 +626,7 @@ run_scenario() {
     RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS="$RUSTFS_POD_STABLE_WINDOW_SECONDS" \
     RUSTFS_FAULT_TEST_DURATION_SECONDS="${RUSTFS_FAULT_TEST_DURATION_SECONDS:-7200}" \
     RUSTFS_FAULT_TEST_ARTIFACTS="$artifacts" \
-    "$FAULT_TEST_BINARY" --ignored --test-threads=1 --nocapture \
+    "$FAULT_TEST_BINARY" fault-run \
       >"$artifacts/test.log" 2>&1
     echo "$?" >"$artifacts/test-exit-code.tmp"
   ) &
@@ -772,6 +700,108 @@ run_one() {
   echo "run artifacts: $run_root"
 }
 
+preflight_suite() {
+  local suite="$1" scenario
+  s3chaos_cli fault-suite-validate "$suite"
+  while IFS= read -r scenario; do
+    [[ -n "$scenario" ]] || continue
+    preflight "$scenario"
+  done < <(s3chaos_cli fault-suite-json "$suite" | jq -r '.scenarios[].name' | sort -u)
+}
+
+suite_requires_chaos() {
+  local suite="$1"
+  s3chaos_cli fault-suite-json "$suite" \
+    | jq -e 'any(.scenarios[]; .requiresChaosMesh == true)' >/dev/null
+}
+
+suite_max_duration_seconds() {
+  local suite="$1"
+  s3chaos_cli fault-suite-json "$suite" | jq -r '.budgets.maxDurationSeconds // empty'
+}
+
+run_suite() {
+  local suite="$1" run_root rc
+  local baseline_ready_nodes baseline_tenants current_time health_checks require_chaos
+  local started_at now max_duration_seconds elapsed
+  [[ -f "$suite" ]] || die "suite yaml file not found: $suite"
+  run_root="$(new_run_root)"
+  mkdir -p "$run_root"
+  preflight_suite "$suite"
+  build_fault_binary "$run_root" "fault-suite-run"
+  preflight_suite "$suite"
+  baseline_ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
+  baseline_tenants="$run_root/baseline-non-fault-tenants.tsv"
+  list_non_fault_tenants >"$baseline_tenants"
+  if suite_requires_chaos "$suite"; then
+    require_chaos=true
+  else
+    require_chaos=false
+  fi
+  max_duration_seconds="$(suite_max_duration_seconds "$suite")"
+  capture_cluster_snapshot "$run_root" before
+
+  echo "starting suite=$suite artifacts=$run_root"
+  ACTIVE_ARTIFACTS="$run_root"
+  (
+    set +e
+    RUSTFS_FAULT_TEST_DESTRUCTIVE=1 \
+    RUSTFS_FAULT_TEST_ARTIFACTS="$run_root" \
+    "$FAULT_TEST_BINARY" fault-suite-run "$suite" \
+      >"$run_root/suite.log" 2>&1
+    echo "$?" >"$run_root/suite-exit-code.tmp"
+  ) &
+  ACTIVE_PID="$!"
+  started_at="$(date +%s)"
+  health_checks=0
+
+  while kill -0 "$ACTIVE_PID" 2>/dev/null; do
+    current_time="$(date -u +%FT%TZ)"
+    now="$(date +%s)"
+    elapsed=$((now - started_at))
+    if [[ -n "$max_duration_seconds" && "$elapsed" -ge "$max_duration_seconds" ]]; then
+      echo "$current_time budget=false maxDurationSeconds=$max_duration_seconds elapsedSeconds=$elapsed" >>"$run_root/health-watch.log"
+      touch "$run_root/suite-budget-failed"
+      cleanup_managed_chaos
+      terminate_process_tree "$ACTIVE_PID"
+      break
+    fi
+
+    health_checks=$((health_checks + 1))
+    if health_is_safe "$baseline_ready_nodes" "$baseline_tenants" "$require_chaos"; then
+      echo "$current_time safe=true" >>"$run_root/health-watch.log"
+      if (( health_checks % 6 == 0 )); then
+        echo "suite=$suite running safe=true time=$current_time"
+      fi
+    else
+      echo "$current_time safe=false" >>"$run_root/health-watch.log"
+      touch "$run_root/health-guard-failed"
+      cleanup_managed_chaos
+      terminate_process_tree "$ACTIVE_PID"
+      break
+    fi
+    sleep 10
+  done
+
+  wait "$ACTIVE_PID" 2>/dev/null || true
+  ACTIVE_PID=""
+  ACTIVE_ARTIFACTS=""
+  rc=125
+  [[ -f "$run_root/suite-exit-code.tmp" ]] && rc="$(cat "$run_root/suite-exit-code.tmp")"
+  [[ ! -f "$run_root/health-guard-failed" ]] || rc=90
+  [[ ! -f "$run_root/suite-budget-failed" ]] || rc=91
+  echo "$rc" >"$run_root/suite-exit-code"
+  capture_cluster_snapshot "$run_root" after
+  capture_fault_logs "$run_root"
+  if [[ "$rc" -ne 0 ]]; then
+    cleanup_managed_chaos
+    echo "suite failed: $suite rc=$rc log=$run_root/suite.log" >&2
+    return "$rc"
+  fi
+  echo "suite passed: $suite"
+  echo "run artifacts: $run_root"
+}
+
 list_scenarios() {
   fault_catalog_json | jq -r '.[] | .scenario'
 }
@@ -804,6 +834,28 @@ case "${1:-help}" in
   list)
     [[ -z "${2:-}" ]] || die "list does not accept arguments; run a named scenario with: fault-test.sh run <scenario>"
     list_scenarios
+    ;;
+  suite-template)
+    [[ -z "${2:-}" ]] || die "suite-template does not accept arguments"
+    s3chaos_cli fault-suite-template
+    ;;
+  suite-validate)
+    [[ -n "${2:-}" ]] || die "suite yaml path is required"
+    [[ -z "${3:-}" ]] || die "suite-validate accepts exactly one suite yaml path"
+    s3chaos_cli fault-suite-validate "$2"
+    ;;
+  suite-run)
+    [[ -n "${2:-}" ]] || die "suite yaml path is required"
+    [[ -z "${3:-}" ]] || die "suite-run accepts exactly one suite yaml path"
+    run_suite "$2"
+    ;;
+  dashboard-install)
+    [[ -z "${2:-}" ]] || die "dashboard-install does not accept arguments"
+    install_chaos_dashboard
+    ;;
+  dashboard-port-forward)
+    [[ -z "${3:-}" ]] || die "dashboard-port-forward accepts at most one local port"
+    port_forward_chaos_dashboard "${2:-}"
     ;;
   cleanup)
     preflight_cleanup

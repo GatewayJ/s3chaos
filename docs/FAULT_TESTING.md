@@ -51,14 +51,21 @@ make fault-list
 make fault-preflight SCENARIO=io-eio
 make fault-run SCENARIO=io-eio
 make fault-run-dm
+make fault-suite-template
+make fault-suite-validate SUITE=suite.yaml
+make fault-suite-run SUITE=suite.yaml
+make fault-dashboard-install
+make fault-dashboard-port-forward
 make fault-cleanup
 ```
 
 `fault-check` is local only. It runs Bash syntax, Rust fmt, tests, and clippy.
 
-`fault-run` prebuilds the ignored `faults` test binary before the fault window,
-then runs that binary directly. The runner reruns preflight before and after the
-build.
+`fault-run` prebuilds the `s3chaos` CLI before the fault window, then runs
+`s3chaos fault-run` directly. The runner reruns preflight before and after the
+build. After a successful run, the shell runner delegates artifact contract
+validation to `s3chaos fault-validate-artifacts`; Bash does not duplicate the
+JSON artifact schema.
 
 ## Required Environment
 
@@ -115,6 +122,10 @@ resource cleanup remain under `src/framework/`.
 | `RUSTFS_FAULT_TEST_REQUIRE_CLIENT_DISRUPTION` | `false` | Force at least one client-visible failed/timeout/unknown S3 operation even when the catalog marks disruption optional. |
 | `RUSTFS_FAULT_TEST_BUILD_JOBS` | `1` | Cargo prebuild job count. |
 | `RUSTFS_FAULT_TEST_RUN_ROOT` | timestamped target dir | Artifact root. |
+| `RUSTFS_FAULT_TEST_CHAOS_MESH_VERSION` | `2.8.3` | Chaos Mesh Helm chart version for optional Dashboard installation. |
+| `RUSTFS_FAULT_TEST_CHAOS_DAEMON_RUNTIME` | `containerd` | Chaos Daemon runtime value passed to Helm. |
+| `RUSTFS_FAULT_TEST_CHAOS_DAEMON_SOCKET_PATH` | `/run/k3s/containerd/containerd.sock` | Runtime socket path passed to Helm. |
+| `RUSTFS_FAULT_TEST_CHAOS_DASHBOARD_PORT` | `2333` | Local port for Dashboard port-forward. |
 
 The prefill stage writes each setup object once and requires a matching GET
 before fault injection. It retries transient GET timeouts or unknown read
@@ -183,6 +194,18 @@ kubectl get crd iochaos.chaos-mesh.org podchaos.chaos-mesh.org networkchaos.chao
 
 Use the actual runtime socket for non-K3s clusters.
 
+The Dashboard is optional observability, not a pass/fail signal. To install or
+upgrade Chaos Mesh with the Dashboard enabled and authentication still on:
+
+```bash
+make fault-dashboard-install
+make fault-dashboard-port-forward
+```
+
+The port-forward prints a local `http://127.0.0.1:<port>` URL. Keep Dashboard
+access local or otherwise protected; the runner verdict still comes from
+artifacts and checker reports.
+
 ## Recommended Run Flow
 
 1. Run the local gate:
@@ -234,6 +257,72 @@ Each run names exactly one scenario with `SCENARIO=<name>`. SRE-owned scheduling
 or automation should live outside this repository and call the same explicit
 command for the desired scenario. Tool requirements, such as `warp` for
 `warp-under-chaos`, are read from the Rust catalog during preflight.
+
+## YAML Suite Contracts
+
+Scenario definitions stay in Rust. YAML suites are a declarative composition
+layer for selected scenarios, budgets, observability, and per-scenario
+overrides. They compile against the Rust catalog and fail fast when a scenario
+name, percent override, duration, or workload budget is invalid. If `workload`
+is present for a scenario, set both `objects` and `concurrency`. Unknown YAML
+fields are rejected so typos cannot silently drop suite budgets or workload
+overrides.
+
+Generate a starting point:
+
+```bash
+make fault-suite-template > suite.yaml
+make fault-suite-validate SUITE=suite.yaml
+cargo run --manifest-path Cargo.toml --bin s3chaos -- fault-suite-json suite.yaml
+```
+
+Example:
+
+```yaml
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+budgets:
+  maxDuration: 2h
+  stopOnFirstFailure: true
+  maxClientDisruptions: 20
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: optional
+artifacts:
+  required: strict
+scenarios:
+  - name: io-eio
+    duration: 10m
+    percent: 20
+    workload:
+      objects: 40000
+      concurrency: 80
+  - name: network-delay
+    duration: 8m
+```
+
+Run a suite sequentially:
+
+```bash
+make fault-suite-run SUITE=suite.yaml
+```
+
+The shell entrypoint validates the suite, preflights each referenced scenario,
+prebuilds the `s3chaos` binary, captures cluster snapshots, watches baseline
+node/Tenant/Chaos Mesh health while the suite is running, and terminates the
+suite if the guard fails or `maxDuration` is reached. The Rust suite runner
+creates a suite artifact root under `RUSTFS_FAULT_TEST_ARTIFACTS`, runs each
+scenario/repetition in order, validates each successful scenario's artifacts
+with the Rust artifact contract, refuses to start an attempt unless the
+remaining `maxDuration` can cover the scenario duration plus recovery timeout,
+enforces `stopOnFirstFailure` and cumulative `maxClientDisruptions`, and writes
+`suite-summary.json`.
+
+The suite runner is intentionally sequential. It does not yet support parallel
+execution, matrix expansion, per-scenario cluster/storage credentials,
+`observability.chaosDashboard: required`, or `artifacts.required: default`.
 
 ## Artifacts And Pass Criteria
 

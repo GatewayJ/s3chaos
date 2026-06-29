@@ -18,9 +18,6 @@ use std::path::{Path, PathBuf};
 
 use crate::framework::{command::CommandSpec, config::ClusterTestConfig, kubectl::Kubectl};
 
-const ERASURE_READ_QUORUM: &str = "erasure read quorum";
-const DNS_LOOKUP_FAILURE: &str = "failed to lookup address information";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotReport {
     pub dir: PathBuf,
@@ -64,6 +61,15 @@ impl ArtifactCollector {
         case_name: &str,
         config: &ClusterTestConfig,
     ) -> Result<SnapshotReport> {
+        self.collect_kubernetes_snapshot_with_diagnosis(case_name, config, generic_diagnosis)
+    }
+
+    pub fn collect_kubernetes_snapshot_with_diagnosis(
+        &self,
+        case_name: &str,
+        config: &ClusterTestConfig,
+        diagnose: impl FnOnce(&str) -> String,
+    ) -> Result<SnapshotReport> {
         let mut combined_output = String::new();
 
         for SnapshotCommand { file_name, command } in kubernetes_snapshot_commands(config) {
@@ -80,7 +86,7 @@ impl ArtifactCollector {
             self.write_text(case_name, &file_name, &content)?;
         }
 
-        let diagnosis = diagnose_snapshot(&combined_output);
+        let diagnosis = diagnose(&combined_output);
         self.write_text(case_name, "diagnosis.txt", &diagnosis)?;
 
         Ok(SnapshotReport {
@@ -191,40 +197,8 @@ fn kubernetes_snapshot_commands(config: &ClusterTestConfig) -> Vec<SnapshotComma
     ]
 }
 
-fn diagnose_snapshot(snapshot: &str) -> String {
-    let mut lines = vec![
-        "RustFS Operator test diagnostic summary".to_string(),
-        String::new(),
-    ];
-    let mut matched = false;
-
-    if snapshot.contains(ERASURE_READ_QUORUM) {
-        matched = true;
-        lines.extend([
-            format!("Detected `{ERASURE_READ_QUORUM}` in RustFS pod logs."),
-            "Meaning: RustFS ECStore could not read a majority of matching erasure format metadata during startup.".to_string(),
-            "Most likely test causes: stale or partially initialized volumes, peer startup/DNS timing, or a RustFS bootstrap retry window that ended before quorum converged.".to_string(),
-            "Inspect: rustfs-pods-current.log, rustfs-pods-previous.log, tenant-describe.txt, rustfs-pods-describe.txt, and pv-paths.txt.".to_string(),
-            String::new(),
-        ]);
-    }
-
-    if snapshot.contains(DNS_LOOKUP_FAILURE) {
-        matched = true;
-        lines.extend([
-            format!("Detected `{DNS_LOOKUP_FAILURE}` in RustFS pod logs."),
-            "Meaning: a RustFS peer hostname was not resolvable during early pod startup. Check the headless Service, endpoint publication, and whether pods recovered after restart.".to_string(),
-            String::new(),
-        ]);
-    }
-
-    if !matched {
-        lines.push(
-            "No built-in RustFS bootstrap signature was detected. Inspect the collected Kubernetes snapshot files for the first failing pod event or container log.".to_string(),
-        );
-    }
-
-    lines.join("\n")
+fn generic_diagnosis(_: &str) -> String {
+    "Kubernetes snapshot collected. Inspect the generated command outputs for the first failing resource, event, or container log.".to_string()
 }
 
 fn sanitize_case_name(case_name: &str) -> String {
@@ -242,7 +216,7 @@ fn sanitize_case_name(case_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactCollector, diagnose_snapshot, kubernetes_snapshot_commands};
+    use super::{ArtifactCollector, generic_diagnosis, kubernetes_snapshot_commands};
     use crate::framework::config::E2eConfig;
 
     #[test]
@@ -285,41 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn diagnosis_explains_erasure_read_quorum() {
-        let diagnosis = diagnose_snapshot(
-            "[FATAL] store init failed to load formats after 10 retries: erasure read quorum",
-        );
+    fn default_diagnosis_stays_domain_neutral() {
+        let diagnosis = generic_diagnosis("erasure read quorum");
 
-        assert!(diagnosis.contains("Detected `erasure read quorum`"));
-        assert!(diagnosis.contains("ECStore could not read a majority"));
-        assert!(diagnosis.contains("stale or partially initialized volumes"));
-    }
-
-    #[test]
-    fn diagnosis_explains_dns_lookup_failure() {
-        let diagnosis =
-            diagnose_snapshot("failed to lookup address information when contacting peers");
-
-        assert!(diagnosis.contains("Detected `failed to lookup address information`"));
-        assert!(diagnosis.contains("peer hostname was not resolvable"));
-    }
-
-    #[test]
-    fn diagnosis_defaults_to_unknown_signature_when_no_known_pattern_matches() {
-        let diagnosis = diagnose_snapshot("some unrelated startup issue");
-
-        assert!(diagnosis.contains(
-            "No built-in RustFS bootstrap signature was detected. Inspect the collected Kubernetes snapshot files for the first failing pod event or container log."
-        ));
-    }
-
-    #[test]
-    fn diagnosis_supports_multiple_signatures() {
-        let diagnosis = diagnose_snapshot(
-            "store init failed: erasure read quorum\nfailed to lookup address information",
-        );
-
-        assert!(diagnosis.contains("Detected `erasure read quorum`"));
-        assert!(diagnosis.contains("Detected `failed to lookup address information`"));
+        assert!(diagnosis.contains("Kubernetes snapshot collected"));
+        assert!(!diagnosis.contains("RustFS"));
     }
 }

@@ -12,14 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod artifact_validation;
 pub mod backends;
 pub mod checker;
 pub mod config;
+pub mod diagnostics;
 pub mod events;
 pub mod fixture;
 pub mod history;
 pub mod plan;
+pub mod reporting;
 pub mod runner;
 pub mod scenarios;
 pub mod spec;
+pub mod suite;
+pub mod suite_runner;
 pub mod workload;

@@ -22,10 +22,15 @@ use crate::{
         },
         checker,
         config::FaultTestConfig,
+        diagnostics::diagnose_rustfs_snapshot,
         events::{RunEventRecorder, RunEventStatus},
         fixture,
         history::{OperationOutcome, OperationRecord, Recorder},
-        plan::{FaultInjection, FaultKind, FaultPlan, FaultPlanOptions, FaultSelection},
+        plan::{FaultInjection, FaultKind, FaultPlan, FaultPlanOptions},
+        reporting::{
+            FailureSummary, FaultEvidence, FaultStatusSnapshot, PodIdentity, RunMetadata,
+            write_checker_error, write_failure_summary, write_failure_summary_if_absent,
+        },
         scenarios::{self, FaultBackend, FaultIsolation, FaultScenario, FaultScenarioSpec},
         spec::FaultRunSpec,
         workload::{ObjectSpec, S3WorkloadClient, WorkloadPlan, sha256_hex, wait_for_s3_endpoint},
@@ -64,6 +69,10 @@ struct FaultRunContext {
 
 pub async fn run_selected_scenario_from_env() -> Result<()> {
     let config = FaultTestConfig::from_env()?;
+    run_scenario_with_config(config).await
+}
+
+pub async fn run_scenario_with_config(config: FaultTestConfig) -> Result<()> {
     let scenario = FaultScenario::from_config(&config)?;
     let spec = scenarios::scenario_spec(&scenario.name)?;
     let plan = FaultPlan::from_scenario_with_options(
@@ -89,7 +98,11 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
             FailureSummary::new(&scenario.name, "scenario", "unknown", error.to_string()),
         )
         .ok();
-        match collector.collect_kubernetes_snapshot(scenario.case_name, &config.cluster) {
+        match collector.collect_kubernetes_snapshot_with_diagnosis(
+            scenario.case_name,
+            &config.cluster,
+            diagnose_rustfs_snapshot,
+        ) {
             Ok(report) => {
                 eprintln!(
                     "collected fault-test artifacts under {}",
@@ -1921,163 +1934,6 @@ fn chaos_resource_name_suffix(total: usize, index: usize) -> String {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct FaultStatusSnapshot {
-    stage: String,
-    resource_kind: Option<String>,
-    resource_name: Option<String>,
-    chaos_status: Option<serde_json::Value>,
-    dm_status: Option<DmStatusSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct FaultEvidence {
-    scenario: String,
-    backend: String,
-    target: String,
-    injected: bool,
-    active_during_workload: bool,
-    recovered: bool,
-    client_disruptions: usize,
-    workload_plan: WorkloadPlan,
-    pods_before: Vec<PodIdentity>,
-    pods_after: Vec<PodIdentity>,
-    active_snapshots: Vec<FaultStatusSnapshot>,
-    workload_snapshots: Vec<FaultStatusSnapshot>,
-    dm_recovery_snapshot: Option<DmStatusSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct RunMetadata {
-    scenario: String,
-    case_name: String,
-    run_id: String,
-    bucket: String,
-    backend: String,
-    target: String,
-    context: String,
-    namespace: String,
-    tenant: String,
-    storage_class: String,
-    rustfs_image: String,
-    artifacts_dir: String,
-    duration_seconds: u64,
-    percent: Option<u8>,
-    fault_selection: Vec<String>,
-    workload_objects: usize,
-    workload_concurrency: usize,
-    prefill_concurrency: usize,
-    request_timeout_seconds: u64,
-    use_cluster_ip: bool,
-    require_client_disruption: bool,
-    chaos_namespace: String,
-}
-
-impl RunMetadata {
-    fn from_case(
-        config: &FaultTestConfig,
-        scenario: &FaultScenario,
-        plan: &FaultPlan,
-        workload_plan: &WorkloadPlan,
-        run_id: &str,
-        bucket: &str,
-    ) -> Self {
-        Self {
-            scenario: scenario.name.clone(),
-            case_name: scenario.case_name.to_string(),
-            run_id: run_id.to_string(),
-            bucket: bucket.to_string(),
-            backend: plan.backend_summary(),
-            target: plan.target_summary(),
-            context: config.cluster.context.clone(),
-            namespace: config.cluster.test_namespace.clone(),
-            tenant: config.cluster.tenant_name.clone(),
-            storage_class: config.cluster.storage_class.clone(),
-            rustfs_image: config.cluster.rustfs_image.clone(),
-            artifacts_dir: config.cluster.artifacts_dir.display().to_string(),
-            duration_seconds: scenario.duration.as_secs(),
-            percent: plan
-                .faults()
-                .iter()
-                .find_map(|fault| match fault.selection() {
-                    FaultSelection::Percent(percent) => Some(percent),
-                    FaultSelection::FixedTargets(_) => None,
-                }),
-            fault_selection: plan
-                .faults()
-                .iter()
-                .map(|fault| fault.selection().summary())
-                .collect(),
-            workload_objects: workload_plan.object_count,
-            workload_concurrency: workload_plan.concurrency,
-            prefill_concurrency: config.prefill_concurrency,
-            request_timeout_seconds: config.request_timeout.as_secs(),
-            use_cluster_ip: config.use_cluster_ip,
-            require_client_disruption: config.require_client_disruption,
-            chaos_namespace: config.chaos_namespace.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct FailureSummary {
-    scenario: String,
-    stage: String,
-    classification: String,
-    message: String,
-}
-
-impl FailureSummary {
-    fn new(
-        scenario: impl Into<String>,
-        stage: impl Into<String>,
-        classification: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            scenario: scenario.into(),
-            stage: stage.into(),
-            classification: classification.into(),
-            message: message.into(),
-        }
-    }
-}
-
-fn write_failure_summary(
-    collector: &ArtifactCollector,
-    case_name: &str,
-    summary: FailureSummary,
-) -> Result<()> {
-    collector.write_text(
-        case_name,
-        "failure-summary.json",
-        &serde_json::to_string_pretty(&summary)?,
-    )?;
-    Ok(())
-}
-
-fn write_failure_summary_if_absent(
-    collector: &ArtifactCollector,
-    case_name: &str,
-    summary: FailureSummary,
-) -> Result<()> {
-    let path = collector.case_dir(case_name).join("failure-summary.json");
-    if path.exists() {
-        return Ok(());
-    }
-    write_failure_summary(collector, case_name, summary)
-}
-
-fn write_checker_error(
-    collector: &ArtifactCollector,
-    case_name: &str,
-    artifact: &str,
-    message: &str,
-) -> Result<()> {
-    collector.write_text(case_name, artifact, message)?;
-    Ok(())
-}
-
 fn collect_fault_artifacts(
     collector: &ArtifactCollector,
     case_name: &str,
@@ -2127,12 +1983,6 @@ fn chaos_artifact_name(
     } else {
         format!("{prefix}-{suffix}-{index:02}.{extension}")
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct PodIdentity {
-    name: String,
-    uid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
