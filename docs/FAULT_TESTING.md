@@ -264,7 +264,9 @@ Scenario definitions stay in Rust. YAML suites are a declarative composition
 layer for selected scenarios, budgets, observability, and per-scenario
 overrides. They compile against the Rust catalog and fail fast when a scenario
 name, percent override, duration, or workload budget is invalid. If `workload`
-is present for a scenario, set both `objects` and `concurrency`.
+is present for a scenario, set both `objects` and `concurrency`. Unknown YAML
+fields are rejected so typos cannot silently drop suite budgets or workload
+overrides.
 
 Generate a starting point:
 
@@ -319,7 +321,8 @@ enforces `stopOnFirstFailure` and cumulative `maxClientDisruptions`, and writes
 `suite-summary.json`.
 
 The suite runner is intentionally sequential. It does not yet support parallel
-execution, matrix expansion, or per-scenario cluster/storage credentials.
+execution, matrix expansion, per-scenario cluster/storage credentials,
+`observability.chaosDashboard: required`, or `artifacts.required: default`.
 
 ## Artifacts And Pass Criteria
 

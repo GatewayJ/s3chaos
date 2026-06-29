@@ -97,6 +97,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
     let suite = resolve_fault_suite_yaml(&path)?;
     let base_config = FaultTestConfig::from_env()?;
     base_config.require_destructive_enabled()?;
+    validate_suite_runtime_contract(&suite, &base_config)?;
 
     let run_id = format!("suite-{}", Uuid::new_v4());
     let suite_root = suite_run_root(&base_config, &suite, &run_id);
@@ -265,6 +266,19 @@ fn scenario_config(
     Ok(config)
 }
 
+fn validate_suite_runtime_contract(
+    suite: &ResolvedFaultSuite,
+    base_config: &FaultTestConfig,
+) -> Result<()> {
+    if let Some(stable_window_seconds) = suite.budgets.recovery_stable_window_seconds {
+        ensure!(
+            Duration::from_secs(stable_window_seconds) < base_config.cluster.timeout,
+            "suite budgets.recoveryStableWindowSeconds must be less than RUSTFS_FAULT_TEST_TIMEOUT_SECONDS"
+        );
+    }
+    Ok(())
+}
+
 fn suite_duration_budget_failure(
     elapsed: Duration,
     max_duration_seconds: Option<u64>,
@@ -425,7 +439,10 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{attempt_seed, scenario_config, suite_duration_budget_failure};
+    use super::{
+        attempt_seed, scenario_config, suite_duration_budget_failure,
+        validate_suite_runtime_contract,
+    };
     use crate::fault::{config::FaultTestConfig, suite::FaultSuite};
     use std::time::Duration;
 
@@ -535,6 +552,34 @@ scenarios:
         assert!(
             suite_duration_budget_failure(Duration::from_secs(10_000), None, &config, "io-eio", 1)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn suite_runtime_contract_rejects_stable_window_that_matches_timeout_before_run_starts() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+budgets:
+  recoveryStableWindowSeconds: 300
+scenarios:
+  - name: io-eio
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+
+        let error = validate_suite_runtime_contract(&suite, &base).expect_err("runtime contract");
+
+        assert!(
+            error
+                .to_string()
+                .contains("recoveryStableWindowSeconds must be less")
         );
     }
 }

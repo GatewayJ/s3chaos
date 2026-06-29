@@ -23,6 +23,7 @@ pub const FAULT_SUITE_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
 pub const FAULT_SUITE_KIND: &str = "FaultSuite";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FaultSuite {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
@@ -39,12 +40,13 @@ pub struct FaultSuite {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FaultSuiteMetadata {
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaultSuiteBudgets {
     #[serde(default = "default_stop_on_first_failure")]
     pub stop_on_first_failure: bool,
@@ -57,7 +59,7 @@ pub struct FaultSuiteBudgets {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaultSuiteScenario {
     pub name: String,
     #[serde(default = "default_repetitions")]
@@ -71,7 +73,7 @@ pub struct FaultSuiteScenario {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaultSuiteWorkloadOverride {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub objects: Option<usize>,
@@ -80,7 +82,7 @@ pub struct FaultSuiteWorkloadOverride {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaultSuiteObservability {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chaos_dashboard: Option<FaultSuiteDashboardMode>,
@@ -95,7 +97,7 @@ pub enum FaultSuiteDashboardMode {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaultSuiteArtifacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<FaultSuiteArtifactMode>,
@@ -182,6 +184,20 @@ impl FaultSuite {
                 stable_window > 0,
                 "budgets.recoveryStableWindowSeconds must be greater than zero"
             );
+        }
+        if matches!(
+            self.observability.chaos_dashboard,
+            Some(FaultSuiteDashboardMode::Required)
+        ) {
+            bail!(
+                "observability.chaosDashboard=required is not implemented; install the dashboard separately and use optional or disabled"
+            );
+        }
+        if matches!(
+            self.artifacts.required,
+            Some(FaultSuiteArtifactMode::Default)
+        ) {
+            bail!("artifacts.required=default is not implemented; omit it or use strict");
         }
 
         let scenarios = self
@@ -482,6 +498,89 @@ scenarios:
                 .to_string()
                 .contains("must set both objects and concurrency")
         );
+    }
+
+    #[test]
+    fn rejects_unknown_suite_fields() {
+        let error = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+budgets:
+  maxDuraton: 1h
+scenarios:
+  - name: io-eio
+"#,
+        )
+        .expect_err("unknown budget field");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_unknown_scenario_fields() {
+        let error = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    worklod:
+      objects: 64
+      concurrency: 8
+"#,
+        )
+        .expect_err("unknown scenario field");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_unimplemented_suite_modes() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+observability:
+  chaosDashboard: required
+artifacts:
+  required: default
+scenarios:
+  - name: io-eio
+"#,
+        )
+        .expect("suite yaml");
+
+        let error = suite.resolve().expect_err("unimplemented mode");
+
+        assert!(error.to_string().contains("chaosDashboard=required"));
+    }
+
+    #[test]
+    fn rejects_unimplemented_artifact_default_mode() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+artifacts:
+  required: default
+scenarios:
+  - name: io-eio
+"#,
+        )
+        .expect("suite yaml");
+
+        let error = suite.resolve().expect_err("unimplemented artifact mode");
+
+        assert!(error.to_string().contains("artifacts.required=default"));
     }
 
     #[test]
