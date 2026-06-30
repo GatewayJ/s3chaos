@@ -28,6 +28,7 @@ use crate::fault::{
     scenarios::{FaultScenario, FaultScenarioSpec, scenario_spec},
     spec::FaultRunArtifactSpec,
     suite::{ResolvedFaultSuite, ResolvedFaultSuiteScenario, resolve_fault_suite_yaml},
+    workload::{WorkloadHotspot, WorkloadPlan, WorkloadSizeClass},
 };
 
 pub const FAULT_SUITE_PLAN_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
@@ -110,9 +111,19 @@ pub struct FaultSuitePlanWorkload {
     pub objects: usize,
     pub concurrency: usize,
     pub operation_mix: crate::fault::workload::WorkloadOperationMix,
+    pub payload_distribution: Vec<FaultSuitePlanPayloadClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotspot: Option<WorkloadHotspot>,
     pub prefill_concurrency: usize,
     pub request_timeout_seconds: u64,
     pub seed: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanPayloadClass {
+    pub size_bytes: usize,
+    pub object_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -546,6 +557,22 @@ impl FaultSuitePlanAttempt {
             })
             .collect();
 
+        let workload_plan = WorkloadPlan::seeded_with_profile(
+            seed,
+            input.config.workload.object_count,
+            input.config.workload.concurrency,
+            input.config.workload_operation_mix,
+            input.config.workload_payload_distribution.clone(),
+            input.config.workload_hotspot,
+        )?;
+
+        let payload_distribution = workload_plan
+            .size_distribution
+            .iter()
+            .map(FaultSuitePlanPayloadClass::from)
+            .collect();
+        let hotspot = workload_plan.hotspot;
+
         Ok(Self {
             index: input.index,
             scenario: input.scenario.name.clone(),
@@ -562,6 +589,8 @@ impl FaultSuitePlanAttempt {
                 objects: input.config.workload.object_count,
                 concurrency: input.config.workload.concurrency,
                 operation_mix: input.config.workload_operation_mix,
+                payload_distribution,
+                hotspot,
                 prefill_concurrency: input.config.prefill_concurrency,
                 request_timeout_seconds: input.config.request_timeout.as_secs(),
                 seed,
@@ -589,6 +618,15 @@ impl FaultSuitePlanAttempt {
             },
             budget: input.budget,
         })
+    }
+}
+
+impl From<&WorkloadSizeClass> for FaultSuitePlanPayloadClass {
+    fn from(class: &WorkloadSizeClass) -> Self {
+        Self {
+            size_bytes: class.size_bytes,
+            object_count: class.object_count,
+        }
     }
 }
 
@@ -690,6 +728,11 @@ fn scenario_config(
         config.workload_operation_mix = workload
             .operation_weights
             .unwrap_or(config.workload_operation_mix);
+        config.workload_payload_distribution = workload
+            .payload_distribution
+            .clone()
+            .or(config.workload_payload_distribution.clone());
+        config.workload_hotspot = workload.hotspot.or(config.workload_hotspot);
         config.prefill_concurrency = config
             .prefill_concurrency
             .min(config.workload.concurrency)
@@ -1025,6 +1068,14 @@ scenarios:
         list: 1
         delete: 1
         multipart: 1
+      payloadDistribution:
+        - sizeBytes: 1024
+          weight: 1
+        - sizeBytes: 4096
+          weight: 3
+      hotspot:
+        objectPercent: 10
+        operationPercent: 70
 "#,
         )
         .expect("suite yaml")
@@ -1041,6 +1092,12 @@ scenarios:
         assert_eq!(attempt.workload.concurrency, 9);
         assert_eq!(attempt.workload.operation_mix.put, 2);
         assert_eq!(attempt.workload.operation_mix.get, 3);
+        assert_eq!(attempt.workload.payload_distribution[0].object_count, 18);
+        assert_eq!(attempt.workload.payload_distribution[1].object_count, 54);
+        assert_eq!(
+            attempt.workload.hotspot.expect("hotspot").operation_percent,
+            70
+        );
         assert_eq!(
             attempt.faults[0].parameters,
             FaultInjectionParameters::NetworkDelay {
@@ -1054,6 +1111,20 @@ scenarios:
             attempt.faults[0].parameters
         );
         assert_eq!(execution.attempts[0].config.workload_operation_mix.get, 3);
+        assert!(
+            execution.attempts[0]
+                .config
+                .workload_payload_distribution
+                .is_some()
+        );
+        assert_eq!(
+            execution.attempts[0]
+                .config
+                .workload_hotspot
+                .expect("hotspot")
+                .object_percent,
+            10
+        );
     }
 
     #[test]

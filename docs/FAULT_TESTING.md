@@ -266,9 +266,9 @@ layer for selected scenarios, budgets, observability, typed scenario parameters,
 and per-scenario workload overrides. They compile against the Rust catalog and
 fail fast when a scenario name, percent override, duration, parameter, or
 workload budget is invalid. If `workload` changes `objects` or `concurrency`,
-set both fields together; `operationWeights` may be set by itself. Unknown YAML
-fields are rejected so typos cannot silently drop suite budgets, parameters, or
-workload overrides.
+set both fields together; `operationWeights`, `payloadDistribution`, and
+`hotspot` may be set by themselves. Unknown YAML fields are rejected so typos
+cannot silently drop suite budgets, parameters, or workload overrides.
 
 Generate a starting point:
 
@@ -309,6 +309,18 @@ scenarios:
         list: 1
         delete: 1
         multipart: 1
+      payloadDistribution:
+        - sizeBytes: 4096
+          weight: 85
+        - sizeBytes: 16384
+          weight: 10
+        - sizeBytes: 8388608
+          weight: 4
+        - sizeBytes: 16777216
+          weight: 1
+      hotspot:
+        objectPercent: 10
+        operationPercent: 70
   - name: network-delay
     duration: 8m
     params:
@@ -321,9 +333,19 @@ scenarios:
 Typed `params` are scenario-gated. `network-delay`, `network-loss`,
 `network-corrupt`, `network-duplicate`, `io-latency`, `stress-cpu`, and
 `stress-memory` accept the matching `kind`; other scenarios reject `params`
-until their safe schema is added. The plan expands defaults and explicit values
-into `parameters`, so operators can review the exact latency, loss/corruption
-rate, IO latency methods, or stress intensity before a destructive run.
+until their safe schema is added. The supported params schema is declared in the
+Rust scenario catalog, not inferred from raw backend manifests. The plan expands
+defaults and explicit values into `parameters`, so operators can review the
+exact latency, loss/corruption rate, IO latency methods, or stress intensity
+before a destructive run.
+
+`operationWeights` controls the relative mix of PUT, overwrite, GET, LIST,
+DELETE, and multipart work. `payloadDistribution` controls generated object
+sizes by weighted `sizeBytes` classes. `hotspot` routes the configured
+percentage of operations to the configured percentage of the prefilled object
+set, which lets operators model repeated access to a smaller key range without
+exposing raw object selectors. Duration-based workload profiles are not
+implemented yet; scenario `duration` still controls the fault window.
 
 Render and review the exact destructive plan before running:
 
@@ -332,11 +354,12 @@ make fault-suite-plan SUITE=suite.yaml
 ```
 
 The plan expands each attempt with scenario, repetition, resolved duration,
-selected faults, typed fault parameters, targets, workload profile and operation
-mix, expected backend, CRDs/tools, artifact paths, and budget impact. Suite runs
-also write the execution plan to `suite-plan.json` under the suite artifact
-root. Set `RUSTFS_FAULT_TEST_SEED` before both planning and running when the
-preview and execution must use the same workload seeds.
+selected faults, typed fault parameters, targets, workload profile, operation
+mix, payload distribution, hotspot behavior, expected backend, CRDs/tools,
+artifact paths, and budget impact. Suite runs also write the execution plan to
+`suite-plan.json` under the suite artifact root. Set
+`RUSTFS_FAULT_TEST_SEED` before both planning and running when the preview and
+execution must use the same workload seeds.
 
 Run a suite sequentially:
 

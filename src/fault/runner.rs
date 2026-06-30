@@ -1379,11 +1379,13 @@ fn initialize_fault_run(
     let spec = scenarios::scenario_spec(&scenario.name)?;
     let run_id = format!("run-{}", Uuid::new_v4());
     let workload_seed = config.workload_seed.unwrap_or_else(generated_seed);
-    let workload_plan = WorkloadPlan::seeded_with_mix(
+    let workload_plan = WorkloadPlan::seeded_with_profile(
         workload_seed,
         scenario.object_count,
         config.workload.concurrency,
         config.workload_operation_mix,
+        config.workload_payload_distribution.clone(),
+        config.workload_hotspot,
     )
     .context("build workload plan")?;
     let bucket = bucket_name(&run_id);
@@ -3115,7 +3117,7 @@ async fn run_mixed_workload(
         let index = start_index + offset;
         let size_bytes = plan.size_at(index);
         let seed = plan.seed;
-        let existing = prefilled[offset % prefilled.len()].clone();
+        let existing = prefilled[plan.existing_object_offset(offset, prefilled.len())].clone();
         async move {
             let mut result = MixedTaskResult::new(index);
             match plan.operation_mix.operation_at(offset) {

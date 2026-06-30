@@ -61,6 +61,26 @@ pub struct WorkloadOperationMix {
     pub multipart: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkloadPayloadClass {
+    pub size_bytes: usize,
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkloadPayloadDistribution {
+    pub classes: Vec<WorkloadPayloadClass>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkloadHotspot {
+    pub object_percent: u8,
+    pub operation_percent: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkloadOperation {
     Put,
@@ -80,6 +100,8 @@ pub struct WorkloadPlan {
     pub operation_mix: WorkloadOperationMix,
     pub total_payload_bytes: u64,
     pub size_distribution: Vec<WorkloadSizeClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotspot: Option<WorkloadHotspot>,
     sizes: Vec<usize>,
 }
 
@@ -93,6 +115,8 @@ struct SerializedWorkloadPlan {
     operation_mix: WorkloadOperationMix,
     total_payload_bytes: u64,
     size_distribution: Vec<WorkloadSizeClass>,
+    #[serde(default)]
+    hotspot: Option<WorkloadHotspot>,
 }
 
 #[derive(Clone)]
@@ -183,6 +207,8 @@ impl WorkloadPlan {
             object_count,
             concurrency,
             WorkloadOperationMix::default(),
+            None,
+            None,
         )
     }
 
@@ -192,12 +218,31 @@ impl WorkloadPlan {
         concurrency: usize,
         operation_mix: WorkloadOperationMix,
     ) -> Result<Self> {
+        Self::seeded_with_profile(seed, object_count, concurrency, operation_mix, None, None)
+    }
+
+    pub fn seeded_with_profile(
+        seed: u64,
+        object_count: usize,
+        concurrency: usize,
+        operation_mix: WorkloadOperationMix,
+        payload_distribution: Option<WorkloadPayloadDistribution>,
+        hotspot: Option<WorkloadHotspot>,
+    ) -> Result<Self> {
         operation_mix.validate()?;
+        if let Some(payload_distribution) = &payload_distribution {
+            payload_distribution.validate()?;
+        }
+        if let Some(hotspot) = hotspot {
+            hotspot.validate()?;
+        }
         Ok(Self::seeded_unchecked(
             seed,
             object_count,
             concurrency,
             operation_mix,
+            payload_distribution,
+            hotspot,
         ))
     }
 
@@ -206,29 +251,14 @@ impl WorkloadPlan {
         object_count: usize,
         concurrency: usize,
         operation_mix: WorkloadOperationMix,
+        payload_distribution: Option<WorkloadPayloadDistribution>,
+        hotspot: Option<WorkloadHotspot>,
     ) -> Self {
-        const SIZE_CLASSES: &[(usize, usize)] = &[
-            (4 * 1024, 85),
-            (16 * 1024, 10),
-            (8 * 1024 * 1024, 4),
-            (16 * 1024 * 1024, 1),
-        ];
-
+        let payload_distribution = payload_distribution.unwrap_or_default();
+        let size_distribution = payload_distribution.to_size_distribution(object_count);
         let mut sizes = Vec::with_capacity(object_count);
-        let mut size_distribution = Vec::with_capacity(SIZE_CLASSES.len());
-        let mut assigned = 0;
-        for (position, (size_bytes, weight)) in SIZE_CLASSES.iter().copied().enumerate() {
-            let count = if position + 1 == SIZE_CLASSES.len() {
-                object_count.saturating_sub(assigned)
-            } else {
-                object_count.saturating_mul(weight) / 100
-            };
-            sizes.extend(std::iter::repeat_n(size_bytes, count));
-            size_distribution.push(WorkloadSizeClass {
-                size_bytes,
-                object_count: count,
-            });
-            assigned += count;
+        for class in &size_distribution {
+            sizes.extend(std::iter::repeat_n(class.size_bytes, class.object_count));
         }
 
         shuffle_sizes(&mut sizes, seed);
@@ -241,12 +271,33 @@ impl WorkloadPlan {
             operation_mix,
             total_payload_bytes,
             size_distribution,
+            hotspot,
             sizes,
         }
     }
 
     pub fn size_at(&self, index: usize) -> usize {
         self.sizes[index]
+    }
+
+    pub fn existing_object_offset(&self, offset: usize, existing_count: usize) -> usize {
+        let Some(hotspot) = self.hotspot else {
+            return offset % existing_count;
+        };
+        let hotspot_count = (existing_count
+            .saturating_mul(usize::from(hotspot.object_percent))
+            .saturating_add(99)
+            / 100)
+            .clamp(1, existing_count);
+        let mut generator =
+            SplitMix64::new(self.seed ^ (offset as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+        let use_hotspot = generator.next_u64() % 100 < u64::from(hotspot.operation_percent);
+        if use_hotspot || hotspot_count == existing_count {
+            (generator.next_u64() as usize) % hotspot_count
+        } else {
+            let cold_count = existing_count - hotspot_count;
+            hotspot_count + (generator.next_u64() as usize) % cold_count
+        }
     }
 
     fn from_serialized(raw: SerializedWorkloadPlan) -> std::result::Result<Self, String> {
@@ -262,6 +313,9 @@ impl WorkloadPlan {
         raw.operation_mix
             .validate()
             .map_err(|error| error.to_string())?;
+        if let Some(hotspot) = raw.hotspot {
+            hotspot.validate().map_err(|error| error.to_string())?;
+        }
 
         let distributed_objects =
             raw.size_distribution
@@ -313,8 +367,104 @@ impl WorkloadPlan {
             operation_mix: raw.operation_mix,
             total_payload_bytes: raw.total_payload_bytes,
             size_distribution: raw.size_distribution,
+            hotspot: raw.hotspot,
             sizes,
         })
+    }
+}
+
+impl WorkloadPayloadDistribution {
+    const MAX_CLASSES: usize = 8;
+    const MAX_WEIGHT: u32 = 100;
+    const MAX_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.classes.is_empty(),
+            "workload.payloadDistribution must not be empty"
+        );
+        ensure!(
+            self.classes.len() <= Self::MAX_CLASSES,
+            "workload.payloadDistribution must contain at most {} classes",
+            Self::MAX_CLASSES
+        );
+        for class in &self.classes {
+            ensure!(
+                (1..=Self::MAX_SIZE_BYTES).contains(&class.size_bytes),
+                "workload.payloadDistribution.sizeBytes must be between 1 and {}",
+                Self::MAX_SIZE_BYTES
+            );
+            ensure!(
+                (1..=Self::MAX_WEIGHT).contains(&class.weight),
+                "workload.payloadDistribution.weight must be between 1 and {}",
+                Self::MAX_WEIGHT
+            );
+        }
+        Ok(())
+    }
+
+    fn to_size_distribution(&self, object_count: usize) -> Vec<WorkloadSizeClass> {
+        let total_weight = self
+            .classes
+            .iter()
+            .map(|class| class.weight as usize)
+            .sum::<usize>();
+        let mut assigned = 0usize;
+        self.classes
+            .iter()
+            .enumerate()
+            .map(|(index, class)| {
+                let object_count_for_class = if index + 1 == self.classes.len() {
+                    object_count.saturating_sub(assigned)
+                } else {
+                    object_count.saturating_mul(class.weight as usize) / total_weight
+                };
+                assigned = assigned.saturating_add(object_count_for_class);
+                WorkloadSizeClass {
+                    size_bytes: class.size_bytes,
+                    object_count: object_count_for_class,
+                }
+            })
+            .collect()
+    }
+}
+
+impl Default for WorkloadPayloadDistribution {
+    fn default() -> Self {
+        Self {
+            classes: vec![
+                WorkloadPayloadClass {
+                    size_bytes: 4 * 1024,
+                    weight: 85,
+                },
+                WorkloadPayloadClass {
+                    size_bytes: 16 * 1024,
+                    weight: 10,
+                },
+                WorkloadPayloadClass {
+                    size_bytes: 8 * 1024 * 1024,
+                    weight: 4,
+                },
+                WorkloadPayloadClass {
+                    size_bytes: 16 * 1024 * 1024,
+                    weight: 1,
+                },
+            ],
+        }
+    }
+}
+
+impl WorkloadHotspot {
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            (1..=100).contains(&self.object_percent),
+            "workload.hotspot.objectPercent must be between 1 and 100"
+        );
+        ensure!(
+            (1..=100).contains(&self.operation_percent),
+            "workload.hotspot.operationPercent must be between 1 and 100"
+        );
+        Ok(())
     }
 }
 
@@ -1184,7 +1334,10 @@ fn sdk_error_status<E>(error: &SdkError<E>) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectSpec, WorkloadOperation, WorkloadOperationMix, WorkloadPlan, sha256_hex};
+    use super::{
+        ObjectSpec, SplitMix64, WorkloadHotspot, WorkloadOperation, WorkloadOperationMix,
+        WorkloadPayloadClass, WorkloadPayloadDistribution, WorkloadPlan, sha256_hex,
+    };
 
     #[test]
     fn seeded_objects_have_stable_keys_sizes_and_hashes() {
@@ -1302,6 +1455,92 @@ mod tests {
                     ..WorkloadOperationMix::default()
                 }
             )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workload_profile_applies_payload_distribution_and_hotspot() {
+        let plan = WorkloadPlan::seeded_with_profile(
+            42,
+            20,
+            4,
+            WorkloadOperationMix::default(),
+            Some(WorkloadPayloadDistribution {
+                classes: vec![
+                    WorkloadPayloadClass {
+                        size_bytes: 1024,
+                        weight: 1,
+                    },
+                    WorkloadPayloadClass {
+                        size_bytes: 4096,
+                        weight: 3,
+                    },
+                ],
+            }),
+            Some(WorkloadHotspot {
+                object_percent: 10,
+                operation_percent: 100,
+            }),
+        )
+        .expect("workload profile");
+
+        assert_eq!(plan.size_distribution[0].object_count, 5);
+        assert_eq!(plan.size_distribution[1].object_count, 15);
+        assert_eq!(plan.total_payload_bytes, 5 * 1024 + 15 * 4096);
+        for offset in 0..32 {
+            assert!(
+                plan.existing_object_offset(offset, 100) < 10,
+                "100% hotspot operations should stay inside the hot set"
+            );
+        }
+    }
+
+    #[test]
+    fn workload_hotspot_keeps_cold_operations_outside_hot_set() {
+        let plan = WorkloadPlan::seeded_with_profile(
+            42,
+            100,
+            4,
+            WorkloadOperationMix::default(),
+            None,
+            Some(WorkloadHotspot {
+                object_percent: 50,
+                operation_percent: 50,
+            }),
+        )
+        .expect("workload profile");
+
+        for offset in 0..512 {
+            let mut generator =
+                SplitMix64::new(plan.seed ^ (offset as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+            let use_hotspot = generator.next_u64() % 100 < 50;
+            let selected = plan.existing_object_offset(offset, 100);
+
+            if use_hotspot {
+                assert!(selected < 50, "hot operation should stay inside hot set");
+            } else {
+                assert!(selected >= 50, "cold operation should stay outside hot set");
+            }
+        }
+    }
+
+    #[test]
+    fn workload_profile_rejects_unsafe_payload_and_hotspot_values() {
+        let invalid_payload = WorkloadPayloadDistribution {
+            classes: vec![WorkloadPayloadClass {
+                size_bytes: 0,
+                weight: 1,
+            }],
+        };
+        assert!(invalid_payload.validate().is_err());
+
+        assert!(
+            WorkloadHotspot {
+                object_percent: 0,
+                operation_percent: 100,
+            }
+            .validate()
             .is_err()
         );
     }
