@@ -94,6 +94,19 @@ impl FaultBackend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FaultParameterSchema {
+    None,
+    IoLatency,
+    NetworkDelay,
+    NetworkLoss,
+    NetworkCorrupt,
+    NetworkDuplicate,
+    StressCpu,
+    StressMemory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FaultIsolation {
     FreshTenant,
@@ -143,6 +156,7 @@ pub struct FaultScenarioSpec {
     pub crds: &'static [&'static str],
     pub required_tools: &'static [&'static str],
     pub percent_supported: bool,
+    pub param_schema: FaultParameterSchema,
     pub impact_policy: FaultImpactPolicy,
     pub boundary: &'static str,
     pub ci_phase: &'static str,
@@ -174,6 +188,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: true,
+        param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/fault-injection",
         ci_phase: "faults",
@@ -193,6 +208,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[PODCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
+        param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/pod-recovery",
         ci_phase: "faults",
@@ -212,6 +228,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[NETWORKCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
+        param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/network-partition",
         ci_phase: "faults",
@@ -231,6 +248,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[NETWORKCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
+        param_schema: FaultParameterSchema::NetworkDelay,
         impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
         boundary: "rustfs-workload/network-delay",
         ci_phase: "faults",
@@ -250,6 +268,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[NETWORKCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
+        param_schema: FaultParameterSchema::NetworkLoss,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/network-loss",
         ci_phase: "faults",
@@ -269,6 +288,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[NETWORKCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
+        param_schema: FaultParameterSchema::NetworkCorrupt,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/network-corrupt",
         ci_phase: "faults",
@@ -288,6 +308,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[NETWORKCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
+        param_schema: FaultParameterSchema::NetworkDuplicate,
         impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
         boundary: "rustfs-workload/network-duplicate",
         ci_phase: "faults",
@@ -307,6 +328,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: true,
+        param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
         boundary: "rustfs-workload/data-integrity",
         ci_phase: "faults",
@@ -326,6 +348,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: true,
+        param_schema: FaultParameterSchema::IoLatency,
         impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
         boundary: "rustfs-workload/storage-latency",
         ci_phase: "faults",
@@ -345,6 +368,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: true,
+        param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/storage-pressure",
         ci_phase: "faults",
@@ -364,6 +388,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[PODCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
+        param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/pod-failure",
         ci_phase: "faults",
@@ -383,6 +408,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[STRESSCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
+        param_schema: FaultParameterSchema::StressCpu,
         impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
         boundary: "rustfs-workload/cpu-pressure",
         ci_phase: "faults",
@@ -402,6 +428,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[STRESSCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
+        param_schema: FaultParameterSchema::StressMemory,
         impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
         boundary: "rustfs-workload/memory-pressure",
         ci_phase: "faults",
@@ -421,6 +448,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[],
         required_tools: &[],
         percent_supported: false,
+        param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/block-device-fault",
         ci_phase: "faults",
@@ -440,6 +468,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         crds: &[IOCHAOS_CRD],
         required_tools: &["warp"],
         percent_supported: true,
+        param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
         boundary: "rustfs-workload/performance-under-chaos",
         ci_phase: "faults",
@@ -482,6 +511,12 @@ impl FaultScenario {
         );
         config.workload.validate()?;
         config.workload_operation_mix.validate()?;
+        if let Some(payload_distribution) = &config.workload_payload_distribution {
+            payload_distribution.validate()?;
+        }
+        if let Some(hotspot) = config.workload_hotspot {
+            hotspot.validate()?;
+        }
         let mixed_count = config.workload.object_count - config.workload.object_count / 2;
         let total_weight = config.workload_operation_mix.total_weight();
         ensure!(
@@ -540,8 +575,9 @@ pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FaultScenario, FaultScenarioStatus, IO_EIO_SCENARIO, POD_KILL_ONE_SCENARIO,
-        scenario_catalog, scenario_catalog_json,
+        FaultParameterSchema, FaultScenario, FaultScenarioStatus, IO_EIO_SCENARIO,
+        IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO, POD_KILL_ONE_SCENARIO, scenario_catalog,
+        scenario_catalog_json, scenario_spec,
     };
     use crate::fault::config::{FaultTestConfig, FaultWorkloadProfile};
     use std::time::Duration;
@@ -607,6 +643,26 @@ mod tests {
         }
 
         assert_eq!(scenario_catalog().len(), 15);
+    }
+
+    #[test]
+    fn catalog_declares_typed_parameter_schema() {
+        assert_eq!(
+            scenario_spec(NETWORK_DELAY_SCENARIO)
+                .expect("network delay")
+                .param_schema,
+            FaultParameterSchema::NetworkDelay
+        );
+        assert_eq!(
+            scenario_spec(IO_LATENCY_SCENARIO)
+                .expect("io latency")
+                .param_schema,
+            FaultParameterSchema::IoLatency
+        );
+        assert_eq!(
+            scenario_spec(IO_EIO_SCENARIO).expect("io eio").param_schema,
+            FaultParameterSchema::None
+        );
     }
 
     #[test]

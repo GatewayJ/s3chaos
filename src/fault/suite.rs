@@ -20,7 +20,7 @@ use std::path::Path;
 use crate::fault::{
     plan::FaultInjectionParameters,
     scenarios::{FaultScenarioStatus, scenario_spec},
-    workload::WorkloadOperationMix,
+    workload::{WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadDistribution},
 };
 
 pub const FAULT_SUITE_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
@@ -87,6 +87,10 @@ pub struct FaultSuiteWorkloadOverride {
     pub concurrency: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_weights: Option<WorkloadOperationMix>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_distribution: Option<WorkloadPayloadDistribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotspot: Option<WorkloadHotspot>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,7 +285,9 @@ impl ResolvedFaultSuiteScenario {
             validate_workload_override(&scenario.name, workload)?;
         }
         let params = scenario.params.clone().unwrap_or_default();
-        params.validate_for_scenario(&scenario.name)?;
+        if let Some(params) = &scenario.params {
+            params.validate_explicit_for_schema(spec.param_schema)?;
+        }
         let duration_seconds = scenario
             .duration
             .as_deref()
@@ -343,6 +349,18 @@ scenarios:
         list: 1
         delete: 1
         multipart: 1
+      payloadDistribution:
+        - sizeBytes: 4096
+          weight: 85
+        - sizeBytes: 16384
+          weight: 10
+        - sizeBytes: 8388608
+          weight: 4
+        - sizeBytes: 16777216
+          weight: 1
+      hotspot:
+        objectPercent: 10
+        operationPercent: 70
   - name: network-delay
     duration: 8m
     params:
@@ -358,11 +376,19 @@ fn validate_workload_override(name: &str, workload: &FaultSuiteWorkloadOverride)
     ensure!(
         workload.objects.is_some()
             || workload.concurrency.is_some()
-            || workload.operation_weights.is_some(),
-        "scenario {name} workload override must set objects/concurrency or operationWeights"
+            || workload.operation_weights.is_some()
+            || workload.payload_distribution.is_some()
+            || workload.hotspot.is_some(),
+        "scenario {name} workload override must set objects/concurrency, operationWeights, payloadDistribution, or hotspot"
     );
     if let Some(operation_weights) = workload.operation_weights {
         operation_weights.validate()?;
+    }
+    if let Some(payload_distribution) = &workload.payload_distribution {
+        payload_distribution.validate()?;
+    }
+    if let Some(hotspot) = workload.hotspot {
+        hotspot.validate()?;
     }
     match (workload.objects, workload.concurrency) {
         (Some(objects), Some(concurrency)) => {
@@ -539,6 +565,44 @@ scenarios:
     }
 
     #[test]
+    fn accepts_payload_distribution_and_hotspot_without_object_override() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    workload:
+      payloadDistribution:
+        - sizeBytes: 1024
+          weight: 1
+        - sizeBytes: 4096
+          weight: 3
+      hotspot:
+        objectPercent: 10
+        operationPercent: 70
+"#,
+        )
+        .expect("suite yaml");
+
+        let resolved = suite.resolve().expect("resolved suite");
+
+        let workload = resolved.scenarios[0].workload.as_ref().expect("workload");
+        assert_eq!(
+            workload
+                .payload_distribution
+                .as_ref()
+                .expect("payload distribution")
+                .classes[1]
+                .size_bytes,
+            4096
+        );
+        assert_eq!(workload.hotspot.expect("hotspot").operation_percent, 70);
+    }
+
+    #[test]
     fn rejects_percent_override_for_fixed_target_scenario() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
             r#"
@@ -659,6 +723,47 @@ scenarios:
         let error = suite.resolve().expect_err("unsafe operation weights");
 
         assert!(error.to_string().contains("operationWeights.put"));
+    }
+
+    #[test]
+    fn rejects_unsafe_payload_distribution_and_hotspot() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    workload:
+      payloadDistribution:
+        - sizeBytes: 0
+          weight: 1
+"#,
+        )
+        .expect("suite yaml");
+
+        let error = suite.resolve().expect_err("unsafe payload distribution");
+        assert!(error.to_string().contains("payloadDistribution.sizeBytes"));
+
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    workload:
+      hotspot:
+        objectPercent: 10
+        operationPercent: 0
+"#,
+        )
+        .expect("suite yaml");
+
+        let error = suite.resolve().expect_err("unsafe hotspot");
+        assert!(error.to_string().contains("hotspot.operationPercent"));
     }
 
     #[test]

@@ -17,7 +17,10 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::fault::{plan::FaultInjectionParameters, workload::WorkloadOperationMix};
+use crate::fault::{
+    plan::FaultInjectionParameters,
+    workload::{WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadDistribution},
+};
 use crate::framework::{command::CommandSpec, config::ClusterTestConfig, kubectl::Kubectl};
 
 pub const DEFAULT_FAULT_NAMESPACE: &str = "rustfs-fault-test";
@@ -79,6 +82,8 @@ pub struct FaultTestConfig {
     pub percent_overridden: bool,
     pub workload: FaultWorkloadProfile,
     pub workload_operation_mix: WorkloadOperationMix,
+    pub workload_payload_distribution: Option<WorkloadPayloadDistribution>,
+    pub workload_hotspot: Option<WorkloadHotspot>,
     pub prefill_concurrency: usize,
     pub workload_seed: Option<u64>,
     pub request_timeout: Duration,
@@ -219,6 +224,8 @@ impl FaultTestConfig {
             percent_overridden: env_optional(&get_env, "RUSTFS_FAULT_TEST_PERCENT").is_some(),
             workload,
             workload_operation_mix: WorkloadOperationMix::default(),
+            workload_payload_distribution: None,
+            workload_hotspot: None,
             prefill_concurrency,
             workload_seed: env_optional_u64(&get_env, "RUSTFS_FAULT_TEST_SEED")?,
             request_timeout: Duration::from_secs(env_u64(

@@ -26,23 +26,33 @@ plan as `suite-plan.json`.
 
 ## 2. Extend The Suite YAML Contract
 
-Status: first implementation pass added catalog-gated `params.kind` support for
+Status: implementation passes added catalog-declared `params.kind` support for
 network delay/loss/corrupt/duplicate, IO latency, CPU stress, and memory stress,
-plus `workload.operationWeights`. Plans and run specs now carry the resolved
-parameters and operation mix used by execution.
+plus `workload.operationWeights`, `workload.payloadDistribution`, and
+`workload.hotspot`. Plans and run specs now carry the resolved parameters,
+operation mix, payload distribution, and hotspot behavior used by execution.
 
 - Add typed scenario parameters instead of exposing raw backend manifests.
 - Let supported scenarios declare safe parameter schemas, such as network delay,
   packet loss, IO fault mode, target selection policy, or stress intensity.
 - Extend workload profiles beyond `objects` and `concurrency` with operation
   mix, payload distribution, multipart ratio, read/write/delete/list weights,
-  hotspot behavior, and duration-based profiles.
+  hotspot behavior, and duration-based profiles. Operation weights, payload
+  distribution, and hotspot behavior are implemented; duration-based profiles
+  remain a future runner/checker change.
 - Keep validation strict: unknown fields, unsupported params, unsafe values, and
   scenario/backend mismatches must fail before any destructive work starts.
 - Preserve catalog-backed behavior so YAML describes intent while Rust owns the
   supported fault semantics.
 
 ## 3. Abstract Fault Backend Ports
+
+Status: second implementation pass made the applied-fault lifecycle an explicit
+`FaultBackendHandle` port for wait-active, ensure-active, snapshot, delete,
+failure artifacts, and backend-specific recovery. Apply is now routed through
+backend-family factories, and generic runner flow no longer reaches through the
+port to concrete Chaos Mesh guards. Fine-grained extraction of per-kind spec
+construction into backend modules remains a follow-up cleanup.
 
 - Introduce a backend port owned by the fault domain for apply, wait-active,
   snapshot, ensure-active, delete, and cleanup operations.

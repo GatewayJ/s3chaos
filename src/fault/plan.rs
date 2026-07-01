@@ -20,11 +20,12 @@ use std::time::Duration;
 use crate::fault::{
     config::{DEFAULT_RUSTFS_VOLUME_PATH, FaultTestConfig, validate_rustfs_volume_path},
     scenarios::{
-        DISK_FULL_SCENARIO, DM_FLAKEY_SCENARIO, FaultBackend, FaultScenario, FaultScenarioSpec,
-        IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, NETWORK_CORRUPT_SCENARIO,
-        NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO, NETWORK_LOSS_SCENARIO,
-        NETWORK_PARTITION_ONE_SCENARIO, POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO,
-        STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO, WARP_UNDER_CHAOS_SCENARIO,
+        DISK_FULL_SCENARIO, DM_FLAKEY_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
+        FaultScenarioSpec, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO,
+        NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO,
+        NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO, POD_FAILURE_SCENARIO,
+        POD_KILL_ONE_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
+        WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
 };
 
@@ -192,18 +193,30 @@ impl FaultInjectionParameters {
     }
 
     pub fn validate_for_scenario(&self, scenario: &str) -> Result<()> {
+        self.validate_for_schema(scenario_spec(scenario)?.param_schema)
+    }
+
+    pub fn validate_explicit_for_schema(&self, schema: FaultParameterSchema) -> Result<()> {
+        ensure!(
+            !matches!(self, Self::Default),
+            "params.kind=default is implicit; omit params or set a supported typed params kind"
+        );
+        self.validate_for_schema(schema)
+    }
+
+    pub fn validate_for_schema(&self, schema: FaultParameterSchema) -> Result<()> {
         if matches!(self, Self::Default) {
             return Ok(());
         }
-        let kind = match scenario {
-            IO_LATENCY_SCENARIO => FaultKind::RustfsVolumeLatency,
-            NETWORK_DELAY_SCENARIO => FaultKind::RustfsServerNetworkDelay,
-            NETWORK_LOSS_SCENARIO => FaultKind::RustfsServerNetworkLoss,
-            NETWORK_CORRUPT_SCENARIO => FaultKind::RustfsServerNetworkCorrupt,
-            NETWORK_DUPLICATE_SCENARIO => FaultKind::RustfsServerNetworkDuplicate,
-            STRESS_CPU_SCENARIO => FaultKind::RustfsServerCpuStress,
-            STRESS_MEMORY_SCENARIO => FaultKind::RustfsServerMemoryStress,
-            _ => bail!("scenario {scenario:?} does not support typed params yet"),
+        let kind = match schema {
+            FaultParameterSchema::IoLatency => FaultKind::RustfsVolumeLatency,
+            FaultParameterSchema::NetworkDelay => FaultKind::RustfsServerNetworkDelay,
+            FaultParameterSchema::NetworkLoss => FaultKind::RustfsServerNetworkLoss,
+            FaultParameterSchema::NetworkCorrupt => FaultKind::RustfsServerNetworkCorrupt,
+            FaultParameterSchema::NetworkDuplicate => FaultKind::RustfsServerNetworkDuplicate,
+            FaultParameterSchema::StressCpu => FaultKind::RustfsServerCpuStress,
+            FaultParameterSchema::StressMemory => FaultKind::RustfsServerMemoryStress,
+            FaultParameterSchema::None => bail!("scenario does not support typed params yet"),
         };
         self.validate_for_kind(kind)
     }
@@ -955,7 +968,8 @@ mod tests {
     use crate::fault::{
         config::FaultTestConfig,
         scenarios::{
-            FaultBackend, FaultScenario, WARP_UNDER_CHAOS_SCENARIO, scenario_catalog, scenario_spec,
+            FaultBackend, FaultParameterSchema, FaultScenario, WARP_UNDER_CHAOS_SCENARIO,
+            scenario_catalog, scenario_spec,
         },
     };
     use std::time::Duration;
@@ -1015,6 +1029,32 @@ mod tests {
                 "{} should remain an independent single-fault scenario",
                 spec.scenario
             );
+            assert_parameters_match_catalog_schema(
+                spec.scenario,
+                plan.faults()[0].parameters(),
+                spec.param_schema,
+            );
+        }
+    }
+
+    fn assert_parameters_match_catalog_schema(
+        scenario: &str,
+        parameters: &FaultInjectionParameters,
+        schema: FaultParameterSchema,
+    ) {
+        match schema {
+            FaultParameterSchema::None => assert_eq!(
+                parameters,
+                &FaultInjectionParameters::Default,
+                "{scenario} should not expose typed fault parameters"
+            ),
+            _ => parameters
+                .validate_for_schema(schema)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{scenario} catalog schema {schema:?} does not match plan parameters {parameters:?}: {error}"
+                    )
+                }),
         }
     }
 
