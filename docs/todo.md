@@ -47,6 +47,13 @@ operation mix, payload distribution, and hotspot behavior used by execution.
 
 ## 3. Abstract Fault Backend Ports
 
+Status: second implementation pass made the applied-fault lifecycle an explicit
+`FaultBackendHandle` port for wait-active, ensure-active, snapshot, delete,
+failure artifacts, and backend-specific recovery. Apply is now routed through
+backend-family factories, and generic runner flow no longer reaches through the
+port to concrete Chaos Mesh guards. Fine-grained extraction of per-kind spec
+construction into backend modules remains a follow-up cleanup.
+
 - Introduce a backend port owned by the fault domain for apply, wait-active,
   snapshot, ensure-active, delete, and cleanup operations.
 - Keep Chaos Mesh, device-mapper, and future backends as adapters behind that
