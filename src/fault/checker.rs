@@ -21,7 +21,7 @@ use tokio::time::{sleep as async_sleep, timeout};
 
 use crate::fault::{
     history::{OperationKind, OperationOutcome, OperationRecord, Recorder},
-    workload::{GetObjectResult, ObjectSpec, S3WorkloadClient, sha256_hex},
+    workload::{GetObjectResult, ObjectSpec, ObjectVersionEntry, S3WorkloadClient, sha256_hex},
 };
 
 const MAX_WARNING_SAMPLES: usize = 50;
@@ -45,6 +45,26 @@ pub struct CheckerReport {
     pub list_history_warnings: Vec<String>,
     pub list_warnings: Vec<String>,
     pub final_listed_objects: Option<usize>,
+    #[serde(default)]
+    pub versioning_expected: bool,
+    #[serde(default)]
+    pub expected_committed_versions: usize,
+    #[serde(default)]
+    pub verified_committed_versions: usize,
+    #[serde(default)]
+    pub committed_writes_missing_version_id_count: usize,
+    #[serde(default)]
+    pub committed_writes_missing_version_id: Vec<String>,
+    #[serde(default)]
+    pub missing_committed_versions: Vec<String>,
+    #[serde(default)]
+    pub unavailable_committed_versions: Vec<String>,
+    #[serde(default)]
+    pub version_hash_mismatches: Vec<String>,
+    #[serde(default)]
+    pub missing_committed_delete_markers: Vec<String>,
+    #[serde(default)]
+    pub resurrected_deleted_objects: Vec<String>,
     pub tenant_recovered: bool,
     pub passed: bool,
 }
@@ -117,11 +137,17 @@ pub async fn check_s3_history(
     recorder: &Recorder,
     tenant_recovered: bool,
     concurrency: usize,
+    expect_versioning: bool,
 ) -> Result<CheckerReport> {
     let initial_records = recorder.records();
     let model = object_model(&initial_records);
     let read_anomalies = successful_read_anomalies(&initial_records);
     let list_history_warnings = list_history_warnings(&initial_records);
+    let version_lineage = if expect_versioning {
+        Some(committed_version_lineage(&initial_records))
+    } else {
+        None
+    };
     let mut report = CheckerReport {
         scenario: recorder.scenario(),
         run_id: recorder.run_id(),
@@ -140,6 +166,16 @@ pub async fn check_s3_history(
         list_history_warnings: list_history_warnings.samples,
         list_warnings: Vec::new(),
         final_listed_objects: None,
+        versioning_expected: expect_versioning,
+        expected_committed_versions: 0,
+        verified_committed_versions: 0,
+        committed_writes_missing_version_id_count: 0,
+        committed_writes_missing_version_id: Vec::new(),
+        missing_committed_versions: Vec::new(),
+        unavailable_committed_versions: Vec::new(),
+        version_hash_mismatches: Vec::new(),
+        missing_committed_delete_markers: Vec::new(),
+        resurrected_deleted_objects: Vec::new(),
         tenant_recovered,
         passed: false,
     };
@@ -182,6 +218,41 @@ pub async fn check_s3_history(
 
     let run_id = recorder.run_id();
     let prefix = ObjectSpec::key_prefix(&run_id);
+
+    if let Some(lineage) = version_lineage {
+        report.expected_committed_versions = lineage.versions.len();
+        report.committed_writes_missing_version_id_count = lineage.missing_version_id_count;
+        report.committed_writes_missing_version_id = lineage.missing_version_id_samples;
+
+        let mut version_results = stream::iter(lineage.versions.into_iter().map(|version| {
+            let s3 = s3.clone();
+            let recorder = recorder.clone();
+            async move {
+                let get = s3
+                    .get_object_version_result(&version.key, &version.version_id, &recorder)
+                    .await?;
+                Ok::<_, anyhow::Error>((version, get))
+            }
+        }))
+        .buffer_unordered(concurrency);
+        while let Some(result) = version_results.next().await {
+            let (version, get) = result?;
+            evaluate_committed_version_get(&mut report, &version, get);
+        }
+
+        match s3.list_object_versions(&prefix, recorder).await? {
+            Some(entries) => {
+                report.missing_committed_delete_markers =
+                    missing_committed_delete_markers(&lineage.delete_markers, &entries);
+                report.resurrected_deleted_objects =
+                    resurrected_deleted_objects(&model.deleted, &latest_version_entries(&entries));
+            }
+            None => report.unavailable_committed_versions.push(format!(
+                "list_object_versions prefix {prefix} did not complete"
+            )),
+        }
+    }
+
     let mut final_list_warnings = WarningSummary::default();
     match s3.list_prefix(&prefix, recorder).await? {
         Some(keys) => {
@@ -214,6 +285,12 @@ pub async fn check_s3_history(
     report.unexpected_visible_deleted_objects.sort();
     report.list_history_warnings.sort();
     report.list_warnings.sort();
+    report.committed_writes_missing_version_id.sort();
+    report.missing_committed_versions.sort();
+    report.unavailable_committed_versions.sort();
+    report.version_hash_mismatches.sort();
+    report.missing_committed_delete_markers.sort();
+    report.resurrected_deleted_objects.sort();
     report.passed = report.tenant_recovered
         && report.missing_committed_objects.is_empty()
         && report.unavailable_committed_objects.is_empty()
@@ -221,7 +298,13 @@ pub async fn check_s3_history(
         && report.hash_mismatches.is_empty()
         && report.successful_corrupted_reads.is_empty()
         && report.unexpected_visible_deleted_objects.is_empty()
-        && report.final_list_warning_count == 0;
+        && report.final_list_warning_count == 0
+        && report.committed_writes_missing_version_id_count == 0
+        && report.missing_committed_versions.is_empty()
+        && report.unavailable_committed_versions.is_empty()
+        && report.version_hash_mismatches.is_empty()
+        && report.missing_committed_delete_markers.is_empty()
+        && report.resurrected_deleted_objects.is_empty();
 
     Ok(report)
 }
@@ -370,6 +453,161 @@ struct ReadAnomalies {
     visible_deleted_objects: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommittedVersion {
+    key: String,
+    version_id: String,
+    sha256: String,
+    size_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommittedDeleteMarker {
+    key: String,
+    version_id: String,
+}
+
+#[derive(Debug, Default)]
+struct VersionLineage {
+    versions: Vec<CommittedVersion>,
+    delete_markers: Vec<CommittedDeleteMarker>,
+    missing_version_id_count: usize,
+    missing_version_id_samples: Vec<String>,
+}
+
+fn committed_version_lineage(records: &[OperationRecord]) -> VersionLineage {
+    let mut lineage = VersionLineage::default();
+    for record in records {
+        let is_committed_write = matches!(
+            record.kind,
+            OperationKind::Put | OperationKind::CompleteMultipartUpload
+        ) && record.outcome == OperationOutcome::Ok;
+        let is_committed_delete =
+            record.kind == OperationKind::Delete && record.outcome == OperationOutcome::Ok;
+        if !is_committed_write && !is_committed_delete {
+            continue;
+        }
+        let Some(key) = record.key.as_ref() else {
+            continue;
+        };
+        match record.version_id.as_ref() {
+            Some(version_id) if is_committed_write => {
+                let Some((_, expected)) = record_object(record) else {
+                    continue;
+                };
+                lineage.versions.push(CommittedVersion {
+                    key: key.clone(),
+                    version_id: version_id.clone(),
+                    sha256: expected.sha256,
+                    size_bytes: expected.size_bytes,
+                });
+            }
+            Some(version_id) if is_committed_delete => {
+                lineage.delete_markers.push(CommittedDeleteMarker {
+                    key: key.clone(),
+                    version_id: version_id.clone(),
+                });
+            }
+            Some(_) => {}
+            None => {
+                lineage.missing_version_id_count += 1;
+                if lineage.missing_version_id_samples.len() < MAX_WARNING_SAMPLES {
+                    lineage.missing_version_id_samples.push(format!(
+                        "{}: committed {:?} response omitted x-amz-version-id for {key}",
+                        record.id, record.kind
+                    ));
+                }
+            }
+        }
+    }
+    lineage
+}
+
+fn evaluate_committed_version_get(
+    report: &mut CheckerReport,
+    version: &CommittedVersion,
+    get: GetObjectResult,
+) {
+    let reference = format!("{}@{}", version.key, version.version_id);
+    match (get.outcome, get.body) {
+        (OperationOutcome::Ok, Some(body)) => {
+            let actual_hash = sha256_hex(&body);
+            if actual_hash != version.sha256 || body.len() != version.size_bytes {
+                report.version_hash_mismatches.push(format!(
+                    "{reference}: expected {} ({} bytes), got {actual_hash} ({} bytes)",
+                    version.sha256,
+                    version.size_bytes,
+                    body.len()
+                ));
+            } else {
+                report.verified_committed_versions += 1;
+            }
+        }
+        (OperationOutcome::NotFound, None) => {
+            report.missing_committed_versions.push(reference);
+        }
+        (outcome, body) => report
+            .unavailable_committed_versions
+            .push(read_failure_message(
+                &reference,
+                outcome,
+                get.http_status,
+                get.error
+                    .as_deref()
+                    .or(body.is_some().then_some("unexpected body")),
+            )),
+    }
+}
+
+fn latest_version_entries(entries: &[ObjectVersionEntry]) -> BTreeMap<String, ObjectVersionEntry> {
+    let mut latest = BTreeMap::new();
+    for entry in entries {
+        if entry.is_latest {
+            latest.insert(entry.key.clone(), entry.clone());
+        }
+    }
+    latest
+}
+
+fn resurrected_deleted_objects(
+    deleted: &BTreeSet<String>,
+    latest: &BTreeMap<String, ObjectVersionEntry>,
+) -> Vec<String> {
+    deleted
+        .iter()
+        .filter_map(|key| match latest.get(key) {
+            Some(entry) if !entry.is_delete_marker => Some(format!(
+                "{key}: latest version is not a delete marker after committed delete"
+            )),
+            None => Some(format!(
+                "{key}: no latest version entry after committed delete"
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn missing_committed_delete_markers(
+    committed: &[CommittedDeleteMarker],
+    entries: &[ObjectVersionEntry],
+) -> Vec<String> {
+    let present = entries
+        .iter()
+        .filter(|entry| entry.is_delete_marker)
+        .filter_map(|entry| Some((entry.key.clone(), entry.version_id.clone()?)))
+        .collect::<BTreeSet<_>>();
+    committed
+        .iter()
+        .filter(|marker| !present.contains(&(marker.key.clone(), marker.version_id.clone())))
+        .map(|marker| {
+            format!(
+                "{}@{}: committed delete marker missing from ListObjectVersions",
+                marker.key, marker.version_id
+            )
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct WarningSummary {
     total_count: usize,
@@ -455,6 +693,7 @@ fn recovery_tail_candidate_keys(
         .filter_map(|record| {
             let key = record.key.as_ref()?;
             (record.kind == OperationKind::Get
+                && record.version_id.is_none()
                 && model.live.contains_key(key)
                 && is_recovery_tail_read_failure(
                     record.outcome,
@@ -512,11 +751,17 @@ fn classify_without_reread(report: &CheckerReport) -> RecoveryStabilityClassific
         || !report.unexpected_visible_deleted_objects.is_empty()
         || !report.unknown_writes_materialized.is_empty()
         || report.final_list_warning_count > 0
+        || !report.version_hash_mismatches.is_empty()
+        || !report.missing_committed_versions.is_empty()
+        || !report.missing_committed_delete_markers.is_empty()
+        || !report.resurrected_deleted_objects.is_empty()
+        || report.committed_writes_missing_version_id_count > 0
     {
         RecoveryStabilityClassification::DataCorruption
     } else if !report.missing_committed_objects.is_empty()
         || !report.unavailable_committed_objects.is_empty()
         || !report.unknown_committed_read_failures.is_empty()
+        || !report.unavailable_committed_versions.is_empty()
     {
         RecoveryStabilityClassification::CommittedObjectUnavailable
     } else {
@@ -627,6 +872,12 @@ fn immediate_failures_are_only_reread_candidates(
             .is_empty()
         && immediate_report.unknown_writes_materialized.is_empty()
         && immediate_report.final_list_warning_count == 0
+        && immediate_report.committed_writes_missing_version_id_count == 0
+        && immediate_report.missing_committed_versions.is_empty()
+        && immediate_report.unavailable_committed_versions.is_empty()
+        && immediate_report.version_hash_mismatches.is_empty()
+        && immediate_report.missing_committed_delete_markers.is_empty()
+        && immediate_report.resurrected_deleted_objects.is_empty()
         && immediate_report.unavailable_committed_objects.len()
             + immediate_report.unknown_committed_read_failures.len()
             == recovery_report.reread_attempted_keys.len()
@@ -738,6 +989,12 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                 }
             }
             OperationKind::Get if record.outcome == OperationOutcome::Ok => {
+                // Versioned GETs intentionally read historical versions whose
+                // hashes differ from the latest committed value; they are
+                // verified against their own lineage entry instead.
+                if record.version_id.is_some() {
+                    continue;
+                }
                 let Some(key) = record.key.as_ref() else {
                     continue;
                 };
@@ -797,6 +1054,7 @@ mod tests {
             key: Some(key.to_string()),
             value_sha256: Some(hash.to_string()),
             size_bytes: Some(1),
+            version_id: None,
             started_at_ms: 1,
             ended_at_ms: 2,
             outcome,
@@ -821,6 +1079,7 @@ mod tests {
             key: Some(prefix.to_string()),
             value_sha256: None,
             size_bytes: Some(keys.len()),
+            version_id: None,
             listed_keys: Some(keys.iter().map(|key| key.to_string()).collect()),
             started_at_ms,
             ended_at_ms,
@@ -1138,6 +1397,236 @@ mod tests {
     }
 
     #[test]
+    fn committed_version_lineage_collects_versions_and_flags_missing_ids() {
+        let mut versioned_put =
+            record("op-1", OperationKind::Put, "k1", "v1", OperationOutcome::Ok);
+        versioned_put.version_id = Some("ver-1".to_string());
+        let mut versioned_multipart = record(
+            "op-2",
+            OperationKind::CompleteMultipartUpload,
+            "k2",
+            "v2",
+            OperationOutcome::Ok,
+        );
+        versioned_multipart.version_id = Some("ver-2".to_string());
+        let unversioned_put = record("op-3", OperationKind::Put, "k3", "v3", OperationOutcome::Ok);
+        let mut versioned_delete = record(
+            "op-4",
+            OperationKind::Delete,
+            "k1",
+            "",
+            OperationOutcome::Ok,
+        );
+        versioned_delete.version_id = Some("marker-1".to_string());
+        let unversioned_delete = record(
+            "op-5",
+            OperationKind::Delete,
+            "k2",
+            "",
+            OperationOutcome::Ok,
+        );
+        let failed_put = record(
+            "op-6",
+            OperationKind::Put,
+            "k4",
+            "v4",
+            OperationOutcome::Timeout,
+        );
+
+        let lineage = super::committed_version_lineage(&[
+            versioned_put,
+            versioned_multipart,
+            unversioned_put,
+            versioned_delete,
+            unversioned_delete,
+            failed_put,
+        ]);
+
+        assert_eq!(
+            lineage
+                .versions
+                .iter()
+                .map(|version| (version.key.as_str(), version.version_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("k1", "ver-1"), ("k2", "ver-2")]
+        );
+        assert_eq!(
+            lineage
+                .delete_markers
+                .iter()
+                .map(|marker| (marker.key.as_str(), marker.version_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("k1", "marker-1")]
+        );
+        assert_eq!(lineage.missing_version_id_count, 2);
+        assert!(
+            lineage
+                .missing_version_id_samples
+                .iter()
+                .any(|sample| sample.contains("op-3"))
+        );
+        assert!(
+            lineage
+                .missing_version_id_samples
+                .iter()
+                .any(|sample| sample.contains("op-5"))
+        );
+    }
+
+    #[test]
+    fn committed_version_get_classifies_missing_corrupt_and_verified() {
+        let version = super::CommittedVersion {
+            key: "k".to_string(),
+            version_id: "ver-1".to_string(),
+            sha256: crate::fault::workload::sha256_hex(b"x"),
+            size_bytes: 1,
+        };
+
+        let mut report = empty_report();
+        super::evaluate_committed_version_get(
+            &mut report,
+            &version,
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"x".to_vec()),
+            },
+        );
+        assert_eq!(report.verified_committed_versions, 1);
+
+        super::evaluate_committed_version_get(
+            &mut report,
+            &version,
+            GetObjectResult {
+                outcome: OperationOutcome::NotFound,
+                http_status: Some(404),
+                error: None,
+                body: None,
+            },
+        );
+        assert_eq!(report.missing_committed_versions, vec!["k@ver-1"]);
+
+        super::evaluate_committed_version_get(
+            &mut report,
+            &version,
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"y".to_vec()),
+            },
+        );
+        assert_eq!(report.version_hash_mismatches.len(), 1);
+        assert!(report.version_hash_mismatches[0].starts_with("k@ver-1"));
+
+        super::evaluate_committed_version_get(
+            &mut report,
+            &version,
+            GetObjectResult {
+                outcome: OperationOutcome::Timeout,
+                http_status: None,
+                error: Some("get object timed out".to_string()),
+                body: None,
+            },
+        );
+        assert_eq!(report.unavailable_committed_versions.len(), 1);
+    }
+
+    #[test]
+    fn resurrected_deleted_objects_require_latest_delete_marker() {
+        use crate::fault::workload::ObjectVersionEntry;
+        use std::collections::BTreeSet;
+
+        let deleted = ["gone", "resurrected", "absent"]
+            .iter()
+            .map(|key| key.to_string())
+            .collect::<BTreeSet<_>>();
+        let entries = vec![
+            ObjectVersionEntry {
+                key: "gone".to_string(),
+                version_id: Some("marker-1".to_string()),
+                is_latest: true,
+                is_delete_marker: true,
+            },
+            ObjectVersionEntry {
+                key: "gone".to_string(),
+                version_id: Some("ver-0".to_string()),
+                is_latest: false,
+                is_delete_marker: false,
+            },
+            ObjectVersionEntry {
+                key: "resurrected".to_string(),
+                version_id: Some("ver-1".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        ];
+        let latest = super::latest_version_entries(&entries);
+
+        let violations = super::resurrected_deleted_objects(&deleted, &latest);
+
+        assert_eq!(
+            violations,
+            vec![
+                "absent: no latest version entry after committed delete".to_string(),
+                "resurrected: latest version is not a delete marker after committed delete"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_committed_delete_markers_are_reported() {
+        use crate::fault::workload::ObjectVersionEntry;
+
+        let committed = vec![
+            super::CommittedDeleteMarker {
+                key: "k".to_string(),
+                version_id: "marker-1".to_string(),
+            },
+            super::CommittedDeleteMarker {
+                key: "k".to_string(),
+                version_id: "marker-2".to_string(),
+            },
+        ];
+        let entries = vec![
+            ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some("marker-1".to_string()),
+                is_latest: false,
+                is_delete_marker: true,
+            },
+            ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some("old-version".to_string()),
+                is_latest: false,
+                is_delete_marker: false,
+            },
+        ];
+
+        let missing = super::missing_committed_delete_markers(&committed, &entries);
+
+        assert_eq!(
+            missing,
+            vec!["k@marker-2: committed delete marker missing from ListObjectVersions".to_string()]
+        );
+    }
+
+    #[test]
+    fn version_reads_are_excluded_from_plain_read_anomalies() {
+        let put = record("op-1", OperationKind::Put, "k", "new", OperationOutcome::Ok);
+        let mut old_version_get =
+            record("op-2", OperationKind::Get, "k", "old", OperationOutcome::Ok);
+        old_version_get.version_id = Some("ver-0".to_string());
+
+        let anomalies = successful_read_anomalies(&[put, old_version_get]);
+
+        assert!(anomalies.corrupted_reads.is_empty());
+        assert!(anomalies.visible_deleted_objects.is_empty());
+    }
+
+    #[test]
     fn warning_summary_caps_samples_but_counts_all() {
         let mut warnings = WarningSummary::default();
         for idx in 0..(super::MAX_WARNING_SAMPLES + 3) {
@@ -1168,6 +1657,16 @@ mod tests {
             list_history_warnings: Vec::new(),
             list_warnings: Vec::new(),
             final_listed_objects: Some(1),
+            versioning_expected: false,
+            expected_committed_versions: 0,
+            verified_committed_versions: 0,
+            committed_writes_missing_version_id_count: 0,
+            committed_writes_missing_version_id: Vec::new(),
+            missing_committed_versions: Vec::new(),
+            unavailable_committed_versions: Vec::new(),
+            version_hash_mismatches: Vec::new(),
+            missing_committed_delete_markers: Vec::new(),
+            resurrected_deleted_objects: Vec::new(),
             tenant_recovered: true,
             passed: true,
         };
@@ -1194,6 +1693,16 @@ mod tests {
             list_history_warnings: Vec::new(),
             list_warnings: Vec::new(),
             final_listed_objects: None,
+            versioning_expected: false,
+            expected_committed_versions: 0,
+            verified_committed_versions: 0,
+            committed_writes_missing_version_id_count: 0,
+            committed_writes_missing_version_id: Vec::new(),
+            missing_committed_versions: Vec::new(),
+            unavailable_committed_versions: Vec::new(),
+            version_hash_mismatches: Vec::new(),
+            missing_committed_delete_markers: Vec::new(),
+            resurrected_deleted_objects: Vec::new(),
             tenant_recovered: true,
             passed: false,
         }

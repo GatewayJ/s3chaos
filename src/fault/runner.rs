@@ -473,6 +473,43 @@ async fn run_fault_case(
         Some(serde_json::json!({ "bucket": bucket })),
     )?;
 
+    if config.workload_versioning {
+        let versioning_outcome = s3.enable_bucket_versioning(&history).await?;
+        if versioning_outcome != OperationOutcome::Ok {
+            let message = format!(
+                "fault workload bucket versioning enablement did not succeed: {versioning_outcome:?}"
+            );
+            events
+                .record(
+                    "bucket-create",
+                    RunEventStatus::Failed,
+                    message.clone(),
+                    Some(serde_json::json!({
+                        "bucket": bucket,
+                        "outcome": format!("{versioning_outcome:?}"),
+                    })),
+                )
+                .ok();
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "bucket-create",
+                    "product_or_environment",
+                    message.clone(),
+                ),
+            )?;
+            bail!("{message}");
+        }
+        events.record(
+            "bucket-create",
+            RunEventStatus::Succeeded,
+            "run-scoped workload bucket versioning was enabled",
+            Some(serde_json::json!({ "bucket": bucket })),
+        )?;
+    }
+
     events.record(
         "prefill",
         RunEventStatus::Started,
@@ -1146,47 +1183,54 @@ async fn run_fault_case(
         None,
     )?;
     let pre_recommit_record_start = history.records().len();
-    let pre_recommit_report =
-        match checker::check_s3_history(&s3, &history, true, workload_plan.concurrency).await {
-            Ok(report) => report,
-            Err(error) => {
-                let message = error.to_string();
-                events
-                    .record(
-                        "checker-pre-recommit",
-                        RunEventStatus::Failed,
-                        message.clone(),
-                        None,
-                    )
-                    .ok();
-                write_checker_error(
-                    collector,
-                    scenario.case_name,
-                    "checker-pre-recommit-error.txt",
-                    &message,
-                )?;
-                let recovery_stability_report = checker::RecoveryStabilityReport::harness_error(
+    let pre_recommit_report = match checker::check_s3_history(
+        &s3,
+        &history,
+        true,
+        workload_plan.concurrency,
+        config.workload_versioning,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            let message = error.to_string();
+            events
+                .record(
+                    "checker-pre-recommit",
+                    RunEventStatus::Failed,
                     message.clone(),
-                    config.recovery_stability_reread,
-                );
-                collector.write_text(
-                    scenario.case_name,
-                    "recovery-stability-report.json",
-                    &serde_json::to_string_pretty(&recovery_stability_report)?,
-                )?;
-                write_failure_summary(
-                    collector,
-                    scenario.case_name,
-                    FailureSummary::new(
-                        &scenario.name,
-                        "checker-pre-recommit",
-                        recovery_stability_report.classification.as_str(),
-                        message,
-                    ),
-                )?;
-                return Err(error);
-            }
-        };
+                    None,
+                )
+                .ok();
+            write_checker_error(
+                collector,
+                scenario.case_name,
+                "checker-pre-recommit-error.txt",
+                &message,
+            )?;
+            let recovery_stability_report = checker::RecoveryStabilityReport::harness_error(
+                message.clone(),
+                config.recovery_stability_reread,
+            );
+            collector.write_text(
+                scenario.case_name,
+                "recovery-stability-report.json",
+                &serde_json::to_string_pretty(&recovery_stability_report)?,
+            )?;
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "checker-pre-recommit",
+                    recovery_stability_report.classification.as_str(),
+                    message,
+                ),
+            )?;
+            return Err(error);
+        }
+    };
     collector.write_text(
         scenario.case_name,
         "checker-pre-recommit-report.json",
@@ -1338,38 +1382,45 @@ async fn run_fault_case(
         "checking final recovered object model",
         None,
     )?;
-    let report =
-        match checker::check_s3_history(&s3, &history, true, workload_plan.concurrency).await {
-            Ok(report) => report,
-            Err(error) => {
-                let message = error.to_string();
-                events
-                    .record(
-                        "checker-final",
-                        RunEventStatus::Failed,
-                        message.clone(),
-                        None,
-                    )
-                    .ok();
-                write_checker_error(
-                    collector,
-                    scenario.case_name,
-                    "checker-final-error.txt",
-                    &message,
-                )?;
-                write_failure_summary(
-                    collector,
-                    scenario.case_name,
-                    FailureSummary::new(
-                        &scenario.name,
-                        "checker-final",
-                        "checker_or_environment",
-                        message,
-                    ),
-                )?;
-                return Err(error);
-            }
-        };
+    let report = match checker::check_s3_history(
+        &s3,
+        &history,
+        true,
+        workload_plan.concurrency,
+        config.workload_versioning,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            let message = error.to_string();
+            events
+                .record(
+                    "checker-final",
+                    RunEventStatus::Failed,
+                    message.clone(),
+                    None,
+                )
+                .ok();
+            write_checker_error(
+                collector,
+                scenario.case_name,
+                "checker-final-error.txt",
+                &message,
+            )?;
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "checker-final",
+                    "checker_or_environment",
+                    message,
+                ),
+            )?;
+            return Err(error);
+        }
+    };
     collector.write_text(
         scenario.case_name,
         "checker-report.json",

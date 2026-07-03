@@ -20,7 +20,9 @@ use aws_sdk_s3::{
     config::Region,
     error::SdkError,
     primitives::ByteStream,
-    types::{CompletedMultipartUpload, CompletedPart},
+    types::{
+        BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
+    },
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
@@ -124,6 +126,14 @@ pub struct S3WorkloadClient {
     client: Client,
     bucket: String,
     request_timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectVersionEntry {
+    pub key: String,
+    pub version_id: Option<String>,
+    pub is_latest: bool,
+    pub is_delete_marker: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -653,7 +663,11 @@ impl S3WorkloadClient {
         .await;
 
         match result {
-            Ok(Ok(_)) => recorder.finish(record, OperationOutcome::Ok, Some(200), None),
+            Ok(Ok(output)) => {
+                let mut record = record;
+                record.version_id = output.version_id().map(str::to_string);
+                recorder.finish(record, OperationOutcome::Ok, Some(200), None)
+            }
             Ok(Err(error)) => {
                 let outcome = classify_sdk_error(&error);
                 recorder.finish(
@@ -672,6 +686,55 @@ impl S3WorkloadClient {
         }
     }
 
+    pub async fn enable_bucket_versioning(&self, recorder: &Recorder) -> Result<OperationOutcome> {
+        let record = recorder.begin(
+            OperationKind::PutBucketVersioning,
+            self.bucket.clone(),
+            None,
+            None,
+            None,
+        );
+        let result = timeout(
+            self.request_timeout,
+            self.client
+                .put_bucket_versioning()
+                .bucket(&self.bucket)
+                .versioning_configuration(
+                    VersioningConfiguration::builder()
+                        .status(BucketVersioningStatus::Enabled)
+                        .build(),
+                )
+                .send(),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(_)) => {
+                recorder.finish(record, OperationOutcome::Ok, Some(200), None)?;
+                Ok(OperationOutcome::Ok)
+            }
+            Ok(Err(error)) => {
+                let outcome = classify_sdk_error(&error);
+                recorder.finish(
+                    record,
+                    outcome,
+                    sdk_error_status(&error),
+                    Some(format!("put bucket versioning failed: {error}")),
+                )?;
+                Ok(outcome)
+            }
+            Err(_) => {
+                recorder.finish(
+                    record,
+                    OperationOutcome::Timeout,
+                    None,
+                    Some("put bucket versioning timed out".to_string()),
+                )?;
+                Ok(OperationOutcome::Timeout)
+            }
+        }
+    }
+
     pub async fn get_object(&self, key: &str, recorder: &Recorder) -> Result<Option<Vec<u8>>> {
         Ok(self.get_object_result(key, recorder).await?.body)
     }
@@ -681,19 +744,40 @@ impl S3WorkloadClient {
         key: &str,
         recorder: &Recorder,
     ) -> Result<GetObjectResult> {
-        let record = recorder.begin(
+        self.get_object_result_inner(key, None, recorder).await
+    }
+
+    pub async fn get_object_version_result(
+        &self,
+        key: &str,
+        version_id: &str,
+        recorder: &Recorder,
+    ) -> Result<GetObjectResult> {
+        self.get_object_result_inner(key, Some(version_id), recorder)
+            .await
+    }
+
+    async fn get_object_result_inner(
+        &self,
+        key: &str,
+        version_id: Option<&str>,
+        recorder: &Recorder,
+    ) -> Result<GetObjectResult> {
+        let mut record = recorder.begin(
             OperationKind::Get,
             self.bucket.clone(),
             Some(key.to_string()),
             None,
             None,
         );
+        record.version_id = version_id.map(str::to_string);
         let response = timeout(
             self.request_timeout,
             self.client
                 .get_object()
                 .bucket(&self.bucket)
                 .key(key)
+                .set_version_id(version_id.map(str::to_string))
                 .send(),
         )
         .await;
@@ -823,7 +907,9 @@ impl S3WorkloadClient {
         .await;
 
         match result {
-            Ok(Ok(_)) => {
+            Ok(Ok(output)) => {
+                let mut record = record;
+                record.version_id = output.version_id().map(str::to_string);
                 recorder.finish(record, OperationOutcome::Ok, Some(204), None)?;
                 Ok(OperationOutcome::Ok)
             }
@@ -913,7 +999,9 @@ impl S3WorkloadClient {
         .await;
 
         match result {
-            Ok(Ok(_)) => {
+            Ok(Ok(output)) => {
+                let mut record = record;
+                record.version_id = output.version_id().map(str::to_string);
                 recorder.finish(record, OperationOutcome::Ok, Some(200), None)?;
                 Ok(OperationOutcome::Ok)
             }
@@ -1249,6 +1337,90 @@ impl S3WorkloadClient {
         record.listed_keys = Some(keys.clone());
         recorder.finish(record, OperationOutcome::Ok, Some(200), None)?;
         Ok(Some(keys))
+    }
+
+    pub async fn list_object_versions(
+        &self,
+        prefix: &str,
+        recorder: &Recorder,
+    ) -> Result<Option<Vec<ObjectVersionEntry>>> {
+        let record = recorder.begin(
+            OperationKind::ListVersions,
+            self.bucket.clone(),
+            Some(prefix.to_string()),
+            None,
+            None,
+        );
+        let mut entries = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+        loop {
+            let request = self
+                .client
+                .list_object_versions()
+                .bucket(&self.bucket)
+                .prefix(prefix)
+                .set_key_marker(key_marker.clone())
+                .set_version_id_marker(version_id_marker.clone());
+            let response = timeout(self.request_timeout, request.send()).await;
+            let output = match response {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => {
+                    let outcome = classify_sdk_error(&error);
+                    recorder.finish(
+                        record,
+                        outcome,
+                        sdk_error_status(&error),
+                        Some(format!("list object versions failed: {error}")),
+                    )?;
+                    return Ok(None);
+                }
+                Err(_) => {
+                    recorder.finish(
+                        record,
+                        OperationOutcome::Timeout,
+                        None,
+                        Some("list object versions timed out".to_string()),
+                    )?;
+                    return Ok(None);
+                }
+            };
+            entries.extend(output.versions().iter().filter_map(|version| {
+                Some(ObjectVersionEntry {
+                    key: version.key().map(str::to_string)?,
+                    version_id: version.version_id().map(str::to_string),
+                    is_latest: version.is_latest().unwrap_or(false),
+                    is_delete_marker: false,
+                })
+            }));
+            entries.extend(output.delete_markers().iter().filter_map(|marker| {
+                Some(ObjectVersionEntry {
+                    key: marker.key().map(str::to_string)?,
+                    version_id: marker.version_id().map(str::to_string),
+                    is_latest: marker.is_latest().unwrap_or(false),
+                    is_delete_marker: true,
+                })
+            }));
+            if !output.is_truncated().unwrap_or(false) {
+                break;
+            }
+            key_marker = output.next_key_marker().map(str::to_string);
+            version_id_marker = output.next_version_id_marker().map(str::to_string);
+            if key_marker.is_none() && version_id_marker.is_none() {
+                recorder.finish(
+                    record,
+                    OperationOutcome::Unknown,
+                    Some(200),
+                    Some("truncated ListObjectVersions response omitted markers".to_string()),
+                )?;
+                return Ok(None);
+            }
+        }
+
+        let mut record = record;
+        record.size_bytes = Some(entries.len());
+        recorder.finish(record, OperationOutcome::Ok, Some(200), None)?;
+        Ok(Some(entries))
     }
 }
 

@@ -268,6 +268,7 @@ validate_runtime_env_contract() {
   require_optional_unsigned_integer RUSTFS_FAULT_TEST_SEED
   require_optional_bool RUSTFS_FAULT_TEST_USE_CLUSTER_IP
   require_optional_bool RUSTFS_FAULT_TEST_REQUIRE_CLIENT_DISRUPTION
+  require_optional_bool RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING
 
   percent="$(trim_value "${RUSTFS_FAULT_TEST_PERCENT:-}")"
   if [[ -n "$percent" ]]; then

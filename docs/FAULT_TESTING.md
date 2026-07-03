@@ -121,6 +121,7 @@ resource cleanup remain under `src/framework/`.
 | `RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH` | `/data/rustfs0` | RustFS data volume path targeted by volume faults; must be an absolute safe path using ASCII letters, digits, `/`, `.`, `_`, or `-`. |
 | `RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS` | `60` | Required no-restart Ready window before and after fault injection. |
 | `RUSTFS_FAULT_TEST_REQUIRE_CLIENT_DISRUPTION` | `false` | Force at least one client-visible failed/timeout/unknown S3 operation even when the catalog marks disruption optional. |
+| `RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING` | `false` | Enable bucket versioning for the run bucket. Every committed write and delete must return a version id, every committed version is re-read by `versionId` and sha256-verified after recovery, and deleted keys must keep a delete marker as their latest version (resurrection check). Roughly doubles checker read volume. |
 | `RUSTFS_FAULT_TEST_BUILD_JOBS` | `1` | Cargo prebuild job count. |
 | `RUSTFS_FAULT_TEST_RUN_ROOT` | timestamped target dir | Artifact root. |
 | `RUSTFS_FAULT_TEST_CHAOS_MESH_VERSION` | `2.8.3` | Chaos Mesh Helm chart version for optional Dashboard installation. |
@@ -454,7 +455,12 @@ A successful run must show:
   mismatches, unavailable committed-object reads, unknown committed-object read
   failures, successful corrupted reads, unexpected visible deleted objects, and
   final post-recovery LIST warnings are empty. `list_history_warnings` are
-  retained as sampled workload-time diagnostics.
+  retained as sampled workload-time diagnostics. When
+  `RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING` is enabled, the reports additionally
+  require every committed write to carry a version id, every committed version
+  to survive a `versionId` GET with a matching sha256, and every committed
+  delete to keep a delete marker as the latest version
+  (`resurrected_deleted_objects` must stay empty).
 - `recommit-report.json`: every previously unconfirmed write was recommitted
   and GET verified after recovery.
 - `workload-plan.json`: object count, concurrency, operation mix, and payload

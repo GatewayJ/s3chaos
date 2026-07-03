@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -44,6 +44,7 @@ pub struct ArtifactValidationOptions {
     pub artifact_root: PathBuf,
     pub expected_workload_objects: usize,
     pub expected_workload_concurrency: usize,
+    pub expected_workload_versioning: bool,
     pub expected_rustfs_pod_count: usize,
     pub expected_stable_window_seconds: u64,
     pub expected_recovery_stability_reread_seconds: u64,
@@ -86,6 +87,7 @@ impl ArtifactValidationOptions {
                 "RUSTFS_FAULT_TEST_WORKLOAD_CONCURRENCY",
                 DEFAULT_WORKLOAD_CONCURRENCY,
             )?,
+            expected_workload_versioning: env_bool("RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING")?,
             expected_rustfs_pod_count: env_usize(
                 "RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT",
                 DEFAULT_RUSTFS_POD_COUNT,
@@ -208,9 +210,17 @@ pub fn validate_fault_artifacts(
 
     let prechecker =
         read_json::<CheckerReport>(required(&artifacts, "checker-pre-recommit-report.json")?)?;
-    validate_checker_report("checker-pre-recommit-report.json", &prechecker)?;
+    validate_checker_report(
+        "checker-pre-recommit-report.json",
+        &prechecker,
+        options.expected_workload_versioning,
+    )?;
     let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
-    validate_checker_report("checker-report.json", &checker)?;
+    validate_checker_report(
+        "checker-report.json",
+        &checker,
+        options.expected_workload_versioning,
+    )?;
 
     let recommit =
         read_json::<RecommitReportArtifact>(required(&artifacts, "recommit-report.json")?)?;
@@ -278,6 +288,12 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
         "run-spec workload.concurrency {} does not match expected {}",
         spec.workload.concurrency,
         options.expected_workload_concurrency
+    );
+    ensure!(
+        spec.workload.versioning == options.expected_workload_versioning,
+        "run-spec workload.versioning {} does not match expected {}",
+        spec.workload.versioning,
+        options.expected_workload_versioning
     );
     ensure!(
         spec.recovery.expected_rustfs_pod_count == options.expected_rustfs_pod_count,
@@ -354,10 +370,20 @@ fn validate_run_spec_target(
     Ok(())
 }
 
-fn validate_checker_report(name: &str, report: &CheckerReport) -> Result<()> {
+fn validate_checker_report(
+    name: &str,
+    report: &CheckerReport,
+    expected_versioning: bool,
+) -> Result<()> {
     report
         .require_success()
         .with_context(|| format!("{name} did not pass"))?;
+    ensure!(
+        report.versioning_expected == expected_versioning,
+        "{name} versioning_expected {} does not match expected {}",
+        report.versioning_expected,
+        expected_versioning
+    );
     ensure!(
         report.missing_committed_objects.is_empty()
             && report.unavailable_committed_objects.is_empty()
@@ -367,6 +393,12 @@ fn validate_checker_report(name: &str, report: &CheckerReport) -> Result<()> {
             && report.unexpected_visible_deleted_objects.is_empty()
             && report.final_list_warning_count == 0
             && report.list_warnings.is_empty()
+            && report.committed_writes_missing_version_id_count == 0
+            && report.missing_committed_versions.is_empty()
+            && report.unavailable_committed_versions.is_empty()
+            && report.version_hash_mismatches.is_empty()
+            && report.missing_committed_delete_markers.is_empty()
+            && report.resurrected_deleted_objects.is_empty()
             && report.tenant_recovered,
         "{name} contains a non-clean checker verdict"
     );
@@ -604,6 +636,21 @@ fn env_u64(name: &str, default: u64) -> Result<u64> {
         .with_context(|| format!("{name} must be an unsigned integer"))
 }
 
+fn env_bool(name: &str) -> Result<bool> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(false);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(false);
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => bail!("{name} must be a boolean: 1/0, true/false, or yes/no"),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RunMetadataArtifact {
     scenario: String,
@@ -707,6 +754,7 @@ mod tests {
             artifact_root: dir.path().to_path_buf(),
             expected_workload_objects: 12,
             expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
             expected_rustfs_pod_count: 4,
             expected_stable_window_seconds: 60,
             expected_recovery_stability_reread_seconds: 60,
@@ -737,6 +785,7 @@ mod tests {
             artifact_root: dir.path().to_path_buf(),
             expected_workload_objects: 12,
             expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
             expected_rustfs_pod_count: 4,
             expected_stable_window_seconds: 60,
             expected_recovery_stability_reread_seconds: 60,
@@ -772,6 +821,7 @@ mod tests {
             artifact_root: dir.path().to_path_buf(),
             expected_workload_objects: 12,
             expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
             expected_rustfs_pod_count: 4,
             expected_stable_window_seconds: 60,
             expected_recovery_stability_reread_seconds: 60,
@@ -784,6 +834,54 @@ mod tests {
             error
                 .to_string()
                 .contains("recovery_stability_reread_seconds")
+        );
+    }
+
+    #[test]
+    fn rejects_run_spec_when_versioning_expectation_mismatches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: true,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        let error = validate_fault_artifacts(&options).expect_err("versioning mismatch");
+
+        assert!(error.to_string().contains("run-spec workload.versioning"));
+    }
+
+    #[test]
+    fn rejects_checker_report_when_versioning_expectation_mismatches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        rewrite_run_spec_versioning(&case_dir, true);
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: true,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        let error = validate_fault_artifacts(&options).expect_err("checker versioning mismatch");
+
+        assert!(
+            error
+                .to_string()
+                .contains("checker-pre-recommit-report.json versioning_expected")
         );
     }
 
@@ -830,6 +928,7 @@ mod tests {
             artifact_root: dir.path().to_path_buf(),
             expected_workload_objects: 12,
             expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
             expected_rustfs_pod_count: 4,
             expected_stable_window_seconds: 60,
             expected_recovery_stability_reread_seconds: 60,
@@ -1025,5 +1124,24 @@ mod tests {
             serde_json::to_string_pretty(value).expect("json"),
         )
         .expect("write json");
+    }
+
+    fn rewrite_run_spec_versioning(case_dir: &std::path::Path, versioning: bool) {
+        let json_path = case_dir.join("run-spec.json");
+        let mut spec = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(&json_path).expect("read run spec"),
+        )
+        .expect("parse run spec");
+        spec["workload"]["versioning"] = json!(versioning);
+        fs::write(
+            &json_path,
+            serde_json::to_string_pretty(&spec).expect("json"),
+        )
+        .expect("write run spec json");
+        fs::write(
+            case_dir.join("run-spec.yaml"),
+            serde_yaml_ng::to_string(&spec).expect("yaml"),
+        )
+        .expect("write run spec yaml");
     }
 }
