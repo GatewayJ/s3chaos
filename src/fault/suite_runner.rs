@@ -823,6 +823,7 @@ fn validate_attempt_artifacts(
         artifact_root: config.cluster.artifacts_dir.clone(),
         expected_workload_objects: config.workload.object_count,
         expected_workload_concurrency: config.workload.concurrency,
+        expected_workload_versioning: config.workload_versioning,
         expected_rustfs_pod_count: config.expected_rustfs_pod_count,
         expected_stable_window_seconds: config.rustfs_pod_stable_window.as_secs(),
         expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),

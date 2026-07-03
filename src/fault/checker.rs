@@ -62,6 +62,8 @@ pub struct CheckerReport {
     #[serde(default)]
     pub version_hash_mismatches: Vec<String>,
     #[serde(default)]
+    pub missing_committed_delete_markers: Vec<String>,
+    #[serde(default)]
     pub resurrected_deleted_objects: Vec<String>,
     pub tenant_recovered: bool,
     pub passed: bool,
@@ -172,6 +174,7 @@ pub async fn check_s3_history(
         missing_committed_versions: Vec::new(),
         unavailable_committed_versions: Vec::new(),
         version_hash_mismatches: Vec::new(),
+        missing_committed_delete_markers: Vec::new(),
         resurrected_deleted_objects: Vec::new(),
         tenant_recovered,
         passed: false,
@@ -239,8 +242,10 @@ pub async fn check_s3_history(
 
         match s3.list_object_versions(&prefix, recorder).await? {
             Some(entries) => {
+                report.missing_committed_delete_markers =
+                    missing_committed_delete_markers(&lineage.delete_markers, &entries);
                 report.resurrected_deleted_objects =
-                    resurrected_deleted_objects(&model.deleted, &latest_version_entries(entries));
+                    resurrected_deleted_objects(&model.deleted, &latest_version_entries(&entries));
             }
             None => report.unavailable_committed_versions.push(format!(
                 "list_object_versions prefix {prefix} did not complete"
@@ -284,6 +289,7 @@ pub async fn check_s3_history(
     report.missing_committed_versions.sort();
     report.unavailable_committed_versions.sort();
     report.version_hash_mismatches.sort();
+    report.missing_committed_delete_markers.sort();
     report.resurrected_deleted_objects.sort();
     report.passed = report.tenant_recovered
         && report.missing_committed_objects.is_empty()
@@ -297,6 +303,7 @@ pub async fn check_s3_history(
         && report.missing_committed_versions.is_empty()
         && report.unavailable_committed_versions.is_empty()
         && report.version_hash_mismatches.is_empty()
+        && report.missing_committed_delete_markers.is_empty()
         && report.resurrected_deleted_objects.is_empty();
 
     Ok(report)
@@ -454,9 +461,16 @@ struct CommittedVersion {
     size_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommittedDeleteMarker {
+    key: String,
+    version_id: String,
+}
+
 #[derive(Debug, Default)]
 struct VersionLineage {
     versions: Vec<CommittedVersion>,
+    delete_markers: Vec<CommittedDeleteMarker>,
     missing_version_id_count: usize,
     missing_version_id_samples: Vec<String>,
 }
@@ -486,6 +500,12 @@ fn committed_version_lineage(records: &[OperationRecord]) -> VersionLineage {
                     version_id: version_id.clone(),
                     sha256: expected.sha256,
                     size_bytes: expected.size_bytes,
+                });
+            }
+            Some(version_id) if is_committed_delete => {
+                lineage.delete_markers.push(CommittedDeleteMarker {
+                    key: key.clone(),
+                    version_id: version_id.clone(),
                 });
             }
             Some(_) => {}
@@ -539,13 +559,11 @@ fn evaluate_committed_version_get(
     }
 }
 
-fn latest_version_entries(
-    entries: Vec<ObjectVersionEntry>,
-) -> BTreeMap<String, ObjectVersionEntry> {
+fn latest_version_entries(entries: &[ObjectVersionEntry]) -> BTreeMap<String, ObjectVersionEntry> {
     let mut latest = BTreeMap::new();
     for entry in entries {
         if entry.is_latest {
-            latest.insert(entry.key.clone(), entry);
+            latest.insert(entry.key.clone(), entry.clone());
         }
     }
     latest
@@ -561,7 +579,31 @@ fn resurrected_deleted_objects(
             Some(entry) if !entry.is_delete_marker => Some(format!(
                 "{key}: latest version is not a delete marker after committed delete"
             )),
+            None => Some(format!(
+                "{key}: no latest version entry after committed delete"
+            )),
             _ => None,
+        })
+        .collect()
+}
+
+fn missing_committed_delete_markers(
+    committed: &[CommittedDeleteMarker],
+    entries: &[ObjectVersionEntry],
+) -> Vec<String> {
+    let present = entries
+        .iter()
+        .filter(|entry| entry.is_delete_marker)
+        .filter_map(|entry| Some((entry.key.clone(), entry.version_id.clone()?)))
+        .collect::<BTreeSet<_>>();
+    committed
+        .iter()
+        .filter(|marker| !present.contains(&(marker.key.clone(), marker.version_id.clone())))
+        .map(|marker| {
+            format!(
+                "{}@{}: committed delete marker missing from ListObjectVersions",
+                marker.key, marker.version_id
+            )
         })
         .collect()
 }
@@ -711,6 +753,7 @@ fn classify_without_reread(report: &CheckerReport) -> RecoveryStabilityClassific
         || report.final_list_warning_count > 0
         || !report.version_hash_mismatches.is_empty()
         || !report.missing_committed_versions.is_empty()
+        || !report.missing_committed_delete_markers.is_empty()
         || !report.resurrected_deleted_objects.is_empty()
         || report.committed_writes_missing_version_id_count > 0
     {
@@ -833,6 +876,7 @@ fn immediate_failures_are_only_reread_candidates(
         && immediate_report.missing_committed_versions.is_empty()
         && immediate_report.unavailable_committed_versions.is_empty()
         && immediate_report.version_hash_mismatches.is_empty()
+        && immediate_report.missing_committed_delete_markers.is_empty()
         && immediate_report.resurrected_deleted_objects.is_empty()
         && immediate_report.unavailable_committed_objects.len()
             + immediate_report.unknown_committed_read_failures.len()
@@ -1366,15 +1410,23 @@ mod tests {
         );
         versioned_multipart.version_id = Some("ver-2".to_string());
         let unversioned_put = record("op-3", OperationKind::Put, "k3", "v3", OperationOutcome::Ok);
-        let unversioned_delete = record(
+        let mut versioned_delete = record(
             "op-4",
             OperationKind::Delete,
             "k1",
             "",
             OperationOutcome::Ok,
         );
-        let failed_put = record(
+        versioned_delete.version_id = Some("marker-1".to_string());
+        let unversioned_delete = record(
             "op-5",
+            OperationKind::Delete,
+            "k2",
+            "",
+            OperationOutcome::Ok,
+        );
+        let failed_put = record(
+            "op-6",
             OperationKind::Put,
             "k4",
             "v4",
@@ -1385,6 +1437,7 @@ mod tests {
             versioned_put,
             versioned_multipart,
             unversioned_put,
+            versioned_delete,
             unversioned_delete,
             failed_put,
         ]);
@@ -1397,6 +1450,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("k1", "ver-1"), ("k2", "ver-2")]
         );
+        assert_eq!(
+            lineage
+                .delete_markers
+                .iter()
+                .map(|marker| (marker.key.as_str(), marker.version_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("k1", "marker-1")]
+        );
         assert_eq!(lineage.missing_version_id_count, 2);
         assert!(
             lineage
@@ -1408,7 +1469,7 @@ mod tests {
             lineage
                 .missing_version_id_samples
                 .iter()
-                .any(|sample| sample.contains("op-4"))
+                .any(|sample| sample.contains("op-5"))
         );
     }
 
@@ -1481,7 +1542,7 @@ mod tests {
             .iter()
             .map(|key| key.to_string())
             .collect::<BTreeSet<_>>();
-        let latest = super::latest_version_entries(vec![
+        let entries = vec![
             ObjectVersionEntry {
                 key: "gone".to_string(),
                 version_id: Some("marker-1".to_string()),
@@ -1500,16 +1561,55 @@ mod tests {
                 is_latest: true,
                 is_delete_marker: false,
             },
-        ]);
+        ];
+        let latest = super::latest_version_entries(&entries);
 
         let violations = super::resurrected_deleted_objects(&deleted, &latest);
 
         assert_eq!(
             violations,
             vec![
+                "absent: no latest version entry after committed delete".to_string(),
                 "resurrected: latest version is not a delete marker after committed delete"
                     .to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn missing_committed_delete_markers_are_reported() {
+        use crate::fault::workload::ObjectVersionEntry;
+
+        let committed = vec![
+            super::CommittedDeleteMarker {
+                key: "k".to_string(),
+                version_id: "marker-1".to_string(),
+            },
+            super::CommittedDeleteMarker {
+                key: "k".to_string(),
+                version_id: "marker-2".to_string(),
+            },
+        ];
+        let entries = vec![
+            ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some("marker-1".to_string()),
+                is_latest: false,
+                is_delete_marker: true,
+            },
+            ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some("old-version".to_string()),
+                is_latest: false,
+                is_delete_marker: false,
+            },
+        ];
+
+        let missing = super::missing_committed_delete_markers(&committed, &entries);
+
+        assert_eq!(
+            missing,
+            vec!["k@marker-2: committed delete marker missing from ListObjectVersions".to_string()]
         );
     }
 
@@ -1565,6 +1665,7 @@ mod tests {
             missing_committed_versions: Vec::new(),
             unavailable_committed_versions: Vec::new(),
             version_hash_mismatches: Vec::new(),
+            missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
             tenant_recovered: true,
             passed: true,
@@ -1600,6 +1701,7 @@ mod tests {
             missing_committed_versions: Vec::new(),
             unavailable_committed_versions: Vec::new(),
             version_hash_mismatches: Vec::new(),
+            missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
             tenant_recovered: true,
             passed: false,
