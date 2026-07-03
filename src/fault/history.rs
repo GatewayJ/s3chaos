@@ -24,10 +24,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     CreateBucket,
+    PutBucketVersioning,
     Put,
     Get,
     Head,
     List,
+    ListVersions,
     Delete,
     CreateMultipartUpload,
     UploadPart,
@@ -54,6 +56,8 @@ pub struct OperationRecord {
     pub key: Option<String>,
     pub value_sha256: Option<String>,
     pub size_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listed_keys: Option<Vec<String>>,
     pub started_at_ms: u64,
@@ -122,6 +126,7 @@ impl Recorder {
             key,
             value_sha256,
             size_bytes,
+            version_id: None,
             listed_keys: None,
             started_at_ms,
             ended_at_ms: started_at_ms,
@@ -217,6 +222,16 @@ mod tests {
         assert!(content.contains("\"kind\":\"put\""));
         assert_eq!(recorder.records().len(), 1);
         assert_eq!(recorder.path(), path);
+    }
+
+    #[test]
+    fn records_without_version_id_still_deserialize() {
+        let legacy = r#"{"id":"op-000001","scenario":"io-eio","kind":"put","bucket":"bucket","key":"k","value_sha256":"abc","size_bytes":3,"started_at_ms":1,"ended_at_ms":2,"outcome":"ok","http_status":200,"error":null}"#;
+
+        let record = serde_json::from_str::<super::OperationRecord>(legacy).expect("legacy record");
+
+        assert_eq!(record.version_id, None);
+        assert_eq!(record.kind, OperationKind::Put);
     }
 
     #[test]

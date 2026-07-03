@@ -367,6 +367,11 @@ fn validate_checker_report(name: &str, report: &CheckerReport) -> Result<()> {
             && report.unexpected_visible_deleted_objects.is_empty()
             && report.final_list_warning_count == 0
             && report.list_warnings.is_empty()
+            && report.committed_writes_missing_version_id_count == 0
+            && report.missing_committed_versions.is_empty()
+            && report.unavailable_committed_versions.is_empty()
+            && report.version_hash_mismatches.is_empty()
+            && report.resurrected_deleted_objects.is_empty()
             && report.tenant_recovered,
         "{name} contains a non-clean checker verdict"
     );

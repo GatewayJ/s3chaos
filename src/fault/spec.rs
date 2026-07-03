@@ -81,6 +81,8 @@ pub struct FaultRunWorkloadSpec {
     pub prefill_concurrency: usize,
     pub request_timeout_seconds: u64,
     pub seed: u64,
+    #[serde(default)]
+    pub versioning: bool,
     pub plan: WorkloadPlan,
 }
 
@@ -175,6 +177,7 @@ impl FaultRunSpec {
                 prefill_concurrency: config.prefill_concurrency,
                 request_timeout_seconds: config.request_timeout.as_secs(),
                 seed: workload_plan.seed,
+                versioning: config.workload_versioning,
                 plan: workload_plan.clone(),
             },
             recovery: FaultRunRecoverySpec {

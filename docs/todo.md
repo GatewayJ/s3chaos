@@ -66,7 +66,35 @@ logic grow.
 - Keep backend-specific manifests, command invocations, status parsing, and
   cleanup details out of suite parsing and planning code.
 
-## 4. Add Console And Reporting Surfaces
+## 4. Extend Scenario Coverage Toward The RustFS Reliability Plan
+
+Status: versioned workload mode landed. `RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING`
+enables bucket versioning, records version ids in `history.jsonl`, verifies the
+full committed version lineage by `versionId` GET after recovery, and asserts
+deleted keys keep a delete marker as their latest version (resurrection check).
+
+The current catalog covers inject-recover-verify faults. The RustFS reliability
+plan (rustfs repository, `docs/testing/reliability-test-plan.md`) needs the
+stateful operational flows on top, in this order:
+
+- Quorum-parameterized fault targeting: inject IO faults into exactly P or P+1
+  volumes of one erasure set, asserting reads survive at P and writes are
+  rejected cleanly past the write quorum instead of half-committing.
+- Fresh-volume replacement: delete one RustFS PVC and pod so the StatefulSet
+  rebuilds an empty volume, then assert automatic format heal plus full data
+  heal converges with no client-visible corruption. This is the Kubernetes
+  equivalent of swapping in a blank disk.
+- Admin-ops scenario family behind the fault backend port: drive RustFS admin
+  APIs (heal, decommission, rebalance) as orchestrated scenario steps with the
+  same workload/history/checker verdict. Decommission needs a multi-pool
+  Tenant shape first.
+- On-disk bitrot: flip bytes inside a shard file on the host volume, then
+  assert the read path rejects corrupt data and scanner/heal repairs the shard.
+  IOChaos read mistakes do not exercise the on-disk heal closure.
+- Long-run chaos mode: repeat scenario rounds under one continuous workload
+  with periodic full verification and fd/RSS trend gates for leak detection.
+
+## 5. Add Console And Reporting Surfaces
 
 - Design a console-facing summary format for suite plans, live attempt status,
   artifact locations, health-guard decisions, and final verdicts.
