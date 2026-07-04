@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     fault::{
@@ -72,7 +72,7 @@ pub(crate) struct RunMetadata {
     storage_class: String,
     rustfs_image: String,
     artifacts_dir: String,
-    duration_seconds: u64,
+    fault_duration_seconds: u64,
     percent: Option<u8>,
     fault_selection: Vec<String>,
     fault_parameters: Vec<crate::fault::plan::FaultInjectionParameters>,
@@ -109,7 +109,7 @@ impl RunMetadata {
             storage_class: config.cluster.storage_class.clone(),
             rustfs_image: config.cluster.rustfs_image.clone(),
             artifacts_dir: config.cluster.artifacts_dir.display().to_string(),
-            duration_seconds: scenario.duration.as_secs(),
+            fault_duration_seconds: scenario.duration.as_secs(),
             percent: plan
                 .faults()
                 .iter()
@@ -140,11 +140,65 @@ impl RunMetadata {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureVerdict {
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureSeverity {
+    Degraded,
+    FailAvailability,
+    FailCorrectness,
+    Infra,
+    NeedsInvestigation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataCorrectnessStatus {
+    Passed,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AvailabilityStatus {
+    RecoveredAfterTailLatency,
+    CommittedObjectUnavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FailureClassificationDetails {
+    severity: FailureSeverity,
+    data_correctness: DataCorrectnessStatus,
+    availability: AvailabilityStatus,
+    data_loss: Option<bool>,
+    corruption: Option<bool>,
+    recovered_within_window: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FailureSummary {
     scenario: String,
     stage: String,
+    verdict: FailureVerdict,
+    severity: FailureSeverity,
     classification: String,
+    data_correctness: DataCorrectnessStatus,
+    availability: AvailabilityStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_loss: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corruption: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovered_within_window: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovered_within_seconds: Option<u64>,
     message: String,
 }
 
@@ -155,11 +209,84 @@ impl FailureSummary {
         classification: impl Into<String>,
         message: impl Into<String>,
     ) -> Self {
+        let classification = classification.into();
+        let details = FailureClassificationDetails::from_classification(&classification);
         Self {
             scenario: scenario.into(),
             stage: stage.into(),
-            classification: classification.into(),
+            verdict: FailureVerdict::Failed,
+            severity: details.severity,
+            classification,
+            data_correctness: details.data_correctness,
+            availability: details.availability,
+            data_loss: details.data_loss,
+            corruption: details.corruption,
+            recovered_within_window: details.recovered_within_window,
+            recovered_within_seconds: None,
             message: message.into(),
+        }
+    }
+
+    pub(crate) fn with_recovered_within_seconds(mut self, seconds: Option<u64>) -> Self {
+        self.recovered_within_seconds = seconds;
+        self
+    }
+
+    pub(crate) fn severity(&self) -> FailureSeverity {
+        self.severity
+    }
+
+    pub(crate) fn classification(&self) -> &str {
+        &self.classification
+    }
+}
+
+impl FailureClassificationDetails {
+    fn from_classification(classification: &str) -> Self {
+        match classification {
+            "recovery_tail_read_latency" => Self {
+                severity: FailureSeverity::Degraded,
+                data_correctness: DataCorrectnessStatus::Passed,
+                availability: AvailabilityStatus::RecoveredAfterTailLatency,
+                data_loss: Some(false),
+                corruption: Some(false),
+                recovered_within_window: Some(true),
+            },
+            "committed_object_unavailable" => Self {
+                severity: FailureSeverity::FailAvailability,
+                data_correctness: DataCorrectnessStatus::Unknown,
+                availability: AvailabilityStatus::CommittedObjectUnavailable,
+                data_loss: None,
+                corruption: Some(false),
+                recovered_within_window: Some(false),
+            },
+            "data_corruption" => Self {
+                severity: FailureSeverity::FailCorrectness,
+                data_correctness: DataCorrectnessStatus::Failed,
+                availability: AvailabilityStatus::Unknown,
+                data_loss: None,
+                corruption: Some(true),
+                recovered_within_window: None,
+            },
+            "harness_error"
+            | "test_harness"
+            | "test_or_environment"
+            | "environment_or_fault_backend" => Self {
+                severity: FailureSeverity::Infra,
+                data_correctness: DataCorrectnessStatus::Unknown,
+                availability: AvailabilityStatus::Unknown,
+                data_loss: None,
+                corruption: None,
+                recovered_within_window: None,
+            },
+            _ => Self {
+                severity: FailureSeverity::NeedsInvestigation,
+                data_correctness: DataCorrectnessStatus::Unknown,
+                availability: AvailabilityStatus::Unknown,
+                data_loss: None,
+                corruption: None,
+                recovered_within_window: None,
+            },
         }
     }
 }

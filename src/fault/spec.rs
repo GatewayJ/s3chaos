@@ -109,7 +109,7 @@ pub struct FaultRunFaultSpec {
     pub parameters: FaultInjectionParameters,
     pub target: FaultRunTargetSpec,
     pub selection: FaultRunSelectionSpec,
-    pub duration_seconds: u64,
+    pub fault_duration_seconds: u64,
     pub observability: String,
     pub conflict_domain: String,
 }
@@ -243,7 +243,7 @@ impl FaultRunFaultSpec {
             parameters: fault.parameters().clone(),
             target: FaultRunTargetSpec::from_target(fault.target()),
             selection: FaultRunSelectionSpec::from_selection(fault.selection()),
-            duration_seconds: fault.duration().as_secs(),
+            fault_duration_seconds: fault.duration().as_secs(),
             observability: scenario_spec.observability.to_string(),
             conflict_domain: scenario_spec.conflict_domain.to_string(),
         }
