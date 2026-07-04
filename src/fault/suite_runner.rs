@@ -24,12 +24,13 @@ use crate::fault::{
     artifact_validation::{ArtifactValidationOptions, validate_fault_artifacts},
     config::{FaultTestConfig, FaultWorkloadProfile, default_percent_for_scenario},
     plan::{FaultPlan, FaultPlanOptions, FaultSelection, FaultTarget, FaultWorkloadMode},
+    reporting::{FailureSeverity, FailureSummary},
     runner::run_scenario_with_config,
     scenarios::{FaultScenario, FaultScenarioSpec, scenario_spec},
     spec::FaultRunArtifactSpec,
     suite::{
-        ResolvedFaultSuite, ResolvedFaultSuiteScenario, ResolvedFaultSuiteWorkloadDurationProfile,
-        ResolvedFaultSuiteWorkloadOverride, resolve_fault_suite_yaml,
+        ResolvedFaultSuite, ResolvedFaultSuiteScenario, ResolvedFaultSuiteWorkloadOverride,
+        resolve_fault_suite_yaml,
     },
     workload::{
         WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadDistribution, WorkloadPlan,
@@ -77,6 +78,7 @@ pub struct FaultSuitePlanCluster {
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanBudgets {
     pub stop_on_first_failure: bool,
+    pub continue_on_severities: Vec<FailureSeverity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_duration_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,7 +102,7 @@ pub struct FaultSuitePlanAttempt {
     pub impact_policy: String,
     pub expected_backend: String,
     pub catalog_target: String,
-    pub duration_seconds: u64,
+    pub fault_duration_seconds: u64,
     pub workload: FaultSuitePlanWorkload,
     pub faults: Vec<FaultSuitePlanFault>,
     pub requires_chaos_mesh: bool,
@@ -118,7 +120,7 @@ pub struct FaultSuitePlanWorkload {
     pub objects: usize,
     pub concurrency: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration_profile_min_seconds: Option<u64>,
+    pub profile: Option<String>,
     pub operation_mix: crate::fault::workload::WorkloadOperationMix,
     pub payload_distribution: Vec<FaultSuitePlanPayloadClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,7 +146,7 @@ pub struct FaultSuitePlanFault {
     pub parameters: crate::fault::plan::FaultInjectionParameters,
     pub target: FaultSuitePlanTarget,
     pub selection: FaultSuitePlanSelection,
-    pub duration_seconds: u64,
+    pub fault_duration_seconds: u64,
     pub observability: String,
     pub conflict_domain: String,
 }
@@ -178,7 +180,7 @@ pub struct FaultSuitePlanArtifacts {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanBudgetImpact {
-    pub duration_seconds: u64,
+    pub fault_duration_seconds: u64,
     pub recovery_timeout_seconds: u64,
     pub recovery_stability_reread_seconds: u64,
     pub minimum_required_seconds: u64,
@@ -242,15 +244,56 @@ pub struct FaultSuiteRunSummary {
     pub ended_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_seconds: Option<u64>,
+    pub failures: Vec<FaultSuiteRunFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure_reason: Option<String>,
+    pub stop_reason: Option<FaultSuiteStopReason>,
     pub stop_on_first_failure: bool,
+    pub continue_on_severities: Vec<FailureSeverity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_duration_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_client_disruptions: Option<usize>,
     pub total_client_disruptions: usize,
     pub attempts: Vec<FaultSuiteRunAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuiteRunFailure {
+    pub index: usize,
+    pub kind: FaultSuiteRunFailureKind,
+    pub reason: String,
+    pub stopped_suite: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repetition: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<FailureSeverity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_artifacts_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultSuiteRunFailureKind {
+    AttemptFailure,
+    SuiteBudget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum FaultSuiteStopReason {
+    Failure {
+        #[serde(rename = "failureIndex")]
+        failure_index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -272,6 +315,10 @@ pub struct FaultSuiteRunAttempt {
     pub recommitted: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub committed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<FailureSeverity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -315,7 +362,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
             &planned.plan.scenario,
             planned.plan.repetition,
         ) {
-            summary.fail(reason);
+            summary.record_suite_budget_failure(reason);
             write_summary(&summary_path, &summary)?;
             break 'suite;
         }
@@ -338,6 +385,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
         );
 
         let result = run_scenario_with_config(planned.config.clone()).await;
+        let mut stop_after_attempt_failure = false;
         match result {
             Ok(()) => match validate_attempt_artifacts(&planned.config) {
                 Ok(report) => {
@@ -353,7 +401,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                         execution_plan.suite.budgets.max_client_disruptions
                         && summary.total_client_disruptions > max_disruptions
                     {
-                        summary.fail(format!(
+                        summary.record_suite_budget_failure(format!(
                             "suite maxClientDisruptions budget {max_disruptions} was exceeded with {} disruptions",
                             summary.total_client_disruptions
                         ));
@@ -362,28 +410,57 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                     }
                 }
                 Err(error) => {
-                    attempt.fail(format!("artifact validation failed: {error}"));
-                    replace_last_attempt(&mut summary, attempt);
-                    summary.fail(format!(
-                        "scenario {} repetition {} artifact validation failed: {error}",
+                    let (attempt_error, failure_summary, failure_severity) =
+                        attempt_failure_details(
+                            &planned.plan,
+                            format!("artifact validation failed: {error}"),
+                        );
+                    attempt.fail(attempt_error.clone(), failure_summary.as_ref());
+                    let failure_message = format!(
+                        "scenario {} repetition {} failed: {attempt_error}",
                         planned.plan.scenario, planned.plan.repetition
-                    ));
+                    );
+                    stop_after_attempt_failure = should_stop_after_attempt_failure(
+                        &execution_plan.suite.budgets.continue_on_severities,
+                        execution_plan.suite.budgets.stop_on_first_failure,
+                        failure_severity,
+                    );
+                    summary.record_attempt_failure(
+                        &attempt,
+                        failure_summary.as_ref(),
+                        attempt_failure_summary_artifact(&planned.plan),
+                        failure_message,
+                        stop_after_attempt_failure,
+                    );
+                    replace_last_attempt(&mut summary, attempt);
                 }
             },
             Err(error) => {
-                attempt.fail(error.to_string());
-                replace_last_attempt(&mut summary, attempt);
-                summary.fail(format!(
-                    "scenario {} repetition {} failed: {error}",
+                let (attempt_error, failure_summary, failure_severity) =
+                    attempt_failure_details(&planned.plan, error.to_string());
+                attempt.fail(attempt_error.clone(), failure_summary.as_ref());
+                let failure_message = format!(
+                    "scenario {} repetition {} failed: {attempt_error}",
                     planned.plan.scenario, planned.plan.repetition
-                ));
+                );
+                stop_after_attempt_failure = should_stop_after_attempt_failure(
+                    &execution_plan.suite.budgets.continue_on_severities,
+                    execution_plan.suite.budgets.stop_on_first_failure,
+                    failure_severity,
+                );
+                summary.record_attempt_failure(
+                    &attempt,
+                    failure_summary.as_ref(),
+                    attempt_failure_summary_artifact(&planned.plan),
+                    failure_message,
+                    stop_after_attempt_failure,
+                );
+                replace_last_attempt(&mut summary, attempt);
             }
         }
 
         write_summary(&summary_path, &summary)?;
-        if summary.status == SuiteRunStatus::Failed
-            && execution_plan.suite.budgets.stop_on_first_failure
-        {
+        if stop_after_attempt_failure {
             break 'suite;
         }
     }
@@ -476,7 +553,7 @@ fn build_fault_suite_execution_plan(
             required_tools.extend(spec.required_tools.iter().map(|tool| (*tool).to_string()));
 
             let budget = FaultSuitePlanBudgetImpact {
-                duration_seconds: config.duration.as_secs(),
+                fault_duration_seconds: config.duration.as_secs(),
                 recovery_timeout_seconds: config.cluster.timeout.as_secs(),
                 recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
                 minimum_required_seconds: required,
@@ -511,6 +588,7 @@ fn build_fault_suite_execution_plan(
         cluster: FaultSuitePlanCluster::from_config(&base_config),
         budgets: FaultSuitePlanBudgets {
             stop_on_first_failure: suite.budgets.stop_on_first_failure,
+            continue_on_severities: suite.budgets.continue_on_severities.clone(),
             max_duration_seconds: suite.budgets.max_duration_seconds,
             max_client_disruptions: suite.budgets.max_client_disruptions,
             recovery_stable_window_seconds: suite.budgets.recovery_stable_window_seconds,
@@ -584,11 +662,6 @@ impl FaultSuitePlanAttempt {
             .map(FaultSuitePlanPayloadClass::from)
             .collect();
         let hotspot = workload_plan.hotspot;
-        let duration_profile_min_seconds = input.scenario.workload.as_ref().and_then(|workload| {
-            workload
-                .duration_profile_for(input.config.duration.as_secs())
-                .map(|profile| profile.min_duration_seconds)
-        });
 
         Ok(Self {
             index: input.index,
@@ -600,12 +673,12 @@ impl FaultSuitePlanAttempt {
             impact_policy: input.spec.impact_policy.as_str().to_string(),
             expected_backend: input.spec.backend.as_str().to_string(),
             catalog_target: input.spec.target.to_string(),
-            duration_seconds: input.config.duration.as_secs(),
+            fault_duration_seconds: input.config.duration.as_secs(),
             workload: FaultSuitePlanWorkload {
                 mode: workload_mode_name(input.fault_plan.workload_mode).to_string(),
                 objects: input.config.workload.object_count,
                 concurrency: input.config.workload.concurrency,
-                duration_profile_min_seconds,
+                profile: input.scenario.workload_profile.clone(),
                 operation_mix: input.config.workload_operation_mix,
                 payload_distribution,
                 hotspot,
@@ -662,7 +735,7 @@ impl FaultSuitePlanFault {
             parameters: fault.parameters().clone(),
             target: FaultSuitePlanTarget::from_target(fault.target()),
             selection: FaultSuitePlanSelection::from_selection(fault.selection()),
-            duration_seconds: fault.duration().as_secs(),
+            fault_duration_seconds: fault.duration().as_secs(),
             observability: spec.observability.to_string(),
             conflict_domain: spec.conflict_domain.to_string(),
         }
@@ -729,8 +802,8 @@ fn scenario_config(
     let mut config = base.clone();
     config.scenario = scenario.name.clone();
     config.scenario_parameters = scenario.params.clone();
-    if let Some(duration_seconds) = scenario.duration_seconds {
-        config.duration = Duration::from_secs(duration_seconds);
+    if let Some(fault_duration_seconds) = scenario.fault_duration_seconds {
+        config.duration = Duration::from_secs(fault_duration_seconds);
     }
     if let Some(percent) = scenario.percent {
         config.percent = percent;
@@ -741,9 +814,6 @@ fn scenario_config(
     }
     if let Some(workload) = &scenario.workload {
         apply_workload_override(&mut config, workload)?;
-        if let Some(profile) = workload.duration_profile_for(config.duration.as_secs()) {
-            apply_workload_duration_profile(&mut config, profile)?;
-        }
         config.prefill_concurrency = config
             .prefill_concurrency
             .min(config.workload.concurrency)
@@ -773,20 +843,6 @@ fn apply_workload_override(
         workload.operation_weights,
         workload.payload_distribution.as_ref(),
         workload.hotspot,
-    )
-}
-
-fn apply_workload_duration_profile(
-    config: &mut FaultTestConfig,
-    profile: &ResolvedFaultSuiteWorkloadDurationProfile,
-) -> Result<()> {
-    apply_workload_fields(
-        config,
-        profile.objects,
-        profile.concurrency,
-        profile.operation_weights,
-        profile.payload_distribution.as_ref(),
-        profile.hotspot,
     )
 }
 
@@ -848,7 +904,7 @@ fn suite_duration_budget_failure(
     let required = attempt_minimum_required_duration(config).unwrap_or(Duration::MAX);
     if remaining < required {
         return Some(format!(
-            "suite maxDuration budget {max_duration_seconds}s leaves {}s, but scenario {scenario} repetition {repetition} needs at least {}s (duration {}s + recovery timeout {}s + recovery stability reread {}s)",
+            "suite maxDuration budget {max_duration_seconds}s leaves {}s, but scenario {scenario} repetition {repetition} needs at least {}s (fault duration {}s + recovery timeout {}s + recovery stability reread {}s)",
             remaining.as_secs(),
             required.as_secs(),
             config.duration.as_secs(),
@@ -935,6 +991,54 @@ fn replace_last_attempt(summary: &mut FaultSuiteRunSummary, attempt: FaultSuiteR
     }
 }
 
+fn read_attempt_failure_summary(plan: &FaultSuitePlanAttempt) -> Result<Option<FailureSummary>> {
+    let path = Path::new(&plan.artifacts.case_dir).join("failure-summary.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read failure summary {}", path.display()))?;
+    let summary = serde_json::from_str::<FailureSummary>(&raw)
+        .with_context(|| format!("parse failure summary {}", path.display()))?;
+    Ok(Some(summary))
+}
+
+fn attempt_failure_details(
+    plan: &FaultSuitePlanAttempt,
+    base_error: String,
+) -> (String, Option<FailureSummary>, Option<FailureSeverity>) {
+    match read_attempt_failure_summary(plan) {
+        Ok(summary) => {
+            let severity = summary.as_ref().map(FailureSummary::severity);
+            (base_error, summary, severity)
+        }
+        Err(error) => (
+            format!("{base_error}; failure-summary.json could not be read: {error}"),
+            None,
+            None,
+        ),
+    }
+}
+
+fn attempt_failure_summary_artifact(plan: &FaultSuitePlanAttempt) -> Option<String> {
+    let path = Path::new(&plan.artifacts.case_dir).join("failure-summary.json");
+    path.is_file().then(|| path.display().to_string())
+}
+
+fn should_stop_after_attempt_failure(
+    continue_on_severities: &[FailureSeverity],
+    stop_on_first_failure: bool,
+    severity: Option<FailureSeverity>,
+) -> bool {
+    if !stop_on_first_failure {
+        return false;
+    }
+    match severity {
+        Some(severity) => !continue_on_severities.contains(&severity),
+        None => true,
+    }
+}
+
 fn write_summary(path: &Path, summary: &FaultSuiteRunSummary) -> Result<()> {
     fs::write(path, serde_json::to_string_pretty(summary)?)
         .with_context(|| format!("write suite summary {}", path.display()))
@@ -951,8 +1055,10 @@ impl FaultSuiteRunSummary {
             started_at_ms: now_ms(),
             ended_at_ms: None,
             elapsed_seconds: None,
-            failure_reason: None,
+            failures: Vec::new(),
+            stop_reason: None,
             stop_on_first_failure: suite.budgets.stop_on_first_failure,
+            continue_on_severities: suite.budgets.continue_on_severities.clone(),
             max_duration_seconds: suite.budgets.max_duration_seconds,
             max_client_disruptions: suite.budgets.max_client_disruptions,
             total_client_disruptions: 0,
@@ -964,11 +1070,54 @@ impl FaultSuiteRunSummary {
         self.status = SuiteRunStatus::Succeeded;
     }
 
-    fn fail(&mut self, reason: String) {
+    fn record_suite_budget_failure(&mut self, reason: String) {
+        self.record_failure(FaultSuiteRunFailure {
+            index: 0,
+            kind: FaultSuiteRunFailureKind::SuiteBudget,
+            reason,
+            stopped_suite: true,
+            attempt_index: None,
+            scenario: None,
+            repetition: None,
+            severity: None,
+            classification: None,
+            attempt_artifacts_dir: None,
+            failure_summary: None,
+        });
+    }
+
+    fn record_attempt_failure(
+        &mut self,
+        attempt: &FaultSuiteRunAttempt,
+        failure_summary: Option<&FailureSummary>,
+        failure_summary_artifact: Option<String>,
+        reason: String,
+        stopped_suite: bool,
+    ) {
+        self.record_failure(FaultSuiteRunFailure {
+            index: 0,
+            kind: FaultSuiteRunFailureKind::AttemptFailure,
+            reason,
+            stopped_suite,
+            attempt_index: Some(attempt.index),
+            scenario: Some(attempt.scenario.clone()),
+            repetition: Some(attempt.repetition),
+            severity: failure_summary.map(FailureSummary::severity),
+            classification: failure_summary.map(|summary| summary.classification().to_string()),
+            attempt_artifacts_dir: Some(attempt.artifacts_dir.clone()),
+            failure_summary: failure_summary_artifact,
+        });
+    }
+
+    fn record_failure(&mut self, mut failure: FaultSuiteRunFailure) {
         self.status = SuiteRunStatus::Failed;
-        if self.failure_reason.is_none() {
-            self.failure_reason = Some(reason);
+        failure.index = self.failures.len();
+        if failure.stopped_suite && self.stop_reason.is_none() {
+            self.stop_reason = Some(FaultSuiteStopReason::Failure {
+                failure_index: failure.index,
+            });
         }
+        self.failures.push(failure);
     }
 }
 
@@ -986,6 +1135,8 @@ impl FaultSuiteRunAttempt {
             client_disruptions: None,
             recommitted: None,
             committed: None,
+            severity: None,
+            classification: None,
             error: None,
         }
     }
@@ -999,9 +1150,13 @@ impl FaultSuiteRunAttempt {
         self.committed = Some(committed);
     }
 
-    fn fail(&mut self, error: String) {
+    fn fail(&mut self, error: String, failure_summary: Option<&FailureSummary>) {
         self.status = SuiteAttemptStatus::Failed;
         self.ended_at_ms = Some(now_ms());
+        if let Some(summary) = failure_summary {
+            self.severity = Some(summary.severity());
+            self.classification = Some(summary.classification().to_string());
+        }
         self.error = Some(error);
     }
 }
@@ -1016,14 +1171,20 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_seed, build_fault_suite_execution_plan, scenario_config,
-        suite_duration_budget_failure, validate_suite_runtime_contract,
+        FaultSuiteRunAttempt, FaultSuiteRunFailureKind, FaultSuiteRunSummary, FaultSuiteStopReason,
+        SuiteRunStatus, attempt_failure_details, attempt_seed, build_fault_suite_execution_plan,
+        scenario_config, should_stop_after_attempt_failure, suite_duration_budget_failure,
+        validate_suite_runtime_contract,
     };
     use crate::fault::{
-        config::FaultTestConfig, plan::FaultInjectionParameters, suite::FaultSuite,
+        config::FaultTestConfig,
+        plan::FaultInjectionParameters,
+        reporting::{FailureSeverity, FailureSummary},
+        suite::FaultSuite,
         workload::WorkloadOperationMix,
     };
-    use std::{path::PathBuf, time::Duration};
+    use serde_json::json;
+    use std::{fs, path::Path, path::PathBuf, time::Duration};
 
     #[test]
     fn suite_plan_expands_attempts_artifacts_faults_and_budget() {
@@ -1040,7 +1201,7 @@ budgets:
 scenarios:
   - name: io-eio
     repetitions: 2
-    duration: 10m
+    faultDuration: 10m
     percent: 35
     workload:
       objects: 64
@@ -1062,6 +1223,10 @@ scenarios:
         assert_eq!(execution.plan.run_id, "suite-fixed");
         assert_eq!(execution.plan.suite_seed, 100);
         assert_eq!(execution.plan.budgets.max_duration_seconds, Some(1920));
+        assert_eq!(
+            execution.plan.budgets.continue_on_severities,
+            vec![FailureSeverity::Degraded]
+        );
         assert_eq!(execution.plan.budgets.minimum_required_seconds, 1920);
         assert!(execution.plan.requires_chaos_mesh);
         assert_eq!(
@@ -1074,9 +1239,10 @@ scenarios:
         assert_eq!(first.index, 1);
         assert_eq!(first.scenario, "io-eio");
         assert_eq!(first.case_name, "fault_io_eio_preserves_committed_objects");
-        assert_eq!(first.duration_seconds, 600);
+        assert_eq!(first.fault_duration_seconds, 600);
         assert_eq!(first.workload.objects, 64);
         assert_eq!(first.workload.concurrency, 8);
+        assert_eq!(first.workload.profile, None);
         assert_eq!(first.workload.operation_mix.put, 1);
         assert_eq!(first.workload.seed, attempt_seed(Some(100), 1, 1).unwrap());
         assert!(first.artifacts.attempt_dir.ends_with("001-io-eio-r1"));
@@ -1092,6 +1258,7 @@ scenarios:
                 .required
                 .contains(&"run-spec.json".to_string())
         );
+        assert_eq!(first.budget.fault_duration_seconds, 600);
         assert_eq!(first.budget.recovery_stability_reread_seconds, 60);
         assert_eq!(first.budget.minimum_required_seconds, 960);
         assert_eq!(first.budget.remaining_before_seconds, Some(1920));
@@ -1121,7 +1288,7 @@ metadata:
   name: rustfs-smoke
 scenarios:
   - name: network-delay
-    duration: 8m
+    faultDuration: 8m
     params:
       kind: networkDelay
       latency: 350ms
@@ -1197,41 +1364,36 @@ scenarios:
     }
 
     #[test]
-    fn suite_plan_applies_duration_based_workload_profile() {
+    fn suite_plan_applies_reusable_workload_profile() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
             r#"
 apiVersion: rustfs.com/s3chaos/v1alpha1
 kind: FaultSuite
 metadata:
   name: rustfs-smoke
+workloadProfiles:
+  long-read:
+    objects: 96
+    concurrency: 12
+    operationWeights:
+      put: 2
+      overwrite: 1
+      get: 4
+      list: 1
+      delete: 1
+      multipart: 1
+    payloadDistribution:
+      - sizeBytes: 1024
+        weight: 1
+      - sizeBytes: 4096
+        weight: 1
+    hotspot:
+      objectPercent: 20
+      operationPercent: 80
 scenarios:
   - name: io-eio
-    duration: 20m
-    workload:
-      objects: 64
-      concurrency: 8
-      durationProfiles:
-        - minDuration: 5m
-          objects: 72
-          concurrency: 9
-        - minDuration: 15m
-          objects: 96
-          concurrency: 12
-          operationWeights:
-            put: 2
-            overwrite: 1
-            get: 4
-            list: 1
-            delete: 1
-            multipart: 1
-          payloadDistribution:
-            - sizeBytes: 1024
-              weight: 1
-            - sizeBytes: 4096
-              weight: 1
-          hotspot:
-            objectPercent: 20
-            operationPercent: 80
+    faultDuration: 20m
+    workloadProfile: long-read
 "#,
         )
         .expect("suite yaml")
@@ -1246,7 +1408,8 @@ scenarios:
         let attempt = &execution.plan.attempts[0];
         assert_eq!(attempt.workload.objects, 96);
         assert_eq!(attempt.workload.concurrency, 12);
-        assert_eq!(attempt.workload.duration_profile_min_seconds, Some(900));
+        assert_eq!(attempt.workload.profile.as_deref(), Some("long-read"));
+        assert_eq!(attempt.fault_duration_seconds, 1200);
         assert_eq!(attempt.workload.operation_mix.get, 4);
         assert_eq!(attempt.workload.payload_distribution[0].object_count, 48);
         assert_eq!(attempt.workload.payload_distribution[1].object_count, 48);
@@ -1312,7 +1475,7 @@ budgets:
   maxDuration: 10m
 scenarios:
   - name: io-eio
-    duration: 10m
+    faultDuration: 10m
 "#,
         )
         .expect("suite yaml")
@@ -1339,7 +1502,7 @@ budgets:
   recoveryStableWindowSeconds: 30
 scenarios:
   - name: io-eio
-    duration: 10m
+    faultDuration: 10m
     percent: 35
     workload:
       objects: 64
@@ -1437,6 +1600,214 @@ scenarios:
     }
 
     #[test]
+    fn stop_policy_continues_only_configured_severities() {
+        assert!(!should_stop_after_attempt_failure(
+            &[FailureSeverity::Degraded],
+            true,
+            Some(FailureSeverity::Degraded)
+        ));
+        assert!(should_stop_after_attempt_failure(
+            &[FailureSeverity::Degraded],
+            true,
+            Some(FailureSeverity::FailCorrectness)
+        ));
+        assert!(should_stop_after_attempt_failure(
+            &[FailureSeverity::Degraded],
+            true,
+            None
+        ));
+        assert!(!should_stop_after_attempt_failure(
+            &[],
+            false,
+            Some(FailureSeverity::FailCorrectness)
+        ));
+    }
+
+    #[test]
+    fn suite_summary_records_failure_history_and_terminal_stop_reason() {
+        let suite = single_scenario_suite();
+        let mut summary = FaultSuiteRunSummary::started(&suite, "suite-fixed".to_string());
+
+        let degraded = FailureSummary::new(
+            "io-eio",
+            "checker-pre-recommit-verdict",
+            "recovery_tail_read_latency",
+            "tail latency",
+        )
+        .with_recovered_within_seconds(Some(27));
+        let mut first_attempt =
+            FaultSuiteRunAttempt::running(1, "io-eio", 1, Path::new("attempts/0001"));
+        first_attempt.fail("tail latency".to_string(), Some(&degraded));
+        summary.record_attempt_failure(
+            &first_attempt,
+            Some(&degraded),
+            Some("attempts/0001/failure-summary.json".to_string()),
+            "scenario io-eio repetition 1 failed: tail latency".to_string(),
+            false,
+        );
+
+        assert_eq!(summary.status, SuiteRunStatus::Failed);
+        assert_eq!(summary.stop_reason, None);
+        assert_eq!(summary.failures.len(), 1);
+        assert_eq!(
+            summary.failures[0].kind,
+            FaultSuiteRunFailureKind::AttemptFailure
+        );
+        assert!(!summary.failures[0].stopped_suite);
+
+        let hard_failure = FailureSummary::new(
+            "network-delay",
+            "checker-pre-recommit-verdict",
+            "data_corruption",
+            "hash mismatch",
+        );
+        let mut second_attempt =
+            FaultSuiteRunAttempt::running(2, "network-delay", 1, Path::new("attempts/0002"));
+        second_attempt.fail("hash mismatch".to_string(), Some(&hard_failure));
+        summary.record_attempt_failure(
+            &second_attempt,
+            Some(&hard_failure),
+            Some("attempts/0002/failure-summary.json".to_string()),
+            "scenario network-delay repetition 1 failed: hash mismatch".to_string(),
+            true,
+        );
+
+        assert_eq!(
+            summary.stop_reason,
+            Some(FaultSuiteStopReason::Failure { failure_index: 1 })
+        );
+        assert_eq!(summary.failures.len(), 2);
+        assert!(summary.failures[1].stopped_suite);
+        assert_eq!(
+            summary.failures[1].severity,
+            Some(FailureSeverity::FailCorrectness)
+        );
+        assert_eq!(
+            summary.failures[1].classification.as_deref(),
+            Some("data_corruption")
+        );
+
+        let value = serde_json::to_value(&summary).expect("summary json");
+        assert!(value.get("failureReason").is_none());
+        assert_eq!(value["stopReason"]["type"], "failure");
+        assert_eq!(value["stopReason"]["failureIndex"], 1);
+        assert_eq!(value["failures"][0]["stoppedSuite"], false);
+        assert_eq!(
+            value["failures"][0]["failureSummary"],
+            "attempts/0001/failure-summary.json"
+        );
+    }
+
+    #[test]
+    fn attempt_failure_details_reads_summary_for_severity_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite = single_scenario_suite();
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+        base.cluster.artifacts_dir = dir.path().to_path_buf();
+        let execution = build_fault_suite_execution_plan(suite, base, "suite-fixed".to_string())
+            .expect("suite execution plan");
+        let planned = &execution.plan.attempts[0];
+        fs::create_dir_all(&planned.artifacts.case_dir).expect("case dir");
+        write_failure_summary(
+            Path::new(&planned.artifacts.case_dir),
+            json!({
+                "scenario": "io-eio",
+                "stage": "checker-pre-recommit-verdict",
+                "verdict": "failed",
+                "severity": "degraded",
+                "classification": "recovery_tail_read_latency",
+                "data_correctness": "passed",
+                "availability": "recovered_after_tail_latency",
+                "data_loss": false,
+                "corruption": false,
+                "recovered_within_window": true,
+                "recovered_within_seconds": 27,
+                "message": "tail latency"
+            }),
+        );
+
+        let (attempt_error, summary, severity) =
+            attempt_failure_details(planned, "scenario failed".to_string());
+
+        assert_eq!(attempt_error, "scenario failed");
+        assert_eq!(severity, Some(FailureSeverity::Degraded));
+        assert!(!should_stop_after_attempt_failure(
+            &[FailureSeverity::Degraded],
+            true,
+            severity
+        ));
+        let mut attempt = FaultSuiteRunAttempt::running(
+            planned.index,
+            &planned.scenario,
+            planned.repetition,
+            Path::new(&planned.artifacts.attempt_dir),
+        );
+        attempt.fail(attempt_error, summary.as_ref());
+        assert_eq!(attempt.severity, Some(FailureSeverity::Degraded));
+        assert_eq!(
+            attempt.classification.as_deref(),
+            Some("recovery_tail_read_latency")
+        );
+
+        write_failure_summary(
+            Path::new(&planned.artifacts.case_dir),
+            json!({
+                "scenario": "io-eio",
+                "stage": "checker-pre-recommit-verdict",
+                "verdict": "failed",
+                "severity": "fail_correctness",
+                "classification": "data_corruption",
+                "data_correctness": "failed",
+                "availability": "unknown",
+                "corruption": true,
+                "message": "hash mismatch"
+            }),
+        );
+        let (_, _, severity) = attempt_failure_details(planned, "scenario failed".to_string());
+
+        assert_eq!(severity, Some(FailureSeverity::FailCorrectness));
+        assert!(should_stop_after_attempt_failure(
+            &[FailureSeverity::Degraded],
+            true,
+            severity
+        ));
+    }
+
+    #[test]
+    fn attempt_failure_details_surfaces_malformed_summary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite = single_scenario_suite();
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+        base.cluster.artifacts_dir = dir.path().to_path_buf();
+        let execution = build_fault_suite_execution_plan(suite, base, "suite-fixed".to_string())
+            .expect("suite execution plan");
+        let planned = &execution.plan.attempts[0];
+        fs::create_dir_all(&planned.artifacts.case_dir).expect("case dir");
+        fs::write(
+            Path::new(&planned.artifacts.case_dir).join("failure-summary.json"),
+            "{not json",
+        )
+        .expect("write malformed summary");
+
+        let (attempt_error, summary, severity) =
+            attempt_failure_details(planned, "scenario failed".to_string());
+
+        assert!(summary.is_none());
+        assert_eq!(severity, None);
+        assert!(
+            attempt_error.contains("failure-summary.json could not be read"),
+            "{attempt_error}"
+        );
+        assert!(should_stop_after_attempt_failure(
+            &[FailureSeverity::Degraded],
+            true,
+            severity
+        ));
+    }
+
+    #[test]
     fn suite_runtime_contract_rejects_stable_window_that_matches_timeout_before_run_starts() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
             r#"
@@ -1462,5 +1833,30 @@ scenarios:
                 .to_string()
                 .contains("recoveryStableWindowSeconds must be less")
         );
+    }
+
+    fn single_scenario_suite() -> crate::fault::suite::ResolvedFaultSuite {
+        serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    faultDuration: 10m
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite")
+    }
+
+    fn write_failure_summary(case_dir: &Path, summary: serde_json::Value) {
+        fs::write(
+            case_dir.join("failure-summary.json"),
+            serde_json::to_string_pretty(&summary).expect("json"),
+        )
+        .expect("write failure summary");
     }
 }

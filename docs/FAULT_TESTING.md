@@ -264,13 +264,14 @@ command for the desired scenario. Tool requirements, such as `warp` for
 
 Scenario definitions stay in Rust. YAML suites are a declarative composition
 layer for selected scenarios, budgets, observability, typed scenario parameters,
-and per-scenario workload overrides. They compile against the Rust catalog and
-fail fast when a scenario name, percent override, duration, parameter, or
-workload budget is invalid. If `workload` or a duration profile changes
-`objects` or `concurrency`, set both fields together; `operationWeights`,
-`payloadDistribution`, `hotspot`, and `durationProfiles` may be set by
-themselves. Unknown YAML fields are rejected so typos cannot silently drop suite
-budgets, parameters, or workload overrides.
+and named workload profiles. They compile against the Rust catalog and fail fast
+when a scenario name, workload profile reference, percent override, fault
+duration, parameter, or workload budget is invalid. `workloadProfiles` define
+pressure scale and operation model; if a profile changes `objects` or
+`concurrency`, set both fields together. `operationWeights`,
+`payloadDistribution`, and `hotspot` may be set by themselves. Unknown YAML
+fields are rejected so typos cannot silently drop suite budgets, parameters, or
+workload choices.
 
 Generate a starting point:
 
@@ -291,44 +292,45 @@ metadata:
 budgets:
   maxDuration: 2h
   stopOnFirstFailure: true
+  continueOnSeverities:
+    - degraded
   maxClientDisruptions: 20
   recoveryStableWindowSeconds: 60
 observability:
   chaosDashboard: optional
 artifacts:
   required: strict
+workloadProfiles:
+  smoke:
+    objects: 40000
+    concurrency: 80
+    operationWeights:
+      put: 1
+      overwrite: 1
+      get: 1
+      list: 1
+      delete: 1
+      multipart: 1
+    payloadDistribution:
+      - sizeBytes: 4096
+        weight: 85
+      - sizeBytes: 16384
+        weight: 10
+      - sizeBytes: 8388608
+        weight: 4
+      - sizeBytes: 16777216
+        weight: 1
+    hotspot:
+      objectPercent: 10
+      operationPercent: 70
 scenarios:
   - name: io-eio
-    duration: 10m
+    faultDuration: 10m
     percent: 20
-    workload:
-      objects: 40000
-      concurrency: 80
-      operationWeights:
-        put: 1
-        overwrite: 1
-        get: 1
-        list: 1
-        delete: 1
-        multipart: 1
-      payloadDistribution:
-        - sizeBytes: 4096
-          weight: 85
-        - sizeBytes: 16384
-          weight: 10
-        - sizeBytes: 8388608
-          weight: 4
-        - sizeBytes: 16777216
-          weight: 1
-      hotspot:
-        objectPercent: 10
-        operationPercent: 70
-      durationProfiles:
-        - minDuration: 10m
-          objects: 80000
-          concurrency: 120
+    workloadProfile: smoke
   - name: network-delay
-    duration: 8m
+    faultDuration: 8m
+    workloadProfile: smoke
     params:
       kind: networkDelay
       latency: 200ms
@@ -345,17 +347,23 @@ defaults and explicit values into `parameters`, so operators can review the
 exact latency, loss/corruption rate, IO latency methods, or stress intensity
 before a destructive run.
 
-`operationWeights` controls the relative mix of PUT, overwrite, GET, LIST,
-DELETE, and multipart work. `payloadDistribution` controls generated object
-sizes by weighted `sizeBytes` classes. `hotspot` routes the configured
-percentage of operations to the configured percentage of the prefilled object
-set, which lets operators model repeated access to a smaller key range without
-exposing raw object selectors. `durationProfiles` selects the profile with the
-highest `minDuration` that is less than or equal to the resolved scenario
-`duration`; profile fields override the static workload fields before planning
-and execution. If a scenario sets an explicit `duration`, at least one duration
-profile threshold must be reachable by that duration. Scenario `duration` still
-controls the fault window.
+`workloadProfiles` are reusable workload definitions. `objects` and
+`concurrency` set pressure scale. `operationWeights` controls the relative mix
+of PUT, overwrite, GET, LIST, DELETE, and multipart work.
+`payloadDistribution` controls generated object sizes by weighted `sizeBytes`
+classes. `hotspot` routes the configured percentage of operations to the
+configured percentage of the prefilled object set, which lets operators model
+repeated access to a smaller key range without exposing raw object selectors.
+The recommended suite shape is to let each scenario select one profile with
+`workloadProfile`. A scenario may alternatively define an inline `workload` for
+one-off suites, but it cannot set both.
+
+Scenario `faultDuration` is the fault injection window. It does not derive
+workload scale and does not promise the workload will finish. Current execution
+order is: prefill objects, apply fault, run workload while the fault is active,
+delete the fault, then run recovery checks. `suite.budgets.maxDuration` is the
+protective upper bound for the planned suite/attempt budget, not a workload
+profile selector.
 
 Render and review the exact destructive plan before running:
 
@@ -363,11 +371,11 @@ Render and review the exact destructive plan before running:
 make fault-suite-plan SUITE=suite.yaml
 ```
 
-The plan expands each attempt with scenario, repetition, resolved duration,
-selected faults, typed fault parameters, targets, workload profile, operation
-mix, payload distribution, hotspot behavior, expected backend, CRDs/tools,
-artifact paths, and budget impact. Suite runs also write the execution plan to
-`suite-plan.json` under the suite artifact root. Set
+The plan expands each attempt with scenario, repetition, resolved fault
+duration, selected faults, typed fault parameters, targets, selected workload
+profile, operation mix, payload distribution, hotspot behavior, expected
+backend, CRDs/tools, artifact paths, and budget impact. Suite runs also write
+the execution plan to `suite-plan.json` under the suite artifact root. Set
 `RUSTFS_FAULT_TEST_SEED` before both planning and running when the preview and
 execution must use the same workload seeds.
 
@@ -384,10 +392,13 @@ suite is running, and terminates the suite if the guard fails or `maxDuration`
 is reached. The Rust suite runner creates a suite artifact root under
 `RUSTFS_FAULT_TEST_ARTIFACTS`, runs each planned scenario/repetition in order,
 validates each successful scenario's artifacts with the Rust artifact contract,
-refuses to start impossible plans whose minimum attempt duration plus recovery
-timeout cannot fit within `maxDuration`, keeps enforcing the live remaining
-`maxDuration` before every attempt, enforces `stopOnFirstFailure` and cumulative
-`maxClientDisruptions`, and writes `suite-plan.json` and `suite-summary.json`.
+refuses to start impossible plans whose fault duration plus recovery timeout
+cannot fit within `maxDuration`, keeps enforcing the live remaining
+`maxDuration` before every attempt, enforces `stopOnFirstFailure`,
+`continueOnSeverities`, and cumulative `maxClientDisruptions`, and writes
+`suite-plan.json` and `suite-summary.json`. By default, `degraded` failures are
+recorded but do not stop the next planned attempt; harder failures still stop
+when `stopOnFirstFailure` is true.
 
 The suite runner is intentionally sequential. It does not yet support parallel
 execution, matrix expansion, per-scenario cluster/storage credentials,
@@ -422,6 +433,14 @@ Suite-level artifacts include:
 suite-plan.json
 suite-summary.json
 ```
+
+`suite-summary.json` keeps suite-level failure state as an index, not as one
+flattened message. `failures[]` records each failed attempt or suite-budget
+failure with its reason, severity/classification when available, and a pointer
+to the relevant attempt artifacts or `failure-summary.json`. `stopReason`
+points at the `failures[]` entry that actually stopped the suite early. If all
+planned attempts finish but one or more configured continuable failures were
+recorded, the suite status is still `failed` and `stopReason` is omitted.
 
 Key files:
 
@@ -484,7 +503,17 @@ the immediate checker failure intact; for committed-object GETs that returned
 HTTP 200 but timed out or hit a body streaming error, it also runs a bounded
 reread. The artifact classifies the failure as `recovery_tail_read_latency`,
 `committed_object_unavailable`, `data_corruption`, or `harness_error`;
-`failure-summary.json` uses the same classification.
+`failure-summary.json` uses the same classification and also records
+`verdict`, `severity`, `data_correctness`, `availability`, `data_loss`,
+`corruption`, and recovery-window fields. For example, a failed strict checker
+that later rereads every key successfully is reported as
+`verdict=failed`, `severity=degraded`,
+`classification=recovery_tail_read_latency`,
+`data_correctness=passed`, `availability=recovered_after_tail_latency`,
+`data_loss=false`, and `corruption=false`. The suite runner copies failure
+`severity` and `classification` into `suite-summary.json` attempt entries and
+the matching `failures[]` entry, then uses `continueOnSeverities` to decide
+whether to start the next attempt.
 When IOChaos deletion times out, the runner also captures
 `iochaos-finalizer-recovery-*.json`, `iochaos-delete-timeout.*`,
 `podiochaos-delete-timeout.*`, target pod/node evidence, target-node

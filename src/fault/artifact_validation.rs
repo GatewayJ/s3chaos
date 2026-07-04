@@ -30,6 +30,7 @@ use crate::fault::{
         DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS,
     },
     events::{RunEvent, RunEventStatus},
+    reporting::{AvailabilityStatus, DataCorrectnessStatus, FailureSeverity, FailureVerdict},
     scenarios,
     spec::{
         FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec,
@@ -330,8 +331,8 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
     );
     for fault in &spec.faults {
         ensure!(
-            fault.duration_seconds > 0,
-            "run-spec fault {} has zero duration",
+            fault.fault_duration_seconds > 0,
+            "run-spec fault {} has zero fault_duration_seconds",
             fault.name
         );
         ensure!(
@@ -451,6 +452,62 @@ fn validate_conditional_recovery_stability_artifact(root: &Path, case_name: &str
         !failure_summary.scenario.trim().is_empty() && !failure_summary.message.trim().is_empty(),
         "failure-summary.json must include non-empty scenario and message"
     );
+    validate_recovery_failure_summary_fields(&failure_summary, &recovery)?;
+    Ok(())
+}
+
+fn validate_recovery_failure_summary_fields(
+    summary: &FailureSummaryArtifact,
+    recovery: &RecoveryStabilityReport,
+) -> Result<()> {
+    ensure!(
+        summary.verdict == FailureVerdict::Failed,
+        "failure-summary.json verdict must be failed for recovery-stability failures"
+    );
+    match recovery.classification {
+        RecoveryStabilityClassification::RecoveryTailReadLatency => {
+            ensure!(
+                summary.severity == FailureSeverity::Degraded
+                    && summary.data_correctness == DataCorrectnessStatus::Passed
+                    && summary.availability == AvailabilityStatus::RecoveredAfterTailLatency
+                    && summary.data_loss == Some(false)
+                    && summary.corruption == Some(false)
+                    && summary.recovered_within_window == Some(true),
+                "recovery_tail_read_latency failure-summary.json must describe degraded recovered-tail latency without data loss or corruption"
+            );
+            ensure!(
+                summary.recovered_within_seconds == recovery.recovered_within_seconds
+                    && summary.recovered_within_seconds.is_some(),
+                "recovery_tail_read_latency failure-summary.json recovered_within_seconds must match recovery-stability-report.json"
+            );
+        }
+        RecoveryStabilityClassification::CommittedObjectUnavailable => {
+            ensure!(
+                summary.severity == FailureSeverity::FailAvailability
+                    && summary.data_correctness == DataCorrectnessStatus::Unknown
+                    && summary.availability == AvailabilityStatus::CommittedObjectUnavailable
+                    && summary.corruption == Some(false)
+                    && summary.recovered_within_window == Some(false),
+                "committed_object_unavailable failure-summary.json must describe an availability failure with unverified data correctness"
+            );
+        }
+        RecoveryStabilityClassification::DataCorruption => {
+            ensure!(
+                summary.severity == FailureSeverity::FailCorrectness
+                    && summary.data_correctness == DataCorrectnessStatus::Failed
+                    && summary.corruption == Some(true),
+                "data_corruption failure-summary.json must describe a correctness failure"
+            );
+        }
+        RecoveryStabilityClassification::HarnessError => {
+            ensure!(
+                summary.severity == FailureSeverity::Infra
+                    && summary.data_correctness == DataCorrectnessStatus::Unknown
+                    && summary.availability == AvailabilityStatus::Unknown,
+                "harness_error failure-summary.json must describe an infra/harness failure"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -691,7 +748,15 @@ struct RecommitReportArtifact {
 struct FailureSummaryArtifact {
     scenario: String,
     stage: String,
+    verdict: FailureVerdict,
+    severity: FailureSeverity,
     classification: String,
+    data_correctness: DataCorrectnessStatus,
+    availability: AvailabilityStatus,
+    data_loss: Option<bool>,
+    corruption: Option<bool>,
+    recovered_within_window: Option<bool>,
+    recovered_within_seconds: Option<u64>,
     message: String,
 }
 
@@ -919,7 +984,13 @@ mod tests {
             &json!({
                 "scenario": "io-eio",
                 "stage": "checker-pre-recommit-verdict",
+                "verdict": "failed",
+                "severity": "fail_availability",
                 "classification": "committed_object_unavailable",
+                "data_correctness": "unknown",
+                "availability": "committed_object_unavailable",
+                "corruption": false,
+                "recovered_within_window": false,
                 "message": "immediate checker failed"
             }),
         );
@@ -942,6 +1013,59 @@ mod tests {
                 .to_string()
                 .contains("failure-summary.json classification")
         );
+    }
+
+    #[test]
+    fn validates_recovery_tail_failure_summary_severity_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let case_dir = dir.path().join(case_name);
+        fs::create_dir_all(&case_dir).expect("case dir");
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms":1,"scenario":"io-eio","run_id":"run-1","stage":"checker-pre-recommit","status":"failed","message":"failed"}).to_string(),
+                json!({"at_ms":2,"scenario":"io-eio","run_id":"run-1","stage":"recovery-stability-reread","status":"succeeded","message":"done"}).to_string(),
+            ].join("\n"),
+        )
+        .expect("events");
+        write_json(
+            &case_dir,
+            "recovery-stability-report.json",
+            &json!({
+                "immediate_passed": false,
+                "reread_attempted_keys": ["k"],
+                "reread_recovered_keys": ["k"],
+                "still_unavailable_keys": [],
+                "hash_mismatches": [],
+                "data_corruption_evidence": [],
+                "harness_errors": [],
+                "max_recovery_seconds": 60,
+                "recovered_within_seconds": 27,
+                "classification": "recovery_tail_read_latency"
+            }),
+        );
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &json!({
+                "scenario": "io-eio",
+                "stage": "checker-pre-recommit-verdict",
+                "verdict": "failed",
+                "severity": "degraded",
+                "classification": "recovery_tail_read_latency",
+                "data_correctness": "passed",
+                "availability": "recovered_after_tail_latency",
+                "data_loss": false,
+                "corruption": false,
+                "recovered_within_window": true,
+                "recovered_within_seconds": 27,
+                "message": "immediate checker failed"
+            }),
+        );
+
+        super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
+            .expect("valid recovery failure fields");
     }
 
     fn write_success_artifacts(root: &std::path::Path, scenario: &str) {
@@ -992,7 +1116,7 @@ mod tests {
                 "backend": "chaos-mesh-io-chaos",
                 "target": {"kind": "rustfs-volume", "path": "/data/rustfs0"},
                 "selection": {"kind": "percent", "value": 20},
-                "duration_seconds": 60,
+                "fault_duration_seconds": 60,
                 "observability": "chaos",
                 "conflict_domain": "run-scoped IOChaos"
             }],
@@ -1031,7 +1155,7 @@ mod tests {
                 "storage_class": "fast-csi",
                 "rustfs_image": "rustfs:test",
                 "artifacts_dir": root.display().to_string(),
-                "duration_seconds": 60,
+                "fault_duration_seconds": 60,
                 "percent": 20,
                 "fault_selection": ["percent=20"],
                 "workload_objects": 12,

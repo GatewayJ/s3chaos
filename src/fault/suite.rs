@@ -14,12 +14,13 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 use crate::fault::{
     plan::FaultInjectionParameters,
+    reporting::FailureSeverity,
     scenarios::{FaultScenarioStatus, scenario_spec},
     workload::{WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadDistribution},
 };
@@ -36,6 +37,12 @@ pub struct FaultSuite {
     pub metadata: FaultSuiteMetadata,
     #[serde(default)]
     pub budgets: FaultSuiteBudgets,
+    #[serde(
+        rename = "workloadProfiles",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub workload_profiles: BTreeMap<String, FaultSuiteWorkloadOverride>,
     #[serde(default)]
     pub scenarios: Vec<FaultSuiteScenario>,
     #[serde(default)]
@@ -55,6 +62,8 @@ pub struct FaultSuiteMetadata {
 pub struct FaultSuiteBudgets {
     #[serde(default = "default_stop_on_first_failure")]
     pub stop_on_first_failure: bool,
+    #[serde(default = "default_continue_on_severities")]
+    pub continue_on_severities: Vec<FailureSeverity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_duration: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,9 +81,11 @@ pub struct FaultSuiteScenario {
     #[serde(default = "default_repetitions")]
     pub repetitions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration: Option<String>,
+    pub fault_duration: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload: Option<FaultSuiteWorkloadOverride>,
 }
@@ -82,24 +93,6 @@ pub struct FaultSuiteScenario {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaultSuiteWorkloadOverride {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub objects: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concurrency: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_weights: Option<WorkloadOperationMix>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload_distribution: Option<WorkloadPayloadDistribution>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hotspot: Option<WorkloadHotspot>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub duration_profiles: Vec<FaultSuiteWorkloadDurationProfile>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FaultSuiteWorkloadDurationProfile {
-    pub min_duration: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub objects: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,6 +141,11 @@ pub struct ResolvedFaultSuite {
     pub kind: String,
     pub metadata: FaultSuiteMetadata,
     pub budgets: ResolvedFaultSuiteBudgets,
+    #[serde(
+        rename = "workloadProfiles",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub workload_profiles: BTreeMap<String, ResolvedFaultSuiteWorkloadOverride>,
     pub scenarios: Vec<ResolvedFaultSuiteScenario>,
     pub observability: FaultSuiteObservability,
     pub artifacts: FaultSuiteArtifacts,
@@ -157,6 +155,7 @@ pub struct ResolvedFaultSuite {
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedFaultSuiteBudgets {
     pub stop_on_first_failure: bool,
+    pub continue_on_severities: Vec<FailureSeverity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_duration_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,9 +171,11 @@ pub struct ResolvedFaultSuiteScenario {
     pub params: FaultInjectionParameters,
     pub repetitions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration_seconds: Option<u64>,
+    pub fault_duration_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workload: Option<ResolvedFaultSuiteWorkloadOverride>,
     pub priority: String,
@@ -190,24 +191,6 @@ pub struct ResolvedFaultSuiteScenario {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedFaultSuiteWorkloadOverride {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub objects: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concurrency: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation_weights: Option<WorkloadOperationMix>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payload_distribution: Option<WorkloadPayloadDistribution>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hotspot: Option<WorkloadHotspot>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub duration_profiles: Vec<ResolvedFaultSuiteWorkloadDurationProfile>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResolvedFaultSuiteWorkloadDurationProfile {
-    pub min_duration_seconds: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub objects: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,6 +227,8 @@ impl FaultSuite {
             .as_deref()
             .map(parse_duration_seconds)
             .transpose()?;
+        let continue_on_severities =
+            normalized_continue_on_severities(&self.budgets.continue_on_severities)?;
         if let Some(stable_window) = self.budgets.recovery_stable_window_seconds {
             ensure!(
                 stable_window > 0,
@@ -265,10 +250,26 @@ impl FaultSuite {
             bail!("artifacts.required=default is not implemented; omit it or use strict");
         }
 
+        let workload_profiles = self
+            .workload_profiles
+            .iter()
+            .map(|(name, workload)| {
+                validate_workload_profile_name(name)?;
+                Ok((
+                    name.clone(),
+                    ResolvedFaultSuiteWorkloadOverride::from_suite_workload(
+                        &format!("workloadProfiles.{name}"),
+                        workload,
+                    )?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
         let scenarios = self
             .scenarios
             .iter()
-            .map(ResolvedFaultSuiteScenario::from_suite_scenario)
+            .map(|scenario| {
+                ResolvedFaultSuiteScenario::from_suite_scenario(scenario, &workload_profiles)
+            })
             .collect::<Result<Vec<_>>>()?;
 
         Ok(ResolvedFaultSuite {
@@ -277,10 +278,12 @@ impl FaultSuite {
             metadata: self.metadata.clone(),
             budgets: ResolvedFaultSuiteBudgets {
                 stop_on_first_failure: self.budgets.stop_on_first_failure,
+                continue_on_severities,
                 max_duration_seconds: budget_duration,
                 max_client_disruptions: self.budgets.max_client_disruptions,
                 recovery_stable_window_seconds: self.budgets.recovery_stable_window_seconds,
             },
+            workload_profiles,
             scenarios,
             observability: self.observability.clone(),
             artifacts: self.artifacts.clone(),
@@ -309,81 +312,23 @@ impl ResolvedFaultSuite {
 }
 
 impl ResolvedFaultSuiteWorkloadOverride {
-    fn from_suite_workload(name: &str, workload: &FaultSuiteWorkloadOverride) -> Result<Self> {
-        validate_workload_override(name, workload)?;
-        let mut seen_min_durations = BTreeSet::new();
-        let mut duration_profiles = workload
-            .duration_profiles
-            .iter()
-            .enumerate()
-            .map(|(index, profile)| {
-                let resolved =
-                    ResolvedFaultSuiteWorkloadDurationProfile::from_suite_profile(
-                        name, index, profile,
-                    )?;
-                ensure!(
-                    seen_min_durations.insert(resolved.min_duration_seconds),
-                    "scenario {name} workload.durationProfiles[{index}].minDuration duplicates an earlier threshold"
-                );
-                Ok(resolved)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        duration_profiles.sort_by_key(|profile| profile.min_duration_seconds);
-
+    fn from_suite_workload(context: &str, workload: &FaultSuiteWorkloadOverride) -> Result<Self> {
+        validate_workload_override(context, workload)?;
         Ok(Self {
             objects: workload.objects,
             concurrency: workload.concurrency,
             operation_weights: workload.operation_weights,
             payload_distribution: workload.payload_distribution.clone(),
             hotspot: workload.hotspot,
-            duration_profiles,
-        })
-    }
-
-    pub fn duration_profile_for(
-        &self,
-        duration_seconds: u64,
-    ) -> Option<&ResolvedFaultSuiteWorkloadDurationProfile> {
-        self.duration_profiles
-            .iter()
-            .rev()
-            .find(|profile| profile.min_duration_seconds <= duration_seconds)
-    }
-}
-
-impl ResolvedFaultSuiteWorkloadDurationProfile {
-    fn from_suite_profile(
-        name: &str,
-        index: usize,
-        profile: &FaultSuiteWorkloadDurationProfile,
-    ) -> Result<Self> {
-        let min_duration_seconds =
-            parse_duration_seconds(&profile.min_duration).with_context(|| {
-                format!("scenario {name} workload.durationProfiles[{index}].minDuration")
-            })?;
-        validate_workload_fields(
-            name,
-            &format!("workload.durationProfiles[{index}]"),
-            profile.objects,
-            profile.concurrency,
-            profile.operation_weights,
-            profile.payload_distribution.as_ref(),
-            profile.hotspot,
-        )?;
-
-        Ok(Self {
-            min_duration_seconds,
-            objects: profile.objects,
-            concurrency: profile.concurrency,
-            operation_weights: profile.operation_weights,
-            payload_distribution: profile.payload_distribution.clone(),
-            hotspot: profile.hotspot,
         })
     }
 }
 
 impl ResolvedFaultSuiteScenario {
-    fn from_suite_scenario(scenario: &FaultSuiteScenario) -> Result<Self> {
+    fn from_suite_scenario(
+        scenario: &FaultSuiteScenario,
+        workload_profiles: &BTreeMap<String, ResolvedFaultSuiteWorkloadOverride>,
+    ) -> Result<Self> {
         let spec = scenario_spec(&scenario.name)?;
         ensure!(
             spec.status == FaultScenarioStatus::Executable,
@@ -407,41 +352,53 @@ impl ResolvedFaultSuiteScenario {
                 scenario.name
             );
         }
-        if let Some(workload) = &scenario.workload {
-            validate_workload_override(&scenario.name, workload)?;
-        }
+        ensure!(
+            scenario.workload_profile.is_none() || scenario.workload.is_none(),
+            "scenario {} must not set both workloadProfile and workload",
+            scenario.name
+        );
         let params = scenario.params.clone().unwrap_or_default();
         if let Some(params) = &scenario.params {
             params.validate_explicit_for_schema(spec.param_schema)?;
         }
-        let duration_seconds = scenario
-            .duration
+        let fault_duration_seconds = scenario
+            .fault_duration
             .as_deref()
             .map(parse_duration_seconds)
             .transpose()?;
-        let workload = scenario
-            .workload
-            .as_ref()
-            .map(|workload| {
-                ResolvedFaultSuiteWorkloadOverride::from_suite_workload(&scenario.name, workload)
-            })
-            .transpose()?;
-        if let (Some(duration_seconds), Some(workload)) = (duration_seconds, workload.as_ref()) {
-            ensure!(
-                workload.duration_profiles.is_empty()
-                    || workload.duration_profile_for(duration_seconds).is_some(),
-                "scenario {} workload.durationProfiles must include at least one minDuration <= scenario duration {}s",
-                scenario.name,
-                duration_seconds
-            );
-        }
+        let workload = if let Some(profile_name) = &scenario.workload_profile {
+            validate_workload_profile_name(profile_name)?;
+            Some(
+                workload_profiles
+                    .get(profile_name)
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "scenario {} workloadProfile {:?} does not match any workloadProfiles entry",
+                            scenario.name, profile_name
+                        )
+                    })?,
+            )
+        } else {
+            scenario
+                .workload
+                .as_ref()
+                .map(|workload| {
+                    ResolvedFaultSuiteWorkloadOverride::from_suite_workload(
+                        &format!("scenario {} workload", scenario.name),
+                        workload,
+                    )
+                })
+                .transpose()?
+        };
 
         Ok(Self {
             name: scenario.name.clone(),
             params,
             repetitions: scenario.repetitions,
-            duration_seconds,
+            fault_duration_seconds,
             percent: scenario.percent,
+            workload_profile: scenario.workload_profile.clone(),
             workload,
             priority: spec.priority.as_str().to_string(),
             isolation: spec.isolation.as_str().to_string(),
@@ -471,44 +428,45 @@ metadata:
 budgets:
   maxDuration: 2h
   stopOnFirstFailure: true
+  continueOnSeverities:
+    - degraded
   maxClientDisruptions: 20
   recoveryStableWindowSeconds: 60
 observability:
   chaosDashboard: optional
 artifacts:
   required: strict
+workloadProfiles:
+  smoke:
+    objects: 40000
+    concurrency: 80
+    operationWeights:
+      put: 1
+      overwrite: 1
+      get: 1
+      list: 1
+      delete: 1
+      multipart: 1
+    payloadDistribution:
+      - sizeBytes: 4096
+        weight: 85
+      - sizeBytes: 16384
+        weight: 10
+      - sizeBytes: 8388608
+        weight: 4
+      - sizeBytes: 16777216
+        weight: 1
+    hotspot:
+      objectPercent: 10
+      operationPercent: 70
 scenarios:
   - name: io-eio
-    duration: 10m
+    faultDuration: 10m
     percent: 20
-    workload:
-      objects: 40000
-      concurrency: 80
-      operationWeights:
-        put: 1
-        overwrite: 1
-        get: 1
-        list: 1
-        delete: 1
-        multipart: 1
-      payloadDistribution:
-        - sizeBytes: 4096
-          weight: 85
-        - sizeBytes: 16384
-          weight: 10
-        - sizeBytes: 8388608
-          weight: 4
-        - sizeBytes: 16777216
-          weight: 1
-      hotspot:
-        objectPercent: 10
-        operationPercent: 70
-      durationProfiles:
-        - minDuration: 10m
-          objects: 80000
-          concurrency: 120
+    workloadProfile: smoke
   - name: network-delay
-    duration: 8m
+    faultDuration: 8m
+    workloadProfile: smoke
     params:
       kind: networkDelay
       latency: 200ms
@@ -518,7 +476,7 @@ scenarios:
     .to_string()
 }
 
-fn validate_workload_override(name: &str, workload: &FaultSuiteWorkloadOverride) -> Result<()> {
+fn validate_workload_override(context: &str, workload: &FaultSuiteWorkloadOverride) -> Result<()> {
     ensure!(
         workload_has_fields(
             workload.objects,
@@ -526,31 +484,20 @@ fn validate_workload_override(name: &str, workload: &FaultSuiteWorkloadOverride)
             workload.operation_weights,
             workload.payload_distribution.as_ref(),
             workload.hotspot,
-        ) || !workload.duration_profiles.is_empty(),
-        "scenario {name} workload override must set objects/concurrency, operationWeights, payloadDistribution, hotspot, or durationProfiles"
+        ),
+        "{context} must set objects/concurrency, operationWeights, payloadDistribution, or hotspot"
     );
-    if workload_has_fields(
+    validate_workload_fields(
+        context,
         workload.objects,
         workload.concurrency,
         workload.operation_weights,
         workload.payload_distribution.as_ref(),
         workload.hotspot,
-    ) {
-        validate_workload_fields(
-            name,
-            "workload",
-            workload.objects,
-            workload.concurrency,
-            workload.operation_weights,
-            workload.payload_distribution.as_ref(),
-            workload.hotspot,
-        )?;
-    }
-    Ok(())
+    )
 }
 
 fn validate_workload_fields(
-    name: &str,
     context: &str,
     objects: Option<usize>,
     concurrency: Option<usize>,
@@ -566,7 +513,7 @@ fn validate_workload_fields(
             payload_distribution,
             hotspot,
         ),
-        "scenario {name} {context} must set objects/concurrency, operationWeights, payloadDistribution, or hotspot"
+        "{context} must set objects/concurrency, operationWeights, payloadDistribution, or hotspot"
     );
     if let Some(operation_weights) = operation_weights {
         operation_weights.validate()?;
@@ -579,30 +526,27 @@ fn validate_workload_fields(
     }
     match (objects, concurrency) {
         (Some(objects), Some(concurrency)) => {
-            ensure!(
-                objects >= 12,
-                "scenario {name} {context}.objects must be at least 12"
-            );
+            ensure!(objects >= 12, "{context}.objects must be at least 12");
             ensure!(
                 concurrency > 0,
-                "scenario {name} {context}.concurrency must be greater than zero"
+                "{context}.concurrency must be greater than zero"
             );
             ensure!(
                 concurrency <= objects,
-                "scenario {name} {context}.concurrency must be <= {context}.objects"
+                "{context}.concurrency must be <= {context}.objects"
             );
             if let Some(operation_weights) = operation_weights {
                 let mixed_count = objects - objects / 2;
                 let total_weight = operation_weights.total_weight();
                 ensure!(
                     mixed_count as u64 >= total_weight,
-                    "scenario {name} {context}.operationWeights total {} requires at least that many mixed-workload objects, got {mixed_count}",
+                    "{context}.operationWeights total {} requires at least that many mixed-workload objects, got {mixed_count}",
                     total_weight
                 );
             }
         }
         (None, None) => {}
-        _ => bail!("scenario {name} {context} must set both objects and concurrency"),
+        _ => bail!("{context} must set both objects and concurrency"),
     }
     Ok(())
 }
@@ -641,18 +585,23 @@ fn parse_duration_seconds(raw: &str) -> Result<u64> {
 }
 
 fn validate_resource_name(name: &str) -> Result<()> {
-    ensure!(
-        !name.is_empty(),
-        "FaultSuite metadata.name must not be empty"
-    );
+    validate_identifier("FaultSuite metadata.name", name)
+}
+
+fn validate_workload_profile_name(name: &str) -> Result<()> {
+    validate_identifier("workloadProfile name", name)
+}
+
+fn validate_identifier(context: &str, name: &str) -> Result<()> {
+    ensure!(!name.is_empty(), "{context} must not be empty");
     ensure!(
         name.bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
-        "FaultSuite metadata.name must contain lowercase ASCII letters, digits, or '-'"
+        "{context} must contain lowercase ASCII letters, digits, or '-'"
     );
     ensure!(
         !name.starts_with('-') && !name.ends_with('-'),
-        "FaultSuite metadata.name must not start or end with '-'"
+        "{context} must not start or end with '-'"
     );
     Ok(())
 }
@@ -661,14 +610,35 @@ fn default_stop_on_first_failure() -> bool {
     true
 }
 
+fn default_continue_on_severities() -> Vec<FailureSeverity> {
+    vec![FailureSeverity::Degraded]
+}
+
 fn default_repetitions() -> usize {
     1
+}
+
+fn normalized_continue_on_severities(
+    severities: &[FailureSeverity],
+) -> Result<Vec<FailureSeverity>> {
+    let mut normalized = Vec::new();
+    for severity in severities {
+        ensure!(
+            !normalized.contains(severity),
+            "budgets.continueOnSeverities contains duplicate severity {:?}",
+            severity
+        );
+        normalized.push(*severity);
+    }
+    normalized.sort();
+    Ok(normalized)
 }
 
 impl Default for FaultSuiteBudgets {
     fn default() -> Self {
         Self {
             stop_on_first_failure: true,
+            continue_on_severities: default_continue_on_severities(),
             max_duration: None,
             max_client_disruptions: None,
             recovery_stable_window_seconds: None,
@@ -679,7 +649,7 @@ impl Default for FaultSuiteBudgets {
 #[cfg(test)]
 mod tests {
     use super::{FaultSuite, parse_duration_seconds};
-    use crate::fault::plan::FaultInjectionParameters;
+    use crate::fault::{plan::FaultInjectionParameters, reporting::FailureSeverity};
 
     #[test]
     fn resolves_valid_fault_suite() {
@@ -700,7 +670,7 @@ artifacts:
   required: strict
 scenarios:
   - name: io-eio
-    duration: 10m
+    faultDuration: 10m
     percent: 20
     workload:
       objects: 64
@@ -719,8 +689,12 @@ scenarios:
         let resolved = suite.resolve().expect("resolved suite");
 
         assert_eq!(resolved.budgets.max_duration_seconds, Some(7200));
+        assert_eq!(
+            resolved.budgets.continue_on_severities,
+            vec![FailureSeverity::Degraded]
+        );
         assert_eq!(resolved.scenarios.len(), 2);
-        assert_eq!(resolved.scenarios[0].duration_seconds, Some(600));
+        assert_eq!(resolved.scenarios[0].fault_duration_seconds, Some(600));
         assert_eq!(resolved.scenarios[0].priority, "p0");
         assert_eq!(resolved.scenarios[1].repetitions, 2);
         assert_eq!(
@@ -732,6 +706,77 @@ scenarios:
             }
         );
         assert!(resolved.scenarios[0].requires_chaos_mesh);
+    }
+
+    #[test]
+    fn accepts_explicit_continue_on_severities() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+budgets:
+  stopOnFirstFailure: true
+  continueOnSeverities:
+    - degraded
+scenarios:
+  - name: io-eio
+"#,
+        )
+        .expect("suite yaml");
+
+        let resolved = suite.resolve().expect("resolved suite");
+
+        assert_eq!(
+            resolved.budgets.continue_on_severities,
+            vec![FailureSeverity::Degraded]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_continue_on_severities() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+budgets:
+  continueOnSeverities:
+    - degraded
+    - degraded
+scenarios:
+  - name: io-eio
+"#,
+        )
+        .expect("suite yaml");
+
+        let error = suite.resolve().expect_err("duplicate severity");
+
+        assert!(
+            error
+                .to_string()
+                .contains("continueOnSeverities contains duplicate")
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_scenario_duration_field() {
+        let error = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    duration: 10m
+"#,
+        )
+        .expect_err("legacy duration field should be rejected");
+
+        assert!(error.to_string().contains("duration"));
     }
 
     #[test]
@@ -804,55 +849,54 @@ scenarios:
     }
 
     #[test]
-    fn accepts_duration_based_workload_profiles() {
+    fn accepts_reusable_workload_profiles() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
             r#"
 apiVersion: rustfs.com/s3chaos/v1alpha1
 kind: FaultSuite
 metadata:
   name: rustfs-smoke
+workloadProfiles:
+  smoke:
+    objects: 64
+    concurrency: 8
+    operationWeights:
+      put: 2
+      overwrite: 1
+      get: 4
+      list: 1
+      delete: 1
+      multipart: 1
+    payloadDistribution:
+      - sizeBytes: 1024
+        weight: 1
+    hotspot:
+      objectPercent: 10
+      operationPercent: 70
 scenarios:
   - name: io-eio
-    duration: 20m
-    workload:
-      objects: 64
-      concurrency: 8
-      durationProfiles:
-        - minDuration: 15m
-          objects: 96
-          concurrency: 12
-          operationWeights:
-            put: 2
-            overwrite: 1
-            get: 4
-            list: 1
-            delete: 1
-            multipart: 1
-        - minDuration: 5m
-          payloadDistribution:
-            - sizeBytes: 1024
-              weight: 1
+    faultDuration: 20m
+    workloadProfile: smoke
 "#,
         )
         .expect("suite yaml");
 
         let resolved = suite.resolve().expect("resolved suite");
 
-        let profiles = &resolved.scenarios[0]
-            .workload
-            .as_ref()
-            .expect("workload")
-            .duration_profiles;
-        assert_eq!(profiles[0].min_duration_seconds, 300);
-        assert_eq!(profiles[1].min_duration_seconds, 900);
-        assert_eq!(profiles[1].objects, Some(96));
+        assert!(resolved.workload_profiles.contains_key("smoke"));
         assert_eq!(
-            profiles[1]
-                .operation_weights
-                .expect("operation weights")
-                .get,
+            resolved.scenarios[0].workload_profile.as_deref(),
+            Some("smoke")
+        );
+        assert_eq!(resolved.scenarios[0].fault_duration_seconds, Some(1200));
+        let workload = resolved.scenarios[0].workload.as_ref().expect("workload");
+        assert_eq!(workload.objects, Some(64));
+        assert_eq!(workload.concurrency, Some(8));
+        assert_eq!(
+            workload.operation_weights.expect("operation weights").get,
             4
         );
+        assert_eq!(workload.hotspot.expect("hotspot").operation_percent, 70);
     }
 
     #[test]
@@ -905,28 +949,28 @@ scenarios:
     }
 
     #[test]
-    fn rejects_invalid_duration_based_workload_profiles() {
+    fn rejects_invalid_workload_profile_definitions() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
             r#"
 apiVersion: rustfs.com/s3chaos/v1alpha1
 kind: FaultSuite
 metadata:
   name: rustfs-smoke
+workloadProfiles:
+  smoke:
+    objects: 64
 scenarios:
   - name: io-eio
-    workload:
-      durationProfiles:
-        - minDuration: 10m
-          objects: 64
+    workloadProfile: smoke
 "#,
         )
         .expect("suite yaml");
 
-        let error = suite.resolve().expect_err("partial duration profile");
+        let error = suite.resolve().expect_err("partial workload profile");
         assert!(
             error
                 .to_string()
-                .contains("durationProfiles[0] must set both objects and concurrency")
+                .contains("workloadProfiles.smoke must set both objects and concurrency")
         );
 
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
@@ -937,52 +981,44 @@ metadata:
   name: rustfs-smoke
 scenarios:
   - name: io-eio
-    workload:
-      durationProfiles:
-        - minDuration: 10m
-          objects: 64
-          concurrency: 8
-        - minDuration: 10m
-          objects: 72
-          concurrency: 9
+    workloadProfile: missing
 "#,
         )
         .expect("suite yaml");
 
-        let error = suite.resolve().expect_err("duplicate duration profile");
+        let error = suite.resolve().expect_err("unknown workload profile");
         assert!(
             error
                 .to_string()
-                .contains("duplicates an earlier threshold")
+                .contains("does not match any workloadProfiles entry")
         );
     }
 
     #[test]
-    fn rejects_unreachable_duration_based_workload_profiles() {
+    fn rejects_workload_profile_and_inline_workload_together() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
             r#"
 apiVersion: rustfs.com/s3chaos/v1alpha1
 kind: FaultSuite
 metadata:
   name: rustfs-smoke
+workloadProfiles:
+  smoke:
+    objects: 64
+    concurrency: 8
 scenarios:
   - name: io-eio
-    duration: 10m
+    workloadProfile: smoke
     workload:
-      durationProfiles:
-        - minDuration: 15m
-          objects: 64
-          concurrency: 8
+      objects: 72
+      concurrency: 9
 "#,
         )
         .expect("suite yaml");
 
-        let error = suite.resolve().expect_err("unreachable duration profile");
-        assert!(
-            error
-                .to_string()
-                .contains("must include at least one minDuration <= scenario duration 600s")
-        );
+        let error = suite.resolve().expect_err("mixed workload sources");
+
+        assert!(error.to_string().contains("must not set both"));
     }
 
     #[test]

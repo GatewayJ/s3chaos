@@ -1226,7 +1226,8 @@ async fn run_fault_case(
                     "checker-pre-recommit",
                     recovery_stability_report.classification.as_str(),
                     message,
-                ),
+                )
+                .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds),
             )?;
             return Err(error);
         }
@@ -1311,7 +1312,8 @@ async fn run_fault_case(
                 "checker-pre-recommit-verdict",
                 recovery_stability_report.classification.as_str(),
                 error.to_string(),
-            ),
+            )
+            .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds),
         )?;
         return Err(error);
     }

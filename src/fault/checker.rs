@@ -100,6 +100,8 @@ pub struct RecoveryStabilityReport {
     pub data_corruption_evidence: Vec<String>,
     pub harness_errors: Vec<String>,
     pub max_recovery_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_within_seconds: Option<u64>,
     pub classification: RecoveryStabilityClassification,
 }
 
@@ -114,6 +116,7 @@ impl RecoveryStabilityReport {
             data_corruption_evidence: Vec::new(),
             harness_errors: vec![message.into()],
             max_recovery_seconds: max_recovery.as_secs(),
+            recovered_within_seconds: None,
             classification: RecoveryStabilityClassification::HarnessError,
         }
     }
@@ -335,6 +338,7 @@ pub async fn recovery_stability_reread(
         data_corruption_evidence,
         harness_errors: Vec::new(),
         max_recovery_seconds: max_recovery.as_secs(),
+        recovered_within_seconds: None,
         classification: classify_without_reread(immediate_report),
     };
 
@@ -354,6 +358,7 @@ pub async fn recovery_stability_reread(
         })
         .collect::<BTreeMap<_, _>>();
     let mut pending = expected.keys().cloned().collect::<BTreeSet<_>>();
+    let started = Instant::now();
     let deadline = Instant::now() + max_recovery;
     let mut delay = Duration::from_secs(1);
     let concurrency = concurrency.max(1);
@@ -415,6 +420,9 @@ pub async fn recovery_stability_reread(
             }
         }
 
+        if pending.is_empty() && report.recovered_within_seconds.is_none() {
+            report.recovered_within_seconds = Some(started.elapsed().as_secs());
+        }
         if pending.is_empty() || !report.hash_mismatches.is_empty() {
             break;
         }
@@ -1384,6 +1392,7 @@ mod tests {
             data_corruption_evidence: Vec::new(),
             harness_errors: Vec::new(),
             max_recovery_seconds: 60,
+            recovered_within_seconds: None,
             classification: RecoveryStabilityClassification::HarnessError,
         };
 
@@ -1718,6 +1727,7 @@ mod tests {
             data_corruption_evidence: Vec::new(),
             harness_errors: Vec::new(),
             max_recovery_seconds: 60,
+            recovered_within_seconds: None,
             classification: RecoveryStabilityClassification::CommittedObjectUnavailable,
         }
     }

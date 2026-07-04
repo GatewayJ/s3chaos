@@ -18,8 +18,8 @@ plan as `suite-plan.json`.
   setup, build preparation, process supervision, and cluster cleanup.
 - Add `s3chaos fault-suite-plan <suite.yaml>` to render the exact destructive
   plan before execution.
-- Include each attempt's scenario, repetition, resolved duration, selected fault,
-  target, workload profile, expected backend, required CRDs/tools, artifact
+- Include each attempt's scenario, repetition, resolved fault duration, selected
+  fault, target, workload profile, expected backend, required CRDs/tools, artifact
   paths, and budget impact in the plan output.
 - Treat the plan output as the review surface for operators before expanding
   YAML expressiveness.
@@ -28,19 +28,19 @@ plan as `suite-plan.json`.
 
 Status: implementation passes added catalog-declared `params.kind` support for
 network delay/loss/corrupt/duplicate, IO latency, CPU stress, and memory stress,
-plus `workload.operationWeights`, `workload.payloadDistribution`, and
-`workload.hotspot`. Duration-based workload profiles are selected by scenario
-duration with `workload.durationProfiles`. Plans and run specs now carry the
-resolved parameters, operation mix, payload distribution, hotspot behavior, and
-duration-resolved workload used by execution; suite plans also identify the
-selected duration profile threshold.
+plus named `workloadProfiles` with operation weights, payload distribution, and
+hotspot behavior. Scenarios select a profile with `workloadProfile`; scenario
+`faultDuration` is only the fault injection window, and `suite.budgets.maxDuration`
+is the protective suite budget. Plans and run specs now carry the resolved
+parameters, selected workload scale, operation mix, payload distribution, and
+hotspot behavior used by execution.
 
 - Add typed scenario parameters instead of exposing raw backend manifests.
 - Let supported scenarios declare safe parameter schemas, such as network delay,
   packet loss, IO fault mode, target selection policy, or stress intensity.
 - Extend workload profiles beyond `objects` and `concurrency` with operation
   mix, payload distribution, multipart ratio, read/write/delete/list weights,
-  hotspot behavior, and duration-based profiles.
+  and hotspot behavior.
 - Keep validation strict: unknown fields, unsupported params, unsafe values, and
   scenario/backend mismatches must fail before any destructive work starts.
 - Preserve catalog-backed behavior so YAML describes intent while Rust owns the
@@ -101,6 +101,8 @@ stateful operational flows on top, in this order:
   artifact locations, health-guard decisions, and final verdicts.
 - Link suite summaries to run specs, event streams, checker reports, workload
   summaries, and fault evidence.
+- Keep suite summaries structured: `failures[]` is the ordered failure index,
+  and `stopReason` points at the entry that stopped the suite early.
 - Keep the console surface read-only at first; execution should continue through
   the CLI until authorization, audit, cancellation, and blast-radius controls are
   explicit.
