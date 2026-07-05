@@ -191,6 +191,8 @@ pub(crate) struct FailureSummary {
     classification: String,
     data_correctness: DataCorrectnessStatus,
     availability: AvailabilityStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    evidence_classifications: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data_loss: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,6 +221,7 @@ impl FailureSummary {
             classification,
             data_correctness: details.data_correctness,
             availability: details.availability,
+            evidence_classifications: Vec::new(),
             data_loss: details.data_loss,
             corruption: details.corruption,
             recovered_within_window: details.recovered_within_window,
@@ -232,12 +235,26 @@ impl FailureSummary {
         self
     }
 
+    pub(crate) fn with_evidence_classifications(
+        mut self,
+        classifications: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.evidence_classifications = classifications.into_iter().map(Into::into).collect();
+        self.evidence_classifications.sort();
+        self.evidence_classifications.dedup();
+        self
+    }
+
     pub(crate) fn severity(&self) -> FailureSeverity {
         self.severity
     }
 
     pub(crate) fn classification(&self) -> &str {
         &self.classification
+    }
+
+    pub(crate) fn evidence_classifications(&self) -> &[String] {
+        &self.evidence_classifications
     }
 }
 
@@ -266,6 +283,14 @@ impl FailureClassificationDetails {
                 availability: AvailabilityStatus::Unknown,
                 data_loss: None,
                 corruption: Some(true),
+                recovered_within_window: None,
+            },
+            "ambiguous_write_materialized" => Self {
+                severity: FailureSeverity::NeedsInvestigation,
+                data_correctness: DataCorrectnessStatus::Unknown,
+                availability: AvailabilityStatus::Unknown,
+                data_loss: None,
+                corruption: Some(false),
                 recovered_within_window: None,
             },
             "harness_error"

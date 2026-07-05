@@ -39,7 +39,12 @@ pub struct CheckerReport {
     pub hash_mismatches: Vec<String>,
     pub successful_corrupted_reads: Vec<String>,
     pub unexpected_visible_deleted_objects: Vec<String>,
+    #[serde(default)]
     pub unknown_writes_materialized: Vec<String>,
+    #[serde(default)]
+    pub unknown_writes_preserved_committed: Vec<String>,
+    #[serde(default)]
+    pub unknown_write_value_conflicts: Vec<String>,
     pub list_history_warning_count: usize,
     pub final_list_warning_count: usize,
     pub list_history_warnings: Vec<String>,
@@ -75,6 +80,7 @@ pub enum RecoveryStabilityClassification {
     DataCorruption,
     CommittedObjectUnavailable,
     RecoveryTailReadLatency,
+    AmbiguousWriteMaterialized,
     HarnessError,
 }
 
@@ -84,6 +90,7 @@ impl RecoveryStabilityClassification {
             Self::DataCorruption => "data_corruption",
             Self::CommittedObjectUnavailable => "committed_object_unavailable",
             Self::RecoveryTailReadLatency => "recovery_tail_read_latency",
+            Self::AmbiguousWriteMaterialized => "ambiguous_write_materialized",
             Self::HarnessError => "harness_error",
         }
     }
@@ -98,6 +105,8 @@ pub struct RecoveryStabilityReport {
     pub hash_mismatches: Vec<String>,
     #[serde(default)]
     pub data_corruption_evidence: Vec<String>,
+    #[serde(default)]
+    pub ambiguous_write_evidence: Vec<String>,
     pub harness_errors: Vec<String>,
     pub max_recovery_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,11 +123,58 @@ impl RecoveryStabilityReport {
             still_unavailable_keys: Vec::new(),
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
+            ambiguous_write_evidence: Vec::new(),
             harness_errors: vec![message.into()],
             max_recovery_seconds: max_recovery.as_secs(),
             recovered_within_seconds: None,
             classification: RecoveryStabilityClassification::HarnessError,
         }
+    }
+
+    pub(crate) fn evidence_classifications(&self) -> Vec<String> {
+        let mut classifications = BTreeSet::new();
+        classifications.insert(self.classification.as_str().to_string());
+        if !self.hash_mismatches.is_empty() || !self.data_corruption_evidence.is_empty() {
+            classifications.insert(
+                RecoveryStabilityClassification::DataCorruption
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        if !self.still_unavailable_keys.is_empty() {
+            classifications.insert(
+                RecoveryStabilityClassification::CommittedObjectUnavailable
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        if !self.ambiguous_write_evidence.is_empty() {
+            classifications.insert(
+                RecoveryStabilityClassification::AmbiguousWriteMaterialized
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        if !self.reread_attempted_keys.is_empty()
+            && self.reread_attempted_keys == self.reread_recovered_keys
+            && self.still_unavailable_keys.is_empty()
+            && self.hash_mismatches.is_empty()
+            && self.harness_errors.is_empty()
+        {
+            classifications.insert(
+                RecoveryStabilityClassification::RecoveryTailReadLatency
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        if !self.harness_errors.is_empty() {
+            classifications.insert(
+                RecoveryStabilityClassification::HarnessError
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        classifications.into_iter().collect()
     }
 }
 
@@ -163,7 +219,9 @@ pub async fn check_s3_history(
         hash_mismatches: Vec::new(),
         successful_corrupted_reads: read_anomalies.corrupted_reads,
         unexpected_visible_deleted_objects: read_anomalies.visible_deleted_objects,
-        unknown_writes_materialized: Vec::new(),
+        unknown_writes_materialized: read_anomalies.unknown_writes_materialized,
+        unknown_writes_preserved_committed: Vec::new(),
+        unknown_write_value_conflicts: read_anomalies.unknown_write_value_conflicts,
         list_history_warning_count: list_history_warnings.total_count,
         final_list_warning_count: 0,
         list_history_warnings: list_history_warnings.samples,
@@ -183,40 +241,26 @@ pub async fn check_s3_history(
         passed: false,
     };
 
-    let mut committed_results =
-        stream::iter(model.live.clone().into_iter().map(|(key, expected)| {
-            let s3 = s3.clone();
-            let recorder = recorder.clone();
-            async move {
-                let get = s3.get_object_result(&key, &recorder).await?;
-                Ok::<_, anyhow::Error>((key, expected, get))
-            }
-        }))
-        .buffer_unordered(concurrency);
-    while let Some(result) = committed_results.next().await {
-        let (key, expected, get) = result?;
-        evaluate_committed_get(&mut report, key, &expected, get);
-    }
-
-    let mut unknown_results =
-        stream::iter(model.unknown_writes.into_iter().map(|(key, attempted)| {
-            let s3 = s3.clone();
-            let recorder = recorder.clone();
-            async move {
-                let get = s3.get_object_result(&key, &recorder).await?;
-                Ok::<_, anyhow::Error>((key, attempted, get))
-            }
-        }))
-        .buffer_unordered(concurrency);
-    while let Some(result) = unknown_results.next().await {
-        let (key, attempted, get) = result?;
-        if let Some(body) = get.body {
-            let actual_hash = sha256_hex(&body);
-            report.unknown_writes_materialized.push(format!(
-                "{key}: attempted {}, got {actual_hash}",
-                attempted.sha256
-            ));
+    let final_keys = model
+        .live
+        .keys()
+        .chain(model.unknown_writes.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut final_results = stream::iter(final_keys.into_iter().map(|key| {
+        let s3 = s3.clone();
+        let recorder = recorder.clone();
+        let expected = model.live.get(&key).cloned();
+        let unknown_writes = model.unknown_writes.get(&key).cloned().unwrap_or_default();
+        async move {
+            let get = s3.get_object_result(&key, &recorder).await?;
+            Ok::<_, anyhow::Error>((key, expected, unknown_writes, get))
         }
+    }))
+    .buffer_unordered(concurrency);
+    while let Some(result) = final_results.next().await {
+        let (key, expected, unknown_writes, get) = result?;
+        evaluate_final_get(&mut report, key, expected.as_ref(), &unknown_writes, get);
     }
 
     let run_id = recorder.run_id();
@@ -225,9 +269,9 @@ pub async fn check_s3_history(
     if let Some(lineage) = version_lineage {
         report.expected_committed_versions = lineage.versions.len();
         report.committed_writes_missing_version_id_count = lineage.missing_version_id_count;
-        report.committed_writes_missing_version_id = lineage.missing_version_id_samples;
+        report.committed_writes_missing_version_id = lineage.missing_version_id_samples.clone();
 
-        let mut version_results = stream::iter(lineage.versions.into_iter().map(|version| {
+        let mut version_results = stream::iter(lineage.versions.iter().cloned().map(|version| {
             let s3 = s3.clone();
             let recorder = recorder.clone();
             async move {
@@ -249,6 +293,17 @@ pub async fn check_s3_history(
                     missing_committed_delete_markers(&lineage.delete_markers, &entries);
                 report.resurrected_deleted_objects =
                     resurrected_deleted_objects(&model.deleted, &latest_version_entries(&entries));
+                let (materialized, conflicts) = materialized_ambiguous_versions(
+                    s3,
+                    recorder,
+                    &model,
+                    &lineage,
+                    &entries,
+                    concurrency,
+                )
+                .await?;
+                report.unknown_writes_materialized.extend(materialized);
+                report.unknown_write_value_conflicts.extend(conflicts);
             }
             None => report.unavailable_committed_versions.push(format!(
                 "list_object_versions prefix {prefix} did not complete"
@@ -284,7 +339,9 @@ pub async fn check_s3_history(
     report.unavailable_committed_objects.sort();
     report.unknown_committed_read_failures.sort();
     report.hash_mismatches.sort();
-    report.unknown_writes_materialized.sort();
+    sort_dedup(&mut report.unknown_writes_materialized);
+    sort_dedup(&mut report.unknown_writes_preserved_committed);
+    sort_dedup(&mut report.unknown_write_value_conflicts);
     report.unexpected_visible_deleted_objects.sort();
     report.list_history_warnings.sort();
     report.list_warnings.sort();
@@ -301,6 +358,8 @@ pub async fn check_s3_history(
         && report.hash_mismatches.is_empty()
         && report.successful_corrupted_reads.is_empty()
         && report.unexpected_visible_deleted_objects.is_empty()
+        && report.unknown_writes_materialized.is_empty()
+        && report.unknown_write_value_conflicts.is_empty()
         && report.final_list_warning_count == 0
         && report.committed_writes_missing_version_id_count == 0
         && report.missing_committed_versions.is_empty()
@@ -329,6 +388,7 @@ pub async fn recovery_stability_reread(
     let mut hash_mismatches = immediate_report.hash_mismatches.clone();
     hash_mismatches.extend(immediate_report.successful_corrupted_reads.iter().cloned());
     let data_corruption_evidence = immediate_data_corruption_evidence(immediate_report);
+    let ambiguous_write_evidence = immediate_ambiguous_write_evidence(immediate_report);
     let mut report = RecoveryStabilityReport {
         immediate_passed: immediate_report.passed,
         reread_attempted_keys: attempted_keys.clone(),
@@ -336,6 +396,7 @@ pub async fn recovery_stability_reread(
         still_unavailable_keys: immediate_still_unavailable_keys(immediate_report, &attempted_keys),
         hash_mismatches,
         data_corruption_evidence,
+        ambiguous_write_evidence,
         harness_errors: Vec::new(),
         max_recovery_seconds: max_recovery.as_secs(),
         recovered_within_seconds: None,
@@ -350,11 +411,9 @@ pub async fn recovery_stability_reread(
     let expected = attempted_keys
         .iter()
         .filter_map(|key| {
-            model
-                .live
-                .get(key)
-                .cloned()
-                .map(|expected| (key.clone(), expected))
+            let expected = model.live.get(key).cloned()?;
+            let ambiguous_writes = model.unknown_writes.get(key).cloned().unwrap_or_default();
+            Some((key.clone(), (expected, ambiguous_writes)))
         })
         .collect::<BTreeMap<_, _>>();
     let mut pending = expected.keys().cloned().collect::<BTreeSet<_>>();
@@ -377,15 +436,15 @@ pub async fn recovery_stability_reread(
         let mut batch = stream::iter(pending_keys.into_iter().map(|key| {
             let s3 = s3.clone();
             let recorder = recorder.clone();
-            let expected = expected.get(&key).expect("pending key").clone();
+            let (expected, ambiguous_writes) = expected.get(&key).expect("pending key").clone();
             async move {
                 let get = s3.get_object_result(&key, &recorder).await;
-                (key, expected, get)
+                (key, expected, ambiguous_writes, get)
             }
         }))
         .buffer_unordered(concurrency);
 
-        while let Some((key, expected, get)) = {
+        while let Some((key, expected, ambiguous_writes, get)) = {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break 'retry;
@@ -396,18 +455,14 @@ pub async fn recovery_stability_reread(
             }
         } {
             match get {
-                Ok(get) if committed_get_matches(&expected, &get) => {
-                    pending.remove(&key);
-                    report.reread_recovered_keys.push(key);
-                }
-                Ok(get) => {
-                    if let Some(body) = get.body {
-                        report
-                            .hash_mismatches
-                            .push(hash_mismatch_message(&key, &expected, &body));
-                        pending.remove(&key);
-                    }
-                }
+                Ok(get) => evaluate_recovery_reread_get(
+                    &mut report,
+                    &mut pending,
+                    key,
+                    &expected,
+                    &ambiguous_writes,
+                    get,
+                ),
                 Err(error) => {
                     report.still_unavailable_keys.push(key);
                     report.classification = RecoveryStabilityClassification::HarnessError;
@@ -434,9 +489,10 @@ pub async fn recovery_stability_reread(
     report.still_unavailable_keys.extend(pending);
     report.reread_recovered_keys.sort();
     report.still_unavailable_keys.sort();
-    report.hash_mismatches.sort();
-    report.data_corruption_evidence.sort();
-    report.harness_errors.sort();
+    sort_dedup(&mut report.hash_mismatches);
+    sort_dedup(&mut report.data_corruption_evidence);
+    sort_dedup(&mut report.ambiguous_write_evidence);
+    sort_dedup(&mut report.harness_errors);
     finish_recovery_stability_report(&mut report, immediate_report);
     Ok(report)
 }
@@ -447,11 +503,36 @@ struct ExpectedObject {
     size_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AmbiguousWriteAttempt {
+    id: String,
+    kind: OperationKind,
+    outcome: OperationOutcome,
+    object: ExpectedObject,
+    started_at_ms: u64,
+    ended_at_ms: u64,
+    superseded_by: Option<SupersedingMutation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupersedingMutation {
+    id: String,
+    kind: OperationKind,
+    started_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AmbiguousVersionCandidate {
+    key: String,
+    version_id: String,
+    attempts: Vec<AmbiguousWriteAttempt>,
+}
+
 #[derive(Debug, Default)]
 struct ObjectModel {
     live: BTreeMap<String, ExpectedObject>,
     deleted: BTreeSet<String>,
-    unknown_writes: BTreeMap<String, ExpectedObject>,
+    unknown_writes: BTreeMap<String, Vec<AmbiguousWriteAttempt>>,
     committed_writes: usize,
 }
 
@@ -459,6 +540,8 @@ struct ObjectModel {
 struct ReadAnomalies {
     corrupted_reads: Vec<String>,
     visible_deleted_objects: Vec<String>,
+    unknown_writes_materialized: Vec<String>,
+    unknown_write_value_conflicts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -616,6 +699,99 @@ fn missing_committed_delete_markers(
         .collect()
 }
 
+fn ambiguous_version_candidates(
+    model: &ObjectModel,
+    lineage: &VersionLineage,
+    entries: &[ObjectVersionEntry],
+) -> (Vec<AmbiguousVersionCandidate>, Vec<String>) {
+    let committed_versions = lineage
+        .versions
+        .iter()
+        .map(|version| (version.key.as_str(), version.version_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut candidates = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for entry in entries.iter().filter(|entry| !entry.is_delete_marker) {
+        let attempts = model
+            .unknown_writes
+            .get(&entry.key)
+            .cloned()
+            .unwrap_or_default();
+        let Some(version_id) = entry.version_id.as_ref() else {
+            conflicts.push(uncommitted_version_missing_id_message(
+                &entry.key, &attempts,
+            ));
+            continue;
+        };
+        if committed_versions.contains(&(entry.key.as_str(), version_id.as_str())) {
+            continue;
+        }
+        candidates.push(AmbiguousVersionCandidate {
+            key: entry.key.clone(),
+            version_id: version_id.clone(),
+            attempts,
+        });
+    }
+
+    (candidates, conflicts)
+}
+
+async fn materialized_ambiguous_versions(
+    s3: &S3WorkloadClient,
+    recorder: &Recorder,
+    model: &ObjectModel,
+    lineage: &VersionLineage,
+    entries: &[ObjectVersionEntry],
+    concurrency: usize,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let (candidates, mut conflicts) = ambiguous_version_candidates(model, lineage, entries);
+    let mut materialized = Vec::new();
+    let mut results = stream::iter(candidates.into_iter().map(|candidate| {
+        let s3 = s3.clone();
+        let recorder = recorder.clone();
+        async move {
+            let get = s3
+                .get_object_version_result(&candidate.key, &candidate.version_id, &recorder)
+                .await?;
+            Ok::<_, anyhow::Error>((candidate, get))
+        }
+    }))
+    .buffer_unordered(concurrency.max(1));
+
+    while let Some(result) = results.next().await {
+        let (candidate, get) = result?;
+        evaluate_ambiguous_version_get(&mut materialized, &mut conflicts, &candidate, get);
+    }
+    Ok((materialized, conflicts))
+}
+
+fn evaluate_ambiguous_version_get(
+    materialized: &mut Vec<String>,
+    conflicts: &mut Vec<String>,
+    candidate: &AmbiguousVersionCandidate,
+    get: GetObjectResult,
+) {
+    let Some(body) = get.body.as_deref() else {
+        conflicts.push(uncommitted_version_unverified_message(candidate, &get));
+        return;
+    };
+    if get.outcome != OperationOutcome::Ok {
+        conflicts.push(uncommitted_version_unverified_message(candidate, &get));
+        return;
+    }
+    if let Some(attempt) = matching_ambiguous_write(&candidate.attempts, body) {
+        materialized.push(ambiguous_version_materialized_message(
+            &candidate.key,
+            &candidate.version_id,
+            attempt,
+            body,
+        ));
+        return;
+    }
+    conflicts.push(uncommitted_version_value_conflict_message(candidate, body));
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct WarningSummary {
     total_count: usize,
@@ -631,36 +807,79 @@ impl WarningSummary {
     }
 }
 
+fn sort_dedup(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
+}
+
+#[cfg(test)]
 fn evaluate_committed_get(
     report: &mut CheckerReport,
     key: String,
     expected: &ExpectedObject,
     get: GetObjectResult,
 ) {
+    evaluate_final_get(report, key, Some(expected), &[], get);
+}
+
+fn evaluate_final_get(
+    report: &mut CheckerReport,
+    key: String,
+    expected: Option<&ExpectedObject>,
+    ambiguous_writes: &[AmbiguousWriteAttempt],
+    get: GetObjectResult,
+) {
     match (get.outcome, get.body) {
         (OperationOutcome::Ok, Some(body)) => {
-            let actual_hash = sha256_hex(&body);
-            if actual_hash != expected.sha256 || body.len() != expected.size_bytes {
-                report.hash_mismatches.push(format!(
-                    "{key}: expected {} ({} bytes), got {actual_hash} ({} bytes)",
-                    expected.sha256,
-                    expected.size_bytes,
-                    body.len()
-                ));
-            } else {
+            if expected.is_some_and(|expected| object_matches(expected, &body)) {
                 report.verified_live_objects += 1;
+                record_preserved_committed(report, &key, expected, ambiguous_writes, &body);
+                return;
+            }
+            if let Some(attempt) = matching_active_ambiguous_write(ambiguous_writes, &body) {
+                report
+                    .unknown_writes_materialized
+                    .push(ambiguous_write_materialized_message(&key, attempt, &body));
+                return;
+            }
+            if let Some(attempt) = matching_superseded_ambiguous_write(ambiguous_writes, &body) {
+                report
+                    .unknown_writes_materialized
+                    .push(ambiguous_write_materialized_message(&key, attempt, &body));
+                report.unknown_write_value_conflicts.push(
+                    superseded_ambiguous_write_conflict_message(&key, expected, attempt, &body),
+                );
+                return;
+            }
+            if !ambiguous_writes.is_empty() {
+                report
+                    .unknown_write_value_conflicts
+                    .push(unknown_write_value_conflict_message(
+                        &key,
+                        expected,
+                        ambiguous_writes,
+                        &body,
+                    ));
+            } else if let Some(expected) = expected {
+                report
+                    .hash_mismatches
+                    .push(hash_mismatch_message(&key, expected, &body));
             }
         }
-        (OperationOutcome::NotFound, None) => report.missing_committed_objects.push(key),
-        (OperationOutcome::Failed | OperationOutcome::Timeout, None) => report
-            .unavailable_committed_objects
-            .push(read_failure_message(
-                &key,
-                get.outcome,
-                get.http_status,
-                get.error.as_deref(),
-            )),
-        (OperationOutcome::Unknown, None) | (OperationOutcome::Ok, None) => report
+        (OperationOutcome::NotFound, None) if expected.is_some() => {
+            report.missing_committed_objects.push(key)
+        }
+        (OperationOutcome::Failed | OperationOutcome::Timeout, None) if expected.is_some() => {
+            report
+                .unavailable_committed_objects
+                .push(read_failure_message(
+                    &key,
+                    get.outcome,
+                    get.http_status,
+                    get.error.as_deref(),
+                ))
+        }
+        (OperationOutcome::Unknown | OperationOutcome::Ok, None) if expected.is_some() => report
             .unknown_committed_read_failures
             .push(read_failure_message(
                 &key,
@@ -668,13 +887,56 @@ fn evaluate_committed_get(
                 get.http_status,
                 get.error.as_deref(),
             )),
-        (outcome, Some(body)) => report.unknown_committed_read_failures.push(format!(
-            "{}: unexpected body for {:?} ({} bytes)",
-            key,
-            outcome,
-            body.len()
-        )),
+        (outcome, Some(body)) if expected.is_some() => {
+            report.unknown_committed_read_failures.push(format!(
+                "{}: unexpected body for {:?} ({} bytes)",
+                key,
+                outcome,
+                body.len()
+            ))
+        }
+        _ => {}
     }
+}
+
+fn evaluate_recovery_reread_get(
+    report: &mut RecoveryStabilityReport,
+    pending: &mut BTreeSet<String>,
+    key: String,
+    expected: &ExpectedObject,
+    ambiguous_writes: &[AmbiguousWriteAttempt],
+    get: GetObjectResult,
+) {
+    if committed_get_matches(expected, &get) {
+        pending.remove(&key);
+        report.reread_recovered_keys.push(key);
+        return;
+    }
+    let Some(body) = get.body else {
+        return;
+    };
+    if let Some(attempt) = matching_active_ambiguous_write(ambiguous_writes, &body) {
+        pending.remove(&key);
+        report
+            .ambiguous_write_evidence
+            .push(ambiguous_write_materialized_message(&key, attempt, &body));
+        return;
+    }
+    if let Some(attempt) = matching_superseded_ambiguous_write(ambiguous_writes, &body) {
+        pending.remove(&key);
+        report
+            .ambiguous_write_evidence
+            .push(ambiguous_write_materialized_message(&key, attempt, &body));
+        report.data_corruption_evidence.push(format!(
+            "unknown_write_value_conflict: {}",
+            superseded_ambiguous_write_conflict_message(&key, Some(expected), attempt, &body)
+        ));
+        return;
+    }
+    report
+        .hash_mismatches
+        .push(hash_mismatch_message(&key, expected, &body));
+    pending.remove(&key);
 }
 
 fn read_failure_message(
@@ -738,9 +1000,14 @@ fn is_recovery_tail_read_failure(
 
 fn committed_get_matches(expected: &ExpectedObject, get: &GetObjectResult) -> bool {
     get.outcome == OperationOutcome::Ok
-        && get.body.as_deref().is_some_and(|body| {
-            body.len() == expected.size_bytes && sha256_hex(body) == expected.sha256
-        })
+        && get
+            .body
+            .as_deref()
+            .is_some_and(|body| object_matches(expected, body))
+}
+
+fn object_matches(expected: &ExpectedObject, body: &[u8]) -> bool {
+    body.len() == expected.size_bytes && sha256_hex(body) == expected.sha256
 }
 
 fn hash_mismatch_message(key: &str, expected: &ExpectedObject, body: &[u8]) -> String {
@@ -753,28 +1020,312 @@ fn hash_mismatch_message(key: &str, expected: &ExpectedObject, body: &[u8]) -> S
     )
 }
 
+fn matching_ambiguous_write<'a>(
+    attempts: &'a [AmbiguousWriteAttempt],
+    body: &[u8],
+) -> Option<&'a AmbiguousWriteAttempt> {
+    attempts
+        .iter()
+        .rev()
+        .find(|attempt| object_matches(&attempt.object, body))
+}
+
+fn matching_active_ambiguous_write<'a>(
+    attempts: &'a [AmbiguousWriteAttempt],
+    body: &[u8],
+) -> Option<&'a AmbiguousWriteAttempt> {
+    attempts
+        .iter()
+        .rev()
+        .filter(|attempt| attempt.superseded_by.is_none())
+        .find(|attempt| object_matches(&attempt.object, body))
+}
+
+fn matching_superseded_ambiguous_write<'a>(
+    attempts: &'a [AmbiguousWriteAttempt],
+    body: &[u8],
+) -> Option<&'a AmbiguousWriteAttempt> {
+    attempts
+        .iter()
+        .rev()
+        .filter(|attempt| attempt.superseded_by.is_some())
+        .find(|attempt| object_matches(&attempt.object, body))
+}
+
+fn matching_active_ambiguous_object<'a>(
+    attempts: &'a [AmbiguousWriteAttempt],
+    actual: &ExpectedObject,
+) -> Option<&'a AmbiguousWriteAttempt> {
+    attempts
+        .iter()
+        .rev()
+        .filter(|attempt| attempt.superseded_by.is_none())
+        .find(|attempt| attempt.object == *actual)
+}
+
+fn matching_superseded_ambiguous_object<'a>(
+    attempts: &'a [AmbiguousWriteAttempt],
+    actual: &ExpectedObject,
+) -> Option<&'a AmbiguousWriteAttempt> {
+    attempts
+        .iter()
+        .rev()
+        .filter(|attempt| attempt.superseded_by.is_some())
+        .find(|attempt| attempt.object == *actual)
+}
+
+fn record_preserved_committed(
+    report: &mut CheckerReport,
+    key: &str,
+    expected: Option<&ExpectedObject>,
+    attempts: &[AmbiguousWriteAttempt],
+    body: &[u8],
+) {
+    let Some(expected) = expected else {
+        return;
+    };
+    if attempts.is_empty() {
+        return;
+    }
+    let actual_hash = sha256_hex(body);
+    if actual_hash != expected.sha256 || body.len() != expected.size_bytes {
+        report
+            .unknown_write_value_conflicts
+            .push(unknown_write_value_conflict_message(
+                key,
+                Some(expected),
+                attempts,
+                body,
+            ));
+        return;
+    }
+    let materially_distinct_attempt = attempts.iter().any(|attempt| {
+        attempt.object.sha256 != expected.sha256 || attempt.object.size_bytes != expected.size_bytes
+    });
+    if materially_distinct_attempt {
+        let attempts = ambiguous_write_attempt_summary(attempts);
+        report.unknown_writes_preserved_committed.push(format!(
+            "{key}: observed committed {} ({} bytes) after ambiguous attempts [{attempts}]",
+            expected.sha256, expected.size_bytes
+        ));
+    }
+}
+
+fn ambiguous_write_materialized_message(
+    key: &str,
+    attempt: &AmbiguousWriteAttempt,
+    body: &[u8],
+) -> String {
+    format!(
+        "{key}: {} materialized as {} ({} bytes)",
+        ambiguous_write_attempt_label(attempt),
+        sha256_hex(body),
+        body.len()
+    )
+}
+
+fn ambiguous_write_materialized_from_object_message(
+    key: &str,
+    attempt: &AmbiguousWriteAttempt,
+    actual: &ExpectedObject,
+) -> String {
+    format!(
+        "{key}: {} materialized as {} ({} bytes)",
+        ambiguous_write_attempt_label(attempt),
+        actual.sha256,
+        actual.size_bytes
+    )
+}
+
+fn ambiguous_version_materialized_message(
+    key: &str,
+    version_id: &str,
+    attempt: &AmbiguousWriteAttempt,
+    body: &[u8],
+) -> String {
+    format!(
+        "{key}@{version_id}: {} materialized as version {} ({} bytes)",
+        ambiguous_write_attempt_label(attempt),
+        sha256_hex(body),
+        body.len()
+    )
+}
+
+fn uncommitted_version_missing_id_message(key: &str, attempts: &[AmbiguousWriteAttempt]) -> String {
+    let attempts = ambiguous_write_attempt_summary(attempts);
+    format!(
+        "{key}: uncommitted non-delete version from ListObjectVersions did not include a version id; ambiguous attempts [{attempts}]"
+    )
+}
+
+fn uncommitted_version_unverified_message(
+    candidate: &AmbiguousVersionCandidate,
+    get: &GetObjectResult,
+) -> String {
+    let attempts = ambiguous_write_attempt_summary(&candidate.attempts);
+    format!(
+        "{}@{}: uncommitted version could not be verified; outcome={:?} status={:?} error={:?}; ambiguous attempts [{attempts}]",
+        candidate.key, candidate.version_id, get.outcome, get.http_status, get.error
+    )
+}
+
+fn uncommitted_version_value_conflict_message(
+    candidate: &AmbiguousVersionCandidate,
+    body: &[u8],
+) -> String {
+    let attempts = ambiguous_write_attempt_summary(&candidate.attempts);
+    format!(
+        "{}@{}: observed uncommitted version {} ({} bytes), but it matched no ambiguous attempt [{}]",
+        candidate.key,
+        candidate.version_id,
+        sha256_hex(body),
+        body.len(),
+        attempts
+    )
+}
+
+fn unknown_write_value_conflict_message(
+    key: &str,
+    expected: Option<&ExpectedObject>,
+    attempts: &[AmbiguousWriteAttempt],
+    body: &[u8],
+) -> String {
+    let committed = expected
+        .map(|expected| {
+            format!(
+                "committed {} ({} bytes)",
+                expected.sha256, expected.size_bytes
+            )
+        })
+        .unwrap_or_else(|| "no committed object".to_string());
+    let attempts = ambiguous_write_attempt_summary(attempts);
+    format!(
+        "{key}: observed {} ({} bytes), expected {committed} or ambiguous attempts [{attempts}]",
+        sha256_hex(body),
+        body.len()
+    )
+}
+
+fn superseded_ambiguous_write_conflict_message(
+    key: &str,
+    expected: Option<&ExpectedObject>,
+    attempt: &AmbiguousWriteAttempt,
+    body: &[u8],
+) -> String {
+    let committed = expected
+        .map(|expected| {
+            format!(
+                "committed {} ({} bytes)",
+                expected.sha256, expected.size_bytes
+            )
+        })
+        .unwrap_or_else(|| "no committed object".to_string());
+    format!(
+        "{key}: observed {} ({} bytes) from superseded ambiguous attempt [{}], expected {committed}",
+        sha256_hex(body),
+        body.len(),
+        ambiguous_write_attempt_label(attempt)
+    )
+}
+
+fn unknown_write_value_conflict_from_object_message(
+    key: &str,
+    expected: Option<&ExpectedObject>,
+    attempts: &[AmbiguousWriteAttempt],
+    actual: &ExpectedObject,
+) -> String {
+    let committed = expected
+        .map(|expected| {
+            format!(
+                "committed {} ({} bytes)",
+                expected.sha256, expected.size_bytes
+            )
+        })
+        .unwrap_or_else(|| "no committed object".to_string());
+    let attempts = ambiguous_write_attempt_summary(attempts);
+    format!(
+        "{key}: observed {} ({} bytes), expected {committed} or ambiguous attempts [{attempts}]",
+        actual.sha256, actual.size_bytes
+    )
+}
+
+fn superseded_ambiguous_object_conflict_message(
+    key: &str,
+    expected: Option<&ExpectedObject>,
+    attempt: &AmbiguousWriteAttempt,
+    actual: &ExpectedObject,
+) -> String {
+    let committed = expected
+        .map(|expected| {
+            format!(
+                "committed {} ({} bytes)",
+                expected.sha256, expected.size_bytes
+            )
+        })
+        .unwrap_or_else(|| "no committed object".to_string());
+    format!(
+        "{key}: observed {} ({} bytes) from superseded ambiguous attempt [{}], expected {committed}",
+        actual.sha256,
+        actual.size_bytes,
+        ambiguous_write_attempt_label(attempt)
+    )
+}
+
+fn ambiguous_write_attempt_summary(attempts: &[AmbiguousWriteAttempt]) -> String {
+    if attempts.is_empty() {
+        return "none".to_string();
+    }
+    attempts
+        .iter()
+        .map(ambiguous_write_attempt_label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn ambiguous_write_attempt_label(attempt: &AmbiguousWriteAttempt) -> String {
+    let mut label = format!(
+        "{} {:?} {:?} {} ({} bytes)",
+        attempt.id, attempt.kind, attempt.outcome, attempt.object.sha256, attempt.object.size_bytes
+    );
+    if let Some(superseded_by) = &attempt.superseded_by {
+        label.push_str(&format!(
+            " superseded_by={} {:?} started_at_ms={}",
+            superseded_by.id, superseded_by.kind, superseded_by.started_at_ms
+        ));
+    }
+    label
+}
+
 fn classify_without_reread(report: &CheckerReport) -> RecoveryStabilityClassification {
-    if !report.hash_mismatches.is_empty()
+    if has_data_corruption_signal(report) {
+        RecoveryStabilityClassification::DataCorruption
+    } else if !report.unknown_writes_materialized.is_empty() {
+        RecoveryStabilityClassification::AmbiguousWriteMaterialized
+    } else if has_committed_unavailable_signal(report) {
+        RecoveryStabilityClassification::CommittedObjectUnavailable
+    } else {
+        RecoveryStabilityClassification::HarnessError
+    }
+}
+
+fn has_data_corruption_signal(report: &CheckerReport) -> bool {
+    !report.hash_mismatches.is_empty()
         || !report.successful_corrupted_reads.is_empty()
         || !report.unexpected_visible_deleted_objects.is_empty()
-        || !report.unknown_writes_materialized.is_empty()
+        || !report.unknown_write_value_conflicts.is_empty()
         || report.final_list_warning_count > 0
         || !report.version_hash_mismatches.is_empty()
         || !report.missing_committed_versions.is_empty()
         || !report.missing_committed_delete_markers.is_empty()
         || !report.resurrected_deleted_objects.is_empty()
         || report.committed_writes_missing_version_id_count > 0
-    {
-        RecoveryStabilityClassification::DataCorruption
-    } else if !report.missing_committed_objects.is_empty()
+}
+
+fn has_committed_unavailable_signal(report: &CheckerReport) -> bool {
+    !report.missing_committed_objects.is_empty()
         || !report.unavailable_committed_objects.is_empty()
         || !report.unknown_committed_read_failures.is_empty()
         || !report.unavailable_committed_versions.is_empty()
-    {
-        RecoveryStabilityClassification::CommittedObjectUnavailable
-    } else {
-        RecoveryStabilityClassification::HarnessError
-    }
 }
 
 fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
@@ -787,10 +1338,49 @@ fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
     );
     evidence.extend(
         report
-            .unknown_writes_materialized
+            .unknown_write_value_conflicts
             .iter()
-            .map(|item| format!("unknown_write_materialized: {item}")),
+            .map(|item| format!("unknown_write_value_conflict: {item}")),
     );
+    evidence.extend(
+        report
+            .version_hash_mismatches
+            .iter()
+            .map(|item| format!("version_hash_mismatch: {item}")),
+    );
+    evidence.extend(
+        report
+            .missing_committed_versions
+            .iter()
+            .map(|item| format!("missing_committed_version: {item}")),
+    );
+    evidence.extend(
+        report
+            .missing_committed_delete_markers
+            .iter()
+            .map(|item| format!("missing_committed_delete_marker: {item}")),
+    );
+    evidence.extend(
+        report
+            .resurrected_deleted_objects
+            .iter()
+            .map(|item| format!("resurrected_deleted_object: {item}")),
+    );
+    evidence.extend(
+        report
+            .committed_writes_missing_version_id
+            .iter()
+            .map(|item| format!("committed_write_missing_version_id: {item}")),
+    );
+    if report.committed_writes_missing_version_id_count
+        > report.committed_writes_missing_version_id.len()
+    {
+        evidence.push(format!(
+            "committed_writes_missing_version_id_count: {} total, {} sampled",
+            report.committed_writes_missing_version_id_count,
+            report.committed_writes_missing_version_id.len()
+        ));
+    }
     evidence.extend(
         report
             .list_warnings
@@ -804,6 +1394,16 @@ fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
             report.list_warnings.len()
         ));
     }
+    evidence.sort();
+    evidence
+}
+
+fn immediate_ambiguous_write_evidence(report: &CheckerReport) -> Vec<String> {
+    let mut evidence = report
+        .unknown_writes_materialized
+        .iter()
+        .map(|item| format!("ambiguous_write_materialized: {item}"))
+        .collect::<Vec<_>>();
     evidence.sort();
     evidence
 }
@@ -831,6 +1431,12 @@ fn immediate_still_unavailable_keys(
             keys.insert(key);
         }
     }
+    keys.extend(
+        report
+            .unavailable_committed_versions
+            .iter()
+            .map(|item| format!("version:{item}")),
+    );
     keys.into_iter().collect()
 }
 
@@ -858,6 +1464,10 @@ fn finish_recovery_stability_report(
         report.classification = RecoveryStabilityClassification::CommittedObjectUnavailable;
         return;
     }
+    if !report.ambiguous_write_evidence.is_empty() {
+        report.classification = RecoveryStabilityClassification::AmbiguousWriteMaterialized;
+        return;
+    }
     if !report.reread_attempted_keys.is_empty()
         && immediate_failures_are_only_reread_candidates(immediate_report, report)
     {
@@ -879,6 +1489,7 @@ fn immediate_failures_are_only_reread_candidates(
             .unexpected_visible_deleted_objects
             .is_empty()
         && immediate_report.unknown_writes_materialized.is_empty()
+        && immediate_report.unknown_write_value_conflicts.is_empty()
         && immediate_report.final_list_warning_count == 0
         && immediate_report.committed_writes_missing_version_id_count == 0
         && immediate_report.missing_committed_versions.is_empty()
@@ -917,6 +1528,7 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
             if record.outcome == OperationOutcome::Ok =>
         {
             if let Some((key, object)) = record_object(record) {
+                mark_superseded_ambiguous_writes(model, &key, record);
                 model.committed_writes += 1;
                 model.deleted.remove(&key);
                 model.live.insert(key, object);
@@ -929,16 +1541,58 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
             ) =>
         {
             if let Some((key, object)) = record_object(record) {
-                model.unknown_writes.insert(key, object);
+                model
+                    .unknown_writes
+                    .entry(key)
+                    .or_default()
+                    .push(AmbiguousWriteAttempt {
+                        id: record.id.clone(),
+                        kind: record.kind,
+                        outcome: record.outcome,
+                        object,
+                        started_at_ms: record.started_at_ms,
+                        ended_at_ms: record.ended_at_ms,
+                        superseded_by: None,
+                    });
             }
         }
         OperationKind::Delete if record.outcome == OperationOutcome::Ok => {
             if let Some(key) = record.key.clone() {
+                mark_superseded_ambiguous_writes(model, &key, record);
                 model.live.remove(&key);
                 model.deleted.insert(key);
             }
         }
         _ => {}
+    }
+}
+
+fn mark_superseded_ambiguous_writes(
+    model: &mut ObjectModel,
+    key: &str,
+    superseding_record: &OperationRecord,
+) {
+    mark_superseded_attempts(&mut model.unknown_writes, key, superseding_record);
+}
+
+fn mark_superseded_attempts(
+    attempts_by_key: &mut BTreeMap<String, Vec<AmbiguousWriteAttempt>>,
+    key: &str,
+    superseding_record: &OperationRecord,
+) {
+    let Some(attempts) = attempts_by_key.get_mut(key) else {
+        return;
+    };
+    for attempt in attempts {
+        if attempt.superseded_by.is_none()
+            && superseding_record.started_at_ms >= attempt.ended_at_ms
+        {
+            attempt.superseded_by = Some(SupersedingMutation {
+                id: superseding_record.id.clone(),
+                kind: superseding_record.kind,
+                started_at_ms: superseding_record.started_at_ms,
+            });
+        }
     }
 }
 
@@ -981,6 +1635,7 @@ fn list_history_warnings(records: &[OperationRecord]) -> WarningSummary {
 
 fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
     let mut live = BTreeMap::<String, ExpectedObject>::new();
+    let mut ambiguous_writes = BTreeMap::<String, Vec<AmbiguousWriteAttempt>>::new();
     let mut anomalies = ReadAnomalies::default();
     for record in records {
         match record.kind {
@@ -988,11 +1643,34 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                 if record.outcome == OperationOutcome::Ok =>
             {
                 if let Some((key, object)) = record_object(record) {
+                    mark_superseded_attempts(&mut ambiguous_writes, &key, record);
                     live.insert(key, object);
+                }
+            }
+            OperationKind::Put | OperationKind::CompleteMultipartUpload
+                if matches!(
+                    record.outcome,
+                    OperationOutcome::Timeout | OperationOutcome::Unknown
+                ) =>
+            {
+                if let Some((key, object)) = record_object(record) {
+                    ambiguous_writes
+                        .entry(key)
+                        .or_default()
+                        .push(AmbiguousWriteAttempt {
+                            id: record.id.clone(),
+                            kind: record.kind,
+                            outcome: record.outcome,
+                            object,
+                            started_at_ms: record.started_at_ms,
+                            ended_at_ms: record.ended_at_ms,
+                            superseded_by: None,
+                        });
                 }
             }
             OperationKind::Delete if record.outcome == OperationOutcome::Ok => {
                 if let Some(key) = record.key.as_ref() {
+                    mark_superseded_attempts(&mut ambiguous_writes, key, record);
                     live.remove(key);
                 }
             }
@@ -1007,17 +1685,64 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                     continue;
                 };
                 let actual_hash = record.value_sha256.as_deref().unwrap_or_default();
+                let actual = ExpectedObject {
+                    sha256: actual_hash.to_string(),
+                    size_bytes: record.size_bytes.unwrap_or_default(),
+                };
+                let attempts = ambiguous_writes
+                    .get(key)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 match live.get(key) {
-                    Some(expected) if expected.sha256 != actual_hash => {
+                    Some(expected)
+                        if expected.sha256 == actual.sha256
+                            && expected.size_bytes == actual.size_bytes => {}
+                    _ if matching_active_ambiguous_object(attempts, &actual).is_some() => {
+                        let attempt = matching_active_ambiguous_object(attempts, &actual)
+                            .expect("checked ambiguous object");
+                        anomalies.unknown_writes_materialized.push(
+                            ambiguous_write_materialized_from_object_message(key, attempt, &actual),
+                        );
+                    }
+                    _ if matching_superseded_ambiguous_object(attempts, &actual).is_some() => {
+                        let attempt = matching_superseded_ambiguous_object(attempts, &actual)
+                            .expect("checked superseded ambiguous object");
+                        anomalies.unknown_writes_materialized.push(
+                            ambiguous_write_materialized_from_object_message(key, attempt, &actual),
+                        );
+                        anomalies.unknown_write_value_conflicts.push(
+                            superseded_ambiguous_object_conflict_message(
+                                key,
+                                live.get(key),
+                                attempt,
+                                &actual,
+                            ),
+                        );
+                    }
+                    Some(expected) if !attempts.is_empty() => {
+                        anomalies.unknown_write_value_conflicts.push(
+                            unknown_write_value_conflict_from_object_message(
+                                key,
+                                Some(expected),
+                                attempts,
+                                &actual,
+                            ),
+                        );
+                    }
+                    Some(expected) => {
                         anomalies.corrupted_reads.push(format!(
-                            "{key}: expected {}, got {actual_hash}",
-                            expected.sha256
+                            "{key}: expected {} ({} bytes), got {} ({} bytes)",
+                            expected.sha256, expected.size_bytes, actual.sha256, actual.size_bytes
                         ));
                     }
+                    None if !attempts.is_empty() => anomalies.unknown_write_value_conflicts.push(
+                        unknown_write_value_conflict_from_object_message(
+                            key, None, attempts, &actual,
+                        ),
+                    ),
                     None => anomalies
                         .visible_deleted_objects
                         .push(format!("{key}: successful GET had no committed live value")),
-                    _ => {}
                 }
             }
             _ => {}
@@ -1039,13 +1764,15 @@ fn record_object(record: &OperationRecord) -> Option<(String, ExpectedObject)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckerReport, ExpectedObject, RecoveryStabilityClassification, RecoveryStabilityReport,
-        WarningSummary, evaluate_committed_get, finish_recovery_stability_report,
+        AmbiguousWriteAttempt, CheckerReport, ExpectedObject, RecoveryStabilityClassification,
+        RecoveryStabilityReport, WarningSummary, evaluate_committed_get, evaluate_final_get,
+        evaluate_recovery_reread_get, finish_recovery_stability_report,
         immediate_still_unavailable_keys, is_recovery_tail_read_failure, list_history_warnings,
         object_model, recovery_tail_candidate_keys, successful_read_anomalies,
     };
     use crate::fault::history::{OperationKind, OperationOutcome, OperationRecord};
-    use crate::fault::workload::GetObjectResult;
+    use crate::fault::workload::{GetObjectResult, sha256_hex};
+    use std::collections::BTreeSet;
 
     fn record(
         id: &str,
@@ -1069,6 +1796,22 @@ mod tests {
             http_status: Some(200),
             error: None,
             listed_keys: None,
+        }
+    }
+
+    fn timed_record(
+        id: &str,
+        kind: OperationKind,
+        key: &str,
+        hash: &str,
+        outcome: OperationOutcome,
+        started_at_ms: u64,
+        ended_at_ms: u64,
+    ) -> OperationRecord {
+        OperationRecord {
+            started_at_ms,
+            ended_at_ms,
+            ..record(id, kind, key, hash, outcome)
         }
     }
 
@@ -1097,6 +1840,21 @@ mod tests {
         }
     }
 
+    fn ambiguous_attempt(id: &str, hash: &str) -> AmbiguousWriteAttempt {
+        AmbiguousWriteAttempt {
+            id: id.to_string(),
+            kind: OperationKind::Put,
+            outcome: OperationOutcome::Timeout,
+            object: ExpectedObject {
+                sha256: hash.to_string(),
+                size_bytes: 1,
+            },
+            started_at_ms: 1,
+            ended_at_ms: 2,
+            superseded_by: None,
+        }
+    }
+
     #[test]
     fn corrupted_successful_get_is_hard_failure_input() {
         let records = vec![
@@ -1112,7 +1870,10 @@ mod tests {
 
         let anomalies = successful_read_anomalies(&records);
 
-        assert_eq!(anomalies.corrupted_reads, vec!["k: expected good, got bad"]);
+        assert_eq!(
+            anomalies.corrupted_reads,
+            vec!["k: expected good (1 bytes), got bad (1 bytes)"]
+        );
     }
 
     #[test]
@@ -1219,6 +1980,288 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_overwrite_preserving_committed_value_is_not_materialized() {
+        let mut report = empty_report();
+        let committed = ExpectedObject {
+            sha256: sha256_hex(b"a"),
+            size_bytes: 1,
+        };
+        let attempted = ambiguous_attempt("op-2", &sha256_hex(b"b"));
+
+        evaluate_final_get(
+            &mut report,
+            "k".to_string(),
+            Some(&committed),
+            &[attempted],
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"a".to_vec()),
+            },
+        );
+
+        assert_eq!(report.verified_live_objects, 1);
+        assert!(report.hash_mismatches.is_empty());
+        assert!(report.unknown_writes_materialized.is_empty());
+        assert_eq!(report.unknown_writes_preserved_committed.len(), 1);
+    }
+
+    #[test]
+    fn ambiguous_overwrite_materializing_is_not_committed_hash_mismatch() {
+        let mut report = empty_report();
+        let committed = ExpectedObject {
+            sha256: sha256_hex(b"a"),
+            size_bytes: 1,
+        };
+        let attempted = ambiguous_attempt("op-2", &sha256_hex(b"b"));
+
+        evaluate_final_get(
+            &mut report,
+            "k".to_string(),
+            Some(&committed),
+            &[attempted],
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"b".to_vec()),
+            },
+        );
+
+        assert!(report.hash_mismatches.is_empty());
+        assert_eq!(report.unknown_writes_materialized.len(), 1);
+        assert_eq!(
+            super::classify_without_reread(&report),
+            RecoveryStabilityClassification::AmbiguousWriteMaterialized
+        );
+    }
+
+    #[test]
+    fn superseded_ambiguous_final_get_is_data_corruption_evidence() {
+        let mut report = empty_report();
+        let committed = ExpectedObject {
+            sha256: sha256_hex(b"a"),
+            size_bytes: 1,
+        };
+        let mut attempted = ambiguous_attempt("op-2", &sha256_hex(b"b"));
+        attempted.superseded_by = Some(super::SupersedingMutation {
+            id: "op-3".to_string(),
+            kind: OperationKind::Put,
+            started_at_ms: 3,
+        });
+
+        evaluate_final_get(
+            &mut report,
+            "k".to_string(),
+            Some(&committed),
+            &[attempted],
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"b".to_vec()),
+            },
+        );
+
+        assert!(report.hash_mismatches.is_empty());
+        assert_eq!(report.unknown_writes_materialized.len(), 1);
+        assert_eq!(report.unknown_write_value_conflicts.len(), 1);
+        assert_eq!(
+            super::classify_without_reread(&report),
+            RecoveryStabilityClassification::DataCorruption
+        );
+    }
+
+    #[test]
+    fn ambiguous_overwrite_unrelated_value_is_data_corruption_evidence() {
+        let mut report = empty_report();
+        let committed = ExpectedObject {
+            sha256: sha256_hex(b"a"),
+            size_bytes: 1,
+        };
+        let attempted = ambiguous_attempt("op-2", &sha256_hex(b"b"));
+
+        evaluate_final_get(
+            &mut report,
+            "k".to_string(),
+            Some(&committed),
+            &[attempted],
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"c".to_vec()),
+            },
+        );
+
+        assert!(report.hash_mismatches.is_empty());
+        assert_eq!(report.unknown_write_value_conflicts.len(), 1);
+        assert_eq!(
+            super::classify_without_reread(&report),
+            RecoveryStabilityClassification::DataCorruption
+        );
+    }
+
+    #[test]
+    fn successful_get_after_timeout_overwrite_is_ambiguous_not_corrupt() {
+        let records = vec![
+            record("op-1", OperationKind::Put, "k", "old", OperationOutcome::Ok),
+            record(
+                "op-2",
+                OperationKind::Put,
+                "k",
+                "new",
+                OperationOutcome::Timeout,
+            ),
+            record("op-3", OperationKind::Get, "k", "new", OperationOutcome::Ok),
+        ];
+
+        let anomalies = successful_read_anomalies(&records);
+
+        assert!(anomalies.corrupted_reads.is_empty());
+        assert_eq!(anomalies.unknown_writes_materialized.len(), 1);
+    }
+
+    #[test]
+    fn later_non_overlapping_ok_write_makes_old_ambiguous_value_a_conflict() {
+        let records = vec![
+            timed_record(
+                "op-1",
+                OperationKind::Put,
+                "k",
+                "old",
+                OperationOutcome::Ok,
+                1,
+                2,
+            ),
+            timed_record(
+                "op-2",
+                OperationKind::Put,
+                "k",
+                "timeout",
+                OperationOutcome::Timeout,
+                3,
+                4,
+            ),
+            timed_record(
+                "op-3",
+                OperationKind::Put,
+                "k",
+                "new",
+                OperationOutcome::Ok,
+                5,
+                6,
+            ),
+            timed_record(
+                "op-4",
+                OperationKind::Get,
+                "k",
+                "timeout",
+                OperationOutcome::Ok,
+                7,
+                8,
+            ),
+        ];
+
+        let model = object_model(&records);
+        let anomalies = successful_read_anomalies(&records);
+
+        assert_eq!(model.live.get("k").expect("live").sha256, "new");
+        let attempt = model
+            .unknown_writes
+            .get("k")
+            .expect("ambiguous")
+            .first()
+            .expect("attempt");
+        assert_eq!(
+            attempt.superseded_by.as_ref().expect("superseded").id,
+            "op-3"
+        );
+        assert!(anomalies.corrupted_reads.is_empty());
+        assert_eq!(anomalies.unknown_writes_materialized.len(), 1);
+        assert_eq!(anomalies.unknown_write_value_conflicts.len(), 1);
+        assert!(
+            anomalies.unknown_write_value_conflicts[0].contains("superseded ambiguous attempt")
+        );
+    }
+
+    #[test]
+    fn recovery_reread_materialized_ambiguous_write_is_not_hash_mismatch() {
+        let mut recovery = recovery_report_with_attempted_key("k");
+        let mut pending = BTreeSet::from(["k".to_string()]);
+        let committed = ExpectedObject {
+            sha256: sha256_hex(b"a"),
+            size_bytes: 1,
+        };
+        let attempted = ambiguous_attempt("op-2", &sha256_hex(b"b"));
+
+        evaluate_recovery_reread_get(
+            &mut recovery,
+            &mut pending,
+            "k".to_string(),
+            &committed,
+            &[attempted],
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"b".to_vec()),
+            },
+        );
+
+        assert!(pending.is_empty());
+        assert!(recovery.hash_mismatches.is_empty());
+        assert_eq!(recovery.ambiguous_write_evidence.len(), 1);
+    }
+
+    #[test]
+    fn recovery_reread_superseded_ambiguous_write_is_correctness_evidence() {
+        let mut recovery = recovery_report_with_attempted_key("k");
+        let mut pending = BTreeSet::from(["k".to_string()]);
+        let committed = ExpectedObject {
+            sha256: sha256_hex(b"a"),
+            size_bytes: 1,
+        };
+        let mut attempted = ambiguous_attempt("op-2", &sha256_hex(b"b"));
+        attempted.superseded_by = Some(super::SupersedingMutation {
+            id: "op-3".to_string(),
+            kind: OperationKind::Put,
+            started_at_ms: 3,
+        });
+
+        evaluate_recovery_reread_get(
+            &mut recovery,
+            &mut pending,
+            "k".to_string(),
+            &committed,
+            &[attempted],
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"b".to_vec()),
+            },
+        );
+        finish_recovery_stability_report(&mut recovery, &empty_report());
+
+        assert!(pending.is_empty());
+        assert_eq!(recovery.ambiguous_write_evidence.len(), 1);
+        assert_eq!(recovery.data_corruption_evidence.len(), 1);
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::DataCorruption
+        );
+        assert_eq!(
+            recovery.evidence_classifications(),
+            vec![
+                "ambiguous_write_materialized".to_string(),
+                "data_corruption".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn recovery_tail_candidates_require_status_200_body_timeout_or_streaming_error() {
         let put = record("op-1", OperationKind::Put, "k", "sha", OperationOutcome::Ok);
         let model = object_model(&[put]);
@@ -1311,6 +2354,24 @@ mod tests {
     }
 
     #[test]
+    fn recovery_evidence_classifications_preserve_tail_latency_with_ambiguous_evidence() {
+        let mut recovery = recovery_report_with_attempted_key("k");
+        recovery.reread_recovered_keys.push("k".to_string());
+        recovery
+            .ambiguous_write_evidence
+            .push("ambiguous_write_materialized: other op-2".to_string());
+        recovery.classification = RecoveryStabilityClassification::AmbiguousWriteMaterialized;
+
+        assert_eq!(
+            recovery.evidence_classifications(),
+            vec![
+                "ambiguous_write_materialized".to_string(),
+                "recovery_tail_read_latency".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn recovery_stability_report_keeps_unavailable_and_corrupt_classifications_hard() {
         let mut immediate = empty_report();
         immediate
@@ -1333,6 +2394,45 @@ mod tests {
         assert_eq!(
             corrupt.classification,
             RecoveryStabilityClassification::DataCorruption
+        );
+    }
+
+    #[test]
+    fn recovery_stability_hard_version_signals_override_ambiguous_writes() {
+        let mut immediate_corrupt = empty_report();
+        immediate_corrupt
+            .unknown_writes_materialized
+            .push("k: op-2 materialized".to_string());
+        immediate_corrupt
+            .version_hash_mismatches
+            .push("k@v1: expected old, got new".to_string());
+        let mut corrupt = recovery_report_with_attempted_key("k");
+        corrupt.ambiguous_write_evidence =
+            super::immediate_ambiguous_write_evidence(&immediate_corrupt);
+        corrupt.data_corruption_evidence =
+            super::immediate_data_corruption_evidence(&immediate_corrupt);
+        finish_recovery_stability_report(&mut corrupt, &immediate_corrupt);
+        assert_eq!(
+            corrupt.classification,
+            RecoveryStabilityClassification::DataCorruption
+        );
+
+        let mut immediate_unavailable = empty_report();
+        immediate_unavailable
+            .unknown_writes_materialized
+            .push("k: op-2 materialized".to_string());
+        immediate_unavailable
+            .unavailable_committed_versions
+            .push("k@v1: outcome=Timeout".to_string());
+        let keys = immediate_still_unavailable_keys(&immediate_unavailable, &[]);
+        let mut unavailable = recovery_report_with_attempted_key("k");
+        unavailable.ambiguous_write_evidence =
+            super::immediate_ambiguous_write_evidence(&immediate_unavailable);
+        unavailable.still_unavailable_keys = keys;
+        finish_recovery_stability_report(&mut unavailable, &immediate_unavailable);
+        assert_eq!(
+            unavailable.classification,
+            RecoveryStabilityClassification::CommittedObjectUnavailable
         );
     }
 
@@ -1390,6 +2490,7 @@ mod tests {
             still_unavailable_keys: keys,
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
+            ambiguous_write_evidence: Vec::new(),
             harness_errors: Vec::new(),
             max_recovery_seconds: 60,
             recovered_within_seconds: None,
@@ -1623,6 +2724,168 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_version_candidates_ignore_committed_versions_but_keep_unknown_versions() {
+        use crate::fault::workload::ObjectVersionEntry;
+
+        let mut committed = timed_record(
+            "op-1",
+            OperationKind::Put,
+            "k",
+            "committed",
+            OperationOutcome::Ok,
+            1,
+            2,
+        );
+        committed.version_id = Some("ver-ok".to_string());
+        let ambiguous = timed_record(
+            "op-2",
+            OperationKind::Put,
+            "k",
+            "timeout",
+            OperationOutcome::Timeout,
+            3,
+            4,
+        );
+        let mut later = timed_record(
+            "op-3",
+            OperationKind::Put,
+            "k",
+            "later",
+            OperationOutcome::Ok,
+            5,
+            6,
+        );
+        later.version_id = Some("ver-later".to_string());
+        let model = object_model(&[committed.clone(), ambiguous, later.clone()]);
+        let lineage = super::committed_version_lineage(&[committed, later]);
+        let entries = vec![
+            ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some("ver-later".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+            ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some("ver-ok".to_string()),
+                is_latest: false,
+                is_delete_marker: false,
+            },
+            ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some("ver-timeout".to_string()),
+                is_latest: false,
+                is_delete_marker: false,
+            },
+            ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some("marker".to_string()),
+                is_latest: false,
+                is_delete_marker: true,
+            },
+        ];
+
+        let (candidates, conflicts) =
+            super::ambiguous_version_candidates(&model, &lineage, &entries);
+
+        assert!(conflicts.is_empty());
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.version_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ver-timeout"]
+        );
+    }
+
+    #[test]
+    fn ambiguous_version_get_records_materialized_timeout_version() {
+        let attempt = ambiguous_attempt("op-2", &sha256_hex(b"b"));
+        let candidate = super::AmbiguousVersionCandidate {
+            key: "k".to_string(),
+            version_id: "ver-timeout".to_string(),
+            attempts: vec![attempt],
+        };
+        let mut materialized = Vec::new();
+        let mut conflicts = Vec::new();
+
+        super::evaluate_ambiguous_version_get(
+            &mut materialized,
+            &mut conflicts,
+            &candidate,
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"b".to_vec()),
+            },
+        );
+
+        assert!(conflicts.is_empty());
+        assert_eq!(materialized.len(), 1);
+        assert!(materialized[0].contains("k@ver-timeout"));
+        assert!(materialized[0].contains("materialized as version"));
+    }
+
+    #[test]
+    fn ambiguous_version_candidates_report_missing_version_ids() {
+        use crate::fault::workload::ObjectVersionEntry;
+
+        let ambiguous = timed_record(
+            "op-2",
+            OperationKind::Put,
+            "k",
+            "timeout",
+            OperationOutcome::Timeout,
+            3,
+            4,
+        );
+        let model = object_model(&[ambiguous]);
+        let lineage = super::committed_version_lineage(&[]);
+        let entries = vec![ObjectVersionEntry {
+            key: "k".to_string(),
+            version_id: None,
+            is_latest: false,
+            is_delete_marker: false,
+        }];
+
+        let (candidates, conflicts) =
+            super::ambiguous_version_candidates(&model, &lineage, &entries);
+
+        assert!(candidates.is_empty());
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].contains("did not include a version id"));
+    }
+
+    #[test]
+    fn uncommitted_version_with_unexpected_body_is_conflict() {
+        let attempt = ambiguous_attempt("op-2", &sha256_hex(b"b"));
+        let candidate = super::AmbiguousVersionCandidate {
+            key: "k".to_string(),
+            version_id: "ver-extra".to_string(),
+            attempts: vec![attempt],
+        };
+        let mut materialized = Vec::new();
+        let mut conflicts = Vec::new();
+
+        super::evaluate_ambiguous_version_get(
+            &mut materialized,
+            &mut conflicts,
+            &candidate,
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"c".to_vec()),
+            },
+        );
+
+        assert!(materialized.is_empty());
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].contains("matched no ambiguous attempt"));
+    }
+
+    #[test]
     fn version_reads_are_excluded_from_plain_read_anomalies() {
         let put = record("op-1", OperationKind::Put, "k", "new", OperationOutcome::Ok);
         let mut old_version_get =
@@ -1661,6 +2924,8 @@ mod tests {
             successful_corrupted_reads: Vec::new(),
             unexpected_visible_deleted_objects: Vec::new(),
             unknown_writes_materialized: Vec::new(),
+            unknown_writes_preserved_committed: Vec::new(),
+            unknown_write_value_conflicts: Vec::new(),
             list_history_warning_count: 0,
             final_list_warning_count: 0,
             list_history_warnings: Vec::new(),
@@ -1697,6 +2962,8 @@ mod tests {
             successful_corrupted_reads: Vec::new(),
             unexpected_visible_deleted_objects: Vec::new(),
             unknown_writes_materialized: Vec::new(),
+            unknown_writes_preserved_committed: Vec::new(),
+            unknown_write_value_conflicts: Vec::new(),
             list_history_warning_count: 0,
             final_list_warning_count: 0,
             list_history_warnings: Vec::new(),
@@ -1725,6 +2992,7 @@ mod tests {
             still_unavailable_keys: Vec::new(),
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
+            ambiguous_write_evidence: Vec::new(),
             harness_errors: Vec::new(),
             max_recovery_seconds: 60,
             recovered_within_seconds: None,
