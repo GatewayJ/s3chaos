@@ -275,6 +275,8 @@ pub struct FaultSuiteRunFailure {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_classifications: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt_artifacts_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_summary: Option<String>,
@@ -319,6 +321,8 @@ pub struct FaultSuiteRunAttempt {
     pub severity: Option<FailureSeverity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_classifications: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -410,25 +414,21 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                     }
                 }
                 Err(error) => {
-                    let (attempt_error, failure_summary, failure_severity) =
-                        attempt_failure_details(
+                    let (attempt_error, failure_summary_artifact, forced_stop) =
+                        artifact_validation_failure_details(
                             &planned.plan,
                             format!("artifact validation failed: {error}"),
                         );
-                    attempt.fail(attempt_error.clone(), failure_summary.as_ref());
+                    attempt.fail(attempt_error.clone(), None);
                     let failure_message = format!(
                         "scenario {} repetition {} failed: {attempt_error}",
                         planned.plan.scenario, planned.plan.repetition
                     );
-                    stop_after_attempt_failure = should_stop_after_attempt_failure(
-                        &execution_plan.suite.budgets.continue_on_severities,
-                        execution_plan.suite.budgets.stop_on_first_failure,
-                        failure_severity,
-                    );
+                    stop_after_attempt_failure = forced_stop;
                     summary.record_attempt_failure(
                         &attempt,
-                        failure_summary.as_ref(),
-                        attempt_failure_summary_artifact(&planned.plan),
+                        None,
+                        failure_summary_artifact,
                         failure_message,
                         stop_after_attempt_failure,
                     );
@@ -1020,6 +1020,14 @@ fn attempt_failure_details(
     }
 }
 
+fn artifact_validation_failure_details(
+    plan: &FaultSuitePlanAttempt,
+    base_error: String,
+) -> (String, Option<String>, bool) {
+    let (attempt_error, _, _) = attempt_failure_details(plan, base_error);
+    (attempt_error, attempt_failure_summary_artifact(plan), true)
+}
+
 fn attempt_failure_summary_artifact(plan: &FaultSuitePlanAttempt) -> Option<String> {
     let path = Path::new(&plan.artifacts.case_dir).join("failure-summary.json");
     path.is_file().then(|| path.display().to_string())
@@ -1081,6 +1089,7 @@ impl FaultSuiteRunSummary {
             repetition: None,
             severity: None,
             classification: None,
+            evidence_classifications: None,
             attempt_artifacts_dir: None,
             failure_summary: None,
         });
@@ -1104,6 +1113,10 @@ impl FaultSuiteRunSummary {
             repetition: Some(attempt.repetition),
             severity: failure_summary.map(FailureSummary::severity),
             classification: failure_summary.map(|summary| summary.classification().to_string()),
+            evidence_classifications: failure_summary.and_then(|summary| {
+                (!summary.evidence_classifications().is_empty())
+                    .then(|| summary.evidence_classifications().to_vec())
+            }),
             attempt_artifacts_dir: Some(attempt.artifacts_dir.clone()),
             failure_summary: failure_summary_artifact,
         });
@@ -1137,6 +1150,7 @@ impl FaultSuiteRunAttempt {
             committed: None,
             severity: None,
             classification: None,
+            evidence_classifications: None,
             error: None,
         }
     }
@@ -1156,6 +1170,9 @@ impl FaultSuiteRunAttempt {
         if let Some(summary) = failure_summary {
             self.severity = Some(summary.severity());
             self.classification = Some(summary.classification().to_string());
+            if !summary.evidence_classifications().is_empty() {
+                self.evidence_classifications = Some(summary.evidence_classifications().to_vec());
+            }
         }
         self.error = Some(error);
     }
@@ -1172,9 +1189,9 @@ fn now_ms() -> u64 {
 mod tests {
     use super::{
         FaultSuiteRunAttempt, FaultSuiteRunFailureKind, FaultSuiteRunSummary, FaultSuiteStopReason,
-        SuiteRunStatus, attempt_failure_details, attempt_seed, build_fault_suite_execution_plan,
-        scenario_config, should_stop_after_attempt_failure, suite_duration_budget_failure,
-        validate_suite_runtime_contract,
+        SuiteRunStatus, artifact_validation_failure_details, attempt_failure_details, attempt_seed,
+        build_fault_suite_execution_plan, scenario_config, should_stop_after_attempt_failure,
+        suite_duration_budget_failure, validate_suite_runtime_contract,
     };
     use crate::fault::{
         config::FaultTestConfig,
@@ -1660,10 +1677,20 @@ scenarios:
             "checker-pre-recommit-verdict",
             "data_corruption",
             "hash mismatch",
-        );
+        )
+        .with_evidence_classifications(["ambiguous_write_materialized", "data_corruption"]);
         let mut second_attempt =
             FaultSuiteRunAttempt::running(2, "network-delay", 1, Path::new("attempts/0002"));
         second_attempt.fail("hash mismatch".to_string(), Some(&hard_failure));
+        assert_eq!(
+            second_attempt.evidence_classifications.as_deref(),
+            Some(
+                &[
+                    "ambiguous_write_materialized".to_string(),
+                    "data_corruption".to_string()
+                ][..]
+            )
+        );
         summary.record_attempt_failure(
             &second_attempt,
             Some(&hard_failure),
@@ -1686,6 +1713,15 @@ scenarios:
             summary.failures[1].classification.as_deref(),
             Some("data_corruption")
         );
+        assert_eq!(
+            summary.failures[1].evidence_classifications.as_deref(),
+            Some(
+                &[
+                    "ambiguous_write_materialized".to_string(),
+                    "data_corruption".to_string()
+                ][..]
+            )
+        );
 
         let value = serde_json::to_value(&summary).expect("summary json");
         assert!(value.get("failureReason").is_none());
@@ -1695,6 +1731,10 @@ scenarios:
         assert_eq!(
             value["failures"][0]["failureSummary"],
             "attempts/0001/failure-summary.json"
+        );
+        assert_eq!(
+            value["failures"][1]["evidenceClassifications"],
+            serde_json::json!(["ambiguous_write_materialized", "data_corruption"])
         );
     }
 
@@ -1772,6 +1812,73 @@ scenarios:
             true,
             severity
         ));
+    }
+
+    #[test]
+    fn artifact_validation_failure_ignores_degraded_summary_for_stop_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite = single_scenario_suite();
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+        base.cluster.artifacts_dir = dir.path().to_path_buf();
+        let execution = build_fault_suite_execution_plan(suite, base, "suite-fixed".to_string())
+            .expect("suite execution plan");
+        let planned = &execution.plan.attempts[0];
+        fs::create_dir_all(&planned.artifacts.case_dir).expect("case dir");
+        write_failure_summary(
+            Path::new(&planned.artifacts.case_dir),
+            json!({
+                "scenario": "io-eio",
+                "stage": "checker-pre-recommit-verdict",
+                "verdict": "failed",
+                "severity": "degraded",
+                "classification": "recovery_tail_read_latency",
+                "data_correctness": "passed",
+                "availability": "recovered_after_tail_latency",
+                "data_loss": false,
+                "corruption": false,
+                "recovered_within_window": true,
+                "recovered_within_seconds": 27,
+                "message": "tail latency"
+            }),
+        );
+
+        let (attempt_error, failure_summary_artifact, forced_stop) =
+            artifact_validation_failure_details(planned, "artifact validation failed".to_string());
+
+        assert_eq!(attempt_error, "artifact validation failed");
+        assert!(failure_summary_artifact.is_some());
+        assert!(forced_stop);
+        let artifact = failure_summary_artifact.clone();
+        let mut attempt = FaultSuiteRunAttempt::running(
+            planned.index,
+            &planned.scenario,
+            planned.repetition,
+            Path::new(&planned.artifacts.attempt_dir),
+        );
+        attempt.fail(attempt_error, None);
+        assert_eq!(attempt.severity, None);
+        assert_eq!(attempt.classification, None);
+
+        let mut summary =
+            FaultSuiteRunSummary::started(&execution.suite, "suite-fixed".to_string());
+        summary.record_attempt_failure(
+            &attempt,
+            None,
+            artifact,
+            format!(
+                "scenario {} repetition {} failed: artifact validation failed",
+                planned.scenario, planned.repetition
+            ),
+            forced_stop,
+        );
+        assert_eq!(
+            summary.stop_reason,
+            Some(FaultSuiteStopReason::Failure { failure_index: 0 })
+        );
+        assert!(summary.failures[0].stopped_suite);
+        assert_eq!(summary.failures[0].severity, None);
+        assert!(summary.failures[0].failure_summary.is_some());
     }
 
     #[test]

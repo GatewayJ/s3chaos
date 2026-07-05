@@ -502,18 +502,28 @@ When `checker-pre-recommit` fails or errors, the runner writes
 the immediate checker failure intact; for committed-object GETs that returned
 HTTP 200 but timed out or hit a body streaming error, it also runs a bounded
 reread. The artifact classifies the failure as `recovery_tail_read_latency`,
-`committed_object_unavailable`, `data_corruption`, or `harness_error`;
+`committed_object_unavailable`, `ambiguous_write_materialized`,
+`data_corruption`, or `harness_error`;
 `failure-summary.json` uses the same classification and also records
-`verdict`, `severity`, `data_correctness`, `availability`, `data_loss`,
-`corruption`, and recovery-window fields. For example, a failed strict checker
-that later rereads every key successfully is reported as
+`verdict`, `severity`, `data_correctness`, `availability`,
+`evidence_classifications`, `data_loss`, `corruption`, and recovery-window
+fields. The suite stop policy is driven by `severity` and
+`continueOnSeverities`; `classification` and `evidence_classifications` are
+diagnostic labels. `evidence_classifications` preserves mixed evidence such as
+availability failure plus ambiguous-write materialization. For example, a failed strict
+checker that later rereads every key successfully is reported as
 `verdict=failed`, `severity=degraded`,
 `classification=recovery_tail_read_latency`,
 `data_correctness=passed`, `availability=recovered_after_tail_latency`,
 `data_loss=false`, and `corruption=false`. The suite runner copies failure
-`severity` and `classification` into `suite-summary.json` attempt entries and
-the matching `failures[]` entry, then uses `continueOnSeverities` to decide
-whether to start the next attempt.
+`severity`, `classification`, and `evidence_classifications` into
+`suite-summary.json` attempt entries and the matching `failures[]` entry. When
+`stopOnFirstFailure` is true, `continueOnSeverities` decides whether that
+failure is allowed to continue to the next attempt.
+An `ambiguous_write_materialized` result means a timeout/unknown write attempt
+later became visible; it fails the strict checker and is retained as explicit
+evidence, but it is not reported as proven data corruption unless the visible
+value matches neither the previous committed value nor the ambiguous attempt.
 When IOChaos deletion times out, the runner also captures
 `iochaos-finalizer-recovery-*.json`, `iochaos-delete-timeout.*`,
 `podiochaos-delete-timeout.*`, target pod/node evidence, target-node

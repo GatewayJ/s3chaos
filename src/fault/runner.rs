@@ -1227,7 +1227,10 @@ async fn run_fault_case(
                     recovery_stability_report.classification.as_str(),
                     message,
                 )
-                .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds),
+                .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds)
+                .with_evidence_classifications(
+                    recovery_stability_report.evidence_classifications(),
+                ),
             )?;
             return Err(error);
         }
@@ -1313,7 +1316,8 @@ async fn run_fault_case(
                 recovery_stability_report.classification.as_str(),
                 error.to_string(),
             )
-            .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds),
+            .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds)
+            .with_evidence_classifications(recovery_stability_report.evidence_classifications()),
         )?;
         return Err(error);
     }

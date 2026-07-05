@@ -392,6 +392,8 @@ fn validate_checker_report(
             && report.hash_mismatches.is_empty()
             && report.successful_corrupted_reads.is_empty()
             && report.unexpected_visible_deleted_objects.is_empty()
+            && report.unknown_writes_materialized.is_empty()
+            && report.unknown_write_value_conflicts.is_empty()
             && report.final_list_warning_count == 0
             && report.list_warnings.is_empty()
             && report.committed_writes_missing_version_id_count == 0
@@ -464,6 +466,12 @@ fn validate_recovery_failure_summary_fields(
         summary.verdict == FailureVerdict::Failed,
         "failure-summary.json verdict must be failed for recovery-stability failures"
     );
+    ensure!(
+        summary.evidence_classifications == recovery.evidence_classifications(),
+        "failure-summary.json evidence_classifications {:?} do not match recovery-stability-report.json evidence classifications {:?}",
+        summary.evidence_classifications,
+        recovery.evidence_classifications()
+    );
     match recovery.classification {
         RecoveryStabilityClassification::RecoveryTailReadLatency => {
             ensure!(
@@ -499,6 +507,18 @@ fn validate_recovery_failure_summary_fields(
                 "data_corruption failure-summary.json must describe a correctness failure"
             );
         }
+        RecoveryStabilityClassification::AmbiguousWriteMaterialized => {
+            ensure!(
+                summary.severity == FailureSeverity::NeedsInvestigation
+                    && summary.data_correctness == DataCorrectnessStatus::Unknown
+                    && summary.availability == AvailabilityStatus::Unknown
+                    && summary.data_loss.is_none()
+                    && summary.corruption == Some(false)
+                    && summary.recovered_within_window.is_none()
+                    && summary.recovered_within_seconds.is_none(),
+                "ambiguous_write_materialized failure-summary.json must describe an explicit ambiguous-write result without proven corruption"
+            );
+        }
         RecoveryStabilityClassification::HarnessError => {
             ensure!(
                 summary.severity == FailureSeverity::Infra
@@ -528,6 +548,10 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
         &report.data_corruption_evidence,
         "recovery-stability-report.json data_corruption_evidence",
     )?;
+    ensure_sorted_unique(
+        &report.ambiguous_write_evidence,
+        "recovery-stability-report.json ambiguous_write_evidence",
+    )?;
     match report.classification {
         RecoveryStabilityClassification::RecoveryTailReadLatency => {
             ensure!(
@@ -535,14 +559,19 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
                     && report.reread_attempted_keys == report.reread_recovered_keys
                     && report.still_unavailable_keys.is_empty()
                     && report.hash_mismatches.is_empty()
+                    && report.data_corruption_evidence.is_empty()
+                    && report.ambiguous_write_evidence.is_empty()
                     && report.harness_errors.is_empty(),
                 "recovery_tail_read_latency requires all attempted keys to be recovered without hard failures"
             );
         }
         RecoveryStabilityClassification::CommittedObjectUnavailable => {
             ensure!(
-                !report.still_unavailable_keys.is_empty(),
-                "committed_object_unavailable requires still_unavailable_keys"
+                !report.still_unavailable_keys.is_empty()
+                    && report.hash_mismatches.is_empty()
+                    && report.data_corruption_evidence.is_empty()
+                    && report.harness_errors.is_empty(),
+                "committed_object_unavailable requires still_unavailable_keys without higher-priority recovery failures"
             );
         }
         RecoveryStabilityClassification::DataCorruption => {
@@ -551,10 +580,22 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
                 "data_corruption requires hash_mismatches or data_corruption_evidence"
             );
         }
+        RecoveryStabilityClassification::AmbiguousWriteMaterialized => {
+            ensure!(
+                !report.ambiguous_write_evidence.is_empty()
+                    && report.hash_mismatches.is_empty()
+                    && report.data_corruption_evidence.is_empty()
+                    && report.still_unavailable_keys.is_empty()
+                    && report.harness_errors.is_empty(),
+                "ambiguous_write_materialized requires only ambiguous_write_evidence without harder recovery failures"
+            );
+        }
         RecoveryStabilityClassification::HarnessError => {
             ensure!(
-                !report.harness_errors.is_empty(),
-                "harness_error requires harness_errors"
+                !report.harness_errors.is_empty()
+                    && report.hash_mismatches.is_empty()
+                    && report.data_corruption_evidence.is_empty(),
+                "harness_error requires harness_errors without data-corruption evidence"
             );
         }
     }
@@ -753,6 +794,7 @@ struct FailureSummaryArtifact {
     classification: String,
     data_correctness: DataCorrectnessStatus,
     availability: AvailabilityStatus,
+    evidence_classifications: Vec<String>,
     data_loss: Option<bool>,
     corruption: Option<bool>,
     recovered_within_window: Option<bool>,
@@ -951,6 +993,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_clean_checker_report_with_ambiguous_write_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let checker_path = case_dir.join("checker-pre-recommit-report.json");
+        let mut checker: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&checker_path).expect("checker report"))
+                .expect("checker json");
+        checker["unknown_writes_materialized"] = json!(["k: op-2 materialized"]);
+        write_json(&case_dir, "checker-pre-recommit-report.json", &checker);
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        let error = validate_fault_artifacts(&options).expect_err("ambiguous evidence mismatch");
+
+        assert!(
+            error
+                .to_string()
+                .contains("contains a non-clean checker verdict")
+        );
+    }
+
+    #[test]
     fn rejects_mismatched_recovery_stability_failure_summary_classification() {
         let dir = tempfile::tempdir().expect("tempdir");
         let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
@@ -987,6 +1061,7 @@ mod tests {
                 "verdict": "failed",
                 "severity": "fail_availability",
                 "classification": "committed_object_unavailable",
+                "evidence_classifications": ["recovery_tail_read_latency"],
                 "data_correctness": "unknown",
                 "availability": "committed_object_unavailable",
                 "corruption": false,
@@ -1054,6 +1129,7 @@ mod tests {
                 "verdict": "failed",
                 "severity": "degraded",
                 "classification": "recovery_tail_read_latency",
+                "evidence_classifications": ["recovery_tail_read_latency"],
                 "data_correctness": "passed",
                 "availability": "recovered_after_tail_latency",
                 "data_loss": false,
@@ -1066,6 +1142,281 @@ mod tests {
 
         super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
             .expect("valid recovery failure fields");
+    }
+
+    #[test]
+    fn validates_ambiguous_write_failure_summary_severity_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let case_dir = dir.path().join(case_name);
+        fs::create_dir_all(&case_dir).expect("case dir");
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms":1,"scenario":"io-eio","run_id":"run-1","stage":"checker-pre-recommit","status":"failed","message":"failed"}).to_string(),
+                json!({"at_ms":2,"scenario":"io-eio","run_id":"run-1","stage":"recovery-stability-reread","status":"succeeded","message":"done"}).to_string(),
+            ].join("\n"),
+        )
+        .expect("events");
+        write_json(
+            &case_dir,
+            "recovery-stability-report.json",
+            &json!({
+                "immediate_passed": false,
+                "reread_attempted_keys": [],
+                "reread_recovered_keys": [],
+                "still_unavailable_keys": [],
+                "hash_mismatches": [],
+                "data_corruption_evidence": [],
+                "ambiguous_write_evidence": ["ambiguous_write_materialized: k op-2"],
+                "harness_errors": [],
+                "max_recovery_seconds": 60,
+                "classification": "ambiguous_write_materialized"
+            }),
+        );
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &json!({
+                "scenario": "io-eio",
+                "stage": "checker-pre-recommit-verdict",
+                "verdict": "failed",
+                "severity": "needs_investigation",
+                "classification": "ambiguous_write_materialized",
+                "evidence_classifications": ["ambiguous_write_materialized"],
+                "data_correctness": "unknown",
+                "availability": "unknown",
+                "corruption": false,
+                "message": "immediate checker failed"
+            }),
+        );
+
+        super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
+            .expect("valid ambiguous write failure fields");
+    }
+
+    #[test]
+    fn rejects_ambiguous_write_summary_with_proven_loss_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let case_dir = dir.path().join(case_name);
+        fs::create_dir_all(&case_dir).expect("case dir");
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms":1,"scenario":"io-eio","run_id":"run-1","stage":"checker-pre-recommit","status":"failed","message":"failed"}).to_string(),
+                json!({"at_ms":2,"scenario":"io-eio","run_id":"run-1","stage":"recovery-stability-reread","status":"succeeded","message":"done"}).to_string(),
+            ].join("\n"),
+        )
+        .expect("events");
+        write_json(
+            &case_dir,
+            "recovery-stability-report.json",
+            &json!({
+                "immediate_passed": false,
+                "reread_attempted_keys": [],
+                "reread_recovered_keys": [],
+                "still_unavailable_keys": [],
+                "hash_mismatches": [],
+                "data_corruption_evidence": [],
+                "ambiguous_write_evidence": ["ambiguous_write_materialized: k op-2"],
+                "harness_errors": [],
+                "max_recovery_seconds": 60,
+                "classification": "ambiguous_write_materialized"
+            }),
+        );
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &json!({
+                "scenario": "io-eio",
+                "stage": "checker-pre-recommit-verdict",
+                "verdict": "failed",
+                "severity": "needs_investigation",
+                "classification": "ambiguous_write_materialized",
+                "evidence_classifications": ["ambiguous_write_materialized"],
+                "data_correctness": "unknown",
+                "availability": "unknown",
+                "data_loss": true,
+                "corruption": false,
+                "recovered_within_window": false,
+                "message": "immediate checker failed"
+            }),
+        );
+
+        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
+            .expect_err("ambiguous summary with loss fields");
+
+        assert!(error.to_string().contains("without proven corruption"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_write_report_with_harder_recovery_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let case_dir = dir.path().join(case_name);
+        fs::create_dir_all(&case_dir).expect("case dir");
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms":1,"scenario":"io-eio","run_id":"run-1","stage":"checker-pre-recommit","status":"failed","message":"failed"}).to_string(),
+                json!({"at_ms":2,"scenario":"io-eio","run_id":"run-1","stage":"recovery-stability-reread","status":"succeeded","message":"done"}).to_string(),
+            ].join("\n"),
+        )
+        .expect("events");
+        write_json(
+            &case_dir,
+            "recovery-stability-report.json",
+            &json!({
+                "immediate_passed": false,
+                "reread_attempted_keys": [],
+                "reread_recovered_keys": [],
+                "still_unavailable_keys": [],
+                "hash_mismatches": ["k: expected old, got other"],
+                "data_corruption_evidence": [],
+                "ambiguous_write_evidence": ["ambiguous_write_materialized: k op-2"],
+                "harness_errors": [],
+                "max_recovery_seconds": 60,
+                "classification": "ambiguous_write_materialized"
+            }),
+        );
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &json!({
+                "scenario": "io-eio",
+                "stage": "checker-pre-recommit-verdict",
+                "verdict": "failed",
+                "severity": "needs_investigation",
+                "classification": "ambiguous_write_materialized",
+                "evidence_classifications": ["ambiguous_write_materialized", "data_corruption"],
+                "data_correctness": "unknown",
+                "availability": "unknown",
+                "corruption": false,
+                "message": "immediate checker failed"
+            }),
+        );
+
+        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
+            .expect_err("ambiguous report with hard evidence");
+
+        assert!(
+            error
+                .to_string()
+                .contains("without harder recovery failures")
+        );
+    }
+
+    #[test]
+    fn rejects_tail_latency_report_with_ambiguous_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let case_dir = dir.path().join(case_name);
+        fs::create_dir_all(&case_dir).expect("case dir");
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms":1,"scenario":"io-eio","run_id":"run-1","stage":"checker-pre-recommit","status":"failed","message":"failed"}).to_string(),
+                json!({"at_ms":2,"scenario":"io-eio","run_id":"run-1","stage":"recovery-stability-reread","status":"succeeded","message":"done"}).to_string(),
+            ].join("\n"),
+        )
+        .expect("events");
+        write_json(
+            &case_dir,
+            "recovery-stability-report.json",
+            &json!({
+                "immediate_passed": false,
+                "reread_attempted_keys": ["k"],
+                "reread_recovered_keys": ["k"],
+                "still_unavailable_keys": [],
+                "hash_mismatches": [],
+                "data_corruption_evidence": [],
+                "ambiguous_write_evidence": ["ambiguous_write_materialized: k op-2"],
+                "harness_errors": [],
+                "max_recovery_seconds": 60,
+                "recovered_within_seconds": 27,
+                "classification": "recovery_tail_read_latency"
+            }),
+        );
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &json!({
+                "scenario": "io-eio",
+                "stage": "checker-pre-recommit-verdict",
+                "verdict": "failed",
+                "severity": "degraded",
+                "classification": "recovery_tail_read_latency",
+                "evidence_classifications": ["ambiguous_write_materialized", "recovery_tail_read_latency"],
+                "data_correctness": "passed",
+                "availability": "recovered_after_tail_latency",
+                "data_loss": false,
+                "corruption": false,
+                "recovered_within_window": true,
+                "recovered_within_seconds": 27,
+                "message": "immediate checker failed"
+            }),
+        );
+
+        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
+            .expect_err("tail latency with ambiguous evidence");
+
+        assert!(error.to_string().contains("without hard failures"));
+    }
+
+    #[test]
+    fn rejects_availability_report_with_data_corruption_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let case_dir = dir.path().join(case_name);
+        fs::create_dir_all(&case_dir).expect("case dir");
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [json!({"at_ms":1,"scenario":"io-eio","run_id":"run-1","stage":"checker-pre-recommit","status":"failed","message":"failed"}).to_string()].join("\n"),
+        )
+        .expect("events");
+        write_json(
+            &case_dir,
+            "recovery-stability-report.json",
+            &json!({
+                "immediate_passed": false,
+                "reread_attempted_keys": [],
+                "reread_recovered_keys": [],
+                "still_unavailable_keys": ["k"],
+                "hash_mismatches": [],
+                "data_corruption_evidence": ["unknown_write_value_conflict: k"],
+                "ambiguous_write_evidence": [],
+                "harness_errors": [],
+                "max_recovery_seconds": 60,
+                "classification": "committed_object_unavailable"
+            }),
+        );
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &json!({
+                "scenario": "io-eio",
+                "stage": "checker-pre-recommit-verdict",
+                "verdict": "failed",
+                "severity": "fail_availability",
+                "classification": "committed_object_unavailable",
+                "evidence_classifications": ["committed_object_unavailable", "data_corruption"],
+                "data_correctness": "unknown",
+                "availability": "committed_object_unavailable",
+                "corruption": false,
+                "recovered_within_window": false,
+                "message": "immediate checker failed"
+            }),
+        );
+
+        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
+            .expect_err("availability report with data evidence");
+
+        assert!(
+            error
+                .to_string()
+                .contains("without higher-priority recovery failures")
+        );
     }
 
     fn write_success_artifacts(root: &std::path::Path, scenario: &str) {
