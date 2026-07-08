@@ -46,6 +46,7 @@ pub struct ClusterTestConfig {
     pub tenant_name: String,
     pub storage_class: String,
     pub rustfs_image: String,
+    pub rustfs_env: Vec<(String, String)>,
     pub pod_management_policy: Option<PodManagementPolicy>,
     pub artifacts_dir: PathBuf,
     pub timeout: Duration,
@@ -109,6 +110,7 @@ impl E2eConfig {
                 tenant_name: env_or(&get_env, "RUSTFS_E2E_TENANT", "e2e-tenant"),
                 storage_class: env_or(&get_env, "RUSTFS_E2E_STORAGE_CLASS", "local-storage"),
                 rustfs_image: env_or(&get_env, "RUSTFS_E2E_SERVER_IMAGE", DEFAULT_RUSTFS_IMAGE),
+                rustfs_env: Vec::new(),
                 artifacts_dir: PathBuf::from(env_or(
                     &get_env,
                     "RUSTFS_E2E_ARTIFACTS",

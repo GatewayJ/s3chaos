@@ -25,6 +25,7 @@ WORKLOAD_CONCURRENCY="${RUSTFS_FAULT_TEST_WORKLOAD_CONCURRENCY:-80}"
 RUSTFS_POD_COUNT="${RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT:-4}"
 RUSTFS_VOLUME_PATH="${RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH:-/data/rustfs0}"
 RUSTFS_POD_STABLE_WINDOW_SECONDS="${RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS:-60}"
+HEALTH_GUARD_FAILURE_THRESHOLD="${RUSTFS_FAULT_TEST_HEALTH_GUARD_FAILURE_THRESHOLD:-1}"
 BUILD_JOBS="${RUSTFS_FAULT_TEST_BUILD_JOBS:-1}"
 CHAOS_MESH_VERSION="${RUSTFS_FAULT_TEST_CHAOS_MESH_VERSION:-2.8.3}"
 CHAOS_DAEMON_RUNTIME="${RUSTFS_FAULT_TEST_CHAOS_DAEMON_RUNTIME:-containerd}"
@@ -246,6 +247,7 @@ validate_runtime_env_contract() {
   RUSTFS_POD_COUNT="$(trim_value "$RUSTFS_POD_COUNT")"
   RUSTFS_VOLUME_PATH="$(trim_value "$RUSTFS_VOLUME_PATH")"
   RUSTFS_POD_STABLE_WINDOW_SECONDS="$(trim_value "$RUSTFS_POD_STABLE_WINDOW_SECONDS")"
+  HEALTH_GUARD_FAILURE_THRESHOLD="$(trim_value "$HEALTH_GUARD_FAILURE_THRESHOLD")"
   BUILD_JOBS="$(trim_value "$BUILD_JOBS")"
 
   require_positive_integer RUSTFS_FAULT_TEST_WORKLOAD_OBJECTS "$WORKLOAD_OBJECTS"
@@ -255,12 +257,14 @@ validate_runtime_env_contract() {
   require_positive_integer RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT "$RUSTFS_POD_COUNT"
   require_absolute_non_root_path RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH "$RUSTFS_VOLUME_PATH"
   require_positive_integer RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS "$RUSTFS_POD_STABLE_WINDOW_SECONDS"
+  require_positive_integer RUSTFS_FAULT_TEST_HEALTH_GUARD_FAILURE_THRESHOLD "$HEALTH_GUARD_FAILURE_THRESHOLD"
   timeout_seconds="$(trim_value "${RUSTFS_FAULT_TEST_TIMEOUT_SECONDS:-300}")"
   require_unsigned_integer RUSTFS_FAULT_TEST_TIMEOUT_SECONDS "$timeout_seconds"
   (( 10#$RUSTFS_POD_STABLE_WINDOW_SECONDS < 10#$timeout_seconds )) || die "RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS must be less than RUSTFS_FAULT_TEST_TIMEOUT_SECONDS"
   export RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT="$RUSTFS_POD_COUNT"
   export RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH="$RUSTFS_VOLUME_PATH"
   export RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS="$RUSTFS_POD_STABLE_WINDOW_SECONDS"
+  export RUSTFS_FAULT_TEST_HEALTH_GUARD_FAILURE_THRESHOLD="$HEALTH_GUARD_FAILURE_THRESHOLD"
   require_optional_positive_integer RUSTFS_FAULT_TEST_DURATION_SECONDS
   require_optional_unsigned_integer RUSTFS_FAULT_TEST_REQUEST_TIMEOUT_SECONDS
   require_optional_unsigned_integer RUSTFS_FAULT_TEST_TIMEOUT_SECONDS
@@ -466,6 +470,7 @@ require_storage_class() {
 preflight() {
   local scenario="${1:-io-eio}"
   local ready_nodes crd tool
+  local disk_pressure_nodes
   require_supported_scenario "$scenario"
 
   require_command cargo
@@ -483,6 +488,10 @@ preflight() {
     | select(.spec.unschedulable != true)
     | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
   [[ "$ready_nodes" -ge 4 ]] || die "at least four schedulable Ready nodes are required, found $ready_nodes"
+  disk_pressure_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[]
+    | select(any(.status.conditions[]; .type == "DiskPressure" and .status == "True"))
+    | .metadata.name] | join(",")')"
+  [[ -z "$disk_pressure_nodes" ]] || die "node DiskPressure present before fault test: $disk_pressure_nodes"
 
   require_storage_class "$scenario"
   require_namespace_ownership
@@ -561,14 +570,159 @@ capture_fault_logs() {
   done
 }
 
-health_is_safe() {
+health_status_json() {
   local baseline_ready_nodes="$1" baseline_tenants="$2" require_chaos="$3"
-  local current_ready_nodes
-  current_ready_nodes="$(kubectl_cluster get nodes -o json 2>/dev/null | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length' 2>/dev/null || echo 0)"
-  [[ "$current_ready_nodes" -ge "$baseline_ready_nodes" ]] || return 1
-  non_fault_tenants_are_ready "$baseline_tenants" || return 1
-  [[ "$require_chaos" != "true" ]] || chaos_is_ready || return 1
-  return 0
+  local current_ready_nodes=0 disk_pressure_nodes="" disk_pressure_count=0
+  local nodes_safe=false disk_pressure_safe=true tenants_safe=true chaos_safe=true chaos_required=false
+  local safe=false reason="cluster_health_safe" message="cluster health is safe"
+
+  if [[ "$require_chaos" == "true" ]]; then
+    chaos_required=true
+  fi
+
+  current_ready_nodes="$(kubectl_cluster get nodes -o json 2>/dev/null \
+    | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length' 2>/dev/null \
+    || echo 0)"
+  if [[ "$current_ready_nodes" -ge "$baseline_ready_nodes" ]]; then
+    nodes_safe=true
+  else
+    reason="ready_node_count_below_baseline"
+    message="Ready node count is below baseline"
+  fi
+
+  disk_pressure_nodes="$(kubectl_cluster get nodes -o json 2>/dev/null \
+    | jq -r '[.items[]
+      | select(any(.status.conditions[]; .type == "DiskPressure" and .status == "True"))
+      | .metadata.name] | join(",")' 2>/dev/null || true)"
+  if [[ -n "$disk_pressure_nodes" ]]; then
+    disk_pressure_safe=false
+    disk_pressure_count="$(tr ',' '\n' <<<"$disk_pressure_nodes" | grep -c . || true)"
+    if [[ "$reason" == "cluster_health_safe" ]]; then
+      reason="node_disk_pressure"
+      message="node DiskPressure detected"
+    fi
+  fi
+
+  if ! non_fault_tenants_are_ready "$baseline_tenants"; then
+    tenants_safe=false
+    if [[ "$reason" == "cluster_health_safe" ]]; then
+      reason="non_fault_tenant_not_ready"
+      message="pre-existing non-fault Tenant is not Ready"
+    fi
+  fi
+
+  if [[ "$chaos_required" == "true" ]] && ! chaos_is_ready; then
+    chaos_safe=false
+    if [[ "$reason" == "cluster_health_safe" ]]; then
+      reason="chaos_mesh_not_ready"
+      message="Chaos Mesh controller or daemon is not Ready"
+    fi
+  fi
+
+  if [[ "$nodes_safe" == "true" && "$disk_pressure_safe" == "true" && "$tenants_safe" == "true" && "$chaos_safe" == "true" ]]; then
+    safe=true
+  fi
+
+  jq -cn \
+    --argjson safe "$safe" \
+    --arg reason "$reason" \
+    --arg message "$message" \
+    --argjson baseline_ready_nodes "$baseline_ready_nodes" \
+    --argjson current_ready_nodes "$current_ready_nodes" \
+    --argjson nodes_safe "$nodes_safe" \
+    --arg disk_pressure_nodes "$disk_pressure_nodes" \
+    --argjson disk_pressure_count "$disk_pressure_count" \
+    --argjson disk_pressure_safe "$disk_pressure_safe" \
+    --argjson tenants_safe "$tenants_safe" \
+    --argjson chaos_required "$chaos_required" \
+    --argjson chaos_safe "$chaos_safe" \
+    '{
+      safe: $safe,
+      reason: $reason,
+      message: $message,
+      subchecks: {
+        readyNodes: {
+          safe: $nodes_safe,
+          current: $current_ready_nodes,
+          baseline: $baseline_ready_nodes
+        },
+        nodeDiskPressure: {
+          safe: $disk_pressure_safe,
+          count: $disk_pressure_count,
+          nodes: (if $disk_pressure_nodes == "" then [] else ($disk_pressure_nodes | split(",")) end)
+        },
+        nonFaultTenants: {
+          safe: $tenants_safe
+        },
+        chaosMesh: {
+          required: $chaos_required,
+          safe: $chaos_safe
+        }
+      }
+    }'
+}
+
+write_health_watch_event() {
+  local jsonl="$1" at="$2" scope="$3" name="$4" safe="$5" health_checks="$6" message="$7" reason="$8" status_json="$9"
+  local consecutive_failures="${10:-0}" failure_threshold="${11:-1}" will_abort="${12:-false}"
+  jq -cn \
+    --arg at "$at" \
+    --arg scope "$scope" \
+    --arg name "$name" \
+    --argjson safe "$safe" \
+    --argjson health_checks "$health_checks" \
+    --arg message "$message" \
+    --arg reason "$reason" \
+    --argjson status "$status_json" \
+    --argjson consecutive_failures "$consecutive_failures" \
+    --argjson failure_threshold "$failure_threshold" \
+    --argjson will_abort "$will_abort" \
+    '{
+      at: $at,
+      scope: $scope,
+      safe: $safe,
+      health_checks: $health_checks,
+      consecutive_failures: $consecutive_failures,
+      failure_threshold: $failure_threshold,
+      will_abort: $will_abort
+    } + (if $scope == "scenario" then {scenario: $name} else {suite: $name} end) + {
+      message: $message,
+      reason: $reason,
+      subchecks: ($status.subchecks // {})
+    }' >>"$jsonl"
+}
+
+write_suite_budget_watch_event() {
+  local jsonl="$1" at="$2" suite="$3" health_checks="$4" elapsed="$5" max_duration="$6"
+  jq -cn \
+    --arg at "$at" \
+    --arg suite "$suite" \
+    --argjson health_checks "$health_checks" \
+    --argjson elapsed_seconds "$elapsed" \
+    --argjson max_duration_seconds "$max_duration" \
+    '{
+      at: $at,
+      scope: "suite",
+      safe: false,
+      health_checks: $health_checks,
+      suite: $suite,
+      message: "suite maxDuration budget exceeded",
+      reason: "maxDurationSeconds exceeded",
+      budget: false,
+      elapsedSeconds: $elapsed_seconds,
+      maxDurationSeconds: $max_duration_seconds
+    }' >>"$jsonl"
+}
+
+append_health_watch_log() {
+  local path="$1" at="$2" safe="$3" health_checks="$4" reason="$5" message="$6" consecutive_failures="$7" failure_threshold="$8" will_abort="$9"
+  printf '%s safe=%s checks=%s reason=%s consecutiveFailures=%s/%s willAbort=%s message=%s\n' \
+    "$at" "$safe" "$health_checks" "$reason" "$consecutive_failures" "$failure_threshold" "$will_abort" "$message" >>"$path"
+}
+
+health_failure_is_immediate() {
+  local reason="$1"
+  [[ "$reason" == "node_disk_pressure" || "$reason" == "ready_node_count_below_baseline" ]]
 }
 
 validate_scenario_artifacts() {
@@ -582,28 +736,67 @@ validate_scenario_artifacts() {
 write_runner_failure_summary() {
   local scenario="$1" artifacts="$2" rc="$3"
   local health_guard_failed=false rust_failure_summary=false
+  local health_watch_last=""
   [[ ! -f "$artifacts/health-guard-failed" ]] || health_guard_failed=true
   [[ ! -f "$artifacts/failure-summary.json" ]] || rust_failure_summary=true
+  [[ ! -f "$artifacts/health-watch.log" ]] || health_watch_last="$(tail -n 1 "$artifacts/health-watch.log" 2>/dev/null || true)"
   jq -n \
     --arg scenario "$scenario" \
     --argjson exit_code "$rc" \
     --argjson health_guard_failed "$health_guard_failed" \
     --argjson rust_failure_summary "$rust_failure_summary" \
     --arg test_log "$artifacts/test.log" \
+    --arg health_watch_last "$health_watch_last" \
     '{
       scenario: $scenario,
       stage: "runner",
       exit_code: $exit_code,
       health_guard_failed: $health_guard_failed,
       rust_failure_summary_present: $rust_failure_summary,
-      test_log: $test_log
+      test_log: $test_log,
+      health_watch_last: (if $health_watch_last == "" then null else $health_watch_last end)
     }' >"$artifacts/runner-failure-summary.json"
+}
+
+write_suite_runner_failure_summary() {
+  local suite="$1" run_root="$2" rc="$3"
+  local health_guard_failed=false suite_budget_failed=false suite_summary_present=false
+  local health_watch_last=""
+  [[ ! -f "$run_root/health-guard-failed" ]] || health_guard_failed=true
+  [[ ! -f "$run_root/suite-budget-failed" ]] || suite_budget_failed=true
+  [[ ! -f "$run_root/suite-summary.json" ]] || suite_summary_present=true
+  [[ ! -f "$run_root/health-watch.log" ]] || health_watch_last="$(tail -n 1 "$run_root/health-watch.log" 2>/dev/null || true)"
+  jq -n \
+    --arg suite "$suite" \
+    --argjson exit_code "$rc" \
+    --argjson health_guard_failed "$health_guard_failed" \
+    --argjson suite_budget_failed "$suite_budget_failed" \
+    --argjson suite_summary_present "$suite_summary_present" \
+    --arg suite_log "$run_root/suite.log" \
+    --arg health_watch_last "$health_watch_last" \
+    '{
+      suite: $suite,
+      stage: "runner",
+      exit_code: $exit_code,
+      health_guard_failed: $health_guard_failed,
+      suite_budget_failed: $suite_budget_failed,
+      suite_summary_present: $suite_summary_present,
+      suite_log: $suite_log,
+      health_watch_last: (if $health_watch_last == "" then null else $health_watch_last end)
+    }' >"$run_root/runner-failure-summary.json"
+}
+
+warn_artifact_write_failed() {
+  local artifact="$1" path="$2"
+  echo "warning: could not write $artifact: $path" >&2
 }
 
 run_scenario() {
   local scenario="$1" run_root="$2"
   local artifacts="$run_root/$scenario"
   local baseline_ready_nodes baseline_tenants test_pid rc current_time health_checks require_chaos
+  local health_status health_safe health_message health_reason
+  local consecutive_health_failures will_abort
   preflight "$scenario"
   mkdir -p "$artifacts"
   baseline_ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
@@ -636,21 +829,38 @@ run_scenario() {
   ACTIVE_PID="$test_pid"
   ACTIVE_ARTIFACTS="$artifacts"
   health_checks=0
+  consecutive_health_failures=0
 
   while kill -0 "$test_pid" 2>/dev/null; do
     current_time="$(date -u +%FT%TZ)"
     health_checks=$((health_checks + 1))
-    if health_is_safe "$baseline_ready_nodes" "$baseline_tenants" "$require_chaos"; then
-      echo "$current_time safe=true" >>"$artifacts/health-watch.log"
+    health_status="$(health_status_json "$baseline_ready_nodes" "$baseline_tenants" "$require_chaos")"
+    health_safe="$(jq -r '.safe' <<<"$health_status")"
+    health_message="$(jq -r '.message' <<<"$health_status")"
+    health_reason="$(jq -r '.reason' <<<"$health_status")"
+    if [[ "$health_safe" == "true" ]]; then
+      consecutive_health_failures=0
+      append_health_watch_log "$artifacts/health-watch.log" "$current_time" true "$health_checks" "$health_reason" "$health_message" "$consecutive_health_failures" "$HEALTH_GUARD_FAILURE_THRESHOLD" false
+      write_health_watch_event "$artifacts/health-watch.jsonl" "$current_time" scenario "$scenario" true "$health_checks" "$health_message" "$health_reason" "$health_status" "$consecutive_health_failures" "$HEALTH_GUARD_FAILURE_THRESHOLD" false \
+        || warn_artifact_write_failed "health-watch.jsonl" "$artifacts/health-watch.jsonl"
       if (( health_checks % 6 == 0 )); then
         echo "scenario=$scenario running safe=true time=$current_time"
       fi
     else
-      echo "$current_time safe=false" >>"$artifacts/health-watch.log"
-      touch "$artifacts/health-guard-failed"
-      cleanup_managed_chaos
-      terminate_process_tree "$test_pid"
-      break
+      consecutive_health_failures=$((consecutive_health_failures + 1))
+      will_abort=false
+      if health_failure_is_immediate "$health_reason" || (( consecutive_health_failures >= 10#$HEALTH_GUARD_FAILURE_THRESHOLD )); then
+        will_abort=true
+      fi
+      append_health_watch_log "$artifacts/health-watch.log" "$current_time" false "$health_checks" "$health_reason" "$health_message" "$consecutive_health_failures" "$HEALTH_GUARD_FAILURE_THRESHOLD" "$will_abort"
+      write_health_watch_event "$artifacts/health-watch.jsonl" "$current_time" scenario "$scenario" false "$health_checks" "$health_message" "$health_reason" "$health_status" "$consecutive_health_failures" "$HEALTH_GUARD_FAILURE_THRESHOLD" "$will_abort" \
+        || warn_artifact_write_failed "health-watch.jsonl" "$artifacts/health-watch.jsonl"
+      if [[ "$will_abort" == "true" ]]; then
+        touch "$artifacts/health-guard-failed"
+        cleanup_managed_chaos
+        terminate_process_tree "$test_pid"
+        break
+      fi
     fi
     sleep 10
   done
@@ -666,7 +876,8 @@ run_scenario() {
   capture_fault_logs "$artifacts"
 
   if [[ "$rc" -ne 0 ]]; then
-    write_runner_failure_summary "$scenario" "$artifacts" "$rc"
+    write_runner_failure_summary "$scenario" "$artifacts" "$rc" \
+      || warn_artifact_write_failed "runner-failure-summary.json" "$artifacts/runner-failure-summary.json"
     cleanup_managed_chaos
     echo "scenario failed: $scenario rc=$rc log=$artifacts/test.log" >&2
     return "$rc"
@@ -724,8 +935,10 @@ suite_max_duration_seconds() {
 }
 
 run_suite() {
-  local suite="$1" run_root rc suite_plan
+  local suite="$1" run_root rc suite_plan suite_name
   local baseline_ready_nodes baseline_tenants current_time health_checks require_chaos
+  local health_status health_safe health_message health_reason
+  local consecutive_health_failures will_abort
   local started_at now max_duration_seconds elapsed
   [[ -f "$suite" ]] || die "suite yaml file not found: $suite"
   run_root="$(new_run_root)"
@@ -734,6 +947,8 @@ run_suite() {
   preflight_suite "$suite" "$suite_plan"
   build_fault_binary "$run_root" "fault-suite-run"
   preflight_suite "$suite" "$suite_plan"
+  suite_name="$(jq -r '.suite // empty' "$suite_plan")"
+  [[ -n "$suite_name" ]] || suite_name="$suite"
   baseline_ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
   baseline_tenants="$run_root/baseline-non-fault-tenants.tsv"
   list_non_fault_tenants >"$baseline_tenants"
@@ -758,6 +973,7 @@ run_suite() {
   ACTIVE_PID="$!"
   started_at="$(date +%s)"
   health_checks=0
+  consecutive_health_failures=0
 
   while kill -0 "$ACTIVE_PID" 2>/dev/null; do
     current_time="$(date -u +%FT%TZ)"
@@ -765,6 +981,8 @@ run_suite() {
     elapsed=$((now - started_at))
     if [[ -n "$max_duration_seconds" && "$elapsed" -ge "$max_duration_seconds" ]]; then
       echo "$current_time budget=false maxDurationSeconds=$max_duration_seconds elapsedSeconds=$elapsed" >>"$run_root/health-watch.log"
+      write_suite_budget_watch_event "$run_root/health-watch.jsonl" "$current_time" "$suite_name" "$health_checks" "$elapsed" "$max_duration_seconds" \
+        || warn_artifact_write_failed "health-watch.jsonl" "$run_root/health-watch.jsonl"
       touch "$run_root/suite-budget-failed"
       cleanup_managed_chaos
       terminate_process_tree "$ACTIVE_PID"
@@ -772,17 +990,33 @@ run_suite() {
     fi
 
     health_checks=$((health_checks + 1))
-    if health_is_safe "$baseline_ready_nodes" "$baseline_tenants" "$require_chaos"; then
-      echo "$current_time safe=true" >>"$run_root/health-watch.log"
+    health_status="$(health_status_json "$baseline_ready_nodes" "$baseline_tenants" "$require_chaos")"
+    health_safe="$(jq -r '.safe' <<<"$health_status")"
+    health_message="$(jq -r '.message' <<<"$health_status")"
+    health_reason="$(jq -r '.reason' <<<"$health_status")"
+    if [[ "$health_safe" == "true" ]]; then
+      consecutive_health_failures=0
+      append_health_watch_log "$run_root/health-watch.log" "$current_time" true "$health_checks" "$health_reason" "$health_message" "$consecutive_health_failures" "$HEALTH_GUARD_FAILURE_THRESHOLD" false
+      write_health_watch_event "$run_root/health-watch.jsonl" "$current_time" suite "$suite_name" true "$health_checks" "$health_message" "$health_reason" "$health_status" "$consecutive_health_failures" "$HEALTH_GUARD_FAILURE_THRESHOLD" false \
+        || warn_artifact_write_failed "health-watch.jsonl" "$run_root/health-watch.jsonl"
       if (( health_checks % 6 == 0 )); then
         echo "suite=$suite running safe=true time=$current_time"
       fi
     else
-      echo "$current_time safe=false" >>"$run_root/health-watch.log"
-      touch "$run_root/health-guard-failed"
-      cleanup_managed_chaos
-      terminate_process_tree "$ACTIVE_PID"
-      break
+      consecutive_health_failures=$((consecutive_health_failures + 1))
+      will_abort=false
+      if health_failure_is_immediate "$health_reason" || (( consecutive_health_failures >= 10#$HEALTH_GUARD_FAILURE_THRESHOLD )); then
+        will_abort=true
+      fi
+      append_health_watch_log "$run_root/health-watch.log" "$current_time" false "$health_checks" "$health_reason" "$health_message" "$consecutive_health_failures" "$HEALTH_GUARD_FAILURE_THRESHOLD" "$will_abort"
+      write_health_watch_event "$run_root/health-watch.jsonl" "$current_time" suite "$suite_name" false "$health_checks" "$health_message" "$health_reason" "$health_status" "$consecutive_health_failures" "$HEALTH_GUARD_FAILURE_THRESHOLD" "$will_abort" \
+        || warn_artifact_write_failed "health-watch.jsonl" "$run_root/health-watch.jsonl"
+      if [[ "$will_abort" == "true" ]]; then
+        touch "$run_root/health-guard-failed"
+        cleanup_managed_chaos
+        terminate_process_tree "$ACTIVE_PID"
+        break
+      fi
     fi
     sleep 10
   done
@@ -798,6 +1032,8 @@ run_suite() {
   capture_cluster_snapshot "$run_root" after
   capture_fault_logs "$run_root"
   if [[ "$rc" -ne 0 ]]; then
+    write_suite_runner_failure_summary "$suite_name" "$run_root" "$rc" \
+      || warn_artifact_write_failed "runner-failure-summary.json" "$run_root/runner-failure-summary.json"
     cleanup_managed_chaos
     echo "suite failed: $suite rc=$rc log=$run_root/suite.log" >&2
     return "$rc"

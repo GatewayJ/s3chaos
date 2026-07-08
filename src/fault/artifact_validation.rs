@@ -125,6 +125,11 @@ pub fn validate_fault_artifacts(
         "/recovery_stability_reread_seconds",
         "run-metadata.json recovery_stability_reread_seconds",
     )?;
+    ensure_json_field_present(
+        metadata_path,
+        "/require_client_disruption",
+        "run-metadata.json require_client_disruption",
+    )?;
     let metadata = read_json::<RunMetadataArtifact>(metadata_path)?;
     ensure!(
         metadata.scenario == options.scenario,
@@ -198,8 +203,13 @@ pub fn validate_fault_artifacts(
         "run-events.jsonl is missing run started, run succeeded, or checker-final succeeded events"
     );
 
-    let evidence =
-        read_json::<FaultEvidenceArtifact>(required(&artifacts, "fault-evidence.json")?)?;
+    let fault_evidence_path = required(&artifacts, "fault-evidence.json")?;
+    ensure_json_field_present(
+        fault_evidence_path,
+        "/require_client_disruption",
+        "fault-evidence.json require_client_disruption",
+    )?;
+    let evidence = read_json::<FaultEvidenceArtifact>(fault_evidence_path)?;
     ensure!(
         evidence.injected && evidence.active_during_workload && evidence.recovered,
         "fault-evidence.json must record injected=true, active_during_workload=true, recovered=true"
@@ -207,6 +217,12 @@ pub fn validate_fault_artifacts(
     ensure!(
         !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
         "fault-evidence.json must include active and workload fault snapshots"
+    );
+    ensure!(
+        evidence.require_client_disruption == metadata.require_client_disruption,
+        "fault-evidence.json require_client_disruption {} does not match run-metadata.json {}",
+        evidence.require_client_disruption,
+        metadata.require_client_disruption
     );
 
     let prechecker =
@@ -472,6 +488,11 @@ fn validate_recovery_failure_summary_fields(
         summary.evidence_classifications,
         recovery.evidence_classifications()
     );
+    ensure!(
+        summary.final_list_warning_count == recovery.final_list_warning_count
+            && summary.list_warnings == recovery.list_warnings,
+        "failure-summary.json LIST warning fields do not match recovery-stability-report.json"
+    );
     match recovery.classification {
         RecoveryStabilityClassification::RecoveryTailReadLatency => {
             ensure!(
@@ -497,6 +518,16 @@ fn validate_recovery_failure_summary_fields(
                     && summary.corruption == Some(false)
                     && summary.recovered_within_window == Some(false),
                 "committed_object_unavailable failure-summary.json must describe an availability failure with unverified data correctness"
+            );
+        }
+        RecoveryStabilityClassification::ListUnavailableOrUnknown => {
+            ensure!(
+                summary.severity == FailureSeverity::FailAvailability
+                    && summary.data_correctness == DataCorrectnessStatus::Unknown
+                    && summary.availability == AvailabilityStatus::ListUnavailableOrUnknown
+                    && summary.corruption == Some(false)
+                    && summary.recovered_within_window == Some(false),
+                "list_unavailable_or_unknown failure-summary.json must describe a LIST availability/unknown failure without proven corruption"
             );
         }
         RecoveryStabilityClassification::DataCorruption => {
@@ -552,6 +583,14 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
         &report.ambiguous_write_evidence,
         "recovery-stability-report.json ambiguous_write_evidence",
     )?;
+    ensure_sorted_unique(
+        &report.list_warnings,
+        "recovery-stability-report.json list_warnings",
+    )?;
+    ensure!(
+        report.final_list_warning_count >= report.list_warnings.len(),
+        "recovery-stability-report.json final_list_warning_count must cover sampled list_warnings"
+    );
     match report.classification {
         RecoveryStabilityClassification::RecoveryTailReadLatency => {
             ensure!(
@@ -572,6 +611,17 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
                     && report.data_corruption_evidence.is_empty()
                     && report.harness_errors.is_empty(),
                 "committed_object_unavailable requires still_unavailable_keys without higher-priority recovery failures"
+            );
+        }
+        RecoveryStabilityClassification::ListUnavailableOrUnknown => {
+            ensure!(
+                report.final_list_warning_count > 0
+                    && report.still_unavailable_keys.is_empty()
+                    && report.hash_mismatches.is_empty()
+                    && report.data_corruption_evidence.is_empty()
+                    && report.ambiguous_write_evidence.is_empty()
+                    && report.harness_errors.is_empty(),
+                "list_unavailable_or_unknown requires LIST-only availability evidence without harder recovery failures"
             );
         }
         RecoveryStabilityClassification::DataCorruption => {
@@ -758,6 +808,7 @@ struct RunMetadataArtifact {
     rustfs_image: String,
     workload_objects: usize,
     workload_concurrency: usize,
+    require_client_disruption: bool,
     #[serde(default = "default_recovery_stability_reread_seconds")]
     recovery_stability_reread_seconds: u64,
 }
@@ -771,6 +822,7 @@ struct FaultEvidenceArtifact {
     injected: bool,
     active_during_workload: bool,
     recovered: bool,
+    require_client_disruption: bool,
     client_disruptions: usize,
     active_snapshots: Vec<Value>,
     workload_snapshots: Vec<Value>,
@@ -795,6 +847,10 @@ struct FailureSummaryArtifact {
     data_correctness: DataCorrectnessStatus,
     availability: AvailabilityStatus,
     evidence_classifications: Vec<String>,
+    #[serde(default)]
+    final_list_warning_count: usize,
+    #[serde(default)]
+    list_warnings: Vec<String>,
     data_loss: Option<bool>,
     corruption: Option<bool>,
     recovered_within_window: Option<bool>,
@@ -1142,6 +1198,62 @@ mod tests {
 
         super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
             .expect("valid recovery failure fields");
+    }
+
+    #[test]
+    fn validates_list_unavailable_failure_summary_severity_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let case_dir = dir.path().join(case_name);
+        fs::create_dir_all(&case_dir).expect("case dir");
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms":1,"scenario":"io-eio","run_id":"run-1","stage":"checker-pre-recommit","status":"failed","message":"failed"}).to_string(),
+                json!({"at_ms":2,"scenario":"io-eio","run_id":"run-1","stage":"recovery-stability-reread","status":"succeeded","message":"done"}).to_string(),
+            ].join("\n"),
+        )
+        .expect("events");
+        write_json(
+            &case_dir,
+            "recovery-stability-report.json",
+            &json!({
+                "immediate_passed": false,
+                "reread_attempted_keys": [],
+                "reread_recovered_keys": [],
+                "still_unavailable_keys": [],
+                "hash_mismatches": [],
+                "data_corruption_evidence": [],
+                "ambiguous_write_evidence": [],
+                "final_list_warning_count": 1,
+                "list_warnings": ["LIST prefix fault-test/ did not complete"],
+                "harness_errors": [],
+                "max_recovery_seconds": 60,
+                "classification": "list_unavailable_or_unknown"
+            }),
+        );
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &json!({
+                "scenario": "io-eio",
+                "stage": "checker-pre-recommit-verdict",
+                "verdict": "failed",
+                "severity": "fail_availability",
+                "classification": "list_unavailable_or_unknown",
+                "evidence_classifications": ["list_unavailable_or_unknown"],
+                "final_list_warning_count": 1,
+                "list_warnings": ["LIST prefix fault-test/ did not complete"],
+                "data_correctness": "unknown",
+                "availability": "list_unavailable_or_unknown",
+                "corruption": false,
+                "recovered_within_window": false,
+                "message": "final LIST did not complete"
+            }),
+        );
+
+        super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
+            .expect("valid LIST availability failure fields");
     }
 
     #[test]
@@ -1582,6 +1694,7 @@ mod tests {
                 "injected": true,
                 "active_during_workload": true,
                 "recovered": true,
+                "require_client_disruption": true,
                 "client_disruptions": 2,
                 "workload_plan": plan,
                 "pods_before": [{"name": "p0", "uid": "u0"}],

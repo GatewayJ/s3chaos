@@ -214,6 +214,7 @@ impl FaultTestConfig {
             tenant_name: env_or(&get_env, "RUSTFS_FAULT_TEST_TENANT", DEFAULT_FAULT_TENANT),
             storage_class,
             rustfs_image,
+            rustfs_env: env_vars(&get_env, "RUSTFS_FAULT_TEST_SERVER_ENV")?,
             artifacts_dir: PathBuf::from(env_or(
                 &get_env,
                 "RUSTFS_FAULT_TEST_ARTIFACTS",
@@ -466,6 +467,68 @@ where
         .map(|value| value.unwrap_or(default))
 }
 
+fn env_vars<F>(get_env: &F, name: &str) -> Result<Vec<(String, String)>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(raw) = env_optional(get_env, name) else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (env_name, value) = entry
+                .split_once('=')
+                .with_context(|| format!("{name} entries must be KEY=value"))?;
+            let env_name = env_name.trim();
+            ensure_valid_env_name(name, env_name)?;
+            ensure_non_sensitive_env_name(name, env_name)?;
+            Ok((env_name.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn ensure_valid_env_name(source: &str, name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        bail!("{source} env var names must not be empty");
+    };
+    ensure!(
+        first == '_' || first.is_ascii_alphabetic(),
+        "{source} env var names must start with an ASCII letter or '_'"
+    );
+    ensure!(
+        chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()),
+        "{source} env var names must contain only ASCII letters, digits, or '_'"
+    );
+    Ok(())
+}
+
+fn ensure_non_sensitive_env_name(source: &str, name: &str) -> Result<()> {
+    const SENSITIVE_TOKENS: &[&str] = &[
+        "ACCESSKEY",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "PASSWD",
+        "PASSWORD",
+        "PRIVATEKEY",
+        "SECRET",
+        "SECRETKEY",
+        "TOKEN",
+    ];
+
+    let upper = name.to_ascii_uppercase();
+    let has_sensitive_token = upper
+        .split('_')
+        .any(|token| token == "KEY" || SENSITIVE_TOKENS.contains(&token));
+    ensure!(
+        !has_sensitive_token,
+        "{source} env var {name:?} looks secret-like and would be captured in fault-test artifacts; use only non-secret feature gates or diagnostics"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FaultTestConfig, FaultWorkloadProfile, validate_storage_class};
@@ -488,6 +551,7 @@ mod tests {
         assert_eq!(config.cluster.tenant_name, "fault-test-tenant");
         assert_eq!(config.cluster.storage_class, "fast-csi");
         assert_eq!(config.cluster.rustfs_image, "rustfs/rustfs:test");
+        assert!(config.cluster.rustfs_env.is_empty());
         assert_eq!(
             config.cluster.artifacts_dir,
             std::path::PathBuf::from("target/fault-tests/artifacts")
@@ -532,6 +596,9 @@ mod tests {
             |name| match name {
                 "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("fast-csi".to_string()),
                 "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_ENV" => {
+                    Some("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE=true,RUSTFS_FOO=bar".to_string())
+                }
                 "RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" => Some("production-test-cluster".to_string()),
                 "RUSTFS_FAULT_TEST_SCENARIO" => Some("dm-flakey".to_string()),
                 "RUSTFS_FAULT_TEST_DURATION_SECONDS" => Some("45".to_string()),
@@ -575,6 +642,16 @@ mod tests {
         assert_eq!(config.workload.object_count, 64);
         assert_eq!(config.workload.concurrency, 8);
         assert_eq!(config.prefill_concurrency, 4);
+        assert_eq!(
+            config.cluster.rustfs_env,
+            vec![
+                (
+                    "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE".to_string(),
+                    "true".to_string()
+                ),
+                ("RUSTFS_FOO".to_string(), "bar".to_string())
+            ]
+        );
         assert_eq!(config.workload_seed, Some(4242));
         assert_eq!(config.request_timeout, std::time::Duration::from_secs(7));
         assert_eq!(
@@ -674,6 +751,38 @@ mod tests {
         let result = FaultTestConfig::from_env_with(
             |name| match name {
                 "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("fast-csi".to_string()),
+                _ => None,
+            },
+            "production-test-cluster".to_string(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_server_env_name_is_rejected() {
+        let result = FaultTestConfig::from_env_with(
+            |name| match name {
+                "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("fast-csi".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_ENV" => Some("1INVALID=true".to_string()),
+                _ => None,
+            },
+            "production-test-cluster".to_string(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sensitive_server_env_name_is_rejected() {
+        let result = FaultTestConfig::from_env_with(
+            |name| match name {
+                "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("fast-csi".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_ENV" => {
+                    Some("RUSTFS_SECRET_KEY=please-do-not-capture".to_string())
+                }
                 _ => None,
             },
             "production-test-cluster".to_string(),

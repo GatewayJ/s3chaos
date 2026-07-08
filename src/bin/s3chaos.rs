@@ -13,14 +13,20 @@
 // limitations under the License.
 
 use anyhow::{Context, Result, bail, ensure};
+#[path = "s3chaos/console_server.rs"]
+mod console_server;
+
+use console_server::serve_console;
 use s3chaos::fault::{
     artifact_validation::{ArtifactValidationOptions, validate_fault_artifacts},
+    console::build_console_snapshot,
     runner::run_selected_scenario_from_env,
     scenarios::scenario_catalog_json,
     spec::{FaultRunArtifactSpec, FaultRunSpec},
     suite::{fault_suite_template_yaml, resolve_fault_suite_yaml},
     suite_runner::{plan_fault_suite_from_yaml, run_fault_suite_from_yaml},
 };
+use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,6 +36,8 @@ async fn main() -> Result<()> {
     match command.as_str() {
         "help" | "--help" | "-h" => print_help(),
         "fault-catalog-json" => print_fault_catalog_json(),
+        "fault-console-json" => print_fault_console_json(args),
+        "fault-console-serve" => serve_fault_console(args).await,
         "fault-required-artifacts-json" => print_fault_required_artifacts_json(),
         "fault-run" => run_selected_scenario_from_env().await,
         "fault-suite-json" => print_fault_suite_json(args),
@@ -48,6 +56,8 @@ fn print_help() -> Result<()> {
     println!();
     println!("Commands:");
     println!("  fault-catalog-json");
+    println!("  fault-console-json <artifact-root>");
+    println!("  fault-console-serve <artifact-root> [--addr 127.0.0.1:0] [--allow-non-loopback]");
     println!("  fault-required-artifacts-json");
     println!("  fault-run");
     println!("  fault-suite-json <suite.yaml>");
@@ -58,6 +68,77 @@ fn print_help() -> Result<()> {
     println!("  fault-validate-artifacts <scenario> <artifact-root> [--validation-summary-tsv]");
     println!("  fault-run-spec-equal <run-spec.json> <run-spec.yaml>");
     Ok(())
+}
+
+fn print_fault_console_json(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let artifact_root = args
+        .next()
+        .context("fault-console-json requires artifact root")?;
+    ensure!(
+        args.next().is_none(),
+        "fault-console-json accepts exactly one artifact root"
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&build_console_snapshot(artifact_root)?)?
+    );
+    Ok(())
+}
+
+async fn serve_fault_console(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let options = parse_fault_console_serve_args(&mut args)?;
+    if !options.addr.ip().is_loopback() {
+        eprintln!(
+            "WARNING: fault-console-serve is binding to non-loopback address {}; artifact contents may be exposed beyond this host",
+            options.addr
+        );
+    }
+
+    serve_console(options.artifact_root, options.addr).await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FaultConsoleServeOptions {
+    artifact_root: String,
+    addr: SocketAddr,
+}
+
+fn parse_fault_console_serve_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<FaultConsoleServeOptions> {
+    let artifact_root = args
+        .next()
+        .context("fault-console-serve requires artifact root")?;
+    let mut addr = "127.0.0.1:0"
+        .parse::<SocketAddr>()
+        .expect("default console address is valid");
+    let mut allow_non_loopback = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--addr" => {
+                let raw_addr = args
+                    .next()
+                    .context("fault-console-serve --addr requires socket address")?;
+                addr = raw_addr
+                    .parse()
+                    .with_context(|| format!("parse fault-console-serve --addr {raw_addr}"))?;
+            }
+            "--allow-non-loopback" => allow_non_loopback = true,
+            _ => bail!("unknown fault-console-serve option: {arg}"),
+        }
+    }
+
+    if !addr.ip().is_loopback() && !allow_non_loopback {
+        bail!(
+            "fault-console-serve refuses non-loopback bind address {addr}; pass --allow-non-loopback to expose the console beyond localhost"
+        );
+    }
+
+    Ok(FaultConsoleServeOptions {
+        artifact_root,
+        addr,
+    })
 }
 
 fn print_fault_catalog_json() -> Result<()> {
@@ -181,4 +262,51 @@ fn validate_fault_run_spec_equivalence(mut args: impl Iterator<Item = String>) -
     );
     println!("run spec JSON/YAML contract matches");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_fault_console_serve_args;
+    use std::net::SocketAddr;
+
+    fn args<'a>(items: &'a [&'a str]) -> impl Iterator<Item = String> + 'a {
+        items.iter().map(|item| item.to_string())
+    }
+
+    #[test]
+    fn fault_console_serve_defaults_to_loopback_addr() {
+        let options = parse_fault_console_serve_args(args(&["artifacts"])).expect("options");
+
+        assert_eq!(options.artifact_root, "artifacts");
+        assert_eq!(
+            options.addr,
+            "127.0.0.1:0".parse::<SocketAddr>().expect("addr")
+        );
+    }
+
+    #[test]
+    fn fault_console_serve_rejects_non_loopback_addr_without_flag() {
+        let error = parse_fault_console_serve_args(args(&["artifacts", "--addr", "0.0.0.0:8080"]))
+            .expect_err("non-loopback without flag");
+
+        let message = error.to_string();
+        assert!(message.contains("refuses non-loopback bind address"));
+        assert!(message.contains("--allow-non-loopback"));
+    }
+
+    #[test]
+    fn fault_console_serve_allows_non_loopback_addr_with_flag() {
+        let options = parse_fault_console_serve_args(args(&[
+            "artifacts",
+            "--addr",
+            "0.0.0.0:8080",
+            "--allow-non-loopback",
+        ]))
+        .expect("non-loopback with flag");
+
+        assert_eq!(
+            options.addr,
+            "0.0.0.0:8080".parse::<SocketAddr>().expect("addr")
+        );
+    }
 }

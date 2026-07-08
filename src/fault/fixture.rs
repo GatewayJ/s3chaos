@@ -50,13 +50,14 @@ metadata:
 }
 
 pub fn tenant_manifest(config: &ClusterTestConfig) -> Result<String> {
-    let template = TenantTemplate::real_cluster(
+    let mut template = TenantTemplate::real_cluster(
         &config.test_namespace,
         &config.tenant_name,
         &config.rustfs_image,
         &config.storage_class,
         credential_secret_name(config),
     );
+    template.rustfs_env.clone_from(&config.rustfs_env);
     template.manifest()
 }
 
@@ -157,6 +158,31 @@ mod tests {
         assert!(manifest.contains("storage: 100Gi"));
         assert!(!manifest.contains("rustfs-storage"));
         assert!(!manifest.contains("RUSTFS_UNSAFE_BYPASS_DISK_CHECK"));
+    }
+
+    #[test]
+    fn fault_tenant_manifest_includes_extra_rustfs_env() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.cluster.rustfs_env = vec![(
+            "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE".to_string(),
+            "true".to_string(),
+        )];
+
+        let manifest = tenant_manifest(&config.cluster).expect("fault tenant manifest");
+        let value: serde_json::Value = serde_yaml_ng::from_str(&manifest).expect("valid yaml");
+
+        assert_eq!(
+            value
+                .pointer("/spec/env/1/name")
+                .and_then(serde_json::Value::as_str),
+            Some("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE")
+        );
+        assert_eq!(
+            value
+                .pointer("/spec/env/1/value")
+                .and_then(serde_json::Value::as_str),
+            Some("true")
+        );
     }
 
     #[test]

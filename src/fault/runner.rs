@@ -1163,6 +1163,7 @@ async fn run_fault_case(
         injected: true,
         active_during_workload: true,
         recovered: true,
+        require_client_disruption,
         client_disruptions: workload.summary.disrupted(),
         workload_plan: workload_plan.clone(),
         pods_before: pods_before.clone(),
@@ -1317,7 +1318,11 @@ async fn run_fault_case(
                 error.to_string(),
             )
             .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds)
-            .with_evidence_classifications(recovery_stability_report.evidence_classifications()),
+            .with_evidence_classifications(recovery_stability_report.evidence_classifications())
+            .with_list_warnings(
+                recovery_stability_report.final_list_warning_count,
+                recovery_stability_report.list_warnings.clone(),
+            ),
         )?;
         return Err(error);
     }
@@ -1439,6 +1444,7 @@ async fn run_fault_case(
         injected: true,
         active_during_workload: true,
         recovered: report.tenant_recovered,
+        require_client_disruption,
         client_disruptions: workload.summary.disrupted(),
         workload_plan,
         pods_before,
@@ -1536,6 +1542,7 @@ fn initialize_fault_run(
         &serde_json::to_string_pretty(&RunMetadata::from_case(
             config,
             scenario,
+            spec,
             plan,
             &workload_plan,
             &run_id,
