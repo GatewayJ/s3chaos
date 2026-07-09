@@ -222,6 +222,21 @@ impl FaultTestConfig {
             )),
             pod_management_policy: None,
             timeout: Duration::from_secs(cluster_timeout_seconds),
+            tenant_storage_request: env_or(
+                &get_env,
+                "RUSTFS_FAULT_TEST_TENANT_STORAGE_REQUEST",
+                "100Gi",
+            ),
+            tenant_spread_across_hosts: env_bool_or(
+                &get_env,
+                "RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS",
+                true,
+            )?,
+            tenant_unsafe_bypass_disk_check: env_bool_or(
+                &get_env,
+                "RUSTFS_FAULT_TEST_TENANT_UNSAFE_BYPASS_DISK_CHECK",
+                false,
+            )?,
         };
 
         Ok(Self {
@@ -402,8 +417,15 @@ fn env_bool<F>(get_env: &F, name: &str) -> Result<bool>
 where
     F: Fn(&str) -> Option<String>,
 {
+    env_bool_or(get_env, name, false)
+}
+
+fn env_bool_or<F>(get_env: &F, name: &str, default: bool) -> Result<bool>
+where
+    F: Fn(&str) -> Option<String>,
+{
     let Some(value) = env_optional(get_env, name) else {
-        return Ok(false);
+        return Ok(default);
     };
     match value.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" => Ok(true),
@@ -552,6 +574,9 @@ mod tests {
         assert_eq!(config.cluster.storage_class, "fast-csi");
         assert_eq!(config.cluster.rustfs_image, "rustfs/rustfs:test");
         assert!(config.cluster.rustfs_env.is_empty());
+        assert_eq!(config.cluster.tenant_storage_request, "100Gi");
+        assert!(config.cluster.tenant_spread_across_hosts);
+        assert!(!config.cluster.tenant_unsafe_bypass_disk_check);
         assert_eq!(
             config.cluster.artifacts_dir,
             std::path::PathBuf::from("target/fault-tests/artifacts")
@@ -588,6 +613,41 @@ mod tests {
         assert_eq!(config.warp_duration, std::time::Duration::from_secs(60));
         assert!(!config.destructive_enabled);
         assert!(config.require_destructive_enabled().is_err());
+    }
+
+    #[test]
+    fn single_node_tenant_topology_env_overrides_are_parsed() {
+        let config = FaultTestConfig::from_env_with(
+            |name| match name {
+                "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("standard".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_TENANT_STORAGE_REQUEST" => Some("2Gi".to_string()),
+                "RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS" => Some("false".to_string()),
+                "RUSTFS_FAULT_TEST_TENANT_UNSAFE_BYPASS_DISK_CHECK" => Some("true".to_string()),
+                _ => None,
+            },
+            "minikube".to_string(),
+        )
+        .expect("fault config");
+
+        assert_eq!(config.cluster.tenant_storage_request, "2Gi");
+        assert!(!config.cluster.tenant_spread_across_hosts);
+        assert!(config.cluster.tenant_unsafe_bypass_disk_check);
+    }
+
+    #[test]
+    fn tenant_topology_env_rejects_non_boolean() {
+        let result = FaultTestConfig::from_env_with(
+            |name| match name {
+                "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("standard".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS" => Some("maybe".to_string()),
+                _ => None,
+            },
+            "minikube".to_string(),
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]

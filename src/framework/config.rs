@@ -50,6 +50,18 @@ pub struct ClusterTestConfig {
     pub pod_management_policy: Option<PodManagementPolicy>,
     pub artifacts_dir: PathBuf,
     pub timeout: Duration,
+    /// Per-volume storage request for the fault-test Tenant. Defaults to a
+    /// production-sized `100Gi`; lower it for single-node/lab clusters whose
+    /// backing disks are small.
+    pub tenant_storage_request: String,
+    /// Whether the fault-test Tenant requires pods on distinct hosts. True on
+    /// multi-node clusters; set false so a single-node cluster can schedule all
+    /// server pods without editing source.
+    pub tenant_spread_across_hosts: bool,
+    /// Whether the fault-test Tenant bypasses RustFS's block-device disk check.
+    /// False by default; set true for hostpath/loopback lab storage that is not
+    /// a dedicated block device.
+    pub tenant_unsafe_bypass_disk_check: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +130,11 @@ impl E2eConfig {
                 )),
                 pod_management_policy: parse_pod_management_policy(&get_env),
                 timeout: Duration::from_secs(env_u64(&get_env, "RUSTFS_E2E_TIMEOUT_SECONDS", 300)),
+                // The E2e/smoke path builds its Tenant from the kind_local
+                // template and never reads these; keep the production defaults.
+                tenant_storage_request: "100Gi".to_string(),
+                tenant_spread_across_hosts: true,
+                tenant_unsafe_bypass_disk_check: false,
             },
             cluster_name,
             pv_count: env_usize(&get_env, "RUSTFS_E2E_PV_COUNT", 12),

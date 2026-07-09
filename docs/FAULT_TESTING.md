@@ -125,6 +125,10 @@ resource cleanup remain under `src/framework/`.
 | `RUSTFS_FAULT_TEST_TIMEOUT_SECONDS` | `300` | Kubernetes wait timeout. |
 | `RUSTFS_FAULT_TEST_SEED` | generated | Reuse a workload plan. |
 | `RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT` | `4` | Expected RustFS server Pod count for stability gates. |
+| `RUSTFS_FAULT_TEST_MIN_NODES` | `4` | Minimum schedulable Ready nodes required by preflight. Lower to `1` for a single-node cluster. |
+| `RUSTFS_FAULT_TEST_TENANT_STORAGE_REQUEST` | `100Gi` | Per-volume storage request for the fault Tenant. Lower it (e.g. `2Gi`) for small lab disks. |
+| `RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS` | `true` | Require Tenant server Pods on distinct hosts. Set `false` so a single-node cluster can schedule all server Pods. |
+| `RUSTFS_FAULT_TEST_TENANT_UNSAFE_BYPASS_DISK_CHECK` | `false` | Bypass RustFS's block-device disk check. Set `true` for hostpath/loopback lab storage that is not a dedicated block device. |
 | `RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH` | `/data/rustfs0` | RustFS data volume path targeted by volume faults; must be an absolute safe path using ASCII letters, digits, `/`, `.`, `_`, or `-`. |
 | `RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS` | `60` | Required no-restart Ready window before and after fault injection. |
 | `RUSTFS_FAULT_TEST_HEALTH_GUARD_FAILURE_THRESHOLD` | `1` | Consecutive unsafe health samples required before the shell runner aborts for non-immediate guard failures. Node `DiskPressure` and Ready-node loss abort immediately. |
@@ -171,13 +175,33 @@ kubectl get storageclass
 Requirements:
 
 - The current context must be a real Kubernetes or K3s cluster, not `kind-*`.
-- At least four schedulable Ready nodes are required for the current default
-  Tenant shape.
+- At least four schedulable Ready nodes are required for the default Tenant
+  shape. A single-node cluster is supported by relaxing the topology (see
+  below); it is not validated for node-level or `dm-flakey` faults.
 - Non-static scenarios need a dedicated dynamic StorageClass.
 - `dm-flakey` needs a dedicated static Local PV StorageClass and explicit
   device-mapper variables.
 - Other Tenants in the cluster are health guardrails. They must remain Ready,
   but the runner does not modify them.
+
+### Single-node clusters
+
+A single-node cluster (for example K3s or minikube for local iteration on
+Chaos Mesh Pod/Network/Stress scenarios) is supported through configuration —
+no source edits. Relax the node requirement and the Tenant topology:
+
+```bash
+export RUSTFS_FAULT_TEST_MIN_NODES=1
+export RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS=false
+export RUSTFS_FAULT_TEST_TENANT_UNSAFE_BYPASS_DISK_CHECK=true   # hostpath/loopback storage
+export RUSTFS_FAULT_TEST_TENANT_STORAGE_REQUEST=2Gi            # small lab disks
+```
+
+The defaults keep the production four-node, spread, disk-checked shape, so
+multi-node runs are unaffected. Chaos Mesh IOChaos-backed scenarios (`io-eio`,
+`io-latency`, `io-read-mistake`, `disk-full`) need a real kernel per node and do
+not work on nested-container Kubernetes such as minikube-in-a-VM; use
+Pod/Network/Stress scenarios there.
 
 For K3s with local-path storage, verify the actual backing filesystem has
 enough free space. PVC capacity alone may not enforce real disk quota.
