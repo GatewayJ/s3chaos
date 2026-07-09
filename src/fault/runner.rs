@@ -22,6 +22,11 @@ use crate::{
         config::FaultTestConfig,
         diagnostics::diagnose_rustfs_snapshot,
         events::{RunEventRecorder, RunEventStatus},
+        fault_artifacts::FaultFailureArtifactSource,
+        fault_lifecycle::{
+            AppliedFault, AppliedFaults, FaultDeleteTimeoutRecovery,
+            FaultDeleteTimeoutRecoveryRequest, FaultLifecyclePort,
+        },
         fixture,
         history::{OperationOutcome, OperationRecord, Recorder},
         plan::{FaultInjection, FaultPlan, FaultPlanOptions},
@@ -984,11 +989,10 @@ async fn run_fault_case(
     )?;
     let fault_delete_started_at = Instant::now();
     if let Err(error) = fault.delete(cluster.timeout) {
-        let finalizer_recovery = match try_recover_stuck_iochaos_finalizer(
+        let finalizer_recovery = match fault.recover_delete_timeout(
             config,
             collector,
             scenario.case_name,
-            &mut fault,
             &run_id,
             &error,
             fault_delete_started_at,
@@ -1011,8 +1015,8 @@ async fn run_fault_case(
                 RunEventStatus::Succeeded,
                 "patched stuck IOChaos finalizer after recovery evidence",
                 Some(serde_json::json!({
-                    "warning_artifact": "iochaos-finalizer-recovery-warning.json",
-                    "iochaos": recovery.iochaos_name,
+                    "warning_artifact": recovery.warning_artifact,
+                    "iochaos": recovery.resource_name,
                     "target_nodes": recovery.target_nodes,
                 })),
             )?;
@@ -1673,69 +1677,6 @@ fn prepare_fault_fixture(config: &ClusterTestConfig, isolation: FaultIsolation) 
     Ok(())
 }
 
-trait FaultBackendHandle {
-    fn wait_active(&self, timeout: Duration) -> Result<()>;
-    fn ensure_active(&self, stage: &str) -> Result<()>;
-    fn delete(&mut self, timeout: Duration) -> Result<()>;
-    fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot>;
-
-    fn recovery_dm_snapshot(&self) -> Option<DmStatusSnapshot> {
-        None
-    }
-
-    fn failure_artifacts(&self) -> Option<FaultFailureArtifacts<'_>> {
-        None
-    }
-
-    fn recover_delete_timeout(
-        &mut self,
-        _config: &FaultTestConfig,
-        _collector: &ArtifactCollector,
-        _case_name: &str,
-        _run_id: &str,
-        _original_error: &anyhow::Error,
-        _delete_started_at: Instant,
-    ) -> Result<Option<IoChaosFinalizerRecoveryReport>> {
-        Ok(None)
-    }
-}
-
-type AppliedFault = Box<dyn FaultBackendHandle>;
-
-enum FaultFailureArtifacts<'a> {
-    Chaos {
-        guard: &'a ChaosGuard,
-    },
-    #[cfg(test)]
-    Recording {
-        body: &'a str,
-    },
-}
-
-impl FaultFailureArtifacts<'_> {
-    fn collect(
-        &self,
-        collector: &ArtifactCollector,
-        case_name: &str,
-        total: usize,
-        index: usize,
-        suffix: &str,
-    ) -> Result<()> {
-        match self {
-            Self::Chaos { guard } => {
-                collect_chaos_failure_artifacts(guard, collector, case_name, total, index, suffix)
-            }
-            #[cfg(test)]
-            Self::Recording { body } => {
-                let artifact_name =
-                    chaos_artifact_name(total, index, "recording-artifact", suffix, "txt");
-                collector.write_text(case_name, &artifact_name, body)?;
-                Ok(())
-            }
-        }
-    }
-}
-
 struct ChaosFaultHandle {
     guard: Box<ChaosGuard>,
     active_required: bool,
@@ -1749,10 +1690,6 @@ struct PodKillFaultHandle {
 
 struct DmFlakeyFaultHandle {
     guard: Box<DmFlakeyGuard>,
-}
-
-struct AppliedFaults {
-    items: Vec<AppliedFault>,
 }
 
 impl AppliedFaults {
@@ -1785,72 +1722,7 @@ impl AppliedFaults {
             )?);
         }
 
-        Ok(Self { items })
-    }
-
-    fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    fn wait_active(&self, timeout: Duration) -> Result<()> {
-        for fault in &self.items {
-            fault.wait_active(timeout)?;
-        }
-        Ok(())
-    }
-
-    fn ensure_active(&self, stage: &str) -> Result<()> {
-        for fault in &self.items {
-            fault.ensure_active(stage)?;
-        }
-        Ok(())
-    }
-
-    fn delete(&mut self, timeout: Duration) -> Result<()> {
-        for fault in self.items.iter_mut().rev() {
-            fault.delete(timeout)?;
-        }
-        Ok(())
-    }
-
-    fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot> {
-        ensure!(
-            self.items.len() == 1,
-            "single fault snapshot requested for {} applied faults",
-            self.items.len()
-        );
-        self.items[0].snapshot(stage)
-    }
-
-    fn snapshots(&self, stage: &str) -> Result<Vec<FaultStatusSnapshot>> {
-        self.items
-            .iter()
-            .map(|fault| fault.snapshot(stage))
-            .collect()
-    }
-
-    fn recovery_dm_snapshot(&self) -> Option<DmStatusSnapshot> {
-        self.items
-            .iter()
-            .find_map(|fault| fault.recovery_dm_snapshot())
-    }
-
-    fn collect_failure_artifacts(
-        &self,
-        collector: &ArtifactCollector,
-        case_name: &str,
-        suffix: &str,
-    ) -> Result<()> {
-        let artifacts = self
-            .items
-            .iter()
-            .filter_map(|fault| fault.failure_artifacts())
-            .collect::<Vec<_>>();
-        let total = artifacts.len();
-        for (index, artifacts) in artifacts.iter().enumerate() {
-            artifacts.collect(collector, case_name, total, index, suffix)?;
-        }
-        Ok(())
+        Ok(Self::new(items))
     }
 
     fn recover_delete_timeout(
@@ -1861,18 +1733,29 @@ impl AppliedFaults {
         run_id: &str,
         original_error: &anyhow::Error,
         delete_started_at: Instant,
-    ) -> Result<Option<IoChaosFinalizerRecoveryReport>> {
-        if self.items.len() != 1 {
-            return Ok(None);
-        }
-        self.items[0].as_mut().recover_delete_timeout(
+    ) -> Result<Option<FaultDeleteTimeoutRecovery>> {
+        self.recover_delete_timeout_with(&FaultDeleteTimeoutRecoveryRequest {
             config,
             collector,
             case_name,
             run_id,
             original_error,
             delete_started_at,
-        )
+        })
+    }
+
+    fn collect_failure_artifacts(
+        &self,
+        collector: &ArtifactCollector,
+        case_name: &str,
+        suffix: &str,
+    ) -> Result<()> {
+        let artifacts = self.failure_artifacts();
+        let total = artifacts.len();
+        for (index, artifacts) in artifacts.iter().enumerate() {
+            artifacts.collect_failure_artifacts(collector, case_name, total, index, suffix)?;
+        }
+        Ok(())
     }
 }
 
@@ -1954,7 +1837,27 @@ fn apply_host_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFa
     }))
 }
 
-impl FaultBackendHandle for ChaosFaultHandle {
+impl FaultFailureArtifactSource for ChaosFaultHandle {
+    fn collect_failure_artifacts(
+        &self,
+        collector: &ArtifactCollector,
+        case_name: &str,
+        total: usize,
+        index: usize,
+        suffix: &str,
+    ) -> Result<()> {
+        collect_chaos_failure_artifacts(
+            self.guard.as_ref(),
+            collector,
+            case_name,
+            total,
+            index,
+            suffix,
+        )
+    }
+}
+
+impl FaultLifecyclePort for ChaosFaultHandle {
     fn wait_active(&self, timeout: Duration) -> Result<()> {
         if self.active_required {
             self.guard.wait_active(timeout)?;
@@ -1977,37 +1880,51 @@ impl FaultBackendHandle for ChaosFaultHandle {
         chaos_fault_snapshot(self.guard.as_ref(), stage)
     }
 
-    fn failure_artifacts(&self) -> Option<FaultFailureArtifacts<'_>> {
-        Some(FaultFailureArtifacts::Chaos {
-            guard: self.guard.as_ref(),
-        })
+    fn failure_artifacts(&self) -> Option<&dyn FaultFailureArtifactSource> {
+        Some(self)
     }
 
     fn recover_delete_timeout(
         &mut self,
-        config: &FaultTestConfig,
-        collector: &ArtifactCollector,
-        case_name: &str,
-        run_id: &str,
-        original_error: &anyhow::Error,
-        delete_started_at: Instant,
-    ) -> Result<Option<IoChaosFinalizerRecoveryReport>> {
+        request: &FaultDeleteTimeoutRecoveryRequest<'_>,
+    ) -> Result<Option<FaultDeleteTimeoutRecovery>> {
         if !self.guard.is_kind("iochaos") {
             return Ok(None);
         }
-        recover_stuck_iochaos_finalizer(
-            config,
+        Ok(recover_stuck_iochaos_finalizer(
+            request.config,
+            request.collector,
+            request.case_name,
+            self.guard.as_mut(),
+            request.run_id,
+            request.original_error,
+            request.delete_started_at,
+        )?
+        .map(FaultDeleteTimeoutRecovery::from))
+    }
+}
+
+impl FaultFailureArtifactSource for PodKillFaultHandle {
+    fn collect_failure_artifacts(
+        &self,
+        collector: &ArtifactCollector,
+        case_name: &str,
+        total: usize,
+        index: usize,
+        suffix: &str,
+    ) -> Result<()> {
+        collect_chaos_failure_artifacts(
+            self.guard.as_ref(),
             collector,
             case_name,
-            self.guard.as_mut(),
-            run_id,
-            original_error,
-            delete_started_at,
+            total,
+            index,
+            suffix,
         )
     }
 }
 
-impl FaultBackendHandle for PodKillFaultHandle {
+impl FaultLifecyclePort for PodKillFaultHandle {
     fn wait_active(&self, timeout: Duration) -> Result<()> {
         wait_for_rustfs_pod_deletion(&self.config, &self.before_pods, timeout)
     }
@@ -2025,14 +1942,12 @@ impl FaultBackendHandle for PodKillFaultHandle {
         chaos_fault_snapshot(self.guard.as_ref(), stage)
     }
 
-    fn failure_artifacts(&self) -> Option<FaultFailureArtifacts<'_>> {
-        Some(FaultFailureArtifacts::Chaos {
-            guard: self.guard.as_ref(),
-        })
+    fn failure_artifacts(&self) -> Option<&dyn FaultFailureArtifactSource> {
+        Some(self)
     }
 }
 
-impl FaultBackendHandle for DmFlakeyFaultHandle {
+impl FaultLifecyclePort for DmFlakeyFaultHandle {
     fn wait_active(&self, _timeout: Duration) -> Result<()> {
         Ok(())
     }
@@ -2129,6 +2044,16 @@ struct IoChaosFinalizerRecoveryReport {
     daemon_log_since: String,
 }
 
+impl From<IoChaosFinalizerRecoveryReport> for FaultDeleteTimeoutRecovery {
+    fn from(report: IoChaosFinalizerRecoveryReport) -> Self {
+        Self {
+            warning_artifact: IOCHAOS_FINALIZER_RECOVERY_WARNING,
+            resource_name: report.iochaos_name,
+            target_nodes: report.target_nodes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct DaemonUnmountLogEvidence {
     node: String,
@@ -2150,25 +2075,6 @@ struct PodIoChaosRecoveryEvidence {
     related_count: usize,
     source_actions_remaining: usize,
     empty_action_objects: usize,
-}
-
-fn try_recover_stuck_iochaos_finalizer(
-    config: &FaultTestConfig,
-    collector: &ArtifactCollector,
-    case_name: &str,
-    faults: &mut AppliedFaults,
-    run_id: &str,
-    original_error: &anyhow::Error,
-    delete_started_at: Instant,
-) -> Result<Option<IoChaosFinalizerRecoveryReport>> {
-    faults.recover_delete_timeout(
-        config,
-        collector,
-        case_name,
-        run_id,
-        original_error,
-        delete_started_at,
-    )
 }
 
 fn recover_stuck_iochaos_finalizer(
@@ -3544,13 +3450,13 @@ fn warp_bucket_name(run_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppliedFaults, DaemonUnmountLogEvidence, FaultBackendHandle, FaultFailureArtifacts,
+        AppliedFaults, DaemonUnmountLogEvidence, FaultFailureArtifactSource, FaultLifecyclePort,
         IoChaosFinalizerRecoveryReport, OutcomeCounts, PodIoChaosRecoveryEvidence, PodRuntimeState,
         RecommitAttempt, RecommitReport, TargetPodRecoveryEvidence, WorkloadSummary, bucket_name,
-        chaos_daemon_pods_from_json, chaos_manifest_artifact_name, chaos_resource_name_suffix,
-        finalizers_from_resource, iochaos_finalizer_patch_allowed, podiochaos_recovery_evidence,
-        resource_has_deletion_timestamp, resource_label_matches, stable_pod_fingerprint,
-        target_pods_from_json, unmount_success_log_lines, warp_bucket_name,
+        chaos_artifact_name, chaos_daemon_pods_from_json, chaos_manifest_artifact_name,
+        chaos_resource_name_suffix, finalizers_from_resource, iochaos_finalizer_patch_allowed,
+        podiochaos_recovery_evidence, resource_has_deletion_timestamp, resource_label_matches,
+        stable_pod_fingerprint, target_pods_from_json, unmount_success_log_lines, warp_bucket_name,
     };
     use crate::fault::history::OperationOutcome;
     use crate::fault::plan::{
@@ -3562,19 +3468,35 @@ mod tests {
     use crate::framework::artifacts::ArtifactCollector;
     use anyhow::Result;
     use serde_json::json;
-    use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::fs;
-    use std::rc::Rc;
     use std::time::Duration;
 
     struct RecordingFaultBackend {
         name: &'static str,
-        deletes: Rc<RefCell<Vec<&'static str>>>,
         artifact_body: Option<&'static str>,
     }
 
-    impl FaultBackendHandle for RecordingFaultBackend {
+    impl FaultFailureArtifactSource for RecordingFaultBackend {
+        fn collect_failure_artifacts(
+            &self,
+            collector: &ArtifactCollector,
+            case_name: &str,
+            total: usize,
+            index: usize,
+            suffix: &str,
+        ) -> Result<()> {
+            let Some(body) = self.artifact_body else {
+                return Ok(());
+            };
+            let artifact_name =
+                chaos_artifact_name(total, index, "recording-artifact", suffix, "txt");
+            collector.write_text(case_name, &artifact_name, body)?;
+            Ok(())
+        }
+    }
+
+    impl FaultLifecyclePort for RecordingFaultBackend {
         fn wait_active(&self, _timeout: Duration) -> Result<()> {
             Ok(())
         }
@@ -3584,7 +3506,6 @@ mod tests {
         }
 
         fn delete(&mut self, _timeout: Duration) -> Result<()> {
-            self.deletes.borrow_mut().push(self.name);
             Ok(())
         }
 
@@ -3598,9 +3519,9 @@ mod tests {
             })
         }
 
-        fn failure_artifacts(&self) -> Option<FaultFailureArtifacts<'_>> {
+        fn failure_artifacts(&self) -> Option<&dyn FaultFailureArtifactSource> {
             self.artifact_body
-                .map(|body| FaultFailureArtifacts::Recording { body })
+                .map(|_| self as &dyn FaultFailureArtifactSource)
         }
     }
 
@@ -3642,52 +3563,21 @@ mod tests {
     }
 
     #[test]
-    fn applied_faults_delete_backends_in_reverse_order() {
-        let deletes = Rc::new(RefCell::new(Vec::new()));
-        let mut faults = AppliedFaults {
-            items: vec![
-                Box::new(RecordingFaultBackend {
-                    name: "first",
-                    deletes: deletes.clone(),
-                    artifact_body: None,
-                }),
-                Box::new(RecordingFaultBackend {
-                    name: "second",
-                    deletes: deletes.clone(),
-                    artifact_body: None,
-                }),
-            ],
-        };
-
-        faults
-            .delete(Duration::from_secs(1))
-            .expect("delete faults");
-
-        assert_eq!(&*deletes.borrow(), &["second", "first"]);
-    }
-
-    #[test]
     fn applied_faults_collects_declared_artifact_sources() {
-        let deletes = Rc::new(RefCell::new(Vec::new()));
-        let faults = AppliedFaults {
-            items: vec![
-                Box::new(RecordingFaultBackend {
-                    name: "first",
-                    deletes: deletes.clone(),
-                    artifact_body: Some("first artifact"),
-                }),
-                Box::new(RecordingFaultBackend {
-                    name: "second",
-                    deletes: deletes.clone(),
-                    artifact_body: None,
-                }),
-                Box::new(RecordingFaultBackend {
-                    name: "third",
-                    deletes,
-                    artifact_body: Some("third artifact"),
-                }),
-            ],
-        };
+        let faults = AppliedFaults::new(vec![
+            Box::new(RecordingFaultBackend {
+                name: "first",
+                artifact_body: Some("first artifact"),
+            }),
+            Box::new(RecordingFaultBackend {
+                name: "second",
+                artifact_body: None,
+            }),
+            Box::new(RecordingFaultBackend {
+                name: "third",
+                artifact_body: Some("third artifact"),
+            }),
+        ]);
         let tempdir = tempfile::tempdir().expect("tempdir");
         let collector = ArtifactCollector::new(tempdir.path());
 
