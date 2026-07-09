@@ -32,6 +32,7 @@ pub struct TenantTemplate {
     pub unsafe_bypass_disk_check: bool,
     pub node_selector: Option<BTreeMap<String, String>>,
     pub spread_across_hosts: bool,
+    pub rustfs_env: Vec<(String, String)>,
 }
 
 impl TenantTemplate {
@@ -59,6 +60,7 @@ impl TenantTemplate {
                     .collect(),
             ),
             spread_across_hosts: false,
+            rustfs_env: Vec::new(),
         }
     }
 
@@ -82,6 +84,7 @@ impl TenantTemplate {
             unsafe_bypass_disk_check: false,
             node_selector: None,
             spread_across_hosts: true,
+            rustfs_env: Vec::new(),
         }
     }
 
@@ -122,6 +125,12 @@ impl TenantTemplate {
             env.push(json!({
                 "name": "RUSTFS_UNSAFE_BYPASS_DISK_CHECK",
                 "value": "true",
+            }));
+        }
+        for (name, value) in &self.rustfs_env {
+            env.push(json!({
+                "name": name,
+                "value": value,
             }));
         }
 
@@ -244,5 +253,36 @@ mod tests {
                 .is_none()
         );
         assert!(value.pointer("/spec/pools/0/scheduling").is_none());
+    }
+
+    #[test]
+    fn tenant_manifest_includes_extra_rustfs_env() {
+        let mut template = TenantTemplate::real_cluster(
+            "rustfs-fault-test",
+            "fault-test-tenant",
+            "rustfs/rustfs:latest",
+            "fast-csi",
+            "fault-test-tenant-credentials",
+        );
+        template.rustfs_env = vec![(
+            "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE".to_string(),
+            "true".to_string(),
+        )];
+
+        let manifest = template.manifest().expect("tenant manifest");
+        let value: serde_json::Value = serde_yaml_ng::from_str(&manifest).expect("valid yaml");
+
+        assert_eq!(
+            value
+                .pointer("/spec/env/1/name")
+                .and_then(serde_json::Value::as_str),
+            Some("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE")
+        );
+        assert_eq!(
+            value
+                .pointer("/spec/env/1/value")
+                .and_then(serde_json::Value::as_str),
+            Some("true")
+        );
     }
 }

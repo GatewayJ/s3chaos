@@ -20,7 +20,7 @@ use crate::{
         backends::host::DmStatusSnapshot,
         config::FaultTestConfig,
         plan::{FaultPlan, FaultSelection},
-        scenarios::FaultScenario,
+        scenarios::{FaultScenario, FaultScenarioSpec},
         workload::WorkloadPlan,
     },
     framework::artifacts::ArtifactCollector,
@@ -49,6 +49,7 @@ pub(crate) struct FaultEvidence {
     pub(crate) injected: bool,
     pub(crate) active_during_workload: bool,
     pub(crate) recovered: bool,
+    pub(crate) require_client_disruption: bool,
     pub(crate) client_disruptions: usize,
     pub(crate) workload_plan: WorkloadPlan,
     pub(crate) pods_before: Vec<PodIdentity>,
@@ -91,11 +92,14 @@ impl RunMetadata {
     pub(crate) fn from_case(
         config: &FaultTestConfig,
         scenario: &FaultScenario,
+        spec: &FaultScenarioSpec,
         plan: &FaultPlan,
         workload_plan: &WorkloadPlan,
         run_id: &str,
         bucket: &str,
     ) -> Self {
+        let require_client_disruption =
+            config.require_client_disruption || spec.impact_policy.requires_client_disruption();
         Self {
             scenario: scenario.name.clone(),
             case_name: scenario.case_name.to_string(),
@@ -134,7 +138,7 @@ impl RunMetadata {
             request_timeout_seconds: config.request_timeout.as_secs(),
             recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
             use_cluster_ip: config.use_cluster_ip,
-            require_client_disruption: config.require_client_disruption,
+            require_client_disruption,
             chaos_namespace: config.chaos_namespace.clone(),
         }
     }
@@ -169,6 +173,7 @@ pub enum DataCorrectnessStatus {
 pub enum AvailabilityStatus {
     RecoveredAfterTailLatency,
     CommittedObjectUnavailable,
+    ListUnavailableOrUnknown,
     Unknown,
 }
 
@@ -193,6 +198,10 @@ pub(crate) struct FailureSummary {
     availability: AvailabilityStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     evidence_classifications: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    final_list_warning_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    list_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data_loss: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,6 +231,8 @@ impl FailureSummary {
             data_correctness: details.data_correctness,
             availability: details.availability,
             evidence_classifications: Vec::new(),
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
             data_loss: details.data_loss,
             corruption: details.corruption,
             recovered_within_window: details.recovered_within_window,
@@ -245,6 +256,18 @@ impl FailureSummary {
         self
     }
 
+    pub(crate) fn with_list_warnings(
+        mut self,
+        final_list_warning_count: usize,
+        warnings: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.final_list_warning_count = final_list_warning_count;
+        self.list_warnings = warnings.into_iter().map(Into::into).collect();
+        self.list_warnings.sort();
+        self.list_warnings.dedup();
+        self
+    }
+
     pub(crate) fn severity(&self) -> FailureSeverity {
         self.severity
     }
@@ -256,6 +279,10 @@ impl FailureSummary {
     pub(crate) fn evidence_classifications(&self) -> &[String] {
         &self.evidence_classifications
     }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 impl FailureClassificationDetails {
@@ -273,6 +300,14 @@ impl FailureClassificationDetails {
                 severity: FailureSeverity::FailAvailability,
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::CommittedObjectUnavailable,
+                data_loss: None,
+                corruption: Some(false),
+                recovered_within_window: Some(false),
+            },
+            "list_unavailable_or_unknown" => Self {
+                severity: FailureSeverity::FailAvailability,
+                data_correctness: DataCorrectnessStatus::Unknown,
+                availability: AvailabilityStatus::ListUnavailableOrUnknown,
                 data_loss: None,
                 corruption: Some(false),
                 recovered_within_window: Some(false),

@@ -16,6 +16,7 @@ pub mod artifact_validation;
 pub mod backends;
 pub mod checker;
 pub mod config;
+pub mod console;
 pub mod diagnostics;
 pub mod events;
 pub mod fixture;

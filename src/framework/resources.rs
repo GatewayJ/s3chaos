@@ -79,6 +79,7 @@ pub fn smoke_tenant_template(config: &ClusterTestConfig) -> TenantTemplate {
             .pod_management_policy
             .unwrap_or(PodManagementPolicy::Parallel),
     );
+    template.rustfs_env.clone_from(&config.rustfs_env);
 
     template
 }

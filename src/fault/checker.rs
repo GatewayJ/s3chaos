@@ -79,6 +79,7 @@ pub struct CheckerReport {
 pub enum RecoveryStabilityClassification {
     DataCorruption,
     CommittedObjectUnavailable,
+    ListUnavailableOrUnknown,
     RecoveryTailReadLatency,
     AmbiguousWriteMaterialized,
     HarnessError,
@@ -89,6 +90,7 @@ impl RecoveryStabilityClassification {
         match self {
             Self::DataCorruption => "data_corruption",
             Self::CommittedObjectUnavailable => "committed_object_unavailable",
+            Self::ListUnavailableOrUnknown => "list_unavailable_or_unknown",
             Self::RecoveryTailReadLatency => "recovery_tail_read_latency",
             Self::AmbiguousWriteMaterialized => "ambiguous_write_materialized",
             Self::HarnessError => "harness_error",
@@ -107,6 +109,10 @@ pub struct RecoveryStabilityReport {
     pub data_corruption_evidence: Vec<String>,
     #[serde(default)]
     pub ambiguous_write_evidence: Vec<String>,
+    #[serde(default)]
+    pub final_list_warning_count: usize,
+    #[serde(default)]
+    pub list_warnings: Vec<String>,
     pub harness_errors: Vec<String>,
     pub max_recovery_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +130,8 @@ impl RecoveryStabilityReport {
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
             ambiguous_write_evidence: Vec::new(),
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
             harness_errors: vec![message.into()],
             max_recovery_seconds: max_recovery.as_secs(),
             recovered_within_seconds: None,
@@ -144,6 +152,13 @@ impl RecoveryStabilityReport {
         if !self.still_unavailable_keys.is_empty() {
             classifications.insert(
                 RecoveryStabilityClassification::CommittedObjectUnavailable
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        if self.classification == RecoveryStabilityClassification::ListUnavailableOrUnknown {
+            classifications.insert(
+                RecoveryStabilityClassification::ListUnavailableOrUnknown
                     .as_str()
                     .to_string(),
             );
@@ -397,6 +412,8 @@ pub async fn recovery_stability_reread(
         hash_mismatches,
         data_corruption_evidence,
         ambiguous_write_evidence,
+        final_list_warning_count: immediate_report.final_list_warning_count,
+        list_warnings: immediate_report.list_warnings.clone(),
         harness_errors: Vec::new(),
         max_recovery_seconds: max_recovery.as_secs(),
         recovered_within_seconds: None,
@@ -492,6 +509,7 @@ pub async fn recovery_stability_reread(
     sort_dedup(&mut report.hash_mismatches);
     sort_dedup(&mut report.data_corruption_evidence);
     sort_dedup(&mut report.ambiguous_write_evidence);
+    sort_dedup(&mut report.list_warnings);
     sort_dedup(&mut report.harness_errors);
     finish_recovery_stability_report(&mut report, immediate_report);
     Ok(report)
@@ -985,17 +1003,20 @@ fn is_recovery_tail_read_failure(
     if !matches!(
         outcome,
         OperationOutcome::Timeout | OperationOutcome::Unknown
-    ) || http_status != Some(200)
-    {
+    ) {
         return false;
     }
     let Some(error) = error else {
         return false;
     };
     let error = error.to_ascii_lowercase();
-    error.contains("body read timed out")
-        || error.contains("body read timeout")
-        || error.contains("streaming error")
+    if http_status == Some(200) {
+        return error.contains("body read timed out")
+            || error.contains("body read timeout")
+            || error.contains("streaming error");
+    }
+    http_status.is_none()
+        && (error.contains("get object timed out") || error.contains("request timed out"))
 }
 
 fn committed_get_matches(expected: &ExpectedObject, get: &GetObjectResult) -> bool {
@@ -1303,6 +1324,8 @@ fn classify_without_reread(report: &CheckerReport) -> RecoveryStabilityClassific
         RecoveryStabilityClassification::AmbiguousWriteMaterialized
     } else if has_committed_unavailable_signal(report) {
         RecoveryStabilityClassification::CommittedObjectUnavailable
+    } else if has_list_unavailable_or_unknown_signal(report) {
+        RecoveryStabilityClassification::ListUnavailableOrUnknown
     } else {
         RecoveryStabilityClassification::HarnessError
     }
@@ -1313,7 +1336,7 @@ fn has_data_corruption_signal(report: &CheckerReport) -> bool {
         || !report.successful_corrupted_reads.is_empty()
         || !report.unexpected_visible_deleted_objects.is_empty()
         || !report.unknown_write_value_conflicts.is_empty()
-        || report.final_list_warning_count > 0
+        || final_list_content_corruption_signal(report)
         || !report.version_hash_mismatches.is_empty()
         || !report.missing_committed_versions.is_empty()
         || !report.missing_committed_delete_markers.is_empty()
@@ -1321,11 +1344,22 @@ fn has_data_corruption_signal(report: &CheckerReport) -> bool {
         || report.committed_writes_missing_version_id_count > 0
 }
 
+fn final_list_content_corruption_signal(report: &CheckerReport) -> bool {
+    report.list_warnings.iter().any(|warning| {
+        warning.contains("did not include expected live key")
+            || warning.contains("included deleted key")
+    })
+}
+
 fn has_committed_unavailable_signal(report: &CheckerReport) -> bool {
     !report.missing_committed_objects.is_empty()
         || !report.unavailable_committed_objects.is_empty()
         || !report.unknown_committed_read_failures.is_empty()
         || !report.unavailable_committed_versions.is_empty()
+}
+
+fn has_list_unavailable_or_unknown_signal(report: &CheckerReport) -> bool {
+    report.final_list_warning_count > 0 && !final_list_content_corruption_signal(report)
 }
 
 fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
@@ -1381,17 +1415,23 @@ fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
             report.committed_writes_missing_version_id.len()
         ));
     }
-    evidence.extend(
-        report
-            .list_warnings
-            .iter()
-            .map(|item| format!("final_list_warning: {item}")),
-    );
-    if report.final_list_warning_count > report.list_warnings.len() {
+    let corruption_list_warnings = report
+        .list_warnings
+        .iter()
+        .filter(|item| {
+            item.contains("did not include expected live key")
+                || item.contains("included deleted key")
+        })
+        .map(|item| format!("final_list_warning: {item}"))
+        .collect::<Vec<_>>();
+    let corruption_list_warning_count = corruption_list_warnings.len();
+    evidence.extend(corruption_list_warnings);
+    if final_list_content_corruption_signal(report)
+        && report.final_list_warning_count > corruption_list_warning_count
+    {
         evidence.push(format!(
-            "final_list_warning_count: {} total, {} sampled",
-            report.final_list_warning_count,
-            report.list_warnings.len()
+            "final_list_content_warning_count: {} total, {} sampled",
+            report.final_list_warning_count, corruption_list_warning_count
         ));
     }
     evidence.sort();
@@ -1466,6 +1506,10 @@ fn finish_recovery_stability_report(
     }
     if !report.ambiguous_write_evidence.is_empty() {
         report.classification = RecoveryStabilityClassification::AmbiguousWriteMaterialized;
+        return;
+    }
+    if has_list_unavailable_or_unknown_signal(immediate_report) {
+        report.classification = RecoveryStabilityClassification::ListUnavailableOrUnknown;
         return;
     }
     if !report.reread_attempted_keys.is_empty()
@@ -2262,7 +2306,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_tail_candidates_require_status_200_body_timeout_or_streaming_error() {
+    fn recovery_tail_candidates_include_body_tail_and_request_timeouts() {
         let put = record("op-1", OperationKind::Put, "k", "sha", OperationOutcome::Ok);
         let model = object_model(&[put]);
         let eligible_timeout = OperationRecord {
@@ -2322,6 +2366,11 @@ mod tests {
             eligible_timeout.outcome,
             eligible_timeout.http_status,
             eligible_timeout.error.as_deref()
+        ));
+        assert!(is_recovery_tail_read_failure(
+            request_timeout.outcome,
+            request_timeout.http_status,
+            request_timeout.error.as_deref()
         ));
         let keys = recovery_tail_candidate_keys(
             &[
@@ -2437,20 +2486,17 @@ mod tests {
     }
 
     #[test]
-    fn recovery_stability_classifies_list_and_visibility_anomalies_as_data_corruption() {
+    fn recovery_stability_keeps_list_timeout_distinct_from_data_corruption() {
         let mut final_list_warning = empty_report();
         final_list_warning.final_list_warning_count = 1;
         final_list_warning
             .list_warnings
-            .push("LIST prefix did not include expected live key k".to_string());
+            .push("LIST prefix fault-test/ did not complete".to_string());
         assert_eq!(
             super::classify_without_reread(&final_list_warning),
-            RecoveryStabilityClassification::DataCorruption
+            RecoveryStabilityClassification::ListUnavailableOrUnknown
         );
-        assert_eq!(
-            super::immediate_data_corruption_evidence(&final_list_warning),
-            vec!["final_list_warning: LIST prefix did not include expected live key k"]
-        );
+        assert!(super::immediate_data_corruption_evidence(&final_list_warning).is_empty());
 
         let mut history_list_warning = empty_report();
         history_list_warning.list_history_warning_count = 1;
@@ -2460,6 +2506,20 @@ mod tests {
         assert_eq!(
             super::classify_without_reread(&history_list_warning),
             RecoveryStabilityClassification::HarnessError
+        );
+
+        let mut final_list_content_warning = empty_report();
+        final_list_content_warning.final_list_warning_count = 1;
+        final_list_content_warning
+            .list_warnings
+            .push("LIST prefix did not include expected live key k".to_string());
+        assert_eq!(
+            super::classify_without_reread(&final_list_content_warning),
+            RecoveryStabilityClassification::DataCorruption
+        );
+        assert_eq!(
+            super::immediate_data_corruption_evidence(&final_list_content_warning),
+            vec!["final_list_warning: LIST prefix did not include expected live key k"]
         );
 
         let mut visible_deleted = empty_report();
@@ -2491,6 +2551,8 @@ mod tests {
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
             ambiguous_write_evidence: Vec::new(),
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
             harness_errors: Vec::new(),
             max_recovery_seconds: 60,
             recovered_within_seconds: None,
@@ -2993,6 +3055,8 @@ mod tests {
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
             ambiguous_write_evidence: Vec::new(),
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
             harness_errors: Vec::new(),
             max_recovery_seconds: 60,
             recovered_within_seconds: None,

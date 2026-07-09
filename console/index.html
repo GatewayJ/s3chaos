@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>s3chaos console</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <h1>s3chaos console</h1>
+          <p id="snapshot-subtitle">target/fault-tests</p>
+        </div>
+        <form id="console-controls" class="controls">
+          <label class="root-field" for="artifact-root">
+            <span>Artifact root</span>
+            <input id="artifact-root" name="root" type="text" autocomplete="off" spellcheck="false">
+          </label>
+          <button id="refresh-button" class="button primary" type="submit">Refresh</button>
+          <label class="toggle" for="auto-refresh">
+            <input id="auto-refresh" type="checkbox">
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span>Auto refresh</span>
+          </label>
+          <span id="last-refresh" class="last-refresh" aria-live="polite">Not loaded</span>
+        </form>
+      </header>
+
+      <div id="status-banner" class="status-banner" role="status" aria-live="polite" hidden></div>
+
+      <main class="dashboard">
+        <section class="panel overview-panel" aria-labelledby="overview-title">
+          <div class="panel-header">
+            <div>
+              <h2 id="overview-title">Run Overview</h2>
+              <p id="overview-meta">Waiting for snapshot</p>
+            </div>
+            <span id="run-status" class="badge neutral">unknown</span>
+          </div>
+          <div id="overview-grid" class="metric-grid"></div>
+        </section>
+
+        <section class="panel focus-panel" aria-labelledby="focus-title">
+          <div class="panel-header compact">
+            <h2 id="focus-title">Current / Failed Stage</h2>
+            <span id="focus-stage-status" class="badge neutral">unknown</span>
+          </div>
+          <div id="focus-details" class="focus-details"></div>
+        </section>
+
+        <section class="panel attempts-panel" aria-labelledby="attempts-title">
+          <div class="panel-header compact">
+            <h2 id="attempts-title">Attempts</h2>
+            <span id="attempt-count" class="count-pill">0</span>
+          </div>
+          <div class="table-wrap">
+            <table class="attempt-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Scenario</th>
+                  <th>Rep</th>
+                  <th>Status</th>
+                  <th>Duration</th>
+                  <th>Severity</th>
+                  <th>Classification</th>
+                  <th>Artifacts</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="attempts-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel timeline-panel" aria-labelledby="timeline-title">
+          <div class="panel-header compact">
+            <h2 id="timeline-title">Event Timeline</h2>
+            <span id="event-count" class="count-pill">0</span>
+          </div>
+          <ol id="timeline-list" class="timeline"></ol>
+        </section>
+
+        <section class="panel artifacts-panel" aria-labelledby="artifacts-title">
+          <div class="panel-header compact">
+            <h2 id="artifacts-title">Artifacts</h2>
+            <span id="artifact-count" class="count-pill">0</span>
+          </div>
+          <div id="artifact-warnings" class="warnings"></div>
+          <div id="artifact-links" class="artifact-links"></div>
+        </section>
+
+        <section class="panel config-panel" aria-labelledby="config-title">
+          <div class="panel-header compact">
+            <h2 id="config-title">Config Summary</h2>
+            <span id="config-focus" class="count-pill">latest</span>
+          </div>
+          <div id="config-summary" class="config-summary"></div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

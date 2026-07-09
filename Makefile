@@ -2,9 +2,12 @@ SHELL := /bin/bash
 
 SCENARIO ?=
 SUITE ?=
+CONSOLE_ROOT ?= $(CURDIR)/target/fault-tests
+CONSOLE_ADDR ?= 127.0.0.1:0
+CONSOLE_ALLOW_NON_LOOPBACK ?=
 FAULT_SCRIPT := $(CURDIR)/scripts/fault-test.sh
 
-.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-preflight fault-run fault-run-dm fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-dashboard-install fault-dashboard-port-forward fault-cleanup
+.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-preflight fault-run fault-run-dm fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup
 
 check: fmt-check clippy test
 
@@ -51,6 +54,12 @@ fault-suite-plan:
 fault-suite-run:
 	@test -n "$(SUITE)" || (echo "SUITE is required, for example: make fault-suite-run SUITE=suite.yaml" >&2; exit 1)
 	bash $(FAULT_SCRIPT) suite-run "$(SUITE)"
+
+fault-console-json:
+	cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- fault-console-json "$(CONSOLE_ROOT)"
+
+fault-console-serve:
+	cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- fault-console-serve "$(CONSOLE_ROOT)" --addr "$(CONSOLE_ADDR)" $(CONSOLE_ALLOW_NON_LOOPBACK)
 
 fault-dashboard-install:
 	bash $(FAULT_SCRIPT) dashboard-install
