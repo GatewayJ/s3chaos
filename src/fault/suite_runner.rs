@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::fault::{
     artifact_validation::{ArtifactValidationOptions, validate_fault_artifacts},
     config::FaultTestConfig,
-    reporting::{FailureSeverity, FailureSummary},
+    reporting::{FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain},
     runner::run_scenario_with_config,
     suite::ResolvedFaultSuite,
     suite_plan::{
@@ -114,6 +114,16 @@ pub struct FaultSuiteRunFailure {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<FailurePhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_model_classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responsibility_domain: Option<ResponsibilityDomain>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_evidence_artifacts: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_classifications: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt_artifacts_dir: Option<String>,
@@ -160,6 +170,14 @@ pub struct FaultSuiteRunAttempt {
     pub severity: Option<FailureSeverity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<FailurePhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_model_classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responsibility_domain: Option<ResponsibilityDomain>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_classifications: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -444,6 +462,25 @@ fn attempt_failure_summary_artifact(plan: &FaultSuitePlanAttempt) -> Option<Stri
     path.is_file().then(|| path.display().to_string())
 }
 
+fn primary_evidence_artifacts(
+    summary: &FailureSummary,
+    failure_summary_artifact: &str,
+) -> Option<Vec<String>> {
+    if summary.primary_evidence_refs().is_empty() {
+        return None;
+    }
+    let base = Path::new(failure_summary_artifact)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    Some(
+        summary
+            .primary_evidence_refs()
+            .iter()
+            .map(|evidence_ref| base.join(evidence_ref).display().to_string())
+            .collect(),
+    )
+}
+
 fn should_stop_after_attempt_failure(
     continue_on_severities: &[FailureSeverity],
     stop_on_first_failure: bool,
@@ -500,6 +537,11 @@ impl FaultSuiteRunSummary {
             repetition: None,
             severity: None,
             classification: None,
+            phase: None,
+            s3_model_classification: None,
+            run_failure_reason: None,
+            responsibility_domain: None,
+            primary_evidence_artifacts: None,
             evidence_classifications: None,
             attempt_artifacts_dir: None,
             failure_summary: None,
@@ -514,6 +556,11 @@ impl FaultSuiteRunSummary {
         reason: String,
         stopped_suite: bool,
     ) {
+        let primary_evidence_artifacts = failure_summary.and_then(|summary| {
+            failure_summary_artifact
+                .as_deref()
+                .and_then(|artifact| primary_evidence_artifacts(summary, artifact))
+        });
         self.record_failure(FaultSuiteRunFailure {
             index: 0,
             kind: FaultSuiteRunFailureKind::AttemptFailure,
@@ -524,6 +571,15 @@ impl FaultSuiteRunSummary {
             repetition: Some(attempt.repetition),
             severity: failure_summary.map(FailureSummary::severity),
             classification: failure_summary.map(|summary| summary.classification().to_string()),
+            phase: failure_summary.and_then(FailureSummary::phase),
+            s3_model_classification: failure_summary
+                .and_then(FailureSummary::s3_model_classification)
+                .map(ToString::to_string),
+            run_failure_reason: failure_summary
+                .and_then(FailureSummary::run_failure_reason)
+                .map(ToString::to_string),
+            responsibility_domain: failure_summary.and_then(FailureSummary::responsibility_domain),
+            primary_evidence_artifacts,
             evidence_classifications: failure_summary.and_then(|summary| {
                 (!summary.evidence_classifications().is_empty())
                     .then(|| summary.evidence_classifications().to_vec())
@@ -561,6 +617,10 @@ impl FaultSuiteRunAttempt {
             committed: None,
             severity: None,
             classification: None,
+            phase: None,
+            s3_model_classification: None,
+            run_failure_reason: None,
+            responsibility_domain: None,
             evidence_classifications: None,
             error: None,
         }
@@ -581,6 +641,11 @@ impl FaultSuiteRunAttempt {
         if let Some(summary) = failure_summary {
             self.severity = Some(summary.severity());
             self.classification = Some(summary.classification().to_string());
+            self.phase = summary.phase();
+            self.s3_model_classification =
+                summary.s3_model_classification().map(ToString::to_string);
+            self.run_failure_reason = summary.run_failure_reason().map(ToString::to_string);
+            self.responsibility_domain = summary.responsibility_domain();
             if !summary.evidence_classifications().is_empty() {
                 self.evidence_classifications = Some(summary.evidence_classifications().to_vec());
             }
@@ -607,7 +672,7 @@ mod tests {
     use crate::fault::{
         config::FaultTestConfig,
         plan::FaultInjectionParameters,
-        reporting::{FailureSeverity, FailureSummary},
+        reporting::{FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain},
         suite::FaultSuite,
     };
     use serde_json::json;
@@ -1009,6 +1074,28 @@ scenarios:
             summary.failures[1].classification.as_deref(),
             Some("data_corruption")
         );
+        assert_eq!(summary.failures[1].phase, Some(FailurePhase::Checker));
+        assert_eq!(
+            summary.failures[1].s3_model_classification.as_deref(),
+            Some("data_corruption")
+        );
+        assert_eq!(summary.failures[1].run_failure_reason, None);
+        assert_eq!(
+            summary.failures[1].responsibility_domain,
+            Some(ResponsibilityDomain::Product)
+        );
+        assert_eq!(
+            summary.failures[1].primary_evidence_artifacts.as_deref(),
+            Some(
+                &[
+                    "attempts/0002/failure-summary.json".to_string(),
+                    "attempts/0002/recovery-stability-report.json".to_string(),
+                    "attempts/0002/checker-pre-recommit-report.json".to_string(),
+                    "attempts/0002/fault-evidence.json".to_string(),
+                    "attempts/0002/run-events.jsonl".to_string()
+                ][..]
+            )
+        );
         assert_eq!(
             summary.failures[1].evidence_classifications.as_deref(),
             Some(
@@ -1032,6 +1119,23 @@ scenarios:
             value["failures"][1]["evidenceClassifications"],
             serde_json::json!(["ambiguous_write_materialized", "data_corruption"])
         );
+        assert_eq!(value["failures"][1]["phase"], "checker");
+        assert_eq!(
+            value["failures"][1]["s3ModelClassification"],
+            "data_corruption"
+        );
+        assert_eq!(value["failures"][1]["responsibilityDomain"], "product");
+        assert_eq!(
+            value["failures"][1]["primaryEvidenceArtifacts"],
+            serde_json::json!([
+                "attempts/0002/failure-summary.json",
+                "attempts/0002/recovery-stability-report.json",
+                "attempts/0002/checker-pre-recommit-report.json",
+                "attempts/0002/fault-evidence.json",
+                "attempts/0002/run-events.jsonl"
+            ])
+        );
+        assert!(value["failures"][1].get("runFailureReason").is_none());
     }
 
     #[test]

@@ -119,6 +119,16 @@ pub struct ConsoleSuiteFailureView {
     pub severity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_model_classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responsibility_domain: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub primary_evidence_artifacts: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence_classifications: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +166,14 @@ pub struct ConsoleSuiteAttemptView {
     pub severity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_model_classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responsibility_domain: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence_classifications: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -233,9 +251,23 @@ pub struct ConsoleFailureSummaryView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub case_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_model_classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responsibility_domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data_correctness: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub availability: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub primary_evidence_refs: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence_classifications: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1419,8 +1451,15 @@ fn failure_summary_view(root: &Path, path: &Path, raw: Value) -> ConsoleFailureS
         verdict: json_string(&raw, "verdict"),
         severity: json_string(&raw, "severity"),
         classification: json_string(&raw, "classification"),
+        schema_version: json_u64(&raw, "schema_version"),
+        case_name: json_string(&raw, "case_name"),
+        phase: json_string(&raw, "phase"),
+        s3_model_classification: json_string(&raw, "s3_model_classification"),
+        run_failure_reason: json_string(&raw, "run_failure_reason"),
+        responsibility_domain: json_string(&raw, "responsibility_domain"),
         data_correctness: json_string(&raw, "data_correctness"),
         availability: json_string(&raw, "availability"),
+        primary_evidence_refs: json_string_array(&raw, "primary_evidence_refs"),
         evidence_classifications: json_string_array(&raw, "evidence_classifications"),
         final_list_warning_count: json_u64(&raw, "final_list_warning_count"),
         list_warnings: json_string_array(&raw, "list_warnings"),
@@ -1604,6 +1643,11 @@ struct SuiteFailureExtract {
     repetition: Option<usize>,
     severity: Option<String>,
     classification: Option<String>,
+    phase: Option<String>,
+    s3_model_classification: Option<String>,
+    run_failure_reason: Option<String>,
+    responsibility_domain: Option<String>,
+    primary_evidence_artifacts: Vec<String>,
     evidence_classifications: Vec<String>,
     attempt_artifacts_dir: Option<String>,
     failure_summary: Option<String>,
@@ -1621,6 +1665,11 @@ impl ConsoleSuiteFailureView {
             repetition: value.repetition,
             severity: value.severity,
             classification: value.classification,
+            phase: value.phase,
+            s3_model_classification: value.s3_model_classification,
+            run_failure_reason: value.run_failure_reason,
+            responsibility_domain: value.responsibility_domain,
+            primary_evidence_artifacts: view_artifact_paths(root, value.primary_evidence_artifacts),
             evidence_classifications: value.evidence_classifications,
             attempt_artifacts_dir: view_artifact_path_opt(root, value.attempt_artifacts_dir),
             failure_summary: view_artifact_path_opt(root, value.failure_summary),
@@ -1644,6 +1693,10 @@ struct SuiteAttemptExtract {
     committed: Option<usize>,
     severity: Option<String>,
     classification: Option<String>,
+    phase: Option<String>,
+    s3_model_classification: Option<String>,
+    run_failure_reason: Option<String>,
+    responsibility_domain: Option<String>,
     evidence_classifications: Vec<String>,
     error: Option<String>,
 }
@@ -1664,6 +1717,10 @@ impl ConsoleSuiteAttemptView {
             committed: value.committed,
             severity: value.severity,
             classification: value.classification,
+            phase: value.phase,
+            s3_model_classification: value.s3_model_classification,
+            run_failure_reason: value.run_failure_reason,
+            responsibility_domain: value.responsibility_domain,
             evidence_classifications: value.evidence_classifications,
             error: value.error,
         }
@@ -1700,6 +1757,13 @@ fn artifact_text_path(root: &Path, path: &str) -> PathBuf {
 
 fn view_artifact_path_opt(root: &Path, path: Option<String>) -> Option<String> {
     path.map(|path| view_artifact_path(root, path))
+}
+
+fn view_artifact_paths(root: &Path, paths: Vec<String>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|path| view_artifact_path(root, path))
+        .collect()
 }
 
 fn view_artifact_path(root: &Path, path: String) -> String {
@@ -1990,6 +2054,10 @@ mod tests {
         let case_dir = attempt_dir.join("fault_io_eio_preserves_committed_objects");
         let raw_attempt_dir = attempt_dir.display().to_string();
         let raw_failure_summary = case_dir.join("failure-summary.json").display().to_string();
+        let raw_recovery_stability = case_dir
+            .join("recovery-stability-report.json")
+            .display()
+            .to_string();
         fs::create_dir_all(&case_dir).expect("case dir");
         fs::write(
             dir.path().join("suite-summary.json"),
@@ -2012,6 +2080,10 @@ mod tests {
                     "repetition": 1,
                     "severity": "degraded",
                     "classification": "recovery_tail_read_latency",
+                    "primaryEvidenceArtifacts": [
+                        raw_failure_summary.clone(),
+                        raw_recovery_stability.clone()
+                    ],
                     "attemptArtifactsDir": raw_attempt_dir.clone(),
                     "failureSummary": raw_failure_summary.clone()
                 }],
@@ -2059,6 +2131,14 @@ mod tests {
             .expect("failure json"),
         )
         .expect("failure");
+        fs::write(
+            case_dir.join("recovery-stability-report.json"),
+            serde_json::to_string_pretty(&json!({
+                "classification": "recovery_tail_read_latency"
+            }))
+            .expect("recovery json"),
+        )
+        .expect("recovery");
         let test_log = case_dir.join("test.log");
         let raw_test_log = test_log.display().to_string();
         fs::write(&test_log, "runner log").expect("test log");
@@ -2087,6 +2167,11 @@ mod tests {
             .join("test.log")
             .display()
             .to_string();
+        let expected_recovery_stability = PathBuf::from("001-io-eio-r1")
+            .join("fault_io_eio_preserves_committed_objects")
+            .join("recovery-stability-report.json")
+            .display()
+            .to_string();
 
         assert_eq!(
             snapshot
@@ -2107,6 +2192,13 @@ mod tests {
         assert_eq!(
             suite_summary.failures[0].failure_summary.as_deref(),
             Some(expected_failure_summary.as_str())
+        );
+        assert_eq!(
+            suite_summary.failures[0].primary_evidence_artifacts,
+            vec![
+                expected_failure_summary.clone(),
+                expected_recovery_stability.clone()
+            ]
         );
         assert_eq!(
             suite_summary.raw["failures"][0]["attemptArtifactsDir"].as_str(),

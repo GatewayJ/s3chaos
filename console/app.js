@@ -729,6 +729,7 @@
       if (failureSummaryPath) {
         addArtifact(links, "failure summary", failureSummaryPath);
       }
+      addPrimaryEvidenceArtifacts(links, failure, failureSummaryPath);
       const dir = readField(failure, "attemptArtifactsDir");
       if (dir) {
         addArtifact(links, "failed attempt", dir);
@@ -750,11 +751,13 @@
             "failure summary",
             artifactPathFrom(caseFailure) || joinArtifactPath(caseDir, "failure-summary.json"),
           );
+          addPrimaryEvidenceArtifacts(links, caseFailure, artifactPathFrom(caseFailure));
         }
       });
     });
     if (failureSummary) {
       addArtifact(links, "failure summary", artifactPathFrom(failureSummary));
+      addPrimaryEvidenceArtifacts(links, failureSummary, artifactPathFrom(failureSummary));
     }
 
     return {
@@ -783,6 +786,28 @@
   function addArtifact(links, label, path) {
     if (path) {
       links.push({ label, path: normalizeArtifactPath(path) });
+    }
+  }
+
+  function addPrimaryEvidenceArtifacts(links, source, summaryPath) {
+    const normalizedSummaryPath = normalizeArtifactPath(summaryPath || artifactPathFrom(source));
+    asArray(readAny(source, ["primaryEvidenceArtifacts", "primary_evidence_artifacts"])).forEach(
+      function (path) {
+        addPrimaryEvidenceArtifact(links, path, normalizedSummaryPath);
+      },
+    );
+    const base = dirnameArtifactPath(normalizedSummaryPath);
+    asArray(readAny(source, ["primaryEvidenceRefs", "primary_evidence_refs"])).forEach(
+      function (path) {
+        addPrimaryEvidenceArtifact(links, joinArtifactPath(base, path), normalizedSummaryPath);
+      },
+    );
+  }
+
+  function addPrimaryEvidenceArtifact(links, path, summaryPath) {
+    const normalized = normalizeArtifactPath(path);
+    if (normalized && normalized !== summaryPath) {
+      addArtifact(links, "primary evidence", normalized);
     }
   }
 
@@ -819,6 +844,12 @@
       return "";
     }
     return normalizeArtifactPath(String(base).replace(/\/+$/, "") + "/" + leaf);
+  }
+
+  function dirnameArtifactPath(path) {
+    const normalized = normalizeArtifactPath(path || "");
+    const index = normalized.lastIndexOf("/");
+    return index >= 0 ? normalized.slice(0, index) : "";
   }
 
   function uniqueArtifacts(links) {
