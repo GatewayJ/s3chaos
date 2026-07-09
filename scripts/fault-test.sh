@@ -487,7 +487,9 @@ preflight() {
   ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[]
     | select(.spec.unschedulable != true)
     | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
-  [[ "$ready_nodes" -ge 4 ]] || die "at least four schedulable Ready nodes are required, found $ready_nodes"
+  min_nodes="${RUSTFS_FAULT_TEST_MIN_NODES:-4}"
+  [[ "$min_nodes" =~ ^[0-9]+$ && "$min_nodes" -ge 1 ]] || die "RUSTFS_FAULT_TEST_MIN_NODES must be a positive integer, got $min_nodes"
+  [[ "$ready_nodes" -ge "$min_nodes" ]] || die "at least $min_nodes schedulable Ready node(s) are required, found $ready_nodes"
   disk_pressure_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[]
     | select(any(.status.conditions[]; .type == "DiskPressure" and .status == "True"))
     | .metadata.name] | join(",")')"
