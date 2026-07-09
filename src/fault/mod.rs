@@ -28,5 +28,6 @@ pub mod runner;
 pub mod scenarios;
 pub mod spec;
 pub mod suite;
+pub mod suite_plan;
 pub mod suite_runner;
 pub mod workload;
