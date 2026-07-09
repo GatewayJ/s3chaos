@@ -24,7 +24,8 @@ use s3chaos::fault::{
     scenarios::scenario_catalog_json,
     spec::{FaultRunArtifactSpec, FaultRunSpec},
     suite::{fault_suite_template_yaml, resolve_fault_suite_yaml},
-    suite_runner::{plan_fault_suite_from_yaml, run_fault_suite_from_yaml},
+    suite_plan::plan_fault_suite_from_yaml,
+    suite_runner::run_fault_suite_from_yaml,
 };
 use std::net::SocketAddr;
 
