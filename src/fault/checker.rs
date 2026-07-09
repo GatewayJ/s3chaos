@@ -263,6 +263,33 @@ pub async fn check_s3_history(
         evaluate_final_get(&mut report, key, expected.as_ref(), &unknown_writes, get);
     }
 
+    // Committed deletes are otherwise never re-read: the final GET loop probes
+    // only live and ambiguous-write keys, so a deleted key that still serves a
+    // body on the GET path (but stays absent from LIST) would pass. Probe the
+    // deleted keys that carry no ambiguous write — a materialized ambiguous
+    // write on a deleted key is a legitimate outcome already handled above.
+    let deleted_probe_keys = model
+        .deleted
+        .iter()
+        .filter(|key| !model.unknown_writes.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut deleted_results = stream::iter(deleted_probe_keys.into_iter().map(|key| {
+        let s3 = s3.clone();
+        let recorder = recorder.clone();
+        async move {
+            let get = s3.get_object_result(&key, &recorder).await?;
+            Ok::<_, anyhow::Error>((key, get))
+        }
+    }))
+    .buffer_unordered(concurrency);
+    while let Some(result) = deleted_results.next().await {
+        let (key, get) = result?;
+        if let Some(message) = evaluate_deleted_reread(&key, &get) {
+            report.resurrected_deleted_objects.push(message);
+        }
+    }
+
     let run_id = recorder.run_id();
     let prefix = ObjectSpec::key_prefix(&run_id);
 
@@ -896,6 +923,20 @@ fn evaluate_final_get(
             ))
         }
         _ => {}
+    }
+}
+
+/// A committed delete (latest committed op for the key was a successful Delete)
+/// must not serve a body after recovery. A direct GET that returns one is a
+/// resurrection; the correct outcome is not-found, and an unavailable probe
+/// response (timeout/error) is not evidence of resurrection either.
+fn evaluate_deleted_reread(key: &str, get: &GetObjectResult) -> Option<String> {
+    match (get.outcome, get.body.as_deref()) {
+        (OperationOutcome::Ok, Some(body)) => Some(format!(
+            "{key}: committed delete resurrected on GET ({} bytes)",
+            body.len()
+        )),
+        _ => None,
     }
 }
 
@@ -2998,5 +3039,50 @@ mod tests {
             recovered_within_seconds: None,
             classification: RecoveryStabilityClassification::CommittedObjectUnavailable,
         }
+    }
+
+    #[test]
+    fn committed_delete_reread_flags_body_as_resurrection() {
+        let message = super::evaluate_deleted_reread(
+            "gone",
+            &GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"back".to_vec()),
+            },
+        );
+
+        assert_eq!(
+            message.as_deref(),
+            Some("gone: committed delete resurrected on GET (4 bytes)")
+        );
+    }
+
+    #[test]
+    fn committed_delete_reread_accepts_not_found_and_unavailable() {
+        let not_found = super::evaluate_deleted_reread(
+            "gone",
+            &GetObjectResult {
+                outcome: OperationOutcome::NotFound,
+                http_status: Some(404),
+                error: None,
+                body: None,
+            },
+        );
+        assert!(not_found.is_none());
+
+        // An unavailable probe response (timeout/error) is not proof of
+        // resurrection; only a returned body is.
+        let unavailable = super::evaluate_deleted_reread(
+            "gone",
+            &GetObjectResult {
+                outcome: OperationOutcome::Timeout,
+                http_status: None,
+                error: Some("read timed out".to_string()),
+                body: None,
+            },
+        );
+        assert!(unavailable.is_none());
     }
 }
