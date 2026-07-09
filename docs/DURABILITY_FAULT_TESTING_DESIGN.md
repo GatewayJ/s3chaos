@@ -52,8 +52,8 @@ The design borrows operating principles, not platform shape:
   passthrough in suite YAML.
 - No free-form workflow DSL with arbitrary steps, dependencies, scripts, or
   backend resources.
-- No console-driven destructive execution in this roadmap. The console remains a
-  read-only artifact viewer.
+- No console-driven destructive execution in this roadmap. A future artifact
+  viewer remains read-only.
 - No production or shared-cluster support. Dedicated real Kubernetes/K3s clusters
   remain required.
 - No all-node power-off until the controller, artifact writer, and recovery path
@@ -78,11 +78,30 @@ The current codebase already has the right backbone:
 - `src/fault/reporting.rs`: failure summary, severity, data correctness, and
   availability mapping.
 - `src/fault/artifact_validation.rs`: success artifact contract.
-- `src/fault/console.rs`: read-only artifact view.
 - `scripts/fault-test.sh`: operational wrapper, preflight, health guard, and
   cleanup.
 
 The design below extends those anchors rather than replacing them.
+
+Current implementation status matters for execution order:
+
+- Suite planning, strict YAML validation, reusable `workloadProfiles`,
+  scenario-level `workloadProfile`, `faultDuration`, and suite `maxDuration`
+  already exist. Later PRs should harden and extract these surfaces rather than
+  reintroduce them from scratch.
+- A runner-local `FaultBackendHandle` shape already exists. The next step is to
+  make lifecycle ownership explicit and testable, not to add a second backend
+  abstraction beside it.
+- Bucket versioning, version id recording, committed version re-read, delete
+  marker checks, and recovery-tail classification already exist in first-pass
+  form. Durability work should split and name those verdicts more precisely.
+- `continueOnSeverities` controls whether a suite continues after a failed
+  attempt. It does not make an expected failure a passing suite result. Any
+  diagnostic expected-failure scenario needs an explicit catalog-owned
+  expectation model before it can be used as a green gate.
+- A fault-test console/artifact viewer is still a future surface in this
+  checkout. The stable JSON reader/model must land before any console display
+  can depend on v2 fields.
 
 ## Architecture
 
@@ -97,8 +116,8 @@ suite.rs
   strict external contract, profile references, scenario names
   |
   v
-scenarios.rs + plan.rs + composition.rs
-  catalog semantics, typed params, target policy, composition policy
+scenarios.rs + plan.rs
+  catalog semantics, typed params, target policy, named composite policy
   |
   v
 suite_plan.rs
@@ -117,7 +136,7 @@ history.rs + checker.rs + reporting.rs
   S3-visible source of truth and final verdict
   |
   v
-artifact_validation.rs + console.rs
+artifact_validation.rs + future artifact viewer
   contract validation and read-only diagnosis
 ```
 
@@ -129,6 +148,39 @@ Dependency direction:
 - Checker/reporting do not read suite budgets or backend policy.
 - Suite stop policy consumes severity and the summary display key; it never
   rewrites checker facts or run failure reasons.
+
+## Execution Readiness Gates
+
+The plan is executable only as vertical slices. A later phase must not rely on an
+implicit future contract from an earlier phase.
+
+- Reader-first artifact migration: before new failure fields become required,
+  existing readers and future console views must tolerate old
+  `failure-summary.json` and `runner-failure-summary.json` files through explicit
+  defaults.
+- Target proof before actuation: no power, disk, PV replacement, bitrot, stale
+  disk, or quorum scenario may execute until a side-effect-free target-proof
+  preflight can prove the exact target set. Pure `fault-suite-plan` may stay
+  environment-free and should not secretly call Kubernetes, host commands, power
+  controllers, or backend secrets.
+- Same-erasure-set proof before quorum scenarios: P and P+1 cases are invalid
+  unless the plan proves erasure-set id, data/parity width, target volumes,
+  target nodes, and non-target volume coverage.
+- Expected-failure policy before expected-fail suites: a scenario that is
+  expected to fail may be used as a manual diagnostic run, but it must not be
+  considered a passing suite attempt until the catalog and suite summary can
+  represent expected classification, severity, responsibility domain, and
+  evidence refs.
+- Out-of-band control proof before real power operations: the controller,
+  artifact writer, recovery path, credentials, and network path must be outside
+  the fault domain and recorded in preflight evidence.
+- Rollback proof before host mutation: any scenario that mutates power state,
+  device state, PV contents, shard bytes, or Kubernetes storage objects must
+  prove rollback, quarantine, or restore capability before injection.
+- Backend-specific destructive opt-in: the generic
+  `RUSTFS_FAULT_TEST_DESTRUCTIVE=1` suite switch is not enough for power, PV,
+  bitrot, stale-disk, or host-storage mutation. Those backends need their own
+  explicit opt-in that wrappers never set implicitly.
 
 ## Composition Boundary
 
@@ -142,34 +194,17 @@ scenarios:
     faultDuration: 2m
 ```
 
-YAML does not define backend steps. Rust owns the expansion:
+YAML does not define backend steps. Rust owns the expansion. The first
+implementation should keep `Single` as the default and add exactly one
+catalog-owned composite scenario in `scenarios.rs`/`plan.rs`. `FaultPlan::new`
+should evolve from "reject multiple faults" to "allow multiple faults only when
+that named catalog scenario validates phases, targets, delete policy, and
+conflict domains".
 
-```rust
-pub enum FaultPlanKind {
-    Single,
-    Composite(FaultCompositionPolicy),
-}
-
-pub enum FaultCompositionPolicy {
-    ConcurrentAll { max_faults: usize },
-    SequentialPhases { phases: &'static [FaultPhaseSpec] },
-}
-
-pub struct FaultPhaseSpec {
-    pub name: &'static str,
-    pub faults: &'static [FaultInjectionSpec],
-    pub activation: ActivationPolicy,
-    pub delete_policy: FaultDeletePolicy,
-    pub duration: FaultPhaseDuration,
-    pub conflict_domains: &'static [&'static str],
-}
-```
-
-Initial implementation should keep `Single` as the default and allow only one
-catalog-owned composite scenario. `FaultPlan::new` should evolve from "reject
-multiple faults" to "allow multiple faults only when a catalog composition
-policy validates their phases, targets, delete policy, and conflict domains".
-Generic target selectors, generic steps, and raw manifests stay out of scope.
+Do not introduce a generic `composition.rs`, phase enum family, or user-facing
+phase model until a second real composite scenario proves that the abstraction is
+shared. Generic target selectors, generic steps, and raw manifests stay out of
+scope.
 
 ## Core Semantics
 
@@ -189,6 +224,14 @@ Ack-triggered fault window:
 
 - Power-loss scenarios must be able to trigger after a selected committed
   operation, not merely "while workload is running".
+- This is a new runner lifecycle, not a small extension of the current
+  apply-before-workload flow. The runner owns the trigger boundary: workload
+  emits operation events, the runner decides whether a committed operation arms
+  the trigger, and only a runner-owned backend handle actuates the fault.
+- Suite YAML needs an explicit trigger contract, for example
+  `trigger.afterCommittedOperation`, `trigger.maxAckToFaultMs`, and
+  `trigger.armPolicy` (`single` first; bounded re-arm only after single-arm
+  behavior is stable).
 - The trigger evidence must record `trigger_operation_id`, operation kind,
   object key, version id if present, `ack_ended_at_ms`, `fault_apply_started_at_ms`,
   `fault_active_at_ms`, and `ack_to_fault_ms`.
@@ -196,15 +239,21 @@ Ack-triggered fault window:
   cannot trigger inside that bound, the run is a harness or fault-backend failure,
   not a product verdict.
 - Timeout or unknown operations cannot arm an ack-triggered power-loss fault.
+- Fake-backend tests must prove no fault is applied before an eligible committed
+  ACK, ineligible outcomes do not arm the trigger, and missed
+  `maxAckToFaultMs` is reported as harness or backend failure.
 
 Verdict source:
 
 - `history.jsonl` and checker reports are the S3-visible source of truth.
 - Internal RustFS evidence can explain why a verdict happened but cannot turn a
   failed S3-visible invariant into a pass.
-- Successful LIST with wrong content is a correctness signal.
-- LIST timeout or incomplete LIST is availability/unknown unless returned
-  content itself violates the model.
+- Target semantics: successful LIST with wrong content is a correctness signal.
+  LIST timeout or incomplete LIST should be availability/unknown unless returned
+  content itself violates the model. Current code still promotes final LIST
+  warnings into the compatibility `data_corruption` bucket, so Phase 2 must split
+  wrong-content from non-completion before `list_unavailable_or_unknown` becomes
+  an accepted classification.
 
 ## Artifact Model
 
@@ -231,8 +280,10 @@ Conditional artifacts:
 - `versioning-report.json`: emitted only when versioning, stale disk, or delete
   marker scenarios need a compact lineage summary. It summarizes checker facts
   and does not become a second verdict source.
-- `runner-failure-summary.json`: emitted when the shell/runner fails before the
-  Rust attempt can write `failure-summary.json`.
+- `runner-failure-summary.json`: shell wrapper companion artifact for scenario
+  mode failures. It may be present even when Rust also wrote
+  `failure-summary.json`; suite-mode runner failures should get their own
+  suite-level projection rather than overloading the case artifact.
 
 Scenario-specific explanatory artifacts:
 
@@ -248,6 +299,20 @@ Scenario-specific explanatory artifacts:
 `failure-summary.json` should evolve as a backward-compatible v2 schema. New
 fields are optional while old artifacts remain supported; new writers should
 always emit them when the value exists.
+
+Migration rules:
+
+- Add readers and future console support before making writers strict.
+- Treat missing v2-only fields in old artifacts as `null`, empty, or
+  `unknown`, according to the field semantics.
+- Validate v2 fields strictly only when `schema_version >= 2` or when a new
+  writer emits the field.
+- Keep `classification` as the compatibility display key. It mirrors
+  `s3_model_classification` for checker verdicts and `run_failure_reason` for
+  non-checker failures.
+- Never let suite continuation policy rewrite checker facts. It may decide
+  whether to continue, but the binary verdict and failure facts remain in the
+  attempt summary.
 
 | Field | Required for new failures | Nullable | Producer | Meaning |
 | --- | --- | --- | --- | --- |
@@ -268,13 +333,21 @@ always emit them when the value exists.
 | `primary_evidence_refs` | yes | no | reporting | Relative paths to 1-5 highest-signal artifacts. |
 | `observed_at_ms` | yes | no | reporting | Event time for the summary. |
 
-`primary_evidence_refs` must be relative paths inside the artifact root. A
-missing or escaping evidence ref is an artifact contract failure.
+`primary_evidence_refs` must be relative paths inside the suite/run artifact
+root, never absolute paths and never `..`. In single-run mode that root is the
+scenario run root; in suite mode it is the suite run root. The summary artifact
+itself is linked by its known location, so `primary_evidence_refs` should contain
+only next-hop evidence such as `001-io-eio-r1/.../checker-report.json` or
+`io-eio/.../fault-evidence.json`. A missing or escaping evidence ref is an
+artifact contract failure for v2 artifacts.
 
 ### Preflight Summary Shape
 
 `preflight-summary.json` is one file per suite/run root. It may contain multiple
-phases rather than overwriting itself:
+phases rather than overwriting itself. The run or suite root must be allocated
+before preflight starts, and the shell/Rust preflight path must be passed into
+the preflight code so failures before scenario execution still leave structured
+evidence.
 
 ```json
 {
@@ -308,6 +381,9 @@ phases rather than overwriting itself:
 
 Rust should own the structured model. The shell wrapper may append operational
 health observations, but those observations do not replace the checker verdict.
+Legacy v1 artifacts that lack `phase`, `responsibility_domain`, or evidence refs
+should project derived defaults with warnings; strict validation applies only to
+`schema_version >= 2`.
 
 ### Classification Model
 
@@ -318,12 +394,36 @@ Use three separate concepts:
   the checker cannot produce a product verdict.
 - `responsibility_domain`: first owner to investigate.
 
-S3 model classifications:
+Current compatibility display keys:
 
 | Classification | Severity | Data correctness | Availability | Responsibility | Primary evidence |
 | --- | --- | --- | --- | --- | --- |
 | `committed_object_unavailable` | `fail_availability` | `unknown` | `committed_object_unavailable` | `product` | `checker-report.json` |
-| `committed_version_unavailable` | `fail_correctness` | `failed` | `unknown` | `product` | `checker-report.json` |
+| `recovery_tail_read_latency` | `degraded` | `passed` | `recovered_after_tail_latency` | `product` | `recovery-stability-report.json` |
+| `data_corruption` | `fail_correctness` | `failed` | `unknown` | `product` | `checker-report.json` |
+| `ambiguous_write_materialized` | `needs_investigation` | `unknown` | `unknown` | `product` | `checker-report.json` |
+| `harness_error` | `infra` | `unknown` | `unknown` | `harness` | `failure-summary.json` |
+
+Legacy non-checker display keys accepted by v2 readers:
+
+| Legacy classification | v2 projection |
+| --- | --- |
+| `unknown` | `run_failure_reason=unknown`, `responsibility_domain=unknown`, `severity=needs_investigation` |
+| `test_harness` | `run_failure_reason=test_harness`, `responsibility_domain=harness`, `severity=infra` |
+| `test_or_environment` | `run_failure_reason=test_or_environment`, `responsibility_domain=environment`, `severity=infra` |
+| `environment_or_fault_backend` | `run_failure_reason=environment_or_fault_backend`, `responsibility_domain=fault_backend`, `severity=infra` |
+| `product_or_environment` | `run_failure_reason=product_or_environment`, `responsibility_domain=unknown`, `severity=needs_investigation` |
+
+These legacy keys are compatibility inputs only. New writers should prefer
+specific `run_failure_reason` and `responsibility_domain` values.
+
+Target v2 S3 model classifications:
+
+| Classification | Severity | Data correctness | Availability | Responsibility | Primary evidence |
+| --- | --- | --- | --- | --- | --- |
+| `committed_object_unavailable` | `fail_availability` | `unknown` | `committed_object_unavailable` | `product` | `checker-report.json` |
+| `committed_version_missing` | `fail_correctness` | `failed` | `unknown` | `product` | `checker-report.json` |
+| `committed_version_unavailable` | `fail_availability` | `unknown` | `committed_version_unavailable` | `product` | `checker-report.json` |
 | `version_hash_mismatch` | `fail_correctness` | `failed` | `unknown` | `product` | `checker-report.json` |
 | `delete_marker_missing` | `fail_correctness` | `failed` | `unknown` | `product` | `checker-report.json` |
 | `deleted_object_resurrected` | `fail_correctness` | `failed` | `unknown` | `product` | `checker-report.json` |
@@ -335,6 +435,11 @@ S3 model classifications:
 | `list_unavailable_or_unknown` | `fail_availability` | `unknown` | `list_unavailable_or_unknown` | `product` | `checker-report.json` |
 | `recovery_tail_read_latency` | `degraded` | `passed` | `recovered_after_tail_latency` | `product` | `recovery-stability-report.json` |
 | `data_corruption` | `fail_correctness` | `failed` | `unknown` | `product` | `checker-report.json` |
+
+The target v2 table requires a reporting mapper and golden-test PR before these
+strings are used as suite continuation inputs. Until then, unknown target
+classifications must not silently fall through to `needs_investigation` in new
+writers.
 
 Run failure reasons:
 
@@ -364,9 +469,9 @@ Examples:
 - Missing version id on a 2xx write: `version_id_missing_on_committed_write`,
   `responsibility_domain=product`.
 
-### Console First Screen
+### Future Artifact Viewer First Screen
 
-The console first screen should show:
+The future artifact viewer first screen should show:
 
 1. Result: status, severity, `s3_model_classification ?? run_failure_reason`,
    responsibility domain.
@@ -378,21 +483,26 @@ The console first screen should show:
    `recovery-stability-report.json`, checker reports, `fault-evidence.json`,
    then runner/health evidence.
 
-The console remains tolerant of missing in-progress files and reports warnings
-instead of inventing a verdict.
+The future artifact viewer remains tolerant of missing in-progress files and
+reports warnings instead of inventing a verdict.
 
 ### Artifact Validation Modes
 
 - Success strict validation: all required artifacts must exist; run-spec JSON and
   YAML must match; fault evidence must prove injected, active, and recovered;
   checker, recommit, and artifact references must be clean.
-- Failure diagnostic validation: a failed run must include
-  `failure-summary.json` or `runner-failure-summary.json`; the summary must have
-  valid severity, phase, responsibility, and in-root evidence refs.
+- Failure diagnostic validation: a case/scenario failure must include
+  `failure-summary.json` or scenario-mode `runner-failure-summary.json`; the
+  summary must have valid severity, phase, responsibility, and in-root evidence
+  refs. Suite-level failures such as suite budget exhaustion must be represented
+  in `suite-summary.json.failures[]` and `stopReason`, or in a future suite-level
+  runner projection. Those suite-level projections must also carry or derive
+  phase, responsibility domain, run failure reason, and evidence refs.
   `runner-failure-summary.json` must at least project into phase,
-  responsibility domain, run failure reason, and evidence refs.
-- In-progress console validation: missing files are warnings. The console does
-  not fail a running test or infer a final verdict.
+  responsibility domain, run failure reason, and evidence refs when it is
+  present.
+- In-progress artifact-view validation: missing files are warnings. The future
+  viewer does not fail a running test or infer a final verdict.
 
 Malformed summaries, missing failure summaries after a terminal failure, and
 escaping evidence paths are artifact contract failures.
@@ -408,7 +518,8 @@ Scope:
 - Add `preflight-summary.json`.
 - Add `artifact-validation-report.json`.
 - Define actuator port ownership before extracting lifecycle code.
-- Split planning and lifecycle code only after the boundary is explicit.
+- Harden the existing suite plan and backend lifecycle boundaries before moving
+  more code.
 - Keep all existing scenarios compatible.
 
 PR split:
@@ -418,32 +529,39 @@ PR split:
    - Link it from `docs/todo.md`.
 
 2. `refactor(fault): extract suite plan model`
-   - Move suite plan structs and plan construction out of `suite_runner.rs` into
-     `suite_plan.rs`.
+   - Move existing suite plan structs and pure plan construction out of
+     `suite_runner.rs` into `suite_plan.rs`.
    - Preserve current `fault-suite-plan` output.
    - Add plan golden tests for current template output.
 
-3. `refactor(fault): define actuator port model`
-   - Define apply, wait-active, snapshot, recovery proof, delete, and cleanup
-     request/response types near the backend layer.
-   - Keep the runner as the only lifecycle caller for now.
+3. `refactor(fault): formalize actuator port model`
+   - Turn the existing runner-local `FaultBackendHandle` shape into the owned
+     lifecycle port, or document why it remains runner-local.
+   - Define apply, wait-active, snapshot, recovery proof, delete, cleanup, and
+     timeout-recovery request/response types near the backend layer.
+   - Keep the runner as the only lifecycle caller until one lifecycle owner is
+     explicit.
    - Add fake actuator tests without touching a cluster.
 
 4. `refactor(fault): extract fault lifecycle`
    - Move `AppliedFaults` and backend lifecycle orchestration from `runner.rs`
      into `fault_lifecycle.rs`.
-   - Use the actuator port model instead of creating a second lifecycle owner.
+   - Use the formalized actuator port model instead of creating a second
+     lifecycle owner.
    - Preserve current single-fault behavior.
    - Add fake backend tests for apply, wait-active, snapshot, reverse delete,
      cleanup, and aggregated cleanup errors.
 
 5. `feat(fault): add diagnostic report fields and validation`
-   - Extend `FailureSummary`.
+   - Add backward-compatible readers for old and v2 `FailureSummary` shapes.
+   - Extend new `FailureSummary` writers with phase, responsibility domain,
+     S3-model classification, run failure reason, observed time, and path-safe
+     `primary_evidence_refs`.
    - Add `preflight-summary.json`.
-   - Add path-safe `primary_evidence_refs`.
-   - Teach console to show responsibility domain and evidence rail.
-   - Validate new summary fields.
-   - Validate evidence refs stay inside artifact root.
+   - Add a stable reader/viewer model for responsibility domain and evidence rail
+     without requiring v2 fields in old artifact roots.
+   - Validate new summary fields only for new-schema artifacts.
+   - Validate evidence refs stay inside the artifact root.
    - Keep success artifacts strict and failure artifacts diagnostic.
 
 Acceptance gates:
@@ -458,8 +576,10 @@ Exit criteria:
 
 - No new destructive backend is introduced.
 - Existing suite YAML and artifacts remain readable.
-- Console remains read-only.
+- Any future artifact viewer remains read-only.
 - A failed setup/preflight has enough artifacts to route investigation.
+- The roadmap no longer treats already-landed suite planning, workload profiles,
+  versioning, or backend handles as missing prerequisites.
 
 ## Phase 2: Checker Semantics And Workload Windows
 
@@ -483,31 +603,50 @@ PR split:
    - Preserve the current `OperationRecord` shape with backward-compatible
      optional fields.
 
-2. `feat(fault): classify committed version failures`
+2. `feat(fault): split final LIST classification`
+   - Split successful LIST wrong-content from LIST timeout, interrupted LIST, and
+     incomplete LIST non-completion.
+   - Update checker classification, recovery stability classification,
+     reporting, artifact validation, and goldens together.
+   - Keep compatibility `classification=data_corruption` readable for old
+     artifacts, but emit `list_unavailable_or_unknown` only after the mapper is
+     explicit.
+
+3. `feat(fault): classify committed version failures`
    - Split current generic correctness failures into committed object,
      committed version, version hash, missing delete marker, and resurrection
      classifications.
    - Keep checker as the single authority. Do not add a competing oracle module.
 
-3. `feat(fault): add ack-triggered fault windows`
+4. `feat(fault): add ack-triggered fault windows`
    - Add trigger metadata to events and fault evidence.
+   - Add a single-arm or bounded re-arm trigger policy so one committed
+     operation, not an arbitrary workload interval, defines the crash window.
    - Enforce maximum ack-to-fault delay.
    - Fail as harness or backend failure if no committed operation arms the
      trigger in time.
+   - Do not arm the trigger from timeout, unknown, interrupted, or unversioned
+     operations when the scenario requires a committed version.
 
-4. `feat(fault): add versioned hot workload profile example`
+5. `feat(fault): add versioned hot workload profile example`
    - Add a documented reusable suite workload profile for hotspot overwrite,
      delete, LIST, and MPU.
    - Keep `workloadProfiles` as workload scale and operation model.
    - Keep `faultDuration` as fault injection time.
+   - Do not imply `workloadProfiles` enables versioning by itself. Until suite
+     YAML owns `workload.versioning`, every versioned row requires
+     `RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING=1` plus run-spec and artifact
+     validation proving `workload.versioning=true`.
    - Do not add hidden built-in workload profile selection.
 
-5. `test(fault): add durability checker goldens`
+6. `test(fault): add durability checker goldens`
    - Golden reports for PUT 200 loss, DELETE 204 resurrection, MPU complete loss,
      missing version id, ambiguous materialization, LIST timeout, and successful
      LIST content mismatch.
-   - Include timed-out CompleteMultipartUpload materialization, aborted MPU
-     cleanup, and orphan part isolation where the client can observe them.
+   - Include timed-out CompleteMultipartUpload materialization.
+   - Keep aborted MPU cleanup and orphan part isolation out of the first gate
+     unless the test also records explicit HEAD/ListMultipartUploads/ListVersions
+     evidence that the client can observe.
 
 Acceptance gates:
 
@@ -515,13 +654,17 @@ Acceptance gates:
 - Focused checker unit tests with synthetic histories.
 - Artifact validation against success and failure goldens.
 - Existing scenario artifact validation remains compatible.
+- Golden tests must include old `failure-summary.json` artifacts so v2 migration
+  does not break existing result roots.
 
 Exit criteria:
 
 - A 2xx committed operation cannot disappear without a correctness or
   availability classification.
 - Ambiguous operations cannot create false data-loss findings.
-- DELETE and MPU have explicit, reviewable verdict paths.
+- DELETE and CompleteMultipartUpload have explicit, reviewable verdict paths.
+- Versioned scenarios prove versioning in run spec and artifact validation, not
+  only by profile name.
 
 ## Phase 3: Target-Aware Preflight And Backend Preparation
 
@@ -539,8 +682,14 @@ PR split:
 1. `feat(fault): add target resolution proof`
    - Emit selected pods, PVCs, PVs, nodes, devices, erasure-set hints where
      available, and conflict domains.
-   - Store proof in `suite-plan.json`, `run-spec.json`, and
-     `preflight-summary.json`.
+   - Keep `fault-suite-plan` pure and side-effect-free. It may declare target
+     intent and required proof, but it must not read cluster state, host state,
+     backend credentials, or actuator secrets.
+   - Add a target-proof/preflight path that may read cluster and host metadata
+     without applying faults. Store resolved proof in `target-proof.json`,
+     `run-spec.json`, and `preflight-summary.json`.
+   - Mark scenarios that require erasure-set proof as invalid when the proof is
+     unavailable; do not silently fall back to random pod or node selection.
 
 2. `feat(fault): make health guard target-aware`
    - Allow planned target disruption while protecting control plane,
@@ -552,8 +701,12 @@ PR split:
    - Add configuration shape for node power control, allowlist, expected
      context, controller identity, and recovery command.
    - Do not execute power operations.
-   - Fail closed without explicit destructive opt-in and out-of-band controller
-     proof.
+   - Fail closed without explicit destructive opt-in, backend-specific
+     power-operation opt-in, and out-of-band controller proof.
+   - Validate that the controller, artifact writer, recovery path, and
+     credentials are outside the target fault domain.
+   - Negative preflight must prove wrappers do not set the power opt-in
+     implicitly.
 
 Acceptance gates:
 
@@ -575,6 +728,7 @@ Exit criteria:
   Phase 4 explicitly enables execution.
 - Existing Chaos Mesh and dm scenarios still run through the same public
   contract.
+- Quorum scenarios remain non-executable until same-erasure-set proof is present.
 
 ## Phase 4: Minimal Destructive Durability Smoke
 
@@ -591,19 +745,26 @@ Scope 4B, true power-cycle smoke:
   gates pass.
 - Keep the artifact writer, controller, and recovery path outside the fault
   domain.
+- Preflight must record controller host, power domain, network path, credentials
+  scope, recovery command, artifact-writer location, and proof that none live on
+  target nodes or target power circuits.
+- Require a backend-specific power opt-in that suite wrappers do not set
+  implicitly.
 - Use ack-triggered fault windows for after-ACK tests.
 
 Recommended scenario order:
 
 1. `dm-flakey-versioned-hot`
    - Dedicated Local PV.
-   - Versioning on.
+   - Versioning on, proven by `RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING=1`,
+     `run-spec.*`, and artifact validation until suite YAML owns
+     `workload.versioning`.
    - Hot overwrite/delete/MPU workload.
    - Oracle: committed versions and delete markers survive.
 
 2. `pod-crash-versioned-hot`
    - Existing pod kill or pod failure backend.
-   - Versioning on.
+   - Versioning on, proven by run spec and artifact validation.
    - Used as a negative control and recovery-tail classifier.
 
 3. `single-node-power-cycle-after-ack` (4B)
@@ -611,6 +772,8 @@ Recommended scenario order:
    - One target node only.
    - Artifact writer and controller stay outside the fault domain.
    - Triggered by a committed operation and bounded by `ack_to_fault_ms`.
+   - Requires backend-specific power opt-in in addition to the generic
+     destructive switch.
 
 4. `quorum-p-power-cycle` (4B)
    - Power off exactly parity count targets.
@@ -625,6 +788,10 @@ Recommended scenario order:
      classification, not harness ambiguity.
    - This is a diagnostic/release-candidate scenario, not an ordinary PR gate,
      and does not introduce a generic expected-failure DSL.
+   - Until expected-failure policy is represented in catalog metadata and
+     `suite-summary.json`, this scenario may exit non-zero even when it produced
+     the expected evidence. Treat that as a valid diagnostic artifact, not a
+     passing suite result.
 
 PR split:
 
@@ -636,18 +803,24 @@ PR split:
    - Clear fault model text in catalog and reports.
 
 3. `feat(fault): enable single node power cycle`
-   - Execute only with explicit destructive env/config, target allowlist, and
-     out-of-band recovery proof.
+   - Execute only with explicit destructive env/config, backend-specific power
+     opt-in, target allowlist, and out-of-band recovery proof.
+   - Negative tests must show the suite wrapper does not enable this backend by
+     default.
 
 4. `feat(fault): add quorum power cycle scenarios`
    - Catalog-owned P and P+1 scenarios.
    - No generic YAML target DSL.
    - Require same-erasure-set proof before execution.
+   - P+1 stays release-candidate/manual unless expected-failure policy has
+     landed.
 
 5. `docs(fault): add destructive smoke runbook`
    - Small run values: objects 64, concurrency 8, pinned image digest.
    - Recommended hot workload: versioning on, high overwrite/delete ratio,
      explicit MPU ratio, and request timeout recorded in run metadata.
+   - Record `RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING=1` until suite YAML exposes a
+     first-class versioning field.
    - Required artifact set and first-failure triage steps.
 
 Acceptance gates:
@@ -656,6 +829,8 @@ Acceptance gates:
 - Dedicated cluster preflight.
 - Clean checkout and recorded commit OID.
 - Pinned RustFS image digest.
+- Backend-specific destructive opt-in evidence for power, PV, bitrot, stale-disk,
+  and host-storage mutation scenarios.
 - `fault-evidence.json` proves injected, active during workload, and recovered.
 - `checker-pre-recommit-report.json`, `checker-report.json`, and
   `recommit-report.json` are clean for expected-pass scenarios.
@@ -665,7 +840,10 @@ Acceptance gates:
   snapshots are preserved.
 - Expected-fail scenarios may exit non-zero, but they must produce the expected
   classification, severity, responsibility domain, and evidence refs. They must
-  not end as `harness`, `unknown`, or missing-artifact failures.
+  not end as `harness`, `unknown`, or missing-artifact failures. A non-zero
+  expected-fail run is acceptable diagnostic evidence only when the expected
+  classification is explicit in the runbook or catalog. It is not a passing CI
+  signal until suite-level expected-failure semantics exist.
 
 Exit criteria:
 
@@ -694,6 +872,8 @@ Scenario families:
    - Reattach stale disk.
    - Oracle: latest version id, delete marker latest state, and object hash
      cannot roll back to the stale generation.
+   - Must prove how the old disk generation was captured and restored without
+     deleting or mutating non-target volumes.
 
 2. `delete-marker-stale-disk-heal`
    - DELETE 204 with versioning on.
@@ -707,12 +887,15 @@ Scenario families:
      dangling cleanup event, cleanup actor, shard inventory after cleanup.
    - Oracle: fragments that were recoverable before cleanup are not deleted by
      dangling cleanup.
+   - Requires a product-side trigger that can be isolated from harness-induced
+     data deletion; otherwise classify only the S3-visible result.
 
 4. `fresh-volume-replacement-heal`
    - Replace one PVC/PV with an empty volume.
    - Record original generation, quarantine location, replacement generation, and
      restore/cleanup status.
    - Oracle: format and data heal converge without committed data loss.
+   - Requires a quarantine path for the original PV/PVC before replacement.
 
 5. `on-disk-bitrot-heal`
    - Flip bytes in a shard on a dedicated host volume.
@@ -720,6 +903,10 @@ Scenario families:
      rollback/quarantine evidence.
    - Oracle: corrupt data is not returned as successful S3 bytes; heal repairs or
      reports unavailable explicitly.
+   - Requires shard-level target proof and a byte-accurate rollback plan before
+     mutation: object-to-shard mapping, file/device identity, byte offset,
+     original hash, mutated hash, backup path, mutation command, and rollback
+     command. Mutation outside the target shard is a harness failure.
 
 6. `long-run-durability-campaign`
    - Continuous workload.
@@ -764,10 +951,13 @@ Acceptance gates:
 - One small dedicated-cluster smoke per new scenario family.
 - Rollback, quarantine, or restore evidence for every scenario that mutates host
   data, PV contents, or device state.
+- No next attempt may start if rollback, quarantine, or target state is
+  uncertain after a host or storage mutation.
 - Device and node allowlists for every host-level mutation.
 - Post-cleanup health and target state verification.
 - Artifact validation for pass and fail outcomes.
-- Console renders the first screen without reading raw logs for verdicts.
+- Future artifact viewer renders the first screen without reading raw logs for
+  verdicts.
 
 Exit criteria:
 
@@ -776,24 +966,26 @@ Exit criteria:
   resurrection, dangling deletion, bitrot detection, heal non-convergence, and
   recovery-tail unavailability.
 - The campaign is evidence-rich enough for release qualification.
+- Host and storage mutation scenarios cannot run unless their target proof,
+  allowlist, rollback, and post-cleanup evidence are present.
 
 ## Use Case Matrix
 
-| Priority | Scenario | Injection | Workload | Oracle | Required evidence | Expected outcome and false-positive guard |
+| Priority | Proposed catalog scenario | Current executable proxy | Execution status | Injection | Workload and oracle | Required evidence and false-positive guard |
 | --- | --- | --- | --- | --- | --- | --- |
-| P0 | `dm-flakey-versioned-hot` | Dedicated Local PV through dm-flakey/error/no-flush recovery. | Versioning on, hotspot overwrite/delete, explicit MPU ratio, small smoke values first. | Committed version GET and delete marker latest must pass. | dm active/recovered snapshots, PV/device proof, history, checker reports. | Expected pass. If fault did not hit target device, use `run_failure_reason=fault_not_active`, not product failure. |
-| P0 | `pod-crash-versioned-hot` | Pod kill/failure while workload is active. | Same versioned hot profile. | Version lineage survives; recovery tail is separated from corruption. | Pod identity before/after, restart counts, previous logs, recovery stability report. | Expected pass. This is process crash proxy, not physical power loss. |
-| P0 | `single-node-power-cycle-after-ack` | Out-of-band power cycle after selected committed ACK. | Ack-triggered PUT/DELETE/MPU operations. | Committed object/version survives after node recovery. | Trigger op id, ACK time, fault active time, node power proof, checker reports. | Expected pass. If `ack_to_fault_ms` exceeds bound, mark harness/backend failure. |
-| P0 | `delete-marker-hard-poweroff` | Hard power during delete-heavy ack-triggered workload. | Versioning on, high DELETE weight, interleaved overwrites. | Delete marker remains latest; deleted object is not resurrected. | ListObjectVersions evidence, checker report, power proof. | Expected pass. DELETE without 204/version id is not committed. |
-| P0 | `multipart-complete-hard-poweroff` | Hard power around CompleteMultipartUpload ACK. | MPU ratio enabled, 8 MiB/16 MiB/64 MiB objects, abort path retained. | Complete 200 is a committed write; timed-out complete is ambiguous; aborted MPU is not visible as object. | MPU operation history, version id, checker report, recommit report. | Expected pass. Complete timeout materialization is ambiguous, not confirmed data loss. |
-| P1 | `quorum-p-power-cycle` | Power off exactly parity count targets in one erasure set. | Versioned hot profile. | EC redundancy survives or recovers within window. | Erasure-set id, data/parity width, target volume list, non-target proof. | Expected pass. Random nodes without same-set proof are invalid. |
-| P1 | `quorum-p-plus-one-power-cycle` | Power off parity plus one targets in one erasure set. | Versioned hot profile. | Must fail with explicit availability/correctness classification. | Same-set proof, power proof, failure summary. | Expected fail for diagnostic/release use only; not ordinary PR gate. |
-| P1 | `stale-disk-return-detect` | Reattach old disk generation after writes/deletes. | Versioned hot profile, delete marker emphasis. | Latest version id/delete marker/hash cannot roll back. | Disk generation proof, reattach events, versioning report, checker report. | Expected pass. Missing generation proof is harness failure. |
-| P1 | `delete-marker-stale-disk-heal` | Reattach disk predating committed DELETE marker, then observe heal. | DELETE-heavy versioned workload. | Delete marker remains latest and object is not resurrected. | Old/new disk generation, heal summary, ListObjectVersions evidence. | Expected pass. Versioning disabled or DELETE not committed invalidates verdict. |
-| P1 | `dangling-cleanup-after-ack-loss` | Induce missing shards beyond parity and trigger dangling cleanup path. | Prefill known large objects plus versioned mutations. | Recoverable committed fragments are not deleted by cleanup. | Object/version shard map, inventory before/after, cleanup actor/event, checker report. | Expected pass. Without before/after inventory, only classify S3 unavailability, not dangling causality. |
-| P2 | `fresh-volume-replacement-heal` | Replace one PVC/PV with an empty volume. | Prefill plus versioned verification. | Heal converges with no committed data loss. | Original and replacement generation, quarantine/restore evidence, heal summary. | Expected pass. Non-convergence maps to `recovery_not_converged` run reason plus checker facts. |
-| P2 | `on-disk-bitrot-heal` | Mutate shard bytes on dedicated host volume. | Read-heavy verification plus periodic full checker. | Corrupt bytes are never returned as successful S3 data; heal repairs or reports unavailable. | Target shard proof, original/mutated hash, rollback evidence, checker report. | Expected pass. Mutation outside target shard is harness failure. |
-| P2 | `long-run-durability-campaign` | Repeated named scenarios under continuous workload. | Continuous workload with periodic full verification. | Aggregate scenario verdicts and resource trends. | Suite summary, event tail, fd/RSS trend, artifact size report. | Release/nightly only. Resource ceiling breach is runner/environment failure. |
+| P0 | `dm-flakey-versioned-hot` | `dm-flakey` plus `RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING=1` | Needs catalog/profile PR | Dedicated Local PV through dm-flakey/error/no-flush recovery. | Hot overwrite/delete/MPU workload; committed version GET and delete marker latest must pass. | dm active/recovered snapshots, PV/device proof, history, checker reports. If fault did not hit target device, use `run_failure_reason=fault_not_active`, not product failure. |
+| P0 | `pod-crash-versioned-hot` | `pod-kill-one` or `pod-failure` plus versioning env | Needs catalog/profile PR | Pod kill/failure while workload is active. | Version lineage survives; recovery tail is separated from corruption. | Pod identity before/after, restart counts, previous logs, recovery stability report. This is process crash proxy, not physical power loss. |
+| P0 | `single-node-power-cycle-after-ack` | none | Blocked on power preflight and trigger lifecycle | Out-of-band power cycle after selected committed ACK. | Ack-triggered PUT/DELETE/MPU operations; committed object/version survives after node recovery. | Trigger op id, ACK time, fault active time, node power proof, checker reports. If `ack_to_fault_ms` exceeds bound, mark harness/backend failure. |
+| P0 | `delete-marker-hard-poweroff` | none | Blocked on power preflight and trigger lifecycle | Hard power during delete-heavy ack-triggered workload. | Versioning on, high DELETE weight, interleaved overwrites; delete marker remains latest. | ListObjectVersions evidence, checker report, power proof. DELETE without 204/version id is not committed. |
+| P0 | `multipart-complete-hard-poweroff` | none | Blocked on power preflight and trigger lifecycle | Hard power around CompleteMultipartUpload ACK. | Complete 200 is a committed write; timed-out complete is ambiguous. | MPU operation history, version id, checker report, recommit report. Abort/orphan-part checks require explicit observable evidence before becoming gates. |
+| P1 | `quorum-p-power-cycle` | none | Blocked on same-erasure-set proof | Power off exactly parity count targets in one erasure set. | EC redundancy survives or recovers within window. | Erasure-set id, data/parity width, target volume list, non-target proof. Random nodes without same-set proof are invalid. |
+| P1 | `quorum-p-plus-one-power-cycle` | none | Manual/release-candidate only | Power off parity plus one targets in one erasure set. | Must fail with explicit availability/correctness classification. | Same-set proof, power proof, failure summary. Non-zero is acceptable evidence until explicit expected-failure suite semantics exist. |
+| P1 | `stale-disk-return-detect` | none | Blocked on disk generation proof and rollback | Reattach old disk generation after writes/deletes. | Latest version id/delete marker/hash cannot roll back. | Disk generation proof, reattach events, versioning report, checker report. Missing generation proof is harness failure. |
+| P1 | `delete-marker-stale-disk-heal` | none | Blocked on disk generation proof and heal observer | Reattach disk predating committed DELETE marker, then observe heal. | Delete marker remains latest and object is not resurrected. | Old/new disk generation, heal summary, ListObjectVersions evidence. Versioning disabled or DELETE not committed invalidates verdict. |
+| P1 | `dangling-cleanup-after-ack-loss` | none | Blocked on product trigger and shard inventory | Induce missing shards beyond parity and trigger dangling cleanup path. | Recoverable committed fragments are not deleted by cleanup. | Object/version shard map, inventory before/after, cleanup actor/event, checker report. Without before/after inventory, classify only S3 unavailability, not dangling causality. |
+| P2 | `fresh-volume-replacement-heal` | none | Blocked on PV quarantine/restore proof | Replace one PVC/PV with an empty volume. | Heal converges with no committed data loss. | Original and replacement generation, quarantine/restore evidence, heal summary. Non-convergence maps to `recovery_not_converged` plus checker facts. |
+| P2 | `on-disk-bitrot-heal` | none | Blocked on shard target proof and rollback | Mutate shard bytes on dedicated host volume. | Corrupt bytes are never returned as successful S3 data; heal repairs or reports unavailable. | Object-to-shard mapping, file/device identity, byte offset, original/mutated hash, backup, mutation and rollback commands. Mutation outside target shard is harness failure. |
+| P2 | `long-run-durability-campaign` | none | Release/nightly only | Repeated named scenarios under continuous workload. | Aggregate scenario verdicts and resource trends. | Suite summary, event tail, fd/RSS trend, artifact size report. Resource ceiling breach is runner/environment failure. |
 
 ## Review Checklist
 
@@ -807,7 +999,7 @@ Use this checklist for every PR in this plan:
   stop condition, and cleanup evidence?
 - Does the checker remain the source of truth for S3-visible correctness?
 - Are ambiguous operations kept separate from committed operations?
-- Are artifacts few, stable, path-safe, and console-readable?
+- Are artifacts few, stable, path-safe, and artifact-viewer-readable?
 - Does the failure summary route ownership through `responsibility_domain`
   rather than vague classification names?
 - Can the implementation be merged as a small PR without requiring the next
