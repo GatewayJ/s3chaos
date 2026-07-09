@@ -844,7 +844,7 @@ impl OutcomeCountsArtifact {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactValidationOptions, validate_fault_artifacts};
+    use super::{ArtifactValidationOptions, recursive_find, validate_fault_artifacts};
     use crate::fault::{
         spec::{FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec},
         workload::WorkloadPlan,
@@ -1618,5 +1618,54 @@ mod tests {
             serde_yaml_ng::to_string(&spec).expect("yaml"),
         )
         .expect("write run spec yaml");
+    }
+
+    #[test]
+    fn recursive_find_returns_none_for_missing_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+
+        assert_eq!(
+            recursive_find(&missing, "checker-report.json").expect("find"),
+            None
+        );
+    }
+
+    #[test]
+    fn recursive_find_returns_none_when_name_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("other.json"), "{}").expect("write");
+
+        assert_eq!(
+            recursive_find(dir.path(), "checker-report.json").expect("find"),
+            None
+        );
+    }
+
+    #[test]
+    fn recursive_find_locates_a_nested_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("a").join("b");
+        fs::create_dir_all(&nested).expect("mkdir");
+        let target = nested.join("checker-report.json");
+        fs::write(&target, "{}").expect("write");
+
+        assert_eq!(
+            recursive_find(dir.path(), "checker-report.json").expect("find"),
+            Some(target)
+        );
+    }
+
+    #[test]
+    fn recursive_find_matches_by_exact_file_name_not_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory sharing the searched name must not be returned; only a
+        // file with that exact name counts as a hit.
+        fs::create_dir_all(dir.path().join("checker-report.json")).expect("mkdir");
+
+        assert_eq!(
+            recursive_find(dir.path(), "checker-report.json").expect("find"),
+            None
+        );
     }
 }
