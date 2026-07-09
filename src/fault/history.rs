@@ -191,7 +191,14 @@ fn truncate_error(message: &str) -> String {
     if message.len() <= MAX_ERROR_LEN {
         message.to_string()
     } else {
-        format!("{}...", &message[..MAX_ERROR_LEN])
+        // Slice on a char boundary at or below the byte budget; error messages
+        // carry object keys and backend output that can be non-ASCII, and
+        // slicing mid-codepoint would panic in the failure-recording path.
+        let mut end = MAX_ERROR_LEN;
+        while end > 0 && !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &message[..end])
     }
 }
 
@@ -269,5 +276,25 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(records.len(), 200);
         assert_eq!(ids.len(), 200);
+    }
+
+    #[test]
+    fn truncate_error_keeps_short_ascii_intact() {
+        let message = "boom";
+        assert_eq!(super::truncate_error(message), "boom");
+    }
+
+    #[test]
+    fn truncate_error_does_not_panic_on_multibyte_boundary() {
+        // A multi-byte codepoint straddling the 300-byte cut point must not
+        // panic and must produce valid UTF-8. '€' is three bytes; padding the
+        // prefix to 299 bytes puts the cut in the middle of a codepoint.
+        let message = format!("{}{}", "a".repeat(299), "€".repeat(20));
+        let truncated = super::truncate_error(&message);
+
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.len() <= 303);
+        // The 300th byte lands inside '€', so the boundary walk backs up to 299.
+        assert_eq!(truncated, format!("{}...", "a".repeat(299)));
     }
 }
