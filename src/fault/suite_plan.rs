@@ -539,10 +539,14 @@ fn scenario_config(
     if let Some(fault_duration_seconds) = scenario.fault_duration_seconds {
         config.duration = Duration::from_secs(fault_duration_seconds);
     }
+    // A suite attempt's fault percent comes only from the scenario YAML or the
+    // catalog default — never from an ambient RUSTFS_FAULT_TEST_PERCENT. Letting
+    // the env leak in silently rewrites per-scenario semantics across a mixed
+    // suite (e.g. an ambient 20 turns disk-full's 100 into a partial fill).
     if let Some(percent) = scenario.percent {
         config.percent = percent;
         config.percent_overridden = true;
-    } else if !base.percent_overridden {
+    } else {
         config.percent = default_percent_for_scenario(&scenario.name);
         config.percent_overridden = false;
     }
@@ -1009,6 +1013,43 @@ scenarios:
         .resolve()
         .expect("resolved suite");
         let base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+
+        let config = scenario_config(
+            &base,
+            &suite,
+            &suite.scenarios[0],
+            1,
+            1,
+            Path::new("target/fault-tests/suite/disk-full"),
+        )
+        .expect("scenario config");
+
+        assert_eq!(config.percent, 100);
+        assert!(!config.percent_overridden);
+    }
+
+    #[test]
+    fn scenario_config_ignores_ambient_percent_for_suite_scenarios() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: disk-full
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+
+        // Simulate an ambient RUSTFS_FAULT_TEST_PERCENT=20 leaking in from the
+        // environment. The suite scenario declares no percent, so it must still
+        // use disk-full's catalog default (100), not the ambient value.
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.percent = 20;
+        base.percent_overridden = true;
 
         let config = scenario_config(
             &base,
