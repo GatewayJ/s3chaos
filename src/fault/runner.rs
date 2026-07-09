@@ -1639,17 +1639,16 @@ fn cleanup_fault_backends(config: &FaultTestConfig, plan: &FaultPlan) -> Result<
 
 fn cleanup_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Result<()> {
     match backend {
-        FaultBackend::ChaosMeshIoChaos | FaultBackend::MinioWarpWithChaos => {
-            chaos_mesh::cleanup_managed_iochaos(&config.cluster, &config.chaos_namespace)
-        }
-        FaultBackend::ChaosMeshPodChaos => {
-            chaos_mesh::cleanup_managed_podchaos(&config.cluster, &config.chaos_namespace)
-        }
-        FaultBackend::ChaosMeshNetworkChaos => {
-            chaos_mesh::cleanup_managed_networkchaos(&config.cluster, &config.chaos_namespace)
-        }
-        FaultBackend::ChaosMeshStressChaos => {
-            chaos_mesh::cleanup_managed_stresschaos(&config.cluster, &config.chaos_namespace)
+        FaultBackend::ChaosMeshIoChaos
+        | FaultBackend::MinioWarpWithChaos
+        | FaultBackend::ChaosMeshPodChaos
+        | FaultBackend::ChaosMeshNetworkChaos
+        | FaultBackend::ChaosMeshStressChaos => {
+            // Sweep every managed chaos kind, not just this plan's backend: a
+            // chaos CR leaked by a prior run or a prior suite attempt of a
+            // different kind would otherwise stay active during this attempt and
+            // be misattributed to (or mask) the fault under test.
+            chaos_mesh::cleanup_managed_chaos(&config.cluster, &config.chaos_namespace)
         }
         FaultBackend::DeviceMapper => Ok(()),
     }
