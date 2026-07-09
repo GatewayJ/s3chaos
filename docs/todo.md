@@ -1,5 +1,8 @@
 # Fault Suite Roadmap
 
+Detailed durability and power-loss design: see
+[`DURABILITY_FAULT_TESTING_DESIGN.md`](DURABILITY_FAULT_TESTING_DESIGN.md).
+
 This document tracks the next architecture steps for the fault-suite runner. The
 current suite format is valid for selecting catalog scenarios, repetitions,
 durations, percent overrides, workload object count, workload concurrency, and
