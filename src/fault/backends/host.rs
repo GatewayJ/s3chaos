@@ -552,7 +552,7 @@ spec:
     - name: host-tools
       image: {image}
       imagePullPolicy: IfNotPresent
-      command: ["sh", "-c", "trap : TERM INT; sleep 3600 & wait"]
+      command: ["sh", "-c", "trap : TERM INT; while :; do sleep 3600 & wait $!; done"]
       securityContext:
         privileged: true
       volumeMounts:
@@ -598,6 +598,24 @@ mod tests {
         assert!(manifest.contains("mountPath: /host"));
         assert!(manifest.contains("path: /"));
         assert!(manifest.contains("s3chaos"));
+    }
+
+    #[test]
+    fn dm_helper_stays_alive_until_explicitly_deleted() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let manifest = dm_helper_manifest(
+            &config.cluster,
+            "rustfs-fault-dm-helper-run123",
+            "worker-a",
+            "busybox:test",
+        );
+
+        // The guard always tears the pod down explicitly (restore/Drop), so it
+        // must never self-terminate: a fixed `sleep 3600` on a restartPolicy:
+        // Never pod would Complete mid-run and strand the fault table loaded on
+        // the real block device once every kubectl exec starts failing.
+        assert!(manifest.contains("while :; do sleep 3600 & wait $!; done"));
+        assert!(!manifest.contains("sleep 3600 & wait\""));
     }
 
     #[test]
