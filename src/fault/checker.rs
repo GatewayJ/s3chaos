@@ -70,6 +70,11 @@ pub struct CheckerReport {
     pub missing_committed_delete_markers: Vec<String>,
     #[serde(default)]
     pub resurrected_deleted_objects: Vec<String>,
+    /// Committed-present keys whose latest delete was ambiguous and that
+    /// returned 404 after recovery: the delete legitimately took effect, so
+    /// these are recorded for audit but do not fail the run.
+    #[serde(default)]
+    pub tolerated_ambiguous_deletes: Vec<String>,
     pub tenant_recovered: bool,
     pub passed: bool,
 }
@@ -252,6 +257,7 @@ pub async fn check_s3_history(
         version_hash_mismatches: Vec::new(),
         missing_committed_delete_markers: Vec::new(),
         resurrected_deleted_objects: Vec::new(),
+        tolerated_ambiguous_deletes: Vec::new(),
         tenant_recovered,
         passed: false,
     };
@@ -275,7 +281,45 @@ pub async fn check_s3_history(
     .buffer_unordered(concurrency);
     while let Some(result) = final_results.next().await {
         let (key, expected, unknown_writes, get) = result?;
+        if expected.is_some()
+            && unknown_writes.is_empty()
+            && get.outcome == OperationOutcome::NotFound
+            && model.ambiguous_delete_pending.contains(&key)
+        {
+            // The committed object had a later ambiguous (timeout/unknown)
+            // delete; a 404 means that delete took effect, which is a
+            // legitimate outcome, not a lost committed object.
+            report.tolerated_ambiguous_deletes.push(key);
+            continue;
+        }
         evaluate_final_get(&mut report, key, expected.as_ref(), &unknown_writes, get);
+    }
+
+    // Committed deletes are otherwise never re-read: the final GET loop probes
+    // only live and ambiguous-write keys, so a deleted key that still serves a
+    // body on the GET path (but stays absent from LIST) would pass. Probe the
+    // deleted keys that carry no ambiguous write — a materialized ambiguous
+    // write on a deleted key is a legitimate outcome already handled above.
+    let deleted_probe_keys = model
+        .deleted
+        .iter()
+        .filter(|key| !model.unknown_writes.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut deleted_results = stream::iter(deleted_probe_keys.into_iter().map(|key| {
+        let s3 = s3.clone();
+        let recorder = recorder.clone();
+        async move {
+            let get = s3.get_object_result(&key, &recorder).await?;
+            Ok::<_, anyhow::Error>((key, get))
+        }
+    }))
+    .buffer_unordered(concurrency);
+    while let Some(result) = deleted_results.next().await {
+        let (key, get) = result?;
+        if let Some(message) = evaluate_deleted_reread(&key, &get) {
+            report.resurrected_deleted_objects.push(message);
+        }
     }
 
     let run_id = recorder.run_id();
@@ -366,6 +410,7 @@ pub async fn check_s3_history(
     report.version_hash_mismatches.sort();
     report.missing_committed_delete_markers.sort();
     report.resurrected_deleted_objects.sort();
+    report.tolerated_ambiguous_deletes.sort();
     report.passed = report.tenant_recovered
         && report.missing_committed_objects.is_empty()
         && report.unavailable_committed_objects.is_empty()
@@ -551,6 +596,10 @@ struct ObjectModel {
     live: BTreeMap<String, ExpectedObject>,
     deleted: BTreeSet<String>,
     unknown_writes: BTreeMap<String, Vec<AmbiguousWriteAttempt>>,
+    // Keys still committed-present whose latest delete was ambiguous
+    // (timeout/unknown): the object may or may not have been removed, so a
+    // post-recovery 404 is a legitimate outcome rather than a lost object.
+    ambiguous_delete_pending: BTreeSet<String>,
     committed_writes: usize,
 }
 
@@ -914,6 +963,20 @@ fn evaluate_final_get(
             ))
         }
         _ => {}
+    }
+}
+
+/// A committed delete (latest committed op for the key was a successful Delete)
+/// must not serve a body after recovery. A direct GET that returns one is a
+/// resurrection; the correct outcome is not-found, and an unavailable probe
+/// response (timeout/error) is not evidence of resurrection either.
+fn evaluate_deleted_reread(key: &str, get: &GetObjectResult) -> Option<String> {
+    match (get.outcome, get.body.as_deref()) {
+        (OperationOutcome::Ok, Some(body)) => Some(format!(
+            "{key}: committed delete resurrected on GET ({} bytes)",
+            body.len()
+        )),
+        _ => None,
     }
 }
 
@@ -1575,6 +1638,7 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
                 mark_superseded_ambiguous_writes(model, &key, record);
                 model.committed_writes += 1;
                 model.deleted.remove(&key);
+                model.ambiguous_delete_pending.remove(&key);
                 model.live.insert(key, object);
             }
         }
@@ -1603,8 +1667,24 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
         OperationKind::Delete if record.outcome == OperationOutcome::Ok => {
             if let Some(key) = record.key.clone() {
                 mark_superseded_ambiguous_writes(model, &key, record);
+                model.ambiguous_delete_pending.remove(&key);
                 model.live.remove(&key);
                 model.deleted.insert(key);
+            }
+        }
+        OperationKind::Delete
+            if matches!(
+                record.outcome,
+                OperationOutcome::Timeout | OperationOutcome::Unknown
+            ) =>
+        {
+            // An ambiguous delete of a committed object may or may not have
+            // taken effect; mark it so a post-recovery 404 is tolerated instead
+            // of being reported as a lost committed object.
+            if let Some(key) = record.key.clone()
+                && model.live.contains_key(&key)
+            {
+                model.ambiguous_delete_pending.insert(key);
             }
         }
         _ => {}
@@ -1949,6 +2029,80 @@ mod tests {
         assert!(!model.live.contains_key("k2"));
         assert_eq!(model.live.get("k3").expect("k3").sha256, "mp");
         assert!(model.deleted.contains("k2"));
+    }
+
+    #[test]
+    fn ambiguous_delete_marks_committed_key_pending() {
+        let model = object_model(&[
+            record("op-1", OperationKind::Put, "k", "v1", OperationOutcome::Ok),
+            record(
+                "op-2",
+                OperationKind::Delete,
+                "k",
+                "",
+                OperationOutcome::Timeout,
+            ),
+        ]);
+
+        // The object is still committed-present, but the ambiguous delete makes
+        // a post-recovery 404 a legitimate outcome.
+        assert!(model.live.contains_key("k"));
+        assert!(model.ambiguous_delete_pending.contains("k"));
+    }
+
+    #[test]
+    fn recommit_clears_ambiguous_delete_pending() {
+        let model = object_model(&[
+            record("op-1", OperationKind::Put, "k", "v1", OperationOutcome::Ok),
+            record(
+                "op-2",
+                OperationKind::Delete,
+                "k",
+                "",
+                OperationOutcome::Unknown,
+            ),
+            record("op-3", OperationKind::Put, "k", "v2", OperationOutcome::Ok),
+        ]);
+
+        // A fresh committed write supersedes the ambiguous delete: the key is
+        // definitively present again, so a 404 would be a real failure.
+        assert!(model.live.contains_key("k"));
+        assert!(!model.ambiguous_delete_pending.contains("k"));
+    }
+
+    #[test]
+    fn committed_delete_clears_ambiguous_delete_pending() {
+        let model = object_model(&[
+            record("op-1", OperationKind::Put, "k", "v1", OperationOutcome::Ok),
+            record(
+                "op-2",
+                OperationKind::Delete,
+                "k",
+                "",
+                OperationOutcome::Timeout,
+            ),
+            record("op-3", OperationKind::Delete, "k", "", OperationOutcome::Ok),
+        ]);
+
+        // The delete became definitive; the key is deleted (handled by the
+        // resurrection probe) and no longer pending-ambiguous.
+        assert!(model.deleted.contains("k"));
+        assert!(!model.live.contains_key("k"));
+        assert!(!model.ambiguous_delete_pending.contains("k"));
+    }
+
+    #[test]
+    fn ambiguous_delete_of_uncommitted_key_is_not_pending() {
+        // A delete with no prior committed write leaves nothing to lose.
+        let model = object_model(&[record(
+            "op-1",
+            OperationKind::Delete,
+            "k",
+            "",
+            OperationOutcome::Timeout,
+        )]);
+
+        assert!(model.ambiguous_delete_pending.is_empty());
     }
 
     #[test]
@@ -3003,6 +3157,7 @@ mod tests {
             version_hash_mismatches: Vec::new(),
             missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
+            tolerated_ambiguous_deletes: Vec::new(),
             tenant_recovered: true,
             passed: true,
         };
@@ -3041,6 +3196,7 @@ mod tests {
             version_hash_mismatches: Vec::new(),
             missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
+            tolerated_ambiguous_deletes: Vec::new(),
             tenant_recovered: true,
             passed: false,
         }
@@ -3062,5 +3218,50 @@ mod tests {
             recovered_within_seconds: None,
             classification: RecoveryStabilityClassification::CommittedObjectUnavailable,
         }
+    }
+
+    #[test]
+    fn committed_delete_reread_flags_body_as_resurrection() {
+        let message = super::evaluate_deleted_reread(
+            "gone",
+            &GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"back".to_vec()),
+            },
+        );
+
+        assert_eq!(
+            message.as_deref(),
+            Some("gone: committed delete resurrected on GET (4 bytes)")
+        );
+    }
+
+    #[test]
+    fn committed_delete_reread_accepts_not_found_and_unavailable() {
+        let not_found = super::evaluate_deleted_reread(
+            "gone",
+            &GetObjectResult {
+                outcome: OperationOutcome::NotFound,
+                http_status: Some(404),
+                error: None,
+                body: None,
+            },
+        );
+        assert!(not_found.is_none());
+
+        // An unavailable probe response (timeout/error) is not proof of
+        // resurrection; only a returned body is.
+        let unavailable = super::evaluate_deleted_reread(
+            "gone",
+            &GetObjectResult {
+                outcome: OperationOutcome::Timeout,
+                http_status: None,
+                error: Some("read timed out".to_string()),
+                body: None,
+            },
+        );
+        assert!(unavailable.is_none());
     }
 }
