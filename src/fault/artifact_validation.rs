@@ -166,8 +166,13 @@ impl ArtifactValidationOptions {
         scenario: impl Into<String>,
         artifact_root: impl Into<PathBuf>,
     ) -> Result<Self> {
+        let scenario = scenario.into();
+        let expected_workload_versioning = scenarios::expected_workload_versioning_for_scenario(
+            &scenario,
+            env_bool("RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING")?,
+        )?;
         Ok(Self {
-            scenario: scenario.into(),
+            scenario,
             artifact_root: artifact_root.into(),
             expected_workload_objects: env_usize(
                 "RUSTFS_FAULT_TEST_WORKLOAD_OBJECTS",
@@ -177,7 +182,7 @@ impl ArtifactValidationOptions {
                 "RUSTFS_FAULT_TEST_WORKLOAD_CONCURRENCY",
                 DEFAULT_WORKLOAD_CONCURRENCY,
             )?,
-            expected_workload_versioning: env_bool("RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING")?,
+            expected_workload_versioning,
             expected_rustfs_pod_count: env_usize(
                 "RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT",
                 DEFAULT_RUSTFS_POD_COUNT,
@@ -450,6 +455,11 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
         ensure!(
             !fault.conflict_domain.is_empty(),
             "run-spec fault {} has empty conflict_domain",
+            fault.name
+        );
+        ensure!(
+            !fault.target_proof.is_empty(),
+            "run-spec fault {} has empty target_proof",
             fault.name
         );
         ensure!(
@@ -2244,6 +2254,7 @@ mod tests {
                 "target": {"kind": "rustfs-volume", "path": "/data/rustfs0"},
                 "target_proof": {"required": true, "artifact": "target-proof.json"},
                 "selection": {"kind": "percent", "value": 20},
+                "target_proof": ["test fixture proves selected target"],
                 "fault_duration_seconds": 60,
                 "observability": "chaos",
                 "conflict_domain": "run-scoped IOChaos"

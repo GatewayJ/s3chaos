@@ -85,7 +85,8 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
     run_scenario_with_config(config).await
 }
 
-pub async fn run_scenario_with_config(config: FaultTestConfig) -> Result<()> {
+pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()> {
+    scenarios::apply_catalog_defaults(&mut config)?;
     let scenario = FaultScenario::from_config(&config)?;
     let spec = scenarios::scenario_spec(&scenario.name)?;
     let plan = FaultPlan::from_scenario_with_options(
@@ -1892,6 +1893,9 @@ fn require_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Res
         FaultBackend::ChaosMeshNetworkChaos => chaos_mesh::require_networkchaos_crd(cluster),
         FaultBackend::ChaosMeshStressChaos => chaos_mesh::require_stresschaos_crd(cluster),
         FaultBackend::DeviceMapper => require_dm_flakey_preflight(config),
+        FaultBackend::PlannedReliabilityWorkflow => {
+            bail!("planned reliability workflow scenarios are catalog-only and cannot execute yet")
+        }
     }
 }
 
@@ -1948,6 +1952,7 @@ fn cleanup_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Res
             chaos_mesh::cleanup_managed_chaos(&config.cluster, &config.chaos_namespace)
         }
         FaultBackend::DeviceMapper => Ok(()),
+        FaultBackend::PlannedReliabilityWorkflow => Ok(()),
     }
 }
 
@@ -2069,6 +2074,9 @@ fn apply_fault_backend(
         | FaultBackend::ChaosMeshNetworkChaos
         | FaultBackend::ChaosMeshStressChaos
         | FaultBackend::MinioWarpWithChaos => apply_chaos_mesh_fault_backend(&request),
+        FaultBackend::PlannedReliabilityWorkflow => {
+            bail!("planned reliability workflow scenarios are catalog-only and cannot execute yet")
+        }
     }
 }
 

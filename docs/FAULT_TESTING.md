@@ -288,10 +288,54 @@ make fault-list
 cargo run --manifest-path Cargo.toml --bin s3chaos -- fault-catalog-json
 ```
 
+`make fault-list` prints only scenarios whose catalog status is `executable`.
+`fault-catalog-json` prints the full catalog, including `planned` reliability
+flows that are visible for roadmap review but rejected by preflight, direct
+runs, and YAML suite validation.
+
 Each run names exactly one scenario with `SCENARIO=<name>`. SRE-owned scheduling
 or automation should live outside this repository and call the same explicit
 command for the desired scenario. Tool requirements, such as `warp` for
 `warp-under-chaos`, are read from the Rust catalog during preflight.
+
+## RustFS Reliability Extension Scenarios
+
+The first executable RustFS reliability slice is intentionally a durability
+proxy on top of existing, proven fault backends:
+
+- `pod-crash-versioned-hot`: kills one RustFS Pod with Chaos Mesh PodChaos,
+  forces bucket versioning, runs hot-key overwrite/delete/MPU workload, and
+  verifies committed version lineage plus delete markers after recovery.
+- `dm-flakey-versioned-hot`: uses the dedicated device-mapper flakey backend
+  with the same versioned hot mutation workload. This requires the static
+  local PV and `RUSTFS_FAULT_TEST_DM_*` setup from the `dm-flakey` section.
+
+Run the Kubernetes recovery proxy:
+
+```bash
+make fault-preflight SCENARIO=pod-crash-versioned-hot
+make fault-run SCENARIO=pod-crash-versioned-hot
+```
+
+Run the block-device durability proxy only on a dedicated lab host:
+
+```bash
+make fault-preflight SCENARIO=dm-flakey-versioned-hot
+make fault-run SCENARIO=dm-flakey-versioned-hot
+```
+
+Pass criteria are the normal run contract plus the catalog-owned reliability
+profile: `run-spec.*` records `workload.versioning: true`, `workload-plan.json`
+records a hotspot, `history.jsonl` records version ids for committed writes and
+deletes, and `checker-report.json` verifies every committed version by
+`versionId` and checks deleted keys keep a latest delete marker.
+
+The catalog also includes planned entries for quorum P/P+1 targeted faults,
+fresh-volume replacement, admin heal/decommission/rebalance, on-disk bitrot,
+and long-run chaos campaigns. They are not executable yet because they still
+need topology or admin-operation target proof and backend adapters. Existing
+percent-based IOChaos scenarios must not be treated as proof of quorum P/P+1
+behavior.
 
 ## YAML Suite Contracts
 

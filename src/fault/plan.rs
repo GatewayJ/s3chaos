@@ -20,11 +20,12 @@ use std::time::Duration;
 use crate::fault::{
     config::{DEFAULT_RUSTFS_VOLUME_PATH, FaultTestConfig, validate_rustfs_volume_path},
     scenarios::{
-        DISK_FULL_SCENARIO, DM_FLAKEY_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
-        FaultScenarioSpec, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO,
-        NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO,
-        NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
-        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO,
+        DISK_FULL_SCENARIO, DM_FLAKEY_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend,
+        FaultParameterSchema, FaultScenario, FaultScenarioSpec, IO_EIO_SCENARIO,
+        IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, NETWORK_CORRUPT_SCENARIO,
+        NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO, NETWORK_LOSS_SCENARIO,
+        NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO,
         STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
 };
@@ -781,7 +782,7 @@ impl FaultPlan {
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
             )?,
-            POD_KILL_ONE_SCENARIO => FaultInjection::new(
+            POD_KILL_ONE_SCENARIO | POD_CRASH_VERSIONED_HOT_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsServerPodKill,
                 spec.backend,
                 FaultTarget::RustfsServerPod,
@@ -872,7 +873,7 @@ impl FaultPlan {
                 scenario,
                 &options.scenario_parameters,
             )?,
-            DM_FLAKEY_SCENARIO => FaultInjection::new(
+            DM_FLAKEY_SCENARIO | DM_FLAKEY_VERSIONED_HOT_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsBlockDeviceFlakey,
                 spec.backend,
                 FaultTarget::DedicatedBlockDevice,
@@ -1002,7 +1003,7 @@ mod tests {
         config::FaultTestConfig,
         scenarios::{
             FaultBackend, FaultParameterSchema, FaultScenario, WARP_UNDER_CHAOS_SCENARIO,
-            scenario_catalog, scenario_spec,
+            executable_scenario_catalog, scenario_spec,
         },
     };
     use std::time::Duration;
@@ -1051,7 +1052,7 @@ mod tests {
     fn every_cataloged_scenario_has_one_current_fault_plan() {
         let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
 
-        for spec in scenario_catalog() {
+        for spec in executable_scenario_catalog() {
             config.scenario = spec.scenario.to_string();
             let scenario = FaultScenario::from_config(&config).expect("scenario");
             let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan");

@@ -1045,7 +1045,7 @@ run_suite() {
 }
 
 list_scenarios() {
-  fault_catalog_json | jq -r '.[] | .scenario'
+  fault_catalog_json | jq -r '.[] | select(.status == "executable") | .scenario'
 }
 
 cleanup() {

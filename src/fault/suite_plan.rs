@@ -26,7 +26,7 @@ use crate::fault::{
         FaultTarget, FaultWorkloadMode,
     },
     reporting::FailureSeverity,
-    scenarios::{FaultScenario, FaultScenarioSpec, scenario_spec},
+    scenarios::{FaultScenario, FaultScenarioSpec, apply_catalog_defaults, scenario_spec},
     spec::FaultRunArtifactSpec,
     suite::{
         ResolvedFaultSuite, ResolvedFaultSuiteScenario, ResolvedFaultSuiteWorkloadOverride,
@@ -117,6 +117,9 @@ pub struct FaultSuitePlanWorkload {
     pub mode: String,
     pub objects: usize,
     pub concurrency: usize,
+    pub versioning: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     pub operation_mix: WorkloadOperationMix,
@@ -145,6 +148,7 @@ pub struct FaultSuitePlanFault {
     pub target: FaultSuitePlanTarget,
     pub target_proof: FaultSuitePlanTargetProof,
     pub selection: FaultSuitePlanSelection,
+    pub target_proof: Vec<String>,
     pub fault_duration_seconds: u64,
     pub observability: String,
     pub conflict_domain: String,
@@ -420,6 +424,12 @@ impl FaultSuitePlanAttempt {
                 mode: workload_mode_name(input.fault_plan.workload_mode).to_string(),
                 objects: input.config.workload.object_count,
                 concurrency: input.config.workload.concurrency,
+                versioning: input.config.workload_versioning,
+                catalog_profile: input
+                    .spec
+                    .workload_profile
+                    .explicit_name()
+                    .map(str::to_string),
                 profile: input.scenario.workload_profile.clone(),
                 operation_mix: input.config.workload_operation_mix,
                 payload_distribution,
@@ -481,6 +491,11 @@ impl FaultSuitePlanFault {
                 artifact: "target-proof.json".to_string(),
             },
             selection: FaultSuitePlanSelection::from_selection(fault.selection()),
+            target_proof: spec
+                .target_proof
+                .iter()
+                .map(|proof| (*proof).to_string())
+                .collect(),
             fault_duration_seconds: fault.duration().as_secs(),
             observability: spec.observability.to_string(),
             conflict_domain: spec.conflict_domain.to_string(),
@@ -562,6 +577,7 @@ fn scenario_config(
         config.percent = default_percent_for_scenario(&scenario.name);
         config.percent_overridden = false;
     }
+    apply_catalog_defaults(&mut config)?;
     if let Some(workload) = &scenario.workload {
         apply_workload_override(&mut config, workload)?;
         config.prefill_concurrency = config
@@ -686,8 +702,9 @@ mod tests {
     };
     use crate::fault::{
         config::FaultTestConfig,
+        scenarios::POD_CRASH_VERSIONED_HOT_SCENARIO,
         suite::{FaultSuite, fault_suite_template_yaml},
-        workload::WorkloadOperationMix,
+        workload::{WorkloadHotspot, WorkloadOperationMix},
     };
     use serde_json::json;
     use std::{path::Path, path::PathBuf, time::Duration};
@@ -750,6 +767,9 @@ mod tests {
             "objectPercent": 10,
             "operationPercent": 70
         });
+        let target_proof = json!([
+            "run artifacts must include the selected Kubernetes object or host device identity before the fault is activated"
+        ]);
 
         assert_eq!(
             plan,
@@ -802,6 +822,7 @@ mod tests {
                             "mode": "s3-mixed",
                             "objects": 40000,
                             "concurrency": 80,
+                            "versioning": false,
                             "profile": "smoke",
                             "operationMix": operation_mix.clone(),
                             "payloadDistribution": payload_distribution.clone(),
@@ -832,6 +853,7 @@ mod tests {
                                     "value": 20,
                                     "summary": "20%"
                                 },
+                                "targetProof": target_proof.clone(),
                                 "faultDurationSeconds": 600,
                                 "observability": "history.jsonl, workload-summary.json, checker-report.json, chaos-manifest.yaml, chaos-describe*.txt, Kubernetes snapshot artifacts",
                                 "conflictDomain": "fresh Tenant/PVC/PV fixture and run-scoped IOChaos cleanup"
@@ -871,6 +893,7 @@ mod tests {
                             "mode": "s3-mixed",
                             "objects": 40000,
                             "concurrency": 80,
+                            "versioning": false,
                             "profile": "smoke",
                             "operationMix": operation_mix,
                             "payloadDistribution": payload_distribution,
@@ -903,6 +926,7 @@ mod tests {
                                     "value": 1,
                                     "summary": "1 target(s)"
                                 },
+                                "targetProof": target_proof.clone(),
                                 "faultDurationSeconds": 480,
                                 "observability": "history.jsonl, checker reports, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
                                 "conflictDomain": "run-scoped NetworkChaos resource; must not overlap with other network faults in the same Tenant"
@@ -1048,6 +1072,43 @@ scenarios:
 
         assert_eq!(config.percent, 100);
         assert!(!config.percent_overridden);
+    }
+
+    #[test]
+    fn scenario_config_applies_catalog_workload_profile() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(&format!(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-reliability
+scenarios:
+  - name: {POD_CRASH_VERSIONED_HOT_SCENARIO}
+"#
+        ))
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+
+        let config = scenario_config(
+            &base,
+            &suite,
+            &suite.scenarios[0],
+            1,
+            1,
+            Path::new("target/fault-tests/suite/pod-crash-versioned-hot"),
+        )
+        .expect("scenario config");
+
+        assert!(config.workload_versioning);
+        assert_eq!(
+            config.workload_hotspot,
+            Some(WorkloadHotspot {
+                object_percent: 10,
+                operation_percent: 80,
+            })
+        );
     }
 
     #[test]
