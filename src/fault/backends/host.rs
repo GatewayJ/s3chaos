@@ -378,10 +378,24 @@ impl Drop for DmFlakeyGuard {
     fn drop(&mut self) {
         if !self.restored {
             let recovery_table = self.recovery_table.clone();
-            if !recovery_table.is_empty() {
-                let _ = self.load_table(&recovery_table, true);
+            if !recovery_table.is_empty()
+                && let Err(error) = self.load_table(&recovery_table, true)
+            {
+                // A discarded failure here leaves the injected fault table on a
+                // real block device; surface it so the leak is at least visible
+                // to operators (ChaosGuard already does this for chaos CRs).
+                eprintln!(
+                    "warning: failed to restore device-mapper target {name} to its recovery table on node {node} during guard cleanup: {error}",
+                    name = self.dm_name,
+                    node = self.mapping.node,
+                );
             }
-            let _ = self.delete_helper();
+            if let Err(error) = self.delete_helper() {
+                eprintln!(
+                    "warning: failed to delete dm-flakey helper pod {pod} during guard cleanup: {error}",
+                    pod = self.helper_pod,
+                );
+            }
         }
     }
 }
