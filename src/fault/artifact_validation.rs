@@ -30,7 +30,10 @@ use crate::fault::{
         DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS,
     },
     events::{RunEvent, RunEventStatus},
-    reporting::{AvailabilityStatus, DataCorrectnessStatus, FailureSeverity, FailureVerdict},
+    reporting::{
+        AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity, FailureVerdict,
+        ResponsibilityDomain, is_s3_model_classification,
+    },
     scenarios,
     spec::{
         FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec,
@@ -470,7 +473,99 @@ fn validate_conditional_recovery_stability_artifact(root: &Path, case_name: &str
         !failure_summary.scenario.trim().is_empty() && !failure_summary.message.trim().is_empty(),
         "failure-summary.json must include non-empty scenario and message"
     );
+    validate_failure_summary_v2_fields(&failure_summary, Some(&failure_summary_path))?;
     validate_recovery_failure_summary_fields(&failure_summary, &recovery)?;
+    Ok(())
+}
+
+fn validate_failure_summary_v2_fields(
+    summary: &FailureSummaryArtifact,
+    artifact_path: Option<&Path>,
+) -> Result<()> {
+    if summary.schema_version < 2 {
+        return Ok(());
+    }
+
+    ensure!(
+        summary.phase == Some(FailurePhase::from_stage(&summary.stage)),
+        "failure-summary.json phase {:?} does not match stage {:?}",
+        summary.phase,
+        summary.stage
+    );
+    ensure!(
+        summary
+            .case_name
+            .as_ref()
+            .is_none_or(|value| !value.trim().is_empty()),
+        "failure-summary.json case_name must be null or a non-empty string"
+    );
+
+    validate_failure_summary_v2_classification(summary)?;
+    ensure!(
+        !summary.primary_evidence_refs.is_empty() && summary.primary_evidence_refs.len() <= 5,
+        "failure-summary.json primary_evidence_refs must contain 1 to 5 entries for schema_version >= 2"
+    );
+    ensure_unique(
+        &summary.primary_evidence_refs,
+        "failure-summary.json primary_evidence_refs",
+    )?;
+    for evidence_ref in &summary.primary_evidence_refs {
+        validate_primary_evidence_ref(evidence_ref, artifact_path)?;
+    }
+    Ok(())
+}
+
+fn validate_failure_summary_v2_classification(summary: &FailureSummaryArtifact) -> Result<()> {
+    if is_s3_model_classification(&summary.classification) {
+        ensure!(
+            summary.s3_model_classification.as_deref() == Some(summary.classification.as_str())
+                && summary.run_failure_reason.is_none()
+                && summary.responsibility_domain == Some(ResponsibilityDomain::Product),
+            "failure-summary.json S3 model classification must set s3_model_classification, omit run_failure_reason, and use product responsibility"
+        );
+    } else {
+        ensure!(
+            summary.s3_model_classification.is_none()
+                && summary.run_failure_reason.as_deref() == Some(summary.classification.as_str()),
+            "failure-summary.json non-S3-model classification must set run_failure_reason and omit s3_model_classification"
+        );
+    }
+    ensure!(
+        summary.responsibility_domain
+            == Some(ResponsibilityDomain::from_classification(
+                &summary.classification
+            )),
+        "failure-summary.json responsibility_domain {:?} does not match classification {:?}",
+        summary.responsibility_domain,
+        summary.classification
+    );
+    Ok(())
+}
+
+fn validate_primary_evidence_ref(evidence_ref: &str, artifact_path: Option<&Path>) -> Result<()> {
+    let path = Path::new(evidence_ref);
+    ensure!(
+        !evidence_ref.trim().is_empty() && path.is_relative(),
+        "failure-summary.json primary_evidence_refs must be non-empty relative artifact paths"
+    );
+    ensure!(
+        path.components()
+            .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "failure-summary.json primary_evidence_refs must stay inside the artifact root"
+    );
+    if let Some(artifact_path) = artifact_path
+        && evidence_ref != "failure-summary.json"
+    {
+        let sibling = artifact_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(evidence_ref);
+        ensure!(
+            sibling.is_file(),
+            "failure-summary.json primary evidence ref {:?} does not exist next to the summary",
+            evidence_ref
+        );
+    }
     Ok(())
 }
 
@@ -662,6 +757,16 @@ fn ensure_sorted_unique(values: &[String], field: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_unique(values: &[String], field: &str) -> Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        ensure!(
+            !values[..index].iter().any(|seen| seen == value),
+            "{field} must contain no duplicates"
+        );
+    }
+    Ok(())
+}
+
 fn locate_artifact(root: &Path, case_name: &str, name: &str) -> Result<PathBuf> {
     for candidate in [root.join(case_name).join(name), root.join(name)] {
         if candidate.is_file() {
@@ -839,13 +944,28 @@ struct RecommitReportArtifact {
 
 #[derive(Debug, Deserialize)]
 struct FailureSummaryArtifact {
+    #[serde(default)]
+    schema_version: u8,
     scenario: String,
+    #[serde(default)]
+    case_name: Option<String>,
     stage: String,
+    #[serde(default)]
+    phase: Option<FailurePhase>,
     verdict: FailureVerdict,
     severity: FailureSeverity,
     classification: String,
+    #[serde(default)]
+    s3_model_classification: Option<String>,
+    #[serde(default)]
+    run_failure_reason: Option<String>,
+    #[serde(default)]
+    responsibility_domain: Option<ResponsibilityDomain>,
     data_correctness: DataCorrectnessStatus,
     availability: AvailabilityStatus,
+    #[serde(default)]
+    primary_evidence_refs: Vec<String>,
+    #[serde(default)]
     evidence_classifications: Vec<String>,
     #[serde(default)]
     final_list_warning_count: usize,
@@ -900,8 +1020,14 @@ impl OutcomeCountsArtifact {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactValidationOptions, recursive_find, validate_fault_artifacts};
+    use super::{
+        ArtifactValidationOptions, FailureSummaryArtifact, recursive_find, validate_fault_artifacts,
+    };
     use crate::fault::{
+        reporting::{
+            AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity,
+            FailureVerdict, ResponsibilityDomain,
+        },
         spec::{FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec},
         workload::WorkloadPlan,
     };
@@ -931,6 +1057,125 @@ mod tests {
             report.validation_summary_tsv_row(),
             "io-eio\t42\t0\t2\t1\t7\t0\t0\t0\t0\ttrue"
         );
+    }
+
+    #[test]
+    fn validates_failure_summary_v2_checker_projection() {
+        let summary = failure_summary_v2_for_test();
+
+        super::validate_failure_summary_v2_fields(&summary, None).expect("valid v2 summary");
+    }
+
+    #[test]
+    fn validates_failure_summary_v2_evidence_refs_next_to_summary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let summary_path = dir.path().join("failure-summary.json");
+        fs::write(&summary_path, "{}").expect("summary");
+        fs::write(dir.path().join("checker-report.json"), "{}").expect("checker");
+        fs::write(dir.path().join("run-events.jsonl"), "").expect("events");
+        let summary = failure_summary_v2_for_test();
+
+        super::validate_failure_summary_v2_fields(&summary, Some(&summary_path))
+            .expect("existing evidence refs");
+    }
+
+    #[test]
+    fn rejects_failure_summary_v2_missing_evidence_ref_next_to_summary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let summary_path = dir.path().join("failure-summary.json");
+        fs::write(&summary_path, "{}").expect("summary");
+        let summary = failure_summary_v2_for_test();
+
+        let error = super::validate_failure_summary_v2_fields(&summary, Some(&summary_path))
+            .expect_err("missing evidence ref");
+
+        assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn allows_legacy_failure_summary_without_v2_fields() {
+        let mut summary = failure_summary_v2_for_test();
+        summary.schema_version = 0;
+        summary.phase = None;
+        summary.s3_model_classification = None;
+        summary.responsibility_domain = None;
+        summary.primary_evidence_refs.clear();
+
+        super::validate_failure_summary_v2_fields(&summary, None).expect("legacy summary");
+    }
+
+    #[test]
+    fn parses_legacy_failure_summary_without_evidence_classifications() {
+        let summary: FailureSummaryArtifact = serde_json::from_value(json!({
+            "scenario": "io-eio",
+            "stage": "checker-pre-recommit-verdict",
+            "verdict": "failed",
+            "severity": "fail_correctness",
+            "classification": "data_corruption",
+            "data_correctness": "failed",
+            "availability": "unknown",
+            "message": "hash mismatch"
+        }))
+        .expect("legacy failure-summary.json");
+
+        assert_eq!(summary.schema_version, 0);
+        assert!(summary.evidence_classifications.is_empty());
+        super::validate_failure_summary_v2_fields(&summary, None).expect("legacy summary");
+    }
+
+    #[test]
+    fn rejects_failure_summary_v2_mismatched_phase() {
+        let mut summary = failure_summary_v2_for_test();
+        summary.phase = Some(FailurePhase::Workload);
+
+        let error =
+            super::validate_failure_summary_v2_fields(&summary, None).expect_err("bad phase");
+
+        assert!(error.to_string().contains("phase"));
+    }
+
+    #[test]
+    fn rejects_failure_summary_v2_checker_with_run_failure_reason() {
+        let mut summary = failure_summary_v2_for_test();
+        summary.run_failure_reason = Some("data_corruption".to_string());
+
+        let error = super::validate_failure_summary_v2_fields(&summary, None)
+            .expect_err("checker summary must not set run_failure_reason");
+
+        assert!(error.to_string().contains("S3 model classification"));
+    }
+
+    #[test]
+    fn rejects_failure_summary_v2_wrong_run_failure_responsibility_domain() {
+        let mut summary = failure_summary_v2_for_test();
+        summary.stage = "fault-backend-preflight".to_string();
+        summary.phase = Some(FailurePhase::Preflight);
+        summary.classification = "environment_or_fault_backend".to_string();
+        summary.s3_model_classification = None;
+        summary.run_failure_reason = Some("environment_or_fault_backend".to_string());
+        summary.responsibility_domain = Some(ResponsibilityDomain::Product);
+        summary.primary_evidence_refs = vec![
+            "failure-summary.json".to_string(),
+            "run-events.jsonl".to_string(),
+        ];
+
+        let error = super::validate_failure_summary_v2_fields(&summary, None)
+            .expect_err("wrong responsibility domain");
+
+        assert!(error.to_string().contains("responsibility_domain"));
+    }
+
+    #[test]
+    fn rejects_failure_summary_v2_unsafe_evidence_ref() {
+        let mut summary = failure_summary_v2_for_test();
+        summary
+            .primary_evidence_refs
+            .push("../outside.json".to_string());
+
+        let error = super::validate_failure_summary_v2_fields(&summary, None)
+            .expect_err("unsafe evidence ref");
+
+        assert!(error.to_string().contains("artifact root"));
     }
 
     #[test]
@@ -1529,6 +1774,37 @@ mod tests {
                 .to_string()
                 .contains("without higher-priority recovery failures")
         );
+    }
+
+    fn failure_summary_v2_for_test() -> FailureSummaryArtifact {
+        FailureSummaryArtifact {
+            schema_version: 2,
+            scenario: "io-eio".to_string(),
+            case_name: Some("fault_io_eio_preserves_committed_objects".to_string()),
+            stage: "checker-pre-recommit-verdict".to_string(),
+            phase: Some(FailurePhase::Checker),
+            verdict: FailureVerdict::Failed,
+            severity: FailureSeverity::FailCorrectness,
+            classification: "data_corruption".to_string(),
+            s3_model_classification: Some("data_corruption".to_string()),
+            run_failure_reason: None,
+            responsibility_domain: Some(ResponsibilityDomain::Product),
+            data_correctness: DataCorrectnessStatus::Failed,
+            availability: AvailabilityStatus::Unknown,
+            primary_evidence_refs: vec![
+                "failure-summary.json".to_string(),
+                "checker-report.json".to_string(),
+                "run-events.jsonl".to_string(),
+            ],
+            evidence_classifications: vec!["data_corruption".to_string()],
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
+            data_loss: None,
+            corruption: Some(true),
+            recovered_within_window: None,
+            recovered_within_seconds: None,
+            message: "hash mismatch".to_string(),
+        }
     }
 
     fn write_success_artifacts(root: &std::path::Path, scenario: &str) {
