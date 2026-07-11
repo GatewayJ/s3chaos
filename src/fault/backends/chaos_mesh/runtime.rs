@@ -67,10 +67,18 @@ fn require_crd(config: &ClusterTestConfig, crd: &str, description: &str) -> Resu
 
 pub fn cleanup_run(config: &ClusterTestConfig, namespace: &str, run_id: &str) -> Result<()> {
     let selector = format!("{RUN_ID_LABEL}={run_id}");
+    let timeout = delete_timeout_arg(config);
     for kind in ["iochaos", "podchaos", "networkchaos", "stresschaos"] {
         Kubectl::new(config)
             .namespaced(namespace)
-            .command(["delete", kind, "-l", &selector, "--ignore-not-found"])
+            .command([
+                "delete",
+                kind,
+                "-l",
+                &selector,
+                "--ignore-not-found",
+                &timeout,
+            ])
             .run_checked()?;
     }
     Ok(())
@@ -85,7 +93,14 @@ pub fn cleanup_run_kind(
     let selector = format!("{RUN_ID_LABEL}={run_id}");
     Kubectl::new(config)
         .namespaced(namespace)
-        .command(["delete", kind, "-l", &selector, "--ignore-not-found"])
+        .command([
+            "delete",
+            kind,
+            "-l",
+            &selector,
+            "--ignore-not-found",
+            &delete_timeout_arg(config),
+        ])
         .run_checked()?;
     Ok(())
 }
@@ -117,9 +132,23 @@ fn cleanup_managed_kind(config: &ClusterTestConfig, namespace: &str, kind: &str)
     let selector = format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}");
     Kubectl::new(config)
         .namespaced(namespace)
-        .command(["delete", kind, "-l", &selector, "--ignore-not-found"])
+        .command([
+            "delete",
+            kind,
+            "-l",
+            &selector,
+            "--ignore-not-found",
+            &delete_timeout_arg(config),
+        ])
         .run_checked()?;
     Ok(())
+}
+
+/// Bounds every label-selector cleanup delete so a chaos CR stuck on a
+/// finalizer surfaces a classified timeout instead of hanging the run (and any
+/// suite driving it) forever — `kubectl delete` waits indefinitely by default.
+fn delete_timeout_arg(config: &ClusterTestConfig) -> String {
+    format!("--timeout={}s", config.timeout.as_secs().max(1))
 }
 
 pub fn apply_iochaos(config: &ClusterTestConfig, spec: &IoChaosSpec) -> Result<ChaosGuard> {
@@ -377,8 +406,16 @@ fn condition_status(value: &Value, condition_type: &str) -> Option<String> {
 
 impl Drop for ChaosGuard {
     fn drop(&mut self) {
-        if !self.deleted {
-            let _ = self.delete_inner();
+        if !self.deleted
+            && let Err(error) = self.delete_inner()
+        {
+            // A discarded failure here leaks an active chaos CR into later runs;
+            // surface it so the leak is at least visible to operators.
+            eprintln!(
+                "warning: failed to delete leaked {kind}/{name} during guard cleanup: {error}",
+                kind = self.kind,
+                name = self.name,
+            );
         }
     }
 }

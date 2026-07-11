@@ -12,24 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod artifact_validation;
-pub mod backends;
-pub mod checker;
-pub mod config;
-pub mod console;
-pub mod diagnostics;
-pub mod events;
-mod fault_artifacts;
-mod fault_lifecycle;
-pub mod fixture;
-pub mod history;
-pub mod plan;
-pub mod pods;
-pub mod reporting;
-pub mod runner;
-pub mod scenarios;
-pub mod spec;
-pub mod suite;
-pub mod suite_plan;
-pub mod suite_runner;
-pub mod workload;
+use crate::framework::artifacts::ArtifactCollector;
+use anyhow::Result;
+
+pub(super) trait FaultFailureArtifactSource {
+    fn collect_failure_artifacts(
+        &self,
+        collector: &ArtifactCollector,
+        case_name: &str,
+        total: usize,
+        index: usize,
+        suffix: &str,
+    ) -> Result<()>;
+}

@@ -1,0 +1,1101 @@
+// Copyright 2025 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use anyhow::{Context, Result, bail, ensure};
+use serde::Serialize;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use uuid::Uuid;
+
+use crate::fault::{
+    config::{FaultTestConfig, FaultWorkloadProfile, default_percent_for_scenario},
+    plan::{
+        FaultInjection, FaultInjectionParameters, FaultPlan, FaultPlanOptions, FaultSelection,
+        FaultTarget, FaultWorkloadMode,
+    },
+    reporting::FailureSeverity,
+    scenarios::{FaultScenario, FaultScenarioSpec, scenario_spec},
+    spec::FaultRunArtifactSpec,
+    suite::{
+        ResolvedFaultSuite, ResolvedFaultSuiteScenario, ResolvedFaultSuiteWorkloadOverride,
+        resolve_fault_suite_yaml,
+    },
+    workload::{
+        WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadDistribution, WorkloadPlan,
+        WorkloadSizeClass,
+    },
+};
+
+pub const FAULT_SUITE_PLAN_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
+pub const FAULT_SUITE_PLAN_KIND: &str = "FaultSuitePlan";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlan {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub suite: String,
+    pub run_id: String,
+    pub suite_seed: u64,
+    pub artifact_root: String,
+    pub cluster: FaultSuitePlanCluster,
+    pub budgets: FaultSuitePlanBudgets,
+    pub requires_chaos_mesh: bool,
+    pub requires_static_storage: bool,
+    pub required_crds: Vec<String>,
+    pub required_tools: Vec<String>,
+    pub attempts: Vec<FaultSuitePlanAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanCluster {
+    pub context: String,
+    pub namespace: String,
+    pub tenant: String,
+    pub storage_class: String,
+    pub rustfs_image: String,
+    pub chaos_namespace: String,
+    pub use_cluster_ip: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanBudgets {
+    pub stop_on_first_failure: bool,
+    pub continue_on_severities: Vec<FailureSeverity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_duration_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_client_disruptions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_stable_window_seconds: Option<u64>,
+    pub cluster_timeout_seconds: u64,
+    pub recovery_stability_reread_seconds: u64,
+    pub minimum_required_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanAttempt {
+    pub index: usize,
+    pub scenario: String,
+    pub case_name: String,
+    pub repetition: usize,
+    pub priority: String,
+    pub isolation: String,
+    pub impact_policy: String,
+    pub expected_backend: String,
+    pub catalog_target: String,
+    pub fault_duration_seconds: u64,
+    pub workload: FaultSuitePlanWorkload,
+    pub faults: Vec<FaultSuitePlanFault>,
+    pub requires_chaos_mesh: bool,
+    pub requires_static_storage: bool,
+    pub crds: Vec<String>,
+    pub required_tools: Vec<String>,
+    pub artifacts: FaultSuitePlanArtifacts,
+    pub budget: FaultSuitePlanBudgetImpact,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanWorkload {
+    pub mode: String,
+    pub objects: usize,
+    pub concurrency: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    pub operation_mix: WorkloadOperationMix,
+    pub payload_distribution: Vec<FaultSuitePlanPayloadClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotspot: Option<WorkloadHotspot>,
+    pub prefill_concurrency: usize,
+    pub request_timeout_seconds: u64,
+    pub seed: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanPayloadClass {
+    pub size_bytes: usize,
+    pub object_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanFault {
+    pub name: String,
+    pub kind: String,
+    pub backend: String,
+    pub parameters: FaultInjectionParameters,
+    pub target: FaultSuitePlanTarget,
+    pub selection: FaultSuitePlanSelection,
+    pub fault_duration_seconds: u64,
+    pub observability: String,
+    pub conflict_domain: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanTarget {
+    pub kind: String,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanSelection {
+    pub kind: String,
+    pub value: u32,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanArtifacts {
+    pub attempt_dir: String,
+    pub case_dir: String,
+    pub required: Vec<String>,
+    pub event_stream: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanBudgetImpact {
+    pub fault_duration_seconds: u64,
+    pub recovery_timeout_seconds: u64,
+    pub recovery_stability_reread_seconds: u64,
+    pub minimum_required_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_before_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_after_minimum_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FaultSuitePlanExpansion {
+    pub suite: ResolvedFaultSuite,
+    pub plan: FaultSuitePlan,
+    pub attempts: Vec<FaultSuiteExpandedAttempt>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FaultSuiteExpandedAttempt {
+    pub plan: FaultSuitePlanAttempt,
+    pub config: FaultTestConfig,
+}
+
+struct FaultSuitePlanAttemptInput<'a> {
+    index: usize,
+    scenario: &'a ResolvedFaultSuiteScenario,
+    repetition: usize,
+    config: &'a FaultTestConfig,
+    spec: &'a FaultScenarioSpec,
+    fault_plan: &'a FaultPlan,
+    attempt_dir: &'a Path,
+    budget: FaultSuitePlanBudgetImpact,
+}
+
+pub fn plan_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<FaultSuitePlan> {
+    let suite = resolve_fault_suite_yaml(path)?;
+    let base_config = FaultTestConfig::from_env()?;
+    Ok(build_fault_suite_plan_expansion(suite, base_config, suite_run_id())?.plan)
+}
+
+pub(crate) fn build_fault_suite_plan_expansion(
+    suite: ResolvedFaultSuite,
+    mut base_config: FaultTestConfig,
+    run_id: String,
+) -> Result<FaultSuitePlanExpansion> {
+    validate_suite_runtime_contract(&suite, &base_config)?;
+    if base_config.workload_seed.is_none() {
+        base_config.workload_seed = Some(generated_suite_seed());
+    }
+    let suite_seed = base_config
+        .workload_seed
+        .expect("suite planning sets a seed before expanding attempts");
+    let suite_root = suite_run_root(&base_config, &suite, &run_id);
+    let mut attempts = Vec::new();
+    let mut attempt_index = 0usize;
+    let mut minimum_required_seconds = 0u64;
+    let mut remaining = suite.budgets.max_duration_seconds;
+    let mut required_crds = BTreeSet::new();
+    let mut required_tools = BTreeSet::new();
+    let mut requires_chaos_mesh = false;
+    let mut requires_static_storage = false;
+
+    for scenario in &suite.scenarios {
+        for repetition in 1..=scenario.repetitions {
+            attempt_index += 1;
+            let attempt_dir = suite_root.join(format!(
+                "{attempt_index:03}-{}-r{repetition}",
+                scenario.name
+            ));
+            let config = scenario_config(
+                &base_config,
+                &suite,
+                scenario,
+                repetition,
+                attempt_index,
+                &attempt_dir,
+            )?;
+            let fault_scenario = FaultScenario::from_config(&config)?;
+            let spec = scenario_spec(&fault_scenario.name)?;
+            let fault_plan = FaultPlan::from_scenario_with_options(
+                &fault_scenario,
+                spec,
+                FaultPlanOptions::from_config(&config),
+            )?;
+            let required = attempt_minimum_required_seconds(&config)?;
+            let remaining_before = remaining;
+            let remaining_after = match remaining {
+                Some(before) => {
+                    if before < required {
+                        bail!(
+                            "suite maxDuration budget {before}s cannot cover planned scenario {} repetition {} requiring at least {required}s",
+                            scenario.name,
+                            repetition
+                        );
+                    }
+                    Some(before - required)
+                }
+                None => None,
+            };
+            remaining = remaining_after;
+            minimum_required_seconds = minimum_required_seconds
+                .checked_add(required)
+                .context("suite minimum required duration overflowed")?;
+            requires_chaos_mesh |= spec.requires_chaos_mesh();
+            requires_static_storage |= spec.requires_static_storage();
+            required_crds.extend(spec.crds.iter().map(|crd| (*crd).to_string()));
+            required_tools.extend(spec.required_tools.iter().map(|tool| (*tool).to_string()));
+
+            let budget = FaultSuitePlanBudgetImpact {
+                fault_duration_seconds: config.duration.as_secs(),
+                recovery_timeout_seconds: config.cluster.timeout.as_secs(),
+                recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
+                minimum_required_seconds: required,
+                remaining_before_seconds: remaining_before,
+                remaining_after_minimum_seconds: remaining_after,
+            };
+            let plan = FaultSuitePlanAttempt::from_attempt(FaultSuitePlanAttemptInput {
+                index: attempt_index,
+                scenario,
+                repetition,
+                config: &config,
+                spec,
+                fault_plan: &fault_plan,
+                attempt_dir: &attempt_dir,
+                budget,
+            })?;
+            attempts.push(FaultSuiteExpandedAttempt { plan, config });
+        }
+    }
+
+    let plan_attempts = attempts
+        .iter()
+        .map(|attempt| attempt.plan.clone())
+        .collect();
+    let plan = FaultSuitePlan {
+        api_version: FAULT_SUITE_PLAN_API_VERSION.to_string(),
+        kind: FAULT_SUITE_PLAN_KIND.to_string(),
+        suite: suite.metadata.name.clone(),
+        run_id,
+        suite_seed,
+        artifact_root: suite_root.display().to_string(),
+        cluster: FaultSuitePlanCluster::from_config(&base_config),
+        budgets: FaultSuitePlanBudgets {
+            stop_on_first_failure: suite.budgets.stop_on_first_failure,
+            continue_on_severities: suite.budgets.continue_on_severities.clone(),
+            max_duration_seconds: suite.budgets.max_duration_seconds,
+            max_client_disruptions: suite.budgets.max_client_disruptions,
+            recovery_stable_window_seconds: suite.budgets.recovery_stable_window_seconds,
+            cluster_timeout_seconds: base_config.cluster.timeout.as_secs(),
+            recovery_stability_reread_seconds: base_config.recovery_stability_reread.as_secs(),
+            minimum_required_seconds,
+        },
+        requires_chaos_mesh,
+        requires_static_storage,
+        required_crds: required_crds.into_iter().collect(),
+        required_tools: required_tools.into_iter().collect(),
+        attempts: plan_attempts,
+    };
+
+    Ok(FaultSuitePlanExpansion {
+        suite,
+        plan,
+        attempts,
+    })
+}
+
+impl FaultSuitePlan {
+    pub fn to_json(&self) -> Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+}
+
+impl FaultSuitePlanCluster {
+    fn from_config(config: &FaultTestConfig) -> Self {
+        Self {
+            context: config.cluster.context.clone(),
+            namespace: config.cluster.test_namespace.clone(),
+            tenant: config.cluster.tenant_name.clone(),
+            storage_class: config.cluster.storage_class.clone(),
+            rustfs_image: config.cluster.rustfs_image.clone(),
+            chaos_namespace: config.chaos_namespace.clone(),
+            use_cluster_ip: config.use_cluster_ip,
+        }
+    }
+}
+
+impl FaultSuitePlanAttempt {
+    fn from_attempt(input: FaultSuitePlanAttemptInput<'_>) -> Result<Self> {
+        let seed = input
+            .config
+            .workload_seed
+            .context("suite attempt workload seed must be resolved during planning")?;
+        let case_dir = input.attempt_dir.join(input.spec.case_name);
+        let faults = input
+            .fault_plan
+            .faults()
+            .iter()
+            .enumerate()
+            .map(|(fault_index, fault)| {
+                FaultSuitePlanFault::from_fault(fault_index, input.scenario, input.spec, fault)
+            })
+            .collect();
+
+        let workload_plan = WorkloadPlan::seeded_with_profile(
+            seed,
+            input.config.workload.object_count,
+            input.config.workload.concurrency,
+            input.config.workload_operation_mix,
+            input.config.workload_payload_distribution.clone(),
+            input.config.workload_hotspot,
+        )?;
+
+        let payload_distribution = workload_plan
+            .size_distribution
+            .iter()
+            .map(FaultSuitePlanPayloadClass::from)
+            .collect();
+        let hotspot = workload_plan.hotspot;
+
+        Ok(Self {
+            index: input.index,
+            scenario: input.scenario.name.clone(),
+            case_name: input.spec.case_name.to_string(),
+            repetition: input.repetition,
+            priority: input.spec.priority.as_str().to_string(),
+            isolation: input.spec.isolation.as_str().to_string(),
+            impact_policy: input.spec.impact_policy.as_str().to_string(),
+            expected_backend: input.spec.backend.as_str().to_string(),
+            catalog_target: input.spec.target.to_string(),
+            fault_duration_seconds: input.config.duration.as_secs(),
+            workload: FaultSuitePlanWorkload {
+                mode: workload_mode_name(input.fault_plan.workload_mode).to_string(),
+                objects: input.config.workload.object_count,
+                concurrency: input.config.workload.concurrency,
+                profile: input.scenario.workload_profile.clone(),
+                operation_mix: input.config.workload_operation_mix,
+                payload_distribution,
+                hotspot,
+                prefill_concurrency: input.config.prefill_concurrency,
+                request_timeout_seconds: input.config.request_timeout.as_secs(),
+                seed,
+            },
+            faults,
+            requires_chaos_mesh: input.spec.requires_chaos_mesh(),
+            requires_static_storage: input.spec.requires_static_storage(),
+            crds: input
+                .spec
+                .crds
+                .iter()
+                .map(|crd| (*crd).to_string())
+                .collect(),
+            required_tools: input
+                .spec
+                .required_tools
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+            artifacts: FaultSuitePlanArtifacts {
+                attempt_dir: input.attempt_dir.display().to_string(),
+                case_dir: case_dir.display().to_string(),
+                required: FaultRunArtifactSpec::required_names(),
+                event_stream: "run-events.jsonl".to_string(),
+            },
+            budget: input.budget,
+        })
+    }
+}
+
+impl From<&WorkloadSizeClass> for FaultSuitePlanPayloadClass {
+    fn from(class: &WorkloadSizeClass) -> Self {
+        Self {
+            size_bytes: class.size_bytes,
+            object_count: class.object_count,
+        }
+    }
+}
+
+impl FaultSuitePlanFault {
+    fn from_fault(
+        index: usize,
+        scenario: &ResolvedFaultSuiteScenario,
+        spec: &FaultScenarioSpec,
+        fault: &FaultInjection,
+    ) -> Self {
+        Self {
+            name: format!("{}-{:02}-{}", scenario.name, index, fault.kind().as_str()),
+            kind: fault.kind().as_str().to_string(),
+            backend: fault.backend().as_str().to_string(),
+            parameters: fault.parameters().clone(),
+            target: FaultSuitePlanTarget::from_target(fault.target()),
+            selection: FaultSuitePlanSelection::from_selection(fault.selection()),
+            fault_duration_seconds: fault.duration().as_secs(),
+            observability: spec.observability.to_string(),
+            conflict_domain: spec.conflict_domain.to_string(),
+        }
+    }
+}
+
+impl FaultSuitePlanTarget {
+    fn from_target(target: &FaultTarget) -> Self {
+        match target {
+            FaultTarget::RustfsVolume { path } => Self {
+                kind: "rustfs-volume".to_string(),
+                summary: target.summary(),
+                path: Some(path.clone()),
+            },
+            FaultTarget::RustfsServerPod => Self {
+                kind: "rustfs-server-pod".to_string(),
+                summary: target.summary(),
+                path: None,
+            },
+            FaultTarget::RustfsServerPeerNetwork => Self {
+                kind: "rustfs-server-peer-network".to_string(),
+                summary: target.summary(),
+                path: None,
+            },
+            FaultTarget::RustfsServerResource => Self {
+                kind: "rustfs-server-resource".to_string(),
+                summary: target.summary(),
+                path: None,
+            },
+            FaultTarget::DedicatedBlockDevice => Self {
+                kind: "dedicated-block-device".to_string(),
+                summary: target.summary(),
+                path: None,
+            },
+        }
+    }
+}
+
+impl FaultSuitePlanSelection {
+    fn from_selection(selection: FaultSelection) -> Self {
+        match selection {
+            FaultSelection::Percent(percent) => Self {
+                kind: "percent".to_string(),
+                value: percent.into(),
+                summary: selection.summary(),
+            },
+            FaultSelection::FixedTargets(count) => Self {
+                kind: "fixed-targets".to_string(),
+                value: count,
+                summary: selection.summary(),
+            },
+        }
+    }
+}
+
+fn scenario_config(
+    base: &FaultTestConfig,
+    suite: &ResolvedFaultSuite,
+    scenario: &ResolvedFaultSuiteScenario,
+    repetition: usize,
+    attempt_index: usize,
+    attempt_dir: &Path,
+) -> Result<FaultTestConfig> {
+    let mut config = base.clone();
+    config.scenario = scenario.name.clone();
+    config.scenario_parameters = scenario.params.clone();
+    if let Some(fault_duration_seconds) = scenario.fault_duration_seconds {
+        config.duration = Duration::from_secs(fault_duration_seconds);
+    }
+    // A suite attempt's fault percent comes only from the scenario YAML or the
+    // catalog default — never from an ambient RUSTFS_FAULT_TEST_PERCENT. Letting
+    // the env leak in silently rewrites per-scenario semantics across a mixed
+    // suite (e.g. an ambient 20 turns disk-full's 100 into a partial fill).
+    if let Some(percent) = scenario.percent {
+        config.percent = percent;
+        config.percent_overridden = true;
+    } else {
+        config.percent = default_percent_for_scenario(&scenario.name);
+        config.percent_overridden = false;
+    }
+    if let Some(workload) = &scenario.workload {
+        apply_workload_override(&mut config, workload)?;
+        config.prefill_concurrency = config
+            .prefill_concurrency
+            .min(config.workload.concurrency)
+            .min(config.workload.object_count)
+            .max(1);
+    }
+    if let Some(stable_window_seconds) = suite.budgets.recovery_stable_window_seconds {
+        config.rustfs_pod_stable_window = Duration::from_secs(stable_window_seconds);
+        ensure!(
+            config.rustfs_pod_stable_window < config.cluster.timeout,
+            "suite budgets.recoveryStableWindowSeconds must be less than RUSTFS_FAULT_TEST_TIMEOUT_SECONDS"
+        );
+    }
+    config.workload_seed = attempt_seed(base.workload_seed, attempt_index, repetition);
+    config.cluster.artifacts_dir = attempt_dir.to_path_buf();
+    Ok(config)
+}
+
+fn apply_workload_override(
+    config: &mut FaultTestConfig,
+    workload: &ResolvedFaultSuiteWorkloadOverride,
+) -> Result<()> {
+    apply_workload_fields(
+        config,
+        workload.objects,
+        workload.concurrency,
+        workload.operation_weights,
+        workload.payload_distribution.as_ref(),
+        workload.hotspot,
+    )
+}
+
+fn apply_workload_fields(
+    config: &mut FaultTestConfig,
+    objects: Option<usize>,
+    concurrency: Option<usize>,
+    operation_weights: Option<WorkloadOperationMix>,
+    payload_distribution: Option<&WorkloadPayloadDistribution>,
+    hotspot: Option<WorkloadHotspot>,
+) -> Result<()> {
+    if objects.is_some() || concurrency.is_some() {
+        let object_count = objects.unwrap_or(config.workload.object_count);
+        let concurrency = concurrency.unwrap_or(config.workload.concurrency);
+        config.workload = FaultWorkloadProfile::new(object_count, concurrency)?;
+    }
+    if let Some(operation_weights) = operation_weights {
+        config.workload_operation_mix = operation_weights;
+    }
+    if let Some(payload_distribution) = payload_distribution {
+        config.workload_payload_distribution = Some(payload_distribution.clone());
+    }
+    if let Some(hotspot) = hotspot {
+        config.workload_hotspot = Some(hotspot);
+    }
+    Ok(())
+}
+
+fn validate_suite_runtime_contract(
+    suite: &ResolvedFaultSuite,
+    base_config: &FaultTestConfig,
+) -> Result<()> {
+    if let Some(stable_window_seconds) = suite.budgets.recovery_stable_window_seconds {
+        ensure!(
+            Duration::from_secs(stable_window_seconds) < base_config.cluster.timeout,
+            "suite budgets.recoveryStableWindowSeconds must be less than RUSTFS_FAULT_TEST_TIMEOUT_SECONDS"
+        );
+    }
+    Ok(())
+}
+
+fn attempt_minimum_required_seconds(config: &FaultTestConfig) -> Result<u64> {
+    attempt_minimum_required_duration(config).map(|required| required.as_secs())
+}
+
+pub(crate) fn attempt_minimum_required_duration(config: &FaultTestConfig) -> Result<Duration> {
+    config
+        .duration
+        .checked_add(config.cluster.timeout)
+        .and_then(|duration| duration.checked_add(config.recovery_stability_reread))
+        .context("suite attempt duration plus recovery timeout plus recovery stability reread overflowed")
+}
+
+fn attempt_seed(base_seed: Option<u64>, attempt_index: usize, repetition: usize) -> Option<u64> {
+    base_seed.map(|seed| seed ^ ((attempt_index as u64) << 32) ^ repetition as u64)
+}
+
+fn suite_run_root(config: &FaultTestConfig, suite: &ResolvedFaultSuite, run_id: &str) -> PathBuf {
+    config
+        .cluster
+        .artifacts_dir
+        .join(&suite.metadata.name)
+        .join(run_id)
+}
+
+pub(crate) fn suite_run_id() -> String {
+    format!("suite-{}", Uuid::new_v4())
+}
+
+fn generated_suite_seed() -> u64 {
+    let bytes = *Uuid::new_v4().as_bytes();
+    u64::from_le_bytes(
+        bytes[0..8]
+            .try_into()
+            .expect("uuid contains at least eight bytes"),
+    )
+}
+
+fn workload_mode_name(mode: FaultWorkloadMode) -> &'static str {
+    match mode {
+        FaultWorkloadMode::S3Mixed => "s3-mixed",
+        FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        attempt_seed, build_fault_suite_plan_expansion, scenario_config,
+        validate_suite_runtime_contract,
+    };
+    use crate::fault::{
+        config::FaultTestConfig,
+        suite::{FaultSuite, fault_suite_template_yaml},
+        workload::WorkloadOperationMix,
+    };
+    use serde_json::json;
+    use std::{path::Path, path::PathBuf, time::Duration};
+
+    #[test]
+    fn suite_template_plan_matches_golden_output() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(&fault_suite_template_yaml())
+            .expect("suite template yaml")
+            .resolve()
+            .expect("resolved suite template");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+        base.cluster.artifacts_dir = PathBuf::from("target/fault-tests/artifacts");
+
+        let expansion = build_fault_suite_plan_expansion(suite, base, "suite-fixed".to_string())
+            .expect("suite plan expansion");
+        let plan = serde_json::to_value(&expansion.plan).expect("plan json");
+        let required_artifacts = json!([
+            "run-spec.yaml",
+            "run-spec.json",
+            "run-events.jsonl",
+            "run-metadata.json",
+            "workload-plan.json",
+            "history.jsonl",
+            "workload-summary.json",
+            "recommit-report.json",
+            "checker-pre-recommit-report.json",
+            "checker-report.json",
+            "fault-evidence.json"
+        ]);
+        let operation_mix = json!({
+            "put": 1,
+            "overwrite": 1,
+            "get": 1,
+            "list": 1,
+            "delete": 1,
+            "multipart": 1
+        });
+        let payload_distribution = json!([
+            {
+                "sizeBytes": 4096,
+                "objectCount": 34000
+            },
+            {
+                "sizeBytes": 16384,
+                "objectCount": 4000
+            },
+            {
+                "sizeBytes": 8388608,
+                "objectCount": 1600
+            },
+            {
+                "sizeBytes": 16777216,
+                "objectCount": 400
+            }
+        ]);
+        let hotspot = json!({
+            "objectPercent": 10,
+            "operationPercent": 70
+        });
+
+        assert_eq!(
+            plan,
+            json!({
+                "apiVersion": "rustfs.com/s3chaos/v1alpha1",
+                "kind": "FaultSuitePlan",
+                "suite": "rustfs-smoke",
+                "runId": "suite-fixed",
+                "suiteSeed": 100,
+                "artifactRoot": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed",
+                "cluster": {
+                    "context": "real-cluster",
+                    "namespace": "rustfs-fault-test",
+                    "tenant": "fault-test-tenant",
+                    "storageClass": "fast-csi",
+                    "rustfsImage": "rustfs/rustfs:test",
+                    "chaosNamespace": "chaos-mesh",
+                    "useClusterIp": false
+                },
+                "budgets": {
+                    "stopOnFirstFailure": true,
+                    "continueOnSeverities": ["degraded"],
+                    "maxDurationSeconds": 7200,
+                    "maxClientDisruptions": 20,
+                    "recoveryStableWindowSeconds": 60,
+                    "clusterTimeoutSeconds": 300,
+                    "recoveryStabilityRereadSeconds": 60,
+                    "minimumRequiredSeconds": 1800
+                },
+                "requiresChaosMesh": true,
+                "requiresStaticStorage": false,
+                "requiredCrds": [
+                    "iochaos.chaos-mesh.org",
+                    "networkchaos.chaos-mesh.org"
+                ],
+                "requiredTools": [],
+                "attempts": [
+                    {
+                        "index": 1,
+                        "scenario": "io-eio",
+                        "caseName": "fault_io_eio_preserves_committed_objects",
+                        "repetition": 1,
+                        "priority": "p0",
+                        "isolation": "fresh-tenant",
+                        "impactPolicy": "client-disruption-required",
+                        "expectedBackend": "chaos-mesh-io-chaos",
+                        "catalogTarget": "one RustFS container data volume selected by tenant label and configured RustFS volume path",
+                        "faultDurationSeconds": 600,
+                        "workload": {
+                            "mode": "s3-mixed",
+                            "objects": 40000,
+                            "concurrency": 80,
+                            "profile": "smoke",
+                            "operationMix": operation_mix.clone(),
+                            "payloadDistribution": payload_distribution.clone(),
+                            "hotspot": hotspot.clone(),
+                            "prefillConcurrency": 16,
+                            "requestTimeoutSeconds": 30,
+                            "seed": 4294967397u64
+                        },
+                        "faults": [
+                            {
+                                "name": "io-eio-00-rustfs_volume_io_error",
+                                "kind": "rustfs_volume_io_error",
+                                "backend": "chaos-mesh-io-chaos",
+                                "parameters": {
+                                    "kind": "default"
+                                },
+                                "target": {
+                                    "kind": "rustfs-volume",
+                                    "summary": "one RustFS volume at /data/rustfs0",
+                                    "path": "/data/rustfs0"
+                                },
+                                "selection": {
+                                    "kind": "percent",
+                                    "value": 20,
+                                    "summary": "20%"
+                                },
+                                "faultDurationSeconds": 600,
+                                "observability": "history.jsonl, workload-summary.json, checker-report.json, chaos-manifest.yaml, chaos-describe*.txt, Kubernetes snapshot artifacts",
+                                "conflictDomain": "fresh Tenant/PVC/PV fixture and run-scoped IOChaos cleanup"
+                            }
+                        ],
+                        "requiresChaosMesh": true,
+                        "requiresStaticStorage": false,
+                        "crds": ["iochaos.chaos-mesh.org"],
+                        "requiredTools": [],
+                        "artifacts": {
+                            "attemptDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1",
+                            "caseDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1/fault_io_eio_preserves_committed_objects",
+                            "required": required_artifacts.clone(),
+                            "eventStream": "run-events.jsonl"
+                        },
+                        "budget": {
+                            "faultDurationSeconds": 600,
+                            "recoveryTimeoutSeconds": 300,
+                            "recoveryStabilityRereadSeconds": 60,
+                            "minimumRequiredSeconds": 960,
+                            "remainingBeforeSeconds": 7200,
+                            "remainingAfterMinimumSeconds": 6240
+                        }
+                    },
+                    {
+                        "index": 2,
+                        "scenario": "network-delay",
+                        "caseName": "fault_network_delay_preserves_object_model",
+                        "repetition": 1,
+                        "priority": "p1",
+                        "isolation": "reusable-tenant",
+                        "impactPolicy": "client-disruption-optional",
+                        "expectedBackend": "chaos-mesh-network-chaos",
+                        "catalogTarget": "one RustFS Pod selected by tenant label with delayed peer traffic inside the e2e namespace",
+                        "faultDurationSeconds": 480,
+                        "workload": {
+                            "mode": "s3-mixed",
+                            "objects": 40000,
+                            "concurrency": 80,
+                            "profile": "smoke",
+                            "operationMix": operation_mix,
+                            "payloadDistribution": payload_distribution,
+                            "hotspot": hotspot,
+                            "prefillConcurrency": 16,
+                            "requestTimeoutSeconds": 30,
+                            "seed": 8589934693u64
+                        },
+                        "faults": [
+                            {
+                                "name": "network-delay-00-rustfs_server_network_delay",
+                                "kind": "rustfs_server_network_delay",
+                                "backend": "chaos-mesh-network-chaos",
+                                "parameters": {
+                                    "kind": "networkDelay",
+                                    "latency": "200ms",
+                                    "jitter": "50ms",
+                                    "correlationPercent": 25
+                                },
+                                "target": {
+                                    "kind": "rustfs-server-peer-network",
+                                    "summary": "one RustFS server Pod partitioned from its peers"
+                                },
+                                "selection": {
+                                    "kind": "fixed-targets",
+                                    "value": 1,
+                                    "summary": "1 target(s)"
+                                },
+                                "faultDurationSeconds": 480,
+                                "observability": "history.jsonl, checker reports, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
+                                "conflictDomain": "run-scoped NetworkChaos resource; must not overlap with other network faults in the same Tenant"
+                            }
+                        ],
+                        "requiresChaosMesh": true,
+                        "requiresStaticStorage": false,
+                        "crds": ["networkchaos.chaos-mesh.org"],
+                        "requiredTools": [],
+                        "artifacts": {
+                            "attemptDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1",
+                            "caseDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1/fault_network_delay_preserves_object_model",
+                            "required": required_artifacts,
+                            "eventStream": "run-events.jsonl"
+                        },
+                        "budget": {
+                            "faultDurationSeconds": 480,
+                            "recoveryTimeoutSeconds": 300,
+                            "recoveryStabilityRereadSeconds": 60,
+                            "minimumRequiredSeconds": 840,
+                            "remainingBeforeSeconds": 6240,
+                            "remainingAfterMinimumSeconds": 5400
+                        }
+                    }
+                ]
+            })
+        );
+        assert_eq!(
+            expansion.attempts[0].config.cluster.artifacts_dir,
+            PathBuf::from("target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1")
+        );
+        assert_eq!(
+            expansion.attempts[1].config.cluster.artifacts_dir,
+            PathBuf::from(
+                "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1"
+            )
+        );
+    }
+
+    #[test]
+    fn workload_override_inherits_base_operation_mix_when_weights_are_omitted() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    workload:
+      objects: 72
+      concurrency: 9
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_operation_mix = WorkloadOperationMix {
+            put: 2,
+            overwrite: 1,
+            get: 3,
+            list: 1,
+            delete: 1,
+            multipart: 1,
+        };
+        let attempt_dir =
+            PathBuf::from("target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1");
+
+        let config = scenario_config(&base, &suite, &suite.scenarios[0], 1, 1, &attempt_dir)
+            .expect("scenario config");
+
+        assert_eq!(config.workload.object_count, 72);
+        assert_eq!(config.workload.concurrency, 9);
+        assert_eq!(config.workload_operation_mix, base.workload_operation_mix);
+    }
+
+    #[test]
+    fn scenario_config_applies_suite_overrides_and_unique_artifacts() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+budgets:
+  recoveryStableWindowSeconds: 30
+scenarios:
+  - name: io-eio
+    faultDuration: 10m
+    percent: 35
+    workload:
+      objects: 64
+      concurrency: 8
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let attempt_dir = PathBuf::from("target/fault-tests/suite/attempt-1");
+
+        let config = scenario_config(&base, &suite, &suite.scenarios[0], 1, 1, &attempt_dir)
+            .expect("scenario config");
+
+        assert_eq!(config.scenario, "io-eio");
+        assert_eq!(config.duration, Duration::from_secs(600));
+        assert_eq!(config.percent, 35);
+        assert!(config.percent_overridden);
+        assert_eq!(config.workload.object_count, 64);
+        assert_eq!(config.workload.concurrency, 8);
+        assert_eq!(config.prefill_concurrency, 8);
+        assert_eq!(config.rustfs_pod_stable_window, Duration::from_secs(30));
+        assert_eq!(config.cluster.artifacts_dir, attempt_dir);
+    }
+
+    #[test]
+    fn scenario_config_uses_per_scenario_default_percent_without_global_override() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: disk-full
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+
+        let config = scenario_config(
+            &base,
+            &suite,
+            &suite.scenarios[0],
+            1,
+            1,
+            Path::new("target/fault-tests/suite/disk-full"),
+        )
+        .expect("scenario config");
+
+        assert_eq!(config.percent, 100);
+        assert!(!config.percent_overridden);
+    }
+
+    #[test]
+    fn scenario_config_ignores_ambient_percent_for_suite_scenarios() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: disk-full
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+
+        // Simulate an ambient RUSTFS_FAULT_TEST_PERCENT=20 leaking in from the
+        // environment. The suite scenario declares no percent, so it must still
+        // use disk-full's catalog default (100), not the ambient value.
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.percent = 20;
+        base.percent_overridden = true;
+
+        let config = scenario_config(
+            &base,
+            &suite,
+            &suite.scenarios[0],
+            1,
+            1,
+            Path::new("target/fault-tests/suite/disk-full"),
+        )
+        .expect("scenario config");
+
+        assert_eq!(config.percent, 100);
+        assert!(!config.percent_overridden);
+    }
+
+    #[test]
+    fn attempt_seed_keeps_repetitions_distinct_when_seed_is_fixed() {
+        assert_ne!(attempt_seed(Some(42), 1, 1), attempt_seed(Some(42), 2, 1));
+        assert_eq!(attempt_seed(None, 1, 1), None);
+    }
+
+    #[test]
+    fn suite_runtime_contract_rejects_stable_window_that_matches_timeout_before_run_starts() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+budgets:
+  recoveryStableWindowSeconds: 300
+scenarios:
+  - name: io-eio
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+
+        let error = validate_suite_runtime_contract(&suite, &base).expect_err("runtime contract");
+
+        assert!(
+            error
+                .to_string()
+                .contains("recoveryStableWindowSeconds must be less")
+        );
+    }
+}

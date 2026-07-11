@@ -50,13 +50,19 @@ metadata:
 }
 
 pub fn tenant_manifest(config: &ClusterTestConfig) -> Result<String> {
-    let template = TenantTemplate::real_cluster(
+    let mut template = TenantTemplate::real_cluster(
         &config.test_namespace,
         &config.tenant_name,
         &config.rustfs_image,
         &config.storage_class,
         credential_secret_name(config),
     );
+    template.rustfs_env.clone_from(&config.rustfs_env);
+    // Topology knobs that a single-node/lab cluster otherwise had to patch in
+    // source (backlog#1037): the defaults preserve the production 4-node shape.
+    template.storage_request = config.tenant_storage_request.clone();
+    template.spread_across_hosts = config.tenant_spread_across_hosts;
+    template.unsafe_bypass_disk_check = config.tenant_unsafe_bypass_disk_check;
     template.manifest()
 }
 
@@ -157,6 +163,48 @@ mod tests {
         assert!(manifest.contains("storage: 100Gi"));
         assert!(!manifest.contains("rustfs-storage"));
         assert!(!manifest.contains("RUSTFS_UNSAFE_BYPASS_DISK_CHECK"));
+        assert!(manifest.contains("topologyKey: kubernetes.io/hostname"));
+    }
+
+    #[test]
+    fn fault_tenant_manifest_honors_single_node_topology() {
+        let mut config = FaultTestConfig::for_test("minikube", "standard");
+        config.cluster.tenant_storage_request = "2Gi".to_string();
+        config.cluster.tenant_spread_across_hosts = false;
+        config.cluster.tenant_unsafe_bypass_disk_check = true;
+
+        let manifest = tenant_manifest(&config.cluster).expect("fault tenant manifest");
+
+        // Single-node knobs come from config without editing source: small PVC,
+        // no host anti-affinity, and the disk-check bypass env present.
+        assert!(manifest.contains("storage: 2Gi"));
+        assert!(!manifest.contains("topologyKey"));
+        assert!(manifest.contains("RUSTFS_UNSAFE_BYPASS_DISK_CHECK"));
+    }
+
+    #[test]
+    fn fault_tenant_manifest_includes_extra_rustfs_env() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.cluster.rustfs_env = vec![(
+            "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE".to_string(),
+            "true".to_string(),
+        )];
+
+        let manifest = tenant_manifest(&config.cluster).expect("fault tenant manifest");
+        let value: serde_json::Value = serde_yaml_ng::from_str(&manifest).expect("valid yaml");
+
+        assert_eq!(
+            value
+                .pointer("/spec/env/1/name")
+                .and_then(serde_json::Value::as_str),
+            Some("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE")
+        );
+        assert_eq!(
+            value
+                .pointer("/spec/env/1/value")
+                .and_then(serde_json::Value::as_str),
+            Some("true")
+        );
     }
 
     #[test]

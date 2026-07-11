@@ -70,6 +70,11 @@ pub struct CheckerReport {
     pub missing_committed_delete_markers: Vec<String>,
     #[serde(default)]
     pub resurrected_deleted_objects: Vec<String>,
+    /// Committed-present keys whose latest delete was ambiguous and that
+    /// returned 404 after recovery: the delete legitimately took effect, so
+    /// these are recorded for audit but do not fail the run.
+    #[serde(default)]
+    pub tolerated_ambiguous_deletes: Vec<String>,
     pub tenant_recovered: bool,
     pub passed: bool,
 }
@@ -79,6 +84,7 @@ pub struct CheckerReport {
 pub enum RecoveryStabilityClassification {
     DataCorruption,
     CommittedObjectUnavailable,
+    ListUnavailableOrUnknown,
     RecoveryTailReadLatency,
     AmbiguousWriteMaterialized,
     HarnessError,
@@ -89,6 +95,7 @@ impl RecoveryStabilityClassification {
         match self {
             Self::DataCorruption => "data_corruption",
             Self::CommittedObjectUnavailable => "committed_object_unavailable",
+            Self::ListUnavailableOrUnknown => "list_unavailable_or_unknown",
             Self::RecoveryTailReadLatency => "recovery_tail_read_latency",
             Self::AmbiguousWriteMaterialized => "ambiguous_write_materialized",
             Self::HarnessError => "harness_error",
@@ -107,6 +114,10 @@ pub struct RecoveryStabilityReport {
     pub data_corruption_evidence: Vec<String>,
     #[serde(default)]
     pub ambiguous_write_evidence: Vec<String>,
+    #[serde(default)]
+    pub final_list_warning_count: usize,
+    #[serde(default)]
+    pub list_warnings: Vec<String>,
     pub harness_errors: Vec<String>,
     pub max_recovery_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +135,8 @@ impl RecoveryStabilityReport {
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
             ambiguous_write_evidence: Vec::new(),
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
             harness_errors: vec![message.into()],
             max_recovery_seconds: max_recovery.as_secs(),
             recovered_within_seconds: None,
@@ -144,6 +157,13 @@ impl RecoveryStabilityReport {
         if !self.still_unavailable_keys.is_empty() {
             classifications.insert(
                 RecoveryStabilityClassification::CommittedObjectUnavailable
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        if self.classification == RecoveryStabilityClassification::ListUnavailableOrUnknown {
+            classifications.insert(
+                RecoveryStabilityClassification::ListUnavailableOrUnknown
                     .as_str()
                     .to_string(),
             );
@@ -237,6 +257,7 @@ pub async fn check_s3_history(
         version_hash_mismatches: Vec::new(),
         missing_committed_delete_markers: Vec::new(),
         resurrected_deleted_objects: Vec::new(),
+        tolerated_ambiguous_deletes: Vec::new(),
         tenant_recovered,
         passed: false,
     };
@@ -260,7 +281,45 @@ pub async fn check_s3_history(
     .buffer_unordered(concurrency);
     while let Some(result) = final_results.next().await {
         let (key, expected, unknown_writes, get) = result?;
+        if expected.is_some()
+            && unknown_writes.is_empty()
+            && get.outcome == OperationOutcome::NotFound
+            && model.ambiguous_delete_pending.contains(&key)
+        {
+            // The committed object had a later ambiguous (timeout/unknown)
+            // delete; a 404 means that delete took effect, which is a
+            // legitimate outcome, not a lost committed object.
+            report.tolerated_ambiguous_deletes.push(key);
+            continue;
+        }
         evaluate_final_get(&mut report, key, expected.as_ref(), &unknown_writes, get);
+    }
+
+    // Committed deletes are otherwise never re-read: the final GET loop probes
+    // only live and ambiguous-write keys, so a deleted key that still serves a
+    // body on the GET path (but stays absent from LIST) would pass. Probe the
+    // deleted keys that carry no ambiguous write — a materialized ambiguous
+    // write on a deleted key is a legitimate outcome already handled above.
+    let deleted_probe_keys = model
+        .deleted
+        .iter()
+        .filter(|key| !model.unknown_writes.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut deleted_results = stream::iter(deleted_probe_keys.into_iter().map(|key| {
+        let s3 = s3.clone();
+        let recorder = recorder.clone();
+        async move {
+            let get = s3.get_object_result(&key, &recorder).await?;
+            Ok::<_, anyhow::Error>((key, get))
+        }
+    }))
+    .buffer_unordered(concurrency);
+    while let Some(result) = deleted_results.next().await {
+        let (key, get) = result?;
+        if let Some(message) = evaluate_deleted_reread(&key, &get) {
+            report.resurrected_deleted_objects.push(message);
+        }
     }
 
     let run_id = recorder.run_id();
@@ -351,6 +410,7 @@ pub async fn check_s3_history(
     report.version_hash_mismatches.sort();
     report.missing_committed_delete_markers.sort();
     report.resurrected_deleted_objects.sort();
+    report.tolerated_ambiguous_deletes.sort();
     report.passed = report.tenant_recovered
         && report.missing_committed_objects.is_empty()
         && report.unavailable_committed_objects.is_empty()
@@ -397,6 +457,8 @@ pub async fn recovery_stability_reread(
         hash_mismatches,
         data_corruption_evidence,
         ambiguous_write_evidence,
+        final_list_warning_count: immediate_report.final_list_warning_count,
+        list_warnings: immediate_report.list_warnings.clone(),
         harness_errors: Vec::new(),
         max_recovery_seconds: max_recovery.as_secs(),
         recovered_within_seconds: None,
@@ -492,6 +554,7 @@ pub async fn recovery_stability_reread(
     sort_dedup(&mut report.hash_mismatches);
     sort_dedup(&mut report.data_corruption_evidence);
     sort_dedup(&mut report.ambiguous_write_evidence);
+    sort_dedup(&mut report.list_warnings);
     sort_dedup(&mut report.harness_errors);
     finish_recovery_stability_report(&mut report, immediate_report);
     Ok(report)
@@ -533,6 +596,10 @@ struct ObjectModel {
     live: BTreeMap<String, ExpectedObject>,
     deleted: BTreeSet<String>,
     unknown_writes: BTreeMap<String, Vec<AmbiguousWriteAttempt>>,
+    // Keys still committed-present whose latest delete was ambiguous
+    // (timeout/unknown): the object may or may not have been removed, so a
+    // post-recovery 404 is a legitimate outcome rather than a lost object.
+    ambiguous_delete_pending: BTreeSet<String>,
     committed_writes: usize,
 }
 
@@ -899,6 +966,20 @@ fn evaluate_final_get(
     }
 }
 
+/// A committed delete (latest committed op for the key was a successful Delete)
+/// must not serve a body after recovery. A direct GET that returns one is a
+/// resurrection; the correct outcome is not-found, and an unavailable probe
+/// response (timeout/error) is not evidence of resurrection either.
+fn evaluate_deleted_reread(key: &str, get: &GetObjectResult) -> Option<String> {
+    match (get.outcome, get.body.as_deref()) {
+        (OperationOutcome::Ok, Some(body)) => Some(format!(
+            "{key}: committed delete resurrected on GET ({} bytes)",
+            body.len()
+        )),
+        _ => None,
+    }
+}
+
 fn evaluate_recovery_reread_get(
     report: &mut RecoveryStabilityReport,
     pending: &mut BTreeSet<String>,
@@ -985,17 +1066,20 @@ fn is_recovery_tail_read_failure(
     if !matches!(
         outcome,
         OperationOutcome::Timeout | OperationOutcome::Unknown
-    ) || http_status != Some(200)
-    {
+    ) {
         return false;
     }
     let Some(error) = error else {
         return false;
     };
     let error = error.to_ascii_lowercase();
-    error.contains("body read timed out")
-        || error.contains("body read timeout")
-        || error.contains("streaming error")
+    if http_status == Some(200) {
+        return error.contains("body read timed out")
+            || error.contains("body read timeout")
+            || error.contains("streaming error");
+    }
+    http_status.is_none()
+        && (error.contains("get object timed out") || error.contains("request timed out"))
 }
 
 fn committed_get_matches(expected: &ExpectedObject, get: &GetObjectResult) -> bool {
@@ -1303,6 +1387,8 @@ fn classify_without_reread(report: &CheckerReport) -> RecoveryStabilityClassific
         RecoveryStabilityClassification::AmbiguousWriteMaterialized
     } else if has_committed_unavailable_signal(report) {
         RecoveryStabilityClassification::CommittedObjectUnavailable
+    } else if has_list_unavailable_or_unknown_signal(report) {
+        RecoveryStabilityClassification::ListUnavailableOrUnknown
     } else {
         RecoveryStabilityClassification::HarnessError
     }
@@ -1313,7 +1399,7 @@ fn has_data_corruption_signal(report: &CheckerReport) -> bool {
         || !report.successful_corrupted_reads.is_empty()
         || !report.unexpected_visible_deleted_objects.is_empty()
         || !report.unknown_write_value_conflicts.is_empty()
-        || report.final_list_warning_count > 0
+        || final_list_content_corruption_signal(report)
         || !report.version_hash_mismatches.is_empty()
         || !report.missing_committed_versions.is_empty()
         || !report.missing_committed_delete_markers.is_empty()
@@ -1321,11 +1407,22 @@ fn has_data_corruption_signal(report: &CheckerReport) -> bool {
         || report.committed_writes_missing_version_id_count > 0
 }
 
+fn final_list_content_corruption_signal(report: &CheckerReport) -> bool {
+    report.list_warnings.iter().any(|warning| {
+        warning.contains("did not include expected live key")
+            || warning.contains("included deleted key")
+    })
+}
+
 fn has_committed_unavailable_signal(report: &CheckerReport) -> bool {
     !report.missing_committed_objects.is_empty()
         || !report.unavailable_committed_objects.is_empty()
         || !report.unknown_committed_read_failures.is_empty()
         || !report.unavailable_committed_versions.is_empty()
+}
+
+fn has_list_unavailable_or_unknown_signal(report: &CheckerReport) -> bool {
+    report.final_list_warning_count > 0 && !final_list_content_corruption_signal(report)
 }
 
 fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
@@ -1381,17 +1478,23 @@ fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
             report.committed_writes_missing_version_id.len()
         ));
     }
-    evidence.extend(
-        report
-            .list_warnings
-            .iter()
-            .map(|item| format!("final_list_warning: {item}")),
-    );
-    if report.final_list_warning_count > report.list_warnings.len() {
+    let corruption_list_warnings = report
+        .list_warnings
+        .iter()
+        .filter(|item| {
+            item.contains("did not include expected live key")
+                || item.contains("included deleted key")
+        })
+        .map(|item| format!("final_list_warning: {item}"))
+        .collect::<Vec<_>>();
+    let corruption_list_warning_count = corruption_list_warnings.len();
+    evidence.extend(corruption_list_warnings);
+    if final_list_content_corruption_signal(report)
+        && report.final_list_warning_count > corruption_list_warning_count
+    {
         evidence.push(format!(
-            "final_list_warning_count: {} total, {} sampled",
-            report.final_list_warning_count,
-            report.list_warnings.len()
+            "final_list_content_warning_count: {} total, {} sampled",
+            report.final_list_warning_count, corruption_list_warning_count
         ));
     }
     evidence.sort();
@@ -1468,6 +1571,10 @@ fn finish_recovery_stability_report(
         report.classification = RecoveryStabilityClassification::AmbiguousWriteMaterialized;
         return;
     }
+    if has_list_unavailable_or_unknown_signal(immediate_report) {
+        report.classification = RecoveryStabilityClassification::ListUnavailableOrUnknown;
+        return;
+    }
     if !report.reread_attempted_keys.is_empty()
         && immediate_failures_are_only_reread_candidates(immediate_report, report)
     {
@@ -1531,6 +1638,7 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
                 mark_superseded_ambiguous_writes(model, &key, record);
                 model.committed_writes += 1;
                 model.deleted.remove(&key);
+                model.ambiguous_delete_pending.remove(&key);
                 model.live.insert(key, object);
             }
         }
@@ -1559,8 +1667,24 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
         OperationKind::Delete if record.outcome == OperationOutcome::Ok => {
             if let Some(key) = record.key.clone() {
                 mark_superseded_ambiguous_writes(model, &key, record);
+                model.ambiguous_delete_pending.remove(&key);
                 model.live.remove(&key);
                 model.deleted.insert(key);
+            }
+        }
+        OperationKind::Delete
+            if matches!(
+                record.outcome,
+                OperationOutcome::Timeout | OperationOutcome::Unknown
+            ) =>
+        {
+            // An ambiguous delete of a committed object may or may not have
+            // taken effect; mark it so a post-recovery 404 is tolerated instead
+            // of being reported as a lost committed object.
+            if let Some(key) = record.key.clone()
+                && model.live.contains_key(&key)
+            {
+                model.ambiguous_delete_pending.insert(key);
             }
         }
         _ => {}
@@ -1905,6 +2029,80 @@ mod tests {
         assert!(!model.live.contains_key("k2"));
         assert_eq!(model.live.get("k3").expect("k3").sha256, "mp");
         assert!(model.deleted.contains("k2"));
+    }
+
+    #[test]
+    fn ambiguous_delete_marks_committed_key_pending() {
+        let model = object_model(&[
+            record("op-1", OperationKind::Put, "k", "v1", OperationOutcome::Ok),
+            record(
+                "op-2",
+                OperationKind::Delete,
+                "k",
+                "",
+                OperationOutcome::Timeout,
+            ),
+        ]);
+
+        // The object is still committed-present, but the ambiguous delete makes
+        // a post-recovery 404 a legitimate outcome.
+        assert!(model.live.contains_key("k"));
+        assert!(model.ambiguous_delete_pending.contains("k"));
+    }
+
+    #[test]
+    fn recommit_clears_ambiguous_delete_pending() {
+        let model = object_model(&[
+            record("op-1", OperationKind::Put, "k", "v1", OperationOutcome::Ok),
+            record(
+                "op-2",
+                OperationKind::Delete,
+                "k",
+                "",
+                OperationOutcome::Unknown,
+            ),
+            record("op-3", OperationKind::Put, "k", "v2", OperationOutcome::Ok),
+        ]);
+
+        // A fresh committed write supersedes the ambiguous delete: the key is
+        // definitively present again, so a 404 would be a real failure.
+        assert!(model.live.contains_key("k"));
+        assert!(!model.ambiguous_delete_pending.contains("k"));
+    }
+
+    #[test]
+    fn committed_delete_clears_ambiguous_delete_pending() {
+        let model = object_model(&[
+            record("op-1", OperationKind::Put, "k", "v1", OperationOutcome::Ok),
+            record(
+                "op-2",
+                OperationKind::Delete,
+                "k",
+                "",
+                OperationOutcome::Timeout,
+            ),
+            record("op-3", OperationKind::Delete, "k", "", OperationOutcome::Ok),
+        ]);
+
+        // The delete became definitive; the key is deleted (handled by the
+        // resurrection probe) and no longer pending-ambiguous.
+        assert!(model.deleted.contains("k"));
+        assert!(!model.live.contains_key("k"));
+        assert!(!model.ambiguous_delete_pending.contains("k"));
+    }
+
+    #[test]
+    fn ambiguous_delete_of_uncommitted_key_is_not_pending() {
+        // A delete with no prior committed write leaves nothing to lose.
+        let model = object_model(&[record(
+            "op-1",
+            OperationKind::Delete,
+            "k",
+            "",
+            OperationOutcome::Timeout,
+        )]);
+
+        assert!(model.ambiguous_delete_pending.is_empty());
     }
 
     #[test]
@@ -2262,7 +2460,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_tail_candidates_require_status_200_body_timeout_or_streaming_error() {
+    fn recovery_tail_candidates_include_body_tail_and_request_timeouts() {
         let put = record("op-1", OperationKind::Put, "k", "sha", OperationOutcome::Ok);
         let model = object_model(&[put]);
         let eligible_timeout = OperationRecord {
@@ -2322,6 +2520,11 @@ mod tests {
             eligible_timeout.outcome,
             eligible_timeout.http_status,
             eligible_timeout.error.as_deref()
+        ));
+        assert!(is_recovery_tail_read_failure(
+            request_timeout.outcome,
+            request_timeout.http_status,
+            request_timeout.error.as_deref()
         ));
         let keys = recovery_tail_candidate_keys(
             &[
@@ -2437,20 +2640,17 @@ mod tests {
     }
 
     #[test]
-    fn recovery_stability_classifies_list_and_visibility_anomalies_as_data_corruption() {
+    fn recovery_stability_keeps_list_timeout_distinct_from_data_corruption() {
         let mut final_list_warning = empty_report();
         final_list_warning.final_list_warning_count = 1;
         final_list_warning
             .list_warnings
-            .push("LIST prefix did not include expected live key k".to_string());
+            .push("LIST prefix fault-test/ did not complete".to_string());
         assert_eq!(
             super::classify_without_reread(&final_list_warning),
-            RecoveryStabilityClassification::DataCorruption
+            RecoveryStabilityClassification::ListUnavailableOrUnknown
         );
-        assert_eq!(
-            super::immediate_data_corruption_evidence(&final_list_warning),
-            vec!["final_list_warning: LIST prefix did not include expected live key k"]
-        );
+        assert!(super::immediate_data_corruption_evidence(&final_list_warning).is_empty());
 
         let mut history_list_warning = empty_report();
         history_list_warning.list_history_warning_count = 1;
@@ -2460,6 +2660,20 @@ mod tests {
         assert_eq!(
             super::classify_without_reread(&history_list_warning),
             RecoveryStabilityClassification::HarnessError
+        );
+
+        let mut final_list_content_warning = empty_report();
+        final_list_content_warning.final_list_warning_count = 1;
+        final_list_content_warning
+            .list_warnings
+            .push("LIST prefix did not include expected live key k".to_string());
+        assert_eq!(
+            super::classify_without_reread(&final_list_content_warning),
+            RecoveryStabilityClassification::DataCorruption
+        );
+        assert_eq!(
+            super::immediate_data_corruption_evidence(&final_list_content_warning),
+            vec!["final_list_warning: LIST prefix did not include expected live key k"]
         );
 
         let mut visible_deleted = empty_report();
@@ -2491,6 +2705,8 @@ mod tests {
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
             ambiguous_write_evidence: Vec::new(),
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
             harness_errors: Vec::new(),
             max_recovery_seconds: 60,
             recovered_within_seconds: None,
@@ -2941,6 +3157,7 @@ mod tests {
             version_hash_mismatches: Vec::new(),
             missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
+            tolerated_ambiguous_deletes: Vec::new(),
             tenant_recovered: true,
             passed: true,
         };
@@ -2979,6 +3196,7 @@ mod tests {
             version_hash_mismatches: Vec::new(),
             missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
+            tolerated_ambiguous_deletes: Vec::new(),
             tenant_recovered: true,
             passed: false,
         }
@@ -2993,10 +3211,57 @@ mod tests {
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
             ambiguous_write_evidence: Vec::new(),
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
             harness_errors: Vec::new(),
             max_recovery_seconds: 60,
             recovered_within_seconds: None,
             classification: RecoveryStabilityClassification::CommittedObjectUnavailable,
         }
+    }
+
+    #[test]
+    fn committed_delete_reread_flags_body_as_resurrection() {
+        let message = super::evaluate_deleted_reread(
+            "gone",
+            &GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"back".to_vec()),
+            },
+        );
+
+        assert_eq!(
+            message.as_deref(),
+            Some("gone: committed delete resurrected on GET (4 bytes)")
+        );
+    }
+
+    #[test]
+    fn committed_delete_reread_accepts_not_found_and_unavailable() {
+        let not_found = super::evaluate_deleted_reread(
+            "gone",
+            &GetObjectResult {
+                outcome: OperationOutcome::NotFound,
+                http_status: Some(404),
+                error: None,
+                body: None,
+            },
+        );
+        assert!(not_found.is_none());
+
+        // An unavailable probe response (timeout/error) is not proof of
+        // resurrection; only a returned body is.
+        let unavailable = super::evaluate_deleted_reread(
+            "gone",
+            &GetObjectResult {
+                outcome: OperationOutcome::Timeout,
+                http_status: None,
+                error: Some("read timed out".to_string()),
+                body: None,
+            },
+        );
+        assert!(unavailable.is_none());
     }
 }

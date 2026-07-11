@@ -55,6 +55,8 @@ make fault-suite-template
 make fault-suite-validate SUITE=suite.yaml
 make fault-suite-plan SUITE=suite.yaml
 make fault-suite-run SUITE=suite.yaml
+make fault-console-json CONSOLE_ROOT=target/fault-tests/<timestamp>
+make fault-console-serve CONSOLE_ROOT=target/fault-tests/<timestamp>
 make fault-dashboard-install
 make fault-dashboard-port-forward
 make fault-cleanup
@@ -67,6 +69,11 @@ make fault-cleanup
 build. After a successful run, the shell runner delegates artifact contract
 validation to `s3chaos fault-validate-artifacts`; Bash does not duplicate the
 JSON artifact schema.
+
+`fault-console-json` and `fault-console-serve` are read-only artifact views. They
+do not start, stop, or clean up destructive tests. Use them against an existing
+run root, scenario artifact root, or suite artifact root to inspect progress,
+configuration, health-guard decisions, failure reasons, and artifact links.
 
 ## Required Environment
 
@@ -118,10 +125,16 @@ resource cleanup remain under `src/framework/`.
 | `RUSTFS_FAULT_TEST_TIMEOUT_SECONDS` | `300` | Kubernetes wait timeout. |
 | `RUSTFS_FAULT_TEST_SEED` | generated | Reuse a workload plan. |
 | `RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT` | `4` | Expected RustFS server Pod count for stability gates. |
+| `RUSTFS_FAULT_TEST_MIN_NODES` | `4` | Minimum schedulable Ready nodes required by preflight. Lower to `1` for a single-node cluster. |
+| `RUSTFS_FAULT_TEST_TENANT_STORAGE_REQUEST` | `100Gi` | Per-volume storage request for the fault Tenant. Lower it (e.g. `2Gi`) for small lab disks. |
+| `RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS` | `true` | Require Tenant server Pods on distinct hosts. Set `false` so a single-node cluster can schedule all server Pods. |
+| `RUSTFS_FAULT_TEST_TENANT_UNSAFE_BYPASS_DISK_CHECK` | `false` | Bypass RustFS's block-device disk check. Set `true` for hostpath/loopback lab storage that is not a dedicated block device. |
 | `RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH` | `/data/rustfs0` | RustFS data volume path targeted by volume faults; must be an absolute safe path using ASCII letters, digits, `/`, `.`, `_`, or `-`. |
 | `RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS` | `60` | Required no-restart Ready window before and after fault injection. |
+| `RUSTFS_FAULT_TEST_HEALTH_GUARD_FAILURE_THRESHOLD` | `1` | Consecutive unsafe health samples required before the shell runner aborts for non-immediate guard failures. Node `DiskPressure` and Ready-node loss abort immediately. |
 | `RUSTFS_FAULT_TEST_REQUIRE_CLIENT_DISRUPTION` | `false` | Force at least one client-visible failed/timeout/unknown S3 operation even when the catalog marks disruption optional. |
 | `RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING` | `false` | Enable bucket versioning for the run bucket. Every committed write and delete must return a version id, every committed version is re-read by `versionId` and sha256-verified after recovery, and deleted keys must keep a delete marker as their latest version (resurrection check). Roughly doubles checker read volume. |
+| `RUSTFS_FAULT_TEST_SERVER_ENV` | empty | Comma-separated `KEY=value` RustFS server environment variables rendered into the test Tenant. Use only for non-secret feature gates or diagnostics. |
 | `RUSTFS_FAULT_TEST_BUILD_JOBS` | `1` | Cargo prebuild job count. |
 | `RUSTFS_FAULT_TEST_RUN_ROOT` | timestamped target dir | Artifact root. |
 | `RUSTFS_FAULT_TEST_CHAOS_MESH_VERSION` | `2.8.3` | Chaos Mesh Helm chart version for optional Dashboard installation. |
@@ -162,13 +175,33 @@ kubectl get storageclass
 Requirements:
 
 - The current context must be a real Kubernetes or K3s cluster, not `kind-*`.
-- At least four schedulable Ready nodes are required for the current default
-  Tenant shape.
+- At least four schedulable Ready nodes are required for the default Tenant
+  shape. A single-node cluster is supported by relaxing the topology (see
+  below); it is not validated for node-level or `dm-flakey` faults.
 - Non-static scenarios need a dedicated dynamic StorageClass.
 - `dm-flakey` needs a dedicated static Local PV StorageClass and explicit
   device-mapper variables.
 - Other Tenants in the cluster are health guardrails. They must remain Ready,
   but the runner does not modify them.
+
+### Single-node clusters
+
+A single-node cluster (for example K3s or minikube for local iteration on
+Chaos Mesh Pod/Network/Stress scenarios) is supported through configuration —
+no source edits. Relax the node requirement and the Tenant topology:
+
+```bash
+export RUSTFS_FAULT_TEST_MIN_NODES=1
+export RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS=false
+export RUSTFS_FAULT_TEST_TENANT_UNSAFE_BYPASS_DISK_CHECK=true   # hostpath/loopback storage
+export RUSTFS_FAULT_TEST_TENANT_STORAGE_REQUEST=2Gi            # small lab disks
+```
+
+The defaults keep the production four-node, spread, disk-checked shape, so
+multi-node runs are unaffected. Chaos Mesh IOChaos-backed scenarios (`io-eio`,
+`io-latency`, `io-read-mistake`, `disk-full`) need a real kernel per node and do
+not work on nested-container Kubernetes such as minikube-in-a-VM; use
+Pod/Network/Stress scenarios there.
 
 For K3s with local-path storage, verify the actual backing filesystem has
 enough free space. PVC capacity alone may not enforce real disk quota.
@@ -477,7 +510,7 @@ A successful run must show:
   successful run includes `run started`, `checker-final succeeded`, and `run
   succeeded` events.
 - `fault-evidence.json`: `injected`, `active_during_workload`, and `recovered`
-  are `true`.
+  are `true`; `require_client_disruption` matches the resolved run metadata.
 - `checker-pre-recommit-report.json` and `checker-report.json`: `passed` is
   `true`; expected live objects are GET+sha256 verified; missing objects, hash
   mismatches, unavailable committed-object reads, unknown committed-object read
@@ -499,11 +532,12 @@ If a scenario fails, inspect `failure-summary.json`,
 RustFS Pod logs first.
 When `checker-pre-recommit` fails or errors, the runner writes
 `recovery-stability-report.json` as a failure-only diagnostic artifact. It keeps
-the immediate checker failure intact; for committed-object GETs that returned
-HTTP 200 but timed out or hit a body streaming error, it also runs a bounded
-reread. The artifact classifies the failure as `recovery_tail_read_latency`,
-`committed_object_unavailable`, `ambiguous_write_materialized`,
-`data_corruption`, or `harness_error`;
+the immediate checker failure intact; for committed-object GETs that timed out
+before response headers, or returned HTTP 200 but timed out or hit a body
+streaming error while reading the body, it also runs a bounded reread. The
+artifact classifies the failure as `recovery_tail_read_latency`,
+`committed_object_unavailable`, `list_unavailable_or_unknown`,
+`ambiguous_write_materialized`, `data_corruption`, or `harness_error`;
 `failure-summary.json` uses the same classification and also records
 `verdict`, `severity`, `data_correctness`, `availability`,
 `evidence_classifications`, `data_loss`, `corruption`, and recovery-window
@@ -515,8 +549,10 @@ checker that later rereads every key successfully is reported as
 `verdict=failed`, `severity=degraded`,
 `classification=recovery_tail_read_latency`,
 `data_correctness=passed`, `availability=recovered_after_tail_latency`,
-`data_loss=false`, and `corruption=false`. The suite runner copies failure
-`severity`, `classification`, and `evidence_classifications` into
+`data_loss=false`, and `corruption=false`. Final LIST timeout/unknown warnings
+are reported as `list_unavailable_or_unknown` unless the LIST response itself
+proves missing live keys or visible deleted keys. The suite runner copies
+failure `severity`, `classification`, and `evidence_classifications` into
 `suite-summary.json` attempt entries and the matching `failures[]` entry. When
 `stopOnFirstFailure` is true, `continueOnSeverities` decides whether that
 failure is allowed to continue to the next attempt.
@@ -531,6 +567,54 @@ When IOChaos deletion times out, the runner also captures
 evidence proves the IO fault was already recovered but the IOChaos finalizer is
 stuck, s3chaos may patch only that run-id-owned managed IOChaos finalizer and
 record the action as a warning artifact.
+
+## Console
+
+The console is intentionally local and read-only. It is a fast way to inspect
+artifact state while the CLI and shell runner remain the only execution path.
+
+Render the same view model as JSON:
+
+```bash
+make fault-console-json CONSOLE_ROOT=target/fault-tests/<timestamp>
+```
+
+Start the browser console on a local loopback address:
+
+```bash
+make fault-console-serve CONSOLE_ROOT=target/fault-tests/<timestamp>
+```
+
+The server prints the actual URL. The default address uses port `0`, so the OS
+chooses a free loopback port. Set `CONSOLE_ADDR=127.0.0.1:19091` when a stable
+port is useful. Binding to a non-loopback address is refused unless explicitly
+confirmed:
+
+```bash
+make fault-console-serve \
+  CONSOLE_ROOT=target/fault-tests/<timestamp> \
+  CONSOLE_ADDR=0.0.0.0:19091 \
+  CONSOLE_ALLOW_NON_LOOPBACK=--allow-non-loopback
+```
+
+The console view is built from stable artifact contracts instead of log
+scraping: `suite-plan.json`, `suite-summary.json`, `run-events.jsonl`,
+`failure-summary.json`, `runner-failure-summary.json`, `health-watch.jsonl` when
+present, and legacy `health-watch.log` as a fallback. Missing files are surfaced
+as warnings because in-progress runs may not have emitted every artifact yet.
+Health guard artifacts include the unsafe reason, subchecks, consecutive failure
+count, abort threshold, and whether that sample triggered cleanup. Node
+`DiskPressure` is reported as an environment guard failure, not a RustFS
+checker failure.
+When a `CONSOLE_ROOT` contains exactly one nested suite run root, the snapshot
+uses that inner root so links and progress counters line up with suite
+artifacts.
+The HTTP server is constrained to the startup `CONSOLE_ROOT`; an empty browser
+root uses that default, an absolute override must stay inside it, and a relative
+override is resolved below it. Artifact reads also use relative paths only, so
+links cannot traverse into unrelated host files. Very large JSON artifacts are
+reported as warnings instead of being loaded wholesale; event and health streams
+are tailed for live progress views.
 
 ## Cleanup
 
