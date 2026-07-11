@@ -480,6 +480,8 @@ Key files:
 ```text
 run-spec.yaml
 run-spec.json
+preflight-summary.json
+target-proof.json
 run-events.jsonl
 run-metadata.json
 workload-plan.json
@@ -489,6 +491,7 @@ recommit-report.json
 checker-pre-recommit-report.json
 checker-report.json
 fault-evidence.json
+artifact-validation-report.json
 chaos-manifest.yaml
 fault-status-*.json
 nodes-*.txt
@@ -506,6 +509,13 @@ A successful run must show:
   assumptions, and required artifacts. This is the stable handoff surface for
   suite planning, audit, and UI rendering. The shell runner validates that the
   JSON and YAML artifacts decode to the same contract.
+- `preflight-summary.json`: the structured preflight outcome. A successful run
+  records `status: passed` and includes a passed `target-proof` phase, alongside
+  the resolved context, namespace, Tenant, storage class, and scenario set.
+- `target-proof.json`: the target evidence for every planned fault. A successful
+  run records `status: satisfied`; selector-based targets include the current
+  RustFS Pods and node placement, and volume targets include PVC/PV/node/
+  device-or-path bindings.
 - `run-events.jsonl`: an ordered lifecycle event stream for visualization. A
   successful run includes `run started`, `checker-final succeeded`, and `run
   succeeded` events.
@@ -526,10 +536,15 @@ A successful run must show:
   and GET verified after recovery.
 - `workload-plan.json`: object count, concurrency, operation mix, and payload
   distribution are internally consistent with the selected environment values.
+- `artifact-validation-report.json`: written by the Rust artifact validator after
+  validation. Successful suite attempts and explicit `fault-validate-artifacts`
+  runs record `status: passed`; failed validation writes the same file with
+  `status: failed` and the validation errors.
 
 If a scenario fails, inspect `failure-summary.json`,
-`runner-failure-summary.json`, `test.log`, `fault-status-*.json`, and the
-RustFS Pod logs first.
+`preflight-summary.json`, `target-proof.json`, `artifact-validation-report.json`,
+`runner-failure-summary.json`, `test.log`, `fault-status-*.json`, and the RustFS
+Pod logs first.
 When `checker-pre-recommit` fails or errors, the runner writes
 `recovery-stability-report.json` as a failure-only diagnostic artifact. It keeps
 the immediate checker failure intact; for committed-object GETs that timed out
