@@ -29,7 +29,7 @@ use crate::{
         },
         fixture,
         history::{DurabilityCohort, OperationOutcome, OperationRecord, Recorder},
-        plan::{FaultInjection, FaultPlan, FaultPlanOptions},
+        plan::{FaultInjection, FaultPlan, FaultPlanOptions, WRITE_QUORUM_LOSS_PARTITION_TARGETS},
         pods::{
             rustfs_pod_identities, rustfs_target_inventory, wait_for_rustfs_pod_deletion,
             wait_for_rustfs_pod_replacement,
@@ -39,7 +39,10 @@ use crate::{
             FailureSummary, FaultEvidence, FaultStatusSnapshot, PodIdentity, RunMetadata,
             write_checker_error, write_failure_summary, write_failure_summary_if_absent,
         },
-        scenarios::{self, FaultBackend, FaultIsolation, FaultScenario, FaultScenarioSpec},
+        scenarios::{
+            self, FaultBackend, FaultIsolation, FaultScenario, FaultScenarioSpec,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+        },
         spec::FaultRunSpec,
         workload::{
             ObjectSpec, S3WorkloadClient, WorkloadOperation, WorkloadPlan, sha256_hex,
@@ -1743,6 +1746,66 @@ fn require_fault_backends(config: &FaultTestConfig, plan: &FaultPlan) -> Result<
     for backend in plan.required_backends() {
         require_fault_backend(config, backend)?;
     }
+    if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+        require_write_quorum_loss_topology(config)?;
+    }
+    Ok(())
+}
+
+/// Topology-conservation proof for the write-quorum-loss partition.
+///
+/// The scenario's FixedTargets(2) only means "write quorum breaks, read quorum
+/// survives" on the reference tenant shape: 4 servers x 2 volumes = 8 drives,
+/// which RustFS lays out as a single erasure set with EC 4+4 (write quorum
+/// data+1 = 5, read quorum data = 4). Isolating 2 of 4 servers then provably
+/// removes exactly half the drives of that one set — every pod is in the same
+/// set, so no same-erasure-set resolution is needed. On any other shape the
+/// same count could be a no-op (more servers) or a full outage (fewer), so we
+/// fail closed instead of running a scenario whose oracle no longer matches
+/// its name. Replacing this with a real erasure-set proof (admin cluster
+/// snapshot) generalizes it later.
+fn require_write_quorum_loss_topology(config: &FaultTestConfig) -> Result<()> {
+    const EXPECTED_SERVERS: usize = 4;
+    const EXPECTED_VOLUMES_PER_SERVER: u64 = 2;
+
+    ensure!(
+        config.expected_rustfs_pod_count == EXPECTED_SERVERS,
+        "network-partition-write-quorum-loss requires the reference 4-server tenant \
+         (RUSTFS_POD_COUNT={}); partitioning {} of {} servers does not provably break \
+         write quorum on other shapes",
+        EXPECTED_SERVERS,
+        WRITE_QUORUM_LOSS_PARTITION_TARGETS,
+        config.expected_rustfs_pod_count,
+    );
+
+    let cluster = &config.cluster;
+    let output = Kubectl::new(cluster)
+        .namespaced(&cluster.test_namespace)
+        .command([
+            "get",
+            "tenant",
+            cluster.tenant_name.as_str(),
+            "-o",
+            "jsonpath={.spec.pools[*].volumesPerServer}",
+        ])
+        .run_checked()
+        .context("reading tenant volumesPerServer for the write-quorum-loss topology proof")?;
+    let raw = output.stdout.trim().to_string();
+    let volumes: Vec<u64> = raw
+        .split_whitespace()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .with_context(|| format!("tenant volumesPerServer must be numeric, got {value:?}"))
+        })
+        .collect::<Result<_>>()?;
+    ensure!(
+        volumes == vec![EXPECTED_VOLUMES_PER_SERVER],
+        "network-partition-write-quorum-loss requires the reference single-pool tenant with \
+         volumesPerServer={EXPECTED_VOLUMES_PER_SERVER} (8 drives, single erasure set, EC 4+4); \
+         found volumesPerServer={raw:?} — on that shape a 2-of-4 partition does not provably \
+         break write quorum, so the run is rejected instead of producing a misleading verdict",
+    );
     Ok(())
 }
 

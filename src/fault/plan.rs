@@ -23,13 +23,21 @@ use crate::fault::{
         DISK_FULL_SCENARIO, DM_FLAKEY_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
         FaultScenarioSpec, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO,
         NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO,
-        NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO, POD_FAILURE_SCENARIO,
-        POD_KILL_ONE_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
-        WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
+        NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
+        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO,
+        STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
 };
 
 pub const DEFAULT_RUSTFS_DATA_VOLUME: &str = DEFAULT_RUSTFS_VOLUME_PATH;
+
+/// Pod count the write-quorum-loss partition isolates. Meaningful only on the
+/// reference tenant topology (4 servers x 2 volumes = 8 drives, EC 4+4):
+/// isolating 2 of 4 servers removes 4 of 8 drives, so write quorum
+/// (data + 1 = 5) is unreachable while read quorum (data = 4) can still be
+/// served by the surviving half. The runner preflight rejects other
+/// topologies instead of letting the count silently lose that meaning.
+pub const WRITE_QUORUM_LOSS_PARTITION_TARGETS: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultWorkloadMode {
@@ -637,9 +645,21 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
             FaultSelection::Percent(percent) => (1..=100).contains(&percent),
             FaultSelection::FixedTargets(_) => false,
         },
+        // NetworkPartition is the only kind whose Chaos Mesh render honors a
+        // multi-target count today (`mode: fixed` + `value`); quorum-loss
+        // scenarios rely on it. The cap is a sanity bound, and the topology
+        // preconditions (which counts actually break quorum) are enforced by
+        // the scenario's runner preflight, not here.
+        FaultKind::RustfsServerNetworkPartition => match selection {
+            FaultSelection::FixedTargets(count) => (1..=8).contains(&count),
+            FaultSelection::Percent(_) => false,
+        },
+        // Every other kind is rendered single-target (`mode: one`) and never
+        // reads the count. Accepting FixedTargets(n > 1) here would let a plan
+        // declare an n-pod blast radius that the backend silently narrows to
+        // one — a weaker fault than requested, i.e. a false sense of coverage.
         FaultKind::RustfsServerPodKill
         | FaultKind::RustfsServerPodFailure
-        | FaultKind::RustfsServerNetworkPartition
         | FaultKind::RustfsServerNetworkDelay
         | FaultKind::RustfsServerNetworkLoss
         | FaultKind::RustfsServerNetworkCorrupt
@@ -647,7 +667,7 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         | FaultKind::RustfsServerCpuStress
         | FaultKind::RustfsServerMemoryStress
         | FaultKind::RustfsBlockDeviceFlakey => match selection {
-            FaultSelection::FixedTargets(count) => count > 0,
+            FaultSelection::FixedTargets(count) => count == 1,
             FaultSelection::Percent(_) => false,
         },
     }
@@ -780,6 +800,19 @@ impl FaultPlan {
                 spec.backend,
                 FaultTarget::RustfsServerPeerNetwork,
                 FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsServerNetworkPartition,
+                spec.backend,
+                FaultTarget::RustfsServerPeerNetwork,
+                // Two of the reference topology's four servers: isolating them
+                // removes half the drives, which breaks write quorum (EC 4+4
+                // needs data+1 = 5 writable shards) while read quorum (4) can
+                // still be met by the surviving half. The runner preflight
+                // rejects topologies where this count does not carry that
+                // meaning.
+                FaultSelection::FixedTargets(WRITE_QUORUM_LOSS_PARTITION_TARGETS),
                 scenario.duration,
             )?,
             NETWORK_DELAY_SCENARIO => network_fault(
@@ -1102,6 +1135,59 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn multi_target_selection_is_partition_only() {
+        // NetworkPartition is the only kind whose backend render honors a
+        // multi-target count; it accepts 1..=8 and rejects zero/over-cap.
+        for (count, ok) in [(1u32, true), (2, true), (8, true), (0, false), (9, false)] {
+            let result = FaultInjection::new(
+                FaultKind::RustfsServerNetworkPartition,
+                FaultBackend::ChaosMeshNetworkChaos,
+                FaultTarget::RustfsServerPeerNetwork,
+                FaultSelection::FixedTargets(count),
+                Duration::from_secs(60),
+            );
+            assert_eq!(
+                result.is_ok(),
+                ok,
+                "partition FixedTargets({count}) acceptance mismatch"
+            );
+        }
+
+        // Every other pod/network kind still renders `mode: one` and ignores
+        // the count, so a multi-target selection must be rejected instead of
+        // silently narrowing the declared blast radius to a single Pod.
+        let multi_pod_kill = FaultInjection::new(
+            FaultKind::RustfsServerPodKill,
+            FaultBackend::ChaosMeshPodChaos,
+            FaultTarget::RustfsServerPod,
+            FaultSelection::FixedTargets(2),
+            Duration::from_secs(60),
+        );
+        assert!(
+            multi_pod_kill.is_err(),
+            "multi-target pod kill must stay rejected until its render honors the count"
+        );
+    }
+
+    #[test]
+    fn write_quorum_loss_scenario_plans_multi_target_partition() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = super::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO.to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario should resolve");
+        let spec = scenario_spec(&scenario.name).expect("catalog spec");
+        let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan should build");
+
+        let faults = plan.faults();
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].kind(), FaultKind::RustfsServerNetworkPartition);
+        assert_eq!(
+            faults[0].selection(),
+            FaultSelection::FixedTargets(super::WRITE_QUORUM_LOSS_PARTITION_TARGETS),
+            "the quorum-loss plan must declare the two-server blast radius"
+        );
     }
 
     #[test]

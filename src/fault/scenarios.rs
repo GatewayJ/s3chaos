@@ -21,6 +21,8 @@ use crate::fault::config::FaultTestConfig;
 pub const IO_EIO_SCENARIO: &str = "io-eio";
 pub const POD_KILL_ONE_SCENARIO: &str = "pod-kill-one";
 pub const NETWORK_PARTITION_ONE_SCENARIO: &str = "network-partition-one";
+pub const NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO: &str =
+    "network-partition-write-quorum-loss";
 pub const NETWORK_DELAY_SCENARIO: &str = "network-delay";
 pub const NETWORK_LOSS_SCENARIO: &str = "network-loss";
 pub const NETWORK_CORRUPT_SCENARIO: &str = "network-corrupt";
@@ -235,6 +237,26 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target: "one RustFS Pod selected by tenant label with peer traffic disrupted inside the e2e namespace",
         validation: "network disruption is active during workload, successful reads never return wrong hashes, committed PUTs remain readable after heal, and Tenant recovers Ready",
         observability: "history.jsonl, workload-summary.json, checker-report.json, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
+        conflict_domain: "run-scoped NetworkChaos resource; must not overlap with PodChaos or IOChaos in the same Tenant",
+    },
+    FaultScenarioSpec {
+        scenario: NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+        case_name: "fault_network_partition_write_quorum_loss_preserves_committed_state",
+        description: "Partition two of the four RustFS Pods from all peers at once (half the drives on the reference 8-drive EC 4+4 topology), driving the cluster below write quorum while read quorum can survive, and verify committed state is fully intact after the partition heals.",
+        priority: FaultPriority::P1,
+        backend: FaultBackend::ChaosMeshNetworkChaos,
+        status: FaultScenarioStatus::Executable,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[NETWORKCHAOS_CRD],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        boundary: "rustfs-workload/network-partition-write-quorum",
+        ci_phase: "faults",
+        target: "exactly two RustFS Pods selected by tenant label, fully isolated from the remaining peers (and each other); on the reference 4-server x 2-volume tenant this removes 4 of 8 drives, so write quorum (data+1 = 5) is unreachable during the fault",
+        validation: "the runner preflight proves the tenant matches the reference single-erasure-set topology (4 servers, 8 drives) so the two-Pod partition provably breaks write quorum; writes during the outage fail cleanly instead of half-committing; successful reads never return wrong hashes; after the partition heals every committed object and version is re-readable with intact content (post-return zero-loss), and Tenant recovers Ready",
+        observability: "history.jsonl, workload-summary.json, checker-report.json, checker-pre-recommit-report.json, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
         conflict_domain: "run-scoped NetworkChaos resource; must not overlap with PodChaos or IOChaos in the same Tenant",
     },
     FaultScenarioSpec {
@@ -642,7 +664,7 @@ mod tests {
             );
         }
 
-        assert_eq!(scenario_catalog().len(), 15);
+        assert_eq!(scenario_catalog().len(), 16);
     }
 
     #[test]
