@@ -29,7 +29,9 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tokio::time::timeout;
 
-use crate::fault::history::{OperationKind, OperationOutcome, OperationRecord, Recorder};
+use crate::fault::history::{
+    ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef, Recorder,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSpec {
@@ -672,13 +674,20 @@ impl S3WorkloadClient {
         recorder: &Recorder,
     ) -> Result<OperationRecord> {
         let spec = &object.spec;
-        let record = recorder.begin(
+        let mut record = recorder.begin(
             OperationKind::Put,
             self.bucket.clone(),
             Some(spec.key.clone()),
             Some(spec.sha256.clone()),
             Some(spec.size_bytes),
         );
+        // The body is fully determined by (seed, index, size); recording the
+        // generator inputs lets the checker regenerate the exact bytes when
+        // verifying ranged GET slices against this committed value.
+        record.payload_ref = Some(PayloadRef {
+            seed: spec.seed,
+            index: spec.index,
+        });
         let result = timeout(
             self.request_timeout,
             self.client
@@ -783,6 +792,139 @@ impl S3WorkloadClient {
     ) -> Result<GetObjectResult> {
         self.get_object_result_inner(key, Some(version_id), recorder)
             .await
+    }
+
+    /// Ranged GET: requests `bytes=offset..offset+length-1` and records the
+    /// returned slice (the record's `value_sha256`/`size_bytes` describe the
+    /// slice, with `range` set so the checker verifies it against the
+    /// regenerated slice of a committed value instead of the whole-object
+    /// hash). A 200 full-body reply to a range request is recorded as Failed:
+    /// silently ignoring the Range header would otherwise let every range
+    /// read degenerate into a whole-object read and hide broken range
+    /// handling.
+    pub async fn get_object_range_result(
+        &self,
+        key: &str,
+        range: ByteRange,
+        recorder: &Recorder,
+    ) -> Result<GetObjectResult> {
+        let mut record = recorder.begin(
+            OperationKind::Get,
+            self.bucket.clone(),
+            Some(key.to_string()),
+            None,
+            None,
+        );
+        record.range = Some(range);
+        let end = range.offset + range.length - 1;
+        let response = timeout(
+            self.request_timeout,
+            self.client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .range(format!("bytes={}-{}", range.offset, end))
+                .send(),
+        )
+        .await;
+
+        let output = match response {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                let outcome = classify_sdk_error(&error);
+                recorder.finish(
+                    record,
+                    outcome,
+                    sdk_error_status(&error),
+                    Some(format!("ranged get failed: {error}")),
+                )?;
+                return Ok(GetObjectResult {
+                    outcome,
+                    http_status: sdk_error_status(&error),
+                    error: Some(format!("ranged get failed: {error}")),
+                    body: None,
+                });
+            }
+            Err(_) => {
+                recorder.finish(
+                    record,
+                    OperationOutcome::Timeout,
+                    None,
+                    Some("ranged get timed out".to_string()),
+                )?;
+                return Ok(GetObjectResult {
+                    outcome: OperationOutcome::Timeout,
+                    http_status: None,
+                    error: Some("ranged get timed out".to_string()),
+                    body: None,
+                });
+            }
+        };
+
+        let body = timeout(self.request_timeout, output.body.collect()).await;
+        match body {
+            Ok(Ok(bytes)) => {
+                let body = bytes.into_bytes().to_vec();
+                record.value_sha256 = Some(sha256_hex(&body));
+                record.size_bytes = Some(body.len());
+                if body.len() as u64 != range.length {
+                    let error = format!(
+                        "ranged get returned {} bytes for a {}-byte range request",
+                        body.len(),
+                        range.length
+                    );
+                    recorder.finish(
+                        record,
+                        OperationOutcome::Failed,
+                        Some(206),
+                        Some(error.clone()),
+                    )?;
+                    return Ok(GetObjectResult {
+                        outcome: OperationOutcome::Failed,
+                        http_status: Some(206),
+                        error: Some(error),
+                        body: Some(body),
+                    });
+                }
+                recorder.finish(record, OperationOutcome::Ok, Some(206), None)?;
+                Ok(GetObjectResult {
+                    outcome: OperationOutcome::Ok,
+                    http_status: Some(206),
+                    error: None,
+                    body: Some(body),
+                })
+            }
+            Ok(Err(error)) => {
+                let error = format!("ranged get body read failed: {error}");
+                recorder.finish(
+                    record,
+                    OperationOutcome::Unknown,
+                    Some(206),
+                    Some(error.clone()),
+                )?;
+                Ok(GetObjectResult {
+                    outcome: OperationOutcome::Unknown,
+                    http_status: Some(206),
+                    error: Some(error),
+                    body: None,
+                })
+            }
+            Err(_) => {
+                let error = "ranged get body read timed out".to_string();
+                recorder.finish(
+                    record,
+                    OperationOutcome::Timeout,
+                    Some(206),
+                    Some(error.clone()),
+                )?;
+                Ok(GetObjectResult {
+                    outcome: OperationOutcome::Timeout,
+                    http_status: Some(206),
+                    error: Some(error),
+                    body: None,
+                })
+            }
+        }
     }
 
     async fn get_object_result_inner(
@@ -1476,7 +1618,7 @@ pub async fn wait_for_s3_endpoint(endpoint: &str, timeout_duration: Duration) ->
     }
 }
 
-fn seeded_bytes(seed: u64, index: usize, size_bytes: usize) -> Vec<u8> {
+pub(crate) fn seeded_bytes(seed: u64, index: usize, size_bytes: usize) -> Vec<u8> {
     let mut generator = SplitMix64::new(seed ^ (index as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93));
     let mut body = vec![0; size_bytes];
     for chunk in body.chunks_mut(8) {

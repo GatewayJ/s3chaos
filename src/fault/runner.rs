@@ -28,7 +28,7 @@ use crate::{
             FaultDeleteTimeoutRecoveryRequest, FaultLifecyclePort,
         },
         fixture,
-        history::{DurabilityCohort, OperationOutcome, OperationRecord, Recorder},
+        history::{ByteRange, DurabilityCohort, OperationOutcome, OperationRecord, Recorder},
         plan::{FaultInjection, FaultPlan, FaultPlanOptions, WRITE_QUORUM_LOSS_PARTITION_TARGETS},
         pods::{
             rustfs_pod_identities, rustfs_target_inventory, wait_for_rustfs_pod_deletion,
@@ -995,6 +995,7 @@ async fn run_fault_case(
         &prefilled,
         scenario.prefill_count(),
         scenario.mixed_workload_count(),
+        config.workload_ranged_get_percent,
     )
     .await
     {
@@ -3272,6 +3273,7 @@ async fn verify_prefill_object(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_mixed_workload(
     s3: &S3WorkloadClient,
     history: &Recorder,
@@ -3280,6 +3282,7 @@ async fn run_mixed_workload(
     prefilled: &[ObjectSpec],
     start_index: usize,
     count: usize,
+    ranged_get_percent: u8,
 ) -> Result<MixedWorkloadResult> {
     let tasks = (0..count).map(|offset| {
         let s3 = s3.clone();
@@ -3317,9 +3320,20 @@ async fn run_mixed_workload(
                     }
                 }
                 WorkloadOperation::Get => {
-                    result
-                        .gets
-                        .push(s3.get_object_result(&existing.key, &history).await?.outcome);
+                    // Deterministically (seeded, resume-stable) turn a slice of
+                    // GETs into ranged reads so the sharded read path is
+                    // exercised at offsets, not only via whole-object streams.
+                    let range =
+                        ranged_get_range(ranged_get_percent, seed, index, existing.size_bytes);
+                    let outcome = match range {
+                        Some(range) => {
+                            s3.get_object_range_result(&existing.key, range, &history)
+                                .await?
+                                .outcome
+                        }
+                        None => s3.get_object_result(&existing.key, &history).await?.outcome,
+                    };
+                    result.gets.push(outcome);
                 }
                 WorkloadOperation::List => {
                     let prefix = ObjectSpec::key_prefix(&run_id);
@@ -3386,6 +3400,33 @@ async fn run_mixed_workload(
         summary,
         unconfirmed_puts,
     })
+}
+
+/// Decide whether the GET at `index` runs as a ranged read, and derive a
+/// deterministic in-bounds byte range for it. Everything is a pure function of
+/// (seed, index) so reruns with the same workload seed replay identical
+/// operations.
+fn ranged_get_range(percent: u8, seed: u64, index: usize, size_bytes: usize) -> Option<ByteRange> {
+    if percent == 0 || size_bytes < 2 {
+        return None;
+    }
+    let mix = |salt: u64| -> u64 {
+        let mut value = seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt;
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    };
+    if mix(0x52414E47) % 100 >= u64::from(percent) {
+        return None;
+    }
+    let size = size_bytes as u64;
+    // Length in [1, size], offset in [0, size - length]: covers single-byte,
+    // interior, and suffix reads without ever leaving the object bounds.
+    let length = 1 + mix(0x4C454E47) % size;
+    let offset = mix(0x4F464653) % (size - length + 1);
+    Some(ByteRange { offset, length })
 }
 
 async fn recommit_unconfirmed_objects(
@@ -3774,7 +3815,49 @@ mod tests {
         stable_pod_fingerprint, target_pods_from_json, unmount_success_log_lines, warp_bucket_name,
         write_quorum_loss_topology_shape,
     };
+    use crate::fault::history::ByteRange;
     use crate::fault::history::OperationOutcome;
+
+    /// The ranged-GET sampler must be a pure function of (seed, index): zero
+    /// percent and tiny objects never sample, derived ranges always stay in
+    /// bounds, and identical inputs replay identically.
+    #[test]
+    fn ranged_get_range_is_deterministic_and_in_bounds() {
+        assert!(super::ranged_get_range(0, 42, 7, 4096).is_none());
+        assert!(super::ranged_get_range(100, 42, 7, 1).is_none());
+
+        for index in 0..2000usize {
+            if let Some(range) = super::ranged_get_range(100, 42, index, 4096) {
+                assert!(
+                    range.length >= 1 && range.length <= 4096,
+                    "length {range:?}"
+                );
+                assert!(range.offset + range.length <= 4096, "bounds {range:?}");
+            } else {
+                panic!("percent=100 must always sample");
+            }
+        }
+
+        let sampled = (0..2000usize)
+            .filter(|index| super::ranged_get_range(30, 42, *index, 4096).is_some())
+            .count();
+        assert!(
+            (300..=900).contains(&sampled),
+            "30% sampling grossly off: {sampled}/2000"
+        );
+        assert_eq!(
+            super::ranged_get_range(30, 42, 5, 4096),
+            super::ranged_get_range(30, 42, 5, 4096),
+            "must replay identically"
+        );
+        assert_eq!(
+            super::ranged_get_range(100, 42, 5, 4096),
+            Some(ByteRange {
+                offset: super::ranged_get_range(100, 42, 5, 4096).unwrap().offset,
+                length: super::ranged_get_range(100, 42, 5, 4096).unwrap().length,
+            })
+        );
+    }
     use crate::fault::plan::{
         DEFAULT_RUSTFS_DATA_VOLUME, FaultInjection, FaultKind, FaultSelection, FaultTarget,
     };

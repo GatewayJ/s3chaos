@@ -20,8 +20,10 @@ use std::time::{Duration, Instant};
 use tokio::time::{sleep as async_sleep, timeout};
 
 use crate::fault::{
-    history::{OperationKind, OperationOutcome, OperationRecord, Recorder},
-    workload::{GetObjectResult, ObjectSpec, ObjectVersionEntry, S3WorkloadClient, sha256_hex},
+    history::{ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef, Recorder},
+    workload::{
+        GetObjectResult, ObjectSpec, ObjectVersionEntry, S3WorkloadClient, seeded_bytes, sha256_hex,
+    },
 };
 
 const MAX_WARNING_SAMPLES: usize = 50;
@@ -1842,6 +1844,9 @@ fn stable_live_objects_at_read_starts(
 struct CommittedWriteWindow {
     object: ExpectedObject,
     ended_at_ms: u64,
+    /// Generator inputs for regenerating this write's exact body (absent for
+    /// multipart bodies and legacy records, which cannot be slice-verified).
+    payload_ref: Option<PayloadRef>,
 }
 
 /// Whether a successful GET that does not match the latest committed value is
@@ -1885,6 +1890,96 @@ fn concurrent_committed_read(
     false
 }
 
+/// Regenerate the expected slice hash for one committed write, if its body is
+/// reproducible (seeded generator inputs recorded and the range fits).
+fn regenerated_slice_sha(window: &CommittedWriteWindow, range: ByteRange) -> Option<String> {
+    let payload_ref = window.payload_ref?;
+    let size = window.object.size_bytes as u64;
+    if range.offset >= size || range.length == 0 || range.offset + range.length > size {
+        return None;
+    }
+    let body = seeded_bytes(
+        payload_ref.seed,
+        payload_ref.index,
+        window.object.size_bytes,
+    );
+    let start = range.offset as usize;
+    let end = (range.offset + range.length) as usize;
+    Some(sha256_hex(&body[start..end]))
+}
+
+/// Verify a successful ranged GET against the regenerated slice of the
+/// committed values it could legally observe: the latest committed write, any
+/// write whose completion window overlaps the GET, and the immediately
+/// previous value while the latest write was still in flight (the same
+/// concurrency legs as `concurrent_committed_read`). Writes without a
+/// payload_ref (multipart bodies, legacy records) cannot be slice-verified:
+/// if any such write is in the candidate set the mismatch is inconclusive and
+/// the read is not flagged, because the slice may belong to that
+/// unreproducible body.
+fn verify_ranged_get(
+    key: &str,
+    range: ByteRange,
+    record: &OperationRecord,
+    history: &[CommittedWriteWindow],
+    key_is_live: bool,
+    anomalies: &mut ReadAnomalies,
+) {
+    if history.is_empty() {
+        if !key_is_live {
+            anomalies.visible_deleted_objects.push(format!(
+                "{key}: successful ranged GET had no committed live value"
+            ));
+        }
+        return;
+    }
+    let actual_sha = record.value_sha256.as_deref().unwrap_or_default();
+    let actual_len = record.size_bytes.unwrap_or_default() as u64;
+    if actual_len != range.length {
+        anomalies.corrupted_reads.push(format!(
+            "{key}: ranged GET bytes={}-{} returned {} bytes instead of {}",
+            range.offset,
+            range.offset + range.length - 1,
+            actual_len,
+            range.length
+        ));
+        return;
+    }
+
+    let (latest, prior) = history.split_last().expect("history checked non-empty");
+    let mut candidates: Vec<&CommittedWriteWindow> = vec![latest];
+    for window in prior {
+        if window.ended_at_ms >= record.started_at_ms {
+            candidates.push(window);
+        }
+    }
+    if latest.ended_at_ms >= record.started_at_ms
+        && let Some(previous) = prior.last()
+    {
+        candidates.push(previous);
+    }
+
+    let mut unverifiable = false;
+    for window in &candidates {
+        match regenerated_slice_sha(window, range) {
+            Some(expected) if expected == actual_sha => return,
+            Some(_) => {}
+            None => unverifiable = true,
+        }
+    }
+    if unverifiable {
+        // At least one legally-observable body is not reproducible; the slice
+        // may belong to it, so a mismatch here is not evidence of corruption.
+        return;
+    }
+    anomalies.corrupted_reads.push(format!(
+        "{key}: ranged GET bytes={}-{} returned slice sha {} matching no committed value",
+        range.offset,
+        range.offset + range.length - 1,
+        actual_sha
+    ));
+}
+
 fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
     let mut live = BTreeMap::<String, ExpectedObject>::new();
     let mut committed_history = BTreeMap::<String, Vec<CommittedWriteWindow>>::new();
@@ -1904,6 +1999,7 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                         .push(CommittedWriteWindow {
                             object: object.clone(),
                             ended_at_ms: record.ended_at_ms,
+                            payload_ref: record.payload_ref,
                         });
                     live.insert(key, object);
                 }
@@ -1946,6 +2042,22 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                 let Some(key) = record.key.as_ref() else {
                     continue;
                 };
+                if let Some(range) = record.range {
+                    // A ranged GET's recorded hash describes the slice, so the
+                    // whole-object comparison below would always misfire.
+                    verify_ranged_get(
+                        key,
+                        range,
+                        record,
+                        committed_history
+                            .get(key)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        live.contains_key(key),
+                        &mut anomalies,
+                    );
+                    continue;
+                }
                 let actual_hash = record.value_sha256.as_deref().unwrap_or_default();
                 let actual = ExpectedObject {
                     sha256: actual_hash.to_string(),
@@ -2051,7 +2163,10 @@ mod tests {
         immediate_still_unavailable_keys, is_recovery_tail_read_failure, list_history_warnings,
         object_model, recovery_tail_candidate_keys, successful_read_anomalies,
     };
-    use crate::fault::history::{OperationKind, OperationOutcome, OperationRecord};
+    use crate::fault::history::{
+        ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
+    };
+    use crate::fault::workload::seeded_bytes;
     use crate::fault::workload::{GetObjectResult, sha256_hex};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -2071,6 +2186,8 @@ mod tests {
             value_sha256: Some(hash.to_string()),
             size_bytes: Some(1),
             version_id: None,
+            payload_ref: None,
+            range: None,
             started_at_ms: 1,
             ended_at_ms: 2,
             outcome,
@@ -2115,6 +2232,8 @@ mod tests {
             size_bytes: Some(keys.len()),
             version_id: None,
             listed_keys: Some(keys.iter().map(|key| key.to_string()).collect()),
+            payload_ref: None,
+            range: None,
             started_at_ms,
             ended_at_ms,
             outcome: OperationOutcome::Ok,
@@ -3382,6 +3501,165 @@ mod tests {
 
         assert!(anomalies.corrupted_reads.is_empty());
         assert!(anomalies.visible_deleted_objects.is_empty());
+    }
+
+    fn slice_sha(seed: u64, index: usize, size: usize, range: ByteRange) -> String {
+        let body = seeded_bytes(seed, index, size);
+        sha256_hex(&body[range.offset as usize..(range.offset + range.length) as usize])
+    }
+
+    fn committed_put(
+        id: &str,
+        key: &str,
+        seed: u64,
+        index: usize,
+        size: usize,
+        started_at_ms: u64,
+        ended_at_ms: u64,
+    ) -> OperationRecord {
+        let body = seeded_bytes(seed, index, size);
+        let mut record = timed_record(
+            id,
+            OperationKind::Put,
+            key,
+            &sha256_hex(&body),
+            OperationOutcome::Ok,
+            started_at_ms,
+            ended_at_ms,
+        );
+        record.size_bytes = Some(size);
+        record.payload_ref = Some(PayloadRef { seed, index });
+        record
+    }
+
+    fn ranged_get(
+        id: &str,
+        key: &str,
+        range: ByteRange,
+        slice_sha256: &str,
+        started_at_ms: u64,
+        ended_at_ms: u64,
+    ) -> OperationRecord {
+        let mut record = timed_record(
+            id,
+            OperationKind::Get,
+            key,
+            slice_sha256,
+            OperationOutcome::Ok,
+            started_at_ms,
+            ended_at_ms,
+        );
+        record.size_bytes = Some(range.length as usize);
+        record.range = Some(range);
+        record
+    }
+
+    /// A ranged GET whose slice matches the regenerated slice of the latest
+    /// committed write is clean — and crucially is never compared against the
+    /// whole-object hash (which would always mismatch).
+    #[test]
+    fn ranged_get_matching_latest_slice_is_clean() {
+        let range = ByteRange {
+            offset: 100,
+            length: 64,
+        };
+        let put = committed_put("op-1", "k", 7, 3, 4096, 10, 11);
+        let get = ranged_get("op-2", "k", range, &slice_sha(7, 3, 4096, range), 20, 21);
+
+        let anomalies = successful_read_anomalies(&[put, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "clean ranged read flagged: {:?}",
+            anomalies.corrupted_reads
+        );
+    }
+
+    /// A ranged GET racing a concurrent overwrite may return the earlier
+    /// variant's slice — same concurrency legs as whole-object reads.
+    #[test]
+    fn ranged_get_matching_concurrent_variant_slice_is_clean() {
+        let range = ByteRange {
+            offset: 5,
+            length: 32,
+        };
+        let first = committed_put("op-1", "k", 7, 3, 4096, 10, 19);
+        let second = committed_put("op-2", "k", 99, 3, 4096, 18, 20);
+        // GET starts while op-2 is in flight and observes op-1's slice.
+        let get = ranged_get("op-3", "k", range, &slice_sha(7, 3, 4096, range), 19, 21);
+
+        let anomalies = successful_read_anomalies(&[first, second, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "concurrent ranged read flagged: {:?}",
+            anomalies.corrupted_reads
+        );
+    }
+
+    /// A slice matching no committed value (after all writes settled) is
+    /// corruption, with the range in the message.
+    #[test]
+    fn ranged_get_slice_matching_nothing_is_corruption() {
+        let range = ByteRange {
+            offset: 0,
+            length: 16,
+        };
+        let put = committed_put("op-1", "k", 7, 3, 4096, 10, 11);
+        let get = ranged_get("op-2", "k", range, &sha256_hex(b"garbage"), 50, 51);
+
+        let anomalies = successful_read_anomalies(&[put, get]);
+
+        assert_eq!(anomalies.corrupted_reads.len(), 1);
+        assert!(anomalies.corrupted_reads[0].contains("bytes=0-15"));
+    }
+
+    /// If a legally-observable committed body is not reproducible (multipart,
+    /// legacy record without payload_ref), a mismatching slice is inconclusive
+    /// and must not be flagged.
+    #[test]
+    fn ranged_get_with_unreproducible_candidate_is_inconclusive() {
+        let range = ByteRange {
+            offset: 0,
+            length: 16,
+        };
+        let mut mpu = timed_record(
+            "op-1",
+            OperationKind::CompleteMultipartUpload,
+            "k",
+            "mpu-body-sha",
+            OperationOutcome::Ok,
+            10,
+            11,
+        );
+        mpu.size_bytes = Some(4096);
+        let get = ranged_get("op-2", "k", range, &sha256_hex(b"whatever"), 50, 51);
+
+        let anomalies = successful_read_anomalies(&[mpu, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "inconclusive ranged read flagged: {:?}",
+            anomalies.corrupted_reads
+        );
+    }
+
+    /// A ranged GET returning the wrong byte count is flagged regardless of
+    /// content reproducibility.
+    #[test]
+    fn ranged_get_length_mismatch_is_corruption() {
+        let range = ByteRange {
+            offset: 0,
+            length: 16,
+        };
+        let put = committed_put("op-1", "k", 7, 3, 4096, 10, 11);
+        let mut get = ranged_get("op-2", "k", range, &sha256_hex(b"short"), 50, 51);
+        get.size_bytes = Some(8);
+
+        let anomalies = successful_read_anomalies(&[put, get]);
+
+        assert_eq!(anomalies.corrupted_reads.len(), 1);
+        assert!(anomalies.corrupted_reads[0].contains("8 bytes instead of 16"));
     }
 
     /// Replays the hotspot race observed on a real cluster (stress-cpu,
