@@ -1,6 +1,6 @@
 # RustFS Durability Fault Testing Design
 
-This document turns the durability and power-loss discussion into an
+This document turns the durability and crash-consistency discussion into an
 implementation plan for s3chaos. It is intentionally scoped to fault testing and
 recovery verification for S3-compatible object storage. It must not turn
 s3chaos into a general chaos orchestration platform.
@@ -11,7 +11,7 @@ The target failure chain is:
 
 1. A client receives a successful S3 response.
 2. RustFS data or metadata is still vulnerable to process, node, disk, or
-   cluster power loss.
+   host-storage disruption.
 3. After recovery, heal, stale disk return, quorum selection, or dangling cleanup
    may amplify the loss.
 4. The test harness must say whether committed S3-visible state was preserved,
@@ -56,8 +56,10 @@ The design borrows operating principles, not platform shape:
   viewer remains read-only.
 - No production or shared-cluster support. Dedicated real Kubernetes/K3s clusters
   remain required.
-- No all-node power-off until the controller, artifact writer, and recovery path
-  are out-of-band and independently powered.
+- No near-term real node power-cycle implementation. Physical power control
+  remains an optional future backend after a dedicated lab controller, target
+  allowlist, and out-of-band artifact/recovery path exist.
+- No all-node power-off in this roadmap.
 - No claim that pod kill or dm-flakey is literal physical power loss. Each
   scenario must state its fault model.
 
@@ -158,11 +160,11 @@ implicit future contract from an earlier phase.
   existing readers and future console views must tolerate old
   `failure-summary.json` and `runner-failure-summary.json` files through explicit
   defaults.
-- Target proof before actuation: no power, disk, PV replacement, bitrot, stale
-  disk, or quorum scenario may execute until a side-effect-free target-proof
-  preflight can prove the exact target set. Pure `fault-suite-plan` may stay
-  environment-free and should not secretly call Kubernetes, host commands, power
-  controllers, or backend secrets.
+- Target proof before actuation: no disk, PV replacement, bitrot, stale disk,
+  quorum, or future power scenario may execute until a side-effect-free
+  target-proof preflight can prove the exact target set. Pure `fault-suite-plan`
+  may stay environment-free and should not secretly call Kubernetes, host
+  commands, future power controllers, or backend secrets.
 - Same-erasure-set proof before quorum scenarios: P and P+1 cases are invalid
   unless the plan proves erasure-set id, data/parity width, target volumes,
   target nodes, and non-target volume coverage.
@@ -171,16 +173,18 @@ implicit future contract from an earlier phase.
   considered a passing suite attempt until the catalog and suite summary can
   represent expected classification, severity, responsibility domain, and
   evidence refs.
-- Out-of-band control proof before real power operations: the controller,
-  artifact writer, recovery path, credentials, and network path must be outside
-  the fault domain and recorded in preflight evidence.
-- Rollback proof before host mutation: any scenario that mutates power state,
-  device state, PV contents, shard bytes, or Kubernetes storage objects must
-  prove rollback, quarantine, or restore capability before injection.
+- Out-of-band control proof before any future real power operations: the
+  controller, artifact writer, recovery path, credentials, and network path must
+  be outside the fault domain and recorded in preflight evidence. Until that lab
+  capability exists, physical power scenarios stay non-executable and outside
+  the implementation sequence below.
+- Rollback proof before host mutation: any scenario that mutates device state,
+  PV contents, shard bytes, Kubernetes storage objects, or future power state
+  must prove rollback, quarantine, or restore capability before injection.
 - Backend-specific destructive opt-in: the generic
-  `RUSTFS_FAULT_TEST_DESTRUCTIVE=1` suite switch is not enough for power, PV,
-  bitrot, stale-disk, or host-storage mutation. Those backends need their own
-  explicit opt-in that wrappers never set implicitly.
+  `RUSTFS_FAULT_TEST_DESTRUCTIVE=1` suite switch is not enough for PV, bitrot,
+  stale-disk, host-storage mutation, or future power-control backends. Those
+  backends need their own explicit opt-in that wrappers never set implicitly.
 
 ## Composition Boundary
 
@@ -189,7 +193,7 @@ an explicit composition policy. YAML continues to select intent:
 
 ```yaml
 scenarios:
-  - name: quorum-p-power-cycle
+  - name: quorum-p-io-fault
     workloadProfile: versioned-hot-ack-tail
     faultDuration: 2m
 ```
@@ -222,8 +226,10 @@ Committed operation:
 
 Ack-triggered fault window:
 
-- Power-loss scenarios must be able to trigger after a selected committed
-  operation, not merely "while workload is running".
+- After-ACK scenarios must be able to trigger after a selected committed
+  operation, not merely "while workload is running". This lifecycle is useful
+  for crash-like pod and storage faults first; physical power-cycle remains a
+  future optional backend, not a prerequisite for this roadmap.
 - This is a new runner lifecycle, not a small extension of the current
   apply-before-workload flow. The runner owns the trigger boundary: workload
   emits operation events, the runner decides whether a committed operation arms
@@ -238,7 +244,7 @@ Ack-triggered fault window:
 - The plan must declare the maximum allowed `ack_to_fault_ms`. If the harness
   cannot trigger inside that bound, the run is a harness or fault-backend failure,
   not a product verdict.
-- Timeout or unknown operations cannot arm an ack-triggered power-loss fault.
+- Timeout or unknown operations cannot arm an ack-triggered fault.
 - Fake-backend tests must prove no fault is applied before an eligible committed
   ACK, ineligible outcomes do not arm the trigger, and missed
   `maxAckToFaultMs` is reported as harness or backend failure.
@@ -589,7 +595,7 @@ Scope:
 
 - Define committed, ambiguous, pre-crash, crash-window, and post-recovery
   cohorts.
-- Define ack-triggered fault windows for power-loss scenarios.
+- Define ack-triggered fault windows for after-ACK crash-like scenarios.
 - Extend checker/reporting for durability-specific versioning and delete marker
   failures.
 - Add workload profiles that exercise overwrite, delete, MPU, and hot keys.
@@ -674,8 +680,11 @@ Scope:
 
 - Add target resolution proof.
 - Make health guard target-aware.
-- Add backend actuator interfaces for future power and disk operations.
-- Validate out-of-band recovery requirements without executing them yet.
+- Add backend actuator intent interfaces for host/storage operations that are
+  realistic in the current lab, such as device, PV, stale-disk, bitrot, and
+  quorum targeting.
+- Keep any future physical power backend as an optional capability contract, not
+  as an implementation dependency for this phase.
 
 PR split:
 
@@ -697,16 +706,14 @@ PR split:
    - Keep DiskPressure and non-fault tenant failures as hard stops.
    - Preserve current behavior for existing scenarios.
 
-3. `feat(fault): add power backend preflight only`
-   - Add configuration shape for node power control, allowlist, expected
-     context, controller identity, and recovery command.
-   - Do not execute power operations.
-   - Fail closed without explicit destructive opt-in, backend-specific
-     power-operation opt-in, and out-of-band controller proof.
-   - Validate that the controller, artifact writer, recovery path, and
-     credentials are outside the target fault domain.
-   - Negative preflight must prove wrappers do not set the power opt-in
-     implicitly.
+3. `feat(fault): add host/storage mutation preflight`
+   - Add configuration shape for node/device/PV allowlists, expected context,
+     target proof, quarantine or rollback commands, and recovery observation.
+   - Do not execute host-storage mutations in the preflight-only PR.
+   - Fail closed without explicit destructive opt-in, target allowlist match,
+     and rollback/quarantine proof.
+   - Leave physical power-control fields out of the required schema unless a
+     concrete lab backend is available.
 
 Acceptance gates:
 
@@ -715,42 +722,36 @@ Acceptance gates:
 - No side-effect `fault-suite-plan` tests: plan/validate cannot apply, delete,
   patch, power-cycle, read backend secrets, or call actuator methods.
 - Manual `make fault-preflight SCENARIO=<existing-p0>` on a dedicated cluster.
-- Negative power preflight cases must exit non-zero and create no fault
-  resources: missing destructive opt-in, target not in allowlist, controller in
-  the fault domain, missing recovery proof, non-target node health loss, and
-  non-fault tenant health loss.
+- Negative preflight cases must exit non-zero and create no fault resources:
+  missing destructive opt-in, target not in allowlist, missing rollback or
+  quarantine proof, non-target node health loss, and non-fault tenant health
+  loss.
 
 Exit criteria:
 
 - The plan proves exactly what would be disrupted.
 - Preflight can reject unsafe target selection without applying faults.
-- Power and disk adapters are present only as preflight-verifiable intents until
-  Phase 4 explicitly enables execution.
+- Host-storage adapters are present only as preflight-verifiable intents until a
+  later phase explicitly enables execution.
 - Existing Chaos Mesh and dm scenarios still run through the same public
   contract.
 - Quorum scenarios remain non-executable until same-erasure-set proof is present.
 
 ## Phase 4: Minimal Destructive Durability Smoke
 
-Goal: run the smallest useful destructive evidence path.
+Goal: run the smallest useful destructive evidence path without requiring real
+power control.
 
-Scope 4A, near-power-loss smoke:
+Scope:
 
 - Start with near-power-loss smoke that is safe and diagnosable.
 - Treat pod kill and dm-flakey as fault models, not literal power loss.
-
-Scope 4B, true power-cycle smoke:
-
-- Enable real node power operations only when Phase 3 preflight-only safety
-  gates pass.
-- Keep the artifact writer, controller, and recovery path outside the fault
-  domain.
-- Preflight must record controller host, power domain, network path, credentials
-  scope, recovery command, artifact-writer location, and proof that none live on
-  target nodes or target power circuits.
-- Require a backend-specific power opt-in that suite wrappers do not set
-  implicitly.
-- Use ack-triggered fault windows for after-ACK tests.
+- Add quorum P/P+1 targeted IO fault scenarios once same-erasure-set proof is
+  available.
+- Keep real power-cycle, hard-poweroff delete, and hard-poweroff MPU cases in a
+  deferred optional extension section.
+- Use ack-triggered fault windows for after-ACK tests where the selected backend
+  can actuate quickly and prove timing.
 
 Recommended scenario order:
 
@@ -767,23 +768,16 @@ Recommended scenario order:
    - Versioning on, proven by run spec and artifact validation.
    - Used as a negative control and recovery-tail classifier.
 
-3. `single-node-power-cycle-after-ack` (4B)
-   - Out-of-band power backend.
-   - One target node only.
-   - Artifact writer and controller stay outside the fault domain.
-   - Triggered by a committed operation and bounded by `ack_to_fault_ms`.
-   - Requires backend-specific power opt-in in addition to the generic
-     destructive switch.
-
-4. `quorum-p-power-cycle` (4B)
-   - Power off exactly parity count targets.
+3. `quorum-p-io-fault`
+   - Inject IO faults into exactly parity count target volumes in one erasure
+     set.
    - Suite plan and preflight must show erasure-set id, data/parity width,
      target volumes, target nodes, and non-target volume proof.
    - Expected result: committed S3-visible state remains available or recovers
      within the declared window.
 
-5. `quorum-p-plus-one-power-cycle` (4B)
-   - Power off parity plus one targets.
+4. `quorum-p-plus-one-io-fault`
+   - Inject IO faults into parity plus one target volumes in one erasure set.
    - Expected result: fail with explicit availability/correctness
      classification, not harness ambiguity.
    - This is a diagnostic/release-candidate scenario, not an ordinary PR gate,
@@ -802,20 +796,14 @@ PR split:
    - Catalog scenario using existing pod backend.
    - Clear fault model text in catalog and reports.
 
-3. `feat(fault): enable single node power cycle`
-   - Execute only with explicit destructive env/config, backend-specific power
-     opt-in, target allowlist, and out-of-band recovery proof.
-   - Negative tests must show the suite wrapper does not enable this backend by
-     default.
-
-4. `feat(fault): add quorum power cycle scenarios`
+3. `feat(fault): add quorum targeted IO scenarios`
    - Catalog-owned P and P+1 scenarios.
    - No generic YAML target DSL.
    - Require same-erasure-set proof before execution.
    - P+1 stays release-candidate/manual unless expected-failure policy has
      landed.
 
-5. `docs(fault): add destructive smoke runbook`
+4. `docs(fault): add destructive smoke runbook`
    - Small run values: objects 64, concurrency 8, pinned image digest.
    - Recommended hot workload: versioning on, high overwrite/delete ratio,
      explicit MPU ratio, and request timeout recorded in run metadata.
@@ -829,14 +817,14 @@ Acceptance gates:
 - Dedicated cluster preflight.
 - Clean checkout and recorded commit OID.
 - Pinned RustFS image digest.
-- Backend-specific destructive opt-in evidence for power, PV, bitrot, stale-disk,
-  and host-storage mutation scenarios.
+- Backend-specific destructive opt-in evidence for PV, bitrot, stale-disk, and
+  host-storage mutation scenarios.
 - `fault-evidence.json` proves injected, active during workload, and recovered.
 - `checker-pre-recommit-report.json`, `checker-report.json`, and
   `recommit-report.json` are clean for expected-pass scenarios.
 - `failure-summary.json` has precise classification for expected-fail scenarios.
 - Postflight proves the control plane and non-fault tenants are Ready, managed
-  Chaos resources are gone, device-mapper/power state is restored, and cleanup
+  Chaos resources are gone, device-mapper state is restored, and cleanup
   snapshots are preserved.
 - Expected-fail scenarios may exit non-zero, but they must produce the expected
   classification, severity, responsibility domain, and evidence refs. They must
@@ -847,7 +835,8 @@ Acceptance gates:
 
 Exit criteria:
 
-- A minimal destructive run can be repeated from artifacts and commands.
+- A minimal destructive run can be repeated from artifacts and commands without
+  physical power-control infrastructure.
 - Data loss, recovery-tail availability, backend failure, and environment
   failure are distinguishable.
 - No full catalog destructive suite is required for ordinary PRs.
@@ -975,17 +964,31 @@ Exit criteria:
 | --- | --- | --- | --- | --- | --- | --- |
 | P0 | `dm-flakey-versioned-hot` | `dm-flakey` plus `RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING=1` | Needs catalog/profile PR | Dedicated Local PV through dm-flakey/error/no-flush recovery. | Hot overwrite/delete/MPU workload; committed version GET and delete marker latest must pass. | dm active/recovered snapshots, PV/device proof, history, checker reports. If fault did not hit target device, use `run_failure_reason=fault_not_active`, not product failure. |
 | P0 | `pod-crash-versioned-hot` | `pod-kill-one` or `pod-failure` plus versioning env | Needs catalog/profile PR | Pod kill/failure while workload is active. | Version lineage survives; recovery tail is separated from corruption. | Pod identity before/after, restart counts, previous logs, recovery stability report. This is process crash proxy, not physical power loss. |
-| P0 | `single-node-power-cycle-after-ack` | none | Blocked on power preflight and trigger lifecycle | Out-of-band power cycle after selected committed ACK. | Ack-triggered PUT/DELETE/MPU operations; committed object/version survives after node recovery. | Trigger op id, ACK time, fault active time, node power proof, checker reports. If `ack_to_fault_ms` exceeds bound, mark harness/backend failure. |
-| P0 | `delete-marker-hard-poweroff` | none | Blocked on power preflight and trigger lifecycle | Hard power during delete-heavy ack-triggered workload. | Versioning on, high DELETE weight, interleaved overwrites; delete marker remains latest. | ListObjectVersions evidence, checker report, power proof. DELETE without 204/version id is not committed. |
-| P0 | `multipart-complete-hard-poweroff` | none | Blocked on power preflight and trigger lifecycle | Hard power around CompleteMultipartUpload ACK. | Complete 200 is a committed write; timed-out complete is ambiguous. | MPU operation history, version id, checker report, recommit report. Abort/orphan-part checks require explicit observable evidence before becoming gates. |
-| P1 | `quorum-p-power-cycle` | none | Blocked on same-erasure-set proof | Power off exactly parity count targets in one erasure set. | EC redundancy survives or recovers within window. | Erasure-set id, data/parity width, target volume list, non-target proof. Random nodes without same-set proof are invalid. |
-| P1 | `quorum-p-plus-one-power-cycle` | none | Manual/release-candidate only | Power off parity plus one targets in one erasure set. | Must fail with explicit availability/correctness classification. | Same-set proof, power proof, failure summary. Non-zero is acceptable evidence until explicit expected-failure suite semantics exist. |
+| P1 | `quorum-p-io-fault` | none | Blocked on same-erasure-set proof | Inject IO fault into exactly parity count target volumes in one erasure set. | EC redundancy survives or recovers within window. | Erasure-set id, data/parity width, target volume list, non-target proof, and IO fault-active proof. Random nodes without same-set proof are invalid. |
+| P1 | `quorum-p-plus-one-io-fault` | none | Manual/release-candidate until expected-failure policy lands | Inject IO fault into parity plus one target volumes in one erasure set. | Must fail or reject writes with explicit availability/correctness classification, never ambiguous half-commit evidence. | Same-set proof, IO fault-active proof, failure summary. Non-zero is acceptable evidence until explicit expected-failure suite semantics exist. |
 | P1 | `stale-disk-return-detect` | none | Blocked on disk generation proof and rollback | Reattach old disk generation after writes/deletes. | Latest version id/delete marker/hash cannot roll back. | Disk generation proof, reattach events, versioning report, checker report. Missing generation proof is harness failure. |
 | P1 | `delete-marker-stale-disk-heal` | none | Blocked on disk generation proof and heal observer | Reattach disk predating committed DELETE marker, then observe heal. | Delete marker remains latest and object is not resurrected. | Old/new disk generation, heal summary, ListObjectVersions evidence. Versioning disabled or DELETE not committed invalidates verdict. |
 | P1 | `dangling-cleanup-after-ack-loss` | none | Blocked on product trigger and shard inventory | Induce missing shards beyond parity and trigger dangling cleanup path. | Recoverable committed fragments are not deleted by cleanup. | Object/version shard map, inventory before/after, cleanup actor/event, checker report. Without before/after inventory, classify only S3 unavailability, not dangling causality. |
 | P2 | `fresh-volume-replacement-heal` | none | Blocked on PV quarantine/restore proof | Replace one PVC/PV with an empty volume. | Heal converges with no committed data loss. | Original and replacement generation, quarantine/restore evidence, heal summary. Non-convergence maps to `recovery_not_converged` plus checker facts. |
 | P2 | `on-disk-bitrot-heal` | none | Blocked on shard target proof and rollback | Mutate shard bytes on dedicated host volume. | Corrupt bytes are never returned as successful S3 data; heal repairs or reports unavailable. | Object-to-shard mapping, file/device identity, byte offset, original/mutated hash, backup, mutation and rollback commands. Mutation outside target shard is harness failure. |
 | P2 | `long-run-durability-campaign` | none | Release/nightly only | Repeated named scenarios under continuous workload. | Aggregate scenario verdicts and resource trends. | Suite summary, event tail, fd/RSS trend, artifact size report. Resource ceiling breach is runner/environment failure. |
+
+### Deferred Physical Power Extension
+
+Physical power-cycle scenarios are outside the current implementation sequence.
+Reintroduce them only after a concrete lab backend can prove controller
+identity, target allowlist, independent artifact writing, independent recovery,
+credential scope, and out-of-band network path. Candidate future scenarios:
+
+- `single-node-power-cycle-after-ack`
+- `delete-marker-hard-poweroff`
+- `multipart-complete-hard-poweroff`
+- `quorum-p-power-cycle`
+- `quorum-p-plus-one-power-cycle`
+
+Those future scenarios reuse the same committed-operation, trigger, target
+proof, and checker semantics above, but they must not block the dm-flakey,
+pod-crash, quorum-IO, heal, bitrot, or campaign roadmap.
 
 ## Review Checklist
 
@@ -1018,14 +1021,16 @@ Use this checklist for every PR in this plan:
 9. Versioned hot workload profile example.
 10. Target resolution proof.
 11. Target-aware health guard.
-12. Power backend preflight-only adapter.
+12. Host/storage mutation preflight and target proof hardening.
 13. dm-flakey durability smoke.
 14. pod crash durability smoke.
-15. single-node power cycle.
-16. quorum P and P+1 power cycle.
-17. stale disk return detection.
-18. heal observer artifacts.
-19. dangling cleanup scenario.
-20. fresh volume replacement scenario.
-21. on-disk bitrot scenario.
-22. long-run durability campaign suite.
+15. quorum P and P+1 targeted IO fault scenarios.
+16. stale disk return detection.
+17. heal observer artifacts.
+18. dangling cleanup scenario.
+19. fresh volume replacement scenario.
+20. on-disk bitrot scenario.
+21. long-run durability campaign suite.
+
+Deferred outside this order: physical power backend preflight and power-cycle
+scenarios, once a dedicated lab controller and out-of-band recovery path exist.

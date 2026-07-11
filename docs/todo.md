@@ -1,6 +1,6 @@
 # Fault Suite Roadmap
 
-Detailed durability and power-loss design: see
+Detailed durability fault-testing design: see
 [`DURABILITY_FAULT_TESTING_DESIGN.md`](DURABILITY_FAULT_TESTING_DESIGN.md).
 
 This document tracks the next architecture steps for the fault-suite runner. The
