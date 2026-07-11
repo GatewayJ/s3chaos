@@ -580,6 +580,10 @@ struct AmbiguousWriteAttempt {
     kind: OperationKind,
     outcome: OperationOutcome,
     object: ExpectedObject,
+    /// Generator inputs for regenerating this attempt's body, so a ranged GET
+    /// that materialized this ambiguous write can be verified at the slice
+    /// level (absent for multipart bodies and legacy records).
+    payload_ref: Option<PayloadRef>,
     started_at_ms: u64,
     ended_at_ms: u64,
     superseded_by: Option<SupersedingMutation>,
@@ -1688,6 +1692,7 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
                         kind: record.kind,
                         outcome: record.outcome,
                         object,
+                        payload_ref: record.payload_ref,
                         started_at_ms: record.started_at_ms,
                         ended_at_ms: record.ended_at_ms,
                         superseded_by: None,
@@ -1890,49 +1895,47 @@ fn concurrent_committed_read(
     false
 }
 
-/// Regenerate the expected slice hash for one committed write, if its body is
-/// reproducible (seeded generator inputs recorded and the range fits).
-fn regenerated_slice_sha(window: &CommittedWriteWindow, range: ByteRange) -> Option<String> {
-    let payload_ref = window.payload_ref?;
-    let size = window.object.size_bytes as u64;
+/// Regenerate the expected slice hash for a reproducible body (seeded generator
+/// inputs recorded and the range fits within the object). Returns None when the
+/// body is unreproducible (no payload_ref) or the range does not fit.
+fn regenerated_slice_sha(
+    payload_ref: Option<PayloadRef>,
+    size_bytes: usize,
+    range: ByteRange,
+) -> Option<String> {
+    let payload_ref = payload_ref?;
+    let size = size_bytes as u64;
     if range.offset >= size || range.length == 0 || range.offset + range.length > size {
         return None;
     }
-    let body = seeded_bytes(
-        payload_ref.seed,
-        payload_ref.index,
-        window.object.size_bytes,
-    );
+    let body = seeded_bytes(payload_ref.seed, payload_ref.index, size_bytes);
     let start = range.offset as usize;
     let end = (range.offset + range.length) as usize;
     Some(sha256_hex(&body[start..end]))
 }
 
-/// Verify a successful ranged GET against the regenerated slice of the
-/// committed values it could legally observe: the latest committed write, any
-/// write whose completion window overlaps the GET, and the immediately
-/// previous value while the latest write was still in flight (the same
-/// concurrency legs as `concurrent_committed_read`). Writes without a
-/// payload_ref (multipart bodies, legacy records) cannot be slice-verified:
-/// if any such write is in the candidate set the mismatch is inconclusive and
-/// the read is not flagged, because the slice may belong to that
-/// unreproducible body.
+/// Verify a successful ranged GET against the slices it could legally observe.
+///
+/// Candidates are the committed values the GET could linearize to (latest
+/// committed write, writes whose completion window overlaps the GET, and the
+/// immediately-previous value while the latest write was in flight -- the same
+/// legs as `concurrent_committed_read`) PLUS any not-yet-superseded ambiguous
+/// (timeout/unknown) write, which may have materialized server-side. A slice
+/// matching a committed value is clean; matching a materialized ambiguous write
+/// is `unknown_writes_materialized`, mirroring the whole-object path (NOT
+/// corruption). A mismatch is only flagged as corruption when every candidate
+/// is reproducible and none match; if any candidate body is unreproducible
+/// (multipart, legacy) or is a range-spanning ambiguous write, the mismatch is
+/// inconclusive -- the slice may belong to that unverifiable body.
 fn verify_ranged_get(
     key: &str,
     range: ByteRange,
     record: &OperationRecord,
     history: &[CommittedWriteWindow],
+    ambiguous: &[AmbiguousWriteAttempt],
     key_is_live: bool,
     anomalies: &mut ReadAnomalies,
 ) {
-    if history.is_empty() {
-        if !key_is_live {
-            anomalies.visible_deleted_objects.push(format!(
-                "{key}: successful ranged GET had no committed live value"
-            ));
-        }
-        return;
-    }
     let actual_sha = record.value_sha256.as_deref().unwrap_or_default();
     let actual_len = record.size_bytes.unwrap_or_default() as u64;
     if actual_len != range.length {
@@ -1946,30 +1949,83 @@ fn verify_ranged_get(
         return;
     }
 
-    let (latest, prior) = history.split_last().expect("history checked non-empty");
-    let mut candidates: Vec<&CommittedWriteWindow> = vec![latest];
-    for window in prior {
-        if window.ended_at_ms >= record.started_at_ms {
-            candidates.push(window);
+    // Reproducible slice inputs (payload_ref, size) for every committed value
+    // the GET could legally observe.
+    let mut candidates: Vec<(Option<PayloadRef>, usize)> = Vec::new();
+    if let Some((latest, prior)) = history.split_last() {
+        candidates.push((latest.payload_ref, latest.object.size_bytes));
+        for window in prior {
+            if window.ended_at_ms >= record.started_at_ms {
+                candidates.push((window.payload_ref, window.object.size_bytes));
+            }
         }
-    }
-    if latest.ended_at_ms >= record.started_at_ms
-        && let Some(previous) = prior.last()
-    {
-        candidates.push(previous);
+        if latest.ended_at_ms >= record.started_at_ms
+            && let Some(previous) = prior.last()
+        {
+            candidates.push((previous.payload_ref, previous.object.size_bytes));
+        }
     }
 
     let mut unverifiable = false;
-    for window in &candidates {
-        match regenerated_slice_sha(window, range) {
+    for (payload_ref, size) in &candidates {
+        match regenerated_slice_sha(*payload_ref, *size, range) {
             Some(expected) if expected == actual_sha => return,
             Some(_) => {}
             None => unverifiable = true,
         }
     }
-    if unverifiable {
-        // At least one legally-observable body is not reproducible; the slice
-        // may belong to it, so a mismatch here is not evidence of corruption.
+
+    // An ambiguous write may have materialized: a slice that matches its
+    // regenerated body means the write landed (unknown_writes_materialized,
+    // not corruption). One that spans the range but is unreproducible makes a
+    // mismatch inconclusive.
+    let mut ambiguous_spans_range = false;
+    let mut has_pending_ambiguous = false;
+    for attempt in ambiguous.iter().filter(|a| a.superseded_by.is_none()) {
+        has_pending_ambiguous = true;
+        match regenerated_slice_sha(attempt.payload_ref, attempt.object.size_bytes, range) {
+            Some(expected) if expected == actual_sha => {
+                let actual = ExpectedObject {
+                    sha256: actual_sha.to_string(),
+                    size_bytes: record.size_bytes.unwrap_or_default(),
+                };
+                anomalies.unknown_writes_materialized.push(
+                    ambiguous_write_materialized_from_object_message(key, attempt, &actual),
+                );
+                return;
+            }
+            Some(_) => {}
+            None if range.offset + range.length <= attempt.object.size_bytes as u64 => {
+                ambiguous_spans_range = true;
+            }
+            None => {}
+        }
+    }
+
+    if unverifiable || ambiguous_spans_range {
+        return;
+    }
+    if has_pending_ambiguous {
+        // A pending ambiguous write exists but the slice matches neither it nor
+        // any committed value: the read is unexplained but not provable
+        // corruption, exactly as the whole-object path classifies it.
+        anomalies.unknown_write_value_conflicts.push(format!(
+            "{key}: ranged GET bytes={}-{} returned slice sha {} matching no committed value while an ambiguous write is pending",
+            range.offset,
+            range.offset + range.length - 1,
+            actual_sha
+        ));
+        return;
+    }
+    if candidates.is_empty() {
+        // No committed value and no ambiguous write. If the key is not live
+        // either, a successful ranged read of a never-committed key is a
+        // resurrection-class signal.
+        if !key_is_live {
+            anomalies.visible_deleted_objects.push(format!(
+                "{key}: successful ranged GET had no committed live value"
+            ));
+        }
         return;
     }
     anomalies.corrupted_reads.push(format!(
@@ -2019,6 +2075,7 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                             kind: record.kind,
                             outcome: record.outcome,
                             object,
+                            payload_ref: record.payload_ref,
                             started_at_ms: record.started_at_ms,
                             ended_at_ms: record.ended_at_ms,
                             superseded_by: None,
@@ -2050,6 +2107,10 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                         range,
                         record,
                         committed_history
+                            .get(key)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        ambiguous_writes
                             .get(key)
                             .map(Vec::as_slice)
                             .unwrap_or_default(),
@@ -2253,6 +2314,7 @@ mod tests {
                 sha256: hash.to_string(),
                 size_bytes: 1,
             },
+            payload_ref: None,
             started_at_ms: 1,
             ended_at_ms: 2,
             superseded_by: None,
@@ -3660,6 +3722,80 @@ mod tests {
 
         assert_eq!(anomalies.corrupted_reads.len(), 1);
         assert!(anomalies.corrupted_reads[0].contains("8 bytes instead of 16"));
+    }
+
+    fn ambiguous_put(
+        id: &str,
+        key: &str,
+        seed: u64,
+        index: usize,
+        size: usize,
+        started_at_ms: u64,
+        ended_at_ms: u64,
+    ) -> OperationRecord {
+        let body = seeded_bytes(seed, index, size);
+        let mut record = timed_record(
+            id,
+            OperationKind::Put,
+            key,
+            &sha256_hex(&body),
+            OperationOutcome::Timeout,
+            started_at_ms,
+            ended_at_ms,
+        );
+        record.size_bytes = Some(size);
+        record.payload_ref = Some(PayloadRef { seed, index });
+        record
+    }
+
+    /// Adversarial self-review catch (PR#30 finding): a ranged GET reading a
+    /// materialized-but-unconfirmed (timeout) overwrite must classify as
+    /// unknown_writes_materialized, exactly like the whole-object path -- NOT
+    /// as data corruption.
+    #[test]
+    fn ranged_get_of_materialized_ambiguous_write_is_not_corruption() {
+        let range = ByteRange {
+            offset: 100,
+            length: 64,
+        };
+        let committed = committed_put("op-1", "k", 7, 3, 4096, 10, 11);
+        // Overwrite times out but landed server-side (seed 99).
+        let ambiguous = ambiguous_put("op-2", "k", 99, 3, 4096, 12, 13);
+        let get = ranged_get("op-3", "k", range, &slice_sha(99, 3, 4096, range), 50, 51);
+
+        let anomalies = successful_read_anomalies(&[committed, ambiguous, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "materialized ambiguous ranged read flagged as corruption: {:?}",
+            anomalies.corrupted_reads
+        );
+        assert_eq!(
+            anomalies.unknown_writes_materialized.len(),
+            1,
+            "must be classified as a materialized ambiguous write"
+        );
+    }
+
+    /// A ranged GET on a key whose only write is a pending ambiguous one is
+    /// inconclusive (the ambiguous write may have materialized), not a
+    /// visible-deleted resurrection signal.
+    #[test]
+    fn ranged_get_of_only_ambiguous_write_is_inconclusive() {
+        let range = ByteRange {
+            offset: 0,
+            length: 16,
+        };
+        let ambiguous = ambiguous_put("op-1", "k", 99, 3, 4096, 10, 11);
+        // GET returns something not matching the ambiguous slice; because the
+        // ambiguous write spans the range and might hold other bytes, this is
+        // inconclusive rather than corruption or resurrection.
+        let get = ranged_get("op-2", "k", range, &sha256_hex(b"other"), 50, 51);
+
+        let anomalies = successful_read_anomalies(&[ambiguous, get]);
+
+        assert!(anomalies.corrupted_reads.is_empty());
+        assert!(anomalies.visible_deleted_objects.is_empty());
     }
 
     /// Replays the hotspot race observed on a real cluster (stress-cpu,
