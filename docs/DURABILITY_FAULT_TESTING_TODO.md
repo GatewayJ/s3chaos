@@ -16,9 +16,10 @@ Status legend:
 
 ## Current Implemented Baseline
 
-- [x] DONE: Ordered TODO and roadmap link.
-  Meaning: this file is the implementation entry point and `docs/todo.md` links
-  to it.
+- [x] DONE: Ordered TODO as the single roadmap.
+  Meaning: this file is the implementation entry point for durability
+  fault-testing work. The older `docs/todo.md` roadmap has been folded into this
+  file and removed so future work has one source of truth.
 
 - [x] DONE: Suite plan extraction.
   Meaning: `suite_plan.rs` owns the pure `fault-suite-plan` model and plan
@@ -70,6 +71,98 @@ Status legend:
 - [x] DONE: Read-only artifact console exists.
   Meaning: `fault-console-json` and `fault-console-serve` inspect artifact
   roots.
+
+## Retired Roadmap Guardrails
+
+The old `docs/todo.md` roadmap is intentionally folded here. Keep these
+guardrails when implementing the ordered TODO below.
+
+### Bash And Rust Responsibility Boundary
+
+- [x] DONE: Rust owns suite planning and persists `suite-plan.json`.
+  Meaning: `s3chaos fault-suite-plan <suite.yaml>` is the destructive-plan
+  review surface before execution.
+
+- [ ] PARTIAL: Keep moving execution contract ownership into Rust.
+  Meaning: Rust should own suite planning, artifact layout, budget decisions,
+  and runtime validation. `scripts/fault-test.sh` should stay a thin operational
+  wrapper for shell-specific setup, build preparation, process supervision, and
+  cluster cleanup.
+
+- [ ] PARTIAL: Keep the plan output operator-reviewable.
+  Meaning: each attempt plan should include scenario, repetition, resolved fault
+  duration, selected fault, target, workload profile, expected backend, required
+  CRDs/tools, artifact paths, and budget impact before new YAML expressiveness is
+  added.
+
+### Suite YAML Contract Boundary
+
+- [x] DONE: Typed scenario parameters and reusable workload profiles exist.
+  Meaning: catalog-declared `params.kind` supports network delay/loss/corrupt/
+  duplicate, IO latency, CPU stress, and memory stress. Suite-level
+  `workloadProfiles` define reusable operation mix, payload distribution, and
+  hotspot behavior, while a scenario selects one with `workloadProfile`.
+
+- [x] DONE: Fault duration and suite budget have separate meanings.
+  Meaning: scenario `faultDuration` is only the injection window. The suite
+  `budgets.maxDuration` value is the protective attempt/suite budget.
+
+- [ ] PARTIAL: Keep YAML intent-oriented, not a raw backend passthrough.
+  Meaning: scenarios may declare safe parameter schemas such as network delay,
+  packet loss, IO fault mode, target policy, or stress intensity, but Rust must
+  continue to own supported fault semantics and reject unknown fields,
+  unsupported params, unsafe values, and scenario/backend mismatches before
+  destructive work starts.
+
+### Fault Backend Port Boundary
+
+- [x] DONE: Basic lifecycle orchestration is behind a fault-domain port.
+  Meaning: apply, wait-active, snapshot, delete, and cleanup are modeled through
+  lifecycle abstractions instead of being suite-parser behavior.
+
+- [ ] PARTIAL: Keep backend-specific state out of suite parsing and planning.
+  Meaning: Chaos Mesh, device-mapper, pod disruption, and future backends should
+  remain adapters behind the fault-domain port. Backend-specific manifests,
+  commands, status parsing, identity capture, and cleanup details must not define
+  the user-facing suite contract.
+
+- [ ] PARTIAL: Defer new backend families until the parameter model is stable.
+  Meaning: adding more backends before scenario params are settled would let
+  adapters leak semantics into YAML. New backend work should start from the
+  catalog/spec boundary.
+
+### RustFS Reliability Coverage Boundary
+
+- [ ] PARTIAL: Versioned workload foundation exists, but the reliability plan is
+  not implemented yet.
+  Meaning: current executable catalog scenarios still mostly cover
+  inject-recover-verify faults. The stateful RustFS reliability flows remain in
+  the ordered TODO below: quorum P/P+1, fresh volume replacement, admin heal/
+  decommission/rebalance, on-disk bitrot, stale disk, dangling cleanup, and
+  long-run campaigns.
+
+- [ ] TODO: Keep admin operations as scenario-owned product/recovery steps.
+  Meaning: RustFS admin APIs such as heal, decommission, and rebalance should be
+  orchestrated by scenarios and observed through workload/history/checker
+  verdicts. They are not generic fault backend behavior. Decommission needs a
+  multi-pool Tenant shape first.
+
+### Console And Reporting Boundary
+
+- [x] DONE: Read-only artifact inspection exists.
+  Meaning: the console can inspect artifact roots without becoming an execution
+  control plane.
+
+- [ ] PARTIAL: Keep shaping stable structured report JSON for the console.
+  Meaning: suite summaries should link plans, live attempt status, artifact
+  locations, health-guard decisions, final verdicts, run specs, event streams,
+  checker reports, workload summaries, and fault evidence. `failures[]` is the
+  ordered failure index, and `stopReason` points to the failure that stopped the
+  suite early.
+
+- [ ] TODO: Keep execution CLI-only until control-plane safety is explicit.
+  Meaning: the console must remain read-only until authorization, audit,
+  cancellation, and blast-radius controls are designed and implemented.
 
 ## Implementation Order
 
