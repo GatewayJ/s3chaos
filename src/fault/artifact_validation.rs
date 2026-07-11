@@ -30,6 +30,7 @@ use crate::fault::{
         DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS,
     },
     events::{RunEvent, RunEventStatus},
+    preflight::{PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus},
     reporting::{
         AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity, FailureVerdict,
         ResponsibilityDomain, is_s3_model_classification,
@@ -66,6 +67,27 @@ pub struct ArtifactValidationReport {
     pub required_artifacts: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactValidationStatus {
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ArtifactValidationFileReport {
+    pub schema_version: u8,
+    pub status: ArtifactValidationStatus,
+    pub scenario: String,
+    pub artifact_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub case_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ArtifactValidationReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
 impl ArtifactValidationReport {
     pub fn validation_summary_tsv_row(&self) -> String {
         format!(
@@ -73,6 +95,70 @@ impl ArtifactValidationReport {
             self.scenario, self.seed, self.client_disruptions, self.recommitted, self.committed
         )
     }
+}
+
+pub fn validate_fault_artifacts_and_write_report(
+    options: &ArtifactValidationOptions,
+) -> Result<ArtifactValidationReport> {
+    match validate_fault_artifacts(options) {
+        Ok(report) => {
+            write_artifact_validation_file_report(
+                options,
+                Some(&report.case_name),
+                &ArtifactValidationFileReport {
+                    schema_version: 1,
+                    status: ArtifactValidationStatus::Passed,
+                    scenario: options.scenario.clone(),
+                    artifact_root: options.artifact_root.display().to_string(),
+                    case_name: Some(report.case_name.clone()),
+                    validation: Some(report.clone()),
+                    errors: Vec::new(),
+                },
+            )
+            .context("write artifact-validation-report.json")?;
+            Ok(report)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let case_name = scenarios::scenario_spec(&options.scenario)
+                .ok()
+                .map(|spec| spec.case_name.to_string());
+            let report = ArtifactValidationFileReport {
+                schema_version: 1,
+                status: ArtifactValidationStatus::Failed,
+                scenario: options.scenario.clone(),
+                artifact_root: options.artifact_root.display().to_string(),
+                case_name: case_name.clone(),
+                validation: None,
+                errors: vec![message],
+            };
+            write_artifact_validation_file_report(options, case_name.as_deref(), &report)
+                .context("write artifact-validation-report.json after validation failure")?;
+            Err(error)
+        }
+    }
+}
+
+fn write_artifact_validation_file_report(
+    options: &ArtifactValidationOptions,
+    case_name: Option<&str>,
+    report: &ArtifactValidationFileReport,
+) -> Result<()> {
+    let dir = case_name
+        .map(|case_name| options.artifact_root.join(case_name))
+        .unwrap_or_else(|| options.artifact_root.clone());
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("create artifact validation report dir {}", dir.display()))?;
+    fs::write(
+        dir.join("artifact-validation-report.json"),
+        serde_json::to_string_pretty(report)?,
+    )
+    .with_context(|| {
+        format!(
+            "write artifact validation report {}",
+            dir.join("artifact-validation-report.json").display()
+        )
+    })
 }
 
 impl ArtifactValidationOptions {
@@ -198,6 +284,12 @@ pub fn validate_fault_artifacts(
     );
     validate_run_spec(&json_spec, options)?;
 
+    let preflight_summary =
+        read_json::<PreflightSummary>(required(&artifacts, "preflight-summary.json")?)?;
+    validate_preflight_summary(&preflight_summary, options)?;
+    let target_proof = read_json::<TargetProof>(required(&artifacts, "target-proof.json")?)?;
+    validate_target_proof(&target_proof, &json_spec, options)?;
+
     let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
     ensure!(
         has_event(&events, "run", RunEventStatus::Started)
@@ -227,6 +319,7 @@ pub fn validate_fault_artifacts(
         evidence.require_client_disruption,
         metadata.require_client_disruption
     );
+    validate_fault_window_evidence(&evidence)?;
 
     let prechecker =
         read_json::<CheckerReport>(required(&artifacts, "checker-pre-recommit-report.json")?)?;
@@ -364,9 +457,151 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
             "run-spec fault {} has zero selection value",
             fault.name
         );
+        ensure!(
+            fault.target_proof.required && fault.target_proof.artifact == "target-proof.json",
+            "run-spec fault {} must require target-proof.json",
+            fault.name
+        );
         validate_run_spec_target(&fault.name, &fault.target, options)?;
     }
     Ok(())
+}
+
+fn validate_preflight_summary(
+    summary: &PreflightSummary,
+    options: &ArtifactValidationOptions,
+) -> Result<()> {
+    ensure!(
+        summary.schema_version == 1,
+        "preflight-summary.json schema_version {} is unsupported",
+        summary.schema_version
+    );
+    ensure!(
+        summary.status == PreflightStatus::Passed,
+        "preflight-summary.json status must be passed for successful artifact validation"
+    );
+    ensure!(
+        summary
+            .scenario_set
+            .iter()
+            .any(|scenario| scenario == &options.scenario),
+        "preflight-summary.json scenario_set does not include selected scenario {:?}",
+        options.scenario
+    );
+    ensure_nonempty(&summary.context, "preflight-summary.json context")?;
+    ensure_nonempty(&summary.namespace, "preflight-summary.json namespace")?;
+    ensure_nonempty(&summary.tenant, "preflight-summary.json tenant")?;
+    ensure_nonempty(
+        &summary.storage_class,
+        "preflight-summary.json storage_class",
+    )?;
+    ensure!(
+        summary
+            .phases
+            .iter()
+            .any(|phase| phase.name == "target-proof" && phase.status == PreflightStatus::Passed),
+        "preflight-summary.json must include passed target-proof phase"
+    );
+    Ok(())
+}
+
+fn validate_target_proof(
+    proof: &TargetProof,
+    spec: &FaultRunSpec,
+    options: &ArtifactValidationOptions,
+) -> Result<()> {
+    ensure!(
+        proof.schema_version == 1,
+        "target-proof.json schema_version {} is unsupported",
+        proof.schema_version
+    );
+    ensure!(
+        proof.status == TargetProofStatus::Satisfied,
+        "target-proof.json status must be satisfied for successful artifact validation"
+    );
+    ensure!(
+        proof.scenario == options.scenario,
+        "target-proof.json scenario {:?} does not match selected scenario {:?}",
+        proof.scenario,
+        options.scenario
+    );
+    ensure!(
+        proof.case_name == spec.scenario.case_name,
+        "target-proof.json case_name {:?} does not match run-spec case {:?}",
+        proof.case_name,
+        spec.scenario.case_name
+    );
+    ensure!(
+        proof.run_id == spec.metadata.run_id,
+        "target-proof.json run_id {:?} does not match run-spec run_id {:?}",
+        proof.run_id,
+        spec.metadata.run_id
+    );
+    ensure!(
+        proof.faults.len() == spec.faults.len(),
+        "target-proof.json faults length {} does not match run-spec faults length {}",
+        proof.faults.len(),
+        spec.faults.len()
+    );
+    ensure!(
+        !proof.requirements.is_empty(),
+        "target-proof.json must record target requirements"
+    );
+    ensure!(
+        proof
+            .requirements
+            .iter()
+            .all(|requirement| requirement.status == PreflightStatus::Passed),
+        "target-proof.json includes failed target requirements"
+    );
+    if proof
+        .faults
+        .iter()
+        .any(|fault| fault.pod_selector.is_some())
+    {
+        ensure!(
+            !proof.resolved_pods.is_empty()
+                && proof.faults.iter().all(|fault| {
+                    fault
+                        .pod_selector
+                        .as_ref()
+                        .is_none_or(|selector| selector.exact_pods_resolved)
+                }),
+            "target-proof.json selector targets must include resolved current pods"
+        );
+        ensure!(
+            proof
+                .resolved_pods
+                .iter()
+                .all(|pod| pod.node.as_deref().is_some_and(|node| !node.is_empty())),
+            "target-proof.json selector targets must include target pod nodes"
+        );
+    }
+    if proof.faults.iter().any(|fault| fault.volume_path.is_some()) {
+        ensure!(
+            proof.resolved_pods.iter().all(target_pod_has_bound_volume),
+            "target-proof.json volume targets must include pod PVC/PV/node/device-or-path bindings"
+        );
+    }
+    Ok(())
+}
+
+fn target_pod_has_bound_volume(pod: &crate::fault::preflight::TargetResolvedPodProof) -> bool {
+    !pod.persistent_volume_claims.is_empty()
+        && pod.persistent_volume_claims.iter().all(|claim| {
+            claim
+                .volume_name
+                .as_deref()
+                .is_some_and(|volume| !volume.is_empty())
+                && claim.persistent_volume.as_ref().is_some_and(|pv| {
+                    !pv.name.is_empty()
+                        && pv.node.as_deref().is_some_and(|node| !node.is_empty())
+                        && pv
+                            .device_or_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty())
+                })
+        })
 }
 
 fn validate_run_spec_target(
@@ -405,6 +640,10 @@ fn validate_checker_report(
         expected_versioning
     );
     ensure!(
+        !report.operation_cohorts.is_empty(),
+        "{name} must include operation_cohorts derived from history.jsonl"
+    );
+    ensure!(
         report.missing_committed_objects.is_empty()
             && report.unavailable_committed_objects.is_empty()
             && report.unknown_committed_read_failures.is_empty()
@@ -423,6 +662,41 @@ fn validate_checker_report(
             && report.resurrected_deleted_objects.is_empty()
             && report.tenant_recovered,
         "{name} contains a non-clean checker verdict"
+    );
+    Ok(())
+}
+
+fn validate_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Result<()> {
+    let apply_started = evidence
+        .fault_apply_started_at_ms
+        .context("fault-evidence.json fault_apply_started_at_ms is required")?;
+    let active = evidence
+        .fault_active_at_ms
+        .context("fault-evidence.json fault_active_at_ms is required")?;
+    let workload_started = evidence
+        .workload_started_at_ms
+        .context("fault-evidence.json workload_started_at_ms is required")?;
+    let workload_ended = evidence
+        .workload_ended_at_ms
+        .context("fault-evidence.json workload_ended_at_ms is required")?;
+    let delete_started = evidence
+        .fault_delete_started_at_ms
+        .context("fault-evidence.json fault_delete_started_at_ms is required")?;
+    let recovery_started = evidence
+        .recovery_started_at_ms
+        .context("fault-evidence.json recovery_started_at_ms is required")?;
+    let recovery_ended = evidence
+        .recovery_ended_at_ms
+        .context("fault-evidence.json recovery_ended_at_ms is required")?;
+
+    ensure!(
+        apply_started <= active
+            && active <= workload_started
+            && workload_started <= workload_ended
+            && workload_ended <= delete_started
+            && delete_started <= recovery_started
+            && recovery_started <= recovery_ended,
+        "fault-evidence.json fault window timestamps are not monotonic"
     );
     Ok(())
 }
@@ -931,6 +1205,20 @@ struct FaultEvidenceArtifact {
     client_disruptions: usize,
     active_snapshots: Vec<Value>,
     workload_snapshots: Vec<Value>,
+    #[serde(default)]
+    fault_apply_started_at_ms: Option<u64>,
+    #[serde(default)]
+    fault_active_at_ms: Option<u64>,
+    #[serde(default)]
+    workload_started_at_ms: Option<u64>,
+    #[serde(default)]
+    workload_ended_at_ms: Option<u64>,
+    #[serde(default)]
+    fault_delete_started_at_ms: Option<u64>,
+    #[serde(default)]
+    recovery_started_at_ms: Option<u64>,
+    #[serde(default)]
+    recovery_ended_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1021,7 +1309,8 @@ impl OutcomeCountsArtifact {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactValidationOptions, FailureSummaryArtifact, recursive_find, validate_fault_artifacts,
+        ArtifactValidationOptions, FailureSummaryArtifact, recursive_find,
+        validate_fault_artifacts, validate_fault_artifacts_and_write_report,
     };
     use crate::fault::{
         reporting::{
@@ -1057,6 +1346,33 @@ mod tests {
             report.validation_summary_tsv_row(),
             "io-eio\t42\t0\t2\t1\t7\t0\t0\t0\t0\ttrue"
         );
+    }
+
+    #[test]
+    fn validation_wrapper_writes_report_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        validate_fault_artifacts_and_write_report(&options).expect("valid artifacts");
+
+        let report_path = dir
+            .path()
+            .join("fault_io_eio_preserves_committed_objects")
+            .join("artifact-validation-report.json");
+        let report = fs::read_to_string(report_path).expect("report");
+        assert!(report.contains("\"status\": \"passed\""));
+        assert!(report.contains("\"schema_version\": 1"));
     }
 
     #[test]
@@ -1854,6 +2170,7 @@ mod tests {
                 "kind": "rustfs-volume-io-error",
                 "backend": "chaos-mesh-io-chaos",
                 "target": {"kind": "rustfs-volume", "path": "/data/rustfs0"},
+                "target_proof": {"required": true, "artifact": "target-proof.json"},
                 "selection": {"kind": "percent", "value": 20},
                 "fault_duration_seconds": 60,
                 "observability": "chaos",
@@ -1878,6 +2195,82 @@ mod tests {
                 json!({"at_ms":3,"scenario":scenario,"run_id":"run-1","stage":"run","status":"succeeded","message":"done"}).to_string(),
             ].join("\n"),
         ).expect("write events");
+        write_json(
+            &case_dir,
+            "preflight-summary.json",
+            &json!({
+                "schemaVersion": 1,
+                "status": "passed",
+                "scenarioSet": [scenario],
+                "checkedAtMs": 1,
+                "context": "real-cluster",
+                "namespace": "rustfs-fault-test",
+                "tenant": "fault-test-tenant",
+                "storageClass": "fast-csi",
+                "phases": [{
+                    "name": "target-proof",
+                    "status": "passed",
+                    "checks": [{
+                        "name": "target_proof",
+                        "status": "passed",
+                        "responsibilityDomain": "harness",
+                        "message": "target proof artifact describes every planned fault target"
+                    }]
+                }]
+            }),
+        );
+        write_json(
+            &case_dir,
+            "target-proof.json",
+            &json!({
+                "schemaVersion": 1,
+                "status": "satisfied",
+                "proofLevel": "selector_intent",
+                "generatedAtMs": 1,
+                "scenario": scenario,
+                "caseName": "fault_io_eio_preserves_committed_objects",
+                "runId": "run-1",
+                "namespace": "rustfs-fault-test",
+                "tenant": "fault-test-tenant",
+                "resolvedPods": [{
+                    "name": "p0",
+                    "uid": "u0",
+                    "node": "node-a",
+                    "persistentVolumeClaims": [{
+                        "name": "data-p0",
+                        "volumeName": "pv-a",
+                        "storageClass": "fast-csi",
+                        "persistentVolume": {
+                            "name": "pv-a",
+                            "node": "node-a",
+                            "deviceOrPath": "/mnt/rustfs0"
+                        }
+                    }]
+                }],
+                "faults": [{
+                    "name": "io-eio-00-rustfs-volume-io-error",
+                    "kind": "rustfs-volume-io-error",
+                    "backend": "chaos-mesh-io-chaos",
+                    "targetKind": "rustfs-volume",
+                    "targetSummary": "one RustFS volume at /data/rustfs0",
+                    "selection": "20%",
+                    "conflictDomain": "run-scoped IOChaos",
+                    "podSelector": {
+                        "namespace": "rustfs-fault-test",
+                        "tenant": "fault-test-tenant",
+                        "selector": "rustfs.tenant=fault-test-tenant",
+                        "exactPodsResolved": true,
+                        "note": "preflight resolved current RustFS target pods"
+                    },
+                    "volumePath": "/data/rustfs0"
+                }],
+                "requirements": [{
+                    "name": "catalog_target_intent",
+                    "status": "passed",
+                    "message": "one RustFS container data volume"
+                }]
+            }),
+        );
         write_json(
             &case_dir,
             "run-metadata.json",
@@ -1950,6 +2343,8 @@ mod tests {
             "successful_corrupted_reads": [],
             "unexpected_visible_deleted_objects": [],
             "unknown_writes_materialized": [],
+            "operation_cohorts": {"pre_fault": 12, "fault_active": 8, "post_recovery": 4},
+            "fault_window_relations": {"during_fault": 8, "after_fault": 4},
             "list_history_warning_count": 0,
             "final_list_warning_count": 0,
             "list_history_warnings": [],
@@ -1977,7 +2372,14 @@ mod tests {
                 "pods_after": [{"name": "p0", "uid": "u0"}],
                 "active_snapshots": [{"stage": "active"}],
                 "workload_snapshots": [{"stage": "after-workload"}],
-                "dm_recovery_snapshot": null
+                "dm_recovery_snapshot": null,
+                "fault_apply_started_at_ms": 10,
+                "fault_active_at_ms": 20,
+                "workload_started_at_ms": 30,
+                "workload_ended_at_ms": 40,
+                "fault_delete_started_at_ms": 50,
+                "recovery_started_at_ms": 60,
+                "recovery_ended_at_ms": 70
             }),
         );
     }

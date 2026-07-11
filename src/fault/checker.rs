@@ -75,6 +75,10 @@ pub struct CheckerReport {
     /// these are recorded for audit but do not fail the run.
     #[serde(default)]
     pub tolerated_ambiguous_deletes: Vec<String>,
+    #[serde(default)]
+    pub operation_cohorts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub fault_window_relations: BTreeMap<String, usize>,
     pub tenant_recovered: bool,
     pub passed: bool,
 }
@@ -258,6 +262,8 @@ pub async fn check_s3_history(
         missing_committed_delete_markers: Vec::new(),
         resurrected_deleted_objects: Vec::new(),
         tolerated_ambiguous_deletes: Vec::new(),
+        operation_cohorts: operation_cohort_counts(&initial_records),
+        fault_window_relations: fault_window_relation_counts(&initial_records),
         tenant_recovered,
         passed: false,
     };
@@ -1425,6 +1431,25 @@ fn has_list_unavailable_or_unknown_signal(report: &CheckerReport) -> bool {
     report.final_list_warning_count > 0 && !final_list_content_corruption_signal(report)
 }
 
+fn operation_cohort_counts(records: &[OperationRecord]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for cohort in records.iter().filter_map(|record| record.durability_cohort) {
+        *counts.entry(cohort.as_str().to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn fault_window_relation_counts(records: &[OperationRecord]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for relation in records
+        .iter()
+        .filter_map(|record| record.fault_window_relation)
+    {
+        *counts.entry(relation.as_str().to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
 fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
     let mut evidence = Vec::new();
     evidence.extend(
@@ -1896,7 +1921,7 @@ mod tests {
     };
     use crate::fault::history::{OperationKind, OperationOutcome, OperationRecord};
     use crate::fault::workload::{GetObjectResult, sha256_hex};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn record(
         id: &str,
@@ -1920,6 +1945,8 @@ mod tests {
             http_status: Some(200),
             error: None,
             listed_keys: None,
+            durability_cohort: None,
+            fault_window_relation: None,
         }
     }
 
@@ -1961,6 +1988,8 @@ mod tests {
             outcome: OperationOutcome::Ok,
             http_status: Some(200),
             error: None,
+            durability_cohort: None,
+            fault_window_relation: None,
         }
     }
 
@@ -3158,6 +3187,8 @@ mod tests {
             missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
             tolerated_ambiguous_deletes: Vec::new(),
+            operation_cohorts: BTreeMap::new(),
+            fault_window_relations: BTreeMap::new(),
             tenant_recovered: true,
             passed: true,
         };
@@ -3197,6 +3228,8 @@ mod tests {
             missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
             tolerated_ambiguous_deletes: Vec::new(),
+            operation_cohorts: BTreeMap::new(),
+            fault_window_relations: BTreeMap::new(),
             tenant_recovered: true,
             passed: false,
         }
