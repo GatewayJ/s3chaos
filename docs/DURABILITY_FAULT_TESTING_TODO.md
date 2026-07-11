@@ -1,8 +1,9 @@
 # RustFS Durability Fault Testing TODO
 
-This TODO turns `DURABILITY_FAULT_TESTING_DESIGN.md` plus the PR #15 review
-feedback into an implementation order. It is intentionally ordered by the
-highest-risk false-green controls first, not by the original phase numbering.
+This TODO is the source of truth for the RustFS durability fault-testing work.
+It folds the earlier durability/crash-consistency design discussion and the
+PR #15 review feedback into an implementation order. Future work should follow
+this file in order unless a new blocker changes the risk ranking.
 
 Status legend:
 
@@ -15,8 +16,8 @@ Status legend:
 
 ## Current Implemented Baseline
 
-- [x] DONE: Design document and roadmap link.
-  Meaning: `DURABILITY_FAULT_TESTING_DESIGN.md` exists and `docs/todo.md` links
+- [x] DONE: Ordered TODO and roadmap link.
+  Meaning: this file is the implementation entry point and `docs/todo.md` links
   to it.
 
 - [x] DONE: Suite plan extraction.
@@ -68,17 +69,16 @@ Status legend:
 
 - [x] DONE: Read-only artifact console exists.
   Meaning: `fault-console-json` and `fault-console-serve` inspect artifact
-  roots. The design document still needs to stop calling this a future surface.
+  roots.
 
 ## Implementation Order
 
-### 1. Reconcile Design And Current Code Before More Feature Work
+### 1. Keep This TODO And Current Code Aligned Before More Feature Work
 
-- [ ] TODO: Update the design document's current-status claims.
-  Meaning: remove stale claims that the console is future-only, that LIST
-  warnings still always promote to `data_corruption`, or that suite planning and
-  failure-summary v2 are still only proposed. This avoids duplicate work by
-  future contributors.
+- [x] DONE: Remove the stale long-form roadmap from this PR.
+  Meaning: this TODO is now the only durability fault-testing work queue in
+  `docs/`. Future status drift should be corrected here instead of maintaining a
+  second roadmap.
 
 - [ ] TODO: Make failure-summary v2 additions explicitly optional until v3.
   Meaning: `schema_version=2` already exists. New fields that would invalidate
