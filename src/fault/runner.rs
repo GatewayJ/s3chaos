@@ -28,11 +28,13 @@ use crate::{
             FaultDeleteTimeoutRecoveryRequest, FaultLifecyclePort,
         },
         fixture,
-        history::{OperationOutcome, OperationRecord, Recorder},
+        history::{DurabilityCohort, OperationOutcome, OperationRecord, Recorder},
         plan::{FaultInjection, FaultPlan, FaultPlanOptions},
         pods::{
-            rustfs_pod_identities, wait_for_rustfs_pod_deletion, wait_for_rustfs_pod_replacement,
+            rustfs_pod_identities, rustfs_target_inventory, wait_for_rustfs_pod_deletion,
+            wait_for_rustfs_pod_replacement,
         },
+        preflight::{PreflightCheck, PreflightPhase, PreflightSummary, TargetProof},
         reporting::{
             FailureSummary, FaultEvidence, FaultStatusSnapshot, PodIdentity, RunMetadata,
             write_checker_error, write_failure_summary, write_failure_summary_if_absent,
@@ -59,7 +61,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use kube::core::DynamicObject;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep as async_sleep;
 use uuid::Uuid;
 
@@ -143,6 +145,7 @@ async fn run_fault_case(
     } = initialize_fault_run(config, collector, scenario, plan)?;
     let mut run_completion =
         events.completion_guard("run", "fault run failed before successful completion");
+    let mut preflight_phases = Vec::new();
 
     events.record(
         "fault-backend-preflight",
@@ -151,6 +154,15 @@ async fn run_fault_case(
         None,
     )?;
     if let Err(error) = require_fault_backends(config, plan) {
+        preflight_phases.push(PreflightPhase::new(
+            "fault-backend-preflight",
+            vec![PreflightCheck::failed(
+                "required_fault_backends",
+                error.to_string(),
+                crate::fault::reporting::ResponsibilityDomain::FaultBackend,
+            )],
+        ));
+        write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
         events
             .record(
                 "fault-backend-preflight",
@@ -171,6 +183,15 @@ async fn run_fault_case(
         )?;
         return Err(error);
     }
+    preflight_phases.push(PreflightPhase::new(
+        "fault-backend-preflight",
+        vec![PreflightCheck::passed(
+            "required_fault_backends",
+            "required fault backends are available",
+            crate::fault::reporting::ResponsibilityDomain::FaultBackend,
+        )],
+    ));
+    write_preflight_summary(collector, scenario, config, &preflight_phases)?;
     events.record(
         "fault-backend-preflight",
         RunEventStatus::Succeeded,
@@ -184,6 +205,15 @@ async fn run_fault_case(
         None,
     )?;
     if let Err(error) = cleanup_fault_backends(config, plan) {
+        preflight_phases.push(PreflightPhase::new(
+            "fault-backend-pre-cleanup",
+            vec![PreflightCheck::failed(
+                "stale_fault_cleanup",
+                error.to_string(),
+                crate::fault::reporting::ResponsibilityDomain::FaultBackend,
+            )],
+        ));
+        write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
         events
             .record(
                 "fault-backend-pre-cleanup",
@@ -204,6 +234,15 @@ async fn run_fault_case(
         )?;
         return Err(error);
     }
+    preflight_phases.push(PreflightPhase::new(
+        "fault-backend-pre-cleanup",
+        vec![PreflightCheck::passed(
+            "stale_fault_cleanup",
+            "stale managed fault resources were removed",
+            crate::fault::reporting::ResponsibilityDomain::FaultBackend,
+        )],
+    ));
+    write_preflight_summary(collector, scenario, config, &preflight_phases)?;
     events.record(
         "fault-backend-pre-cleanup",
         RunEventStatus::Succeeded,
@@ -558,22 +597,88 @@ async fn run_fault_case(
         "pre-fault objects were written and verified",
         Some(serde_json::json!({ "objects": prefilled.len() })),
     )?;
-    let pods_before = match rustfs_pod_identities(cluster) {
-        Ok(pods) => pods,
-        Err(error) => {
-            write_failure_summary(
-                collector,
-                scenario.case_name,
-                FailureSummary::new(
-                    &scenario.name,
-                    "pod-identity-before-fault",
-                    "test_or_environment",
-                    error.to_string(),
-                ),
-            )?;
-            return Err(error);
-        }
-    };
+    events.record(
+        "target-preflight",
+        RunEventStatus::Started,
+        "validating planned fault target proof",
+        Some(serde_json::json!({
+            "include_volume_bindings": plan_requires_volume_bindings(plan),
+        })),
+    )?;
+    let target_inventory =
+        match rustfs_target_inventory(cluster, plan_requires_volume_bindings(plan)) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                preflight_phases.push(PreflightPhase::new(
+                    "target-proof",
+                    vec![PreflightCheck::failed(
+                        "target_inventory",
+                        error.to_string(),
+                        crate::fault::reporting::ResponsibilityDomain::Harness,
+                    )],
+                ));
+                write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+                events
+                    .record(
+                        "target-preflight",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "target-preflight",
+                        "test_or_environment",
+                        error.to_string(),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
+    let pods_before = target_inventory.identities;
+    let target_proof = TargetProof::from_plan(config, scenario, spec, plan, &run_id)
+        .with_resolved_pod_proofs(target_inventory.pod_proofs);
+    collector.write_text(
+        scenario.case_name,
+        "target-proof.json",
+        &serde_json::to_string_pretty(&target_proof)?,
+    )?;
+    preflight_phases.push(PreflightPhase::new(
+        "target-proof",
+        vec![target_proof.preflight_check()],
+    ));
+    write_preflight_summary(collector, scenario, config, &preflight_phases)?;
+    if let Err(error) = target_proof.require_satisfied() {
+        events
+            .record(
+                "target-preflight",
+                RunEventStatus::Failed,
+                error.to_string(),
+                None,
+            )
+            .ok();
+        write_failure_summary(
+            collector,
+            scenario.case_name,
+            FailureSummary::new(
+                &scenario.name,
+                "target-preflight",
+                "preflight_failed",
+                error.to_string(),
+            ),
+        )?;
+        return Err(error);
+    }
+    events.record(
+        "target-preflight",
+        RunEventStatus::Succeeded,
+        "planned fault target proof is satisfied",
+        None,
+    )?;
     events.record(
         "fault-apply",
         RunEventStatus::Started,
@@ -583,6 +688,7 @@ async fn run_fault_case(
             "backend": plan.backend_summary(),
         })),
     )?;
+    let fault_apply_started_at_ms = now_ms();
     let mut fault = match AppliedFaults::apply(config, collector, scenario, plan, &run_id) {
         Ok(fault) => fault,
         Err(error) => {
@@ -642,6 +748,7 @@ async fn run_fault_case(
         )?;
         return Err(error);
     }
+    let fault_active_at_ms = history.mark_fault_active_now();
     events.record(
         "wait-active",
         RunEventStatus::Succeeded,
@@ -821,6 +928,8 @@ async fn run_fault_case(
             "concurrency": workload_plan.concurrency,
         })),
     )?;
+    let workload_started_at_ms = now_ms();
+    history.set_durability_cohort(DurabilityCohort::FaultActive);
     let mut workload = match run_mixed_workload(
         &s3,
         &history,
@@ -856,6 +965,7 @@ async fn run_fault_case(
             return Err(error);
         }
     };
+    let workload_ended_at_ms = now_ms();
     events.record(
         "mixed-workload",
         RunEventStatus::Succeeded,
@@ -987,6 +1097,7 @@ async fn run_fault_case(
         "removing applied faults",
         None,
     )?;
+    let fault_delete_started_at_ms = history.mark_fault_ended_now();
     let fault_delete_started_at = Instant::now();
     if let Err(error) = fault.delete(cluster.timeout) {
         let finalizer_recovery = match fault.recover_delete_timeout(
@@ -1057,6 +1168,8 @@ async fn run_fault_case(
         "waiting for Tenant readiness after fault removal",
         None,
     )?;
+    let recovery_started_at_ms = now_ms();
+    history.set_durability_cohort(DurabilityCohort::PostRecovery);
     if let Err(error) = wait_for_ready_tenant(cluster).await {
         events
             .record(
@@ -1160,6 +1273,7 @@ async fn run_fault_case(
         "S3 endpoint is reachable after recovery",
         Some(serde_json::json!({ "endpoint": endpoint })),
     )?;
+    let recovery_ended_at_ms = now_ms();
     let recovered_evidence = FaultEvidence {
         scenario: scenario.name.clone(),
         backend: plan.backend_summary(),
@@ -1175,6 +1289,13 @@ async fn run_fault_case(
         active_snapshots: active_snapshots.clone(),
         workload_snapshots: workload_snapshots.clone(),
         dm_recovery_snapshot: fault.recovery_dm_snapshot(),
+        fault_apply_started_at_ms: Some(fault_apply_started_at_ms),
+        fault_active_at_ms: Some(fault_active_at_ms),
+        workload_started_at_ms: Some(workload_started_at_ms),
+        workload_ended_at_ms: Some(workload_ended_at_ms),
+        fault_delete_started_at_ms: Some(fault_delete_started_at_ms),
+        recovery_started_at_ms: Some(recovery_started_at_ms),
+        recovery_ended_at_ms: Some(recovery_ended_at_ms),
     };
     collector.write_text(
         scenario.case_name,
@@ -1456,6 +1577,13 @@ async fn run_fault_case(
         active_snapshots,
         workload_snapshots,
         dm_recovery_snapshot: fault.recovery_dm_snapshot(),
+        fault_apply_started_at_ms: Some(fault_apply_started_at_ms),
+        fault_active_at_ms: Some(fault_active_at_ms),
+        workload_started_at_ms: Some(workload_started_at_ms),
+        workload_ended_at_ms: Some(workload_ended_at_ms),
+        fault_delete_started_at_ms: Some(fault_delete_started_at_ms),
+        recovery_started_at_ms: Some(recovery_started_at_ms),
+        recovery_ended_at_ms: Some(recovery_ended_at_ms),
     };
     collector.write_text(
         scenario.case_name,
@@ -1584,6 +1712,30 @@ fn initialize_fault_run(
         bucket,
         events,
         history,
+    })
+}
+
+fn write_preflight_summary(
+    collector: &ArtifactCollector,
+    scenario: &FaultScenario,
+    config: &FaultTestConfig,
+    phases: &[PreflightPhase],
+) -> Result<()> {
+    let summary = PreflightSummary::single_run(config, &scenario.name, phases.to_vec());
+    collector.write_text(
+        scenario.case_name,
+        "preflight-summary.json",
+        &serde_json::to_string_pretty(&summary)?,
+    )?;
+    Ok(())
+}
+
+fn plan_requires_volume_bindings(plan: &FaultPlan) -> bool {
+    plan.faults().iter().any(|fault| {
+        matches!(
+            fault.target(),
+            crate::fault::plan::FaultTarget::RustfsVolume { .. }
+        )
     })
 }
 
@@ -3440,6 +3592,13 @@ fn generated_seed() -> u64 {
     let mut bytes = [0; 8];
     bytes.copy_from_slice(&run.as_bytes()[..8]);
     u64::from_le_bytes(bytes)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn warp_bucket_name(run_id: &str) -> String {

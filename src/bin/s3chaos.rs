@@ -18,7 +18,7 @@ mod console_server;
 
 use console_server::serve_console;
 use s3chaos::fault::{
-    artifact_validation::{ArtifactValidationOptions, validate_fault_artifacts},
+    artifact_validation::{ArtifactValidationOptions, validate_fault_artifacts_and_write_report},
     console::build_console_snapshot,
     runner::run_selected_scenario_from_env,
     scenarios::scenario_catalog_json,
@@ -227,7 +227,7 @@ fn validate_fault_artifacts_command(mut args: impl Iterator<Item = String>) -> R
         }
     }
     let options = ArtifactValidationOptions::from_env(scenario, artifact_root)?;
-    let report = validate_fault_artifacts(&options)?;
+    let report = validate_fault_artifacts_and_write_report(&options)?;
     if summary_tsv {
         println!("{}", report.validation_summary_tsv_row());
     } else {

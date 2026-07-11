@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::fault::{
-    artifact_validation::{ArtifactValidationOptions, validate_fault_artifacts},
+    artifact_validation::{ArtifactValidationOptions, validate_fault_artifacts_and_write_report},
     config::FaultTestConfig,
     reporting::{FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain},
     runner::run_scenario_with_config,
@@ -402,7 +402,7 @@ fn validate_attempt_artifacts(
         expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
         expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
     };
-    validate_fault_artifacts(&options)
+    validate_fault_artifacts_and_write_report(&options)
 }
 
 fn write_attempt_started(

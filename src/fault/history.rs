@@ -47,6 +47,46 @@ pub enum OperationOutcome {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurabilityCohort {
+    PreFault,
+    FaultActive,
+    PostRecovery,
+}
+
+impl DurabilityCohort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreFault => "pre_fault",
+            Self::FaultActive => "fault_active",
+            Self::PostRecovery => "post_recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultWindowRelation {
+    BeforeFault,
+    DuringFault,
+    AfterFault,
+    OverlapsFault,
+    Unknown,
+}
+
+impl FaultWindowRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeFault => "before_fault",
+            Self::DuringFault => "during_fault",
+            Self::AfterFault => "after_fault",
+            Self::OverlapsFault => "overlaps_fault",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub id: String,
@@ -65,6 +105,10 @@ pub struct OperationRecord {
     pub outcome: OperationOutcome,
     pub http_status: Option<u16>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability_cohort: Option<DurabilityCohort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault_window_relation: Option<FaultWindowRelation>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,8 +122,16 @@ struct RecorderState {
     scenario: String,
     run_id: String,
     next_id: usize,
+    durability_cohort: DurabilityCohort,
+    fault_window: FaultWindow,
     records: Vec<OperationRecord>,
     writer: BufWriter<File>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct FaultWindow {
+    active_at_ms: Option<u64>,
+    ended_at_ms: Option<u64>,
 }
 
 impl Recorder {
@@ -99,6 +151,8 @@ impl Recorder {
                 scenario: scenario.into(),
                 run_id: run_id.into(),
                 next_id: 1,
+                durability_cohort: DurabilityCohort::PreFault,
+                fault_window: FaultWindow::default(),
                 records: Vec::new(),
                 writer,
             })),
@@ -133,6 +187,10 @@ impl Recorder {
             outcome: OperationOutcome::Unknown,
             http_status: None,
             error: None,
+            durability_cohort: Some(state.durability_cohort),
+            fault_window_relation: state
+                .fault_window
+                .relation_for(started_at_ms, started_at_ms),
         }
     }
 
@@ -149,6 +207,10 @@ impl Recorder {
         record.error = error.map(|message| truncate_error(&message));
 
         let mut state = self.state();
+        record.durability_cohort = Some(state.durability_cohort);
+        record.fault_window_relation = state
+            .fault_window
+            .relation_for(record.started_at_ms, record.ended_at_ms);
         serde_json::to_writer(&mut state.writer, &record)?;
         state.writer.write_all(b"\n")?;
         state.writer.flush()?;
@@ -172,10 +234,54 @@ impl Recorder {
         self.state().path.clone()
     }
 
+    pub fn set_durability_cohort(&self, cohort: DurabilityCohort) {
+        self.state().durability_cohort = cohort;
+    }
+
+    pub fn mark_fault_active_now(&self) -> u64 {
+        let at_ms = now_ms();
+        let mut state = self.state();
+        state.fault_window.active_at_ms = Some(at_ms);
+        state.fault_window.ended_at_ms = None;
+        state.durability_cohort = DurabilityCohort::FaultActive;
+        at_ms
+    }
+
+    pub fn mark_fault_ended_now(&self) -> u64 {
+        let at_ms = now_ms();
+        let mut state = self.state();
+        state.fault_window.ended_at_ms = Some(at_ms);
+        state.durability_cohort = DurabilityCohort::PostRecovery;
+        at_ms
+    }
+
     fn state(&self) -> MutexGuard<'_, RecorderState> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl FaultWindow {
+    fn relation_for(self, started_at_ms: u64, ended_at_ms: u64) -> Option<FaultWindowRelation> {
+        let active_at_ms = self.active_at_ms?;
+        let Some(fault_ended_at_ms) = self.ended_at_ms else {
+            return Some(if ended_at_ms < active_at_ms {
+                FaultWindowRelation::BeforeFault
+            } else {
+                FaultWindowRelation::DuringFault
+            });
+        };
+
+        if ended_at_ms < active_at_ms {
+            Some(FaultWindowRelation::BeforeFault)
+        } else if started_at_ms >= fault_ended_at_ms {
+            Some(FaultWindowRelation::AfterFault)
+        } else if started_at_ms >= active_at_ms && ended_at_ms <= fault_ended_at_ms {
+            Some(FaultWindowRelation::DuringFault)
+        } else {
+            Some(FaultWindowRelation::OverlapsFault)
+        }
     }
 }
 
@@ -204,7 +310,7 @@ fn truncate_error(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{OperationKind, OperationOutcome, Recorder};
+    use super::{DurabilityCohort, OperationKind, OperationOutcome, Recorder};
     use std::collections::BTreeSet;
 
     #[test]
@@ -276,6 +382,66 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(records.len(), 200);
         assert_eq!(ids.len(), 200);
+    }
+
+    #[test]
+    fn recorder_marks_durability_cohort_and_fault_window_relation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Recorder::create(dir.path().join("history.jsonl"), "io-eio", "run-1")
+            .expect("recorder");
+
+        let pre_fault = recorder.begin(
+            OperationKind::Put,
+            "bucket",
+            Some("pre".to_string()),
+            Some("hash".to_string()),
+            Some(4),
+        );
+        let pre_fault = recorder
+            .finish(pre_fault, OperationOutcome::Ok, Some(200), None)
+            .expect("pre fault");
+        recorder.mark_fault_active_now();
+        let active = recorder.begin(
+            OperationKind::Put,
+            "bucket",
+            Some("active".to_string()),
+            Some("hash".to_string()),
+            Some(4),
+        );
+        let active = recorder
+            .finish(active, OperationOutcome::Ok, Some(200), None)
+            .expect("active");
+        recorder.mark_fault_ended_now();
+        let post = recorder.begin(
+            OperationKind::Get,
+            "bucket",
+            Some("active".to_string()),
+            None,
+            None,
+        );
+        let post = recorder
+            .finish(post, OperationOutcome::Ok, Some(200), None)
+            .expect("post");
+
+        assert_eq!(
+            pre_fault.durability_cohort,
+            Some(DurabilityCohort::PreFault)
+        );
+        assert_eq!(
+            active.durability_cohort,
+            Some(DurabilityCohort::FaultActive)
+        );
+        assert_eq!(post.durability_cohort, Some(DurabilityCohort::PostRecovery));
+        assert_eq!(
+            active
+                .fault_window_relation
+                .map(|relation| relation.as_str()),
+            Some("during_fault")
+        );
+        assert_eq!(
+            post.fault_window_relation.map(|relation| relation.as_str()),
+            Some("after_fault")
+        );
     }
 
     #[test]
