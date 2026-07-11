@@ -1,0 +1,679 @@
+// Copyright 2025 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::fault::{
+    config::FaultTestConfig,
+    plan::{FaultPlan, FaultTarget},
+    reporting::ResponsibilityDomain,
+    scenarios::{FaultScenario, FaultScenarioSpec},
+};
+
+const PREFLIGHT_SUMMARY_SCHEMA_VERSION: u8 = 1;
+const TARGET_PROOF_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightStatus {
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreflightSummary {
+    pub schema_version: u8,
+    pub status: PreflightStatus,
+    pub scenario_set: Vec<String>,
+    pub checked_at_ms: u64,
+    pub context: String,
+    pub namespace: String,
+    pub tenant: String,
+    pub storage_class: String,
+    pub phases: Vec<PreflightPhase>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreflightPhase {
+    pub name: String,
+    pub status: PreflightStatus,
+    pub checks: Vec<PreflightCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreflightCheck {
+    pub name: String,
+    pub status: PreflightStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+    pub responsibility_domain: ResponsibilityDomain,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetProofStatus {
+    Satisfied,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetProofLevel {
+    SelectorIntent,
+    ConfiguredHostTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetProof {
+    pub schema_version: u8,
+    pub status: TargetProofStatus,
+    pub proof_level: TargetProofLevel,
+    pub generated_at_ms: u64,
+    pub scenario: String,
+    pub case_name: String,
+    pub run_id: String,
+    pub namespace: String,
+    pub tenant: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_pods: Vec<TargetResolvedPodProof>,
+    pub faults: Vec<TargetProofFault>,
+    pub requirements: Vec<TargetProofRequirement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetProofFault {
+    pub name: String,
+    pub kind: String,
+    pub backend: String,
+    pub target_kind: String,
+    pub target_summary: String,
+    pub selection: String,
+    pub conflict_domain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_selector: Option<TargetPodSelectorProof>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_target: Option<TargetHostProof>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub erasure_set: Option<TargetErasureSetProof>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetPodSelectorProof {
+    pub namespace: String,
+    pub tenant: String,
+    pub selector: String,
+    pub exact_pods_resolved: bool,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetResolvedPodProof {
+    pub name: String,
+    pub uid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persistent_volume_claims: Vec<TargetPersistentVolumeClaimProof>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetPersistentVolumeClaimProof {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistent_volume: Option<TargetPersistentVolumeProof>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetPersistentVolumeProof {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_or_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetHostProof {
+    pub node: String,
+    pub mapper_name: String,
+    pub mount_path: String,
+    pub has_fault_table: bool,
+    pub has_recovery_table: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetErasureSetProof {
+    pub required: bool,
+    pub resolved: bool,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetProofRequirement {
+    pub name: String,
+    pub status: PreflightStatus,
+    pub message: String,
+}
+
+impl PreflightSummary {
+    pub fn single_run(
+        config: &FaultTestConfig,
+        scenario: &str,
+        phases: Vec<PreflightPhase>,
+    ) -> Self {
+        let status = if phases
+            .iter()
+            .any(|phase| phase.status == PreflightStatus::Failed)
+        {
+            PreflightStatus::Failed
+        } else {
+            PreflightStatus::Passed
+        };
+
+        Self {
+            schema_version: PREFLIGHT_SUMMARY_SCHEMA_VERSION,
+            status,
+            scenario_set: vec![scenario.to_string()],
+            checked_at_ms: now_ms(),
+            context: config.cluster.context.clone(),
+            namespace: config.cluster.test_namespace.clone(),
+            tenant: config.cluster.tenant_name.clone(),
+            storage_class: config.cluster.storage_class.clone(),
+            phases,
+        }
+    }
+}
+
+impl PreflightPhase {
+    pub fn new(name: impl Into<String>, checks: Vec<PreflightCheck>) -> Self {
+        let status = if checks
+            .iter()
+            .any(|check| check.status == PreflightStatus::Failed)
+        {
+            PreflightStatus::Failed
+        } else {
+            PreflightStatus::Passed
+        };
+        Self {
+            name: name.into(),
+            status,
+            checks,
+        }
+    }
+}
+
+impl PreflightCheck {
+    pub fn passed(
+        name: impl Into<String>,
+        message: impl Into<String>,
+        responsibility_domain: ResponsibilityDomain,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: PreflightStatus::Passed,
+            expected: None,
+            actual: None,
+            responsibility_domain,
+            message: message.into(),
+        }
+    }
+
+    pub fn failed(
+        name: impl Into<String>,
+        message: impl Into<String>,
+        responsibility_domain: ResponsibilityDomain,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: PreflightStatus::Failed,
+            expected: None,
+            actual: None,
+            responsibility_domain,
+            message: message.into(),
+        }
+    }
+
+    pub fn with_expected_actual(
+        mut self,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
+        self.expected = Some(expected.into());
+        self.actual = Some(actual.into());
+        self
+    }
+}
+
+impl TargetProof {
+    pub fn from_plan(
+        config: &FaultTestConfig,
+        scenario: &FaultScenario,
+        spec: &FaultScenarioSpec,
+        plan: &FaultPlan,
+        run_id: &str,
+    ) -> Self {
+        let faults = plan
+            .faults()
+            .iter()
+            .enumerate()
+            .map(|(index, fault)| TargetProofFault {
+                name: format!("{}-{:02}-{}", scenario.name, index, fault.kind().as_str()),
+                kind: fault.kind().as_str().to_string(),
+                backend: fault.backend().as_str().to_string(),
+                target_kind: target_kind(fault.target()).to_string(),
+                target_summary: fault.target().summary(),
+                selection: fault.selection().summary(),
+                conflict_domain: spec.conflict_domain.to_string(),
+                pod_selector: pod_selector_proof(config, fault.target()),
+                volume_path: volume_path(fault.target()),
+                host_target: host_target_proof(config, fault.target()),
+                erasure_set: erasure_set_proof(spec),
+            })
+            .collect::<Vec<_>>();
+        let mut requirements = target_requirements(config, spec, plan);
+        if erasure_set_proof(spec).is_some() {
+            requirements.push(TargetProofRequirement {
+                name: "same_erasure_set_target_proof".to_string(),
+                status: PreflightStatus::Failed,
+                message: "same-erasure-set proof is not implemented".to_string(),
+            });
+        }
+        let status = if requirements
+            .iter()
+            .any(|requirement| requirement.status == PreflightStatus::Failed)
+        {
+            TargetProofStatus::Missing
+        } else {
+            TargetProofStatus::Satisfied
+        };
+        let proof_level = if faults.iter().any(|fault| fault.host_target.is_some()) {
+            TargetProofLevel::ConfiguredHostTarget
+        } else {
+            TargetProofLevel::SelectorIntent
+        };
+
+        Self {
+            schema_version: TARGET_PROOF_SCHEMA_VERSION,
+            status,
+            proof_level,
+            generated_at_ms: now_ms(),
+            scenario: scenario.name.clone(),
+            case_name: scenario.case_name.to_string(),
+            run_id: run_id.to_string(),
+            namespace: config.cluster.test_namespace.clone(),
+            tenant: config.cluster.tenant_name.clone(),
+            resolved_pods: Vec::new(),
+            faults,
+            requirements,
+        }
+    }
+
+    pub fn with_resolved_pods(self, pods: impl IntoIterator<Item = (String, String)>) -> Self {
+        let proofs = pods
+            .into_iter()
+            .map(|(name, uid)| TargetResolvedPodProof::new(name, uid))
+            .collect::<Vec<_>>();
+        self.with_resolved_pod_proofs(proofs)
+    }
+
+    pub fn with_resolved_pod_proofs(
+        mut self,
+        pods: impl IntoIterator<Item = TargetResolvedPodProof>,
+    ) -> Self {
+        self.resolved_pods = pods.into_iter().collect();
+        self.resolved_pods.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.uid.cmp(&right.uid))
+        });
+        for fault in &mut self.faults {
+            if let Some(selector) = &mut fault.pod_selector {
+                selector.exact_pods_resolved = !self.resolved_pods.is_empty();
+                selector.note = if selector.exact_pods_resolved {
+                    "preflight resolved current RustFS target pods; backend selectors still apply at injection time".to_string()
+                } else {
+                    "preflight proves selector intent but did not resolve current pods".to_string()
+                };
+            }
+        }
+        self.record_runtime_target_requirements();
+        self
+    }
+
+    pub fn preflight_check(&self) -> PreflightCheck {
+        match self.status {
+            TargetProofStatus::Satisfied => PreflightCheck::passed(
+                "target_proof",
+                "target proof artifact describes every planned fault target",
+                ResponsibilityDomain::Harness,
+            ),
+            TargetProofStatus::Missing => PreflightCheck::failed(
+                "target_proof",
+                "target proof is missing required target evidence",
+                ResponsibilityDomain::Harness,
+            ),
+        }
+    }
+
+    pub fn require_satisfied(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.status == TargetProofStatus::Satisfied,
+            "target-proof.json did not satisfy all target requirements"
+        );
+        Ok(())
+    }
+
+    fn record_runtime_target_requirements(&mut self) {
+        let requires_selector = self.faults.iter().any(|fault| fault.pod_selector.is_some());
+        let requires_volume_binding = self.faults.iter().any(|fault| fault.volume_path.is_some());
+        if requires_selector {
+            self.requirements.push(TargetProofRequirement {
+                name: "target_pods_resolved".to_string(),
+                status: if self.resolved_pods.is_empty() {
+                    PreflightStatus::Failed
+                } else {
+                    PreflightStatus::Passed
+                },
+                message: if self.resolved_pods.is_empty() {
+                    "no current RustFS pods matched the target selector".to_string()
+                } else {
+                    format!(
+                        "resolved {} current RustFS target pod(s)",
+                        self.resolved_pods.len()
+                    )
+                },
+            });
+            let pods_have_nodes = self
+                .resolved_pods
+                .iter()
+                .all(|pod| pod.node.as_deref().is_some_and(|node| !node.is_empty()));
+            self.requirements.push(TargetProofRequirement {
+                name: "target_pod_nodes_resolved".to_string(),
+                status: if pods_have_nodes {
+                    PreflightStatus::Passed
+                } else {
+                    PreflightStatus::Failed
+                },
+                message: if pods_have_nodes {
+                    "resolved target pod node placement".to_string()
+                } else {
+                    "target pod node placement is missing".to_string()
+                },
+            });
+        }
+        if requires_volume_binding {
+            let volume_bindings_resolved =
+                !self.resolved_pods.is_empty() && self.resolved_pods.iter().all(pod_has_bound_pv);
+            self.requirements.push(TargetProofRequirement {
+                name: "target_volume_bindings_resolved".to_string(),
+                status: if volume_bindings_resolved {
+                    PreflightStatus::Passed
+                } else {
+                    PreflightStatus::Failed
+                },
+                message: if volume_bindings_resolved {
+                    "resolved target pod PVC/PV/node/device-or-path bindings".to_string()
+                } else {
+                    "target pod PVC/PV/node/device-or-path binding proof is incomplete".to_string()
+                },
+            });
+        }
+        self.status = if self
+            .requirements
+            .iter()
+            .any(|requirement| requirement.status == PreflightStatus::Failed)
+        {
+            TargetProofStatus::Missing
+        } else {
+            TargetProofStatus::Satisfied
+        };
+    }
+}
+
+impl TargetResolvedPodProof {
+    pub fn new(name: impl Into<String>, uid: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            uid: uid.into(),
+            node: None,
+            persistent_volume_claims: Vec::new(),
+        }
+    }
+
+    pub fn with_node(mut self, node: impl Into<String>) -> Self {
+        self.node = Some(node.into());
+        self
+    }
+
+    pub fn with_persistent_volume_claims(
+        mut self,
+        persistent_volume_claims: Vec<TargetPersistentVolumeClaimProof>,
+    ) -> Self {
+        self.persistent_volume_claims = persistent_volume_claims;
+        self
+    }
+}
+
+fn pod_has_bound_pv(pod: &TargetResolvedPodProof) -> bool {
+    !pod.persistent_volume_claims.is_empty()
+        && pod.persistent_volume_claims.iter().all(|claim| {
+            claim
+                .volume_name
+                .as_deref()
+                .is_some_and(|volume| !volume.is_empty())
+                && claim.persistent_volume.as_ref().is_some_and(|pv| {
+                    !pv.name.is_empty()
+                        && pv
+                            .device_or_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty())
+                })
+        })
+}
+
+fn target_requirements(
+    config: &FaultTestConfig,
+    spec: &FaultScenarioSpec,
+    plan: &FaultPlan,
+) -> Vec<TargetProofRequirement> {
+    let mut requirements = vec![TargetProofRequirement {
+        name: "catalog_target_intent".to_string(),
+        status: PreflightStatus::Passed,
+        message: spec.target.to_string(),
+    }];
+
+    for fault in plan.faults() {
+        if matches!(fault.target(), FaultTarget::DedicatedBlockDevice) {
+            requirements.extend([
+                host_requirement("dm_name", config.dm_name.as_deref()),
+                host_requirement("dm_node", config.dm_node.as_deref()),
+                host_requirement("dm_mount_path", config.dm_mount_path.as_deref()),
+                host_requirement("dm_fault_table", config.dm_fault_table.as_deref()),
+            ]);
+        }
+    }
+
+    requirements
+}
+
+fn host_requirement(name: &str, value: Option<&str>) -> TargetProofRequirement {
+    let status = if value.is_some_and(|value| !value.trim().is_empty()) {
+        PreflightStatus::Passed
+    } else {
+        PreflightStatus::Failed
+    };
+    TargetProofRequirement {
+        name: name.to_string(),
+        status,
+        message: match status {
+            PreflightStatus::Passed => "configured".to_string(),
+            PreflightStatus::Failed => "required for dedicated block-device target".to_string(),
+        },
+    }
+}
+
+fn target_kind(target: &FaultTarget) -> &'static str {
+    match target {
+        FaultTarget::RustfsVolume { .. } => "rustfs-volume",
+        FaultTarget::RustfsServerPod => "rustfs-server-pod",
+        FaultTarget::RustfsServerPeerNetwork => "rustfs-server-peer-network",
+        FaultTarget::RustfsServerResource => "rustfs-server-resource",
+        FaultTarget::DedicatedBlockDevice => "dedicated-block-device",
+    }
+}
+
+fn pod_selector_proof(
+    config: &FaultTestConfig,
+    target: &FaultTarget,
+) -> Option<TargetPodSelectorProof> {
+    match target {
+        FaultTarget::RustfsVolume { .. }
+        | FaultTarget::RustfsServerPod
+        | FaultTarget::RustfsServerPeerNetwork
+        | FaultTarget::RustfsServerResource => Some(TargetPodSelectorProof {
+            namespace: config.cluster.test_namespace.clone(),
+            tenant: config.cluster.tenant_name.clone(),
+            selector: format!("rustfs.tenant={}", config.cluster.tenant_name),
+            exact_pods_resolved: false,
+            note: "preflight proves the selector intent; runtime pod identity is captured in fault-evidence.json".to_string(),
+        }),
+        FaultTarget::DedicatedBlockDevice => None,
+    }
+}
+
+fn volume_path(target: &FaultTarget) -> Option<String> {
+    match target {
+        FaultTarget::RustfsVolume { path } => Some(path.clone()),
+        FaultTarget::RustfsServerPod
+        | FaultTarget::RustfsServerPeerNetwork
+        | FaultTarget::RustfsServerResource
+        | FaultTarget::DedicatedBlockDevice => None,
+    }
+}
+
+fn host_target_proof(config: &FaultTestConfig, target: &FaultTarget) -> Option<TargetHostProof> {
+    if !matches!(target, FaultTarget::DedicatedBlockDevice) {
+        return None;
+    }
+    Some(TargetHostProof {
+        node: config.dm_node.clone().unwrap_or_default(),
+        mapper_name: config.dm_name.clone().unwrap_or_default(),
+        mount_path: config.dm_mount_path.clone().unwrap_or_default(),
+        has_fault_table: config.dm_fault_table.is_some(),
+        has_recovery_table: config.dm_recovery_table.is_some(),
+    })
+}
+
+fn erasure_set_proof(spec: &FaultScenarioSpec) -> Option<TargetErasureSetProof> {
+    let requires = spec.target.contains("erasure set") || spec.conflict_domain.contains("erasure");
+    requires.then(|| TargetErasureSetProof {
+        required: true,
+        resolved: false,
+        note: "same-erasure-set target proof is not implemented for this scenario".to_string(),
+    })
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PreflightStatus, TargetProof, TargetProofStatus, TargetResolvedPodProof};
+    use crate::fault::{
+        config::FaultTestConfig,
+        plan::{FaultPlan, FaultPlanOptions},
+        scenarios::{FaultScenario, scenario_spec},
+    };
+
+    #[test]
+    fn target_proof_captures_selector_intent_for_chaos_mesh_targets() {
+        let mut config = FaultTestConfig::for_test("k3d-lab", "local-path");
+        config.scenario = "pod-kill-one".to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let spec = scenario_spec(&scenario.name).expect("spec");
+        let plan = FaultPlan::from_scenario_with_options(
+            &scenario,
+            spec,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("plan");
+
+        let proof = TargetProof::from_plan(&config, &scenario, spec, &plan, "run-1")
+            .with_resolved_pod_proofs([
+                TargetResolvedPodProof::new("rustfs-0", "uid-0").with_node("node-a")
+            ]);
+
+        assert_eq!(proof.status, TargetProofStatus::Satisfied);
+        assert_eq!(proof.faults.len(), 1);
+        assert_eq!(proof.resolved_pods.len(), 1);
+        assert_eq!(
+            proof.faults[0].pod_selector.as_ref().unwrap().selector,
+            "rustfs.tenant=fault-test-tenant"
+        );
+        assert!(
+            proof.faults[0]
+                .pod_selector
+                .as_ref()
+                .unwrap()
+                .exact_pods_resolved
+        );
+        assert_eq!(proof.preflight_check().status, PreflightStatus::Passed);
+    }
+
+    #[test]
+    fn target_proof_fails_closed_for_incomplete_host_target() {
+        let mut config = FaultTestConfig::for_test("k3d-lab", "local-path");
+        config.scenario = "dm-flakey".to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let spec = scenario_spec(&scenario.name).expect("spec");
+        let plan = FaultPlan::from_scenario_with_options(
+            &scenario,
+            spec,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("plan");
+
+        let proof = TargetProof::from_plan(&config, &scenario, spec, &plan, "run-1");
+
+        assert_eq!(proof.status, TargetProofStatus::Missing);
+        assert!(proof.require_satisfied().is_err());
+    }
+}

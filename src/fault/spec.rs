@@ -108,10 +108,25 @@ pub struct FaultRunFaultSpec {
     #[serde(default)]
     pub parameters: FaultInjectionParameters,
     pub target: FaultRunTargetSpec,
+    #[serde(default = "default_target_proof_spec")]
+    pub target_proof: FaultRunTargetProofSpec,
     pub selection: FaultRunSelectionSpec,
     pub fault_duration_seconds: u64,
     pub observability: String,
     pub conflict_domain: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaultRunTargetProofSpec {
+    pub required: bool,
+    pub artifact: String,
+}
+
+fn default_target_proof_spec() -> FaultRunTargetProofSpec {
+    FaultRunTargetProofSpec {
+        required: false,
+        artifact: String::new(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +228,8 @@ impl FaultRunArtifactSpec {
         [
             "run-spec.yaml",
             "run-spec.json",
+            "preflight-summary.json",
+            "target-proof.json",
             "run-events.jsonl",
             "run-metadata.json",
             "workload-plan.json",
@@ -242,6 +259,10 @@ impl FaultRunFaultSpec {
             backend: fault.backend().as_str().to_string(),
             parameters: fault.parameters().clone(),
             target: FaultRunTargetSpec::from_target(fault.target()),
+            target_proof: FaultRunTargetProofSpec {
+                required: true,
+                artifact: "target-proof.json".to_string(),
+            },
             selection: FaultRunSelectionSpec::from_selection(fault.selection()),
             fault_duration_seconds: fault.duration().as_secs(),
             observability: scenario_spec.observability.to_string(),
@@ -345,6 +366,8 @@ mod tests {
         assert_eq!(spec.api_version, FAULT_RUN_API_VERSION);
         assert_eq!(spec.faults.len(), 1);
         assert_eq!(spec.faults[0].target.path.as_deref(), Some("/data/rustfs0"));
+        assert!(spec.faults[0].target_proof.required);
+        assert_eq!(spec.faults[0].target_proof.artifact, "target-proof.json");
         assert_eq!(spec.scenario.priority, "p0");
         assert_eq!(spec.scenario.isolation, "fresh-tenant");
         assert_eq!(spec.faults[0].backend, "chaos-mesh-io-chaos");

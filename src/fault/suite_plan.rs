@@ -143,6 +143,7 @@ pub struct FaultSuitePlanFault {
     pub backend: String,
     pub parameters: FaultInjectionParameters,
     pub target: FaultSuitePlanTarget,
+    pub target_proof: FaultSuitePlanTargetProof,
     pub selection: FaultSuitePlanSelection,
     pub fault_duration_seconds: u64,
     pub observability: String,
@@ -156,6 +157,13 @@ pub struct FaultSuitePlanTarget {
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaultSuitePlanTargetProof {
+    pub required: bool,
+    pub artifact: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -468,6 +476,10 @@ impl FaultSuitePlanFault {
             backend: fault.backend().as_str().to_string(),
             parameters: fault.parameters().clone(),
             target: FaultSuitePlanTarget::from_target(fault.target()),
+            target_proof: FaultSuitePlanTargetProof {
+                required: true,
+                artifact: "target-proof.json".to_string(),
+            },
             selection: FaultSuitePlanSelection::from_selection(fault.selection()),
             fault_duration_seconds: fault.duration().as_secs(),
             observability: spec.observability.to_string(),
@@ -696,6 +708,8 @@ mod tests {
         let required_artifacts = json!([
             "run-spec.yaml",
             "run-spec.json",
+            "preflight-summary.json",
+            "target-proof.json",
             "run-events.jsonl",
             "run-metadata.json",
             "workload-plan.json",
@@ -809,6 +823,10 @@ mod tests {
                                     "summary": "one RustFS volume at /data/rustfs0",
                                     "path": "/data/rustfs0"
                                 },
+                                "targetProof": {
+                                    "required": true,
+                                    "artifact": "target-proof.json"
+                                },
                                 "selection": {
                                     "kind": "percent",
                                     "value": 20,
@@ -875,6 +893,10 @@ mod tests {
                                 "target": {
                                     "kind": "rustfs-server-peer-network",
                                     "summary": "one RustFS server Pod partitioned from its peers"
+                                },
+                                "targetProof": {
+                                    "required": true,
+                                    "artifact": "target-proof.json"
                                 },
                                 "selection": {
                                     "kind": "fixed-targets",

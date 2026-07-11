@@ -25,6 +25,7 @@ pub mod fixture;
 pub mod history;
 pub mod plan;
 pub mod pods;
+pub mod preflight;
 pub mod reporting;
 pub mod runner;
 pub mod scenarios;
