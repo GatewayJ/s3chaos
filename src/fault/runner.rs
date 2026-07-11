@@ -319,6 +319,45 @@ async fn run_fault_case(
         "Tenant is Ready before fault injection",
         None,
     )?;
+    // Topology-conservation proof runs here, after the harness has created and
+    // readied its own Tenant, not in the pre-fixture backend preflight: the
+    // proof reads the live Tenant's pool geometry, which does not exist yet on
+    // a fresh/standalone run before prepare_fault_fixture.
+    if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+        events.record(
+            "write-quorum-loss-topology-proof",
+            RunEventStatus::Started,
+            "proving the tenant matches a reference single-erasure-set topology",
+            None,
+        )?;
+        if let Err(error) = require_write_quorum_loss_topology(config) {
+            events
+                .record(
+                    "write-quorum-loss-topology-proof",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    None,
+                )
+                .ok();
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "write-quorum-loss-topology-proof",
+                    "test_or_environment",
+                    error.to_string(),
+                ),
+            )?;
+            return Err(error);
+        }
+        events.record(
+            "write-quorum-loss-topology-proof",
+            RunEventStatus::Succeeded,
+            "tenant topology provably makes a two-server partition break write quorum",
+            None,
+        )?;
+    }
     events.record(
         "pod-stability-before-fault",
         RunEventStatus::Started,
@@ -1746,9 +1785,10 @@ fn require_fault_backends(config: &FaultTestConfig, plan: &FaultPlan) -> Result<
     for backend in plan.required_backends() {
         require_fault_backend(config, backend)?;
     }
-    if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
-        require_write_quorum_loss_topology(config)?;
-    }
+    // The write-quorum-loss topology proof deliberately does NOT run here: this
+    // preflight runs before prepare_fault_fixture creates the Tenant, so
+    // reading the Tenant's pool geometry would NotFound on a fresh run. The
+    // proof runs right after tenant readiness instead (see run_fault_case).
     Ok(())
 }
 
