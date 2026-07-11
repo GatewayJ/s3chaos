@@ -1,5 +1,9 @@
 # Fault Suite Roadmap
 
+Ordered durability implementation TODO, including PR #15 review feedback and
+the sequence for future work: see
+[`DURABILITY_FAULT_TESTING_TODO.md`](DURABILITY_FAULT_TESTING_TODO.md).
+
 This document tracks the next architecture steps for the fault-suite runner. The
 current suite format is valid for selecting catalog scenarios, repetitions,
 durations, percent overrides, workload object count, workload concurrency, and
@@ -16,8 +20,8 @@ plan as `suite-plan.json`.
   layout, budget decisions, and runtime validation.
 - Keep `scripts/fault-test.sh` as a thin operational wrapper for shell-specific
   setup, build preparation, process supervision, and cluster cleanup.
-- Add `s3chaos fault-suite-plan <suite.yaml>` to render the exact destructive
-  plan before execution.
+- Keep hardening `s3chaos fault-suite-plan <suite.yaml>` as the exact
+  destructive-plan review surface before execution.
 - Include each attempt's scenario, repetition, resolved fault duration, selected
   fault, target, workload profile, expected backend, required CRDs/tools, artifact
   paths, and budget impact in the plan output.
@@ -35,7 +39,8 @@ is the protective suite budget. Plans and run specs now carry the resolved
 parameters, selected workload scale, operation mix, payload distribution, and
 hotspot behavior used by execution.
 
-- Add typed scenario parameters instead of exposing raw backend manifests.
+- Harden and extend typed scenario parameters instead of exposing raw backend
+  manifests.
 - Let supported scenarios declare safe parameter schemas, such as network delay,
   packet loss, IO fault mode, target selection policy, or stress intensity.
 - Extend workload profiles beyond `objects` and `concurrency` with operation
@@ -58,8 +63,9 @@ Kubernetes side effects run. Remaining cleanup is optional: move the
 runner-local handle wrappers out if more backends make that stateful lifecycle
 logic grow.
 
-- Introduce a backend port owned by the fault domain for apply, wait-active,
-  snapshot, ensure-active, delete, and cleanup operations.
+- Formalize the existing runner-local backend handle into a clear fault-domain
+  port for apply, wait-active, snapshot, ensure-active, delete, and cleanup
+  operations, or document why it should remain runner-local.
 - Keep Chaos Mesh, device-mapper, and future backends as adapters behind that
   port.
 - Avoid adding a new backend until the scenario parameter model is stable enough
@@ -85,10 +91,11 @@ stateful operational flows on top, in this order:
   rebuilds an empty volume, then assert automatic format heal plus full data
   heal converges with no client-visible corruption. This is the Kubernetes
   equivalent of swapping in a blank disk.
-- Admin-ops scenario family behind the fault backend port: drive RustFS admin
-  APIs (heal, decommission, rebalance) as orchestrated scenario steps with the
-  same workload/history/checker verdict. Decommission needs a multi-pool
-  Tenant shape first.
+- Admin-ops scenario family as catalog-owned product/recovery operations or
+  observers, not as fault backend behavior: drive RustFS admin APIs (heal,
+  decommission, rebalance) as orchestrated scenario steps with the same
+  workload/history/checker verdict. Decommission needs a multi-pool Tenant shape
+  first.
 - On-disk bitrot: flip bytes inside a shard file on the host volume, then
   assert the read path rejects corrupt data and scanner/heal repairs the shard.
   IOChaos read mistakes do not exercise the on-disk heal closure.
