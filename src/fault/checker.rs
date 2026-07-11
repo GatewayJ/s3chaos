@@ -1386,7 +1386,10 @@ fn ambiguous_write_attempt_label(attempt: &AmbiguousWriteAttempt) -> String {
     label
 }
 
-fn classify_without_reread(report: &CheckerReport) -> RecoveryStabilityClassification {
+/// Derive the S3-model classification for a failing checker report. Shared by
+/// the recovery-stability path and the final checker verdict so the same
+/// evidence never classifies differently depending on which gate caught it.
+pub(crate) fn classify_without_reread(report: &CheckerReport) -> RecoveryStabilityClassification {
     if has_data_corruption_signal(report) {
         RecoveryStabilityClassification::DataCorruption
     } else if !report.unknown_writes_materialized.is_empty() {
@@ -2322,6 +2325,37 @@ mod tests {
         assert_eq!(
             super::classify_without_reread(&report),
             RecoveryStabilityClassification::AmbiguousWriteMaterialized
+        );
+    }
+
+    /// The final checker verdict and the pre-recommit gate must classify the
+    /// same evidence identically (review finding C3-3): a committed-loss
+    /// report derives committed_object_unavailable, a corruption report
+    /// derives data_corruption — never the catch-all product_or_environment.
+    #[test]
+    fn classify_without_reread_covers_final_verdict_evidence() {
+        let mut unavailable = empty_report();
+        unavailable.missing_committed_objects.push("k1".to_string());
+        assert_eq!(
+            super::classify_without_reread(&unavailable),
+            RecoveryStabilityClassification::CommittedObjectUnavailable
+        );
+
+        let mut corrupted = empty_report();
+        corrupted
+            .hash_mismatches
+            .push("k2: expected a, got b".to_string());
+        assert_eq!(
+            super::classify_without_reread(&corrupted),
+            RecoveryStabilityClassification::DataCorruption
+        );
+
+        // No product signal at all falls back to harness_error, not to a
+        // product bucket.
+        let clean = empty_report();
+        assert_eq!(
+            super::classify_without_reread(&clean),
+            RecoveryStabilityClassification::HarnessError
         );
     }
 
