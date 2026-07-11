@@ -1755,18 +1755,20 @@ fn require_fault_backends(config: &FaultTestConfig, plan: &FaultPlan) -> Result<
 /// Topology-conservation proof for the write-quorum-loss partition.
 ///
 /// The scenario's FixedTargets(2) only means "write quorum breaks, read quorum
-/// survives" on the reference tenant shape: 4 servers x 2 volumes = 8 drives,
-/// which RustFS lays out as a single erasure set with EC 4+4 (write quorum
-/// data+1 = 5, read quorum data = 4). Isolating 2 of 4 servers then provably
-/// removes exactly half the drives of that one set — every pod is in the same
-/// set, so no same-erasure-set resolution is needed. On any other shape the
-/// same count could be a no-op (more servers) or a full outage (fewer), so we
-/// fail closed instead of running a scenario whose oracle no longer matches
-/// its name. Replacing this with a real erasure-set proof (admin cluster
-/// snapshot) generalizes it later.
+/// survives" on the reference tenant shapes: a single pool of 4 servers with
+/// 1 or 2 volumes per server (4 or 8 drives). RustFS lays both out as a single
+/// erasure set with data == parity (4 drives -> EC 2+2, 8 drives -> EC 4+4),
+/// where write quorum is data+1 and read quorum is data. Isolating 2 of 4
+/// servers then provably removes exactly half the drives of that one set:
+/// write quorum becomes unreachable while read quorum can still be met by the
+/// surviving half — and every pod is in the same set, so no same-erasure-set
+/// resolution is needed. On any other shape the same count could be a no-op
+/// (more servers) or a full outage (fewer), so we fail closed instead of
+/// running a scenario whose oracle no longer matches its name. Replacing this
+/// with a real erasure-set proof (admin cluster snapshot) generalizes it later.
 fn require_write_quorum_loss_topology(config: &FaultTestConfig) -> Result<()> {
     const EXPECTED_SERVERS: usize = 4;
-    const EXPECTED_VOLUMES_PER_SERVER: u64 = 2;
+    const ACCEPTED_VOLUMES_PER_SERVER: [u64; 2] = [1, 2];
 
     ensure!(
         config.expected_rustfs_pod_count == EXPECTED_SERVERS,
@@ -1786,7 +1788,7 @@ fn require_write_quorum_loss_topology(config: &FaultTestConfig) -> Result<()> {
             "tenant",
             cluster.tenant_name.as_str(),
             "-o",
-            "jsonpath={.spec.pools[*].volumesPerServer}",
+            "jsonpath={.spec.pools[*].persistence.volumesPerServer}",
         ])
         .run_checked()
         .context("reading tenant volumesPerServer for the write-quorum-loss topology proof")?;
@@ -1800,9 +1802,10 @@ fn require_write_quorum_loss_topology(config: &FaultTestConfig) -> Result<()> {
         })
         .collect::<Result<_>>()?;
     ensure!(
-        volumes == vec![EXPECTED_VOLUMES_PER_SERVER],
+        volumes.len() == 1 && ACCEPTED_VOLUMES_PER_SERVER.contains(&volumes[0]),
         "network-partition-write-quorum-loss requires the reference single-pool tenant with \
-         volumesPerServer={EXPECTED_VOLUMES_PER_SERVER} (8 drives, single erasure set, EC 4+4); \
+         volumesPerServer of 1 or 2 (4 or 8 drives; both lay out as one erasure set with \
+         data == parity, so isolating 2 of 4 servers removes exactly half the drives); \
          found volumesPerServer={raw:?} — on that shape a 2-of-4 partition does not provably \
          break write quorum, so the run is rejected instead of producing a misleading verdict",
     );
