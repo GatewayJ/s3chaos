@@ -1832,8 +1832,59 @@ fn stable_live_objects_at_read_starts(
     stable
 }
 
+/// One committed write's value and completion window, kept per key so a GET
+/// racing concurrent overwrites can be told apart from a genuinely corrupt or
+/// stale read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommittedWriteWindow {
+    object: ExpectedObject,
+    ended_at_ms: u64,
+}
+
+/// Whether a successful GET that does not match the latest committed value is
+/// still a legal concurrent read rather than corruption.
+///
+/// S3 gives concurrent overwrites of one key no client-observable order, so a
+/// GET may legally return:
+/// - the value of any committed write whose completion window overlaps the
+///   GET itself (`w.ended >= get.started`), or
+/// - the previous committed value while the *latest* write was still in
+///   flight when the GET started (`latest.ended >= get.started`).
+///
+/// Both legs keep real stale-read detection intact: if every write finished
+/// before the GET started, no exemption applies and an old value is still
+/// reported as corruption. This complements `stable_live_objects_at_read_starts`
+/// (which exempts a GET that returned the value stable-live at its start,
+/// e.g. across an overlapping delete); this function additionally exempts a GET
+/// that returned a value whose write window merely overlaps the GET.
+fn concurrent_committed_read(
+    history: &[CommittedWriteWindow],
+    get_started_at_ms: u64,
+    actual: &ExpectedObject,
+) -> bool {
+    let Some((latest, prior)) = history.split_last() else {
+        return false;
+    };
+    let matches = |w: &CommittedWriteWindow| {
+        w.object.sha256 == actual.sha256 && w.object.size_bytes == actual.size_bytes
+    };
+    if prior
+        .iter()
+        .any(|w| matches(w) && w.ended_at_ms >= get_started_at_ms)
+    {
+        return true;
+    }
+    if latest.ended_at_ms >= get_started_at_ms
+        && let Some(previous) = prior.last()
+    {
+        return matches(previous);
+    }
+    false
+}
+
 fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
     let mut live = BTreeMap::<String, ExpectedObject>::new();
+    let mut committed_history = BTreeMap::<String, Vec<CommittedWriteWindow>>::new();
     let mut ambiguous_writes = BTreeMap::<String, Vec<AmbiguousWriteAttempt>>::new();
     let stable_live_at_start = stable_live_objects_at_read_starts(records);
     let mut anomalies = ReadAnomalies::default();
@@ -1844,6 +1895,13 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
             {
                 if let Some((key, object)) = record_object(record) {
                     mark_superseded_attempts(&mut ambiguous_writes, &key, record);
+                    committed_history
+                        .entry(key.clone())
+                        .or_default()
+                        .push(CommittedWriteWindow {
+                            object: object.clone(),
+                            ended_at_ms: record.ended_at_ms,
+                        });
                     live.insert(key, object);
                 }
             }
@@ -1871,6 +1929,7 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
             OperationKind::Delete if record.outcome == OperationOutcome::Ok => {
                 if let Some(key) = record.key.as_ref() {
                     mark_superseded_attempts(&mut ambiguous_writes, key, record);
+                    committed_history.remove(key);
                     live.remove(key);
                 }
             }
@@ -1934,10 +1993,19 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                         );
                     }
                     Some(expected) => {
-                        anomalies.corrupted_reads.push(format!(
-                            "{key}: expected {} ({} bytes), got {} ({} bytes)",
-                            expected.sha256, expected.size_bytes, actual.sha256, actual.size_bytes
-                        ));
+                        let history = committed_history
+                            .get(key)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        if !concurrent_committed_read(history, record.started_at_ms, &actual) {
+                            anomalies.corrupted_reads.push(format!(
+                                "{key}: expected {} ({} bytes), got {} ({} bytes)",
+                                expected.sha256,
+                                expected.size_bytes,
+                                actual.sha256,
+                                actual.size_bytes
+                            ));
+                        }
                     }
                     None if !attempts.is_empty() => anomalies.unknown_write_value_conflicts.push(
                         unknown_write_value_conflict_from_object_message(
@@ -3280,6 +3348,136 @@ mod tests {
 
         assert!(anomalies.corrupted_reads.is_empty());
         assert!(anomalies.visible_deleted_objects.is_empty());
+    }
+
+    /// Replays the hotspot race observed on a real cluster (stress-cpu,
+    /// ec-shard profile): two committed overwrites of one key with
+    /// overlapping completion windows, and a GET issued before the later
+    /// write finished that returned the earlier value. S3 gives concurrent
+    /// overwrites no client-observable order, so this must not be reported
+    /// as corruption.
+    #[test]
+    fn concurrent_overwrite_read_is_not_corruption() {
+        let first = timed_record(
+            "op-1",
+            OperationKind::Put,
+            "k",
+            "a",
+            OperationOutcome::Ok,
+            10,
+            19,
+        );
+        let second = timed_record(
+            "op-2",
+            OperationKind::Put,
+            "k",
+            "b",
+            OperationOutcome::Ok,
+            18,
+            20,
+        );
+        // GET starts while op-2 is still in flight and observes op-1's value.
+        let get = timed_record(
+            "op-3",
+            OperationKind::Get,
+            "k",
+            "a",
+            OperationOutcome::Ok,
+            19,
+            21,
+        );
+
+        let anomalies = successful_read_anomalies(&[first, second, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "concurrent committed read must not be corruption: {:?}",
+            anomalies.corrupted_reads
+        );
+    }
+
+    /// The exemption must not blunt real stale-read detection: once every
+    /// write has settled long before the GET starts, returning an old value
+    /// is corruption.
+    #[test]
+    fn stale_read_after_settled_overwrites_is_corruption() {
+        let first = timed_record(
+            "op-1",
+            OperationKind::Put,
+            "k",
+            "a",
+            OperationOutcome::Ok,
+            10,
+            11,
+        );
+        let second = timed_record(
+            "op-2",
+            OperationKind::Put,
+            "k",
+            "b",
+            OperationOutcome::Ok,
+            12,
+            13,
+        );
+        let get = timed_record(
+            "op-3",
+            OperationKind::Get,
+            "k",
+            "a",
+            OperationOutcome::Ok,
+            50,
+            51,
+        );
+
+        let anomalies = successful_read_anomalies(&[first, second, get]);
+
+        assert_eq!(
+            anomalies.corrupted_reads.len(),
+            1,
+            "a stale read after settled overwrites must stay flagged"
+        );
+    }
+
+    /// A GET racing the latest in-flight write may legally observe the
+    /// previous committed value even though that previous write finished
+    /// before the GET started.
+    #[test]
+    fn get_racing_latest_write_may_read_previous_value() {
+        let first = timed_record(
+            "op-1",
+            OperationKind::Put,
+            "k",
+            "a",
+            OperationOutcome::Ok,
+            10,
+            11,
+        );
+        let second = timed_record(
+            "op-2",
+            OperationKind::Put,
+            "k",
+            "b",
+            OperationOutcome::Ok,
+            18,
+            25,
+        );
+        let get = timed_record(
+            "op-3",
+            OperationKind::Get,
+            "k",
+            "a",
+            OperationOutcome::Ok,
+            20,
+            22,
+        );
+
+        let anomalies = successful_read_anomalies(&[first, second, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "reading the previous value while the latest write is in flight is legal: {:?}",
+            anomalies.corrupted_reads
+        );
     }
 
     #[test]
