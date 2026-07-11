@@ -1782,11 +1782,62 @@ fn list_history_warnings(records: &[OperationRecord]) -> WarningSummary {
     warnings
 }
 
+fn stable_live_objects_at_read_starts(
+    records: &[OperationRecord],
+) -> BTreeMap<usize, ExpectedObject> {
+    let mut reads = records
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| {
+            if record.kind != OperationKind::Get
+                || record.outcome != OperationOutcome::Ok
+                || record.version_id.is_some()
+            {
+                return None;
+            }
+            Some((index, record.started_at_ms, record.key.as_deref()?))
+        })
+        .collect::<Vec<_>>();
+    reads.sort_by_key(|(_, started_at_ms, _)| *started_at_ms);
+
+    let mut mutations = records
+        .iter()
+        .filter(|record| {
+            record.outcome == OperationOutcome::Ok
+                && matches!(
+                    record.kind,
+                    OperationKind::Put
+                        | OperationKind::CompleteMultipartUpload
+                        | OperationKind::Delete
+                )
+        })
+        .collect::<Vec<_>>();
+    mutations.sort_by_key(|record| record.ended_at_ms);
+
+    let mut model = ObjectModel::default();
+    let mut next_mutation = 0;
+    let mut stable = BTreeMap::new();
+    for (index, started_at_ms, key) in reads {
+        while let Some(record) = mutations.get(next_mutation) {
+            if record.ended_at_ms >= started_at_ms {
+                break;
+            }
+            apply_record_to_model(&mut model, record);
+            next_mutation += 1;
+        }
+        if let Some(expected) = model.live.get(key) {
+            stable.insert(index, expected.clone());
+        }
+    }
+    stable
+}
+
 fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
     let mut live = BTreeMap::<String, ExpectedObject>::new();
     let mut ambiguous_writes = BTreeMap::<String, Vec<AmbiguousWriteAttempt>>::new();
+    let stable_live_at_start = stable_live_objects_at_read_starts(records);
     let mut anomalies = ReadAnomalies::default();
-    for record in records {
+    for (record_index, record) in records.iter().enumerate() {
         match record.kind {
             OperationKind::Put | OperationKind::CompleteMultipartUpload
                 if record.outcome == OperationOutcome::Ok =>
@@ -1838,6 +1889,10 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                     sha256: actual_hash.to_string(),
                     size_bytes: record.size_bytes.unwrap_or_default(),
                 };
+                let stable_expected = stable_live_at_start.get(&record_index);
+                if stable_expected.is_some_and(|expected| expected == &actual) {
+                    continue;
+                }
                 let attempts = ambiguous_writes
                     .get(key)
                     .map(Vec::as_slice)
@@ -1889,6 +1944,12 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                             key, None, attempts, &actual,
                         ),
                     ),
+                    None if let Some(expected) = stable_expected => {
+                        anomalies.corrupted_reads.push(format!(
+                            "{key}: expected {} ({} bytes), got {} ({} bytes)",
+                            expected.sha256, expected.size_bytes, actual.sha256, actual.size_bytes
+                        ));
+                    }
                     None => anomalies
                         .visible_deleted_objects
                         .push(format!("{key}: successful GET had no committed live value")),
@@ -2348,6 +2409,84 @@ mod tests {
 
         assert!(anomalies.corrupted_reads.is_empty());
         assert_eq!(anomalies.unknown_writes_materialized.len(), 1);
+    }
+
+    #[test]
+    fn overlapping_get_can_return_pre_delete_value() {
+        let records = vec![
+            timed_record(
+                "op-1",
+                OperationKind::Put,
+                "k",
+                "old",
+                OperationOutcome::Ok,
+                1,
+                2,
+            ),
+            timed_record(
+                "op-3",
+                OperationKind::Delete,
+                "k",
+                "",
+                OperationOutcome::Ok,
+                12,
+                13,
+            ),
+            timed_record(
+                "op-2",
+                OperationKind::Get,
+                "k",
+                "old",
+                OperationOutcome::Ok,
+                10,
+                20,
+            ),
+        ];
+
+        let anomalies = successful_read_anomalies(&records);
+
+        assert!(anomalies.corrupted_reads.is_empty());
+        assert!(anomalies.visible_deleted_objects.is_empty());
+    }
+
+    #[test]
+    fn post_delete_get_returning_body_is_still_resurrection() {
+        let records = vec![
+            timed_record(
+                "op-1",
+                OperationKind::Put,
+                "k",
+                "old",
+                OperationOutcome::Ok,
+                1,
+                2,
+            ),
+            timed_record(
+                "op-2",
+                OperationKind::Delete,
+                "k",
+                "",
+                OperationOutcome::Ok,
+                3,
+                4,
+            ),
+            timed_record(
+                "op-3",
+                OperationKind::Get,
+                "k",
+                "old",
+                OperationOutcome::Ok,
+                5,
+                6,
+            ),
+        ];
+
+        let anomalies = successful_read_anomalies(&records);
+
+        assert_eq!(
+            anomalies.visible_deleted_objects,
+            vec!["k: successful GET had no committed live value"]
+        );
     }
 
     #[test]
