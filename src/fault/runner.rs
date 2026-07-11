@@ -597,29 +597,49 @@ async fn run_fault_case(
         "pre-fault objects were written and verified",
         Some(serde_json::json!({ "objects": prefilled.len() })),
     )?;
-    let target_inventory = match rustfs_target_inventory(cluster) {
-        Ok(inventory) => inventory,
-        Err(error) => {
-            write_failure_summary(
-                collector,
-                scenario.case_name,
-                FailureSummary::new(
-                    &scenario.name,
-                    "target-preflight",
-                    "test_or_environment",
-                    error.to_string(),
-                ),
-            )?;
-            return Err(error);
-        }
-    };
-    let pods_before = target_inventory.identities;
     events.record(
         "target-preflight",
         RunEventStatus::Started,
         "validating planned fault target proof",
-        None,
+        Some(serde_json::json!({
+            "include_volume_bindings": plan_requires_volume_bindings(plan),
+        })),
     )?;
+    let target_inventory =
+        match rustfs_target_inventory(cluster, plan_requires_volume_bindings(plan)) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                preflight_phases.push(PreflightPhase::new(
+                    "target-proof",
+                    vec![PreflightCheck::failed(
+                        "target_inventory",
+                        error.to_string(),
+                        crate::fault::reporting::ResponsibilityDomain::Harness,
+                    )],
+                ));
+                write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+                events
+                    .record(
+                        "target-preflight",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "target-preflight",
+                        "test_or_environment",
+                        error.to_string(),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
+    let pods_before = target_inventory.identities;
     let target_proof = TargetProof::from_plan(config, scenario, spec, plan, &run_id)
         .with_resolved_pod_proofs(target_inventory.pod_proofs);
     collector.write_text(
@@ -1708,6 +1728,15 @@ fn write_preflight_summary(
         &serde_json::to_string_pretty(&summary)?,
     )?;
     Ok(())
+}
+
+fn plan_requires_volume_bindings(plan: &FaultPlan) -> bool {
+    plan.faults().iter().any(|fault| {
+        matches!(
+            fault.target(),
+            crate::fault::plan::FaultTarget::RustfsVolume { .. }
+        )
+    })
 }
 
 fn require_fault_backends(config: &FaultTestConfig, plan: &FaultPlan) -> Result<()> {

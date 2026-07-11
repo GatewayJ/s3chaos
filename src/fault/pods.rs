@@ -40,16 +40,25 @@ pub(crate) fn rustfs_pod_identities(config: &ClusterTestConfig) -> Result<Vec<Po
     pod_identities_from_items(items, &selector, &config.test_namespace)
 }
 
-pub(crate) fn rustfs_target_inventory(config: &ClusterTestConfig) -> Result<RustfsTargetInventory> {
+pub(crate) fn rustfs_target_inventory(
+    config: &ClusterTestConfig,
+    include_volume_bindings: bool,
+) -> Result<RustfsTargetInventory> {
     let pods = rustfs_pods_json(config)?;
     let selector = rustfs_tenant_selector(config);
     let items = pod_items(&pods)?;
     let identities = pod_identities_from_items(items, &selector, &config.test_namespace)?;
-    let pvcs = pvc_map(config)?;
-    let pvs = pv_map(config)?;
+    let volume_maps = if include_volume_bindings {
+        Some((pvc_map(config)?, pv_map(config)?))
+    } else {
+        None
+    };
     let pod_proofs = items
         .iter()
-        .filter_map(|item| target_pod_proof(item, &pvcs, &pvs))
+        .filter_map(|item| match &volume_maps {
+            Some((pvcs, pvs)) => target_pod_proof(item, Some(pvcs), Some(pvs)),
+            None => target_pod_proof(item, None, None),
+        })
         .collect();
 
     Ok(RustfsTargetInventory {
@@ -133,8 +142,8 @@ fn items_by_metadata_name(value: &Value) -> BTreeMap<String, Value> {
 
 fn target_pod_proof(
     pod: &Value,
-    pvcs: &BTreeMap<String, Value>,
-    pvs: &BTreeMap<String, Value>,
+    pvcs: Option<&BTreeMap<String, Value>>,
+    pvs: Option<&BTreeMap<String, Value>>,
 ) -> Option<TargetResolvedPodProof> {
     let metadata = pod.get("metadata")?;
     let name = metadata.get("name")?.as_str()?.to_string();
@@ -143,10 +152,13 @@ fn target_pod_proof(
     if let Some(node) = pod.pointer("/spec/nodeName").and_then(Value::as_str) {
         proof = proof.with_node(node);
     }
-    let claims = persistent_volume_claim_names(pod)
-        .into_iter()
-        .map(|claim| target_pvc_proof(&claim, pvcs, pvs))
-        .collect();
+    let claims = match (pvcs, pvs) {
+        (Some(pvcs), Some(pvs)) => persistent_volume_claim_names(pod)
+            .into_iter()
+            .map(|claim| target_pvc_proof(&claim, pvcs, pvs))
+            .collect(),
+        _ => Vec::new(),
+    };
     Some(proof.with_persistent_volume_claims(claims))
 }
 
@@ -408,7 +420,7 @@ mod tests {
         let pvcs = items_by_metadata_name(&pvc_list);
         let pvs = items_by_metadata_name(&pv_list);
 
-        let proof = target_pod_proof(&pod, &pvcs, &pvs).expect("proof");
+        let proof = target_pod_proof(&pod, Some(&pvcs), Some(&pvs)).expect("proof");
 
         assert_eq!(persistent_volume_claim_names(&pod), vec!["data-rustfs-0"]);
         assert_eq!(proof.node.as_deref(), Some("node-a"));
@@ -418,5 +430,25 @@ mod tests {
         let pv = claim.persistent_volume.as_ref().expect("pv");
         assert_eq!(pv.node.as_deref(), Some("node-a"));
         assert_eq!(pv.device_or_path.as_deref(), Some("/mnt/rustfs0"));
+    }
+
+    #[test]
+    fn target_pod_proof_can_skip_volume_binding_enrichment() {
+        let pod = json!({
+            "metadata": {"name": "rustfs-0", "uid": "uid-a"},
+            "spec": {
+                "nodeName": "node-a",
+                "volumes": [{
+                    "name": "data",
+                    "persistentVolumeClaim": {"claimName": "data-rustfs-0"}
+                }]
+            }
+        });
+
+        let proof = target_pod_proof(&pod, None, None).expect("proof");
+
+        assert_eq!(proof.name, "rustfs-0");
+        assert_eq!(proof.node.as_deref(), Some("node-a"));
+        assert!(proof.persistent_volume_claims.is_empty());
     }
 }
