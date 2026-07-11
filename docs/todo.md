@@ -3,6 +3,9 @@
 Detailed durability fault-testing design: see
 [`DURABILITY_FAULT_TESTING_DESIGN.md`](DURABILITY_FAULT_TESTING_DESIGN.md).
 
+Ordered durability implementation TODO, including PR #15 review feedback: see
+[`DURABILITY_FAULT_TESTING_TODO.md`](DURABILITY_FAULT_TESTING_TODO.md).
+
 This document tracks the next architecture steps for the fault-suite runner. The
 current suite format is valid for selecting catalog scenarios, repetitions,
 durations, percent overrides, workload object count, workload concurrency, and
