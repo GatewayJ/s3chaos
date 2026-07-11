@@ -752,6 +752,22 @@ fn validate_conditional_recovery_stability_artifact(root: &Path, case_name: &str
     Ok(())
 }
 
+/// Diagnostic-mode contract check for a failure summary that was just written.
+///
+/// The strict success-path validator only runs on passing runs, so without
+/// this entry point a failed run's `failure-summary.json` was never validated
+/// by any automated path — a malformed or contract-violating summary would sit
+/// undetected exactly where it matters most. Called from
+/// `reporting::write_failure_summary` right after the write; violations are
+/// surfaced as warnings there so they never mask the run's original failure.
+pub(crate) fn validate_written_failure_summary(path: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading just-written failure summary {}", path.display()))?;
+    let summary: FailureSummaryArtifact = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing just-written failure summary {}", path.display()))?;
+    validate_failure_summary_v2_fields(&summary, Some(path))
+}
+
 fn validate_failure_summary_v2_fields(
     summary: &FailureSummaryArtifact,
     artifact_path: Option<&Path>,
@@ -1418,6 +1434,62 @@ mod tests {
         summary.primary_evidence_refs.clear();
 
         super::validate_failure_summary_v2_fields(&summary, None).expect("legacy summary");
+    }
+
+    #[test]
+    fn validate_written_failure_summary_reads_files_from_disk() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // A v2 summary that violates the contract (phase missing) must be
+        // caught when read back from disk — this is the failure-path
+        // diagnostic entry used by reporting::write_failure_summary.
+        let bad = dir.path().join("failure-summary.json");
+        std::fs::write(
+            &bad,
+            serde_json::json!({
+                "schema_version": 2,
+                "scenario": "io-eio",
+                "stage": "checker",
+                "verdict": "failed",
+                "severity": "fail_correctness",
+                "classification": "data_corruption",
+                "data_correctness": "failed",
+                "availability": "unknown",
+                "message": "boom",
+            })
+            .to_string(),
+        )
+        .expect("write bad summary");
+        let error = super::validate_written_failure_summary(&bad).expect_err("v2 violation");
+        assert!(
+            error.to_string().contains("phase"),
+            "unexpected error: {error:#}"
+        );
+
+        // Legacy (pre-v2) summaries stay accepted, so the diagnostic check
+        // never rejects old artifacts.
+        let legacy = dir.path().join("legacy-failure-summary.json");
+        std::fs::write(
+            &legacy,
+            serde_json::json!({
+                "scenario": "io-eio",
+                "stage": "checker",
+                "verdict": "failed",
+                "severity": "fail_correctness",
+                "classification": "data_corruption",
+                "data_correctness": "failed",
+                "availability": "unknown",
+                "message": "boom",
+            })
+            .to_string(),
+        )
+        .expect("write legacy summary");
+        super::validate_written_failure_summary(&legacy).expect("legacy summary accepted");
+
+        // Unparseable JSON is a contract violation, not a silent pass.
+        let torn = dir.path().join("torn-failure-summary.json");
+        std::fs::write(&torn, "{ not json").expect("write torn summary");
+        assert!(super::validate_written_failure_summary(&torn).is_err());
     }
 
     #[test]
