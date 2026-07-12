@@ -146,6 +146,8 @@ Runner gate TODO:
 - [ ] Add a protocol runner script or Make wrapper that performs preflight,
       invokes the binary, captures logs, and preserves the artifact root.
 - [ ] Require an explicit endpoint and admin profile before running.
+- [ ] Require the admin profile to resolve through a documented
+      `CredentialProvider` before any target mutation.
 - [ ] Require a dedicated RustFS protocol-test target by default.
 - [ ] Record the target fingerprint in artifacts before mutating resources.
 - [ ] Refuse cleanup commands that are not scoped to an artifact root or an
@@ -196,6 +198,7 @@ target:
   region: us-east-1
   credentials:
     adminProfile: root
+    provider: env
   ownership:
     mode: dedicated-tenant
     resourcePrefix: s3chaos
@@ -217,10 +220,34 @@ Field meaning:
 - `target.region`: S3 signing region.
 - `target.credentials.adminProfile`: logical credential profile name for RustFS
   admin operations. This is not a password.
+- `target.credentials.provider`: where the logical profile is resolved. Phase 1
+  supports `env` only.
 - `target.ownership.mode`: Phase 1 requires `dedicated-tenant` unless an
   explicit future opt-in mode is added.
 - `target.ownership.resourcePrefix`: prefix for all generated resources; the
   actual run prefix must include the generated `run_id`.
+
+Credential contract:
+
+- [ ] Add a `CredentialProvider` owned by `src/protocol`, with the concrete
+      Phase 1 implementation reading environment variables at the binary or
+      runner edge.
+- [ ] Suggested Phase 1 env names:
+      `RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY`,
+      `RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY`, and optional
+      `RUSTFS_PROTOCOL_TEST_ADMIN_SESSION_TOKEN`.
+- [ ] The plan may record credential profile ids and provider names, but never
+      raw access keys, secret keys, or session tokens.
+- [ ] Add an `ActorCredential` model for credentials created during a case:
+      actor id, credential id, source resource handle, creation phase, expiration
+      when applicable, and redaction state.
+- [ ] Register generated access keys and STS sessions in the resource registry
+      before using them for S3 calls.
+- [ ] Cleanup must delete generated access keys before deleting users, and must
+      expire or forget temporary session credentials without writing raw token
+      material to artifacts.
+- [ ] Artifact validation must fail if raw credential material appears in any
+      protocol artifact.
 
 ## Case Catalog
 
@@ -244,7 +271,12 @@ ProtocolCase {
     tags: &["smoke", "authz"],
     isolation: Isolation::Case,
     requires: &["s3", "admin-api", "bucket-policy"],
-    locks: &["tenant", "admin-api-global", "bucket:auto", "iam-prefix:auto"],
+    locks: &[
+        Lock::exclusive("tenant", "target"),
+        Lock::exclusive("admin-api", "identity-management"),
+        Lock::exclusive("bucket", "auto"),
+        Lock::exclusive("iam-prefix", "auto"),
+    ],
 }
 ```
 
@@ -323,6 +355,7 @@ expected result:
 ## Fixture Model
 
 - [ ] Add `ProtocolRunFixture`.
+- [ ] Add `ProtocolResourceNamer`.
 - [ ] Generate a unique `run_id` for every suite run.
 - [ ] Prefix all resources with the `run_id`.
 - [ ] Register every resource before or immediately after creation.
@@ -333,13 +366,30 @@ expected result:
 Default resource naming:
 
 ```text
-bucket:      s3chaos-<run-id>-<case-id>-<n>
+bucket:      s3c-<run-token>-<case-token>-<n>
 object key:  cases/<case-id>/<actor>/<seq>
-user:        s3chaos-<run-id>-<case-id>-user-<n>
-group:       s3chaos-<run-id>-<case-id>-group-<n>
-policy:      s3chaos-<run-id>-<case-id>-policy-<n>
-role:        s3chaos-<run-id>-<case-id>-role-<n>
+user:        s3chaos-<run-token>-<case-token>-user-<n>
+group:       s3chaos-<run-token>-<case-token>-group-<n>
+policy:      s3chaos-<run-token>-<case-token>-policy-<n>
+role:        s3chaos-<run-token>-<case-token>-role-<n>
 ```
+
+Naming rules:
+
+- `run-token` is a lowercase alphanumeric token derived from `run_id`, no longer
+  than 12 characters.
+- `case-token` is a lowercase alphanumeric hash or slug derived from the case id,
+  no longer than 10 characters.
+- Bucket names must be validated before use:
+  3 to 63 characters, lowercase letters, digits, and hyphens only, no leading or
+  trailing hyphen, no adjacent dots, no IP-address shape.
+- IAM, policy, group, and role names must use the target API's accepted
+  character set and length limits.
+- Full human-readable case ids stay in `resource-registry.json`,
+  `case-report.json`, and operation history; they do not need to fit inside
+  external resource names.
+- Add unit tests for representative long case ids and unusual characters before
+  implementing additional case groups.
 
 Resource registry state machine:
 
@@ -365,6 +415,9 @@ Registry rules:
 - Treat unknown or partially-created resources as cleanup work, not as success.
 - `protocol-cleanup` must be able to replay cleanup from only the artifact root
   or registry path.
+- Mutating preflight probes must use the same registry, with
+  `owner_phase=preflight` and a stable synthetic case id such as
+  `preflight-permission-probe`.
 
 Supported isolation levels:
 
@@ -488,18 +541,42 @@ write cleanup report
 
 Lock model:
 
+```rust
+ProtocolLock {
+    scope: LockScope::Tenant,
+    name: "target",
+    mode: LockMode::Exclusive,
+}
+
+ProtocolLock {
+    scope: LockScope::Bucket,
+    name: "s3c-run123-caseabcd-0",
+    mode: LockMode::Exclusive,
+}
+```
+
+Lock scopes:
+
 ```text
 tenant
 endpoint
-bucket:<bucket-name>
-bucket-prefix:<prefix>
-iam-prefix:<prefix>
-iam-user:<user-name>
-iam-policy:<policy-name>
-iam-role:<role-name>
-admin-api-global
-external-idp:<name>
+bucket
+bucket-prefix
+iam-prefix
+iam-user
+iam-policy
+iam-role
+admin-api
+external-idp
 ```
+
+Lock modes:
+
+- `shared`: multiple cases may hold the lock when they only read shared state.
+- `exclusive`: only one case may hold the lock when it creates, modifies, or
+  deletes state.
+- Phase 1 runs serially, but it must still emit typed locks into the resolved
+  plan so Phase 6 does not infer semantics from strings.
 
 Parallel-safe requirements:
 
@@ -696,6 +773,16 @@ Do not expose feature capability switches such as `sts: optional` in the suite
 YAML. If a selected RustFS protocol group requires a RustFS API, that API must
 be available or the run should fail during preflight.
 
+Preflight order:
+
+1. Resolve suite and catalog selection without mutating the target.
+2. Create the artifact root and initialize `resource-registry.json`.
+3. Record target fingerprint with non-mutating probes.
+4. Scan stale resources for the configured prefix.
+5. Run mutating permission probes only after registry initialization.
+6. Clean mutating probe resources through the normal cleanup path.
+7. Write `preflight-summary.json` and include it in the resolved plan.
+
 - [ ] Detect S3 endpoint availability.
 - [ ] Detect RustFS admin API availability.
 - [ ] Detect RustFS IAM management availability when IAM cases are selected.
@@ -711,8 +798,15 @@ be available or the run should fail during preflight.
 - [ ] Detect the target fingerprint before mutation and write it to
       `preflight-summary.json`, `protocol-suite-plan.json`, and
       `resource-registry.json`.
-- [ ] Scan for stale resources with the configured resource prefix and fail or
-      warn according to the safety policy before creating new resources.
+- [ ] Scan for stale resources with the configured resource prefix.
+- [ ] Default stale-resource policy is fail-closed: stale resources in
+      `planned`, `creating`, `created`, `cleanup_attempted`, or `failed` state
+      stop the run and require explicit cleanup first.
+- [ ] `warn` stale-resource behavior is allowed only behind a local debug flag;
+      never allow it in CI or default suite execution.
+- [ ] Mutating permission probes must register their probe users, policies,
+      roles, access keys, buckets, and bucket policies in `resource-registry.json`
+      before the first external mutation.
 - [ ] Validate that Phase 1 runs use `parallelism: 1` and `cleanup: always`.
 - [ ] Record preflight results in `protocol-suite-plan.json`.
 
@@ -730,6 +824,11 @@ Case behavior:
 - [ ] Require a dedicated RustFS protocol-test target for the first
       implementation.
 - [ ] Define target fingerprint fields and where they appear in artifacts.
+- [ ] Define `CredentialProvider`, `ActorCredential`, and secret redaction
+      rules before adding real cases.
+- [ ] Define `ProtocolResourceNamer` and bucket/IAM name validators before
+      adding real cases.
+- [ ] Define mutating preflight probe registration and cleanup semantics.
 - [ ] Choose the stable RustFS admin API surface for identity, policy, and role
       management.
 - [ ] Choose the initial STS call path, but do not block bucket-policy smoke on
@@ -738,6 +837,8 @@ Case behavior:
       `apiVersion`, `kind`, `metadata`, `selector`, `execution`, `target`.
 - [ ] Freeze Phase 1 artifact names and required JSON files.
 - [ ] Freeze cleanup addressing as artifact-root or registry-path based.
+- [ ] Freeze stale-resource policy as fail-closed for Phase 1.
+- [ ] Freeze typed lock shape as `scope + name + mode`.
 - [ ] Decide how the runner wrapper exposes safety gates and required env vars.
 
 ### Phase 1: Minimal Protocol E2E Closure
@@ -751,6 +852,9 @@ Case behavior:
 - [ ] Validate that `cleanup == always`.
 - [ ] Add protocol artifact layout.
 - [ ] Add `ResourceRegistry` with atomic state transitions.
+- [ ] Add `ProtocolResourceNamer` with S3 bucket and IAM name validation.
+- [ ] Add `CredentialProvider` and `ActorCredential` without writing raw secrets
+      to artifacts.
 - [ ] Add S3 client wrapper needed by bucket policy smoke.
 - [ ] Add admin client wrapper needed by bucket policy smoke.
 - [ ] Add bucket, identity, and bucket-policy fixture helpers needed by one
@@ -758,6 +862,9 @@ Case behavior:
 - [ ] Implement `bucket-policy-authenticated-user-rw`.
 - [ ] Add allow/deny assertion helpers.
 - [ ] Add policy propagation retry helper.
+- [ ] Add mutating preflight permission probes that register probe resources in
+      the registry.
+- [ ] Add fail-closed stale-resource scan.
 - [ ] Run case cleanup immediately after the case.
 - [ ] Run suite fallback cleanup from registry.
 - [ ] Add `protocol-validate-artifacts`.
@@ -858,6 +965,13 @@ Phase 1 is ready to implement when:
       selected cases require.
 - [ ] The selector vocabulary matches the Rust catalog exactly.
 - [ ] `parallelism > 1` and cleanup modes other than `always` are rejected.
+- [ ] Bucket and IAM resource naming is deterministic, validated, and safe for
+      long case ids.
+- [ ] Admin and actor credential sources are modeled without leaking raw secrets
+      into plans or reports.
+- [ ] Mutating preflight probes run only after artifact root and registry
+      initialization.
+- [ ] Stale-resource handling defaults to fail-closed.
 - [ ] The first runner can produce a stable artifact root without running real
       fault tests.
 - [ ] The first cleanup command is scoped by artifact root or registry path.
@@ -868,12 +982,15 @@ Phase 1 is ready to merge when:
 - [ ] `protocol-suite-validate` rejects unknown fields, unsupported
       parallelism, unsupported cleanup modes, and missing target ownership.
 - [ ] `protocol-suite-plan` writes a deterministic plan with selected case ids,
-      target fingerprint, preflight probe list, and cleanup policy.
+      target fingerprint, preflight probe list, typed locks, and cleanup policy.
 - [ ] `protocol-suite-run` executes
       `bucket-policy-authenticated-user-rw` against a RustFS test target.
 - [ ] The case proves both denied and allowed authorization paths.
 - [ ] Case cleanup runs after success and after assertion failure.
 - [ ] Suite fallback cleanup can replay from `resource-registry.json`.
+- [ ] Mutating preflight probe resources are registered and cleaned.
+- [ ] A stale resource with the configured prefix fails preflight by default.
+- [ ] Long case ids produce valid bucket and IAM resource names.
 - [ ] `protocol-validate-artifacts` verifies summary, case report, registry,
       cleanup report, preflight summary, and secret redaction.
 - [ ] No protocol artifact is written under `target/fault-tests/`.
