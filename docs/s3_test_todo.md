@@ -148,7 +148,10 @@ Runner gate TODO:
 - [ ] Require an explicit endpoint and admin profile before running.
 - [ ] Require the admin profile to resolve through a documented
       `CredentialProvider` before any target mutation.
-- [ ] Require a dedicated RustFS protocol-test target by default.
+- [ ] Require a dedicated RustFS protocol-test target by default through an
+      explicit safety acknowledgement plus fingerprint recording. If the runner
+      cannot prove the target identity from probes, it must fail unless a local
+      non-CI debug override acknowledges the dedicated target.
 - [ ] Record the target fingerprint in artifacts before mutating resources.
 - [ ] Refuse cleanup commands that are not scoped to an artifact root or an
       explicit registry path.
@@ -201,7 +204,11 @@ target:
     provider: env
   ownership:
     mode: dedicated-tenant
-    resourcePrefix: s3chaos
+    resourcePrefixes:
+      bucket: s3c
+      identity: s3chaos
+  safety:
+    dedicatedTarget: required
 ```
 
 Field meaning:
@@ -224,8 +231,15 @@ Field meaning:
   supports `env` only.
 - `target.ownership.mode`: Phase 1 requires `dedicated-tenant` unless an
   explicit future opt-in mode is added.
-- `target.ownership.resourcePrefix`: prefix for all generated resources; the
-  actual run prefix must include the generated `run_id`.
+- `target.ownership.resourcePrefixes.bucket`: prefix for generated buckets.
+- `target.ownership.resourcePrefixes.identity`: prefix for generated IAM users,
+  groups, roles, policies, and access keys.
+- Each actual resource name must include the configured prefix, generated
+  `run_id`, and case token. Stale-resource scans and cleanup plans must list
+  every configured prefix they will inspect.
+- `target.safety.dedicatedTarget`: Phase 1 supports only `required`. The runner
+  records a target fingerprint before mutation and refuses CI/default execution
+  if the fingerprint cannot be captured.
 
 Credential contract:
 
@@ -257,8 +271,8 @@ Credential contract:
 - [ ] Use RustFS API requirements to fail preflight clearly when a selected
       group cannot run.
 - [ ] Keep matrix combinations inside the case module, not in YAML.
-- [ ] Treat the Rust catalog as the authority. Status lists may override
-      run-state behavior, but they must not define new groups.
+- [ ] Treat the Rust catalog as the sole Phase 1 authority. Compatibility status
+      lists belong to Phase 7 and must not affect the first smoke suite.
 - [ ] Generate `protocol-catalog-json` from Rust metadata so docs, CLI, and plan
       resolution all use the same vocabulary.
 
@@ -271,12 +285,7 @@ ProtocolCase {
     tags: &["smoke", "authz"],
     isolation: Isolation::Case,
     requires: &["s3", "admin-api", "bucket-policy"],
-    locks: &[
-        Lock::exclusive("tenant", "target"),
-        Lock::exclusive("admin-api", "identity-management"),
-        Lock::exclusive("bucket", "auto"),
-        Lock::exclusive("iam-prefix", "auto"),
-    ],
+    serial: true,
 }
 ```
 
@@ -290,14 +299,12 @@ Case groups:
 - [ ] `sts-session-policy`
 - [ ] `public-access-block`
 
-Case status lists:
+Future compatibility status lists (Phase 7 only):
 
-- [ ] `docs/protocol-cases/implemented.yaml`
-- [ ] `docs/protocol-cases/unimplemented.yaml`
-- [ ] `docs/protocol-cases/excluded.yaml`
-- [ ] `docs/protocol-cases/expected_divergence.yaml`
+- [ ] Defer `implemented.yaml`, `unimplemented.yaml`, `excluded.yaml`, and
+      `expected_divergence.yaml` to Phase 7 compatibility expansion.
 
-Each expected divergence entry must include:
+When Phase 7 adds expected divergence entries, each entry must include:
 
 - Case id
 - Product or compatibility reason
@@ -307,17 +314,10 @@ Each expected divergence entry must include:
 
 Selector resolution order:
 
-1. Load all cases from the Rust catalog.
+1. Load all Phase 1 cases from the Rust catalog.
 2. Apply `selector.groups`, `selector.tags`, and explicit case includes.
-3. Apply explicit excludes.
-4. Apply status lists:
-   - `implemented`: selected cases are runnable.
-   - `unimplemented`: selected cases fail validation unless explicitly allowed
-     by a development flag.
-   - `excluded`: selected cases are skipped with a reason.
-   - `expected_divergence`: selected cases run, warn, skip, or fail according to
-     the recorded policy.
-5. Emit the final selected case set into `protocol-suite-plan.json`.
+3. Apply explicit excludes from the suite file.
+4. Emit the final selected case set into `protocol-suite-plan.json`.
 
 Authorization matrix model:
 
@@ -366,16 +366,18 @@ expected result:
 Default resource naming:
 
 ```text
-bucket:      s3c-<run-token>-<case-token>-<n>
+bucket:      <bucket-prefix>-<run-token>-<case-token>-<n>
 object key:  cases/<case-id>/<actor>/<seq>
-user:        s3chaos-<run-token>-<case-token>-user-<n>
-group:       s3chaos-<run-token>-<case-token>-group-<n>
-policy:      s3chaos-<run-token>-<case-token>-policy-<n>
-role:        s3chaos-<run-token>-<case-token>-role-<n>
+user:        <identity-prefix>-<run-token>-<case-token>-user-<n>
+group:       <identity-prefix>-<run-token>-<case-token>-group-<n>
+policy:      <identity-prefix>-<run-token>-<case-token>-policy-<n>
+role:        <identity-prefix>-<run-token>-<case-token>-role-<n>
 ```
 
 Naming rules:
 
+- `bucket-prefix` and `identity-prefix` come from
+  `target.ownership.resourcePrefixes` and are copied into the resolved plan.
 - `run-token` is a lowercase alphanumeric token derived from `run_id`, no longer
   than 12 characters.
 - `case-token` is a lowercase alphanumeric hash or slug derived from the case id,
@@ -413,9 +415,9 @@ Registry rules:
   attachments, owning case id, and dependency ordering.
 - Include target fingerprint and `run_id` in the registry header.
 - Treat unknown or partially-created resources as cleanup work, not as success.
-- `protocol-cleanup` must be able to replay cleanup from only the artifact root
-  or registry path.
-- Mutating preflight probes must use the same registry, with
+- Phase 1 cleanup must be able to replay cleanup from the artifact root.
+- Emergency cleanup from a standalone registry path belongs to Phase 2.
+- Phase 2 mutating preflight probes must use the same registry, with
   `owner_phase=preflight` and a stable synthetic case id such as
   `preflight-permission-probe`.
 
@@ -575,8 +577,9 @@ Lock modes:
 - `shared`: multiple cases may hold the lock when they only read shared state.
 - `exclusive`: only one case may hold the lock when it creates, modifies, or
   deletes state.
-- Phase 1 runs serially, but it must still emit typed locks into the resolved
-  plan so Phase 6 does not infer semantics from strings.
+- Phase 1 runs serially and does not need to emit typed locks. It should record
+  `isolation: case` and `serial: true` for selected cases. The typed lock model
+  is frozen only when the Phase 6 scheduler is implemented.
 
 Parallel-safe requirements:
 
@@ -662,7 +665,7 @@ target/protocol-tests/<timestamp>/<suite-name>/<run-id>/
   resource-registry.json
   cleanup-report.json
   protocol-failure-summary.json
-  protocol-artifact-validation-report.json
+  protocol-artifact-validation-report.json   # Phase 2
   cases/
     <case-id>/
       case-report.json
@@ -679,10 +682,12 @@ Artifact contract rules:
   failure summary paths. It should not duplicate their full content.
 - `protocol-failure-summary.json` records the first failing stage, normalized
   classification, selected case id, and primary evidence references.
-- `preflight-summary.json` records target fingerprint, selected API probes,
-  cleanup permission probes, stale resource scan results, and selected cases.
-- `protocol-artifact-validation-report.json` validates that all required files
-  exist, parse, link to each other, and do not contain raw secrets.
+- `preflight-summary.json` records target fingerprint, endpoint/admin
+  reachability, stale resource scan results, and selected cases. Phase 2 adds
+  cleanup permission probes.
+- `protocol-artifact-validation-report.json` is a Phase 2 artifact. It validates
+  that all required files exist, parse, link to each other, and do not contain
+  raw secrets.
 
 ## Initial Bucket Policy Cases
 
@@ -778,9 +783,10 @@ Preflight order:
 1. Resolve suite and catalog selection without mutating the target.
 2. Create the artifact root and initialize `resource-registry.json`.
 3. Record target fingerprint with non-mutating probes.
-4. Scan stale resources for the configured prefix.
-5. Run mutating permission probes only after registry initialization.
-6. Clean mutating probe resources through the normal cleanup path.
+4. Scan stale resources for every configured resource prefix and record the
+   results.
+5. Phase 2 only: run mutating permission probes after registry initialization.
+6. Phase 2 only: clean mutating probe resources through the normal cleanup path.
 7. Write `preflight-summary.json` and include it in the resolved plan.
 
 - [ ] Detect S3 endpoint availability.
@@ -794,12 +800,13 @@ Preflight order:
       policies, users, groups, roles, and access keys needed by selected cases.
 - [ ] Detect that admin credentials can put and delete bucket policies.
 - [ ] Detect that cleanup can delete objects, versions, delete markers, and
-      buckets under the generated resource prefix.
+      buckets under the generated resource prefixes.
 - [ ] Detect the target fingerprint before mutation and write it to
       `preflight-summary.json`, `protocol-suite-plan.json`, and
       `resource-registry.json`.
-- [ ] Scan for stale resources with the configured resource prefix.
-- [ ] Default stale-resource policy is fail-closed: stale resources in
+- [ ] Scan for stale resources with every configured resource prefix.
+- [ ] Phase 1 records stale-resource scan results. Phase 2 freezes the default
+      fail-closed policy after scoped cleanup commands exist: stale resources in
       `planned`, `creating`, `created`, `cleanup_attempted`, or `failed` state
       stop the run and require explicit cleanup first.
 - [ ] `warn` stale-resource behavior is allowed only behind a local debug flag;
@@ -836,9 +843,12 @@ Case behavior:
 - [ ] Freeze Phase 1 suite schema fields:
       `apiVersion`, `kind`, `metadata`, `selector`, `execution`, `target`.
 - [ ] Freeze Phase 1 artifact names and required JSON files.
-- [ ] Freeze cleanup addressing as artifact-root or registry-path based.
-- [ ] Freeze stale-resource policy as fail-closed for Phase 1.
-- [ ] Freeze typed lock shape as `scope + name + mode`.
+- [ ] Freeze Phase 1 cleanup addressing as artifact-root based. Standalone
+      registry-path cleanup belongs to Phase 2.
+- [ ] Define stale-resource scan fields for Phase 1, but defer fail-closed stale
+      policy until Phase 2 cleanup commands exist.
+- [ ] Record `isolation` and `serial` execution hints in Phase 1 plans. Defer the
+      typed lock shape to the Phase 6 scheduler.
 - [ ] Decide how the runner wrapper exposes safety gates and required env vars.
 
 ### Phase 1: Minimal Protocol E2E Closure
@@ -862,15 +872,14 @@ Case behavior:
 - [ ] Implement `bucket-policy-authenticated-user-rw`.
 - [ ] Add allow/deny assertion helpers.
 - [ ] Add policy propagation retry helper.
-- [ ] Add mutating preflight permission probes that register probe resources in
-      the registry.
-- [ ] Add fail-closed stale-resource scan.
+- [ ] Record a non-mutating preflight summary, including endpoint reachability,
+      target fingerprint, selected cases, and stale-resource scan results.
 - [ ] Run case cleanup immediately after the case.
 - [ ] Run suite fallback cleanup from registry.
-- [ ] Add `protocol-validate-artifacts`.
 - [ ] Write `preflight-summary.json`, `case-report.json`,
-      `cleanup-report.json`, `protocol-suite-summary.json`, and
-      `protocol-artifact-validation-report.json`.
+      `cleanup-report.json`, and `protocol-suite-summary.json`.
+- [ ] Add a basic artifact sanity check for required Phase 1 files and raw secret
+      leakage. The full protocol artifact validator belongs to Phase 2.
 
 Phase 1 is complete only when this flow works end to end:
 
@@ -884,7 +893,7 @@ assert allowed in scope
 assert unrelated user denied
 cleanup case resources
 run suite fallback cleanup
-validate protocol artifacts
+run basic artifact and secret checks
 ```
 
 ### Phase 2: Fixture And Cleanup Hardening
@@ -893,10 +902,14 @@ validate protocol artifacts
 - [ ] Add cleanup retry behavior for transient S3/admin errors.
 - [ ] Add versioned bucket cleanup.
 - [ ] Add delete marker cleanup.
-- [ ] Add stale-resource preflight policy.
+- [ ] Add mutating preflight permission probes that register probe resources in
+      the registry.
+- [ ] Add fail-closed stale-resource preflight policy.
 - [ ] Add `protocol-cleanup <artifact-root>`.
 - [ ] Add `protocol-cleanup --registry <resource-registry.json>`.
 - [ ] Add cleanup failure tests with forced mid-run interruption.
+- [ ] Add `protocol-validate-artifacts`.
+- [ ] Add `protocol-artifact-validation-report.json`.
 - [ ] Add secret redaction validation for all artifacts.
 
 ### Phase 3: Bucket Policy Coverage
@@ -969,12 +982,14 @@ Phase 1 is ready to implement when:
       long case ids.
 - [ ] Admin and actor credential sources are modeled without leaking raw secrets
       into plans or reports.
-- [ ] Mutating preflight probes run only after artifact root and registry
-      initialization.
-- [ ] Stale-resource handling defaults to fail-closed.
+- [ ] Non-mutating preflight records endpoint reachability, target fingerprint,
+      selected cases, and stale-resource scan fields.
+- [ ] Resource prefix handling lists every prefix used for bucket and identity
+      resources.
 - [ ] The first runner can produce a stable artifact root without running real
       fault tests.
-- [ ] The first cleanup command is scoped by artifact root or registry path.
+- [ ] The first cleanup path is scoped by artifact root. Standalone registry-path
+      cleanup remains a Phase 2 item.
 
 Phase 1 is ready to merge when:
 
@@ -982,17 +997,18 @@ Phase 1 is ready to merge when:
 - [ ] `protocol-suite-validate` rejects unknown fields, unsupported
       parallelism, unsupported cleanup modes, and missing target ownership.
 - [ ] `protocol-suite-plan` writes a deterministic plan with selected case ids,
-      target fingerprint, preflight probe list, typed locks, and cleanup policy.
+      target fingerprint, resource prefixes, `isolation: case`, `serial: true`,
+      and cleanup policy.
 - [ ] `protocol-suite-run` executes
       `bucket-policy-authenticated-user-rw` against a RustFS test target.
 - [ ] The case proves both denied and allowed authorization paths.
 - [ ] Case cleanup runs after success and after assertion failure.
 - [ ] Suite fallback cleanup can replay from `resource-registry.json`.
-- [ ] Mutating preflight probe resources are registered and cleaned.
-- [ ] A stale resource with the configured prefix fails preflight by default.
+- [ ] Stale-resource scan results cover every configured resource prefix and are
+      recorded before mutation.
 - [ ] Long case ids produce valid bucket and IAM resource names.
-- [ ] `protocol-validate-artifacts` verifies summary, case report, registry,
-      cleanup report, preflight summary, and secret redaction.
+- [ ] Basic artifact checks verify summary, case report, registry, cleanup
+      report, preflight summary, and raw secret redaction for Phase 1 files.
 - [ ] No protocol artifact is written under `target/fault-tests/`.
 - [ ] No raw access key, secret key, session token, or admin credential appears
       in artifacts.
