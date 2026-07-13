@@ -12,6 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod fault;
-pub mod framework;
-pub mod protocol;
+pub mod artifact_validation;
+pub mod authorization;
+pub mod cases;
+pub mod catalog;
+pub mod clients;
+pub mod compatibility;
+pub mod credentials;
+pub mod fixture;
+pub mod ports;
+pub mod preflight;
+pub mod reporting;
+pub mod scheduler;
+pub mod suite;
+pub mod suite_plan;
+pub mod suite_runner;
