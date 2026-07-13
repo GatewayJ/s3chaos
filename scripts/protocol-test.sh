@@ -9,8 +9,7 @@ die() {
   exit 1
 }
 
-require_runtime_env() {
-  [[ -n "${RUSTFS_PROTOCOL_TEST_ENDPOINT:-}" ]] || die "RUSTFS_PROTOCOL_TEST_ENDPOINT is required"
+require_runtime_credentials() {
   require_admin_credentials
 }
 
@@ -40,12 +39,12 @@ case "$command" in
     ;;
   suite-plan)
     [[ $# -eq 2 ]] || die "suite-plan requires exactly one suite path"
-    require_runtime_env
+    require_runtime_credentials
     run_cli protocol-suite-plan "$2"
     ;;
   suite-run)
     [[ $# -eq 2 ]] || die "suite-run requires exactly one suite path"
-    require_runtime_env
+    require_runtime_credentials
     [[ "${RUSTFS_PROTOCOL_TEST_DEDICATED:-}" == "1" ]] || \
       die "set RUSTFS_PROTOCOL_TEST_DEDICATED=1 only for a verified dedicated target"
     run_cli protocol-suite-run "$2"

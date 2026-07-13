@@ -46,5 +46,5 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
-      - name: Shell lint fault-test.sh
-        run: bash -n scripts/fault-test.sh
+      - name: Shell lint test entrypoints
+        run: bash -n scripts/fault-test.sh scripts/protocol-test.sh scripts/protocol-compatibility.sh

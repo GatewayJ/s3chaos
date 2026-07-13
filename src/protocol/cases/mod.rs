@@ -140,6 +140,9 @@ impl CaseContext {
     }
 
     pub(crate) fn add_actor(&mut self, actor: ActorCredential) {
+        if actor.session_token().is_some() {
+            self.forbidden_secrets.push(actor.access_key().to_string());
+        }
         self.forbidden_secrets.push(actor.secret_key().to_string());
         if let Some(token) = actor.session_token() {
             self.forbidden_secrets.push(token.to_string());

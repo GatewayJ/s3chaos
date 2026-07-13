@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{
@@ -78,22 +78,44 @@ pub async fn preflight_protocol_suite(
         matches!(stale_resource_policy, "fail" | "warn-local-debug"),
         "unsupported stale resource policy {stale_resource_policy}"
     );
-    let server_info = admin.server_info().await?;
-    let fingerprint = TargetFingerprint::new(
-        endpoint,
-        &suite.target.region,
-        server_info.deployment_id,
-        server_info.mode,
-        server_info.region,
-    )?;
+    let requires_admin_api = suite
+        .cases
+        .iter()
+        .any(|case| case.requires.contains(&"admin-api"));
+    let fingerprint = if requires_admin_api {
+        let server_info = admin.server_info().await?;
+        TargetFingerprint::new(
+            endpoint,
+            &suite.target.region,
+            server_info.deployment_id,
+            server_info.mode,
+            server_info.region,
+        )?
+    } else {
+        TargetFingerprint::new(
+            endpoint,
+            &suite.target.region,
+            format!("s3-endpoint:{endpoint}"),
+            None,
+            None,
+        )?
+    };
     let bucket_prefix = suite.target.ownership.resource_prefixes.bucket.clone();
     let identity_prefix = suite.target.ownership.resource_prefixes.identity.clone();
     let buckets = s3.list_buckets_with_prefix(&bucket_prefix).await?;
-    let mut identities = admin.users_with_prefix(&identity_prefix).await?;
     let requires_iam = suite
         .cases
         .iter()
         .any(|case| case.requires.contains(&"iam"));
+    let requires_identity = requires_iam
+        || suite
+            .cases
+            .iter()
+            .any(|case| case.requires.contains(&"identity"));
+    let mut identities = Vec::new();
+    if requires_identity {
+        identities.extend(admin.users_with_prefix(&identity_prefix).await?);
+    }
     if requires_iam {
         identities.extend(admin.policies_with_prefix(&identity_prefix).await?);
         identities.extend(admin.groups_with_prefix(&identity_prefix).await?);
@@ -106,7 +128,7 @@ pub async fn preflight_protocol_suite(
         kind: "ProtocolPreflightSummary".to_string(),
         target_fingerprint: fingerprint,
         endpoint_reachable: true,
-        admin_api_reachable: true,
+        admin_api_reachable: requires_admin_api,
         selected_cases: suite.cases.iter().map(|case| case.id.to_string()).collect(),
         stale_resources: ProtocolStaleResourceScan {
             bucket_prefix,
@@ -138,28 +160,46 @@ pub struct ProtocolMutatingProbeExecution {
     pub forbidden_secrets: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProtocolProbeCapabilities {
+    pub bucket_policy: bool,
+    pub iam: bool,
+    pub sts: bool,
+}
+
+impl ProtocolProbeCapabilities {
+    pub fn from_suite(suite: &ResolvedProtocolSuite) -> Self {
+        let requires = |capability| {
+            suite
+                .cases
+                .iter()
+                .any(|case| case.requires.contains(&capability))
+        };
+        Self {
+            bucket_policy: requires("bucket-policy"),
+            iam: requires("iam"),
+            sts: requires("sts"),
+        }
+    }
+}
+
 pub async fn run_mutating_permission_probe(
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
     admin: &impl ProtocolAdminPort,
     s3: &impl ProtocolS3Port,
     sts: Option<&dyn ProtocolStsPort>,
-    requires_iam: bool,
-    requires_sts: bool,
+    capabilities: ProtocolProbeCapabilities,
 ) -> ProtocolMutatingProbeExecution {
     let case_id = "preflight-permission-probe";
     let mut forbidden_secrets = Vec::new();
     let result = run_probe_resources(
-        case_id,
         namer,
         registry,
         admin,
         s3,
-        ProbeCapabilities {
-            sts,
-            requires_iam,
-            requires_sts,
-        },
+        sts,
+        capabilities,
         &mut forbidden_secrets,
     )
     .await;
@@ -218,41 +258,39 @@ pub async fn cleanup_interrupted_mutating_permission_probe(
     }
 }
 
-struct ProbeCapabilities<'a> {
-    sts: Option<&'a dyn ProtocolStsPort>,
-    requires_iam: bool,
-    requires_sts: bool,
-}
-
 async fn run_probe_resources(
-    case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
     admin: &impl ProtocolAdminPort,
     s3: &impl ProtocolS3Port,
-    capabilities: ProbeCapabilities<'_>,
+    sts: Option<&dyn ProtocolStsPort>,
+    capabilities: ProtocolProbeCapabilities,
     forbidden_secrets: &mut Vec<String>,
 ) -> Result<(usize, usize)> {
+    let case_id = "preflight-permission-probe";
     ensure!(
-        !capabilities.requires_sts || capabilities.requires_iam,
-        "STS preflight requires IAM preflight resources"
+        !capabilities.sts || capabilities.iam,
+        "STS preflight requires IAM"
     );
-    let user_name = namer.iam_user(case_id, 0)?;
-    let user_handle = registry.plan_for_phase(
-        ResourceKind::IamUser,
-        &user_name,
-        case_id,
-        Vec::new(),
-        "preflight",
-    )?;
-    let user = ActorCredential::generated("preflight-user", &user_name, &user_handle.id)?;
-    forbidden_secrets.push(user.secret_key().to_string());
-    if let Some(token) = user.session_token() {
-        forbidden_secrets.push(token.to_string());
-    }
-    registry.transition(&user_handle.id, ResourceState::Creating, None)?;
-    admin.create_user(&user).await?;
-    registry.transition(&user_handle.id, ResourceState::Created, None)?;
+    let requires_identity = capabilities.bucket_policy || capabilities.iam;
+    let (user_name, user_handle, user) = if requires_identity {
+        let user_name = namer.iam_user(case_id, 0)?;
+        let user_handle = registry.plan_for_phase(
+            ResourceKind::IamUser,
+            user_name.as_str(),
+            case_id,
+            Vec::new(),
+            "preflight",
+        )?;
+        let user = ActorCredential::generated("preflight-user", &user_name, &user_handle.id)?;
+        forbidden_secrets.push(user.secret_key().to_string());
+        registry.transition(&user_handle.id, ResourceState::Creating, None)?;
+        admin.create_user(&user).await?;
+        registry.transition(&user_handle.id, ResourceState::Created, None)?;
+        (Some(user_name), Some(user_handle), Some(user))
+    } else {
+        (None, None, None)
+    };
 
     let bucket = namer.bucket(case_id, 0)?;
     let bucket_handle = registry.plan_for_phase(
@@ -266,27 +304,40 @@ async fn run_probe_resources(
     s3.create_bucket(&bucket).await?;
     registry.transition(&bucket_handle.id, ResourceState::Created, None)?;
 
-    let policy_handle = registry.plan_for_phase(
-        ResourceKind::BucketPolicy,
-        &bucket,
-        case_id,
-        vec![bucket_handle.id.clone(), user_handle.id.clone()],
-        "preflight",
-    )?;
-    registry.transition(&policy_handle.id, ResourceState::Creating, None)?;
-    let policy = serde_json::to_string(&serde_json::json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Principal": {"AWS": user_name},
-            "Action": ["s3:ListBucket"],
-            "Resource": [format!("arn:aws:s3:::{bucket}")]
-        }]
-    }))?;
-    s3.put_bucket_policy(&bucket, &policy).await?;
-    registry.transition(&policy_handle.id, ResourceState::Created, None)?;
+    if capabilities.bucket_policy {
+        let user_name = user_name
+            .as_deref()
+            .context("bucket-policy probe omitted IAM user")?;
+        let user_handle = user_handle
+            .as_ref()
+            .context("bucket-policy probe omitted IAM user handle")?;
+        let policy_handle = registry.plan_for_phase(
+            ResourceKind::BucketPolicy,
+            &bucket,
+            case_id,
+            vec![bucket_handle.id.clone(), user_handle.id.clone()],
+            "preflight",
+        )?;
+        registry.transition(&policy_handle.id, ResourceState::Creating, None)?;
+        let policy = serde_json::to_string(&serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"AWS": user_name},
+                "Action": ["s3:ListBucket"],
+                "Resource": [format!("arn:aws:s3:::{bucket}")]
+            }]
+        }))?;
+        s3.put_bucket_policy(&bucket, &policy).await?;
+        registry.transition(&policy_handle.id, ResourceState::Created, None)?;
+    }
 
-    if capabilities.requires_iam {
+    if capabilities.iam {
+        let user_name = user_name.as_ref().context("IAM probe omitted IAM user")?;
+        let user_handle = user_handle
+            .as_ref()
+            .context("IAM probe omitted IAM user handle")?;
+        let user = user.as_ref().context("IAM probe omitted IAM credentials")?;
         let iam_policy_name = namer.iam_policy(case_id, 0)?;
         let iam_policy_handle = registry.plan_for_phase(
             ResourceKind::IamPolicy,
@@ -315,7 +366,7 @@ async fn run_probe_resources(
 
         let user_attachment = registry.plan_policy_attachment_for_phase(
             &iam_policy_name,
-            &user_name,
+            user_name.as_str(),
             false,
             case_id,
             vec![iam_policy_handle.id.clone(), user_handle.id.clone()],
@@ -323,16 +374,14 @@ async fn run_probe_resources(
         )?;
         registry.transition(&user_attachment.id, ResourceState::Creating, None)?;
         admin
-            .attach_policy(&iam_policy_name, &user_name, false)
+            .attach_policy(&iam_policy_name, user_name, false)
             .await?;
         registry.transition(&user_attachment.id, ResourceState::Created, None)?;
 
-        if capabilities.requires_sts {
-            let sts = capabilities
-                .sts
-                .ok_or_else(|| anyhow!("STS preflight port is unavailable"))?;
+        if capabilities.sts {
+            let sts = sts.ok_or_else(|| anyhow!("STS preflight port is unavailable"))?;
             let session_handle = registry.plan_sts_session_for_phase(
-                &user_name,
+                user_name.as_str(),
                 case_id,
                 vec![user_handle.id.clone(), user_attachment.id.clone()],
                 "preflight",
@@ -340,7 +389,7 @@ async fn run_probe_resources(
             registry.transition(&session_handle.id, ResourceState::Creating, None)?;
             let session = sts
                 .assume_role(
-                    &user,
+                    user,
                     &ProtocolAssumeRoleRequest {
                         duration_seconds: 900,
                         session_policy: None,
@@ -348,8 +397,8 @@ async fn run_probe_resources(
                     &session_handle.id,
                 )
                 .await?;
-            registry.bind_external_name(&session_handle.id, session.access_key())?;
             registry.transition(&session_handle.id, ResourceState::Created, None)?;
+            forbidden_secrets.push(session.access_key().to_string());
             forbidden_secrets.push(session.secret_key().to_string());
             if let Some(token) = session.session_token() {
                 forbidden_secrets.push(token.to_string());
@@ -367,14 +416,14 @@ async fn run_probe_resources(
         registry.transition(&group_handle.id, ResourceState::Creating, None)?;
         let membership = registry.plan_group_membership_for_phase(
             &group_name,
-            &user_name,
+            user_name.as_str(),
             case_id,
             vec![group_handle.id.clone(), user_handle.id.clone()],
             "preflight",
         )?;
         registry.transition(&membership.id, ResourceState::Creating, None)?;
         admin
-            .update_group_members(&group_name, std::slice::from_ref(&user_name), false)
+            .update_group_members(&group_name, std::slice::from_ref(user_name), false)
             .await?;
         registry.transition(&group_handle.id, ResourceState::Created, None)?;
         registry.transition(&membership.id, ResourceState::Created, None)?;
@@ -403,30 +452,29 @@ async fn run_probe_resources(
         "preflight",
     )?;
     registry.transition(&object_handle.id, ResourceState::Creating, None)?;
-    s3.enable_bucket_versioning(&bucket).await?;
-    let key = format!("{prefix}versioned-object");
-    s3.put_object(&bucket, &key, b"preflight-versioned-object")
-        .await?;
+    let key = format!("{prefix}object");
+    s3.put_object(&bucket, &key, b"preflight-object").await?;
+    ensure!(
+        s3.get_object(&bucket, &key).await? == b"preflight-object",
+        "S3 preflight object round-trip changed the payload"
+    );
+    ensure!(
+        s3.list_objects(&bucket)
+            .await?
+            .iter()
+            .any(|entry| entry == &key),
+        "S3 preflight did not list the created object"
+    );
     s3.delete_object(&bucket, &key).await?;
-    let versions = s3.list_object_versions(&bucket).await?;
-    let delete_marker_count = versions.iter().filter(|entry| entry.delete_marker).count();
-    ensure!(
-        versions.iter().any(|entry| !entry.delete_marker),
-        "versioning preflight did not observe an object version"
-    );
-    ensure!(
-        delete_marker_count > 0,
-        "versioning preflight did not observe a delete marker"
-    );
     registry.transition(&object_handle.id, ResourceState::Created, None)?;
-    Ok((versions.len(), delete_marker_count))
+    Ok((0, 0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_interrupted_mutating_permission_probe, enforce_stale_resource_policy,
-        run_mutating_permission_probe,
+        ProtocolProbeCapabilities, cleanup_interrupted_mutating_permission_probe,
+        enforce_stale_resource_policy, run_mutating_permission_probe,
     };
     use crate::protocol::{
         credentials::ActorCredential,
@@ -459,6 +507,7 @@ mod tests {
         iam_attachments: Vec<(String, String, bool)>,
         iam_memberships: Vec<(String, String)>,
         sts_sessions: Vec<(String, String)>,
+        versioning_enable_count: usize,
     }
 
     #[derive(Clone)]
@@ -521,6 +570,36 @@ mod tests {
                 .users
                 .iter()
                 .filter(|user| user.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+
+        async fn policies_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .iam_policies
+                .iter()
+                .filter(|name| name.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+
+        async fn groups_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .iam_groups
+                .iter()
+                .filter(|name| name.starts_with(prefix))
                 .cloned()
                 .collect())
         }
@@ -702,6 +781,21 @@ mod tests {
             Ok(())
         }
 
+        async fn get_bucket_policy(
+            &self,
+            _bucket: &str,
+        ) -> std::result::Result<String, ProtocolS3Error> {
+            if self.0.lock().expect("state").policy_present {
+                Ok("{}".to_string())
+            } else {
+                Err(ProtocolS3Error {
+                    code: "NoSuchBucketPolicy".to_string(),
+                    status: Some(404),
+                    request_id: None,
+                })
+            }
+        }
+
         async fn delete_bucket_policy(
             &self,
             _bucket: &str,
@@ -714,7 +808,15 @@ mod tests {
             &self,
             _bucket: &str,
         ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
-            Ok(Vec::new())
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .versions
+                .iter()
+                .filter(|entry| !entry.delete_marker)
+                .map(|entry| entry.key.clone())
+                .collect())
         }
 
         async fn put_object(
@@ -740,7 +842,7 @@ mod tests {
             _bucket: &str,
             _key: &str,
         ) -> std::result::Result<Vec<u8>, ProtocolS3Error> {
-            Ok(Vec::new())
+            Ok(b"preflight-object".to_vec())
         }
 
         async fn delete_object(
@@ -785,6 +887,7 @@ mod tests {
             &self,
             _bucket: &str,
         ) -> std::result::Result<(), ProtocolS3Error> {
+            self.0.lock().expect("state").versioning_enable_count += 1;
             Ok(())
         }
     }
@@ -801,7 +904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutating_probe_verifies_versions_and_cleans_every_resource() {
+    async fn full_mutating_probe_covers_selected_capabilities_and_cleans_every_resource() {
         let state = Arc::new(Mutex::new(State::default()));
         let dir = tempfile::tempdir().expect("tempdir");
         let mut registry =
@@ -813,8 +916,11 @@ mod tests {
             &FakeAdmin(state.clone()),
             &FakeS3(state.clone()),
             Some(&FakeSts(state.clone())),
-            true,
-            true,
+            ProtocolProbeCapabilities {
+                bucket_policy: true,
+                iam: true,
+                sts: true,
+            },
         )
         .await;
 
@@ -822,8 +928,8 @@ mod tests {
             execution.summary.status,
             ProtocolMutatingProbeStatus::Passed
         );
-        assert_eq!(execution.summary.version_count, 2);
-        assert_eq!(execution.summary.delete_marker_count, 1);
+        assert_eq!(execution.summary.version_count, 0);
+        assert_eq!(execution.summary.delete_marker_count, 0);
         assert!(execution.cleanup.succeeded);
         assert!(registry.pending_cleanup().next().is_none());
         assert!(
@@ -845,10 +951,11 @@ mod tests {
             state.iam_attachments
         );
         assert!(state.iam_memberships.is_empty());
+        assert_eq!(state.versioning_enable_count, 0);
     }
 
     #[tokio::test]
-    async fn mutating_probe_failure_still_runs_registry_cleanup() {
+    async fn s3_only_mutating_probe_skips_policy_iam_sts_and_versioning() {
         let state = Arc::new(Mutex::new(State {
             fail_policy_put: true,
             ..State::default()
@@ -863,20 +970,24 @@ mod tests {
             &FakeAdmin(state.clone()),
             &FakeS3(state.clone()),
             None,
-            false,
-            false,
+            ProtocolProbeCapabilities::default(),
         )
         .await;
 
         assert_eq!(
             execution.summary.status,
-            ProtocolMutatingProbeStatus::Failed
+            ProtocolMutatingProbeStatus::Passed
         );
         assert!(execution.cleanup.succeeded);
         assert!(registry.pending_cleanup().next().is_none());
         let state = state.lock().expect("state");
         assert!(state.users.is_empty());
         assert!(state.buckets.is_empty());
+        assert!(!state.policy_present);
+        assert!(state.iam_policies.is_empty());
+        assert!(state.iam_groups.is_empty());
+        assert!(state.sts_sessions.is_empty());
+        assert_eq!(state.versioning_enable_count, 0);
     }
 
     #[tokio::test]

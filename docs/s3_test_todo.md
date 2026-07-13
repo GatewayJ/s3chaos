@@ -728,9 +728,9 @@ Artifact contract rules:
 
 ## Initial IAM Cases
 
-- [x] `iam-user-inline-policy-readonly`
+- [x] `iam-user-managed-policy-readonly`
       - Create user.
-      - Attach inline read-only policy.
+      - Create and attach a managed read-only policy.
       - Assert get/list allowed.
       - Assert put/delete denied.
 
@@ -991,7 +991,7 @@ run basic artifact and secret checks
 
 RustFS exposes direct user/group policy mappings backed by named policy
 documents rather than a separate inline-policy document endpoint. The
-`iam-user-inline-policy-readonly` case therefore tests the direct user mapping
+`iam-user-managed-policy-readonly` case therefore tests named managed-policy
 semantics while registering and cleaning the backing policy explicitly.
 
 ### Phase 5: STS

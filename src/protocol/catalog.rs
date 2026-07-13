@@ -25,7 +25,7 @@ pub const COMPAT_LIST_OBJECTS_BASIC: &str = "compat-list-objects-basic";
 pub const COMPAT_OBJECT_PUT_GET_DELETE: &str = "compat-object-put-get-delete";
 pub const IAM_EXPLICIT_DENY_OVERRIDES_ALLOW: &str = "iam-explicit-deny-overrides-allow";
 pub const IAM_GROUP_POLICY: &str = "iam-group-policy";
-pub const IAM_USER_INLINE_POLICY_READONLY: &str = "iam-user-inline-policy-readonly";
+pub const IAM_USER_MANAGED_POLICY_READONLY: &str = "iam-user-managed-policy-readonly";
 pub const IAM_USER_MANAGED_POLICY_DETACH: &str = "iam-user-managed-policy-detach";
 pub const STS_ASSUME_ROLE_BASIC: &str = "sts-assume-role-basic";
 pub const STS_SESSION_POLICY_DENY_PUT: &str = "sts-session-policy-deny-put";
@@ -81,7 +81,7 @@ const CASES: &[ProtocolCase] = &[
     ),
     iam_case(IAM_GROUP_POLICY, "iam-group", &["authz", "regression"]),
     iam_case(
-        IAM_USER_INLINE_POLICY_READONLY,
+        IAM_USER_MANAGED_POLICY_READONLY,
         "iam-user",
         &["authz", "regression"],
     ),
@@ -101,7 +101,7 @@ const fn bucket_policy_case(id: &'static str, tags: &'static [&'static str]) -> 
         group: "bucket-policy",
         tags,
         isolation: ProtocolIsolation::Case,
-        requires: &["s3", "admin-api", "bucket-policy"],
+        requires: &["s3", "admin-api", "bucket-policy", "identity"],
         serial: false,
     }
 }
@@ -162,7 +162,7 @@ mod tests {
         BUCKET_POLICY_EXPLICIT_DENY_OVERRIDES_ALLOW, BUCKET_POLICY_MALFORMED_POLICY_REJECTED,
         BUCKET_POLICY_PREFIX_SCOPE, COMPAT_BUCKET_LIST_CREATE_DELETE, COMPAT_LIST_OBJECTS_BASIC,
         COMPAT_OBJECT_PUT_GET_DELETE, IAM_EXPLICIT_DENY_OVERRIDES_ALLOW, IAM_GROUP_POLICY,
-        IAM_USER_INLINE_POLICY_READONLY, IAM_USER_MANAGED_POLICY_DETACH, STS_ASSUME_ROLE_BASIC,
+        IAM_USER_MANAGED_POLICY_DETACH, IAM_USER_MANAGED_POLICY_READONLY, STS_ASSUME_ROLE_BASIC,
         STS_SESSION_POLICY_DENY_PUT, STS_SESSION_POLICY_NARROWS_ROLE, protocol_case_catalog,
     };
     use std::collections::BTreeSet;
@@ -184,7 +184,7 @@ mod tests {
                 COMPAT_OBJECT_PUT_GET_DELETE,
                 IAM_EXPLICIT_DENY_OVERRIDES_ALLOW,
                 IAM_GROUP_POLICY,
-                IAM_USER_INLINE_POLICY_READONLY,
+                IAM_USER_MANAGED_POLICY_READONLY,
                 IAM_USER_MANAGED_POLICY_DETACH,
                 STS_ASSUME_ROLE_BASIC,
                 STS_SESSION_POLICY_DENY_PUT,
@@ -192,5 +192,12 @@ mod tests {
             ]
         );
         assert_eq!(ids.len(), ids.iter().collect::<BTreeSet<_>>().len());
+    }
+
+    #[test]
+    fn bucket_policy_declares_identity_without_full_iam_management() {
+        let case = super::protocol_case(BUCKET_POLICY_AUTHENTICATED_USER_RW).expect("case");
+        assert!(case.requires.contains(&"identity"));
+        assert!(!case.requires.contains(&"iam"));
     }
 }

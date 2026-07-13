@@ -380,7 +380,7 @@ impl ResourceRegistry {
         let owning_case_id = owning_case_id.into();
         self.plan_internal(ResourcePlan {
             kind: ResourceKind::StsSession,
-            name: format!("pending:{owning_case_id}"),
+            name: format!("sts-session-{}", uuid::Uuid::new_v4()),
             owning_case_id,
             owner_phase: owner_phase.into(),
             depends_on,
@@ -423,49 +423,6 @@ impl ResourceRegistry {
                 .expect("resource remains present after persist failure");
             resource.state = previous_state;
             resource.last_error = previous_error;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    pub fn bind_external_name(&mut self, resource_id: &str, name: impl Into<String>) -> Result<()> {
-        let name = name.into();
-        ensure!(!name.is_empty(), "external resource name must not be empty");
-        let resource = self
-            .resources
-            .iter()
-            .find(|resource| resource.id == resource_id)
-            .with_context(|| format!("unknown resource handle {resource_id}"))?;
-        ensure!(
-            resource.state == ResourceState::Creating,
-            "external resource name can only be bound while creating"
-        );
-        ensure!(
-            resource.kind == ResourceKind::StsSession,
-            "external resource name binding is reserved for STS sessions"
-        );
-        ensure!(
-            !self.resources.iter().any(|resource| {
-                resource.id != resource_id
-                    && resource.kind == ResourceKind::StsSession
-                    && resource.name == name
-                    && resource.state != ResourceState::Cleaned
-            }),
-            "active STS session {name} is already registered"
-        );
-        let resource = self
-            .resources
-            .iter_mut()
-            .find(|resource| resource.id == resource_id)
-            .context("resource disappeared while binding external name")?;
-        let previous = std::mem::replace(&mut resource.name, name);
-        if let Err(error) = self.persist() {
-            let resource = self
-                .resources
-                .iter_mut()
-                .find(|resource| resource.id == resource_id)
-                .context("resource disappeared after bind persist failure")?;
-            resource.name = previous;
             return Err(error);
         }
         Ok(())

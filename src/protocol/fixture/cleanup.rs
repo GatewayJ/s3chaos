@@ -147,13 +147,14 @@ async fn cleanup_resource_with_retry(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match cleanup_resource(resource, admin, s3).await {
+        let cleanup = cleanup_resource(resource, admin, s3).await;
+        let cleanup = match cleanup {
+            Ok(()) => verify_resource_absent(resource, admin, s3).await,
+            Err(error) if error.is_not_found() => verify_resource_absent(resource, admin, s3).await,
+            Err(error) => Err(error),
+        };
+        match cleanup {
             Ok(()) => {
-                return Ok(CleanupSuccess {
-                    retry_count: attempt - 1,
-                });
-            }
-            Err(error) if error.is_not_found() => {
                 return Ok(CleanupSuccess {
                     retry_count: attempt - 1,
                 });
@@ -169,6 +170,90 @@ async fn cleanup_resource_with_retry(
                 });
             }
         }
+    }
+}
+
+async fn verify_resource_absent(
+    resource: &ResourceHandle,
+    admin: &impl ProtocolAdminPort,
+    s3: &impl ProtocolS3Port,
+) -> std::result::Result<(), CleanupError> {
+    match resource.kind {
+        ResourceKind::Bucket => verify_exact_absence(
+            resource,
+            s3.list_buckets_with_prefix(&resource.name)
+                .await
+                .map_err(CleanupError::S3)?,
+        ),
+        ResourceKind::BucketPolicy => match s3.get_bucket_policy(&resource.name).await {
+            Err(error) if error.is_not_found() => Ok(()),
+            Err(error) => Err(CleanupError::S3(error)),
+            Ok(_) => Err(CleanupError::NotConverged(format!(
+                "bucket policy {} is still visible after deletion",
+                resource.name
+            ))),
+        },
+        ResourceKind::ObjectPrefix => {
+            let bucket = resource.bucket.as_deref().ok_or_else(|| {
+                CleanupError::Contract("object prefix resource omitted bucket".to_string())
+            })?;
+            let prefix = resource.key_prefix.as_deref().ok_or_else(|| {
+                CleanupError::Contract("object prefix resource omitted key prefix".to_string())
+            })?;
+            let current = s3.list_objects(bucket).await.map_err(CleanupError::S3)?;
+            let versions = s3
+                .list_object_versions(bucket)
+                .await
+                .map_err(CleanupError::S3)?;
+            if current.iter().any(|key| key.starts_with(prefix))
+                || versions
+                    .iter()
+                    .any(|version| version.key.starts_with(prefix))
+            {
+                Err(CleanupError::NotConverged(format!(
+                    "object prefix {bucket}/{prefix} is still visible after cleanup"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        ResourceKind::IamUser => {
+            verify_admin_absence(resource, admin.users_with_prefix(&resource.name).await)
+        }
+        ResourceKind::IamPolicy => {
+            verify_admin_absence(resource, admin.policies_with_prefix(&resource.name).await)
+        }
+        ResourceKind::IamGroup => {
+            verify_admin_absence(resource, admin.groups_with_prefix(&resource.name).await)
+        }
+        ResourceKind::IamPolicyAttachment
+        | ResourceKind::IamGroupMembership
+        | ResourceKind::StsSession => Ok(()),
+    }
+}
+
+fn verify_admin_absence(
+    resource: &ResourceHandle,
+    result: std::result::Result<Vec<String>, ProtocolAdminError>,
+) -> std::result::Result<(), CleanupError> {
+    match result {
+        Ok(names) => verify_exact_absence(resource, names),
+        Err(error) => Err(CleanupError::Admin(error)),
+    }
+}
+
+fn verify_exact_absence(
+    resource: &ResourceHandle,
+    names: Vec<String>,
+) -> std::result::Result<(), CleanupError> {
+    if names.iter().any(|name| name == &resource.name) {
+        Err(CleanupError::NotConverged(format!(
+            "{} {} is still visible after deletion",
+            resource.kind.as_str(),
+            resource.name
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -251,6 +336,7 @@ enum CleanupError {
     S3(ProtocolS3Error),
     Admin(ProtocolAdminError),
     Contract(String),
+    NotConverged(String),
 }
 
 impl CleanupError {
@@ -258,7 +344,7 @@ impl CleanupError {
         match self {
             Self::S3(error) => error.is_not_found(),
             Self::Admin(error) => error.is_not_found(),
-            Self::Contract(_) => false,
+            Self::Contract(_) | Self::NotConverged(_) => false,
         }
     }
 
@@ -267,6 +353,7 @@ impl CleanupError {
             Self::S3(error) => error.is_transient(),
             Self::Admin(error) => error.is_transient(),
             Self::Contract(_) => false,
+            Self::NotConverged(_) => true,
         }
     }
 }
@@ -286,6 +373,7 @@ impl fmt::Display for CleanupError {
             ),
             Self::Admin(error) => error.fmt(formatter),
             Self::Contract(message) => formatter.write_str(message),
+            Self::NotConverged(message) => formatter.write_str(message),
         }
     }
 }
@@ -315,6 +403,7 @@ mod tests {
     struct FakeS3 {
         calls: Arc<Mutex<Vec<String>>>,
         policy_failures: Arc<AtomicUsize>,
+        bucket_visibility: Arc<AtomicUsize>,
         versions: Arc<Mutex<Vec<ProtocolObjectVersion>>>,
         objects: Arc<Mutex<Vec<String>>>,
     }
@@ -355,9 +444,19 @@ mod tests {
     impl ProtocolS3Port for FakeS3 {
         async fn list_buckets_with_prefix(
             &self,
-            _prefix: &str,
+            prefix: &str,
         ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
-            Ok(Vec::new())
+            if self
+                .bucket_visibility
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Ok(vec![prefix.to_string()])
+            } else {
+                Ok(Vec::new())
+            }
         }
 
         async fn create_bucket(&self, _bucket: &str) -> std::result::Result<(), ProtocolS3Error> {
@@ -378,6 +477,17 @@ mod tests {
             _policy: &str,
         ) -> std::result::Result<(), ProtocolS3Error> {
             Ok(())
+        }
+
+        async fn get_bucket_policy(
+            &self,
+            _bucket: &str,
+        ) -> std::result::Result<String, ProtocolS3Error> {
+            Err(ProtocolS3Error {
+                code: "NoSuchBucketPolicy".to_string(),
+                status: Some(404),
+                request_id: None,
+            })
         }
 
         async fn delete_bucket_policy(
@@ -557,6 +667,40 @@ mod tests {
                 "delete-object:current",
                 "delete-bucket:bucket",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_when_a_deleted_resource_remains_visible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut registry =
+            ResourceRegistry::create(dir.path(), "run", fingerprint()).expect("registry");
+        let bucket = registry
+            .plan(ResourceKind::Bucket, "bucket", "case", Vec::new())
+            .expect("bucket");
+        registry
+            .transition(&bucket.id, ResourceState::Creating, None)
+            .expect("creating");
+        registry
+            .transition(&bucket.id, ResourceState::Created, None)
+            .expect("created");
+        let s3 = FakeS3 {
+            bucket_visibility: Arc::new(AtomicUsize::new(2)),
+            ..FakeS3::default()
+        };
+
+        let report = cleanup_registered_resources(&mut registry, &FakeAdmin, &s3).await;
+
+        assert!(report.succeeded);
+        assert_eq!(report.attempts[0].retry_count, 2);
+        assert_eq!(
+            s3.calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .filter(|call| call.as_str() == "delete-bucket:bucket")
+                .count(),
+            3
         );
     }
 }

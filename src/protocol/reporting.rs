@@ -32,6 +32,7 @@ pub enum ProtocolAssertionClass {
     Ok,
     AccessDenied,
     NoSuchBucket,
+    NoSuchBucketPolicy,
     NoSuchKey,
     MalformedPolicy,
     ExpiredToken,

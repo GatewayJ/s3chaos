@@ -165,6 +165,22 @@ impl ProtocolS3Client {
         Ok(())
     }
 
+    pub async fn get_bucket_policy(&self, bucket: &str) -> Result<String, ProtocolS3Error> {
+        self.client
+            .get_bucket_policy()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?
+            .policy()
+            .map(str::to_string)
+            .ok_or_else(|| ProtocolS3Error {
+                code: "MissingBucketPolicyBody".to_string(),
+                status: Some(200),
+                request_id: None,
+            })
+    }
+
     pub async fn delete_bucket_policy(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
         self.client
             .delete_bucket_policy()
@@ -365,6 +381,10 @@ impl ProtocolS3Port for ProtocolS3Client {
         ProtocolS3Client::put_bucket_policy(self, bucket, policy).await
     }
 
+    async fn get_bucket_policy(&self, bucket: &str) -> Result<String, ProtocolS3Error> {
+        ProtocolS3Client::get_bucket_policy(self, bucket).await
+    }
+
     async fn delete_bucket_policy(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
         ProtocolS3Client::delete_bucket_policy(self, bucket).await
     }
@@ -477,7 +497,7 @@ mod tests {
     use super::ProtocolS3Error;
 
     #[test]
-    fn access_denied_accepts_code_or_status() {
+    fn access_denied_requires_an_authorization_error_code() {
         assert!(
             ProtocolS3Error {
                 code: "AccessDenied".to_string(),
@@ -494,5 +514,16 @@ mod tests {
             }
             .is_access_denied()
         );
+        for code in ["InvalidToken", "ExpiredToken", "SignatureDoesNotMatch"] {
+            assert!(
+                !ProtocolS3Error {
+                    code: code.to_string(),
+                    status: Some(403),
+                    request_id: None,
+                }
+                .is_access_denied(),
+                "{code} must not satisfy an authorization assertion"
+            );
+        }
     }
 }

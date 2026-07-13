@@ -32,8 +32,9 @@ use crate::protocol::{
         registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
     },
     preflight::{
-        ProtocolPreflightSummary, cleanup_interrupted_mutating_permission_probe,
-        enforce_stale_resource_policy, preflight_protocol_suite, run_mutating_permission_probe,
+        ProtocolPreflightSummary, ProtocolProbeCapabilities,
+        cleanup_interrupted_mutating_permission_probe, enforce_stale_resource_policy,
+        preflight_protocol_suite, run_mutating_permission_probe,
     },
     reporting::{
         ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary, ProtocolSuiteSummary,
@@ -109,24 +110,14 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         &plan.run_id,
     )?;
 
-    let requires_iam = runtime
-        .suite
-        .cases
-        .iter()
-        .any(|case| case.requires.contains(&"iam"));
-    let requires_sts = runtime
-        .suite
-        .cases
-        .iter()
-        .any(|case| case.requires.contains(&"sts"));
+    let probe_capabilities = ProtocolProbeCapabilities::from_suite(&runtime.suite);
     let mut probe_future = Box::pin(run_mutating_permission_probe(
         &namer,
         &mut registry,
         &runtime.admin,
         &runtime.s3,
         Some(&runtime.sts),
-        requires_iam,
-        requires_sts,
+        probe_capabilities,
     ));
     let probe_result = tokio::select! {
         probe = &mut probe_future => Ok(probe),
@@ -584,6 +575,9 @@ async fn verify_cleanup_target(
     admin: &RustfsAdminClient,
     expected: &TargetFingerprint,
 ) -> Result<()> {
+    if expected.deployment_id.starts_with("s3-endpoint:") {
+        return Ok(());
+    }
     let info = admin.server_info().await?;
     let actual = TargetFingerprint::new(
         &expected.endpoint,

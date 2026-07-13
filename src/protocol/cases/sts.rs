@@ -23,7 +23,6 @@ use crate::protocol::{
     cases::{
         CaseContext, ProtocolCaseExecution,
         authz::{expect_access_denied, expect_eventual_ok},
-        iam::{PolicyGrant, create_and_attach_policy, setup_user_bucket},
     },
     catalog::{
         STS_ASSUME_ROLE_BASIC, STS_SESSION_POLICY_DENY_PUT, STS_SESSION_POLICY_NARROWS_ROLE,
@@ -31,6 +30,7 @@ use crate::protocol::{
     fixture::{
         naming::ProtocolResourceNamer,
         registry::{ResourceRegistry, ResourceState},
+        resources::{IamFixture, PolicyGrant, create_and_attach_policy, setup_user_bucket},
     },
     ports::{
         ActorS3ClientFactory, ProtocolAdminPort, ProtocolAssumeRoleRequest, ProtocolS3Port,
@@ -335,10 +335,7 @@ async fn setup_sts_fixture<A, S, T, F>(
     services: StsFixtureServices<'_, A, S, T, F>,
     context: &mut CaseContext,
     session_policy_spec: SessionPolicySpec<'_>,
-) -> Result<(
-    crate::protocol::cases::iam::IamFixture<F::Client>,
-    F::Client,
-)>
+) -> Result<(IamFixture<F::Client>, F::Client)>
 where
     A: ProtocolAdminPort,
     S: ProtocolS3Port,
@@ -352,9 +349,9 @@ where
         services.admin,
         services.admin_s3,
         services.actor_clients,
-        context,
     )
     .await?;
+    context.add_actor(fixture.actor.clone());
     let parent_policy = parent_policy(&fixture.bucket)?;
     let (_, attachment) = create_and_attach_policy(
         case_id,
@@ -385,7 +382,7 @@ where
     let session = match services
         .sts
         .assume_role(
-            &context.actors[0],
+            &fixture.actor,
             &ProtocolAssumeRoleRequest {
                 duration_seconds: 900,
                 session_policy,
@@ -405,10 +402,9 @@ where
             return Err(anyhow!(message));
         }
     };
-    registry.bind_external_name(&session_handle.id, session.access_key())?;
     registry.transition(&session_handle.id, ResourceState::Created, None)?;
+    context.add_actor(session.clone());
     let session_s3 = services.actor_clients.for_actor(&session).await?;
-    context.add_actor(session);
     Ok((fixture, session_s3))
 }
 
@@ -480,6 +476,7 @@ mod tests {
     use async_trait::async_trait;
     use std::{
         collections::{BTreeMap, BTreeSet},
+        fs,
         sync::{Arc, Mutex},
     };
 
@@ -549,6 +546,28 @@ mod tests {
                 .filter(|name| name.starts_with(prefix))
                 .cloned()
                 .collect())
+        }
+
+        async fn policies_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .policies
+                .keys()
+                .filter(|name| name.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+
+        async fn groups_with_prefix(
+            &self,
+            _prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(Vec::new())
         }
 
         async fn create_user(
@@ -909,6 +928,15 @@ mod tests {
                 &factory,
             )
             .await;
+            assert!(
+                execution
+                    .forbidden_secrets
+                    .iter()
+                    .any(|secret| secret == "temp-session-1"),
+                "temporary STS access key must be scanned as forbidden material"
+            );
+            let persisted_registry = fs::read_to_string(registry.path()).expect("read registry");
+            assert!(!persisted_registry.contains("temp-session-1"));
             let cleanup = cleanup_registered_resources(&mut registry, &admin, &admin_s3).await;
             assert_eq!(
                 execution.report.status,

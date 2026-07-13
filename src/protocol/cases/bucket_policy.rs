@@ -574,19 +574,37 @@ where
         },
     )
     .await;
-    match &result {
-        Ok(()) => registry.transition(
-            &policy_handle.id,
-            ResourceState::Failed,
-            Some("malformed policy rejected; cleanup verifies no partial state".to_string()),
-        )?,
-        Err(error) => registry.transition(
+    if let Err(error) = result {
+        registry.transition(
             &policy_handle.id,
             ResourceState::Failed,
             Some(error.to_string()),
-        )?,
+        )?;
+        return Err(error);
     }
-    result?;
+    let absence = expect_error_class(
+        context,
+        "admin",
+        "get-bucket-policy-after-malformed-policy",
+        &fixture.bucket,
+        ProtocolAssertionClass::NoSuchBucketPolicy,
+        || async {
+            admin_s3
+                .get_bucket_policy(&fixture.bucket)
+                .await
+                .map(|_| ())
+        },
+    )
+    .await;
+    registry.transition(
+        &policy_handle.id,
+        ResourceState::Failed,
+        Some(match &absence {
+            Ok(()) => "malformed policy rejected without persisted state".to_string(),
+            Err(error) => error.to_string(),
+        }),
+    )?;
+    absence?;
     context.dimensions.actor_source = ProtocolActorSource::IamUser;
     expect_access_denied(
         context,
@@ -765,6 +783,7 @@ mod tests {
         objects: BTreeMap<(String, String), Vec<u8>>,
         fail_authorized_operations: bool,
         fail_bucket_create: bool,
+        persist_malformed_policy: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -885,6 +904,13 @@ mod tests {
                     })
             });
             if !valid_statements {
+                if self.state.lock().expect("state").persist_malformed_policy {
+                    self.state
+                        .lock()
+                        .expect("state")
+                        .policies
+                        .insert(bucket.to_string(), policy);
+                }
                 return Err(ProtocolS3Error {
                     code: "MalformedPolicy".to_string(),
                     status: Some(400),
@@ -897,6 +923,23 @@ mod tests {
                 .policies
                 .insert(bucket.to_string(), policy);
             Ok(())
+        }
+
+        async fn get_bucket_policy(
+            &self,
+            bucket: &str,
+        ) -> std::result::Result<String, ProtocolS3Error> {
+            self.state
+                .lock()
+                .expect("state")
+                .policies
+                .get(bucket)
+                .map(ToString::to_string)
+                .ok_or_else(|| ProtocolS3Error {
+                    code: "NoSuchBucketPolicy".to_string(),
+                    status: Some(404),
+                    request_id: Some("fake-request".to_string()),
+                })
         }
 
         async fn delete_bucket_policy(
@@ -1168,6 +1211,67 @@ mod tests {
             assert!(cleanup_succeeded, "case {case_id}");
             assert!(state_empty, "case {case_id}");
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_policy_case_fails_if_the_server_persists_rejected_state() {
+        let state = Arc::new(Mutex::new(FakeTargetState {
+            persist_malformed_policy: true,
+            ..FakeTargetState::default()
+        }));
+        let admin = FakeAdmin {
+            state: state.clone(),
+        };
+        let admin_s3 = FakeS3 {
+            state: state.clone(),
+            actor: None,
+        };
+        let factory = FakeActorFactory {
+            state: state.clone(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fingerprint = TargetFingerprint::new(
+            "http://127.0.0.1:9000",
+            "us-east-1",
+            "fake-deployment",
+            None,
+            None,
+        )
+        .expect("fingerprint");
+        let mut registry =
+            ResourceRegistry::create(dir.path(), "run", fingerprint).expect("registry");
+        let namer = ProtocolResourceNamer::new("s3c", "s3chaos", "run").expect("namer");
+
+        let execution = run_bucket_policy_case(
+            crate::protocol::catalog::BUCKET_POLICY_MALFORMED_POLICY_REJECTED,
+            &namer,
+            &mut registry,
+            &admin,
+            &admin_s3,
+            &factory,
+        )
+        .await;
+
+        assert_eq!(execution.report.status, ProtocolCaseStatus::Failed);
+        assert!(execution.report.failure.is_some());
+        let absence_assertion = execution
+            .report
+            .assertions
+            .iter()
+            .find(|assertion| assertion.operation == "get-bucket-policy-after-malformed-policy")
+            .expect("absence assertion");
+        assert_eq!(
+            absence_assertion.expected,
+            crate::protocol::reporting::ProtocolAssertionClass::NoSuchBucketPolicy
+        );
+        assert_eq!(
+            absence_assertion.actual,
+            crate::protocol::reporting::ProtocolAssertionClass::Ok
+        );
+        assert!(!state.lock().expect("state").policies.is_empty());
+        let cleanup = cleanup_registered_resources(&mut registry, &admin, &admin_s3).await;
+        assert!(cleanup.succeeded);
+        assert!(state.lock().expect("state").policies.is_empty());
     }
 
     #[tokio::test]

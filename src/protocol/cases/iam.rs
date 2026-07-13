@@ -25,13 +25,15 @@ use crate::protocol::{
         authz::{expect_access_denied, expect_eventual_access_denied, expect_eventual_ok},
     },
     catalog::{
-        IAM_EXPLICIT_DENY_OVERRIDES_ALLOW, IAM_GROUP_POLICY, IAM_USER_INLINE_POLICY_READONLY,
-        IAM_USER_MANAGED_POLICY_DETACH,
+        IAM_EXPLICIT_DENY_OVERRIDES_ALLOW, IAM_GROUP_POLICY, IAM_USER_MANAGED_POLICY_DETACH,
+        IAM_USER_MANAGED_POLICY_READONLY,
     },
-    credentials::ActorCredential,
     fixture::{
         naming::ProtocolResourceNamer,
         registry::{ResourceHandle, ResourceKind, ResourceRegistry, ResourceState},
+        resources::{
+            PolicyGrant, create_and_attach_policy, setup_user_bucket, transition_external,
+        },
     },
     ports::{ActorS3ClientFactory, ProtocolAdminPort, ProtocolS3Port},
 };
@@ -49,7 +51,7 @@ where
 {
     let mut context = CaseContext::new(case_id, iam_dimensions(case_id));
     let result = match case_id {
-        IAM_USER_INLINE_POLICY_READONLY => {
+        IAM_USER_MANAGED_POLICY_READONLY => {
             run_user_readonly(
                 namer,
                 registry,
@@ -100,9 +102,9 @@ where
 
 fn iam_dimensions(case_id: &str) -> ProtocolAuthorizationDimensions {
     match case_id {
-        IAM_USER_INLINE_POLICY_READONLY => ProtocolAuthorizationDimensions {
+        IAM_USER_MANAGED_POLICY_READONLY => ProtocolAuthorizationDimensions {
             actor_source: ProtocolActorSource::IamUser,
-            grant_source: ProtocolGrantSource::UserInlinePolicy,
+            grant_source: ProtocolGrantSource::ManagedPolicy,
             policy_effect: ProtocolPolicyEffect::Allow,
         },
         IAM_USER_MANAGED_POLICY_DETACH => ProtocolAuthorizationDimensions {
@@ -128,99 +130,6 @@ fn iam_dimensions(case_id: &str) -> ProtocolAuthorizationDimensions {
     }
 }
 
-pub(crate) struct IamFixture<C> {
-    pub(crate) user_handle_id: String,
-    pub(crate) bucket_handle_id: String,
-    pub(crate) user: String,
-    pub(crate) bucket: String,
-    pub(crate) actor_s3: C,
-}
-
-pub(crate) async fn setup_user_bucket<F>(
-    case_id: &str,
-    namer: &ProtocolResourceNamer,
-    registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    admin_s3: &impl ProtocolS3Port,
-    actor_clients: &F,
-    context: &mut CaseContext,
-) -> Result<IamFixture<F::Client>>
-where
-    F: ActorS3ClientFactory,
-{
-    let user = namer.iam_user(case_id, 0)?;
-    let user_handle = registry.plan(ResourceKind::IamUser, &user, case_id, Vec::new())?;
-    let actor = ActorCredential::generated("iam-user", &user, &user_handle.id)?;
-    transition_external(
-        registry,
-        &user_handle,
-        "create IAM user",
-        admin.create_user(&actor),
-    )
-    .await?;
-    let actor_s3 = actor_clients.for_actor(&actor).await?;
-    context.add_actor(actor);
-
-    let bucket = namer.bucket(case_id, 0)?;
-    let bucket_handle = registry.plan(ResourceKind::Bucket, &bucket, case_id, Vec::new())?;
-    transition_external(
-        registry,
-        &bucket_handle,
-        "create bucket",
-        admin_s3.create_bucket(&bucket),
-    )
-    .await?;
-    Ok(IamFixture {
-        user_handle_id: user_handle.id,
-        bucket_handle_id: bucket_handle.id,
-        user,
-        bucket,
-        actor_s3,
-    })
-}
-
-pub(crate) struct PolicyGrant<'a> {
-    pub(crate) document: &'a str,
-    pub(crate) principal: &'a str,
-    pub(crate) is_group: bool,
-    pub(crate) principal_dependency: &'a str,
-}
-
-pub(crate) async fn create_and_attach_policy(
-    case_id: &str,
-    namer: &ProtocolResourceNamer,
-    registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    grant: PolicyGrant<'_>,
-) -> Result<(ResourceHandle, ResourceHandle)> {
-    let policy = namer.iam_policy(case_id, 0)?;
-    let policy_handle = registry.plan(ResourceKind::IamPolicy, &policy, case_id, Vec::new())?;
-    transition_external(
-        registry,
-        &policy_handle,
-        "create IAM policy",
-        admin.create_policy(&policy, grant.document),
-    )
-    .await?;
-    let mut dependencies = vec![policy_handle.id.clone()];
-    dependencies.push(grant.principal_dependency.to_string());
-    let attachment = registry.plan_policy_attachment(
-        &policy,
-        grant.principal,
-        grant.is_group,
-        case_id,
-        dependencies,
-    )?;
-    transition_external(
-        registry,
-        &attachment,
-        "attach IAM policy",
-        admin.attach_policy(&policy, grant.principal, grant.is_group),
-    )
-    .await?;
-    Ok((policy_handle, attachment))
-}
-
 async fn run_user_readonly<F>(
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
@@ -232,17 +141,10 @@ async fn run_user_readonly<F>(
 where
     F: ActorS3ClientFactory,
 {
-    let case_id = IAM_USER_INLINE_POLICY_READONLY;
-    let fixture = setup_user_bucket(
-        case_id,
-        namer,
-        registry,
-        admin,
-        admin_s3,
-        actor_clients,
-        context,
-    )
-    .await?;
+    let case_id = IAM_USER_MANAGED_POLICY_READONLY;
+    let fixture =
+        setup_user_bucket(case_id, namer, registry, admin, admin_s3, actor_clients).await?;
+    context.add_actor(fixture.actor.clone());
     let key = format!("cases/{case_id}/seed-object");
     let objects = registry.plan_object_prefix(
         &fixture.bucket,
@@ -340,16 +242,9 @@ where
     F: ActorS3ClientFactory,
 {
     let case_id = IAM_USER_MANAGED_POLICY_DETACH;
-    let fixture = setup_user_bucket(
-        case_id,
-        namer,
-        registry,
-        admin,
-        admin_s3,
-        actor_clients,
-        context,
-    )
-    .await?;
+    let fixture =
+        setup_user_bucket(case_id, namer, registry, admin, admin_s3, actor_clients).await?;
+    context.add_actor(fixture.actor.clone());
     let policy = object_write_policy(&fixture.bucket, None)?;
     let (policy_handle, attachment) = create_and_attach_policy(
         case_id,
@@ -427,16 +322,9 @@ where
     F: ActorS3ClientFactory,
 {
     let case_id = IAM_GROUP_POLICY;
-    let fixture = setup_user_bucket(
-        case_id,
-        namer,
-        registry,
-        admin,
-        admin_s3,
-        actor_clients,
-        context,
-    )
-    .await?;
+    let fixture =
+        setup_user_bucket(case_id, namer, registry, admin, admin_s3, actor_clients).await?;
+    context.add_actor(fixture.actor.clone());
     let group = namer.iam_group(case_id, 0)?;
     let group_handle = registry.plan(ResourceKind::IamGroup, &group, case_id, Vec::new())?;
     registry.transition(&group_handle.id, ResourceState::Creating, None)?;
@@ -537,16 +425,9 @@ where
     F: ActorS3ClientFactory,
 {
     let case_id = IAM_EXPLICIT_DENY_OVERRIDES_ALLOW;
-    let fixture = setup_user_bucket(
-        case_id,
-        namer,
-        registry,
-        admin,
-        admin_s3,
-        actor_clients,
-        context,
-    )
-    .await?;
+    let fixture =
+        setup_user_bucket(case_id, namer, registry, admin, admin_s3, actor_clients).await?;
+    context.add_actor(fixture.actor.clone());
     let denied_prefix = format!("cases/{case_id}/denied/");
     let policy = object_write_policy(&fixture.bucket, Some(&denied_prefix))?;
     create_and_attach_policy(
@@ -602,27 +483,6 @@ where
         },
     )
     .await
-}
-
-async fn transition_external<E, F>(
-    registry: &mut ResourceRegistry,
-    handle: &ResourceHandle,
-    action: &str,
-    operation: F,
-) -> Result<()>
-where
-    E: std::fmt::Display,
-    F: std::future::Future<Output = std::result::Result<(), E>>,
-{
-    registry.transition(&handle.id, ResourceState::Creating, None)?;
-    match operation.await {
-        Ok(()) => registry.transition(&handle.id, ResourceState::Created, None),
-        Err(error) => {
-            let message = format!("{action} failed: {error}");
-            registry.transition(&handle.id, ResourceState::Failed, Some(message.clone()))?;
-            Err(anyhow!(message))
-        }
-    }
 }
 
 async fn clean_attachment(
@@ -707,8 +567,8 @@ mod tests {
     use super::{iam_dimensions, object_write_policy, readonly_policy, run_iam_case};
     use crate::protocol::{
         catalog::{
-            IAM_EXPLICIT_DENY_OVERRIDES_ALLOW, IAM_GROUP_POLICY, IAM_USER_INLINE_POLICY_READONLY,
-            IAM_USER_MANAGED_POLICY_DETACH,
+            IAM_EXPLICIT_DENY_OVERRIDES_ALLOW, IAM_GROUP_POLICY, IAM_USER_MANAGED_POLICY_DETACH,
+            IAM_USER_MANAGED_POLICY_READONLY,
         },
         credentials::ActorCredential,
         fixture::{
@@ -787,6 +647,36 @@ mod tests {
                 .expect("state")
                 .users
                 .iter()
+                .filter(|name| name.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+
+        async fn policies_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .policies
+                .keys()
+                .filter(|name| name.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+
+        async fn groups_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .group_members
+                .keys()
                 .filter(|name| name.starts_with(prefix))
                 .cloned()
                 .collect())
@@ -1112,7 +1002,7 @@ mod tests {
         for case_id in [
             IAM_EXPLICIT_DENY_OVERRIDES_ALLOW,
             IAM_GROUP_POLICY,
-            IAM_USER_INLINE_POLICY_READONLY,
+            IAM_USER_MANAGED_POLICY_READONLY,
             IAM_USER_MANAGED_POLICY_DETACH,
         ] {
             let state = Arc::new(Mutex::new(State::default()));

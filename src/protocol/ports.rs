@@ -36,7 +36,7 @@ pub struct ProtocolS3Error {
 
 impl ProtocolS3Error {
     pub fn is_access_denied(&self) -> bool {
-        self.code == "AccessDenied" || self.status == Some(403)
+        matches!(self.code.as_str(), "AccessDenied" | "Forbidden")
     }
 
     pub fn is_not_found(&self) -> bool {
@@ -281,6 +281,13 @@ pub trait ProtocolS3Port: Send + Sync {
     async fn create_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
     async fn delete_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
     async fn put_bucket_policy(&self, bucket: &str, policy: &str) -> Result<(), ProtocolS3Error>;
+    async fn get_bucket_policy(&self, _bucket: &str) -> Result<String, ProtocolS3Error> {
+        Err(ProtocolS3Error {
+            code: "GetBucketPolicyUnsupported".to_string(),
+            status: None,
+            request_id: None,
+        })
+    }
     async fn delete_bucket_policy(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
     async fn list_objects(&self, bucket: &str) -> Result<Vec<String>, ProtocolS3Error>;
     async fn put_object(&self, bucket: &str, key: &str, body: &[u8])

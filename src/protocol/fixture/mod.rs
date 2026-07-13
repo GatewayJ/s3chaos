@@ -15,3 +15,4 @@
 pub mod cleanup;
 pub mod naming;
 pub mod registry;
+pub(crate) mod resources;

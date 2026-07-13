@@ -30,7 +30,6 @@ pub enum ProtocolActorSource {
 pub enum ProtocolGrantSource {
     AdminCredential,
     BucketPolicy,
-    UserInlinePolicy,
     GroupPolicy,
     ManagedPolicy,
     RolePolicy,
