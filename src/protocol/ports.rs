@@ -39,14 +39,6 @@ impl ProtocolS3Error {
         matches!(self.code.as_str(), "AccessDenied" | "Forbidden")
     }
 
-    pub fn is_not_found(&self) -> bool {
-        self.status == Some(404)
-            || matches!(
-                self.code.as_str(),
-                "NoSuchBucket" | "NoSuchBucketPolicy" | "NoSuchKey" | "NotFound"
-            )
-    }
-
     pub fn is_transient(&self) -> bool {
         self.status
             .is_some_and(|status| status == 408 || status == 429 || status >= 500)
@@ -118,11 +110,10 @@ impl ProtocolAdminError {
     }
 
     pub fn is_not_found(&self) -> bool {
-        self.status == Some(404)
-            || matches!(
-                self.code.as_str(),
-                "NoSuchUser" | "NoSuchGroup" | "NoSuchPolicy" | "NoSuchEntity" | "NotFound"
-            )
+        matches!(
+            self.code.as_str(),
+            "NoSuchUser" | "NoSuchGroup" | "NoSuchPolicy" | "NoSuchEntity"
+        )
     }
 
     pub fn is_transient(&self) -> bool {
@@ -212,6 +203,34 @@ pub trait ProtocolAdminPort: Send + Sync {
         Err(ProtocolAdminError::protocol("RevokeStsSessionsUnsupported"))
     }
 
+    async fn policy_attached(
+        &self,
+        _policy: &str,
+        _principal: &str,
+        _is_group: bool,
+    ) -> std::result::Result<bool, ProtocolAdminError> {
+        Err(ProtocolAdminError::protocol(
+            "PolicyAttachmentReadbackUnsupported",
+        ))
+    }
+
+    async fn group_contains_member(
+        &self,
+        _group: &str,
+        _member: &str,
+    ) -> std::result::Result<bool, ProtocolAdminError> {
+        Err(ProtocolAdminError::protocol(
+            "GroupMembershipReadbackUnsupported",
+        ))
+    }
+
+    async fn sts_sessions_with_parent(
+        &self,
+        _parent_access_key: &str,
+    ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+        Err(ProtocolAdminError::protocol("ListStsSessionsUnsupported"))
+    }
+
     async fn policies_with_prefix(
         &self,
         _prefix: &str,
@@ -294,10 +313,16 @@ pub trait ProtocolS3Port: Send + Sync {
     -> Result<(), ProtocolS3Error>;
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, ProtocolS3Error>;
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ProtocolS3Error>;
-    async fn empty_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
-        for version in self.list_object_versions(bucket).await? {
-            self.delete_object_version(bucket, &version.key, &version.version_id)
-                .await?;
+    async fn empty_bucket(
+        &self,
+        bucket: &str,
+        include_versions: bool,
+    ) -> Result<(), ProtocolS3Error> {
+        if include_versions {
+            for version in self.list_object_versions(bucket).await? {
+                self.delete_object_version(bucket, &version.key, &version.version_id)
+                    .await?;
+            }
         }
         for key in self.list_objects(bucket).await? {
             self.delete_object(bucket, &key).await?;
@@ -313,10 +338,6 @@ pub trait ProtocolS3Port: Send + Sync {
         bucket: &str,
         key: &str,
         version_id: &str,
-    ) -> std::result::Result<(), ProtocolS3Error>;
-    async fn enable_bucket_versioning(
-        &self,
-        bucket: &str,
     ) -> std::result::Result<(), ProtocolS3Error>;
 }
 

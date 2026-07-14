@@ -14,14 +14,14 @@
 
 pub mod artifact_validation;
 pub mod authorization;
-pub mod cases;
+mod cases;
 pub mod catalog;
-pub mod clients;
+mod clients;
 pub mod compatibility;
 pub mod credentials;
-pub mod fixture;
-pub mod ports;
-pub mod preflight;
+mod fixture;
+mod ports;
+mod preflight;
 pub mod reporting;
 pub mod scheduler;
 pub mod suite;

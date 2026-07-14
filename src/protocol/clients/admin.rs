@@ -150,6 +150,83 @@ impl RustfsAdminClient {
         Ok(())
     }
 
+    pub async fn policy_attached(
+        &self,
+        policy: &str,
+        principal: &str,
+        is_group: bool,
+    ) -> AdminResult<bool> {
+        let (path, query) = if is_group {
+            ("/group", vec![("group", principal)])
+        } else {
+            ("/list-users", Vec::new())
+        };
+        let response = match self
+            .request(Method::GET, path, &query, Vec::new(), None)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if error.is_not_found() => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let value: Value = serde_json::from_slice(&response)
+            .map_err(|_| ProtocolAdminError::protocol("InvalidPolicyAttachmentReadback"))?;
+        let policy_names = if is_group {
+            value.get("policy").and_then(Value::as_str)
+        } else {
+            value
+                .get(principal)
+                .and_then(|user| user.get("policyName"))
+                .and_then(Value::as_str)
+        };
+        Ok(policy_names
+            .is_some_and(|names| names.split(',').map(str::trim).any(|name| name == policy)))
+    }
+
+    pub async fn group_contains_member(&self, group: &str, member: &str) -> AdminResult<bool> {
+        let response = match self
+            .request(Method::GET, "/group", &[("group", group)], Vec::new(), None)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if error.is_not_found() => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let value: Value = serde_json::from_slice(&response)
+            .map_err(|_| ProtocolAdminError::protocol("InvalidGroupMembershipReadback"))?;
+        Ok(value
+            .get("members")
+            .and_then(Value::as_array)
+            .is_some_and(|members| members.iter().any(|item| item.as_str() == Some(member))))
+    }
+
+    pub async fn sts_sessions_with_parent(
+        &self,
+        parent_access_key: &str,
+    ) -> AdminResult<Vec<String>> {
+        let response = self
+            .request(
+                Method::GET,
+                "/list-access-keys-bulk",
+                &[("users", parent_access_key), ("listType", "sts-only")],
+                Vec::new(),
+                None,
+            )
+            .await?;
+        let value: Value = serde_json::from_slice(&response)
+            .map_err(|_| ProtocolAdminError::protocol("InvalidListStsSessionsResponse"))?;
+        let sessions = value
+            .get(parent_access_key)
+            .and_then(|entry| entry.get("stsKeys"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("accessKey").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        Ok(sessions)
+    }
+
     pub async fn policies_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
         let response = self
             .request(Method::GET, "/list-canned-policies", &[], Vec::new(), None)
@@ -418,6 +495,23 @@ impl ProtocolAdminPort for RustfsAdminClient {
         RustfsAdminClient::revoke_sts_sessions(self, parent_access_key).await
     }
 
+    async fn policy_attached(
+        &self,
+        policy: &str,
+        principal: &str,
+        is_group: bool,
+    ) -> AdminResult<bool> {
+        RustfsAdminClient::policy_attached(self, policy, principal, is_group).await
+    }
+
+    async fn group_contains_member(&self, group: &str, member: &str) -> AdminResult<bool> {
+        RustfsAdminClient::group_contains_member(self, group, member).await
+    }
+
+    async fn sts_sessions_with_parent(&self, parent_access_key: &str) -> AdminResult<Vec<String>> {
+        RustfsAdminClient::sts_sessions_with_parent(self, parent_access_key).await
+    }
+
     async fn policies_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
         RustfsAdminClient::policies_with_prefix(self, prefix).await
     }
@@ -467,6 +561,14 @@ impl ProtocolAdminPort for RustfsAdminClient {
 }
 
 fn protocol_error_code(body: &[u8]) -> Option<String> {
+    if let Ok(value) = serde_json::from_slice::<Value>(body)
+        && let Some(code) = value
+            .get("Code")
+            .or_else(|| value.get("code"))
+            .and_then(Value::as_str)
+    {
+        return Some(code.to_string());
+    }
     let text = std::str::from_utf8(body).ok()?;
     let start = text.find("<Code>")? + "<Code>".len();
     let end = text[start..].find("</Code>")? + start;
@@ -483,6 +585,11 @@ mod tests {
             protocol_error_code(b"<Error><Code>NoSuchUser</Code><Message>secret</Message></Error>"),
             Some("NoSuchUser".to_string())
         );
+        assert_eq!(
+            protocol_error_code(br#"{"code":"NoSuchGroup","message":"secret"}"#),
+            Some("NoSuchGroup".to_string())
+        );
+        assert_eq!(protocol_error_code(b"plain 404 page"), None);
     }
 
     #[test]

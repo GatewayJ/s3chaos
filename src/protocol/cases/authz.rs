@@ -23,7 +23,10 @@ use crate::protocol::{
 };
 
 const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(not(test))]
 const PROPAGATION_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const PROPAGATION_INTERVAL: Duration = Duration::from_millis(1);
 
 pub(crate) async fn expect_access_denied<T, F, Fut>(
     context: &mut CaseContext,
@@ -283,7 +286,10 @@ where
                 );
                 return Ok(value);
             }
-            Err(error) if error.is_access_denied() && started.elapsed() < PROPAGATION_TIMEOUT => {
+            Err(error)
+                if is_transient_propagation_error(context, &error)
+                    && started.elapsed() < PROPAGATION_TIMEOUT =>
+            {
                 retries += 1;
                 tokio::time::sleep(PROPAGATION_INTERVAL).await;
             }
@@ -308,6 +314,17 @@ where
             }
         }
     }
+}
+
+fn is_transient_propagation_error(context: &CaseContext, error: &ProtocolS3Error) -> bool {
+    error.is_access_denied()
+        || (context.current_phase == "propagation"
+            && matches!(
+                context.dimensions.actor_source,
+                crate::protocol::authorization::ProtocolActorSource::AssumedRole
+                    | crate::protocol::authorization::ProtocolActorSource::StsSession
+            )
+            && matches!(error.code.as_str(), "InvalidClientTokenId" | "InvalidToken"))
 }
 
 fn record(context: &mut CaseContext, mut assertion: ProtocolAssertion) {
@@ -360,5 +377,57 @@ fn class_for_error(error: &ProtocolS3Error) -> ProtocolAssertionClass {
             "InvalidToken" | "InvalidClientTokenId" => ProtocolAssertionClass::InvalidToken,
             _ => ProtocolAssertionClass::HarnessError,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expect_eventual_ok;
+    use crate::protocol::{
+        authorization::{
+            ProtocolActorSource, ProtocolAuthorizationDimensions, ProtocolGrantSource,
+            ProtocolPolicyEffect,
+        },
+        cases::CaseContext,
+        ports::ProtocolS3Error,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn retries_invalid_client_token_during_sts_propagation() {
+        let mut context = CaseContext::new(
+            "sts-propagation",
+            ProtocolAuthorizationDimensions {
+                actor_source: ProtocolActorSource::StsSession,
+                grant_source: ProtocolGrantSource::ManagedPolicy,
+                policy_effect: ProtocolPolicyEffect::Allow,
+            },
+        );
+        context.current_phase = "propagation".to_string();
+        let calls = AtomicUsize::new(0);
+
+        expect_eventual_ok(
+            &mut context,
+            "sts-session",
+            "get-object",
+            "bucket",
+            Some("key"),
+            || async {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(ProtocolS3Error {
+                        code: "InvalidClientTokenId".to_string(),
+                        status: Some(403),
+                        request_id: None,
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("transient STS credential propagation should be retried");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(context.assertions[0].retry_count, 1);
     }
 }

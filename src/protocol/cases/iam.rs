@@ -767,6 +767,37 @@ mod tests {
             Ok(())
         }
 
+        async fn policy_attached(
+            &self,
+            policy: &str,
+            principal: &str,
+            is_group: bool,
+        ) -> std::result::Result<bool, ProtocolAdminError> {
+            let state = self.0.lock().expect("state");
+            let mappings = if is_group {
+                &state.group_policies
+            } else {
+                &state.user_policies
+            };
+            Ok(mappings
+                .get(principal)
+                .is_some_and(|policies| policies.contains(policy)))
+        }
+
+        async fn group_contains_member(
+            &self,
+            group: &str,
+            member: &str,
+        ) -> std::result::Result<bool, ProtocolAdminError> {
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .group_members
+                .get(group)
+                .is_some_and(|members| members.contains(member)))
+        }
+
         async fn update_group_members(
             &self,
             group: &str,
@@ -917,13 +948,6 @@ mod tests {
                 .expect("state")
                 .objects
                 .remove(&(bucket.to_string(), key.to_string()));
-            Ok(())
-        }
-
-        async fn enable_bucket_versioning(
-            &self,
-            _bucket: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
             Ok(())
         }
     }

@@ -31,6 +31,7 @@ use crate::protocol::{
         naming::ProtocolResourceNamer,
         registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
     },
+    ports::{ProtocolAdminPort, ProtocolS3Port},
     preflight::{
         ProtocolPreflightSummary, ProtocolProbeCapabilities,
         cleanup_interrupted_mutating_permission_probe, enforce_stale_resource_policy,
@@ -103,6 +104,11 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         &artifact_root,
         &plan.run_id,
         runtime.preflight.target_fingerprint.clone(),
+    )?;
+    registry.set_versioned_cleanup(
+        plan.cases
+            .iter()
+            .any(|case| case.requires.iter().any(|item| item == "versioning")),
     )?;
     let namer = ProtocolResourceNamer::new(
         &plan.target.bucket_prefix,
@@ -236,7 +242,7 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
                             &runtime.s3,
                             &runtime.suite.api_version,
                         )
-                        .await?;
+                        .await;
                         case_executions
                             .push((ProtocolCaseExecution::interrupted(&case.id), cleanup));
                     }
@@ -252,7 +258,7 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         &runtime.s3,
         &runtime.suite.api_version,
     )
-    .await?;
+    .await;
     write_json(
         &artifact_root.join("cleanup-report.json"),
         &fallback_cleanup,
@@ -417,26 +423,80 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
     let mut combined = ProtocolCleanupReport::empty(&root_registry.api_version);
     let cases_dir = artifact_root.join("cases");
     if cases_dir.is_dir() {
-        let mut entries = fs::read_dir(&cases_dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        let mut entries = Vec::new();
+        match fs::read_dir(&cases_dir) {
+            Ok(read_dir) => {
+                for entry in read_dir {
+                    match entry {
+                        Ok(entry) => entries.push(entry),
+                        Err(error) => combined.append(cleanup_registry_failure(
+                            &root_registry.api_version,
+                            &cases_dir,
+                            error,
+                        )),
+                    }
+                }
+            }
+            Err(error) => combined.append(cleanup_registry_failure(
+                &root_registry.api_version,
+                &cases_dir,
+                error,
+            )),
+        }
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
-            let file_type = entry.file_type()?;
-            ensure!(
-                file_type.is_dir() && !file_type.is_symlink(),
-                "protocol case artifact must be a non-symlink directory"
-            );
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    combined.append(cleanup_registry_failure(
+                        &root_registry.api_version,
+                        &entry.path(),
+                        error,
+                    ));
+                    continue;
+                }
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                combined.append(cleanup_registry_failure(
+                    &root_registry.api_version,
+                    &entry.path(),
+                    "protocol case artifact must be a non-symlink directory",
+                ));
+                continue;
+            }
             let registry_path = entry.path().join(RESOURCE_REGISTRY_FILE);
             if !registry_path.is_file() {
                 continue;
             }
-            let mut case_registry = load_cleanup_registry(&registry_path)?;
-            ensure!(
-                case_registry.run_id == root_registry.run_id
-                    && case_registry.target_fingerprint == expected,
-                "refuse cleanup because case registry ownership differs from the suite"
-            );
+            let mut case_registry = match load_cleanup_registry(&registry_path) {
+                Ok(registry) => registry,
+                Err(error) => {
+                    combined.append(cleanup_registry_failure(
+                        &root_registry.api_version,
+                        &registry_path,
+                        error,
+                    ));
+                    continue;
+                }
+            };
+            if case_registry.run_id != root_registry.run_id
+                || case_registry.target_fingerprint != expected
+            {
+                combined.append(cleanup_registry_failure(
+                    &root_registry.api_version,
+                    &registry_path,
+                    "refuse cleanup because case registry ownership differs from the suite",
+                ));
+                continue;
+            }
             let cleanup = cleanup_registered_resources(&mut case_registry, &admin, &s3).await;
-            write_json(&entry.path().join("cleanup-report.json"), &cleanup)?;
+            if let Err(error) = write_json(&entry.path().join("cleanup-report.json"), &cleanup) {
+                combined.append(cleanup_registry_failure(
+                    &root_registry.api_version,
+                    &entry.path().join("cleanup-report.json"),
+                    error,
+                ));
+            }
             combined.append(cleanup);
         }
     }
@@ -465,6 +525,7 @@ impl ProtocolCaseRunner<'_> {
         fs::create_dir_all(&case_dir)?;
         let mut registry =
             ResourceRegistry::create(&case_dir, self.run_id, self.fingerprint.clone())?;
+        registry.set_versioned_cleanup(case.requires.iter().any(|item| item == "versioning"))?;
         let case_namer = self.namer.for_worker(case.worker_index);
         let execution = run_protocol_case(
             &case.id,
@@ -487,38 +548,61 @@ impl ProtocolCaseRunner<'_> {
 async fn cleanup_case_registry_if_present(
     artifact_root: &Path,
     case_id: &str,
-    admin: &RustfsAdminClient,
-    s3: &ProtocolS3Client,
+    admin: &impl ProtocolAdminPort,
+    s3: &impl ProtocolS3Port,
     api_version: &str,
-) -> Result<ProtocolCleanupReport> {
+) -> ProtocolCleanupReport {
     let registry_path = artifact_root
         .join("cases")
         .join(case_id)
         .join(RESOURCE_REGISTRY_FILE);
     if !registry_path.is_file() {
-        return Ok(ProtocolCleanupReport::empty(api_version));
+        return ProtocolCleanupReport::empty(api_version);
     }
-    let mut registry = ResourceRegistry::load_path(registry_path)?;
-    Ok(cleanup_registered_resources(&mut registry, admin, s3).await)
+    match ResourceRegistry::load_path(&registry_path) {
+        Ok(mut registry) => cleanup_registered_resources(&mut registry, admin, s3).await,
+        Err(error) => cleanup_registry_failure(api_version, &registry_path, error),
+    }
 }
 
 async fn cleanup_suite_registries(
     artifact_root: &Path,
     cases: &[ProtocolSuitePlanCase],
     root_registry: &mut ResourceRegistry,
-    admin: &RustfsAdminClient,
-    s3: &ProtocolS3Client,
+    admin: &impl ProtocolAdminPort,
+    s3: &impl ProtocolS3Port,
     api_version: &str,
-) -> Result<ProtocolCleanupReport> {
+) -> ProtocolCleanupReport {
     let mut combined = ProtocolCleanupReport::empty(api_version);
     for case in cases {
         combined.append(
-            cleanup_case_registry_if_present(artifact_root, &case.id, admin, s3, api_version)
-                .await?,
+            cleanup_case_registry_if_present(artifact_root, &case.id, admin, s3, api_version).await,
         );
     }
     combined.append(cleanup_registered_resources(root_registry, admin, s3).await);
-    Ok(combined)
+    combined
+}
+
+fn cleanup_registry_failure(
+    api_version: &str,
+    registry_path: &Path,
+    error: impl std::fmt::Display,
+) -> ProtocolCleanupReport {
+    let resource = registry_path.display().to_string();
+    ProtocolCleanupReport {
+        api_version: api_version.to_string(),
+        kind: "ProtocolCleanupReport".to_string(),
+        attempts: vec![crate::protocol::reporting::ProtocolCleanupAttempt {
+            resource_id: format!("registry:{resource}"),
+            resource_kind: "registry".to_string(),
+            resource_name: resource.clone(),
+            retry_count: 0,
+            succeeded: false,
+            error: Some(error.to_string()),
+        }],
+        leftovers: vec![format!("registry:{resource}")],
+        succeeded: false,
+    }
 }
 
 pub async fn cleanup_protocol_registry_path(registry_path: impl AsRef<Path>) -> Result<()> {
@@ -572,12 +656,13 @@ fn load_cleanup_registry(path: &Path) -> Result<ResourceRegistry> {
 }
 
 async fn verify_cleanup_target(
-    admin: &RustfsAdminClient,
+    admin: &impl ProtocolAdminPort,
     expected: &TargetFingerprint,
 ) -> Result<()> {
-    if expected.deployment_id.starts_with("s3-endpoint:") {
-        return Ok(());
-    }
+    ensure!(
+        !expected.deployment_id.starts_with("s3-endpoint:"),
+        "refuse standalone protocol cleanup because the artifact has no verifiable deployment fingerprint"
+    );
     let info = admin.server_info().await?;
     let actual = TargetFingerprint::new(
         &expected.endpoint,
@@ -695,18 +780,253 @@ fn validate_phase_one_artifacts(root: &Path, forbidden: &[String]) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_phase_one_artifacts, write_json, write_json_lines};
+    use super::{
+        cleanup_suite_registries, validate_phase_one_artifacts, write_json, write_json_lines,
+    };
     use crate::protocol::{
-        fixture::registry::ResourceRegistry,
+        credentials::ActorCredential,
+        fixture::registry::{
+            RESOURCE_REGISTRY_FILE, ResourceKind, ResourceRegistry, ResourceState,
+        },
+        ports::{
+            ProtocolAdminError, ProtocolAdminPort, ProtocolObjectVersion, ProtocolS3Error,
+            ProtocolS3Port, ProtocolServerInfo,
+        },
         preflight::{ProtocolPreflightSummary, ProtocolStaleResourceScan},
         reporting::{
             ProtocolAssertion, ProtocolCaseReport, ProtocolCaseStatus, ProtocolCleanupReport,
             ProtocolSuiteSummary,
         },
         suite::{ProtocolSuite, protocol_suite_template_yaml},
-        suite_plan::{ProtocolSuitePlan, TargetFingerprint},
+        suite_plan::{ProtocolSuitePlan, ProtocolSuitePlanCase, TargetFingerprint},
     };
-    use std::fs;
+    use async_trait::async_trait;
+    use std::{
+        collections::BTreeSet,
+        fs,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Default)]
+    struct CleanupAdmin;
+
+    #[async_trait]
+    impl ProtocolAdminPort for CleanupAdmin {
+        async fn server_info(&self) -> std::result::Result<ProtocolServerInfo, ProtocolAdminError> {
+            Ok(ProtocolServerInfo {
+                deployment_id: "deployment".to_string(),
+                mode: None,
+                region: None,
+            })
+        }
+
+        async fn users_with_prefix(
+            &self,
+            _prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(Vec::new())
+        }
+
+        async fn create_user(
+            &self,
+            _credential: &ActorCredential,
+        ) -> std::result::Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+
+        async fn remove_user(
+            &self,
+            _access_key: &str,
+        ) -> std::result::Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CleanupS3(Arc<Mutex<BTreeSet<String>>>);
+
+    #[async_trait]
+    impl ProtocolS3Port for CleanupS3 {
+        async fn list_buckets_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
+            Ok(self
+                .0
+                .lock()
+                .expect("buckets")
+                .iter()
+                .filter(|name| name.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+
+        async fn create_bucket(&self, bucket: &str) -> std::result::Result<(), ProtocolS3Error> {
+            self.0.lock().expect("buckets").insert(bucket.to_string());
+            Ok(())
+        }
+
+        async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), ProtocolS3Error> {
+            self.0.lock().expect("buckets").remove(bucket);
+            Ok(())
+        }
+
+        async fn put_bucket_policy(
+            &self,
+            _bucket: &str,
+            _policy: &str,
+        ) -> std::result::Result<(), ProtocolS3Error> {
+            Ok(())
+        }
+        async fn delete_bucket_policy(
+            &self,
+            _bucket: &str,
+        ) -> std::result::Result<(), ProtocolS3Error> {
+            Ok(())
+        }
+        async fn list_objects(
+            &self,
+            _bucket: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
+            Ok(Vec::new())
+        }
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _body: &[u8],
+        ) -> std::result::Result<(), ProtocolS3Error> {
+            Ok(())
+        }
+        async fn get_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+        ) -> std::result::Result<Vec<u8>, ProtocolS3Error> {
+            Ok(Vec::new())
+        }
+        async fn delete_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+        ) -> std::result::Result<(), ProtocolS3Error> {
+            Ok(())
+        }
+        async fn list_object_versions(
+            &self,
+            _bucket: &str,
+        ) -> std::result::Result<Vec<ProtocolObjectVersion>, ProtocolS3Error> {
+            Ok(Vec::new())
+        }
+        async fn delete_object_version(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _version_id: &str,
+        ) -> std::result::Result<(), ProtocolS3Error> {
+            Ok(())
+        }
+    }
+
+    fn planned_case(id: &str) -> ProtocolSuitePlanCase {
+        ProtocolSuitePlanCase {
+            id: id.to_string(),
+            group: "s3-compatibility".to_string(),
+            tags: Vec::new(),
+            requires: vec!["s3".to_string()],
+            isolation: "case".to_string(),
+            serial: false,
+            worker_index: 0,
+            wave_index: 0,
+            locks: Vec::new(),
+            artifact_dir: format!("cases/{id}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_case_registry_does_not_skip_later_or_root_cleanup() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let fingerprint = TargetFingerprint::new(
+            "http://127.0.0.1:9000",
+            "us-east-1",
+            "deployment",
+            None,
+            None,
+        )
+        .expect("fingerprint");
+        let corrupt_dir = base.path().join("cases/corrupt");
+        fs::create_dir_all(&corrupt_dir).expect("corrupt case dir");
+        fs::write(corrupt_dir.join(RESOURCE_REGISTRY_FILE), "not-json").expect("corrupt registry");
+
+        let valid_dir = base.path().join("cases/valid");
+        let mut valid = ResourceRegistry::create(&valid_dir, "run", fingerprint.clone())
+            .expect("valid registry");
+        let valid_bucket = valid
+            .plan(ResourceKind::Bucket, "valid-bucket", "valid", Vec::new())
+            .expect("valid bucket");
+        valid
+            .transition(&valid_bucket.id, ResourceState::Creating, None)
+            .expect("creating");
+        valid
+            .transition(&valid_bucket.id, ResourceState::Created, None)
+            .expect("created");
+
+        let mut root =
+            ResourceRegistry::create(base.path(), "run", fingerprint).expect("root registry");
+        let root_bucket = root
+            .plan(ResourceKind::Bucket, "root-bucket", "preflight", Vec::new())
+            .expect("root bucket");
+        root.transition(&root_bucket.id, ResourceState::Creating, None)
+            .expect("creating");
+        root.transition(&root_bucket.id, ResourceState::Created, None)
+            .expect("created");
+
+        let s3 = CleanupS3(Arc::new(Mutex::new(BTreeSet::from([
+            "valid-bucket".to_string(),
+            "root-bucket".to_string(),
+        ]))));
+        let report = cleanup_suite_registries(
+            base.path(),
+            &[planned_case("corrupt"), planned_case("valid")],
+            &mut root,
+            &CleanupAdmin,
+            &s3,
+            "rustfs.com/s3chaos/v1alpha1",
+        )
+        .await;
+
+        assert!(!report.succeeded);
+        assert!(
+            report
+                .attempts
+                .iter()
+                .any(|attempt| attempt.resource_kind == "registry")
+        );
+        assert!(s3.0.lock().expect("buckets").is_empty());
+        assert!(root.pending_cleanup().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn standalone_cleanup_rejects_synthetic_s3_fingerprint() {
+        let fingerprint = TargetFingerprint::new(
+            "http://127.0.0.1:9000",
+            "us-east-1",
+            "s3-endpoint:http://127.0.0.1:9000",
+            None,
+            None,
+        )
+        .expect("fingerprint");
+
+        let error = super::verify_cleanup_target(&CleanupAdmin, &fingerprint)
+            .await
+            .expect_err("synthetic fingerprints must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no verifiable deployment fingerprint")
+        );
+    }
 
     #[test]
     fn artifact_sanity_check_accepts_linked_secret_free_run() {

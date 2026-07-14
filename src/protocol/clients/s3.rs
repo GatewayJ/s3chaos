@@ -20,7 +20,6 @@ use aws_sdk_s3::{
     config::Region,
     error::{ProvideErrorMetadata, SdkError},
     primitives::ByteStream,
-    types::{BucketVersioningStatus, VersioningConfiguration},
 };
 use std::fmt::Debug;
 
@@ -340,24 +339,6 @@ impl ProtocolS3Client {
             .map_err(|error| protocol_s3_error(&error))?;
         Ok(())
     }
-
-    pub async fn enable_bucket_versioning(
-        &self,
-        bucket: &str,
-    ) -> std::result::Result<(), ProtocolS3Error> {
-        self.client
-            .put_bucket_versioning()
-            .bucket(bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .map_err(|error| protocol_s3_error(&error))?;
-        Ok(())
-    }
 }
 
 #[async_trait::async_trait]
@@ -424,13 +405,6 @@ impl ProtocolS3Port for ProtocolS3Client {
         version_id: &str,
     ) -> std::result::Result<(), ProtocolS3Error> {
         ProtocolS3Client::delete_object_version(self, bucket, key, version_id).await
-    }
-
-    async fn enable_bucket_versioning(
-        &self,
-        bucket: &str,
-    ) -> std::result::Result<(), ProtocolS3Error> {
-        ProtocolS3Client::enable_bucket_versioning(self, bucket).await
     }
 }
 

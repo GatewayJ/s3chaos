@@ -4,6 +4,11 @@ set -Eeuo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MANIFEST_PATH="$ROOT_DIR/Cargo.toml"
 
+if [[ -z "${S3CHAOS_SOURCE_REVISION:-}" ]] && command -v git >/dev/null 2>&1; then
+  S3CHAOS_SOURCE_REVISION=$(git -C "$ROOT_DIR" rev-parse --verify HEAD 2>/dev/null || true)
+  export S3CHAOS_SOURCE_REVISION
+fi
+
 die() {
   echo "protocol-test: $*" >&2
   exit 1

@@ -82,8 +82,13 @@ pub async fn preflight_protocol_suite(
         .cases
         .iter()
         .any(|case| case.requires.contains(&"admin-api"));
-    let fingerprint = if requires_admin_api {
-        let server_info = admin.server_info().await?;
+    let server_info = if requires_admin_api {
+        Some(admin.server_info().await?)
+    } else {
+        admin.server_info().await.ok()
+    };
+    let admin_api_reachable = server_info.is_some();
+    let fingerprint = if let Some(server_info) = server_info {
         TargetFingerprint::new(
             endpoint,
             &suite.target.region,
@@ -107,6 +112,10 @@ pub async fn preflight_protocol_suite(
         .cases
         .iter()
         .any(|case| case.requires.contains(&"iam"));
+    let requires_iam_group = suite
+        .cases
+        .iter()
+        .any(|case| case.requires.contains(&"iam-group"));
     let requires_identity = requires_iam
         || suite
             .cases
@@ -118,6 +127,8 @@ pub async fn preflight_protocol_suite(
     }
     if requires_iam {
         identities.extend(admin.policies_with_prefix(&identity_prefix).await?);
+    }
+    if requires_iam_group {
         identities.extend(admin.groups_with_prefix(&identity_prefix).await?);
     }
     identities.sort();
@@ -128,7 +139,7 @@ pub async fn preflight_protocol_suite(
         kind: "ProtocolPreflightSummary".to_string(),
         target_fingerprint: fingerprint,
         endpoint_reachable: true,
-        admin_api_reachable: requires_admin_api,
+        admin_api_reachable,
         selected_cases: suite.cases.iter().map(|case| case.id.to_string()).collect(),
         stale_resources: ProtocolStaleResourceScan {
             bucket_prefix,
@@ -154,16 +165,18 @@ pub fn enforce_stale_resource_policy(summary: &ProtocolPreflightSummary) -> Resu
     Ok(())
 }
 
-pub struct ProtocolMutatingProbeExecution {
+#[derive(Debug)]
+pub(crate) struct ProtocolMutatingProbeExecution {
     pub summary: ProtocolMutatingProbeSummary,
     pub cleanup: ProtocolCleanupReport,
     pub forbidden_secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ProtocolProbeCapabilities {
+pub(crate) struct ProtocolProbeCapabilities {
     pub bucket_policy: bool,
     pub iam: bool,
+    pub iam_group: bool,
     pub sts: bool,
 }
 
@@ -178,12 +191,13 @@ impl ProtocolProbeCapabilities {
         Self {
             bucket_policy: requires("bucket-policy"),
             iam: requires("iam"),
+            iam_group: requires("iam-group"),
             sts: requires("sts"),
         }
     }
 }
 
-pub async fn run_mutating_permission_probe(
+pub(crate) async fn run_mutating_permission_probe(
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
     admin: &impl ProtocolAdminPort,
@@ -236,7 +250,7 @@ pub async fn run_mutating_permission_probe(
     }
 }
 
-pub async fn cleanup_interrupted_mutating_permission_probe(
+pub(crate) async fn cleanup_interrupted_mutating_permission_probe(
     registry: &mut ResourceRegistry,
     admin: &impl ProtocolAdminPort,
     s3: &impl ProtocolS3Port,
@@ -347,19 +361,20 @@ async fn run_probe_resources(
             "preflight",
         )?;
         registry.transition(&iam_policy_handle.id, ResourceState::Creating, None)?;
+        let mut statements = vec![serde_json::json!({
+            "Effect": "Allow",
+            "Action": ["s3:ListBucket"],
+            "Resource": [format!("arn:aws:s3:::{bucket}")]
+        })];
+        if capabilities.sts {
+            statements.push(serde_json::json!({
+                "Effect": "Allow",
+                "Action": ["sts:AssumeRole"]
+            }));
+        }
         let iam_policy = serde_json::to_string(&serde_json::json!({
             "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Action": ["s3:ListBucket"],
-                    "Resource": [format!("arn:aws:s3:::{bucket}")]
-                },
-                {
-                    "Effect": "Allow",
-                    "Action": ["sts:AssumeRole"]
-                }
-            ]
+            "Statement": statements
         }))?;
         admin.create_policy(&iam_policy_name, &iam_policy).await?;
         registry.transition(&iam_policy_handle.id, ResourceState::Created, None)?;
@@ -405,42 +420,44 @@ async fn run_probe_resources(
             }
         }
 
-        let group_name = namer.iam_group(case_id, 0)?;
-        let group_handle = registry.plan_for_phase(
-            ResourceKind::IamGroup,
-            &group_name,
-            case_id,
-            Vec::new(),
-            "preflight",
-        )?;
-        registry.transition(&group_handle.id, ResourceState::Creating, None)?;
-        let membership = registry.plan_group_membership_for_phase(
-            &group_name,
-            user_name.as_str(),
-            case_id,
-            vec![group_handle.id.clone(), user_handle.id.clone()],
-            "preflight",
-        )?;
-        registry.transition(&membership.id, ResourceState::Creating, None)?;
-        admin
-            .update_group_members(&group_name, std::slice::from_ref(user_name), false)
-            .await?;
-        registry.transition(&group_handle.id, ResourceState::Created, None)?;
-        registry.transition(&membership.id, ResourceState::Created, None)?;
+        if capabilities.iam_group {
+            let group_name = namer.iam_group(case_id, 0)?;
+            let group_handle = registry.plan_for_phase(
+                ResourceKind::IamGroup,
+                &group_name,
+                case_id,
+                Vec::new(),
+                "preflight",
+            )?;
+            registry.transition(&group_handle.id, ResourceState::Creating, None)?;
+            let membership = registry.plan_group_membership_for_phase(
+                &group_name,
+                user_name.as_str(),
+                case_id,
+                vec![group_handle.id.clone(), user_handle.id.clone()],
+                "preflight",
+            )?;
+            registry.transition(&membership.id, ResourceState::Creating, None)?;
+            admin
+                .update_group_members(&group_name, std::slice::from_ref(user_name), false)
+                .await?;
+            registry.transition(&group_handle.id, ResourceState::Created, None)?;
+            registry.transition(&membership.id, ResourceState::Created, None)?;
 
-        let group_attachment = registry.plan_policy_attachment_for_phase(
-            &iam_policy_name,
-            &group_name,
-            true,
-            case_id,
-            vec![iam_policy_handle.id, group_handle.id],
-            "preflight",
-        )?;
-        registry.transition(&group_attachment.id, ResourceState::Creating, None)?;
-        admin
-            .attach_policy(&iam_policy_name, &group_name, true)
-            .await?;
-        registry.transition(&group_attachment.id, ResourceState::Created, None)?;
+            let group_attachment = registry.plan_policy_attachment_for_phase(
+                &iam_policy_name,
+                &group_name,
+                true,
+                case_id,
+                vec![iam_policy_handle.id, group_handle.id],
+                "preflight",
+            )?;
+            registry.transition(&group_attachment.id, ResourceState::Creating, None)?;
+            admin
+                .attach_policy(&iam_policy_name, &group_name, true)
+                .await?;
+            registry.transition(&group_attachment.id, ResourceState::Created, None)?;
+        }
     }
 
     let prefix = format!("cases/{case_id}/");
@@ -503,11 +520,13 @@ mod tests {
         policy_present: bool,
         fail_policy_put: bool,
         iam_policies: Vec<String>,
+        iam_policy_documents: Vec<String>,
         iam_groups: Vec<String>,
         iam_attachments: Vec<(String, String, bool)>,
         iam_memberships: Vec<(String, String)>,
         sts_sessions: Vec<(String, String)>,
         versioning_enable_count: usize,
+        group_mutation_count: usize,
     }
 
     #[derive(Clone)]
@@ -646,16 +665,58 @@ mod tests {
             Ok(())
         }
 
+        async fn policy_attached(
+            &self,
+            policy: &str,
+            principal: &str,
+            is_group: bool,
+        ) -> std::result::Result<bool, ProtocolAdminError> {
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .iam_attachments
+                .iter()
+                .any(|item| item == &(policy.to_string(), principal.to_string(), is_group)))
+        }
+
+        async fn group_contains_member(
+            &self,
+            group: &str,
+            member: &str,
+        ) -> std::result::Result<bool, ProtocolAdminError> {
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .iam_memberships
+                .iter()
+                .any(|item| item == &(group.to_string(), member.to_string())))
+        }
+
+        async fn sts_sessions_with_parent(
+            &self,
+            parent_access_key: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .sts_sessions
+                .iter()
+                .filter(|(parent, _)| parent == parent_access_key)
+                .map(|(_, session)| session.clone())
+                .collect())
+        }
+
         async fn create_policy(
             &self,
             name: &str,
-            _document: &str,
+            document: &str,
         ) -> std::result::Result<(), ProtocolAdminError> {
-            self.0
-                .lock()
-                .expect("state")
-                .iam_policies
-                .push(name.to_string());
+            let mut state = self.0.lock().expect("state");
+            state.iam_policies.push(name.to_string());
+            state.iam_policy_documents.push(document.to_string());
             Ok(())
         }
 
@@ -674,11 +735,13 @@ mod tests {
             principal: &str,
             is_group: bool,
         ) -> std::result::Result<(), ProtocolAdminError> {
-            self.0.lock().expect("state").iam_attachments.push((
-                policy.to_string(),
-                principal.to_string(),
-                is_group,
-            ));
+            let mut state = self.0.lock().expect("state");
+            if is_group {
+                state.group_mutation_count += 1;
+            }
+            state
+                .iam_attachments
+                .push((policy.to_string(), principal.to_string(), is_group));
             Ok(())
         }
 
@@ -705,6 +768,7 @@ mod tests {
             remove: bool,
         ) -> std::result::Result<(), ProtocolAdminError> {
             let mut state = self.0.lock().expect("state");
+            state.group_mutation_count += 1;
             if !remove && !state.iam_groups.iter().any(|current| current == group) {
                 state.iam_groups.push(group.to_string());
             }
@@ -854,11 +918,7 @@ mod tests {
                 .lock()
                 .expect("state")
                 .versions
-                .push(ProtocolObjectVersion {
-                    key: key.to_string(),
-                    version_id: "marker".to_string(),
-                    delete_marker: true,
-                });
+                .retain(|version| version.key != key);
             Ok(())
         }
 
@@ -880,14 +940,6 @@ mod tests {
                 .expect("state")
                 .versions
                 .retain(|version| version.key != key || version.version_id != version_id);
-            Ok(())
-        }
-
-        async fn enable_bucket_versioning(
-            &self,
-            _bucket: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
-            self.0.lock().expect("state").versioning_enable_count += 1;
             Ok(())
         }
     }
@@ -919,6 +971,7 @@ mod tests {
             ProtocolProbeCapabilities {
                 bucket_policy: true,
                 iam: true,
+                iam_group: true,
                 sts: true,
             },
         )
@@ -926,7 +979,8 @@ mod tests {
 
         assert_eq!(
             execution.summary.status,
-            ProtocolMutatingProbeStatus::Passed
+            ProtocolMutatingProbeStatus::Passed,
+            "{execution:?}"
         );
         assert_eq!(execution.summary.version_count, 0);
         assert_eq!(execution.summary.delete_marker_count, 0);
@@ -976,7 +1030,8 @@ mod tests {
 
         assert_eq!(
             execution.summary.status,
-            ProtocolMutatingProbeStatus::Passed
+            ProtocolMutatingProbeStatus::Passed,
+            "{execution:?}"
         );
         assert!(execution.cleanup.succeeded);
         assert!(registry.pending_cleanup().next().is_none());
@@ -988,6 +1043,47 @@ mod tests {
         assert!(state.iam_groups.is_empty());
         assert!(state.sts_sessions.is_empty());
         assert_eq!(state.versioning_enable_count, 0);
+    }
+
+    #[tokio::test]
+    async fn iam_only_probe_does_not_require_sts_or_group_apis() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut registry =
+            ResourceRegistry::create(dir.path(), "run", fingerprint()).expect("registry");
+        let namer = ProtocolResourceNamer::new("s3c", "s3chaos", "run").expect("namer");
+
+        let execution = run_mutating_permission_probe(
+            &namer,
+            &mut registry,
+            &FakeAdmin(state.clone()),
+            &FakeS3(state.clone()),
+            None,
+            ProtocolProbeCapabilities {
+                bucket_policy: false,
+                iam: true,
+                iam_group: false,
+                sts: false,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            execution.summary.status,
+            ProtocolMutatingProbeStatus::Passed,
+            "{execution:?}"
+        );
+        assert!(execution.cleanup.succeeded);
+        let state = state.lock().expect("state");
+        assert_eq!(state.group_mutation_count, 0);
+        assert!(state.iam_groups.is_empty());
+        assert!(state.iam_memberships.is_empty());
+        assert!(
+            state
+                .iam_policy_documents
+                .iter()
+                .all(|document| !document.contains("sts:AssumeRole"))
+        );
     }
 
     #[tokio::test]

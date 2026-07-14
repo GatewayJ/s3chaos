@@ -113,6 +113,8 @@ pub struct ResourceRegistry {
     pub kind: String,
     pub run_id: String,
     pub target_fingerprint: TargetFingerprint,
+    #[serde(default)]
+    pub versioned_cleanup: bool,
     pub resources: Vec<ResourceHandle>,
     #[serde(skip)]
     path: PathBuf,
@@ -150,6 +152,7 @@ impl ResourceRegistry {
             kind: "ProtocolResourceRegistry".to_string(),
             run_id: run_id.into(),
             target_fingerprint,
+            versioned_cleanup: false,
             resources: Vec::new(),
             path: artifact_root.as_ref().join(RESOURCE_REGISTRY_FILE),
         };
@@ -169,6 +172,11 @@ impl ResourceRegistry {
             .with_context(|| format!("parse resource registry {}", path.display()))?;
         registry.path = path;
         Ok(registry)
+    }
+
+    pub fn set_versioned_cleanup(&mut self, enabled: bool) -> Result<()> {
+        self.versioned_cleanup = enabled;
+        self.persist()
     }
 
     pub fn plan(

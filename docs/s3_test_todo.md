@@ -1098,7 +1098,8 @@ Phase 1 is ready to merge when:
       parallelism, unsupported cleanup modes, and missing target ownership.
 - [x] `protocol-suite-plan` writes a deterministic plan with selected case ids,
       target fingerprint, resource prefixes, `isolation: case`, `serial: true`,
-      and cleanup policy.
+      cleanup policy, and the source revision when invoked through the repository
+      wrapper.
 - [x] `protocol-suite-run` executes
       `bucket-policy-authenticated-user-rw` against a RustFS test target.
 - [x] The case proves both denied and allowed authorization paths against a live

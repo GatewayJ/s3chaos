@@ -66,7 +66,7 @@ impl ProtocolCaseExecution {
     }
 }
 
-pub async fn run_protocol_case<F>(
+pub(crate) async fn run_protocol_case<F>(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,

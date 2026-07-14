@@ -412,13 +412,6 @@ mod tests {
         ) -> std::result::Result<(), ProtocolS3Error> {
             self.delete_object(bucket, key).await
         }
-
-        async fn enable_bucket_versioning(
-            &self,
-            _bucket: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
-            Ok(())
-        }
     }
 
     fn no_such_key() -> ProtocolS3Error {

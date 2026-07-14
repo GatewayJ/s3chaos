@@ -79,7 +79,7 @@ const CASES: &[ProtocolCase] = &[
         "iam-user",
         &["authz", "regression"],
     ),
-    iam_case(IAM_GROUP_POLICY, "iam-group", &["authz", "regression"]),
+    iam_group_case(IAM_GROUP_POLICY, "iam-group", &["authz", "regression"]),
     iam_case(
         IAM_USER_MANAGED_POLICY_READONLY,
         "iam-user",
@@ -143,6 +143,21 @@ const fn iam_case(
     }
 }
 
+const fn iam_group_case(
+    id: &'static str,
+    group: &'static str,
+    tags: &'static [&'static str],
+) -> ProtocolCase {
+    ProtocolCase {
+        id,
+        group,
+        tags,
+        isolation: ProtocolIsolation::Case,
+        requires: &["s3", "admin-api", "iam", "iam-group"],
+        serial: true,
+    }
+}
+
 pub fn protocol_case_catalog() -> &'static [ProtocolCase] {
     CASES
 }
@@ -199,5 +214,17 @@ mod tests {
         let case = super::protocol_case(BUCKET_POLICY_AUTHENTICATED_USER_RW).expect("case");
         assert!(case.requires.contains(&"identity"));
         assert!(!case.requires.contains(&"iam"));
+    }
+
+    #[test]
+    fn only_group_case_declares_group_management() {
+        for case in protocol_case_catalog() {
+            assert_eq!(
+                case.requires.contains(&"iam-group"),
+                case.id == IAM_GROUP_POLICY,
+                "{} has an incorrect iam-group capability",
+                case.id
+            );
+        }
     }
 }

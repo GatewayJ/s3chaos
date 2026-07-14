@@ -605,6 +605,21 @@ mod tests {
             Ok(())
         }
 
+        async fn sts_sessions_with_parent(
+            &self,
+            parent_access_key: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.parent == parent_access_key)
+                .map(|(access_key, _)| access_key.clone())
+                .collect())
+        }
+
         async fn create_policy(
             &self,
             name: &str,
@@ -655,6 +670,21 @@ mod tests {
                 }
             }
             Ok(())
+        }
+
+        async fn policy_attached(
+            &self,
+            policy: &str,
+            principal: &str,
+            _is_group: bool,
+        ) -> std::result::Result<bool, ProtocolAdminError> {
+            Ok(self
+                .0
+                .lock()
+                .expect("state")
+                .user_policies
+                .get(principal)
+                .is_some_and(|policies| policies.contains(policy)))
         }
     }
 
@@ -837,13 +867,6 @@ mod tests {
                 .expect("state")
                 .objects
                 .remove(&(bucket.to_string(), key.to_string()));
-            Ok(())
-        }
-
-        async fn enable_bucket_versioning(
-            &self,
-            _bucket: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
             Ok(())
         }
     }

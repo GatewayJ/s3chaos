@@ -78,6 +78,8 @@ pub struct ProtocolSuitePlan {
     pub kind: String,
     pub suite: String,
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
     pub artifact_root: String,
     pub target: ProtocolSuitePlanTarget,
     pub preflight: ProtocolSuitePlanPreflight,
@@ -224,6 +226,10 @@ impl ProtocolSuitePlan {
             kind: PROTOCOL_SUITE_PLAN_KIND.to_string(),
             suite: suite.metadata.name.clone(),
             run_id,
+            source_revision: std::env::var("S3CHAOS_SOURCE_REVISION")
+                .ok()
+                .or_else(|| std::env::var("GITHUB_SHA").ok())
+                .filter(|revision| !revision.trim().is_empty()),
             artifact_root: artifact_root.display().to_string(),
             target: ProtocolSuitePlanTarget {
                 fingerprint,

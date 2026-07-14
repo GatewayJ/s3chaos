@@ -1030,13 +1030,6 @@ mod tests {
                 .remove(&(bucket.to_string(), key.to_string()));
             Ok(())
         }
-
-        async fn enable_bucket_versioning(
-            &self,
-            _bucket: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
-            Ok(())
-        }
     }
 
     impl FakeS3 {
