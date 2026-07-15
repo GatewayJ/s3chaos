@@ -1599,13 +1599,19 @@ async fn run_fault_case(
                 None,
             )
             .ok();
+        // Derive the S3-model classification from the checker's own evidence
+        // instead of the catch-all product_or_environment: a committed-loss or
+        // corruption verdict at the FINAL gate is the strongest product signal
+        // this harness produces, and it must route like the identical failure
+        // caught at the pre-recommit gate (review finding C3-3).
+        let classification = checker::classify_without_reread(&report);
         write_failure_summary(
             collector,
             scenario.case_name,
             FailureSummary::new(
                 &scenario.name,
                 "checker-verdict",
-                "product_or_environment",
+                classification.as_str(),
                 error.to_string(),
             ),
         )?;
