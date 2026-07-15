@@ -100,6 +100,9 @@ pub struct FaultTestConfig {
     /// directory-marker keys (trailing `/`). 0 keeps the historical
     /// object-only prefill.
     pub workload_directory_marker_percent: u8,
+    /// Percentage (0-100) of mixed-workload GETs issued as ranged reads.
+    /// 0 keeps the historical whole-object-only behavior.
+    pub workload_ranged_get_percent: u8,
     pub dm_name: Option<String>,
     pub dm_node: Option<String>,
     pub dm_mount_path: Option<String>,
@@ -286,6 +289,14 @@ impl FaultTestConfig {
                 ensure!(
                     percent <= 100,
                     "RUSTFS_FAULT_TEST_WORKLOAD_DIRECTORY_MARKER_PERCENT must be between 0 and 100"
+                );
+                percent
+            },
+            workload_ranged_get_percent: {
+                let percent = env_u8(&get_env, "RUSTFS_FAULT_TEST_WORKLOAD_RANGED_GET_PERCENT", 0)?;
+                ensure!(
+                    percent <= 100,
+                    "RUSTFS_FAULT_TEST_WORKLOAD_RANGED_GET_PERCENT must be between 0 and 100"
                 );
                 percent
             },

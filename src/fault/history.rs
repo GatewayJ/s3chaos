@@ -87,6 +87,24 @@ impl FaultWindowRelation {
     }
 }
 
+/// Deterministic payload generator inputs for a committed write. The workload
+/// generates every non-multipart body via `seeded_bytes(seed, index, size)`,
+/// so recording (seed, index) lets the checker regenerate the exact bytes —
+/// the basis for verifying ranged GET slices against any committed value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PayloadRef {
+    pub seed: u64,
+    pub index: usize,
+}
+
+/// The byte range a ranged GET requested (inclusive start offset, exact
+/// length).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByteRange {
+    pub offset: u64,
+    pub length: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub id: String,
@@ -100,6 +118,14 @@ pub struct OperationRecord {
     pub version_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listed_keys: Option<Vec<String>>,
+    /// Set on committed writes whose body came from the seeded generator;
+    /// absent for multipart bodies and legacy artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_ref: Option<PayloadRef>,
+    /// Set on ranged GETs: `value_sha256`/`size_bytes` then describe the
+    /// returned slice, not the whole object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<ByteRange>,
     pub started_at_ms: u64,
     pub ended_at_ms: u64,
     pub outcome: OperationOutcome,
@@ -182,6 +208,8 @@ impl Recorder {
             size_bytes,
             version_id: None,
             listed_keys: None,
+            payload_ref: None,
+            range: None,
             started_at_ms,
             ended_at_ms: started_at_ms,
             outcome: OperationOutcome::Unknown,

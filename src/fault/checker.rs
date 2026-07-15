@@ -20,8 +20,10 @@ use std::time::{Duration, Instant};
 use tokio::time::{sleep as async_sleep, timeout};
 
 use crate::fault::{
-    history::{OperationKind, OperationOutcome, OperationRecord, Recorder},
-    workload::{GetObjectResult, ObjectSpec, ObjectVersionEntry, S3WorkloadClient, sha256_hex},
+    history::{ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef, Recorder},
+    workload::{
+        GetObjectResult, ObjectSpec, ObjectVersionEntry, S3WorkloadClient, seeded_bytes, sha256_hex,
+    },
 };
 
 const MAX_WARNING_SAMPLES: usize = 50;
@@ -578,6 +580,10 @@ struct AmbiguousWriteAttempt {
     kind: OperationKind,
     outcome: OperationOutcome,
     object: ExpectedObject,
+    /// Generator inputs for regenerating this attempt's body, so a ranged GET
+    /// that materialized this ambiguous write can be verified at the slice
+    /// level (absent for multipart bodies and legacy records).
+    payload_ref: Option<PayloadRef>,
     started_at_ms: u64,
     ended_at_ms: u64,
     superseded_by: Option<SupersedingMutation>,
@@ -1686,6 +1692,7 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
                         kind: record.kind,
                         outcome: record.outcome,
                         object,
+                        payload_ref: record.payload_ref,
                         started_at_ms: record.started_at_ms,
                         ended_at_ms: record.ended_at_ms,
                         superseded_by: None,
@@ -1785,9 +1792,18 @@ fn list_history_warnings(records: &[OperationRecord]) -> WarningSummary {
     warnings
 }
 
+/// A committed value that was stably live when a GET started, carrying the
+/// generator inputs so ranged reads can be slice-verified against it (absent
+/// for multipart bodies and legacy records).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StableLiveObject {
+    object: ExpectedObject,
+    payload_ref: Option<PayloadRef>,
+}
+
 fn stable_live_objects_at_read_starts(
     records: &[OperationRecord],
-) -> BTreeMap<usize, ExpectedObject> {
+) -> BTreeMap<usize, StableLiveObject> {
     let mut reads = records
         .iter()
         .enumerate()
@@ -1817,7 +1833,7 @@ fn stable_live_objects_at_read_starts(
         .collect::<Vec<_>>();
     mutations.sort_by_key(|record| record.ended_at_ms);
 
-    let mut model = ObjectModel::default();
+    let mut live = BTreeMap::<String, StableLiveObject>::new();
     let mut next_mutation = 0;
     let mut stable = BTreeMap::new();
     for (index, started_at_ms, key) in reads {
@@ -1825,10 +1841,28 @@ fn stable_live_objects_at_read_starts(
             if record.ended_at_ms >= started_at_ms {
                 break;
             }
-            apply_record_to_model(&mut model, record);
+            match record.kind {
+                OperationKind::Put | OperationKind::CompleteMultipartUpload => {
+                    if let Some((key, object)) = record_object(record) {
+                        live.insert(
+                            key,
+                            StableLiveObject {
+                                object,
+                                payload_ref: record.payload_ref,
+                            },
+                        );
+                    }
+                }
+                OperationKind::Delete => {
+                    if let Some(key) = record.key.as_ref() {
+                        live.remove(key);
+                    }
+                }
+                _ => {}
+            }
             next_mutation += 1;
         }
-        if let Some(expected) = model.live.get(key) {
+        if let Some(expected) = live.get(key) {
             stable.insert(index, expected.clone());
         }
     }
@@ -1842,6 +1876,9 @@ fn stable_live_objects_at_read_starts(
 struct CommittedWriteWindow {
     object: ExpectedObject,
     ended_at_ms: u64,
+    /// Generator inputs for regenerating this write's exact body (absent for
+    /// multipart bodies and legacy records, which cannot be slice-verified).
+    payload_ref: Option<PayloadRef>,
 }
 
 /// Whether a successful GET that does not match the latest committed value is
@@ -1885,6 +1922,192 @@ fn concurrent_committed_read(
     false
 }
 
+/// Regenerate the expected slice hash for a reproducible body (seeded generator
+/// inputs recorded and the range fits within the object). Returns None when the
+/// body is unreproducible (no payload_ref) or the range does not fit.
+fn regenerated_slice_sha(
+    payload_ref: Option<PayloadRef>,
+    size_bytes: usize,
+    range: ByteRange,
+) -> Option<String> {
+    let payload_ref = payload_ref?;
+    let size = size_bytes as u64;
+    if range.offset >= size || range.length == 0 || range.offset + range.length > size {
+        return None;
+    }
+    let body = seeded_bytes(payload_ref.seed, payload_ref.index, size_bytes);
+    let start = range.offset as usize;
+    let end = (range.offset + range.length) as usize;
+    Some(sha256_hex(&body[start..end]))
+}
+
+/// Per-key model state a ranged GET is verified against.
+struct RangedReadState<'a> {
+    /// Committed writes still on the key's history (a committed delete wipes
+    /// this before the GET record is processed).
+    history: &'a [CommittedWriteWindow],
+    /// Ambiguous (timeout/unknown) write attempts against the key.
+    ambiguous: &'a [AmbiguousWriteAttempt],
+    /// The committed value stably live when the GET started, if any.
+    stable_at_start: Option<&'a StableLiveObject>,
+    /// The key's current committed live value, if any.
+    live_object: Option<&'a ExpectedObject>,
+}
+
+/// Verify a successful ranged GET against the slices it could legally observe.
+///
+/// Candidates are the committed values the GET could linearize to (latest
+/// committed write, writes whose completion window overlaps the GET, the
+/// immediately-previous value while the latest write was in flight -- the same
+/// legs as `concurrent_committed_read` -- and the value stably live when the
+/// GET started, which survives an overlapping committed delete exactly like
+/// the whole-object stable-at-read-start exemption) PLUS any ambiguous
+/// (timeout/unknown) write, which may have materialized server-side. A slice
+/// matching a committed value is clean; matching a materialized pending
+/// ambiguous write is `unknown_writes_materialized`, and matching one already
+/// superseded by a later committed mutation additionally records
+/// `unknown_write_value_conflicts`, mirroring the whole-object path (NOT
+/// corruption). A mismatch is only flagged as corruption when every candidate
+/// is reproducible and none match; if any candidate body is unreproducible
+/// (multipart, legacy) or is a range-spanning ambiguous write, the mismatch is
+/// inconclusive -- the slice may belong to that unverifiable body.
+fn verify_ranged_get(
+    key: &str,
+    range: ByteRange,
+    record: &OperationRecord,
+    state: RangedReadState<'_>,
+    anomalies: &mut ReadAnomalies,
+) {
+    let actual_sha = record.value_sha256.as_deref().unwrap_or_default();
+    let actual_len = record.size_bytes.unwrap_or_default() as u64;
+    if actual_len != range.length {
+        anomalies.corrupted_reads.push(format!(
+            "{key}: ranged GET bytes={}-{} returned {} bytes instead of {}",
+            range.offset,
+            range.offset + range.length - 1,
+            actual_len,
+            range.length
+        ));
+        return;
+    }
+
+    // Reproducible slice inputs (payload_ref, size) for every committed value
+    // the GET could legally observe.
+    let mut candidates: Vec<(Option<PayloadRef>, usize)> = Vec::new();
+    if let Some((latest, prior)) = state.history.split_last() {
+        candidates.push((latest.payload_ref, latest.object.size_bytes));
+        for window in prior {
+            if window.ended_at_ms >= record.started_at_ms {
+                candidates.push((window.payload_ref, window.object.size_bytes));
+            }
+        }
+        if latest.ended_at_ms >= record.started_at_ms
+            && let Some(previous) = prior.last()
+        {
+            candidates.push((previous.payload_ref, previous.object.size_bytes));
+        }
+    }
+    // The value stably live when the GET started is always legally
+    // observable, even when a committed delete that overlaps the GET has
+    // since wiped the key's committed history (the whole-object path's
+    // stable-at-read-start exemption).
+    if let Some(stable) = state.stable_at_start {
+        candidates.push((stable.payload_ref, stable.object.size_bytes));
+    }
+
+    let mut unverifiable = false;
+    for (payload_ref, size) in &candidates {
+        match regenerated_slice_sha(*payload_ref, *size, range) {
+            Some(expected) if expected == actual_sha => return,
+            Some(_) => {}
+            None => unverifiable = true,
+        }
+    }
+
+    // An ambiguous write may have materialized: a slice that matches its
+    // regenerated body means the write landed. A pending attempt's match is
+    // unknown_writes_materialized (not corruption); a superseded attempt's
+    // match additionally conflicts with the committed value that superseded
+    // it, exactly like the whole-object path. One that spans the range but is
+    // unreproducible makes a mismatch inconclusive.
+    let mut ambiguous_spans_range = false;
+    let mut pending_match: Option<&AmbiguousWriteAttempt> = None;
+    let mut superseded_match: Option<&AmbiguousWriteAttempt> = None;
+    for attempt in state.ambiguous {
+        match regenerated_slice_sha(attempt.payload_ref, attempt.object.size_bytes, range) {
+            Some(expected) if expected == actual_sha => {
+                if attempt.superseded_by.is_none() {
+                    pending_match = Some(attempt);
+                } else {
+                    superseded_match = Some(attempt);
+                }
+            }
+            Some(_) => {}
+            None if range.offset + range.length <= attempt.object.size_bytes as u64 => {
+                ambiguous_spans_range = true;
+            }
+            None => {}
+        }
+    }
+    let actual = ExpectedObject {
+        sha256: actual_sha.to_string(),
+        size_bytes: record.size_bytes.unwrap_or_default(),
+    };
+    if let Some(attempt) = pending_match {
+        anomalies.unknown_writes_materialized.push(
+            ambiguous_write_materialized_from_object_message(key, attempt, &actual),
+        );
+        return;
+    }
+    if let Some(attempt) = superseded_match {
+        anomalies.unknown_writes_materialized.push(
+            ambiguous_write_materialized_from_object_message(key, attempt, &actual),
+        );
+        anomalies
+            .unknown_write_value_conflicts
+            .push(superseded_ambiguous_object_conflict_message(
+                key,
+                state.live_object,
+                attempt,
+                &actual,
+            ));
+        return;
+    }
+
+    if unverifiable || ambiguous_spans_range {
+        return;
+    }
+    if !state.ambiguous.is_empty() {
+        // Ambiguous writes exist but the slice matches neither them nor any
+        // committed value: the read is unexplained but not provable
+        // corruption, exactly as the whole-object path classifies it.
+        anomalies.unknown_write_value_conflicts.push(format!(
+            "{key}: ranged GET bytes={}-{} returned slice sha {} matching no committed value while ambiguous writes exist",
+            range.offset,
+            range.offset + range.length - 1,
+            actual_sha
+        ));
+        return;
+    }
+    if candidates.is_empty() {
+        // No committed value and no ambiguous write. If the key is not live
+        // either, a successful ranged read of a never-committed key is a
+        // resurrection-class signal.
+        if state.live_object.is_none() {
+            anomalies.visible_deleted_objects.push(format!(
+                "{key}: successful ranged GET had no committed live value"
+            ));
+        }
+        return;
+    }
+    anomalies.corrupted_reads.push(format!(
+        "{key}: ranged GET bytes={}-{} returned slice sha {} matching no committed value",
+        range.offset,
+        range.offset + range.length - 1,
+        actual_sha
+    ));
+}
+
 fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
     let mut live = BTreeMap::<String, ExpectedObject>::new();
     let mut committed_history = BTreeMap::<String, Vec<CommittedWriteWindow>>::new();
@@ -1904,6 +2127,7 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                         .push(CommittedWriteWindow {
                             object: object.clone(),
                             ended_at_ms: record.ended_at_ms,
+                            payload_ref: record.payload_ref,
                         });
                     live.insert(key, object);
                 }
@@ -1923,6 +2147,7 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                             kind: record.kind,
                             outcome: record.outcome,
                             object,
+                            payload_ref: record.payload_ref,
                             started_at_ms: record.started_at_ms,
                             ended_at_ms: record.ended_at_ms,
                             superseded_by: None,
@@ -1946,13 +2171,36 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                 let Some(key) = record.key.as_ref() else {
                     continue;
                 };
+                if let Some(range) = record.range {
+                    // A ranged GET's recorded hash describes the slice, so the
+                    // whole-object comparison below would always misfire.
+                    verify_ranged_get(
+                        key,
+                        range,
+                        record,
+                        RangedReadState {
+                            history: committed_history
+                                .get(key)
+                                .map(Vec::as_slice)
+                                .unwrap_or_default(),
+                            ambiguous: ambiguous_writes
+                                .get(key)
+                                .map(Vec::as_slice)
+                                .unwrap_or_default(),
+                            stable_at_start: stable_live_at_start.get(&record_index),
+                            live_object: live.get(key),
+                        },
+                        &mut anomalies,
+                    );
+                    continue;
+                }
                 let actual_hash = record.value_sha256.as_deref().unwrap_or_default();
                 let actual = ExpectedObject {
                     sha256: actual_hash.to_string(),
                     size_bytes: record.size_bytes.unwrap_or_default(),
                 };
                 let stable_expected = stable_live_at_start.get(&record_index);
-                if stable_expected.is_some_and(|expected| expected == &actual) {
+                if stable_expected.is_some_and(|expected| expected.object == actual) {
                     continue;
                 }
                 let attempts = ambiguous_writes
@@ -2018,7 +2266,10 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                     None if let Some(expected) = stable_expected => {
                         anomalies.corrupted_reads.push(format!(
                             "{key}: expected {} ({} bytes), got {} ({} bytes)",
-                            expected.sha256, expected.size_bytes, actual.sha256, actual.size_bytes
+                            expected.object.sha256,
+                            expected.object.size_bytes,
+                            actual.sha256,
+                            actual.size_bytes
                         ));
                     }
                     None => anomalies
@@ -2051,7 +2302,10 @@ mod tests {
         immediate_still_unavailable_keys, is_recovery_tail_read_failure, list_history_warnings,
         object_model, recovery_tail_candidate_keys, successful_read_anomalies,
     };
-    use crate::fault::history::{OperationKind, OperationOutcome, OperationRecord};
+    use crate::fault::history::{
+        ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
+    };
+    use crate::fault::workload::seeded_bytes;
     use crate::fault::workload::{GetObjectResult, sha256_hex};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -2071,6 +2325,8 @@ mod tests {
             value_sha256: Some(hash.to_string()),
             size_bytes: Some(1),
             version_id: None,
+            payload_ref: None,
+            range: None,
             started_at_ms: 1,
             ended_at_ms: 2,
             outcome,
@@ -2115,6 +2371,8 @@ mod tests {
             size_bytes: Some(keys.len()),
             version_id: None,
             listed_keys: Some(keys.iter().map(|key| key.to_string()).collect()),
+            payload_ref: None,
+            range: None,
             started_at_ms,
             ended_at_ms,
             outcome: OperationOutcome::Ok,
@@ -2134,6 +2392,7 @@ mod tests {
                 sha256: hash.to_string(),
                 size_bytes: 1,
             },
+            payload_ref: None,
             started_at_ms: 1,
             ended_at_ms: 2,
             superseded_by: None,
@@ -3382,6 +3641,381 @@ mod tests {
 
         assert!(anomalies.corrupted_reads.is_empty());
         assert!(anomalies.visible_deleted_objects.is_empty());
+    }
+
+    fn slice_sha(seed: u64, index: usize, size: usize, range: ByteRange) -> String {
+        let body = seeded_bytes(seed, index, size);
+        sha256_hex(&body[range.offset as usize..(range.offset + range.length) as usize])
+    }
+
+    fn committed_put(
+        id: &str,
+        key: &str,
+        seed: u64,
+        index: usize,
+        size: usize,
+        started_at_ms: u64,
+        ended_at_ms: u64,
+    ) -> OperationRecord {
+        let body = seeded_bytes(seed, index, size);
+        let mut record = timed_record(
+            id,
+            OperationKind::Put,
+            key,
+            &sha256_hex(&body),
+            OperationOutcome::Ok,
+            started_at_ms,
+            ended_at_ms,
+        );
+        record.size_bytes = Some(size);
+        record.payload_ref = Some(PayloadRef { seed, index });
+        record
+    }
+
+    fn ranged_get(
+        id: &str,
+        key: &str,
+        range: ByteRange,
+        slice_sha256: &str,
+        started_at_ms: u64,
+        ended_at_ms: u64,
+    ) -> OperationRecord {
+        let mut record = timed_record(
+            id,
+            OperationKind::Get,
+            key,
+            slice_sha256,
+            OperationOutcome::Ok,
+            started_at_ms,
+            ended_at_ms,
+        );
+        record.size_bytes = Some(range.length as usize);
+        record.range = Some(range);
+        record
+    }
+
+    /// A ranged GET whose slice matches the regenerated slice of the latest
+    /// committed write is clean — and crucially is never compared against the
+    /// whole-object hash (which would always mismatch).
+    #[test]
+    fn ranged_get_matching_latest_slice_is_clean() {
+        let range = ByteRange {
+            offset: 100,
+            length: 64,
+        };
+        let put = committed_put("op-1", "k", 7, 3, 4096, 10, 11);
+        let get = ranged_get("op-2", "k", range, &slice_sha(7, 3, 4096, range), 20, 21);
+
+        let anomalies = successful_read_anomalies(&[put, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "clean ranged read flagged: {:?}",
+            anomalies.corrupted_reads
+        );
+    }
+
+    /// A ranged GET racing a concurrent overwrite may return the earlier
+    /// variant's slice — same concurrency legs as whole-object reads.
+    #[test]
+    fn ranged_get_matching_concurrent_variant_slice_is_clean() {
+        let range = ByteRange {
+            offset: 5,
+            length: 32,
+        };
+        let first = committed_put("op-1", "k", 7, 3, 4096, 10, 19);
+        let second = committed_put("op-2", "k", 99, 3, 4096, 18, 20);
+        // GET starts while op-2 is in flight and observes op-1's slice.
+        let get = ranged_get("op-3", "k", range, &slice_sha(7, 3, 4096, range), 19, 21);
+
+        let anomalies = successful_read_anomalies(&[first, second, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "concurrent ranged read flagged: {:?}",
+            anomalies.corrupted_reads
+        );
+    }
+
+    /// A slice matching no committed value (after all writes settled) is
+    /// corruption, with the range in the message.
+    #[test]
+    fn ranged_get_slice_matching_nothing_is_corruption() {
+        let range = ByteRange {
+            offset: 0,
+            length: 16,
+        };
+        let put = committed_put("op-1", "k", 7, 3, 4096, 10, 11);
+        let get = ranged_get("op-2", "k", range, &sha256_hex(b"garbage"), 50, 51);
+
+        let anomalies = successful_read_anomalies(&[put, get]);
+
+        assert_eq!(anomalies.corrupted_reads.len(), 1);
+        assert!(anomalies.corrupted_reads[0].contains("bytes=0-15"));
+    }
+
+    /// If a legally-observable committed body is not reproducible (multipart,
+    /// legacy record without payload_ref), a mismatching slice is inconclusive
+    /// and must not be flagged.
+    #[test]
+    fn ranged_get_with_unreproducible_candidate_is_inconclusive() {
+        let range = ByteRange {
+            offset: 0,
+            length: 16,
+        };
+        let mut mpu = timed_record(
+            "op-1",
+            OperationKind::CompleteMultipartUpload,
+            "k",
+            "mpu-body-sha",
+            OperationOutcome::Ok,
+            10,
+            11,
+        );
+        mpu.size_bytes = Some(4096);
+        let get = ranged_get("op-2", "k", range, &sha256_hex(b"whatever"), 50, 51);
+
+        let anomalies = successful_read_anomalies(&[mpu, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "inconclusive ranged read flagged: {:?}",
+            anomalies.corrupted_reads
+        );
+    }
+
+    /// A ranged GET returning the wrong byte count is flagged regardless of
+    /// content reproducibility.
+    #[test]
+    fn ranged_get_length_mismatch_is_corruption() {
+        let range = ByteRange {
+            offset: 0,
+            length: 16,
+        };
+        let put = committed_put("op-1", "k", 7, 3, 4096, 10, 11);
+        let mut get = ranged_get("op-2", "k", range, &sha256_hex(b"short"), 50, 51);
+        get.size_bytes = Some(8);
+
+        let anomalies = successful_read_anomalies(&[put, get]);
+
+        assert_eq!(anomalies.corrupted_reads.len(), 1);
+        assert!(anomalies.corrupted_reads[0].contains("8 bytes instead of 16"));
+    }
+
+    fn ambiguous_put(
+        id: &str,
+        key: &str,
+        seed: u64,
+        index: usize,
+        size: usize,
+        started_at_ms: u64,
+        ended_at_ms: u64,
+    ) -> OperationRecord {
+        let body = seeded_bytes(seed, index, size);
+        let mut record = timed_record(
+            id,
+            OperationKind::Put,
+            key,
+            &sha256_hex(&body),
+            OperationOutcome::Timeout,
+            started_at_ms,
+            ended_at_ms,
+        );
+        record.size_bytes = Some(size);
+        record.payload_ref = Some(PayloadRef { seed, index });
+        record
+    }
+
+    /// Adversarial self-review catch (PR#30 finding): a ranged GET reading a
+    /// materialized-but-unconfirmed (timeout) overwrite must classify as
+    /// unknown_writes_materialized, exactly like the whole-object path -- NOT
+    /// as data corruption.
+    #[test]
+    fn ranged_get_of_materialized_ambiguous_write_is_not_corruption() {
+        let range = ByteRange {
+            offset: 100,
+            length: 64,
+        };
+        let committed = committed_put("op-1", "k", 7, 3, 4096, 10, 11);
+        // Overwrite times out but landed server-side (seed 99).
+        let ambiguous = ambiguous_put("op-2", "k", 99, 3, 4096, 12, 13);
+        let get = ranged_get("op-3", "k", range, &slice_sha(99, 3, 4096, range), 50, 51);
+
+        let anomalies = successful_read_anomalies(&[committed, ambiguous, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "materialized ambiguous ranged read flagged as corruption: {:?}",
+            anomalies.corrupted_reads
+        );
+        assert_eq!(
+            anomalies.unknown_writes_materialized.len(),
+            1,
+            "must be classified as a materialized ambiguous write"
+        );
+    }
+
+    /// Adversarial review catch (PR#30 finding 1): a ranged GET that started
+    /// before an overlapping committed delete linearized may legally return
+    /// the pre-delete value -- the stable-at-read-start exemption the
+    /// whole-object path already has. It must not be flagged as a
+    /// resurrection/visible-deleted signal.
+    #[test]
+    fn ranged_get_racing_overlapping_delete_returning_pre_delete_slice_is_clean() {
+        let range = ByteRange {
+            offset: 100,
+            length: 64,
+        };
+        let put = committed_put("op-1", "k", 7, 3, 4096, 1, 5);
+        let delete = timed_record(
+            "op-2",
+            OperationKind::Delete,
+            "k",
+            "",
+            OperationOutcome::Ok,
+            10,
+            15,
+        );
+        // GET starts at 12, while the delete (ends at 15) is still in flight,
+        // and observes the pre-delete slice.
+        let get = ranged_get("op-3", "k", range, &slice_sha(7, 3, 4096, range), 12, 20);
+
+        let anomalies = successful_read_anomalies(&[put, delete, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "delete-racing ranged read flagged as corruption: {:?}",
+            anomalies.corrupted_reads
+        );
+        assert!(
+            anomalies.visible_deleted_objects.is_empty(),
+            "delete-racing ranged read flagged as resurrection: {:?}",
+            anomalies.visible_deleted_objects
+        );
+    }
+
+    /// The stable-at-read-start exemption must not blunt true resurrection
+    /// detection: a ranged GET that started AFTER the delete settled and still
+    /// returned the deleted value stays flagged.
+    #[test]
+    fn ranged_get_of_deleted_value_after_settled_delete_is_still_resurrection() {
+        let range = ByteRange {
+            offset: 100,
+            length: 64,
+        };
+        let put = committed_put("op-1", "k", 7, 3, 4096, 1, 5);
+        let delete = timed_record(
+            "op-2",
+            OperationKind::Delete,
+            "k",
+            "",
+            OperationOutcome::Ok,
+            6,
+            8,
+        );
+        // GET starts at 12, long after the delete finished at 8.
+        let get = ranged_get("op-3", "k", range, &slice_sha(7, 3, 4096, range), 12, 13);
+
+        let anomalies = successful_read_anomalies(&[put, delete, get]);
+
+        assert_eq!(
+            anomalies.visible_deleted_objects,
+            vec!["k: successful ranged GET had no committed live value"]
+        );
+    }
+
+    /// Adversarial review catch (PR#30 finding 2): a ranged GET returning the
+    /// slice of a materialized timeout write that a later committed overwrite
+    /// already superseded is classified as unknown_writes_materialized plus
+    /// unknown_write_value_conflicts, exactly like the whole-object path --
+    /// NOT as data corruption.
+    #[test]
+    fn ranged_get_of_superseded_materialized_ambiguous_write_is_not_corruption() {
+        let range = ByteRange {
+            offset: 100,
+            length: 64,
+        };
+        let committed = committed_put("op-1", "k", 7, 3, 4096, 10, 11);
+        // Overwrite times out but landed server-side (seed 99)...
+        let ambiguous = ambiguous_put("op-2", "k", 99, 3, 4096, 12, 13);
+        // ...and a later committed overwrite supersedes it.
+        let overwrite = committed_put("op-3", "k", 42, 3, 4096, 20, 25);
+        // GET races the overwrite and observes the ghost slice.
+        let get = ranged_get("op-4", "k", range, &slice_sha(99, 3, 4096, range), 21, 26);
+
+        let anomalies = successful_read_anomalies(&[committed, ambiguous, overwrite, get]);
+
+        assert!(
+            anomalies.corrupted_reads.is_empty(),
+            "superseded materialized ambiguous ranged read flagged as corruption: {:?}",
+            anomalies.corrupted_reads
+        );
+        assert_eq!(
+            anomalies.unknown_writes_materialized.len(),
+            1,
+            "must be classified as a materialized ambiguous write"
+        );
+        assert_eq!(
+            anomalies.unknown_write_value_conflicts.len(),
+            1,
+            "must also record the conflict with the superseding committed value"
+        );
+        assert!(
+            anomalies.unknown_write_value_conflicts[0].contains("superseded ambiguous attempt")
+        );
+    }
+
+    /// A ranged GET on a key whose only write is a pending ambiguous one whose
+    /// regenerated slice does NOT match is an unknown-write value conflict --
+    /// unexplained but not provable corruption, and not a visible-deleted
+    /// resurrection signal.
+    #[test]
+    fn ranged_get_mismatching_only_pending_ambiguous_write_is_unknown_write_conflict() {
+        let range = ByteRange {
+            offset: 0,
+            length: 16,
+        };
+        let ambiguous = ambiguous_put("op-1", "k", 99, 3, 4096, 10, 11);
+        // The ambiguous write is reproducible and its regenerated slice does
+        // not match, so the mismatch is not inconclusive; but with an
+        // ambiguous write outstanding it is a value conflict, not corruption.
+        let get = ranged_get("op-2", "k", range, &sha256_hex(b"other"), 50, 51);
+
+        let anomalies = successful_read_anomalies(&[ambiguous, get]);
+
+        assert!(anomalies.corrupted_reads.is_empty());
+        assert!(anomalies.visible_deleted_objects.is_empty());
+        assert_eq!(anomalies.unknown_write_value_conflicts.len(), 1);
+        assert!(anomalies.unknown_write_value_conflicts[0].contains("ambiguous writes exist"));
+    }
+
+    /// A ranged GET on a key whose only write is an unreproducible (no
+    /// payload_ref) ambiguous write spanning the range is inconclusive: the
+    /// slice may belong to that unverifiable body, so nothing is flagged.
+    #[test]
+    fn ranged_get_spanned_by_unreproducible_ambiguous_write_is_inconclusive() {
+        let range = ByteRange {
+            offset: 0,
+            length: 16,
+        };
+        let mut ambiguous = timed_record(
+            "op-1",
+            OperationKind::CompleteMultipartUpload,
+            "k",
+            "mpu-body-sha",
+            OperationOutcome::Timeout,
+            10,
+            11,
+        );
+        ambiguous.size_bytes = Some(4096);
+        let get = ranged_get("op-2", "k", range, &sha256_hex(b"other"), 50, 51);
+
+        let anomalies = successful_read_anomalies(&[ambiguous, get]);
+
+        assert!(anomalies.corrupted_reads.is_empty());
+        assert!(anomalies.visible_deleted_objects.is_empty());
+        assert!(anomalies.unknown_writes_materialized.is_empty());
+        assert!(anomalies.unknown_write_value_conflicts.is_empty());
     }
 
     /// Replays the hotspot race observed on a real cluster (stress-cpu,
