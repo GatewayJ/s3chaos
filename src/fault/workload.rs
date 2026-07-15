@@ -182,6 +182,34 @@ impl ObjectSpec {
         }
     }
 
+    /// A zero-byte directory-marker object whose key ends in `/` (the S3
+    /// "folder placeholder" pattern). RustFS routes trailing-slash keys through
+    /// a distinct store-layer directory-object encoding, so exercising them
+    /// through the full prefill -> fault -> recovery -> GET/DELETE/LIST cycle
+    /// covers a code path plain object keys never reach (notably the
+    /// directory-key delete path, rustfs/backlog#798). Size 0 keeps it off the
+    /// erasure-shard and ranged-read paths.
+    pub fn prepare_directory_marker(run_id: &str, index: usize, seed: u64) -> PreparedObject {
+        let key = format!("{}dir-{index:06}/", Self::key_prefix(run_id));
+        let body = Vec::new();
+        let sha256 = sha256_hex(&body);
+
+        PreparedObject {
+            spec: Self {
+                key,
+                size_bytes: 0,
+                sha256,
+                seed,
+                index,
+            },
+            body,
+        }
+    }
+
+    pub fn is_directory_marker(&self) -> bool {
+        self.key.ends_with('/')
+    }
+
     pub fn prepare(&self) -> PreparedObject {
         let body = seeded_bytes(self.seed, self.index, self.size_bytes);
         debug_assert_eq!(sha256_hex(&body), self.sha256);
@@ -1738,5 +1766,38 @@ mod tests {
         let result = serde_json::from_value::<WorkloadPlan>(value);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn directory_marker_is_zero_byte_with_trailing_slash_key() {
+        let object = ObjectSpec::prepare_directory_marker("run-1", 7, 42);
+
+        assert!(object.spec.is_directory_marker());
+        assert_eq!(object.spec.key, "fault-test/run-1/dir-000007/");
+        assert_eq!(object.spec.size_bytes, 0);
+        assert!(object.body.is_empty());
+        // The recorded sha must be the empty-body sha, and matches_body must
+        // accept the zero-length GET body the prefill verifier passes in.
+        assert_eq!(object.spec.sha256, sha256_hex(&[]));
+        assert!(object.spec.matches_body(&[]));
+        assert!(!object.spec.matches_body(b"x"));
+
+        // A plain object of the same index is not a directory marker.
+        assert!(
+            !ObjectSpec::prepare_seeded("run-1", 7, 16, 42)
+                .spec
+                .is_directory_marker()
+        );
+    }
+
+    #[test]
+    fn overwriting_a_directory_marker_stays_zero_byte_with_the_same_key() {
+        let marker = ObjectSpec::prepare_directory_marker("run-1", 7, 42);
+        let overwrite = marker.spec.prepare_overwrite(3);
+
+        assert_eq!(overwrite.spec.key, marker.spec.key);
+        assert_eq!(overwrite.spec.size_bytes, 0);
+        assert!(overwrite.body.is_empty());
+        assert!(overwrite.spec.is_directory_marker());
     }
 }

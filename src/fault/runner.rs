@@ -570,6 +570,7 @@ async fn run_fault_case(
         &workload_plan,
         scenario.prefill_count(),
         config.prefill_concurrency,
+        config.workload_directory_marker_percent,
     )
     .await
     {
@@ -3039,6 +3040,22 @@ async fn wait_for_tenant_s3(
         })
 }
 
+/// Whether the prefill object at `index` is created as a directory marker.
+/// Pure function of (seed, index) so reruns with the same workload seed pick
+/// the same keys.
+fn is_directory_marker_index(percent: u8, seed: u64, index: usize) -> bool {
+    if percent == 0 {
+        return false;
+    }
+    let mut value = seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x4449_524B;
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^= value >> 31;
+    value % 100 < u64::from(percent)
+}
+
 async fn prefill_objects(
     s3: &S3WorkloadClient,
     history: &Recorder,
@@ -3046,6 +3063,7 @@ async fn prefill_objects(
     plan: &WorkloadPlan,
     count: usize,
     prefill_concurrency: usize,
+    directory_marker_percent: u8,
 ) -> Result<Vec<ObjectSpec>> {
     let tasks = (0..count).map(|index| {
         let s3 = s3.clone();
@@ -3054,7 +3072,14 @@ async fn prefill_objects(
         let size_bytes = plan.size_at(index);
         let seed = plan.seed;
         async move {
-            let object = ObjectSpec::prepare_seeded(&run_id, index, size_bytes, seed);
+            // A deterministic (seed-stable) fraction of prefill objects are
+            // zero-byte directory markers so the trailing-slash key path is
+            // exercised through the whole fault/recovery cycle.
+            let object = if is_directory_marker_index(directory_marker_percent, seed, index) {
+                ObjectSpec::prepare_directory_marker(&run_id, index, seed)
+            } else {
+                ObjectSpec::prepare_seeded(&run_id, index, size_bytes, seed)
+            };
             let spec = object.spec.clone();
             let write_outcome = s3.put_object(&object, &history).await?;
             ensure!(
@@ -3635,6 +3660,28 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn directory_marker_selection_is_deterministic_and_rate_bounded() {
+        // 0% never selects; 100% always selects.
+        assert!(!super::is_directory_marker_index(0, 42, 7));
+        for index in 0..500 {
+            assert!(super::is_directory_marker_index(100, 42, index));
+        }
+        // Same (seed, index) replays identically.
+        assert_eq!(
+            super::is_directory_marker_index(20, 42, 9),
+            super::is_directory_marker_index(20, 42, 9)
+        );
+        // ~20% selection over a large index range.
+        let selected = (0..2000)
+            .filter(|index| super::is_directory_marker_index(20, 42, *index))
+            .count();
+        assert!(
+            (200..=600).contains(&selected),
+            "20% directory-marker selection grossly off: {selected}/2000"
+        );
+    }
 
     struct RecordingFaultBackend {
         name: &'static str,

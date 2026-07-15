@@ -96,6 +96,10 @@ pub struct FaultTestConfig {
     pub use_cluster_ip: bool,
     pub require_client_disruption: bool,
     pub workload_versioning: bool,
+    /// Percentage (0-100) of prefill objects created as zero-byte
+    /// directory-marker keys (trailing `/`). 0 keeps the historical
+    /// object-only prefill.
+    pub workload_directory_marker_percent: u8,
     pub dm_name: Option<String>,
     pub dm_node: Option<String>,
     pub dm_mount_path: Option<String>,
@@ -273,6 +277,18 @@ impl FaultTestConfig {
                 "RUSTFS_FAULT_TEST_REQUIRE_CLIENT_DISRUPTION",
             )?,
             workload_versioning: env_bool(&get_env, "RUSTFS_FAULT_TEST_WORKLOAD_VERSIONING")?,
+            workload_directory_marker_percent: {
+                let percent = env_u8(
+                    &get_env,
+                    "RUSTFS_FAULT_TEST_WORKLOAD_DIRECTORY_MARKER_PERCENT",
+                    0,
+                )?;
+                ensure!(
+                    percent <= 100,
+                    "RUSTFS_FAULT_TEST_WORKLOAD_DIRECTORY_MARKER_PERCENT must be between 0 and 100"
+                );
+                percent
+            },
             dm_name: env_optional(&get_env, "RUSTFS_FAULT_TEST_DM_NAME"),
             dm_node: env_optional(&get_env, "RUSTFS_FAULT_TEST_DM_NODE"),
             dm_mount_path: env_optional(&get_env, "RUSTFS_FAULT_TEST_DM_MOUNT_PATH"),
