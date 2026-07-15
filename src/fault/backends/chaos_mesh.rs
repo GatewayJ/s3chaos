@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::{
     fault::{
         config::FaultTestConfig,
-        plan::{FaultInjection, FaultKind},
+        plan::{FaultInjection, FaultKind, FaultSelection},
         pods::rustfs_pod_identities,
         reporting::PodIdentity,
         scenarios::FaultScenario,
@@ -212,16 +212,25 @@ fn build_fault_spec(
             )?
             .with_name_suffix(resource_name_suffix),
         )),
-        FaultKind::RustfsServerNetworkPartition => Ok(FaultSpec::Network(
-            NetworkChaosSpec::partition_one_rustfs_pod(
-                cluster,
-                &config.chaos_namespace,
-                run_id,
-                &scenario.name,
-                injection.duration(),
-            )?
-            .with_name_suffix(resource_name_suffix),
-        )),
+        FaultKind::RustfsServerNetworkPartition => {
+            // Honor the plan-declared blast radius: quorum-loss scenarios
+            // partition more than one Pod, everything else stays single-target.
+            let targets = match injection.selection() {
+                FaultSelection::FixedTargets(count) => count,
+                FaultSelection::Percent(_) => 1,
+            };
+            Ok(FaultSpec::Network(
+                NetworkChaosSpec::partition_rustfs_pods(
+                    cluster,
+                    &config.chaos_namespace,
+                    run_id,
+                    &scenario.name,
+                    injection.duration(),
+                    targets,
+                )?
+                .with_name_suffix(resource_name_suffix),
+            ))
+        }
         FaultKind::RustfsServerNetworkDelay
         | FaultKind::RustfsServerNetworkLoss
         | FaultKind::RustfsServerNetworkCorrupt
@@ -418,6 +427,10 @@ pub struct NetworkChaosSpec {
     pub tenant_name: String,
     pub action: NetworkChaosAction,
     pub duration: Duration,
+    /// How many tenant Pods the source selector picks. 1 renders `mode: one`;
+    /// N > 1 renders `mode: fixed` + `value: "N"` so the plan-declared blast
+    /// radius is honored instead of silently narrowing to a single Pod.
+    pub targets: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -784,6 +797,35 @@ spec:
 }
 
 impl NetworkChaosSpec {
+    /// Partition `targets` tenant Pods from every peer (source and target
+    /// selectors overlap, so the selected Pods are fully isolated — from the
+    /// remaining peers and from each other). `targets` > 1 is how quorum-loss
+    /// scenarios remove more than one server's drives at once.
+    pub fn partition_rustfs_pods(
+        config: &ClusterTestConfig,
+        chaos_namespace: impl Into<String>,
+        run_id: impl Into<String>,
+        scenario: impl Into<String>,
+        duration: Duration,
+        targets: u32,
+    ) -> Result<Self> {
+        ensure!(
+            targets > 0,
+            "NetworkChaos partition must select at least one Pod"
+        );
+        let mut spec = Self::one_rustfs_pod(
+            config,
+            chaos_namespace,
+            run_id,
+            scenario,
+            duration,
+            "net-partition",
+            NetworkChaosAction::Partition,
+        )?;
+        spec.targets = targets;
+        Ok(spec)
+    }
+
     pub fn partition_one_rustfs_pod(
         config: &ClusterTestConfig,
         chaos_namespace: impl Into<String>,
@@ -919,6 +961,7 @@ impl NetworkChaosSpec {
             tenant_name: config.tenant_name.clone(),
             action,
             duration,
+            targets: 1,
         })
     }
 
@@ -927,9 +970,18 @@ impl NetworkChaosSpec {
         self
     }
 
+    fn mode_manifest(&self) -> String {
+        if self.targets == 1 {
+            "  mode: one".to_string()
+        } else {
+            format!("  mode: fixed\n  value: \"{}\"", self.targets)
+        }
+    }
+
     pub fn manifest(&self) -> String {
         let seconds = self.duration.as_secs();
         let action = self.action_manifest();
+        let mode = self.mode_manifest();
         format!(
             r#"apiVersion: chaos-mesh.org/v1alpha1
 kind: NetworkChaos
@@ -942,7 +994,7 @@ metadata:
     {managed_by_label}: {managed_by_value}
 spec:
 {action}
-  mode: one
+{mode}
   selector:
     namespaces:
       - {target_namespace}
@@ -969,6 +1021,7 @@ spec:
             target_namespace = self.target_namespace,
             tenant_name = self.tenant_name,
             action = action,
+            mode = mode,
         )
     }
 
@@ -1299,6 +1352,59 @@ mod tests {
         assert!(loss.contains("action: loss"));
         assert!(loss.contains("loss: \"40\""));
         assert!(loss.contains("correlation: \"10\""));
+    }
+
+    #[test]
+    fn network_partition_manifest_honors_multi_target_count() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+
+        // Single-target keeps the historical `mode: one` shape.
+        let single = NetworkChaosSpec::partition_rustfs_pods(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "network-partition-one",
+            Duration::from_secs(60),
+            1,
+        )
+        .expect("valid single-target partition")
+        .manifest();
+        assert!(single.contains("action: partition"));
+        assert!(single.contains("\n  mode: one\n"));
+        assert!(!single.contains("mode: fixed"));
+
+        // Multi-target renders `mode: fixed` with the exact count so the
+        // plan-declared blast radius is honored, and the peer side stays
+        // `mode: all`.
+        let quorum = NetworkChaosSpec::partition_rustfs_pods(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "network-partition-write-quorum-loss",
+            Duration::from_secs(60),
+            2,
+        )
+        .expect("valid multi-target partition")
+        .manifest();
+        assert!(quorum.contains("action: partition"));
+        assert!(quorum.contains("\n  mode: fixed\n  value: \"2\"\n"));
+        assert!(
+            quorum.contains("    mode: all"),
+            "peer target selector must stay mode: all"
+        );
+
+        assert!(
+            NetworkChaosSpec::partition_rustfs_pods(
+                &config.cluster,
+                "chaos-mesh",
+                "run-1234567890",
+                "network-partition-write-quorum-loss",
+                Duration::from_secs(60),
+                0,
+            )
+            .is_err(),
+            "zero targets must be rejected"
+        );
     }
 
     #[test]

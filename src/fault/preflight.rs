@@ -307,7 +307,7 @@ impl TargetProof {
         let mut requirements = target_requirements(config, spec, plan);
         if erasure_set_proof(spec).is_some() {
             requirements.push(TargetProofRequirement {
-                name: "same_erasure_set_target_proof".to_string(),
+                name: ERASURE_SET_PROOF_REQUIREMENT.to_string(),
                 status: PreflightStatus::Failed,
                 message: "same-erasure-set proof is not implemented".to_string(),
             });
@@ -371,6 +371,37 @@ impl TargetProof {
             }
         }
         self.record_runtime_target_requirements();
+        self
+    }
+
+    /// Marks the same-erasure-set requirement as satisfied after the runner's
+    /// live topology proof has passed. The proof itself runs in the runner
+    /// (it reads the live Tenant's pool geometry, which the plan-time proof
+    /// cannot see); this only records its outcome so the fail-closed
+    /// requirement reflects evidence instead of rejecting the scenario
+    /// unconditionally.
+    pub fn with_erasure_set_topology_proven(mut self) -> Self {
+        for fault in &mut self.faults {
+            if let Some(proof) = &mut fault.erasure_set {
+                proof.resolved = true;
+                proof.note = ERASURE_SET_PROOF_RESOLVED_NOTE.to_string();
+            }
+        }
+        for requirement in &mut self.requirements {
+            if requirement.name == ERASURE_SET_PROOF_REQUIREMENT {
+                requirement.status = PreflightStatus::Passed;
+                requirement.message = ERASURE_SET_PROOF_RESOLVED_NOTE.to_string();
+            }
+        }
+        self.status = if self
+            .requirements
+            .iter()
+            .any(|requirement| requirement.status == PreflightStatus::Failed)
+        {
+            TargetProofStatus::Missing
+        } else {
+            TargetProofStatus::Satisfied
+        };
         self
     }
 
@@ -603,9 +634,15 @@ fn erasure_set_proof(spec: &FaultScenarioSpec) -> Option<TargetErasureSetProof> 
     requires.then(|| TargetErasureSetProof {
         required: true,
         resolved: false,
-        note: "same-erasure-set target proof is not implemented for this scenario".to_string(),
+        note: ERASURE_SET_PROOF_PENDING_NOTE.to_string(),
     })
 }
+
+const ERASURE_SET_PROOF_PENDING_NOTE: &str =
+    "same-erasure-set target proof is not implemented for this scenario";
+const ERASURE_SET_PROOF_RESOLVED_NOTE: &str =
+    "same-erasure-set topology proven from the live tenant pool geometry before fault apply";
+pub const ERASURE_SET_PROOF_REQUIREMENT: &str = "same_erasure_set_target_proof";
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -675,5 +712,51 @@ mod tests {
 
         assert_eq!(proof.status, TargetProofStatus::Missing);
         assert!(proof.require_satisfied().is_err());
+    }
+
+    #[test]
+    fn write_quorum_loss_target_proof_requires_and_records_topology_proof() {
+        let mut config = FaultTestConfig::for_test("k3d-lab", "local-path");
+        config.scenario =
+            crate::fault::scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO.to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let spec = scenario_spec(&scenario.name).expect("spec");
+        let plan = FaultPlan::from_scenario_with_options(
+            &scenario,
+            spec,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("plan");
+
+        // Fail-closed until the runner's live topology proof has passed: the
+        // spec targets an erasure set, so the requirement starts Failed.
+        let unproven = TargetProof::from_plan(&config, &scenario, spec, &plan, "run-1")
+            .with_resolved_pod_proofs([
+                TargetResolvedPodProof::new("rustfs-0", "uid-0").with_node("node-a")
+            ]);
+        assert_eq!(unproven.status, TargetProofStatus::Missing);
+        assert!(unproven.require_satisfied().is_err());
+
+        // Once the runner records the passed proof, the same evidence set is
+        // satisfied — the requirement flips instead of staying unconditional.
+        let proven = TargetProof::from_plan(&config, &scenario, spec, &plan, "run-1")
+            .with_resolved_pod_proofs([
+                TargetResolvedPodProof::new("rustfs-0", "uid-0").with_node("node-a")
+            ])
+            .with_erasure_set_topology_proven();
+        assert_eq!(proven.status, TargetProofStatus::Satisfied);
+        assert!(proven.require_satisfied().is_ok());
+        let requirement = proven
+            .requirements
+            .iter()
+            .find(|requirement| requirement.name == super::ERASURE_SET_PROOF_REQUIREMENT)
+            .expect("erasure-set requirement present");
+        assert_eq!(requirement.status, PreflightStatus::Passed);
+        assert!(
+            proven
+                .faults
+                .iter()
+                .all(|fault| fault.erasure_set.as_ref().is_some_and(|p| p.resolved))
+        );
     }
 }

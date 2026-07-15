@@ -29,7 +29,7 @@ use crate::{
         },
         fixture,
         history::{DurabilityCohort, OperationOutcome, OperationRecord, Recorder},
-        plan::{FaultInjection, FaultPlan, FaultPlanOptions},
+        plan::{FaultInjection, FaultPlan, FaultPlanOptions, WRITE_QUORUM_LOSS_PARTITION_TARGETS},
         pods::{
             rustfs_pod_identities, rustfs_target_inventory, wait_for_rustfs_pod_deletion,
             wait_for_rustfs_pod_replacement,
@@ -39,7 +39,10 @@ use crate::{
             FailureSummary, FaultEvidence, FaultStatusSnapshot, PodIdentity, RunMetadata,
             write_checker_error, write_failure_summary, write_failure_summary_if_absent,
         },
-        scenarios::{self, FaultBackend, FaultIsolation, FaultScenario, FaultScenarioSpec},
+        scenarios::{
+            self, FaultBackend, FaultIsolation, FaultScenario, FaultScenarioSpec,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+        },
         spec::FaultRunSpec,
         workload::{
             ObjectSpec, S3WorkloadClient, WorkloadOperation, WorkloadPlan, sha256_hex,
@@ -316,6 +319,56 @@ async fn run_fault_case(
         "Tenant is Ready before fault injection",
         None,
     )?;
+    // Topology-conservation proof runs here, after the harness has created and
+    // readied its own Tenant, not in the pre-fixture backend preflight: the
+    // proof reads the live Tenant's pool geometry, which does not exist yet on
+    // a fresh/standalone run before prepare_fault_fixture.
+    let mut erasure_set_topology_proven = false;
+    if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+        events.record(
+            "write-quorum-loss-topology-proof",
+            RunEventStatus::Started,
+            "proving the tenant matches a reference single-erasure-set topology",
+            None,
+        )?;
+        if let Err(error) = require_write_quorum_loss_topology(config) {
+            preflight_phases.push(PreflightPhase::new(
+                "write-quorum-loss-topology-proof",
+                vec![PreflightCheck::failed(
+                    "write_quorum_loss_topology",
+                    error.to_string(),
+                    crate::fault::reporting::ResponsibilityDomain::Environment,
+                )],
+            ));
+            write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+            events
+                .record(
+                    "write-quorum-loss-topology-proof",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    None,
+                )
+                .ok();
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "write-quorum-loss-topology-proof",
+                    "test_or_environment",
+                    error.to_string(),
+                ),
+            )?;
+            return Err(error);
+        }
+        erasure_set_topology_proven = true;
+        events.record(
+            "write-quorum-loss-topology-proof",
+            RunEventStatus::Succeeded,
+            "tenant topology provably makes a two-server partition break write quorum",
+            None,
+        )?;
+    }
     events.record(
         "pod-stability-before-fault",
         RunEventStatus::Started,
@@ -641,8 +694,11 @@ async fn run_fault_case(
             }
         };
     let pods_before = target_inventory.identities;
-    let target_proof = TargetProof::from_plan(config, scenario, spec, plan, &run_id)
+    let mut target_proof = TargetProof::from_plan(config, scenario, spec, plan, &run_id)
         .with_resolved_pod_proofs(target_inventory.pod_proofs);
+    if erasure_set_topology_proven {
+        target_proof = target_proof.with_erasure_set_topology_proven();
+    }
     collector.write_text(
         scenario.case_name,
         "target-proof.json",
@@ -1750,6 +1806,76 @@ fn require_fault_backends(config: &FaultTestConfig, plan: &FaultPlan) -> Result<
     for backend in plan.required_backends() {
         require_fault_backend(config, backend)?;
     }
+    // The write-quorum-loss topology proof deliberately does NOT run here: this
+    // preflight runs before prepare_fault_fixture creates the Tenant, so
+    // reading the Tenant's pool geometry would NotFound on a fresh run. The
+    // proof runs right after tenant readiness instead (see run_fault_case).
+    Ok(())
+}
+
+/// Topology-conservation proof for the write-quorum-loss partition.
+///
+/// The scenario's FixedTargets(2) only means "write quorum breaks, read quorum
+/// survives" on the reference tenant shapes: a single pool of 4 servers with
+/// 1 or 2 volumes per server (4 or 8 drives). RustFS lays both out as a single
+/// erasure set with data == parity (4 drives -> EC 2+2, 8 drives -> EC 4+4),
+/// where write quorum is data+1 and read quorum is data. Isolating 2 of 4
+/// servers then provably removes exactly half the drives of that one set:
+/// write quorum becomes unreachable while read quorum can still be met by the
+/// surviving half — and every pod is in the same set, so no same-erasure-set
+/// resolution is needed. On any other shape the same count could be a no-op
+/// (more servers) or a full outage (fewer), so we fail closed instead of
+/// running a scenario whose oracle no longer matches its name. Replacing this
+/// with a real erasure-set proof (admin cluster snapshot) generalizes it later.
+fn require_write_quorum_loss_topology(config: &FaultTestConfig) -> Result<()> {
+    let cluster = &config.cluster;
+    let output = Kubectl::new(cluster)
+        .namespaced(&cluster.test_namespace)
+        .command([
+            "get",
+            "tenant",
+            cluster.tenant_name.as_str(),
+            "-o",
+            "jsonpath={.spec.pools[*].persistence.volumesPerServer}",
+        ])
+        .run_checked()
+        .context("reading tenant volumesPerServer for the write-quorum-loss topology proof")?;
+    let raw = output.stdout.trim().to_string();
+    let volumes: Vec<u64> = raw
+        .split_whitespace()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .with_context(|| format!("tenant volumesPerServer must be numeric, got {value:?}"))
+        })
+        .collect::<Result<_>>()?;
+    write_quorum_loss_topology_shape(config.expected_rustfs_pod_count, &volumes, &raw)
+}
+
+/// Pure shape predicate behind the write-quorum-loss topology proof: accepts
+/// only the reference single-pool 4-server tenant with 1 or 2 volumes per
+/// server. Kept free of kubectl I/O so the acceptance matrix is unit-testable.
+fn write_quorum_loss_topology_shape(pod_count: usize, volumes: &[u64], raw: &str) -> Result<()> {
+    const EXPECTED_SERVERS: usize = 4;
+    const ACCEPTED_VOLUMES_PER_SERVER: [u64; 2] = [1, 2];
+
+    ensure!(
+        pod_count == EXPECTED_SERVERS,
+        "network-partition-write-quorum-loss requires the reference 4-server tenant \
+         (RUSTFS_POD_COUNT={}); partitioning {} of {} servers does not provably break \
+         write quorum on other shapes",
+        EXPECTED_SERVERS,
+        WRITE_QUORUM_LOSS_PARTITION_TARGETS,
+        pod_count,
+    );
+    ensure!(
+        volumes.len() == 1 && ACCEPTED_VOLUMES_PER_SERVER.contains(&volumes[0]),
+        "network-partition-write-quorum-loss requires the reference single-pool tenant with \
+         volumesPerServer of 1 or 2 (4 or 8 drives; both lay out as one erasure set with \
+         data == parity, so isolating 2 of 4 servers removes exactly half the drives); \
+         found volumesPerServer={raw:?} — on that shape a 2-of-4 partition does not provably \
+         break write quorum, so the run is rejected instead of producing a misleading verdict",
+    );
     Ok(())
 }
 
@@ -3646,6 +3772,7 @@ mod tests {
         chaos_resource_name_suffix, finalizers_from_resource, iochaos_finalizer_patch_allowed,
         podiochaos_recovery_evidence, resource_has_deletion_timestamp, resource_label_matches,
         stable_pod_fingerprint, target_pods_from_json, unmount_success_log_lines, warp_bucket_name,
+        write_quorum_loss_topology_shape,
     };
     use crate::fault::history::OperationOutcome;
     use crate::fault::plan::{
@@ -4138,5 +4265,22 @@ mod tests {
         let mut unready = pods;
         unready[0].containers_ready = false;
         assert!(stable_pod_fingerprint(&unready, 4).is_none());
+    }
+
+    #[test]
+    fn write_quorum_loss_topology_shape_accepts_only_reference_shapes() {
+        assert!(write_quorum_loss_topology_shape(4, &[1], "1").is_ok());
+        assert!(write_quorum_loss_topology_shape(4, &[2], "2").is_ok());
+
+        // Wrong server count: partitioning 2 of N != 4 proves nothing.
+        assert!(write_quorum_loss_topology_shape(5, &[1], "1").is_err());
+        assert!(write_quorum_loss_topology_shape(3, &[1], "1").is_err());
+        // Multi-pool tenants are not the reference single-erasure-set layout.
+        assert!(write_quorum_loss_topology_shape(4, &[1, 2], "1 2").is_err());
+        // Absent volumesPerServer must fail closed, not default.
+        assert!(write_quorum_loss_topology_shape(4, &[], "").is_err());
+        // 16 drives resolve to EC 12+4, where a 2-server partition does not
+        // break write quorum.
+        assert!(write_quorum_loss_topology_shape(4, &[4], "4").is_err());
     }
 }

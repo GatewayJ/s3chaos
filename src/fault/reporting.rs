@@ -612,6 +612,18 @@ pub(crate) fn write_failure_summary(
         "failure-summary.json",
         &serde_json::to_string_pretty(&summary)?,
     )?;
+    // Diagnostic contract check on the failure path: the strict validator only
+    // runs on passing runs, so this is the only automated coverage a failed
+    // run's summary gets. Warning-only — a contract violation must never mask
+    // the run's original failure.
+    let path = collector.case_dir(case_name).join("failure-summary.json");
+    if let Err(violation) =
+        crate::fault::artifact_validation::validate_written_failure_summary(&path)
+    {
+        eprintln!(
+            "warning: failure-summary.json violates the artifact contract (diagnostic validation): {violation:#}"
+        );
+    }
     Ok(())
 }
 
