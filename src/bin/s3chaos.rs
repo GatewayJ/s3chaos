@@ -27,6 +27,16 @@ use s3chaos::fault::{
     suite_plan::plan_fault_suite_from_yaml,
     suite_runner::run_fault_suite_from_yaml,
 };
+use s3chaos::protocol::{
+    artifact_validation::validate_protocol_artifacts_and_write_report,
+    catalog::protocol_catalog_json,
+    compatibility::compatibility_catalog_json,
+    suite::{protocol_suite_template_yaml, resolve_protocol_suite_yaml},
+    suite_runner::{
+        cleanup_protocol_artifact_root, cleanup_protocol_registry_path,
+        plan_protocol_suite_from_yaml, run_protocol_suite_from_yaml,
+    },
+};
 use std::net::SocketAddr;
 
 #[tokio::main]
@@ -48,6 +58,15 @@ async fn main() -> Result<()> {
         "fault-suite-validate" => validate_fault_suite(args),
         "fault-validate-artifacts" => validate_fault_artifacts_command(args),
         "fault-run-spec-equal" => validate_fault_run_spec_equivalence(args),
+        "protocol-catalog-json" => print_protocol_catalog_json(),
+        "protocol-compatibility-status-json" => print_protocol_compatibility_status_json(),
+        "protocol-cleanup" => cleanup_protocol_artifacts(args).await,
+        "protocol-suite-json" => print_protocol_suite_json(args),
+        "protocol-suite-plan" => print_protocol_suite_plan(args).await,
+        "protocol-suite-run" => run_protocol_suite(args).await,
+        "protocol-suite-template" => print_protocol_suite_template(),
+        "protocol-suite-validate" => validate_protocol_suite(args),
+        "protocol-validate-artifacts" => validate_protocol_artifacts(args),
         unknown => bail!("unknown s3chaos command: {unknown}; run `s3chaos help`"),
     }
 }
@@ -68,6 +87,126 @@ fn print_help() -> Result<()> {
     println!("  fault-suite-validate <suite.yaml>");
     println!("  fault-validate-artifacts <scenario> <artifact-root> [--validation-summary-tsv]");
     println!("  fault-run-spec-equal <run-spec.json> <run-spec.yaml>");
+    println!("  protocol-catalog-json");
+    println!("  protocol-compatibility-status-json");
+    println!("  protocol-cleanup <artifact-root>");
+    println!("  protocol-cleanup --registry <resource-registry.json>");
+    println!("  protocol-suite-json <suite.yaml>");
+    println!("  protocol-suite-plan <suite.yaml>");
+    println!("  protocol-suite-run <suite.yaml>");
+    println!("  protocol-suite-template");
+    println!("  protocol-suite-validate <suite.yaml>");
+    println!("  protocol-validate-artifacts <artifact-root>");
+    Ok(())
+}
+
+fn validate_protocol_artifacts(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let artifact_root = args
+        .next()
+        .context("protocol-validate-artifacts requires artifact root")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-validate-artifacts accepts exactly one artifact root"
+    );
+    let forbidden = [
+        "RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY",
+        "RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY",
+        "RUSTFS_PROTOCOL_TEST_ADMIN_SESSION_TOKEN",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var(name).ok())
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>();
+    let report = validate_protocol_artifacts_and_write_report(artifact_root, &forbidden)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+async fn cleanup_protocol_artifacts(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let first = args
+        .next()
+        .context("protocol-cleanup requires artifact root or --registry")?;
+    if first == "--registry" {
+        let registry = args
+            .next()
+            .context("protocol-cleanup --registry requires registry path")?;
+        ensure!(
+            args.next().is_none(),
+            "protocol-cleanup --registry accepts exactly one registry path"
+        );
+        return cleanup_protocol_registry_path(registry).await;
+    }
+    ensure!(
+        args.next().is_none(),
+        "protocol-cleanup accepts exactly one artifact root"
+    );
+    cleanup_protocol_artifact_root(first).await
+}
+
+fn print_protocol_catalog_json() -> Result<()> {
+    println!("{}", protocol_catalog_json()?);
+    Ok(())
+}
+
+fn print_protocol_compatibility_status_json() -> Result<()> {
+    println!("{}", compatibility_catalog_json()?);
+    Ok(())
+}
+
+fn print_protocol_suite_json(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let path = args
+        .next()
+        .context("protocol-suite-json requires suite yaml path")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-suite-json accepts exactly one path"
+    );
+    println!("{}", resolve_protocol_suite_yaml(path)?.to_json()?);
+    Ok(())
+}
+
+async fn print_protocol_suite_plan(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let path = args
+        .next()
+        .context("protocol-suite-plan requires suite yaml path")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-suite-plan accepts exactly one path"
+    );
+    println!("{}", plan_protocol_suite_from_yaml(path).await?.to_json()?);
+    Ok(())
+}
+
+async fn run_protocol_suite(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let path = args
+        .next()
+        .context("protocol-suite-run requires suite yaml path")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-suite-run accepts exactly one path"
+    );
+    run_protocol_suite_from_yaml(path).await
+}
+
+fn print_protocol_suite_template() -> Result<()> {
+    print!("{}", protocol_suite_template_yaml());
+    Ok(())
+}
+
+fn validate_protocol_suite(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let path = args
+        .next()
+        .context("protocol-suite-validate requires suite yaml path")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-suite-validate accepts exactly one path"
+    );
+    let resolved = resolve_protocol_suite_yaml(path)?;
+    println!(
+        "protocol suite {} is valid: {} case(s)",
+        resolved.metadata.name,
+        resolved.cases.len()
+    );
     Ok(())
 }
 

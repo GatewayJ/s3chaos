@@ -1,0 +1,10 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: ProtocolCompatibilityStatus
+status: excluded
+source: ceph/s3-tests
+sourceRevision: 5522d1c351f75bc00ae0f64f742f3f095f5939d9
+entries:
+  - id: test_account_usage
+    reason: This is a vendor-specific account usage API rather than portable S3 behavior.
+  - id: test_bucket_header_acl_grants
+    reason: ACL authorization is intentionally outside the RustFS compatibility claim.

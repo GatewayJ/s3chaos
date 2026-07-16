@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod fault;
-pub mod framework;
-pub mod protocol;
+pub mod cleanup;
+pub mod naming;
+pub mod registry;
+pub(crate) mod resources;
