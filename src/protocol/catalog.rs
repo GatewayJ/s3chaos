@@ -27,6 +27,7 @@ pub const IAM_EXPLICIT_DENY_OVERRIDES_ALLOW: &str = "iam-explicit-deny-overrides
 pub const IAM_GROUP_POLICY: &str = "iam-group-policy";
 pub const IAM_USER_MANAGED_POLICY_READONLY: &str = "iam-user-managed-policy-readonly";
 pub const IAM_USER_MANAGED_POLICY_DETACH: &str = "iam-user-managed-policy-detach";
+pub const OIDC_WEB_IDENTITY_BASIC: &str = "oidc-web-identity-basic";
 pub const STS_ASSUME_ROLE_BASIC: &str = "sts-assume-role-basic";
 pub const STS_SESSION_POLICY_DENY_PUT: &str = "sts-session-policy-deny-put";
 pub const STS_SESSION_POLICY_NARROWS_ROLE: &str = "sts-session-policy-narrows-role";
@@ -90,6 +91,7 @@ const CASES: &[ProtocolCase] = &[
         "iam-policy",
         &["authz", "regression"],
     ),
+    oidc_web_identity_case(),
     sts_case(STS_ASSUME_ROLE_BASIC, "sts-assume-role"),
     sts_case(STS_SESSION_POLICY_DENY_PUT, "sts-session-policy"),
     sts_case(STS_SESSION_POLICY_NARROWS_ROLE, "sts-session-policy"),
@@ -112,7 +114,25 @@ const fn sts_case(id: &'static str, group: &'static str) -> ProtocolCase {
         group,
         tags: &["authz", "regression"],
         isolation: ProtocolIsolation::Case,
-        requires: &["s3", "admin-api", "iam", "sts"],
+        requires: &["s3", "admin-api", "iam", "sts-assume-role"],
+        serial: true,
+    }
+}
+
+const fn oidc_web_identity_case() -> ProtocolCase {
+    ProtocolCase {
+        id: OIDC_WEB_IDENTITY_BASIC,
+        group: "oidc-web-identity",
+        tags: &["authz", "integration", "oidc", "regression"],
+        isolation: ProtocolIsolation::Case,
+        requires: &[
+            "s3",
+            "admin-api",
+            "iam",
+            "sts-web-identity",
+            "oidc",
+            "external-idp",
+        ],
         serial: true,
     }
 }
@@ -177,8 +197,9 @@ mod tests {
         BUCKET_POLICY_EXPLICIT_DENY_OVERRIDES_ALLOW, BUCKET_POLICY_MALFORMED_POLICY_REJECTED,
         BUCKET_POLICY_PREFIX_SCOPE, COMPAT_BUCKET_LIST_CREATE_DELETE, COMPAT_LIST_OBJECTS_BASIC,
         COMPAT_OBJECT_PUT_GET_DELETE, IAM_EXPLICIT_DENY_OVERRIDES_ALLOW, IAM_GROUP_POLICY,
-        IAM_USER_MANAGED_POLICY_DETACH, IAM_USER_MANAGED_POLICY_READONLY, STS_ASSUME_ROLE_BASIC,
-        STS_SESSION_POLICY_DENY_PUT, STS_SESSION_POLICY_NARROWS_ROLE, protocol_case_catalog,
+        IAM_USER_MANAGED_POLICY_DETACH, IAM_USER_MANAGED_POLICY_READONLY, OIDC_WEB_IDENTITY_BASIC,
+        STS_ASSUME_ROLE_BASIC, STS_SESSION_POLICY_DENY_PUT, STS_SESSION_POLICY_NARROWS_ROLE,
+        protocol_case_catalog,
     };
     use std::collections::BTreeSet;
 
@@ -201,6 +222,7 @@ mod tests {
                 IAM_GROUP_POLICY,
                 IAM_USER_MANAGED_POLICY_READONLY,
                 IAM_USER_MANAGED_POLICY_DETACH,
+                OIDC_WEB_IDENTITY_BASIC,
                 STS_ASSUME_ROLE_BASIC,
                 STS_SESSION_POLICY_DENY_PUT,
                 STS_SESSION_POLICY_NARROWS_ROLE,
@@ -225,6 +247,23 @@ mod tests {
                 "{} has an incorrect iam-group capability",
                 case.id
             );
+        }
+    }
+
+    #[test]
+    fn oidc_and_signed_sts_declare_distinct_exchange_capabilities() {
+        let oidc = super::protocol_case(OIDC_WEB_IDENTITY_BASIC).expect("OIDC case");
+        assert!(oidc.requires.contains(&"sts-web-identity"));
+        assert!(!oidc.requires.contains(&"sts-assume-role"));
+
+        for id in [
+            STS_ASSUME_ROLE_BASIC,
+            STS_SESSION_POLICY_DENY_PUT,
+            STS_SESSION_POLICY_NARROWS_ROLE,
+        ] {
+            let case = super::protocol_case(id).expect("STS case");
+            assert!(case.requires.contains(&"sts-assume-role"));
+            assert!(!case.requires.contains(&"sts-web-identity"));
         }
     }
 }

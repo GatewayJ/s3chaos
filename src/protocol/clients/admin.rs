@@ -139,9 +139,22 @@ impl RustfsAdminClient {
     }
 
     pub async fn revoke_sts_sessions(&self, parent_access_key: &str) -> AdminResult<()> {
+        self.revoke_sts_sessions_for_provider(parent_access_key, "builtin")
+            .await
+    }
+
+    pub async fn revoke_sts_sessions_for_provider(
+        &self,
+        parent_access_key: &str,
+        provider: &str,
+    ) -> AdminResult<()> {
+        if !matches!(provider, "builtin" | "ldap" | "openid") {
+            return Err(ProtocolAdminError::protocol("InvalidIdentityProvider"));
+        }
+        let path = format!("/revoke-tokens/{provider}");
         self.request(
             Method::POST,
-            "/revoke-tokens/builtin",
+            &path,
             &[("user", parent_access_key), ("fullRevoke", "true")],
             Vec::new(),
             None,
@@ -204,10 +217,25 @@ impl RustfsAdminClient {
         &self,
         parent_access_key: &str,
     ) -> AdminResult<Vec<String>> {
+        self.sts_sessions_with_parent_for_provider(parent_access_key, "builtin")
+            .await
+    }
+
+    pub async fn sts_sessions_with_parent_for_provider(
+        &self,
+        parent_access_key: &str,
+        provider: &str,
+    ) -> AdminResult<Vec<String>> {
+        let path = match provider {
+            "builtin" => "/list-access-keys-bulk",
+            "ldap" => "/idp/ldap/list-access-keys-bulk",
+            "openid" => "/idp/openid/list-access-keys-bulk",
+            _ => return Err(ProtocolAdminError::protocol("InvalidIdentityProvider")),
+        };
         let response = self
             .request(
                 Method::GET,
-                "/list-access-keys-bulk",
+                path,
                 &[("users", parent_access_key), ("listType", "sts-only")],
                 Vec::new(),
                 None,
@@ -495,6 +523,14 @@ impl ProtocolAdminPort for RustfsAdminClient {
         RustfsAdminClient::revoke_sts_sessions(self, parent_access_key).await
     }
 
+    async fn revoke_sts_sessions_for_provider(
+        &self,
+        parent_access_key: &str,
+        provider: &str,
+    ) -> AdminResult<()> {
+        RustfsAdminClient::revoke_sts_sessions_for_provider(self, parent_access_key, provider).await
+    }
+
     async fn policy_attached(
         &self,
         policy: &str,
@@ -510,6 +546,15 @@ impl ProtocolAdminPort for RustfsAdminClient {
 
     async fn sts_sessions_with_parent(&self, parent_access_key: &str) -> AdminResult<Vec<String>> {
         RustfsAdminClient::sts_sessions_with_parent(self, parent_access_key).await
+    }
+
+    async fn sts_sessions_with_parent_for_provider(
+        &self,
+        parent_access_key: &str,
+        provider: &str,
+    ) -> AdminResult<Vec<String>> {
+        RustfsAdminClient::sts_sessions_with_parent_for_provider(self, parent_access_key, provider)
+            .await
     }
 
     async fn policies_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {

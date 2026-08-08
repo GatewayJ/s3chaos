@@ -112,6 +112,8 @@ fn validate_protocol_artifacts(mut args: impl Iterator<Item = String>) -> Result
         "RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY",
         "RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY",
         "RUSTFS_PROTOCOL_TEST_ADMIN_SESSION_TOKEN",
+        "RUSTFS_PROTOCOL_OIDC_CLIENT_SECRET",
+        "RUSTFS_PROTOCOL_OIDC_ADMIN_PASSWORD",
     ]
     .into_iter()
     .filter_map(|name| std::env::var(name).ok())

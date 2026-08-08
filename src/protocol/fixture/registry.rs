@@ -20,7 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-use crate::protocol::suite_plan::TargetFingerprint;
+use crate::protocol::{ports::ProtocolExternalIdentityCoordinates, suite_plan::TargetFingerprint};
 
 pub const RESOURCE_REGISTRY_FILE: &str = "resource-registry.json";
 
@@ -40,6 +40,7 @@ pub enum ResourceState {
 pub enum ResourceKind {
     Bucket,
     BucketPolicy,
+    ExternalIdentitySubject,
     IamGroup,
     IamGroupMembership,
     IamPolicy,
@@ -54,6 +55,7 @@ impl ResourceKind {
         match self {
             Self::Bucket => "bucket",
             Self::BucketPolicy => "bucket-policy",
+            Self::ExternalIdentitySubject => "external-identity-subject",
             Self::IamGroup => "iam-group",
             Self::IamGroupMembership => "iam-group-membership",
             Self::IamPolicy => "iam-policy",
@@ -69,7 +71,7 @@ impl ResourceKind {
             Self::BucketPolicy | Self::IamPolicyAttachment => 0,
             Self::ObjectPrefix | Self::IamGroupMembership => 1,
             Self::IamPolicy => 2,
-            Self::IamGroup => 3,
+            Self::IamGroup | Self::ExternalIdentitySubject => 3,
             Self::StsSession => 4,
             Self::IamUser => 5,
             Self::Bucket => 6,
@@ -103,6 +105,10 @@ pub struct ResourceHandle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_group: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_identity: Option<ProtocolExternalIdentityCoordinates>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
 
@@ -133,6 +139,8 @@ struct ResourcePlan {
     group: Option<String>,
     member: Option<String>,
     is_group: Option<bool>,
+    identity_provider: Option<String>,
+    external_identity: Option<ProtocolExternalIdentityCoordinates>,
 }
 
 impl ResourceRegistry {
@@ -210,6 +218,8 @@ impl ResourceRegistry {
             group: None,
             member: None,
             is_group: None,
+            identity_provider: None,
+            external_identity: None,
         })
     }
 
@@ -229,6 +239,8 @@ impl ResourceRegistry {
             group: plan.group,
             member: plan.member,
             is_group: plan.is_group,
+            identity_provider: plan.identity_provider,
+            external_identity: plan.external_identity,
             last_error: None,
         };
         ensure!(
@@ -284,6 +296,8 @@ impl ResourceRegistry {
             group: None,
             member: None,
             is_group: None,
+            identity_provider: None,
+            external_identity: None,
         })
     }
 
@@ -329,6 +343,8 @@ impl ResourceRegistry {
             group: None,
             member: None,
             is_group: Some(is_group),
+            identity_provider: None,
+            external_identity: None,
         })
     }
 
@@ -365,6 +381,8 @@ impl ResourceRegistry {
             group: Some(group),
             member: Some(member),
             is_group: None,
+            identity_provider: None,
+            external_identity: None,
         })
     }
 
@@ -374,12 +392,51 @@ impl ResourceRegistry {
         owning_case_id: impl Into<String>,
         depends_on: Vec<String>,
     ) -> Result<ResourceHandle> {
-        self.plan_sts_session_for_phase(parent_access_key, owning_case_id, depends_on, "case")
+        self.plan_sts_session_for_provider_and_phase(
+            parent_access_key,
+            "builtin",
+            owning_case_id,
+            depends_on,
+            "case",
+        )
     }
 
     pub fn plan_sts_session_for_phase(
         &mut self,
         parent_access_key: impl Into<String>,
+        owning_case_id: impl Into<String>,
+        depends_on: Vec<String>,
+        owner_phase: impl Into<String>,
+    ) -> Result<ResourceHandle> {
+        self.plan_sts_session_for_provider_and_phase(
+            parent_access_key,
+            "builtin",
+            owning_case_id,
+            depends_on,
+            owner_phase,
+        )
+    }
+
+    pub fn plan_sts_session_for_provider(
+        &mut self,
+        parent: impl Into<String>,
+        provider: impl Into<String>,
+        owning_case_id: impl Into<String>,
+        depends_on: Vec<String>,
+    ) -> Result<ResourceHandle> {
+        self.plan_sts_session_for_provider_and_phase(
+            parent,
+            provider,
+            owning_case_id,
+            depends_on,
+            "case",
+        )
+    }
+
+    fn plan_sts_session_for_provider_and_phase(
+        &mut self,
+        parent_access_key: impl Into<String>,
+        provider: impl Into<String>,
         owning_case_id: impl Into<String>,
         depends_on: Vec<String>,
         owner_phase: impl Into<String>,
@@ -399,6 +456,33 @@ impl ResourceRegistry {
             group: None,
             member: None,
             is_group: None,
+            identity_provider: Some(provider.into()),
+            external_identity: None,
+        })
+    }
+
+    pub fn plan_external_identity_subject(
+        &mut self,
+        username: impl Into<String>,
+        external_identity: ProtocolExternalIdentityCoordinates,
+        owning_case_id: impl Into<String>,
+        depends_on: Vec<String>,
+    ) -> Result<ResourceHandle> {
+        self.plan_internal(ResourcePlan {
+            kind: ResourceKind::ExternalIdentitySubject,
+            name: username.into(),
+            owning_case_id: owning_case_id.into(),
+            owner_phase: "case".to_string(),
+            depends_on,
+            bucket: None,
+            key_prefix: None,
+            policy: None,
+            principal: None,
+            group: None,
+            member: None,
+            is_group: None,
+            identity_provider: None,
+            external_identity: Some(external_identity),
         })
     }
 

@@ -22,7 +22,10 @@ use crate::protocol::{
         naming::ProtocolResourceNamer,
         registry::{ResourceKind, ResourceRegistry, ResourceState},
     },
-    ports::{ProtocolAdminPort, ProtocolAssumeRoleRequest, ProtocolS3Port, ProtocolStsPort},
+    ports::{
+        ProtocolAdminPort, ProtocolAssumeRoleRequest, ProtocolExternalIdentityPort,
+        ProtocolExternalIdentityProviderInfo, ProtocolS3Port, ProtocolStsPort,
+    },
     reporting::ProtocolCleanupReport,
     suite::ResolvedProtocolSuite,
     suite_plan::{
@@ -39,6 +42,8 @@ pub struct ProtocolPreflightSummary {
     pub target_fingerprint: TargetFingerprint,
     pub endpoint_reachable: bool,
     pub admin_api_reachable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_identity: Option<ProtocolExternalIdentityProviderInfo>,
     pub selected_cases: Vec<String>,
     pub stale_resources: ProtocolStaleResourceScan,
     pub mutating_permission_probe: ProtocolMutatingProbeSummary,
@@ -49,6 +54,7 @@ impl From<&ProtocolPreflightSummary> for ProtocolSuitePlanPreflight {
         Self {
             endpoint_reachable: summary.endpoint_reachable,
             admin_api_reachable: summary.admin_api_reachable,
+            external_identity: summary.external_identity.clone(),
             stale_buckets: summary.stale_resources.buckets.clone(),
             stale_identities: summary.stale_resources.identities.clone(),
             stale_resource_policy: summary.stale_resources.policy.clone(),
@@ -67,11 +73,12 @@ pub struct ProtocolStaleResourceScan {
     pub policy: String,
 }
 
-pub async fn preflight_protocol_suite(
+pub async fn preflight_protocol_suite_with_external(
     suite: &ResolvedProtocolSuite,
     endpoint: &str,
     admin: &impl ProtocolAdminPort,
     s3: &impl ProtocolS3Port,
+    external_identity: Option<&dyn ProtocolExternalIdentityPort>,
     stale_resource_policy: &str,
 ) -> Result<ProtocolPreflightSummary> {
     ensure!(
@@ -88,6 +95,20 @@ pub async fn preflight_protocol_suite(
         admin.server_info().await.ok()
     };
     let admin_api_reachable = server_info.is_some();
+    let requires_external_identity = suite
+        .cases
+        .iter()
+        .any(|case| case.requires.contains(&"external-idp"));
+    let external_identity = if requires_external_identity {
+        Some(
+            external_identity
+                .context("selected protocol cases require an external identity provider")?
+                .provider_info()
+                .await?,
+        )
+    } else {
+        None
+    };
     let fingerprint = if let Some(server_info) = server_info {
         TargetFingerprint::new(
             endpoint,
@@ -140,6 +161,7 @@ pub async fn preflight_protocol_suite(
         target_fingerprint: fingerprint,
         endpoint_reachable: true,
         admin_api_reachable,
+        external_identity,
         selected_cases: suite.cases.iter().map(|case| case.id.to_string()).collect(),
         stale_resources: ProtocolStaleResourceScan {
             bucket_prefix,
@@ -177,7 +199,7 @@ pub(crate) struct ProtocolProbeCapabilities {
     pub bucket_policy: bool,
     pub iam: bool,
     pub iam_group: bool,
-    pub sts: bool,
+    pub assume_role: bool,
 }
 
 impl ProtocolProbeCapabilities {
@@ -192,7 +214,7 @@ impl ProtocolProbeCapabilities {
             bucket_policy: requires("bucket-policy"),
             iam: requires("iam"),
             iam_group: requires("iam-group"),
-            sts: requires("sts"),
+            assume_role: requires("sts-assume-role"),
         }
     }
 }
@@ -283,8 +305,8 @@ async fn run_probe_resources(
 ) -> Result<(usize, usize)> {
     let case_id = "preflight-permission-probe";
     ensure!(
-        !capabilities.sts || capabilities.iam,
-        "STS preflight requires IAM"
+        !capabilities.assume_role || capabilities.iam,
+        "AssumeRole preflight requires IAM"
     );
     let requires_identity = capabilities.bucket_policy || capabilities.iam;
     let (user_name, user_handle, user) = if requires_identity {
@@ -366,7 +388,7 @@ async fn run_probe_resources(
             "Action": ["s3:ListBucket"],
             "Resource": [format!("arn:aws:s3:::{bucket}")]
         })];
-        if capabilities.sts {
+        if capabilities.assume_role {
             statements.push(serde_json::json!({
                 "Effect": "Allow",
                 "Action": ["sts:AssumeRole"]
@@ -393,7 +415,7 @@ async fn run_probe_resources(
             .await?;
         registry.transition(&user_attachment.id, ResourceState::Created, None)?;
 
-        if capabilities.sts {
+        if capabilities.assume_role {
             let sts = sts.ok_or_else(|| anyhow!("STS preflight port is unavailable"))?;
             let session_handle = registry.plan_sts_session_for_phase(
                 user_name.as_str(),
@@ -972,7 +994,7 @@ mod tests {
                 bucket_policy: true,
                 iam: true,
                 iam_group: true,
-                sts: true,
+                assume_role: true,
             },
         )
         .await;
@@ -1063,7 +1085,7 @@ mod tests {
                 bucket_policy: false,
                 iam: true,
                 iam_group: false,
-                sts: false,
+                assume_role: false,
             },
         )
         .await;
@@ -1155,6 +1177,7 @@ mod tests {
             target_fingerprint: fingerprint(),
             endpoint_reachable: true,
             admin_api_reachable: true,
+            external_identity: None,
             selected_cases: Vec::new(),
             stale_resources: ProtocolStaleResourceScan {
                 bucket_prefix: "s3c".to_string(),

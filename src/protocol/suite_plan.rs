@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::protocol::{
+    ports::ProtocolExternalIdentityProviderInfo,
     scheduler::{ProtocolLock, plan_protocol_schedule},
     suite::{ProtocolCleanupPolicy, ResolvedProtocolSuite},
 };
@@ -92,6 +93,8 @@ pub struct ProtocolSuitePlan {
 pub struct ProtocolSuitePlanPreflight {
     pub endpoint_reachable: bool,
     pub admin_api_reachable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_identity: Option<ProtocolExternalIdentityProviderInfo>,
     pub stale_buckets: Vec<String>,
     pub stale_identities: Vec<String>,
     pub stale_resource_policy: String,
@@ -143,6 +146,8 @@ pub struct ProtocolSuitePlanTarget {
     pub ownership_mode: String,
     pub bucket_prefix: String,
     pub identity_prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_identity_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +243,11 @@ impl ProtocolSuitePlan {
                 ownership_mode: "dedicated-tenant".to_string(),
                 bucket_prefix: suite.target.ownership.resource_prefixes.bucket.clone(),
                 identity_prefix: suite.target.ownership.resource_prefixes.identity.clone(),
+                external_identity_profile: suite
+                    .target
+                    .external_identity
+                    .as_ref()
+                    .map(|external| external.profile.clone()),
             },
             preflight,
             execution: ProtocolSuitePlanExecution {

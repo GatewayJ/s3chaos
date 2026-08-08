@@ -17,7 +17,10 @@ use std::time::Duration;
 
 use crate::protocol::{
     fixture::registry::{ResourceHandle, ResourceKind, ResourceRegistry, ResourceState},
-    ports::{ProtocolAdminError, ProtocolAdminPort, ProtocolS3Error, ProtocolS3Port},
+    ports::{
+        ProtocolAdminError, ProtocolAdminPort, ProtocolExternalIdentityError,
+        ProtocolExternalIdentityPort, ProtocolS3Error, ProtocolS3Port,
+    },
     reporting::{ProtocolCleanupAttempt, ProtocolCleanupReport},
 };
 
@@ -25,6 +28,15 @@ pub(crate) async fn cleanup_registered_resources(
     registry: &mut ResourceRegistry,
     admin: &impl ProtocolAdminPort,
     s3: &impl ProtocolS3Port,
+) -> ProtocolCleanupReport {
+    cleanup_registered_resources_with_external(registry, admin, s3, None).await
+}
+
+pub(crate) async fn cleanup_registered_resources_with_external(
+    registry: &mut ResourceRegistry,
+    admin: &impl ProtocolAdminPort,
+    s3: &impl ProtocolS3Port,
+    external_identity: Option<&dyn ProtocolExternalIdentityPort>,
 ) -> ProtocolCleanupReport {
     let mut resources = match registry.cleanup_order() {
         Ok(resources) => resources,
@@ -72,7 +84,8 @@ pub(crate) async fn cleanup_registered_resources(
             registry.transition(&resource.id, ResourceState::CleanupAttempted, None)
         };
         let cleanup_result =
-            cleanup_resource_with_retry(&resource, admin, s3, versioned_cleanup).await;
+            cleanup_resource_with_retry(&resource, admin, s3, external_identity, versioned_cleanup)
+                .await;
         let state = if cleanup_result.is_ok() {
             ResourceState::Cleaned
         } else {
@@ -146,13 +159,14 @@ async fn cleanup_resource_with_retry(
     resource: &ResourceHandle,
     admin: &impl ProtocolAdminPort,
     s3: &impl ProtocolS3Port,
+    external_identity: Option<&dyn ProtocolExternalIdentityPort>,
     versioned_cleanup: bool,
 ) -> std::result::Result<CleanupSuccess, CleanupFailure> {
     let mut retry_count = 0;
     let mut mutation_attempt = 0;
     loop {
         mutation_attempt += 1;
-        match cleanup_resource(resource, admin, s3, versioned_cleanup).await {
+        match cleanup_resource(resource, admin, s3, external_identity, versioned_cleanup).await {
             Ok(()) => break,
             Err(error) if error.is_not_found_for(resource.kind) => break,
             Err(error)
@@ -171,7 +185,9 @@ async fn cleanup_resource_with_retry(
     let mut verify_attempt = 0;
     loop {
         verify_attempt += 1;
-        match verify_resource_absent(resource, admin, s3, versioned_cleanup).await {
+        match verify_resource_absent(resource, admin, s3, external_identity, versioned_cleanup)
+            .await
+        {
             Ok(()) => return Ok(CleanupSuccess { retry_count }),
             Err(error) if error.is_transient() && verify_attempt < CLEANUP_VERIFY_MAX_ATTEMPTS => {
                 let multiplier = 1u32 << (verify_attempt - 1);
@@ -187,6 +203,7 @@ async fn verify_resource_absent(
     resource: &ResourceHandle,
     admin: &impl ProtocolAdminPort,
     s3: &impl ProtocolS3Port,
+    external_identity: Option<&dyn ProtocolExternalIdentityPort>,
     versioned_cleanup: bool,
 ) -> std::result::Result<(), CleanupError> {
     match resource.kind {
@@ -206,6 +223,20 @@ async fn verify_resource_absent(
                 resource.name
             ))),
         },
+        ResourceKind::ExternalIdentitySubject => {
+            let provider = external_identity.ok_or_else(|| {
+                CleanupError::Contract("external identity cleanup port is unavailable".to_string())
+            })?;
+            verify_external_identity(resource, provider)?;
+            match provider.subject_exists(&resource.name).await {
+                Ok(false) => Ok(()),
+                Ok(true) => Err(CleanupError::NotConverged(format!(
+                    "external identity subject {} is still visible after deletion",
+                    resource.name
+                ))),
+                Err(error) => Err(CleanupError::ExternalIdentity(error)),
+            }
+        }
         ResourceKind::ObjectPrefix => {
             let bucket = resource.bucket.as_deref().ok_or_else(|| {
                 CleanupError::Contract("object prefix resource omitted bucket".to_string())
@@ -279,7 +310,11 @@ async fn verify_resource_absent(
             let parent = resource.principal.as_deref().ok_or_else(|| {
                 CleanupError::Contract("STS session omitted parent access key".to_string())
             })?;
-            match admin.sts_sessions_with_parent(parent).await {
+            let provider = resource.identity_provider.as_deref().unwrap_or("builtin");
+            match admin
+                .sts_sessions_with_parent_for_provider(parent, provider)
+                .await
+            {
                 Ok(sessions) if sessions.is_empty() => Ok(()),
                 Ok(sessions) => Err(CleanupError::NotConverged(format!(
                     "{} STS session(s) remain for parent {parent}",
@@ -320,6 +355,7 @@ async fn cleanup_resource(
     resource: &ResourceHandle,
     admin: &impl ProtocolAdminPort,
     s3: &impl ProtocolS3Port,
+    external_identity: Option<&dyn ProtocolExternalIdentityPort>,
     versioned_cleanup: bool,
 ) -> std::result::Result<(), CleanupError> {
     match resource.kind {
@@ -327,6 +363,16 @@ async fn cleanup_resource(
             .delete_bucket_policy(&resource.name)
             .await
             .map_err(CleanupError::S3),
+        ResourceKind::ExternalIdentitySubject => {
+            let provider = external_identity.ok_or_else(|| {
+                CleanupError::Contract("external identity cleanup port is unavailable".to_string())
+            })?;
+            verify_external_identity(resource, provider)?;
+            provider
+                .delete_subject(&resource.name)
+                .await
+                .map_err(CleanupError::ExternalIdentity)
+        }
         ResourceKind::ObjectPrefix => {
             let bucket = resource.bucket.as_deref().ok_or_else(|| {
                 CleanupError::Contract("object prefix resource omitted bucket".to_string())
@@ -386,17 +432,35 @@ async fn cleanup_resource(
             let parent = resource.principal.as_deref().ok_or_else(|| {
                 CleanupError::Contract("STS session omitted parent access key".to_string())
             })?;
+            let provider = resource.identity_provider.as_deref().unwrap_or("builtin");
             admin
-                .revoke_sts_sessions(parent)
+                .revoke_sts_sessions_for_provider(parent, provider)
                 .await
                 .map_err(CleanupError::Admin)
         }
     }
 }
 
+fn verify_external_identity(
+    resource: &ResourceHandle,
+    provider: &dyn ProtocolExternalIdentityPort,
+) -> std::result::Result<(), CleanupError> {
+    let expected = resource.external_identity.as_ref().ok_or_else(|| {
+        CleanupError::Contract("external identity subject omitted provider coordinates".to_string())
+    })?;
+    let actual = provider.coordinates();
+    if expected != &actual {
+        return Err(CleanupError::Contract(format!(
+            "external identity coordinates mismatch: registry={expected:?} adapter={actual:?}"
+        )));
+    }
+    Ok(())
+}
+
 enum CleanupError {
     S3(ProtocolS3Error),
     Admin(ProtocolAdminError),
+    ExternalIdentity(ProtocolExternalIdentityError),
     Contract(String),
     NotConverged(String),
 }
@@ -406,6 +470,9 @@ impl CleanupError {
         match (kind, self) {
             (ResourceKind::BucketPolicy, Self::S3(error)) => {
                 matches!(error.code.as_str(), "NoSuchBucketPolicy" | "NoSuchBucket")
+            }
+            (ResourceKind::ExternalIdentitySubject, Self::ExternalIdentity(error)) => {
+                error.code == "NoSuchExternalIdentitySubject"
             }
             (ResourceKind::Bucket, Self::S3(error)) => error.code == "NoSuchBucket",
             (ResourceKind::ObjectPrefix, Self::S3(error)) => {
@@ -438,6 +505,7 @@ impl CleanupError {
         match self {
             Self::S3(error) => error.is_transient(),
             Self::Admin(error) => error.is_transient(),
+            Self::ExternalIdentity(error) => error.is_transient(),
             Self::Contract(_) => false,
             Self::NotConverged(_) => true,
         }
@@ -458,6 +526,7 @@ impl fmt::Display for CleanupError {
                 error.request_id.as_deref().unwrap_or("unknown")
             ),
             Self::Admin(error) => error.fmt(formatter),
+            Self::ExternalIdentity(error) => error.fmt(formatter),
             Self::Contract(message) => formatter.write_str(message),
             Self::NotConverged(message) => formatter.write_str(message),
         }
@@ -466,20 +535,25 @@ impl fmt::Display for CleanupError {
 
 #[cfg(test)]
 mod tests {
-    use super::cleanup_registered_resources;
+    use super::{cleanup_registered_resources, cleanup_registered_resources_with_external};
     use crate::protocol::{
-        credentials::ActorCredential,
+        credentials::{ActorCredential, ExternalIdentityCredential, WebIdentityToken},
         fixture::registry::{ResourceKind, ResourceRegistry, ResourceState},
         ports::{
-            ProtocolAdminError, ProtocolAdminPort, ProtocolObjectVersion, ProtocolS3Error,
+            ProtocolAdminError, ProtocolAdminPort, ProtocolExternalIdentityCoordinates,
+            ProtocolExternalIdentityError, ProtocolExternalIdentityPort,
+            ProtocolExternalIdentityProviderInfo, ProtocolObjectVersion, ProtocolS3Error,
             ProtocolS3Port, ProtocolServerInfo,
         },
         suite_plan::TargetFingerprint,
     };
     use async_trait::async_trait;
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     #[derive(Clone, Default)]
@@ -501,6 +575,60 @@ mod tests {
         version_list_calls: Arc<AtomicUsize>,
         versions: Arc<Mutex<Vec<ProtocolObjectVersion>>>,
         objects: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct FakeExternalIdentity {
+        subjects: Arc<Mutex<BTreeSet<String>>>,
+        coordinates: ProtocolExternalIdentityCoordinates,
+    }
+
+    #[async_trait]
+    impl ProtocolExternalIdentityPort for FakeExternalIdentity {
+        fn coordinates(&self) -> ProtocolExternalIdentityCoordinates {
+            self.coordinates.clone()
+        }
+
+        fn policy_claim(&self) -> &str {
+            "policy"
+        }
+
+        async fn provider_info(
+            &self,
+        ) -> std::result::Result<ProtocolExternalIdentityProviderInfo, ProtocolExternalIdentityError>
+        {
+            Err(ProtocolExternalIdentityError::protocol("unused"))
+        }
+
+        async fn create_subject(
+            &self,
+            _credential: &ExternalIdentityCredential,
+            _claims: &BTreeMap<String, Vec<String>>,
+        ) -> std::result::Result<(), ProtocolExternalIdentityError> {
+            Err(ProtocolExternalIdentityError::protocol("unused"))
+        }
+
+        async fn issue_id_token(
+            &self,
+            _credential: &ExternalIdentityCredential,
+        ) -> std::result::Result<WebIdentityToken, ProtocolExternalIdentityError> {
+            Err(ProtocolExternalIdentityError::protocol("unused"))
+        }
+
+        async fn subject_exists(
+            &self,
+            username: &str,
+        ) -> std::result::Result<bool, ProtocolExternalIdentityError> {
+            Ok(self.subjects.lock().expect("subjects").contains(username))
+        }
+
+        async fn delete_subject(
+            &self,
+            username: &str,
+        ) -> std::result::Result<(), ProtocolExternalIdentityError> {
+            self.subjects.lock().expect("subjects").remove(username);
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -979,5 +1107,86 @@ mod tests {
                 .all(|attempt| attempt.retry_count == 2)
         );
         assert!(registry.pending_cleanup().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn external_identity_cleanup_uses_the_registered_coordinates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut registry =
+            ResourceRegistry::create(dir.path(), "run", fingerprint()).expect("registry");
+        let coordinates = external_identity_coordinates();
+        let subject = registry
+            .plan_external_identity_subject("oidc-user", coordinates.clone(), "case", Vec::new())
+            .expect("subject");
+        registry
+            .transition(&subject.id, ResourceState::Creating, None)
+            .expect("creating");
+        registry
+            .transition(&subject.id, ResourceState::Created, None)
+            .expect("created");
+        let external = FakeExternalIdentity {
+            subjects: Arc::new(Mutex::new(BTreeSet::from(["oidc-user".to_string()]))),
+            coordinates,
+        };
+
+        let report = cleanup_registered_resources_with_external(
+            &mut registry,
+            &FakeAdmin,
+            &FakeS3::default(),
+            Some(&external),
+        )
+        .await;
+
+        assert!(report.succeeded, "{report:?}");
+        assert!(external.subjects.lock().expect("subjects").is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_identity_cleanup_refuses_a_different_subject_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut registry =
+            ResourceRegistry::create(dir.path(), "run", fingerprint()).expect("registry");
+        let subject = registry
+            .plan_external_identity_subject(
+                "oidc-user",
+                external_identity_coordinates(),
+                "case",
+                Vec::new(),
+            )
+            .expect("subject");
+        registry
+            .transition(&subject.id, ResourceState::Creating, None)
+            .expect("creating");
+        registry
+            .transition(&subject.id, ResourceState::Created, None)
+            .expect("created");
+        let subjects = Arc::new(Mutex::new(BTreeSet::from(["oidc-user".to_string()])));
+        let external = FakeExternalIdentity {
+            subjects: subjects.clone(),
+            coordinates: ProtocolExternalIdentityCoordinates {
+                subject_namespace: "https://other.example/admin/realms/ci/users".to_string(),
+                ..external_identity_coordinates()
+            },
+        };
+
+        let report = cleanup_registered_resources_with_external(
+            &mut registry,
+            &FakeAdmin,
+            &FakeS3::default(),
+            Some(&external),
+        )
+        .await;
+
+        assert!(!report.succeeded);
+        assert!(subjects.lock().expect("subjects").contains("oidc-user"));
+    }
+
+    fn external_identity_coordinates() -> ProtocolExternalIdentityCoordinates {
+        ProtocolExternalIdentityCoordinates {
+            provider: "keycloak".to_string(),
+            profile: "keycloak-ci".to_string(),
+            issuer: "https://idp.example/realms/ci".to_string(),
+            subject_namespace: "https://idp.example/admin/realms/ci/users".to_string(),
+        }
     }
 }

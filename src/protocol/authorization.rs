@@ -22,6 +22,7 @@ pub enum ProtocolActorSource {
     GroupMemberUser,
     AssumedRole,
     StsSession,
+    WebIdentity,
     Admin,
 }
 
@@ -34,6 +35,7 @@ pub enum ProtocolGrantSource {
     ManagedPolicy,
     RolePolicy,
     SessionPolicy,
+    OidcClaim,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

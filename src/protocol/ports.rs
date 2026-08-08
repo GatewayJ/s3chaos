@@ -14,9 +14,9 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
-use crate::protocol::credentials::ActorCredential;
+use crate::protocol::credentials::{ActorCredential, ExternalIdentityCredential, WebIdentityToken};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolServerInfo {
@@ -150,6 +150,13 @@ pub struct ProtocolAssumeRoleRequest {
     pub session_policy: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProtocolWebIdentityRequest {
+    pub duration_seconds: u32,
+    pub session_policy: Option<String>,
+    pub token: WebIdentityToken,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolStsError {
     pub code: String,
@@ -173,6 +180,77 @@ impl fmt::Display for ProtocolStsError {
 
 impl std::error::Error for ProtocolStsError {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolExternalIdentityError {
+    pub code: String,
+    pub status: Option<u16>,
+    pub transient: bool,
+}
+
+impl ProtocolExternalIdentityError {
+    pub fn service(code: impl Into<String>, status: u16) -> Self {
+        Self {
+            code: code.into(),
+            status: Some(status),
+            transient: status == 408 || status == 429 || status >= 500,
+        }
+    }
+
+    pub fn transport(code: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            status: None,
+            transient: true,
+        }
+    }
+
+    pub fn protocol(code: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            status: None,
+            transient: false,
+        }
+    }
+
+    pub fn is_transient(&self) -> bool {
+        self.transient
+    }
+}
+
+impl fmt::Display for ProtocolExternalIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "external identity request failed: code={} status={}",
+            self.code,
+            self.status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+    }
+}
+
+impl std::error::Error for ProtocolExternalIdentityError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolExternalIdentityProviderInfo {
+    pub provider: String,
+    pub profile: String,
+    pub issuer: String,
+    pub policy_claim: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolExternalIdentityCoordinates {
+    pub provider: String,
+    pub profile: String,
+    pub issuer: String,
+    pub subject_namespace: String,
+}
+
 #[async_trait]
 pub trait ProtocolStsPort: Send + Sync {
     async fn assume_role(
@@ -181,6 +259,47 @@ pub trait ProtocolStsPort: Send + Sync {
         request: &ProtocolAssumeRoleRequest,
         source_resource_id: &str,
     ) -> std::result::Result<ActorCredential, ProtocolStsError>;
+}
+
+#[async_trait]
+pub trait ProtocolWebIdentityStsPort: Send + Sync {
+    fn cleanup_parent(
+        &self,
+        token: &WebIdentityToken,
+    ) -> std::result::Result<String, ProtocolStsError>;
+
+    async fn assume_role_with_web_identity(
+        &self,
+        request: &ProtocolWebIdentityRequest,
+        source_resource_id: &str,
+    ) -> std::result::Result<ActorCredential, ProtocolStsError>;
+}
+
+#[async_trait]
+pub trait ProtocolExternalIdentityPort: Send + Sync {
+    fn coordinates(&self) -> ProtocolExternalIdentityCoordinates;
+    fn policy_claim(&self) -> &str;
+
+    async fn provider_info(
+        &self,
+    ) -> std::result::Result<ProtocolExternalIdentityProviderInfo, ProtocolExternalIdentityError>;
+    async fn create_subject(
+        &self,
+        credential: &ExternalIdentityCredential,
+        claims: &BTreeMap<String, Vec<String>>,
+    ) -> std::result::Result<(), ProtocolExternalIdentityError>;
+    async fn issue_id_token(
+        &self,
+        credential: &ExternalIdentityCredential,
+    ) -> std::result::Result<WebIdentityToken, ProtocolExternalIdentityError>;
+    async fn subject_exists(
+        &self,
+        username: &str,
+    ) -> std::result::Result<bool, ProtocolExternalIdentityError>;
+    async fn delete_subject(
+        &self,
+        username: &str,
+    ) -> std::result::Result<(), ProtocolExternalIdentityError>;
 }
 
 #[async_trait]
@@ -201,6 +320,20 @@ pub trait ProtocolAdminPort: Send + Sync {
         _parent_access_key: &str,
     ) -> std::result::Result<(), ProtocolAdminError> {
         Err(ProtocolAdminError::protocol("RevokeStsSessionsUnsupported"))
+    }
+
+    async fn revoke_sts_sessions_for_provider(
+        &self,
+        parent_access_key: &str,
+        provider: &str,
+    ) -> std::result::Result<(), ProtocolAdminError> {
+        if provider == "builtin" {
+            self.revoke_sts_sessions(parent_access_key).await
+        } else {
+            Err(ProtocolAdminError::protocol(
+                "RevokeStsSessionsForProviderUnsupported",
+            ))
+        }
     }
 
     async fn policy_attached(
@@ -229,6 +362,20 @@ pub trait ProtocolAdminPort: Send + Sync {
         _parent_access_key: &str,
     ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
         Err(ProtocolAdminError::protocol("ListStsSessionsUnsupported"))
+    }
+
+    async fn sts_sessions_with_parent_for_provider(
+        &self,
+        parent_access_key: &str,
+        provider: &str,
+    ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+        if provider == "builtin" {
+            self.sts_sessions_with_parent(parent_access_key).await
+        } else {
+            Err(ProtocolAdminError::protocol(
+                "ListStsSessionsForProviderUnsupported",
+            ))
+        }
     }
 
     async fn policies_with_prefix(

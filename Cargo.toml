@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 axum = "0.8"
 aws-config = "1"
 aws-credential-types = "1"

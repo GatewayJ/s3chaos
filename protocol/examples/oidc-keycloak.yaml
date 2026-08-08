@@ -1,0 +1,27 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: ProtocolSuite
+metadata:
+  name: rustfs-oidc-keycloak
+selector:
+  cases:
+    - oidc-web-identity-basic
+execution:
+  parallelism: 1
+  defaultIsolation: case
+  cleanup: always
+target:
+  endpoint: ${RUSTFS_PROTOCOL_TEST_ENDPOINT}
+  region: us-east-1
+  credentials:
+    adminProfile: root
+    provider: env
+  ownership:
+    mode: dedicated-tenant
+    resourcePrefixes:
+      bucket: s3c
+      identity: s3chaos
+  safety:
+    dedicatedTarget: required
+  externalIdentity:
+    provider: keycloak
+    profile: keycloak-ci
