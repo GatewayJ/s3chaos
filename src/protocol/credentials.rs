@@ -37,6 +37,61 @@ impl SecretString {
     }
 }
 
+#[derive(Clone)]
+pub struct ExternalIdentityCredential {
+    pub username: String,
+    pub source_resource_id: String,
+    password: SecretString,
+}
+
+impl ExternalIdentityCredential {
+    pub fn generated(
+        username: impl Into<String>,
+        source_resource_id: impl Into<String>,
+    ) -> Result<Self> {
+        let nonce = format!("{}:{}", Uuid::new_v4(), Uuid::new_v4());
+        Ok(Self {
+            username: username.into(),
+            source_resource_id: source_resource_id.into(),
+            password: SecretString::new(hex::encode(Sha256::digest(nonce.as_bytes())))?,
+        })
+    }
+
+    pub(crate) fn password(&self) -> &str {
+        self.password.expose()
+    }
+}
+
+impl fmt::Debug for ExternalIdentityCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalIdentityCredential")
+            .field("username", &self.username)
+            .field("source_resource_id", &self.source_resource_id)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct WebIdentityToken(SecretString);
+
+impl WebIdentityToken {
+    pub(crate) fn new(value: impl Into<String>) -> Result<Self> {
+        Ok(Self(SecretString::new(value)?))
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        self.0.expose()
+    }
+}
+
+impl fmt::Debug for WebIdentityToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 impl fmt::Debug for SecretString {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("[REDACTED]")
@@ -169,11 +224,31 @@ impl ActorCredential {
         source_resource_id: impl Into<String>,
         expiration: impl Into<String>,
     ) -> Result<Self> {
+        Self::temporary_for_phase(
+            actor_id,
+            access_key,
+            secret_key,
+            session_token,
+            source_resource_id,
+            expiration,
+            "sts-assume-role",
+        )
+    }
+
+    pub(crate) fn temporary_for_phase(
+        actor_id: impl Into<String>,
+        access_key: impl Into<String>,
+        secret_key: impl Into<String>,
+        session_token: impl Into<String>,
+        source_resource_id: impl Into<String>,
+        expiration: impl Into<String>,
+        creation_phase: impl Into<String>,
+    ) -> Result<Self> {
         Ok(Self {
             actor_id: actor_id.into(),
             credential_id: format!("credential-{}", Uuid::new_v4()),
             source_resource_id: source_resource_id.into(),
-            creation_phase: "sts-assume-role".to_string(),
+            creation_phase: creation_phase.into(),
             expiration: Some(expiration.into()),
             access_key: SecretString::new(access_key)?,
             secret_key: SecretString::new(secret_key)?,
@@ -219,7 +294,7 @@ pub struct ActorCredentialArtifact {
 
 #[cfg(test)]
 mod tests {
-    use super::ActorCredential;
+    use super::{ActorCredential, ExternalIdentityCredential, WebIdentityToken};
 
     #[test]
     fn actor_credential_debug_and_artifact_hide_secrets() {
@@ -253,5 +328,15 @@ mod tests {
             assert!(!artifact.contains(secret));
         }
         assert!(artifact.contains("2099-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn external_identity_material_is_redacted() {
+        let identity = ExternalIdentityCredential::generated("oidc-user", "resource-1")
+            .expect("external identity");
+        let token = WebIdentityToken::new("header.payload.signature").expect("token");
+
+        assert!(!format!("{identity:?}").contains(identity.password()));
+        assert!(!format!("{token:?}").contains(token.expose()));
     }
 }

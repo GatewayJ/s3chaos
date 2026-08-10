@@ -14,28 +14,33 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use futures::future::join_all;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::protocol::{
     artifact_validation::validate_protocol_artifacts_and_write_report,
-    cases::{ProtocolCaseExecution, run_protocol_case},
+    cases::{ProtocolCaseExecution, ProtocolCaseServices, run_protocol_case},
     clients::{
         admin::RustfsAdminClient,
+        keycloak::KeycloakExternalIdentityProvider,
         s3::{AwsS3ClientFactory, ProtocolS3Client},
         sts::RustfsStsClient,
+        web_identity::RustfsWebIdentityStsClient,
     },
     credentials::{AdminCredentials, CredentialProvider, EnvCredentialProvider},
     fixture::{
-        cleanup::cleanup_registered_resources,
+        cleanup::cleanup_registered_resources_with_external,
         naming::ProtocolResourceNamer,
         registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
     },
-    ports::{ProtocolAdminPort, ProtocolS3Port},
+    ports::{
+        ProtocolAdminPort, ProtocolExternalIdentityPort, ProtocolS3Port, ProtocolWebIdentityStsPort,
+    },
     preflight::{
         ProtocolPreflightSummary, ProtocolProbeCapabilities,
         cleanup_interrupted_mutating_permission_probe, enforce_stale_resource_policy,
-        preflight_protocol_suite, run_mutating_permission_probe,
+        preflight_protocol_suite_with_external, run_mutating_permission_probe,
     },
     reporting::{
         ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary, ProtocolSuiteSummary,
@@ -55,6 +60,8 @@ struct ProtocolRunFixture {
     admin: RustfsAdminClient,
     s3: ProtocolS3Client,
     sts: RustfsStsClient,
+    external_identity: Option<KeycloakExternalIdentityProvider>,
+    web_identity_sts: Option<RustfsWebIdentityStsClient>,
     preflight: ProtocolPreflightSummary,
 }
 
@@ -66,6 +73,8 @@ struct ProtocolCaseRunner<'a> {
     admin: &'a RustfsAdminClient,
     s3: &'a ProtocolS3Client,
     sts: &'a RustfsStsClient,
+    external_identity: Option<&'a dyn ProtocolExternalIdentityPort>,
+    web_identity_sts: Option<&'a dyn ProtocolWebIdentityStsPort>,
     actor_clients: &'a AwsS3ClientFactory,
     api_version: &'a str,
 }
@@ -208,6 +217,14 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
                 admin: &runtime.admin,
                 s3: &runtime.s3,
                 sts: &runtime.sts,
+                external_identity: runtime
+                    .external_identity
+                    .as_ref()
+                    .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
+                web_identity_sts: runtime
+                    .web_identity_sts
+                    .as_ref()
+                    .map(|sts| sts as &dyn ProtocolWebIdentityStsPort),
                 actor_clients: &actor_clients,
                 api_version: &runtime.suite.api_version,
             };
@@ -240,6 +257,10 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
                             &case.id,
                             &runtime.admin,
                             &runtime.s3,
+                            runtime
+                                .external_identity
+                                .as_ref()
+                                .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
                             &runtime.suite.api_version,
                         )
                         .await;
@@ -256,6 +277,10 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         &mut registry,
         &runtime.admin,
         &runtime.s3,
+        runtime
+            .external_identity
+            .as_ref()
+            .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
         &runtime.suite.api_version,
     )
     .await;
@@ -365,6 +390,9 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
     ];
     if let Some(token) = runtime.credentials.session_token() {
         forbidden.push(token.to_string());
+    }
+    if let Some(external_identity) = &runtime.external_identity {
+        forbidden.extend(external_identity.forbidden_secrets());
     }
     forbidden.append(&mut probe_forbidden_secrets);
     forbidden.extend(forbidden_case_secrets);
@@ -489,7 +517,26 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
                 ));
                 continue;
             }
-            let cleanup = cleanup_registered_resources(&mut case_registry, &admin, &s3).await;
+            let external_identity = match external_identity_for_registry(&case_registry) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    combined.append(cleanup_registry_failure(
+                        &root_registry.api_version,
+                        &registry_path,
+                        error,
+                    ));
+                    continue;
+                }
+            };
+            let cleanup = cleanup_registered_resources_with_external(
+                &mut case_registry,
+                &admin,
+                &s3,
+                external_identity
+                    .as_ref()
+                    .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
+            )
+            .await;
             if let Err(error) = write_json(&entry.path().join("cleanup-report.json"), &cleanup) {
                 combined.append(cleanup_registry_failure(
                     &root_registry.api_version,
@@ -500,7 +547,18 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
             combined.append(cleanup);
         }
     }
-    combined.append(cleanup_registered_resources(&mut root_registry, &admin, &s3).await);
+    let root_external_identity = external_identity_for_registry(&root_registry)?;
+    combined.append(
+        cleanup_registered_resources_with_external(
+            &mut root_registry,
+            &admin,
+            &s3,
+            root_external_identity
+                .as_ref()
+                .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
+        )
+        .await,
+    );
     let report_path = artifact_root.join("cleanup-report.json");
     write_json(&report_path, &combined)?;
     ensure!(
@@ -531,13 +589,23 @@ impl ProtocolCaseRunner<'_> {
             &case.id,
             &case_namer,
             &mut registry,
-            self.admin,
-            self.s3,
-            self.sts,
-            self.actor_clients,
+            ProtocolCaseServices {
+                admin: self.admin,
+                admin_s3: self.s3,
+                sts: self.sts,
+                external_identity: self.external_identity,
+                web_identity_sts: self.web_identity_sts,
+                actor_clients: self.actor_clients,
+            },
         )
         .await;
-        let cleanup = cleanup_registered_resources(&mut registry, self.admin, self.s3).await;
+        let cleanup = cleanup_registered_resources_with_external(
+            &mut registry,
+            self.admin,
+            self.s3,
+            self.external_identity,
+        )
+        .await;
         if cleanup.api_version != self.api_version {
             bail!("case {} cleanup apiVersion changed unexpectedly", case.id);
         }
@@ -550,6 +618,7 @@ async fn cleanup_case_registry_if_present(
     case_id: &str,
     admin: &impl ProtocolAdminPort,
     s3: &impl ProtocolS3Port,
+    external_identity: Option<&dyn ProtocolExternalIdentityPort>,
     api_version: &str,
 ) -> ProtocolCleanupReport {
     let registry_path = artifact_root
@@ -560,7 +629,10 @@ async fn cleanup_case_registry_if_present(
         return ProtocolCleanupReport::empty(api_version);
     }
     match ResourceRegistry::load_path(&registry_path) {
-        Ok(mut registry) => cleanup_registered_resources(&mut registry, admin, s3).await,
+        Ok(mut registry) => {
+            cleanup_registered_resources_with_external(&mut registry, admin, s3, external_identity)
+                .await
+        }
         Err(error) => cleanup_registry_failure(api_version, &registry_path, error),
     }
 }
@@ -571,15 +643,27 @@ async fn cleanup_suite_registries(
     root_registry: &mut ResourceRegistry,
     admin: &impl ProtocolAdminPort,
     s3: &impl ProtocolS3Port,
+    external_identity: Option<&dyn ProtocolExternalIdentityPort>,
     api_version: &str,
 ) -> ProtocolCleanupReport {
     let mut combined = ProtocolCleanupReport::empty(api_version);
     for case in cases {
         combined.append(
-            cleanup_case_registry_if_present(artifact_root, &case.id, admin, s3, api_version).await,
+            cleanup_case_registry_if_present(
+                artifact_root,
+                &case.id,
+                admin,
+                s3,
+                external_identity,
+                api_version,
+            )
+            .await,
         );
     }
-    combined.append(cleanup_registered_resources(root_registry, admin, s3).await);
+    combined.append(
+        cleanup_registered_resources_with_external(root_registry, admin, s3, external_identity)
+            .await,
+    );
     combined
 }
 
@@ -630,7 +714,16 @@ async fn cleanup_protocol_registry(registry_path: PathBuf, report_path: PathBuf)
     let s3 =
         ProtocolS3Client::for_admin(&expected.endpoint, &expected.region, &credentials).await?;
     verify_cleanup_target(&admin, &expected).await?;
-    let cleanup = cleanup_registered_resources(&mut registry, &admin, &s3).await;
+    let external_identity = external_identity_for_registry(&registry)?;
+    let cleanup = cleanup_registered_resources_with_external(
+        &mut registry,
+        &admin,
+        &s3,
+        external_identity
+            .as_ref()
+            .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
+    )
+    .await;
     write_json(&report_path, &cleanup)?;
     ensure!(
         cleanup.succeeded,
@@ -653,6 +746,43 @@ fn load_cleanup_registry(path: &Path) -> Result<ResourceRegistry> {
         "resource registry must be a regular non-symlink file"
     );
     ResourceRegistry::load_path(path)
+}
+
+fn external_identity_for_registry(
+    registry: &ResourceRegistry,
+) -> Result<Option<KeycloakExternalIdentityProvider>> {
+    let identities = registry
+        .pending_cleanup()
+        .filter(|resource| {
+            resource.kind
+                == crate::protocol::fixture::registry::ResourceKind::ExternalIdentitySubject
+        })
+        .map(|resource| {
+            resource
+                .external_identity
+                .clone()
+                .context("external identity registry entry omitted its provider coordinates")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    ensure!(
+        identities.len() <= 1,
+        "resource registry contains multiple external identity coordinates"
+    );
+    let Some(expected) = identities.into_iter().next() else {
+        return Ok(None);
+    };
+    ensure!(
+        expected.provider == "keycloak",
+        "unsupported external identity provider {} in resource registry",
+        expected.provider
+    );
+    let provider = KeycloakExternalIdentityProvider::from_env(&expected.profile)?;
+    let actual = provider.coordinates();
+    ensure!(
+        actual == expected,
+        "refuse external identity cleanup because configured provider coordinates differ from the registry: registry={expected:?} adapter={actual:?}"
+    );
+    Ok(Some(provider))
 }
 
 async fn verify_cleanup_target(
@@ -704,9 +834,25 @@ impl ProtocolRunFixture {
         let admin = RustfsAdminClient::new(&endpoint, &suite.target.region, credentials.clone())?;
         let s3 = ProtocolS3Client::for_admin(&endpoint, &suite.target.region, &credentials).await?;
         let sts = RustfsStsClient::new(&endpoint, &suite.target.region)?;
+        let (external_identity, web_identity_sts) = match &suite.target.external_identity {
+            Some(config) => (
+                Some(KeycloakExternalIdentityProvider::from_env(&config.profile)?),
+                Some(RustfsWebIdentityStsClient::new(&endpoint)?),
+            ),
+            None => (None, None),
+        };
         let stale_resource_policy = stale_resource_policy()?;
-        let preflight =
-            preflight_protocol_suite(&suite, &endpoint, &admin, &s3, stale_resource_policy).await?;
+        let preflight = preflight_protocol_suite_with_external(
+            &suite,
+            &endpoint,
+            &admin,
+            &s3,
+            external_identity
+                .as_ref()
+                .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
+            stale_resource_policy,
+        )
+        .await?;
         enforce_stale_resource_policy(&preflight)?;
         Ok(Self {
             suite,
@@ -715,6 +861,8 @@ impl ProtocolRunFixture {
             admin,
             s3,
             sts,
+            external_identity,
+            web_identity_sts,
             preflight,
         })
     }
@@ -991,6 +1139,7 @@ mod tests {
             &mut root,
             &CleanupAdmin,
             &s3,
+            None,
             "rustfs.com/s3chaos/v1alpha1",
         )
         .await;
@@ -1049,6 +1198,7 @@ mod tests {
             target_fingerprint: fingerprint.clone(),
             endpoint_reachable: true,
             admin_api_reachable: true,
+            external_identity: None,
             selected_cases: vec!["bucket-policy-authenticated-user-rw".to_string()],
             stale_resources: ProtocolStaleResourceScan {
                 bucket_prefix: "s3c".to_string(),

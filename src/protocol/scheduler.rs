@@ -23,6 +23,7 @@ pub enum ProtocolLockScope {
     Tenant,
     BucketPrefix,
     IamPrefix,
+    ExternalIdp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,11 +90,19 @@ pub fn plan_protocol_schedule(
 
 fn locks_for_case(case: &ProtocolCase) -> Vec<ProtocolLock> {
     if case.serial {
-        return vec![ProtocolLock {
+        let mut locks = vec![ProtocolLock {
             scope: ProtocolLockScope::Tenant,
             name: "target".to_string(),
             mode: ProtocolLockMode::Exclusive,
         }];
+        if case.requires.contains(&"external-idp") {
+            locks.push(ProtocolLock {
+                scope: ProtocolLockScope::ExternalIdp,
+                name: "configured-provider".to_string(),
+                mode: ProtocolLockMode::Exclusive,
+            });
+        }
+        return locks;
     }
     vec![
         ProtocolLock {
@@ -150,6 +159,14 @@ mod tests {
         requires: &[],
         serial: true,
     };
+    const EXTERNAL_IDP: ProtocolCase = ProtocolCase {
+        id: "external-idp",
+        group: "test",
+        tags: &[],
+        isolation: ProtocolIsolation::Case,
+        requires: &["external-idp"],
+        serial: true,
+    };
 
     #[test]
     fn parallel_safe_cases_receive_distinct_workers_and_prefix_locks() {
@@ -164,6 +181,14 @@ mod tests {
     fn scheduler_rejects_serial_case_when_parallelism_is_requested() {
         assert!(plan_protocol_schedule(&[&SERIAL], 2).is_err());
         assert!(plan_protocol_schedule(&[&SERIAL], 1).is_ok());
+    }
+
+    #[test]
+    fn external_idp_case_receives_explicit_exclusive_lock() {
+        let schedule = plan_protocol_schedule(&[&EXTERNAL_IDP], 1).expect("schedule");
+        assert!(schedule[0][0].locks.iter().any(|lock| {
+            lock.scope == ProtocolLockScope::ExternalIdp && lock.mode == ProtocolLockMode::Exclusive
+        }));
     }
 
     #[test]

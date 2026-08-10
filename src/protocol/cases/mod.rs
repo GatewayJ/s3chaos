@@ -16,6 +16,7 @@ mod authz;
 mod bucket_policy;
 mod compatibility;
 mod iam;
+mod oidc;
 mod sts;
 
 use crate::protocol::{
@@ -23,7 +24,10 @@ use crate::protocol::{
     catalog::protocol_case,
     credentials::ActorCredential,
     fixture::{naming::ProtocolResourceNamer, registry::ResourceRegistry},
-    ports::{ActorS3ClientFactory, ProtocolAdminPort, ProtocolS3Port, ProtocolStsPort},
+    ports::{
+        ActorS3ClientFactory, ProtocolAdminPort, ProtocolExternalIdentityPort, ProtocolS3Port,
+        ProtocolStsPort, ProtocolWebIdentityStsPort,
+    },
     reporting::{ProtocolCaseReport, ProtocolCaseStatus},
 };
 
@@ -66,16 +70,25 @@ impl ProtocolCaseExecution {
     }
 }
 
-pub(crate) async fn run_protocol_case<F>(
+pub(crate) struct ProtocolCaseServices<'a, A, S, T, F> {
+    pub(crate) admin: &'a A,
+    pub(crate) admin_s3: &'a S,
+    pub(crate) sts: &'a T,
+    pub(crate) external_identity: Option<&'a dyn ProtocolExternalIdentityPort>,
+    pub(crate) web_identity_sts: Option<&'a dyn ProtocolWebIdentityStsPort>,
+    pub(crate) actor_clients: &'a F,
+}
+
+pub(crate) async fn run_protocol_case<A, S, T, F>(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    admin_s3: &impl ProtocolS3Port,
-    sts: &impl ProtocolStsPort,
-    actor_clients: &F,
+    services: ProtocolCaseServices<'_, A, S, T, F>,
 ) -> ProtocolCaseExecution
 where
+    A: ProtocolAdminPort,
+    S: ProtocolS3Port,
+    T: ProtocolStsPort,
     F: ActorS3ClientFactory,
 {
     let Some(case) = protocol_case(case_id) else {
@@ -87,27 +100,58 @@ where
                 case_id,
                 namer,
                 registry,
-                admin,
-                admin_s3,
-                actor_clients,
+                services.admin,
+                services.admin_s3,
+                services.actor_clients,
             )
             .await
         }
         "s3-compatibility" => {
-            compatibility::run_compatibility_case(case_id, namer, registry, admin_s3).await
+            compatibility::run_compatibility_case(case_id, namer, registry, services.admin_s3).await
         }
         "iam-user" | "iam-policy" | "iam-group" => {
-            iam::run_iam_case(case_id, namer, registry, admin, admin_s3, actor_clients).await
+            iam::run_iam_case(
+                case_id,
+                namer,
+                registry,
+                services.admin,
+                services.admin_s3,
+                services.actor_clients,
+            )
+            .await
         }
         "sts-assume-role" | "sts-session-policy" => {
             sts::run_sts_case(
                 case_id,
                 namer,
                 registry,
-                admin,
-                admin_s3,
-                sts,
-                actor_clients,
+                services.admin,
+                services.admin_s3,
+                services.sts,
+                services.actor_clients,
+            )
+            .await
+        }
+        "oidc-web-identity" => {
+            let (Some(external_identity), Some(web_identity_sts)) =
+                (services.external_identity, services.web_identity_sts)
+            else {
+                return ProtocolCaseExecution::preflight_failed(
+                    case_id,
+                    "OIDC case requires external identity and WebIdentity STS ports",
+                );
+            };
+            oidc::run_oidc_case(
+                case_id,
+                registry,
+                oidc::OidcCaseServices {
+                    namer,
+                    admin: services.admin,
+                    admin_s3: services.admin_s3,
+                    external_identity,
+                    web_identity_sts,
+                    actor_clients: services.actor_clients,
+                },
             )
             .await
         }
@@ -148,6 +192,10 @@ impl CaseContext {
             self.forbidden_secrets.push(token.to_string());
         }
         self.actors.push(actor);
+    }
+
+    pub(crate) fn add_forbidden_secret(&mut self, secret: impl Into<String>) {
+        self.forbidden_secrets.push(secret.into());
     }
 
     pub(crate) fn finish(self, result: anyhow::Result<()>) -> ProtocolCaseExecution {

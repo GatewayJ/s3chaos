@@ -25,6 +25,9 @@ make fault-suite-validate SUITE=suite.yaml
 make fault-suite-plan SUITE=suite.yaml
 make fault-suite-run SUITE=suite.yaml
 make fault-cleanup
+make protocol-list
+make protocol-suite-validate SUITE=protocol/examples/oidc-keycloak.yaml
+make protocol-suite-run SUITE=protocol/examples/oidc-keycloak.yaml
 ```
 
 Required runtime inputs for non-static scenarios:
@@ -39,3 +42,6 @@ expected dedicated Kubernetes or K3s context.
 
 See [docs/FAULT_TESTING.md](docs/FAULT_TESTING.md) for cluster preparation,
 scenario selection, dm-flakey setup, artifact contracts, and cleanup rules.
+
+See [docs/OIDC_PROTOCOL_TESTING.md](docs/OIDC_PROTOCOL_TESTING.md) for the
+Keycloak-backed `AssumeRoleWithWebIdentity` integration test.

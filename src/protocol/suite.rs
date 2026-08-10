@@ -84,6 +84,25 @@ pub struct ProtocolSuiteTarget {
     pub credentials: ProtocolSuiteCredentials,
     pub ownership: ProtocolSuiteOwnership,
     pub safety: ProtocolSuiteSafety,
+    #[serde(
+        rename = "externalIdentity",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub external_identity: Option<ProtocolSuiteExternalIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolSuiteExternalIdentity {
+    pub provider: ProtocolExternalIdentityProviderKind,
+    pub profile: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtocolExternalIdentityProviderKind {
+    Keycloak,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +217,19 @@ impl ProtocolSuite {
             !cases.is_empty(),
             "ProtocolSuite must select at least one case"
         );
+        let requires_external_identity = cases
+            .iter()
+            .any(|case| case.requires.contains(&"external-idp"));
+        if requires_external_identity {
+            let external = self.target.external_identity.as_ref().context(
+                "target.externalIdentity is required when an external-idp case is selected",
+            )?;
+            ensure!(
+                !external.profile.trim().is_empty(),
+                "target.externalIdentity.profile is required"
+            );
+            validate_dns_label("target.externalIdentity.profile", &external.profile, 63)?;
+        }
         if self.execution.parallelism > 1 {
             for case in &cases {
                 ensure!(
@@ -252,12 +284,14 @@ fn resolve_cases(selector: &ProtocolSuiteSelector) -> Result<Vec<&'static Protoc
     }
 
     let has_filters = !selector.groups.is_empty() || !selector.tags.is_empty();
+    let is_default_selection = !has_filters && selector.cases.is_empty();
     let mut selected = if has_filters || selector.cases.is_empty() {
         catalog
             .iter()
             .filter(|case| {
-                (selector.groups.is_empty()
-                    || selector.groups.iter().any(|group| group == case.group))
+                (!is_default_selection || !case.requires.contains(&"external-idp"))
+                    && (selector.groups.is_empty()
+                        || selector.groups.iter().any(|group| group == case.group))
                     && selector
                         .tags
                         .iter()
@@ -451,5 +485,40 @@ mod tests {
         );
         assert!(resolve_protocol_endpoint("http://user:pass@127.0.0.1:9000").is_err());
         assert!(resolve_protocol_endpoint("http://127.0.0.1:9000/path").is_err());
+    }
+
+    #[test]
+    fn oidc_case_requires_a_valid_external_identity_profile() {
+        let selector = "  groups:\n    - bucket-policy\n  tags:\n    - smoke\n";
+        let oidc_selector = "  cases:\n    - oidc-web-identity-basic\n";
+        let missing = protocol_suite_template_yaml().replace(selector, oidc_selector);
+        let suite: ProtocolSuite =
+            serde_yaml_ng::from_str(&missing).expect("missing profile suite");
+        assert!(suite.resolve().is_err());
+
+        let configured = missing.replace(
+            "  safety:\n    dedicatedTarget: required\n",
+            "  safety:\n    dedicatedTarget: required\n  externalIdentity:\n    provider: keycloak\n    profile: keycloak-ci\n",
+        );
+        let suite: ProtocolSuite = serde_yaml_ng::from_str(&configured).expect("OIDC suite");
+        let resolved = suite.resolve().expect("resolved OIDC suite");
+        assert_eq!(resolved.cases[0].id, "oidc-web-identity-basic");
+    }
+
+    #[test]
+    fn default_selection_keeps_external_idp_cases_opt_in() {
+        let yaml = protocol_suite_template_yaml().replace(
+            "selector:\n  groups:\n    - bucket-policy\n  tags:\n    - smoke\n",
+            "selector: {}\n",
+        );
+        let suite: ProtocolSuite = serde_yaml_ng::from_str(&yaml).expect("default suite");
+        let resolved = suite.resolve().expect("resolved default suite");
+        assert_eq!(resolved.cases.len(), 15);
+        assert!(
+            resolved
+                .cases
+                .iter()
+                .all(|case| !case.requires.contains(&"external-idp"))
+        );
     }
 }

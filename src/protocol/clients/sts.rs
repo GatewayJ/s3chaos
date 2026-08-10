@@ -181,11 +181,14 @@ impl ProtocolStsPort for RustfsStsClient {
     }
 }
 
-fn required_xml_tag(body: &[u8], tag: &str) -> std::result::Result<String, ProtocolStsError> {
+pub(crate) fn required_xml_tag(
+    body: &[u8],
+    tag: &str,
+) -> std::result::Result<String, ProtocolStsError> {
     extract_xml_tag(body, tag).ok_or_else(|| sts_protocol_error("InvalidAssumeRoleResponse"))
 }
 
-fn extract_xml_tag(body: &[u8], tag: &str) -> Option<String> {
+pub(crate) fn extract_xml_tag(body: &[u8], tag: &str) -> Option<String> {
     let xml = std::str::from_utf8(body).ok()?;
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -194,7 +197,7 @@ fn extract_xml_tag(body: &[u8], tag: &str) -> Option<String> {
     Some(xml[start..end].to_string())
 }
 
-fn sts_protocol_error(code: &str) -> ProtocolStsError {
+pub(crate) fn sts_protocol_error(code: &str) -> ProtocolStsError {
     ProtocolStsError {
         code: code.to_string(),
         status: None,

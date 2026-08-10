@@ -13,5 +13,7 @@
 // limitations under the License.
 
 pub mod admin;
+pub mod keycloak;
 pub mod s3;
 pub mod sts;
+pub mod web_identity;
