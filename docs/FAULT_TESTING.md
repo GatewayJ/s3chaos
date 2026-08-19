@@ -288,10 +288,67 @@ make fault-list
 cargo run --manifest-path Cargo.toml --bin s3chaos -- fault-catalog-json
 ```
 
+`make fault-list` prints only scenarios whose catalog status is `executable`.
+`fault-catalog-json` prints the full catalog, including `planned` reliability
+flows that are visible for roadmap review but rejected by preflight, direct
+runs, and YAML suite validation.
+
 Each run names exactly one scenario with `SCENARIO=<name>`. SRE-owned scheduling
 or automation should live outside this repository and call the same explicit
 command for the desired scenario. Tool requirements, such as `warp` for
 `warp-under-chaos`, are read from the Rust catalog during preflight.
+
+## RustFS Reliability Extension Scenarios
+
+The first executable RustFS reliability slice contains two deliberately bounded
+negative controls on top of existing fault backends:
+
+- `pod-crash-versioned-hot`: kills one RustFS Pod with Chaos Mesh PodChaos,
+  forces bucket versioning, runs hot-key overwrite/delete/MPU workload, and
+  verifies committed version lineage plus delete markers after recovery. One
+  Pod remains inside the EC tolerance, so a green run validates recovery and
+  checker plumbing; it is not physical-durability evidence.
+- `dm-flakey-versioned-hot`: runs a single-volume soft-power-loss proxy. The
+  host adapter derives an always-down `flakey ... drop_writes` table from the
+  active linear table, switches with `dmsetup suspend --nolockfs`, requires a
+  versioned mutation ACK, force-deletes the owning Pod, unmounts while writes
+  are still dropped, restores/remounts the device, and then verifies lineage.
+  One lost EC volume is still a negative control, not quorum-loss proof or a
+  calibrated release gate.
+
+Run the Kubernetes recovery proxy:
+
+```bash
+make fault-preflight SCENARIO=pod-crash-versioned-hot
+make fault-run SCENARIO=pod-crash-versioned-hot
+```
+
+Run the block-device durability proxy only on a dedicated lab host:
+
+```bash
+make fault-preflight SCENARIO=dm-flakey-versioned-hot
+make fault-run SCENARIO=dm-flakey-versioned-hot
+```
+
+Pass criteria are the normal run contract plus the catalog-owned reliability
+profile: `run-spec.*` records `workload.versioning: true`, `workload-plan.json`
+records a hotspot and explicit inline/sharded payload classes (4 KiB, 64 KiB,
+2 MiB, and 8 MiB), `history.jsonl` records version ids for committed writes and
+deletes, and `checker-report.json` verifies every committed version by
+`versionId` and checks deleted keys keep a latest delete marker. The DM proxy
+also requires `crash-window-evidence.json`, `dm-crash-boundary.json`, and
+`dm-crash-recovered.json`; missing ACK, Pod-UID transition, unmount, remount, or
+table proof fails as harness/backend evidence rather than producing a green
+durability verdict. Validation binds those files to the same scenario/run,
+checks the trigger against the run-scoped history bucket, and links the crash
+table and pre-crash mount identity to the recovered table and mount.
+
+The catalog also includes planned entries for quorum P/P+1 targeted faults,
+fresh-volume replacement, admin heal/decommission/rebalance, on-disk bitrot,
+and long-run chaos campaigns. They are not executable yet because they still
+need topology or admin-operation target proof and backend adapters. Existing
+percent-based IOChaos scenarios must not be treated as proof of quorum P/P+1
+behavior.
 
 ## YAML Suite Contracts
 
@@ -653,8 +710,9 @@ kubectl get namespace "${RUSTFS_FAULT_TEST_NAMESPACE:-rustfs-fault-test}"
 
 ## dm-flakey
 
-`dm-flakey` is an explicit scenario that needs a dedicated static Local PV setup
-and privileged helper access on the fault namespace.
+`dm-flakey` and `dm-flakey-versioned-hot` are explicit scenarios that need a
+dedicated static Local PV setup and privileged helper access on the fault
+namespace.
 
 There is no Make target that installs this environment. Prepare the host storage
 and Kubernetes Local PVs first, then use `fault-preflight` to verify them.
@@ -776,8 +834,8 @@ kubectl get pv -o wide | grep "$DM_STORAGE_CLASS"
 kubectl get namespace "$RUSTFS_FAULT_TEST_NAMESPACE" --show-labels
 ```
 
-The `dm-flakey` preflight requires exactly four `Available` or `Bound` `100Gi`
-PVs in the selected static StorageClass.
+The device-mapper scenario preflight requires exactly four `Available` or
+`Bound` `100Gi` PVs in the selected static StorageClass.
 
 ### dm-flakey Run
 
@@ -793,7 +851,10 @@ export RUSTFS_FAULT_TEST_DM_FAULT_TABLE='0 <sectors> flakey <backing-device> 0 1
 ```
 
 Use the `SECTORS` and `BACKING` values from the DM node host-storage setup for
-`<sectors>` and `<backing-device>`.
+`<sectors>` and `<backing-device>`. `RUSTFS_FAULT_TEST_DM_FAULT_TABLE` is
+required only by the legacy `dm-flakey` EIO scenario. The
+`dm-flakey-versioned-hot` crash proxy ignores it and derives a fail-closed
+`drop_writes` table from the live, single-segment linear table.
 
 Optional:
 
@@ -808,6 +869,34 @@ Run:
 make fault-preflight SCENARIO=dm-flakey
 make fault-run-dm
 ```
+
+Run the soft-power-loss proxy with the same host/PV variables but without a
+fault-table variable:
+
+```bash
+unset RUSTFS_FAULT_TEST_DM_FAULT_TABLE
+make fault-preflight SCENARIO=dm-flakey-versioned-hot
+make fault-run SCENARIO=dm-flakey-versioned-hot
+```
+
+Its recovery boundary is intentionally owned by the host backend:
+
+1. Prove the Local PV, Pod, node, mount, mapper source, and active linear table.
+2. Switch to `up=0`, `down=86400`, `drop_writes` using `--nolockfs`, so the
+   switch does not synchronize filesystem dirty state.
+3. Run the versioned workload and require at least one successful PUT, delete
+   marker, or multipart completion with a version ID.
+4. Add a run-owned `NoSchedule` taint, force-delete the owning Pod, and unmount
+   the filesystem while `drop_writes` is still active. The unmount flush is
+   acknowledged but discarded, then releases the page cache.
+5. Restore the exact pre-injection linear table, remount with the captured
+   filesystem type/options, remove the taint, and wait for the replacement Pod
+   and Tenant to stabilize before lineage verification.
+
+The adapter refuses multi-segment or non-linear recovery tables, refuses to
+overwrite a pre-existing crash-containment taint, and keeps the node tainted if
+storage cannot be remounted. A configured recovery-table override must exactly
+match the table observed before crash injection.
 
 The Rust test reads the original `dmsetup table` as the recovery table when
 `RUSTFS_FAULT_TEST_DM_RECOVERY_TABLE` is unset. On normal failure paths it

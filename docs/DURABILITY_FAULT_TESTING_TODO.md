@@ -222,14 +222,14 @@ guardrails when implementing the ordered TODO below.
 
 ### 3. Correct The Soft-Power-Loss Fault Model
 
-- [ ] TODO: Add a dm `drop_writes` actuator path.
+- [x] DONE: Add a dm `drop_writes` actuator path.
   Meaning: EIO/flakey faults exercise error handling, not ACK-then-lost
   durability. `drop_writes` lets writes appear successful to the upper layer
   while the backend discards them, which can expose metadata/data loss after a
   committed ACK.
 
-- [ ] TODO: Add `dmsetup suspend --nolockfs` support where suspend is still
-  needed.
+- [x] DONE: Add `dmsetup suspend --nolockfs` support for crash-like table
+  switches.
   Meaning: default suspend freezes and syncs the filesystem, which can flush the
   exact dirty pages the test is trying to lose. Any crash-like dm path must avoid
   implicit flushes.
@@ -238,7 +238,10 @@ guardrails when implementing the ordered TODO below.
   Meaning: the runner must wait for an eligible committed operation, record
   `trigger_operation_id`, version id, ACK timestamp, and apply the fault within
   `maxAckToFaultMs`. Timeout/unknown/interrupted operations must not arm the
-  trigger.
+  trigger. The hot DM proxy now records an acknowledged mutation before its
+  forced crash boundary, but the drop-writes table is active before that ACK;
+  the calibrated quiet single-write detector still needs the stricter
+  ACK-then-activate timing contract.
 
 - [ ] TODO: Add a quiet single-write calibration workload.
   Meaning: hot workloads can self-defeat metadata-loss tests because later
@@ -246,7 +249,7 @@ guardrails when implementing the ordered TODO below.
   should use one committed operation, tight ack-to-fault timing, bounded retry,
   and recorded filesystem commit/writeback parameters.
 
-- [ ] TODO: Assert a non-empty crash-window cohort.
+- [x] DONE: Assert a non-empty crash-window cohort.
   Meaning: if no committed operation actually fell inside the requested
   ACK-to-fault window, the run did not test the intended failure model and must
   not pass as a product verdict.
@@ -329,12 +332,14 @@ guardrails when implementing the ordered TODO below.
   ack-trigger, quiet single-write calibration, `drop_writes`, strict/relaxed/none
   calibration, target proof, and precise final checker classification.
 
-- [ ] TODO: Add `dm-flakey-versioned-hot` only after the detector is calibrated.
-  Meaning: hot overwrite/delete/MPU workload is useful for broader regression
-  coverage, but it should not be the first ACK-then-loss detector because hot
-  workloads can flush or mask the signal.
+- [x] DONE: Add `dm-flakey-versioned-hot` as a diagnostic single-volume
+  soft-power-loss proxy.
+  Meaning: the backend now uses `drop_writes`, `--nolockfs`, forced Pod loss,
+  unmount/remount cache release, ACK evidence, and fail-closed recovery proof.
+  It remains a negative control rather than the first calibrated detector:
+  one-volume loss is masked by EC and hot workloads can flush or mask signal.
 
-- [ ] TODO: Add `pod-crash-versioned-hot` as a process-crash proxy and negative
+- [x] DONE: Add `pod-crash-versioned-hot` as a process-crash proxy and negative
   control.
   Meaning: it proves versioned workload/checker behavior through process
   disruption, but it must not be described as physical power loss.

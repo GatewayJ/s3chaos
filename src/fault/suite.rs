@@ -649,7 +649,10 @@ impl Default for FaultSuiteBudgets {
 #[cfg(test)]
 mod tests {
     use super::{FaultSuite, parse_duration_seconds};
-    use crate::fault::{plan::FaultInjectionParameters, reporting::FailureSeverity};
+    use crate::fault::{
+        plan::FaultInjectionParameters, reporting::FailureSeverity,
+        scenarios::QUORUM_P_IO_FAULT_SCENARIO,
+    };
 
     #[test]
     fn resolves_valid_fault_suite() {
@@ -921,6 +924,25 @@ scenarios:
                 .to_string()
                 .contains("does not support percent override")
         );
+    }
+
+    #[test]
+    fn rejects_planned_scenario_names() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(&format!(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: {QUORUM_P_IO_FAULT_SCENARIO}
+"#
+        ))
+        .expect("suite yaml");
+
+        let error = suite.resolve().expect_err("planned scenario");
+
+        assert!(error.to_string().contains("not executable"));
     }
 
     #[test]

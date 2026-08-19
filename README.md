@@ -41,7 +41,8 @@ export RUSTFS_FAULT_TEST_SERVER_IMAGE='docker.io/rustfs/rustfs@sha256:<digest>'
 expected dedicated Kubernetes or K3s context.
 
 See [docs/FAULT_TESTING.md](docs/FAULT_TESTING.md) for cluster preparation,
-scenario selection, dm-flakey setup, artifact contracts, and cleanup rules.
+scenario selection, the RustFS reliability extension scenarios, dm-flakey
+setup, artifact contracts, and cleanup rules.
 
 See [docs/OIDC_PROTOCOL_TESTING.md](docs/OIDC_PROTOCOL_TESTING.md) for the
 Keycloak-backed `AssumeRoleWithWebIdentity` integration test.

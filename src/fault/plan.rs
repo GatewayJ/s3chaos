@@ -20,11 +20,12 @@ use std::time::Duration;
 use crate::fault::{
     config::{DEFAULT_RUSTFS_VOLUME_PATH, FaultTestConfig, validate_rustfs_volume_path},
     scenarios::{
-        DISK_FULL_SCENARIO, DM_FLAKEY_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
-        FaultScenarioSpec, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO,
-        NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO,
-        NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
-        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO,
+        DISK_FULL_SCENARIO, DM_FLAKEY_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend,
+        FaultParameterSchema, FaultScenario, FaultScenarioSpec, IO_EIO_SCENARIO,
+        IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, NETWORK_CORRUPT_SCENARIO,
+        NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO, NETWORK_LOSS_SCENARIO,
+        NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO,
         STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
 };
@@ -67,6 +68,7 @@ pub enum FaultKind {
     RustfsServerCpuStress,
     RustfsServerMemoryStress,
     RustfsBlockDeviceFlakey,
+    RustfsBlockDeviceDropWritesCrash,
 }
 
 impl FaultKind {
@@ -86,6 +88,7 @@ impl FaultKind {
             Self::RustfsServerCpuStress => "rustfs_server_cpu_stress",
             Self::RustfsServerMemoryStress => "rustfs_server_memory_stress",
             Self::RustfsBlockDeviceFlakey => "rustfs_block_device_flakey",
+            Self::RustfsBlockDeviceDropWritesCrash => "rustfs_block_device_drop_writes_crash",
         }
     }
 }
@@ -630,7 +633,7 @@ fn fault_kind_accepts_backend(kind: FaultKind, backend: FaultBackend) -> bool {
             FaultKind::RustfsServerCpuStress | FaultKind::RustfsServerMemoryStress,
             FaultBackend::ChaosMeshStressChaos
         ) | (
-            FaultKind::RustfsBlockDeviceFlakey,
+            FaultKind::RustfsBlockDeviceFlakey | FaultKind::RustfsBlockDeviceDropWritesCrash,
             FaultBackend::DeviceMapper
         )
     )
@@ -666,7 +669,8 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         | FaultKind::RustfsServerNetworkDuplicate
         | FaultKind::RustfsServerCpuStress
         | FaultKind::RustfsServerMemoryStress
-        | FaultKind::RustfsBlockDeviceFlakey => match selection {
+        | FaultKind::RustfsBlockDeviceFlakey
+        | FaultKind::RustfsBlockDeviceDropWritesCrash => match selection {
             FaultSelection::FixedTargets(count) => count == 1,
             FaultSelection::Percent(_) => false,
         },
@@ -692,7 +696,9 @@ fn fault_kind_accepts_target(kind: FaultKind, target: &FaultTarget) -> bool {
         FaultKind::RustfsServerCpuStress | FaultKind::RustfsServerMemoryStress => {
             matches!(target, FaultTarget::RustfsServerResource)
         }
-        FaultKind::RustfsBlockDeviceFlakey => matches!(target, FaultTarget::DedicatedBlockDevice),
+        FaultKind::RustfsBlockDeviceFlakey | FaultKind::RustfsBlockDeviceDropWritesCrash => {
+            matches!(target, FaultTarget::DedicatedBlockDevice)
+        }
     }
 }
 
@@ -781,7 +787,7 @@ impl FaultPlan {
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
             )?,
-            POD_KILL_ONE_SCENARIO => FaultInjection::new(
+            POD_KILL_ONE_SCENARIO | POD_CRASH_VERSIONED_HOT_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsServerPodKill,
                 spec.backend,
                 FaultTarget::RustfsServerPod,
@@ -874,6 +880,13 @@ impl FaultPlan {
             )?,
             DM_FLAKEY_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsBlockDeviceFlakey,
+                spec.backend,
+                FaultTarget::DedicatedBlockDevice,
+                FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
+            DM_FLAKEY_VERSIONED_HOT_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsBlockDeviceDropWritesCrash,
                 spec.backend,
                 FaultTarget::DedicatedBlockDevice,
                 FaultSelection::FixedTargets(1),
@@ -1001,8 +1014,8 @@ mod tests {
     use crate::fault::{
         config::FaultTestConfig,
         scenarios::{
-            FaultBackend, FaultParameterSchema, FaultScenario, WARP_UNDER_CHAOS_SCENARIO,
-            scenario_catalog, scenario_spec,
+            DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
+            WARP_UNDER_CHAOS_SCENARIO, executable_scenario_catalog, scenario_spec,
         },
     };
     use std::time::Duration;
@@ -1048,10 +1061,26 @@ mod tests {
     }
 
     #[test]
+    fn versioned_dm_scenario_uses_drop_writes_crash_semantics() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = DM_FLAKEY_VERSIONED_HOT_SCENARIO.to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let spec = scenario_spec(&scenario.name).expect("spec");
+
+        let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan");
+
+        assert_eq!(
+            plan.faults()[0].kind(),
+            FaultKind::RustfsBlockDeviceDropWritesCrash
+        );
+        assert_eq!(plan.required_backends(), vec![FaultBackend::DeviceMapper]);
+    }
+
+    #[test]
     fn every_cataloged_scenario_has_one_current_fault_plan() {
         let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
 
-        for spec in scenario_catalog() {
+        for spec in executable_scenario_catalog() {
             config.scenario = spec.scenario.to_string();
             let scenario = FaultScenario::from_config(&config).expect("scenario");
             let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan");

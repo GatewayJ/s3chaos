@@ -76,6 +76,8 @@ pub struct FaultRunWorkloadSpec {
     pub mode: String,
     pub object_count: usize,
     pub concurrency: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_profile: Option<String>,
     #[serde(default)]
     pub operation_mix: crate::fault::workload::WorkloadOperationMix,
     pub prefill_concurrency: usize,
@@ -111,6 +113,8 @@ pub struct FaultRunFaultSpec {
     #[serde(default = "default_target_proof_spec")]
     pub target_proof: FaultRunTargetProofSpec,
     pub selection: FaultRunSelectionSpec,
+    #[serde(default)]
+    pub target_proof_requirements: Vec<String>,
     pub fault_duration_seconds: u64,
     pub observability: String,
     pub conflict_domain: String,
@@ -188,6 +192,10 @@ impl FaultRunSpec {
                 mode: workload_mode_name(plan.workload_mode).to_string(),
                 object_count: workload_plan.object_count,
                 concurrency: workload_plan.concurrency,
+                catalog_profile: scenario_spec
+                    .workload_profile
+                    .explicit_name()
+                    .map(str::to_string),
                 operation_mix: workload_plan.operation_mix,
                 prefill_concurrency: config.prefill_concurrency,
                 request_timeout_seconds: config.request_timeout.as_secs(),
@@ -264,6 +272,11 @@ impl FaultRunFaultSpec {
                 artifact: "target-proof.json".to_string(),
             },
             selection: FaultRunSelectionSpec::from_selection(fault.selection()),
+            target_proof_requirements: scenario_spec
+                .target_proof
+                .iter()
+                .map(|proof| (*proof).to_string())
+                .collect(),
             fault_duration_seconds: fault.duration().as_secs(),
             observability: scenario_spec.observability.to_string(),
             conflict_domain: scenario_spec.conflict_domain.to_string(),
