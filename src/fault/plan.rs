@@ -68,6 +68,7 @@ pub enum FaultKind {
     RustfsServerCpuStress,
     RustfsServerMemoryStress,
     RustfsBlockDeviceFlakey,
+    RustfsBlockDeviceDropWritesCrash,
 }
 
 impl FaultKind {
@@ -87,6 +88,7 @@ impl FaultKind {
             Self::RustfsServerCpuStress => "rustfs_server_cpu_stress",
             Self::RustfsServerMemoryStress => "rustfs_server_memory_stress",
             Self::RustfsBlockDeviceFlakey => "rustfs_block_device_flakey",
+            Self::RustfsBlockDeviceDropWritesCrash => "rustfs_block_device_drop_writes_crash",
         }
     }
 }
@@ -631,7 +633,7 @@ fn fault_kind_accepts_backend(kind: FaultKind, backend: FaultBackend) -> bool {
             FaultKind::RustfsServerCpuStress | FaultKind::RustfsServerMemoryStress,
             FaultBackend::ChaosMeshStressChaos
         ) | (
-            FaultKind::RustfsBlockDeviceFlakey,
+            FaultKind::RustfsBlockDeviceFlakey | FaultKind::RustfsBlockDeviceDropWritesCrash,
             FaultBackend::DeviceMapper
         )
     )
@@ -667,7 +669,8 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         | FaultKind::RustfsServerNetworkDuplicate
         | FaultKind::RustfsServerCpuStress
         | FaultKind::RustfsServerMemoryStress
-        | FaultKind::RustfsBlockDeviceFlakey => match selection {
+        | FaultKind::RustfsBlockDeviceFlakey
+        | FaultKind::RustfsBlockDeviceDropWritesCrash => match selection {
             FaultSelection::FixedTargets(count) => count == 1,
             FaultSelection::Percent(_) => false,
         },
@@ -693,7 +696,9 @@ fn fault_kind_accepts_target(kind: FaultKind, target: &FaultTarget) -> bool {
         FaultKind::RustfsServerCpuStress | FaultKind::RustfsServerMemoryStress => {
             matches!(target, FaultTarget::RustfsServerResource)
         }
-        FaultKind::RustfsBlockDeviceFlakey => matches!(target, FaultTarget::DedicatedBlockDevice),
+        FaultKind::RustfsBlockDeviceFlakey | FaultKind::RustfsBlockDeviceDropWritesCrash => {
+            matches!(target, FaultTarget::DedicatedBlockDevice)
+        }
     }
 }
 
@@ -873,8 +878,15 @@ impl FaultPlan {
                 scenario,
                 &options.scenario_parameters,
             )?,
-            DM_FLAKEY_SCENARIO | DM_FLAKEY_VERSIONED_HOT_SCENARIO => FaultInjection::new(
+            DM_FLAKEY_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsBlockDeviceFlakey,
+                spec.backend,
+                FaultTarget::DedicatedBlockDevice,
+                FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
+            DM_FLAKEY_VERSIONED_HOT_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsBlockDeviceDropWritesCrash,
                 spec.backend,
                 FaultTarget::DedicatedBlockDevice,
                 FaultSelection::FixedTargets(1),
@@ -1002,8 +1014,8 @@ mod tests {
     use crate::fault::{
         config::FaultTestConfig,
         scenarios::{
-            FaultBackend, FaultParameterSchema, FaultScenario, WARP_UNDER_CHAOS_SCENARIO,
-            executable_scenario_catalog, scenario_spec,
+            DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
+            WARP_UNDER_CHAOS_SCENARIO, executable_scenario_catalog, scenario_spec,
         },
     };
     use std::time::Duration;
@@ -1046,6 +1058,22 @@ mod tests {
             plan.required_backends(),
             vec![FaultBackend::MinioWarpWithChaos]
         );
+    }
+
+    #[test]
+    fn versioned_dm_scenario_uses_drop_writes_crash_semantics() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = DM_FLAKEY_VERSIONED_HOT_SCENARIO.to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let spec = scenario_spec(&scenario.name).expect("spec");
+
+        let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan");
+
+        assert_eq!(
+            plan.faults()[0].kind(),
+            FaultKind::RustfsBlockDeviceDropWritesCrash
+        );
+        assert_eq!(plan.required_backends(), vec![FaultBackend::DeviceMapper]);
     }
 
     #[test]

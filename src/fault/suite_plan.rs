@@ -32,10 +32,7 @@ use crate::fault::{
         ResolvedFaultSuite, ResolvedFaultSuiteScenario, ResolvedFaultSuiteWorkloadOverride,
         resolve_fault_suite_yaml,
     },
-    workload::{
-        WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadDistribution, WorkloadPlan,
-        WorkloadSizeClass,
-    },
+    workload::{WorkloadHotspot, WorkloadOperationMix, WorkloadPlan, WorkloadSizeClass},
 };
 
 pub const FAULT_SUITE_PLAN_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
@@ -148,7 +145,7 @@ pub struct FaultSuitePlanFault {
     pub target: FaultSuitePlanTarget,
     pub target_proof: FaultSuitePlanTargetProof,
     pub selection: FaultSuitePlanSelection,
-    pub target_proof: Vec<String>,
+    pub target_proof_requirements: Vec<String>,
     pub fault_duration_seconds: u64,
     pub observability: String,
     pub conflict_domain: String,
@@ -491,7 +488,7 @@ impl FaultSuitePlanFault {
                 artifact: "target-proof.json".to_string(),
             },
             selection: FaultSuitePlanSelection::from_selection(fault.selection()),
-            target_proof: spec
+            target_proof_requirements: spec
                 .target_proof
                 .iter()
                 .map(|proof| (*proof).to_string())
@@ -577,9 +574,12 @@ fn scenario_config(
         config.percent = default_percent_for_scenario(&scenario.name);
         config.percent_overridden = false;
     }
+    if let Some(workload) = &scenario.workload {
+        apply_workload_dimensions(&mut config, workload.objects, workload.concurrency)?;
+    }
     apply_catalog_defaults(&mut config)?;
     if let Some(workload) = &scenario.workload {
-        apply_workload_override(&mut config, workload)?;
+        apply_workload_behavior_overrides(&mut config, workload);
         config.prefill_concurrency = config
             .prefill_concurrency
             .min(config.workload.concurrency)
@@ -598,43 +598,32 @@ fn scenario_config(
     Ok(config)
 }
 
-fn apply_workload_override(
-    config: &mut FaultTestConfig,
-    workload: &ResolvedFaultSuiteWorkloadOverride,
-) -> Result<()> {
-    apply_workload_fields(
-        config,
-        workload.objects,
-        workload.concurrency,
-        workload.operation_weights,
-        workload.payload_distribution.as_ref(),
-        workload.hotspot,
-    )
-}
-
-fn apply_workload_fields(
+fn apply_workload_dimensions(
     config: &mut FaultTestConfig,
     objects: Option<usize>,
     concurrency: Option<usize>,
-    operation_weights: Option<WorkloadOperationMix>,
-    payload_distribution: Option<&WorkloadPayloadDistribution>,
-    hotspot: Option<WorkloadHotspot>,
 ) -> Result<()> {
     if objects.is_some() || concurrency.is_some() {
         let object_count = objects.unwrap_or(config.workload.object_count);
         let concurrency = concurrency.unwrap_or(config.workload.concurrency);
         config.workload = FaultWorkloadProfile::new(object_count, concurrency)?;
     }
-    if let Some(operation_weights) = operation_weights {
+    Ok(())
+}
+
+fn apply_workload_behavior_overrides(
+    config: &mut FaultTestConfig,
+    workload: &ResolvedFaultSuiteWorkloadOverride,
+) {
+    if let Some(operation_weights) = workload.operation_weights {
         config.workload_operation_mix = operation_weights;
     }
-    if let Some(payload_distribution) = payload_distribution {
+    if let Some(payload_distribution) = &workload.payload_distribution {
         config.workload_payload_distribution = Some(payload_distribution.clone());
     }
-    if let Some(hotspot) = hotspot {
+    if let Some(hotspot) = workload.hotspot {
         config.workload_hotspot = Some(hotspot);
     }
-    Ok(())
 }
 
 fn validate_suite_runtime_contract(
@@ -702,7 +691,7 @@ mod tests {
     };
     use crate::fault::{
         config::FaultTestConfig,
-        scenarios::POD_CRASH_VERSIONED_HOT_SCENARIO,
+        scenarios::{FaultScenario, POD_CRASH_VERSIONED_HOT_SCENARIO},
         suite::{FaultSuite, fault_suite_template_yaml},
         workload::{WorkloadHotspot, WorkloadOperationMix},
     };
@@ -853,7 +842,7 @@ mod tests {
                                     "value": 20,
                                     "summary": "20%"
                                 },
-                                "targetProof": target_proof.clone(),
+                                "targetProofRequirements": target_proof.clone(),
                                 "faultDurationSeconds": 600,
                                 "observability": "history.jsonl, workload-summary.json, checker-report.json, chaos-manifest.yaml, chaos-describe*.txt, Kubernetes snapshot artifacts",
                                 "conflictDomain": "fresh Tenant/PVC/PV fixture and run-scoped IOChaos cleanup"
@@ -926,7 +915,7 @@ mod tests {
                                     "value": 1,
                                     "summary": "1 target(s)"
                                 },
-                                "targetProof": target_proof.clone(),
+                                "targetProofRequirements": target_proof.clone(),
                                 "faultDurationSeconds": 480,
                                 "observability": "history.jsonl, checker reports, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
                                 "conflictDomain": "run-scoped NetworkChaos resource; must not overlap with other network faults in the same Tenant"
@@ -1109,6 +1098,45 @@ scenarios:
                 operation_percent: 80,
             })
         );
+    }
+
+    #[test]
+    fn scenario_config_derives_catalog_profile_after_small_workload_override() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(&format!(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-reliability-small
+scenarios:
+  - name: {POD_CRASH_VERSIONED_HOT_SCENARIO}
+    workload:
+      objects: 12
+      concurrency: 2
+"#
+        ))
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+
+        let config = scenario_config(
+            &base,
+            &suite,
+            &suite.scenarios[0],
+            1,
+            1,
+            Path::new("target/fault-tests/suite/pod-crash-versioned-hot-small"),
+        )
+        .expect("scenario config");
+
+        assert_eq!(config.workload.object_count, 12);
+        assert_eq!(config.workload.concurrency, 2);
+        assert_eq!(
+            config.workload_operation_mix,
+            WorkloadOperationMix::default()
+        );
+        FaultScenario::from_config(&config).expect("small catalog workload must remain valid");
     }
 
     #[test]

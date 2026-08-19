@@ -25,6 +25,12 @@ use std::time::{Duration, Instant};
 pub(super) trait FaultLifecyclePort {
     fn wait_active(&self, timeout: Duration) -> Result<()>;
     fn ensure_active(&self, stage: &str) -> Result<()>;
+    fn requires_recovery_boundary(&self) -> bool {
+        false
+    }
+    fn prepare_recovery_boundary(&mut self, _timeout: Duration, _started_at_ms: u64) -> Result<()> {
+        Ok(())
+    }
     fn delete(&mut self, timeout: Duration) -> Result<()>;
     fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot>;
 
@@ -69,6 +75,25 @@ impl AppliedFaults {
     pub(super) fn ensure_active(&self, stage: &str) -> Result<()> {
         for fault in &self.items {
             fault.ensure_active(stage)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn requires_recovery_boundary(&self) -> bool {
+        self.items
+            .iter()
+            .any(|fault| fault.requires_recovery_boundary())
+    }
+
+    pub(super) fn prepare_recovery_boundary(
+        &mut self,
+        timeout: Duration,
+        started_at_ms: u64,
+    ) -> Result<()> {
+        for fault in self.items.iter_mut().rev() {
+            if fault.requires_recovery_boundary() {
+                fault.prepare_recovery_boundary(timeout, started_at_ms)?;
+            }
         }
         Ok(())
     }
@@ -234,6 +259,7 @@ mod tests {
             mapping: DmVolumeMapping {
                 node: "node-a".to_string(),
                 pod: "rustfs-0".to_string(),
+                pod_uid: "pod-uid-a".to_string(),
                 pvc: "data-rustfs-0".to_string(),
                 pv: "pv-a".to_string(),
                 mount_path: "/data/rustfs0".to_string(),

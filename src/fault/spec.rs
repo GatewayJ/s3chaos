@@ -114,7 +114,7 @@ pub struct FaultRunFaultSpec {
     pub target_proof: FaultRunTargetProofSpec,
     pub selection: FaultRunSelectionSpec,
     #[serde(default)]
-    pub target_proof: Vec<String>,
+    pub target_proof_requirements: Vec<String>,
     pub fault_duration_seconds: u64,
     pub observability: String,
     pub conflict_domain: String,
@@ -272,7 +272,7 @@ impl FaultRunFaultSpec {
                 artifact: "target-proof.json".to_string(),
             },
             selection: FaultRunSelectionSpec::from_selection(fault.selection()),
-            target_proof: scenario_spec
+            target_proof_requirements: scenario_spec
                 .target_proof
                 .iter()
                 .map(|proof| (*proof).to_string())

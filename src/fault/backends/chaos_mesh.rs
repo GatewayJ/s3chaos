@@ -327,8 +327,11 @@ fn build_fault_spec(
             .with_name_suffix(resource_name_suffix);
             Ok(FaultSpec::Stress(chaos))
         }
-        FaultKind::RustfsBlockDeviceFlakey => {
-            bail!("fault kind rustfs_block_device_flakey must be applied by the host backend")
+        FaultKind::RustfsBlockDeviceFlakey | FaultKind::RustfsBlockDeviceDropWritesCrash => {
+            bail!(
+                "fault kind {} must be applied by the host backend",
+                injection.kind().as_str()
+            )
         }
     }
 }

@@ -30,12 +30,13 @@ use crate::fault::{
         DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS,
     },
     events::{RunEvent, RunEventStatus},
+    history::{DurabilityCohort, OperationKind, OperationOutcome, OperationRecord},
     preflight::{PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus},
     reporting::{
         AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity, FailureVerdict,
         ResponsibilityDomain, is_s3_model_classification,
     },
-    scenarios,
+    scenarios::{self, DM_FLAKEY_VERSIONED_HOT_SCENARIO},
     spec::{
         FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec,
         FaultRunTargetSpec,
@@ -288,6 +289,11 @@ pub fn validate_fault_artifacts(
         "run spec JSON and YAML artifacts do not describe the same contract"
     );
     validate_run_spec(&json_spec, options)?;
+    ensure!(
+        json_spec.metadata.name == scenario_spec.case_name
+            && json_spec.metadata.run_id == metadata.run_id,
+        "run-spec metadata does not match the selected case and run-metadata.json run identity"
+    );
 
     let preflight_summary =
         read_json::<PreflightSummary>(required(&artifacts, "preflight-summary.json")?)?;
@@ -325,6 +331,17 @@ pub fn validate_fault_artifacts(
         metadata.require_client_disruption
     );
     validate_fault_window_evidence(&evidence)?;
+    if options.scenario == DM_FLAKEY_VERSIONED_HOT_SCENARIO {
+        validate_dm_crash_artifacts(
+            &options.artifact_root,
+            scenario_spec.case_name,
+            &events,
+            &evidence,
+            &metadata.scenario,
+            &metadata.run_id,
+            &json_spec.metadata.bucket,
+        )?;
+    }
 
     let prechecker =
         read_json::<CheckerReport>(required(&artifacts, "checker-pre-recommit-report.json")?)?;
@@ -458,8 +475,8 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
             fault.name
         );
         ensure!(
-            !fault.target_proof.is_empty(),
-            "run-spec fault {} has empty target_proof",
+            !fault.target_proof_requirements.is_empty(),
+            "run-spec fault {} has empty target_proof_requirements",
             fault.name
         );
         ensure!(
@@ -709,6 +726,209 @@ fn validate_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Result<()
         "fault-evidence.json fault window timestamps are not monotonic"
     );
     Ok(())
+}
+
+fn validate_dm_crash_artifacts(
+    root: &Path,
+    case_name: &str,
+    events: &[RunEvent],
+    evidence: &FaultEvidenceArtifact,
+    scenario: &str,
+    run_id: &str,
+    bucket: &str,
+) -> Result<()> {
+    ensure!(
+        events.iter().any(|event| {
+            event.stage == "crash-recovery-boundary"
+                && event.status == RunEventStatus::Succeeded
+                && event.scenario == scenario
+                && event.run_id == run_id
+        }),
+        "run-events.jsonl is missing a successful crash-recovery-boundary event for scenario {scenario:?} run {run_id:?}"
+    );
+    let crash_window = read_json::<CrashWindowEvidenceArtifact>(&locate_artifact(
+        root,
+        case_name,
+        "crash-window-evidence.json",
+    )?)?;
+    ensure!(
+        crash_window.scenario == scenario
+            && crash_window.run_id == run_id
+            && crash_window.committed_versioned_mutations > 0
+            && !crash_window.trigger_operation_id.is_empty()
+            && !crash_window.trigger_version_id.is_empty()
+            && !crash_window.trigger_key.is_empty()
+            && crash_window.trigger_acknowledged_at_ms >= crash_window.fault_active_at_ms
+            && crash_window.trigger_acknowledged_at_ms <= crash_window.crash_boundary_started_at_ms
+            && crash_window.ack_to_crash_boundary_ms
+                == crash_window
+                    .crash_boundary_started_at_ms
+                    .saturating_sub(crash_window.trigger_acknowledged_at_ms),
+        "crash-window-evidence.json does not prove a versioned mutation ACK before the crash boundary"
+    );
+    ensure!(
+        evidence.fault_active_at_ms == Some(crash_window.fault_active_at_ms),
+        "crash-window-evidence.json fault_active_at_ms does not match fault-evidence.json"
+    );
+
+    let history =
+        read_jsonl::<OperationRecord>(&locate_artifact(root, case_name, "history.jsonl")?)?;
+    let committed = history
+        .iter()
+        .filter(|record| {
+            is_committed_crash_window_mutation(
+                record,
+                scenario,
+                bucket,
+                crash_window.fault_active_at_ms,
+                crash_window.crash_boundary_started_at_ms,
+            )
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        committed.len() == crash_window.committed_versioned_mutations,
+        "crash-window-evidence.json committed mutation count {} does not match history.jsonl count {}",
+        crash_window.committed_versioned_mutations,
+        committed.len()
+    );
+    let trigger = committed
+        .iter()
+        .find(|record| record.id == crash_window.trigger_operation_id)
+        .context("history.jsonl does not contain the declared crash trigger operation")?;
+    ensure!(
+        trigger.kind == crash_window.trigger_kind
+            && trigger.key.as_deref() == Some(crash_window.trigger_key.as_str())
+            && trigger.version_id.as_deref() == Some(crash_window.trigger_version_id.as_str())
+            && trigger.ended_at_ms == crash_window.trigger_acknowledged_at_ms,
+        "crash-window-evidence.json trigger fields do not match history.jsonl"
+    );
+    let latest = committed
+        .iter()
+        .max_by_key(|record| record.ended_at_ms)
+        .context("history.jsonl does not contain a committed crash-window mutation")?;
+    ensure!(
+        latest.id == crash_window.trigger_operation_id,
+        "crash-window-evidence.json trigger operation is not the last acknowledged mutation before the crash boundary"
+    );
+
+    let boundary = read_json::<DmCrashBoundaryArtifact>(&locate_artifact(
+        root,
+        case_name,
+        "dm-crash-boundary.json",
+    )?)?;
+    ensure!(
+        boundary.scenario == scenario
+            && boundary.run_id == run_id
+            && boundary.started_at_ms == crash_window.crash_boundary_started_at_ms
+            && boundary.filesystem_unmounted
+            && !boundary.mount_before.canonical_source.is_empty()
+            && !boundary.mount_before.filesystem.is_empty()
+            && !boundary.mount_before.options.is_empty()
+            && boundary.completed_at_ms >= boundary.started_at_ms
+            && boundary
+                .fault
+                .table
+                .split_whitespace()
+                .any(|field| field == "drop_writes"),
+        "dm-crash-boundary.json must prove the filesystem was unmounted while drop_writes was active"
+    );
+    ensure!(
+        evidence
+            .workload_ended_at_ms
+            .is_some_and(|ended| ended <= boundary.started_at_ms)
+            && evidence
+                .fault_delete_started_at_ms
+                .is_some_and(|started| started >= boundary.completed_at_ms),
+        "dm-crash-boundary.json timestamps do not fit between workload completion and fault deletion"
+    );
+    if let Some(replacement_uid) = &boundary.replacement_pod_uid {
+        ensure!(
+            replacement_uid != &boundary.old_pod_uid,
+            "dm-crash-boundary.json replacement Pod UID must differ from the deleted Pod UID"
+        );
+    }
+
+    let recovered = read_json::<DmCrashRecoveryArtifact>(&locate_artifact(
+        root,
+        case_name,
+        "dm-crash-recovered.json",
+    )?)?;
+    ensure!(
+        recovered.scenario == scenario
+            && recovered.run_id == run_id
+            && recovered.recovered_at_ms >= boundary.completed_at_ms
+            && recovered.taint_removed
+            && !recovered.mount.source.is_empty()
+            && !recovered.mount.canonical_source.is_empty()
+            && !recovered.mount.filesystem.is_empty()
+            && recovered.mount.canonical_source == boundary.mount_before.canonical_source
+            && recovered.mount.filesystem == boundary.mount_before.filesystem
+            && recovered.mount.options == boundary.mount_before.options
+            && normalize_dm_table(&recovered.fault.table)
+                == normalize_dm_table(&recovered.expected_table)
+            && drop_writes_table_matches_recovery(&boundary.fault.table, &recovered.expected_table,)
+            && !recovered
+                .fault
+                .table
+                .split_whitespace()
+                .any(|field| field == "drop_writes"),
+        "dm-crash-recovered.json must prove taint removal, remount, and healthy-table recovery"
+    );
+
+    let before = evidence
+        .pods_before
+        .iter()
+        .find(|pod| pod.uid == boundary.old_pod_uid)
+        .context("fault-evidence.json does not contain the DM target Pod UID before crash")?;
+    ensure!(
+        evidence
+            .pods_after
+            .iter()
+            .any(|pod| pod.name == before.name && pod.uid != before.uid),
+        "fault-evidence.json does not prove replacement of the DM target Pod after crash recovery"
+    );
+    Ok(())
+}
+
+fn is_committed_crash_window_mutation(
+    record: &OperationRecord,
+    scenario: &str,
+    bucket: &str,
+    fault_active_at_ms: u64,
+    crash_boundary_started_at_ms: u64,
+) -> bool {
+    record.scenario == scenario
+        && record.bucket == bucket
+        && record.outcome == OperationOutcome::Ok
+        && record.durability_cohort == Some(DurabilityCohort::FaultActive)
+        && matches!(
+            record.kind,
+            OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+        )
+        && record.version_id.is_some()
+        && record.ended_at_ms >= fault_active_at_ms
+        && record.ended_at_ms <= crash_boundary_started_at_ms
+}
+
+fn drop_writes_table_matches_recovery(fault_table: &str, recovery_table: &str) -> bool {
+    let fault = fault_table.split_whitespace().collect::<Vec<_>>();
+    let recovery = recovery_table.split_whitespace().collect::<Vec<_>>();
+    recovery.len() == 5
+        && recovery[2] == "linear"
+        && fault.len() == 9
+        && fault[0] == recovery[0]
+        && fault[1] == recovery[1]
+        && fault[2] == "flakey"
+        && fault[3] == recovery[3]
+        && fault[4] == recovery[4]
+        && fault[5] == "0"
+        && fault[6] == "86400"
+        && fault[7] == "1"
+        && fault[8] == "drop_writes"
+}
+
+fn normalize_dm_table(table: &str) -> String {
+    table.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn locate_required_artifacts(root: &Path, case_name: &str) -> Result<BTreeMap<String, PathBuf>> {
@@ -1229,6 +1449,8 @@ struct FaultEvidenceArtifact {
     recovered: bool,
     require_client_disruption: bool,
     client_disruptions: usize,
+    pods_before: Vec<PodIdentityArtifact>,
+    pods_after: Vec<PodIdentityArtifact>,
     active_snapshots: Vec<Value>,
     workload_snapshots: Vec<Value>,
     #[serde(default)]
@@ -1245,6 +1467,64 @@ struct FaultEvidenceArtifact {
     recovery_started_at_ms: Option<u64>,
     #[serde(default)]
     recovery_ended_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PodIdentityArtifact {
+    name: String,
+    uid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrashWindowEvidenceArtifact {
+    scenario: String,
+    run_id: String,
+    fault_active_at_ms: u64,
+    crash_boundary_started_at_ms: u64,
+    committed_versioned_mutations: usize,
+    trigger_operation_id: String,
+    trigger_kind: OperationKind,
+    trigger_key: String,
+    trigger_version_id: String,
+    trigger_acknowledged_at_ms: u64,
+    ack_to_crash_boundary_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DmFaultTableArtifact {
+    table: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DmMountArtifact {
+    source: String,
+    canonical_source: String,
+    filesystem: String,
+    options: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DmCrashBoundaryArtifact {
+    scenario: String,
+    run_id: String,
+    started_at_ms: u64,
+    completed_at_ms: u64,
+    old_pod_uid: String,
+    replacement_pod_uid: Option<String>,
+    filesystem_unmounted: bool,
+    mount_before: DmMountArtifact,
+    fault: DmFaultTableArtifact,
+}
+
+#[derive(Debug, Deserialize)]
+struct DmCrashRecoveryArtifact {
+    scenario: String,
+    run_id: String,
+    recovered_at_ms: u64,
+    taint_removed: bool,
+    mount: DmMountArtifact,
+    expected_table: String,
+    fault: DmFaultTableArtifact,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1399,6 +1679,187 @@ mod tests {
         let report = fs::read_to_string(report_path).expect("report");
         assert!(report.contains("\"status\": \"passed\""));
         assert!(report.contains("\"schema_version\": 1"));
+    }
+
+    #[test]
+    fn validates_dm_crash_boundary_evidence_package() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_dir = dir.path().join("case");
+        fs::create_dir_all(&case_dir).expect("case dir");
+        write_json(
+            &case_dir,
+            "crash-window-evidence.json",
+            &json!({
+                "scenario": "dm-flakey-versioned-hot",
+                "run_id": "run-1",
+                "fault_active_at_ms": 20,
+                "crash_boundary_started_at_ms": 50,
+                "committed_versioned_mutations": 1,
+                "trigger_operation_id": "put-3",
+                "trigger_kind": "put",
+                "trigger_key": "key-3",
+                "trigger_version_id": "version-3",
+                "trigger_acknowledged_at_ms": 45,
+                "ack_to_crash_boundary_ms": 5
+            }),
+        );
+        write_json(
+            &case_dir,
+            "dm-crash-boundary.json",
+            &json!({
+                "scenario": "dm-flakey-versioned-hot",
+                "run_id": "run-1",
+                "started_at_ms": 50,
+                "completed_at_ms": 60,
+                "old_pod_uid": "uid-before",
+                "replacement_pod_uid": null,
+                "filesystem_unmounted": true,
+                "mount_before": {
+                    "source": "/dev/mapper/rustfs0",
+                    "canonical_source": "/dev/dm-0",
+                    "filesystem": "ext4",
+                    "options": "rw,relatime"
+                },
+                "fault": {
+                    "table": "0 100 flakey /dev/sda 0 0 86400 1 drop_writes"
+                }
+            }),
+        );
+        write_json(
+            &case_dir,
+            "dm-crash-recovered.json",
+            &json!({
+                "scenario": "dm-flakey-versioned-hot",
+                "run_id": "run-1",
+                "recovered_at_ms": 70,
+                "taint_removed": true,
+                "mount": {
+                    "source": "/dev/mapper/rustfs0",
+                    "canonical_source": "/dev/dm-0",
+                    "filesystem": "ext4",
+                    "options": "rw,relatime"
+                },
+                "expected_table": "0 100 linear /dev/sda 0",
+                "fault": {"table": "0 100 linear /dev/sda 0"}
+            }),
+        );
+        let history_record = json!({
+            "id": "put-3",
+            "scenario": "dm-flakey-versioned-hot",
+            "kind": "put",
+            "bucket": "bucket",
+            "key": "key-3",
+            "value_sha256": "abc",
+            "size_bytes": 4096,
+            "version_id": "version-3",
+            "started_at_ms": 40,
+            "ended_at_ms": 45,
+            "outcome": "ok",
+            "http_status": 200,
+            "error": null,
+            "durability_cohort": "fault_active",
+            "fault_window_relation": "during_fault"
+        });
+        fs::write(
+            case_dir.join("history.jsonl"),
+            format!("{}\n", history_record),
+        )
+        .expect("history");
+        let events = vec![
+            serde_json::from_value(json!({
+                "at_ms": 60,
+                "scenario": "dm-flakey-versioned-hot",
+                "run_id": "run-1",
+                "stage": "crash-recovery-boundary",
+                "status": "succeeded",
+                "message": "boundary complete"
+            }))
+            .expect("event"),
+        ];
+        let evidence = serde_json::from_value(json!({
+            "injected": true,
+            "active_during_workload": true,
+            "recovered": true,
+            "require_client_disruption": false,
+            "client_disruptions": 0,
+            "pods_before": [{"name": "rustfs-0", "uid": "uid-before"}],
+            "pods_after": [{"name": "rustfs-0", "uid": "uid-after"}],
+            "active_snapshots": [{}],
+            "workload_snapshots": [{}],
+            "fault_active_at_ms": 20,
+            "workload_ended_at_ms": 49,
+            "fault_delete_started_at_ms": 61
+        }))
+        .expect("fault evidence");
+
+        super::validate_dm_crash_artifacts(
+            dir.path(),
+            "case",
+            &events,
+            &evidence,
+            "dm-flakey-versioned-hot",
+            "run-1",
+            "bucket",
+        )
+        .expect("valid DM crash evidence package");
+
+        let mut mismatched = history_record.clone();
+        mismatched["version_id"] = json!("different-version");
+        fs::write(case_dir.join("history.jsonl"), format!("{}\n", mismatched))
+            .expect("mismatched history");
+        assert!(
+            super::validate_dm_crash_artifacts(
+                dir.path(),
+                "case",
+                &events,
+                &evidence,
+                "dm-flakey-versioned-hot",
+                "run-1",
+                "bucket",
+            )
+            .is_err()
+        );
+
+        write_json(
+            &case_dir,
+            "crash-window-evidence.json",
+            &json!({
+                "scenario": "dm-flakey-versioned-hot",
+                "run_id": "run-1",
+                "fault_active_at_ms": 20,
+                "crash_boundary_started_at_ms": 50,
+                "committed_versioned_mutations": 2,
+                "trigger_operation_id": "put-3",
+                "trigger_kind": "put",
+                "trigger_key": "key-3",
+                "trigger_version_id": "version-3",
+                "trigger_acknowledged_at_ms": 45,
+                "ack_to_crash_boundary_ms": 5
+            }),
+        );
+        let mut later_record = history_record.clone();
+        later_record["id"] = json!("put-4");
+        later_record["key"] = json!("key-4");
+        later_record["version_id"] = json!("version-4");
+        later_record["started_at_ms"] = json!(46);
+        later_record["ended_at_ms"] = json!(48);
+        fs::write(
+            case_dir.join("history.jsonl"),
+            format!("{}\n{}\n", history_record, later_record),
+        )
+        .expect("history with a later mutation");
+        assert!(
+            super::validate_dm_crash_artifacts(
+                dir.path(),
+                "case",
+                &events,
+                &evidence,
+                "dm-flakey-versioned-hot",
+                "run-1",
+                "bucket",
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2254,7 +2715,7 @@ mod tests {
                 "target": {"kind": "rustfs-volume", "path": "/data/rustfs0"},
                 "target_proof": {"required": true, "artifact": "target-proof.json"},
                 "selection": {"kind": "percent", "value": 20},
-                "target_proof": ["test fixture proves selected target"],
+                "target_proof_requirements": ["test fixture proves selected target"],
                 "fault_duration_seconds": 60,
                 "observability": "chaos",
                 "conflict_domain": "run-scoped IOChaos"

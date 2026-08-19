@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use crate::fault::{
     config::FaultTestConfig,
-    workload::{WorkloadHotspot, WorkloadOperationMix},
+    workload::{
+        WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadClass, WorkloadPayloadDistribution,
+    },
 };
 
 pub const IO_EIO_SCENARIO: &str = "io-eio";
@@ -103,6 +105,7 @@ impl FaultScenarioWorkloadProfile {
                 config.workload_versioning = true;
                 config.workload_operation_mix =
                     versioned_hot_mutation_mix(config.workload.object_count);
+                config.workload_payload_distribution = Some(versioned_hot_payload_distribution());
                 config.workload_hotspot = Some(WorkloadHotspot {
                     object_percent: 10,
                     operation_percent: 80,
@@ -263,6 +266,29 @@ fn versioned_hot_mutation_mix(object_count: usize) -> WorkloadOperationMix {
     }
 }
 
+fn versioned_hot_payload_distribution() -> WorkloadPayloadDistribution {
+    WorkloadPayloadDistribution {
+        classes: vec![
+            WorkloadPayloadClass {
+                size_bytes: 4 * 1024,
+                weight: 25,
+            },
+            WorkloadPayloadClass {
+                size_bytes: 64 * 1024,
+                weight: 25,
+            },
+            WorkloadPayloadClass {
+                size_bytes: 2 * 1024 * 1024,
+                weight: 30,
+            },
+            WorkloadPayloadClass {
+                size_bytes: 8 * 1024 * 1024,
+                weight: 20,
+            },
+        ],
+    }
+}
+
 pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     FaultScenarioSpec {
         scenario: IO_EIO_SCENARIO,
@@ -337,6 +363,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         priority: FaultPriority::P1,
         backend: FaultBackend::ChaosMeshNetworkChaos,
         status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
         isolation: FaultIsolation::ReusableTenant,
         crds: &[NETWORKCHAOS_CRD],
         required_tools: &[],
@@ -346,6 +373,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         boundary: "rustfs-workload/network-partition-write-quorum",
         ci_phase: "faults",
         target: "exactly two RustFS Pods selected by tenant label, fully isolated from the remaining peers (and each other); on the reference 4-server single-pool tenant this removes exactly half the drives of the single erasure set, so write quorum (data+1) is unreachable during the fault",
+        target_proof: &[
+            "live target proof must establish the reference single-erasure-set topology before fault activation",
+            "the selected target set must contain exactly two RustFS Pods",
+        ],
         validation: "the runner preflight proves the tenant matches a reference single-erasure-set topology (4 servers, 4 or 8 drives, data == parity) so the two-Pod partition provably breaks write quorum; writes during the outage fail cleanly instead of half-committing; successful reads never return wrong hashes; after the partition heals every committed object and version is re-readable with intact content (post-return zero-loss), and Tenant recovers Ready",
         observability: "history.jsonl, workload-summary.json, checker-report.json, checker-pre-recommit-report.json, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
         conflict_domain: "run-scoped NetworkChaos resource; must not overlap with PodChaos or IOChaos in the same Tenant",
@@ -595,7 +626,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     FaultScenarioSpec {
         scenario: DM_FLAKEY_VERSIONED_HOT_SCENARIO,
         case_name: "fault_dm_flakey_versioned_hot_preserves_version_lineage",
-        description: "Use the existing device-mapper flakey backend while forcing versioned hot-key overwrite/delete/MPU workload checks as the first executable durability proxy.",
+        description: "Exercise a single-volume soft-power-loss durability proxy: silently drop block writes, crash the owning Pod, unmount to discard cached state, restore and remount the device, then verify versioned hot-key lineage after recovery.",
         priority: FaultPriority::P1,
         backend: FaultBackend::DeviceMapper,
         status: FaultScenarioStatus::Executable,
@@ -605,22 +636,24 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
-        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
-        boundary: "rustfs-workload/versioned-block-device-durability",
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-workload/single-volume-soft-power-loss",
         ci_phase: "faults",
         target: "one dedicated Linux block-device-backed PV used only by the e2e Tenant, with versioned S3 mutations concentrated on hot keys",
         target_proof: &[
-            "dmsetup table/status must identify the dedicated mapped device before activation",
+            "dmsetup table/status must prove an always-down flakey drop_writes table on the dedicated mapped device",
+            "the owning Pod must be force-deleted while drop_writes remains active and the filesystem must be unmounted before the healthy table is restored",
+            "the mapped filesystem must be remounted and the owning Pod identity must change before recovery verification",
             "run-spec workload.versioning must be true and workload.hotspot must be present",
         ],
-        validation: "all committed object versions are re-read by versionId after recovery, delete markers remain latest for deleted keys, hot overwrite/delete/MPU operations are exercised during the block-device fault, and successful reads never return corrupt bytes",
-        observability: "run-spec.json/yaml, workload-plan.json, history.jsonl, checker-report.json, dmsetup table/status, kernel logs, PV mapping, events, RustFS logs",
+        validation: "the crash window contains at least one versioned mutation acknowledged while drop_writes is active; after forced Pod loss, unmount, healthy-table restore and remount, all committed object versions are re-read by versionId, delete markers remain latest, and successful reads never return corrupt bytes; because only one EC volume is lost this is a negative-control proxy, not quorum-loss proof",
+        observability: "run-spec.json/yaml, workload-plan.json, history.jsonl, crash-window-evidence.json, dm-crash-boundary.json, dm-crash-recovered.json, checker-report.json, dmsetup table/status, mount identity, Pod UID transition, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {
         scenario: POD_CRASH_VERSIONED_HOT_SCENARIO,
         case_name: "fault_pod_crash_versioned_hot_preserves_version_lineage",
-        description: "Kill one RustFS Pod with Chaos Mesh while forcing versioned hot-key overwrite/delete/MPU workload checks as a Kubernetes recovery durability proxy.",
+        description: "Negative-control recovery test: kill one RustFS Pod while forcing versioned hot-key overwrite/delete/MPU checks; single-Pod loss stays within EC redundancy, so a green run validates recovery plumbing but is not physical-durability evidence.",
         priority: FaultPriority::P1,
         backend: FaultBackend::ChaosMeshPodChaos,
         status: FaultScenarioStatus::Executable,
@@ -630,12 +663,13 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
-        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
-        boundary: "rustfs-workload/versioned-pod-recovery-durability",
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-workload/versioned-pod-recovery",
         ci_phase: "faults",
         target: "one RustFS Pod selected by tenant label, with versioned S3 mutations concentrated on hot keys during pod restart",
         target_proof: &[
             "podchaos manifest/describe output must identify exactly one selected RustFS Pod",
+            "the selected Pod UID must disappear and its replacement UID or restart evidence must be recorded",
             "run-spec workload.versioning must be true and workload.hotspot must be present",
         ],
         validation: "the killed Pod is recreated, Tenant returns Ready, all committed object versions are re-read by versionId, delete markers remain latest for deleted keys, hot overwrite/delete/MPU operations are exercised, and successful reads never return corrupt bytes",
@@ -988,7 +1022,9 @@ mod tests {
         scenario_spec,
     };
     use crate::fault::config::{FaultTestConfig, FaultWorkloadProfile};
-    use crate::fault::workload::{WorkloadHotspot, WorkloadOperationMix};
+    use crate::fault::workload::{
+        WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadClass, WorkloadPayloadDistribution,
+    };
     use std::time::Duration;
 
     #[test]
@@ -1095,6 +1131,29 @@ mod tests {
             Some(WorkloadHotspot {
                 object_percent: 10,
                 operation_percent: 80,
+            })
+        );
+        assert_eq!(
+            config.workload_payload_distribution,
+            Some(WorkloadPayloadDistribution {
+                classes: vec![
+                    WorkloadPayloadClass {
+                        size_bytes: 4 * 1024,
+                        weight: 25,
+                    },
+                    WorkloadPayloadClass {
+                        size_bytes: 64 * 1024,
+                        weight: 25,
+                    },
+                    WorkloadPayloadClass {
+                        size_bytes: 2 * 1024 * 1024,
+                        weight: 30,
+                    },
+                    WorkloadPayloadClass {
+                        size_bytes: 8 * 1024 * 1024,
+                        weight: 20,
+                    },
+                ],
             })
         );
         assert!(FaultScenario::from_config(&config).is_ok());

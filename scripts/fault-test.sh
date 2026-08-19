@@ -284,10 +284,13 @@ validate_runtime_env_contract() {
 }
 
 validate_dm_env_contract() {
+  local scenario="$1"
   require_nonempty_env RUSTFS_FAULT_TEST_DM_NAME
   require_nonempty_env RUSTFS_FAULT_TEST_DM_NODE
   require_nonempty_env RUSTFS_FAULT_TEST_DM_MOUNT_PATH
-  require_nonempty_env RUSTFS_FAULT_TEST_DM_FAULT_TABLE
+  if [[ "$scenario" == "dm-flakey" ]]; then
+    require_nonempty_env RUSTFS_FAULT_TEST_DM_FAULT_TABLE
+  fi
 
   require_safe_dm_name RUSTFS_FAULT_TEST_DM_NAME "$RUSTFS_FAULT_TEST_DM_NAME"
   require_safe_node_name RUSTFS_FAULT_TEST_DM_NODE "$RUSTFS_FAULT_TEST_DM_NODE"
@@ -452,8 +455,8 @@ require_storage_class() {
   provisioner="$(kubectl_cluster get storageclass "$storage_class" -o json | jq -r '.provisioner // ""')"
   [[ -n "$provisioner" ]] || die "StorageClass $storage_class has no provisioner"
 
-  if [[ "$scenario" == "dm-flakey" ]]; then
-    [[ "$provisioner" == "kubernetes.io/no-provisioner" ]] || die "dm-flakey requires a no-provisioner StorageClass"
+  if scenario_requires_static_storage "$scenario"; then
+    [[ "$provisioner" == "kubernetes.io/no-provisioner" ]] || die "$scenario requires a no-provisioner StorageClass"
     pv_count="$(kubectl_cluster get pv -o json | jq -r --arg storage_class "$storage_class" '
       [.items[]
         | select(.spec.storageClassName == $storage_class)
@@ -461,7 +464,7 @@ require_storage_class() {
         | select(.spec.capacity.storage == "100Gi")]
       | length
     ')"
-    [[ "$pv_count" -eq 4 ]] || die "dm-flakey requires exactly four Available/Bound 100Gi PVs, found $pv_count"
+    [[ "$pv_count" -eq 4 ]] || die "$scenario requires exactly four Available/Bound 100Gi PVs, found $pv_count"
   else
     [[ "$provisioner" != "kubernetes.io/no-provisioner" ]] || die "non-static scenarios require dynamic provisioning"
   fi
@@ -508,10 +511,10 @@ preflight() {
   for tool in $(scenario_required_tools "$scenario"); do
     require_command "$tool"
   done
-  if [[ "$scenario" == "dm-flakey" ]]; then
-    validate_dm_env_contract
-    kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 || die "dm-flakey requires a pre-created owned fault namespace with privileged Pod Security"
-    [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] || die "dm-flakey requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
+  if scenario_requires_static_storage "$scenario"; then
+    validate_dm_env_contract "$scenario"
+    kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 || die "$scenario requires a pre-created owned fault namespace with privileged Pod Security"
+    [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] || die "$scenario requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
   fi
 
   echo "preflight passed: context=$FAULT_CONTEXT scenario=$scenario nodes=$ready_nodes storageClass=${RUSTFS_FAULT_TEST_STORAGE_CLASS} objects=$WORKLOAD_OBJECTS concurrency=$WORKLOAD_CONCURRENCY pods=$RUSTFS_POD_COUNT volume=$RUSTFS_VOLUME_PATH"
@@ -804,7 +807,7 @@ run_scenario() {
   baseline_ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
   baseline_tenants="$artifacts/baseline-non-fault-tenants.tsv"
   list_non_fault_tenants >"$baseline_tenants"
-  if [[ "$scenario" == "dm-flakey" ]]; then
+  if scenario_requires_static_storage "$scenario"; then
     require_chaos=false
   else
     require_chaos=true

@@ -28,7 +28,9 @@ use crate::{
             FaultDeleteTimeoutRecoveryRequest, FaultLifecyclePort,
         },
         fixture,
-        history::{ByteRange, DurabilityCohort, OperationOutcome, OperationRecord, Recorder},
+        history::{
+            ByteRange, DurabilityCohort, OperationKind, OperationOutcome, OperationRecord, Recorder,
+        },
         plan::{FaultInjection, FaultPlan, FaultPlanOptions, WRITE_QUORUM_LOSS_PARTITION_TARGETS},
         pods::{
             rustfs_pod_identities, rustfs_target_inventory, wait_for_rustfs_pod_deletion,
@@ -1150,6 +1152,91 @@ async fn run_fault_case(
         Some(serde_json::json!({ "snapshots": workload_snapshots.len() })),
     )?;
 
+    if fault.requires_recovery_boundary() {
+        events.record(
+            "crash-recovery-boundary",
+            RunEventStatus::Started,
+            "proving an acknowledged mutation and forcing the backend-owned crash boundary",
+            None,
+        )?;
+        let crash_boundary_started_at_ms = now_ms();
+        let crash_window_evidence = match crash_window_evidence(
+            &history.records(),
+            &scenario.name,
+            &run_id,
+            fault_active_at_ms,
+            crash_boundary_started_at_ms,
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                events
+                    .record(
+                        "crash-recovery-boundary",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "crash-recovery-boundary",
+                        "no_signal",
+                        error.to_string(),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
+        collector.write_text(
+            scenario.case_name,
+            "crash-window-evidence.json",
+            &serde_json::to_string_pretty(&crash_window_evidence)?,
+        )?;
+        if let Err(error) =
+            fault.prepare_recovery_boundary(cluster.timeout, crash_boundary_started_at_ms)
+        {
+            events
+                .record(
+                    "crash-recovery-boundary",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    Some(serde_json::json!({
+                        "trigger_operation_id": crash_window_evidence.trigger_operation_id,
+                    })),
+                )
+                .ok();
+            collect_fault_artifacts(
+                collector,
+                scenario.case_name,
+                &fault,
+                "crash-boundary-failed",
+            )?;
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "crash-recovery-boundary",
+                    "environment_or_fault_backend",
+                    error.to_string(),
+                ),
+            )?;
+            return Err(error);
+        }
+        events.record(
+            "crash-recovery-boundary",
+            RunEventStatus::Succeeded,
+            "target Pod was force-deleted and the filesystem was unmounted while drop_writes remained active",
+            Some(serde_json::json!({
+                "trigger_operation_id": crash_window_evidence.trigger_operation_id,
+                "ack_to_crash_boundary_ms": crash_window_evidence.ack_to_crash_boundary_ms,
+            })),
+        )?;
+    }
+
     events.record(
         "fault-delete",
         RunEventStatus::Started,
@@ -1808,6 +1895,13 @@ fn require_fault_backends(config: &FaultTestConfig, plan: &FaultPlan) -> Result<
     for backend in plan.required_backends() {
         require_fault_backend(config, backend)?;
     }
+    for fault in plan
+        .faults()
+        .iter()
+        .filter(|fault| fault.backend() == FaultBackend::DeviceMapper)
+    {
+        host::validate_config(config, fault.kind())?;
+    }
     // The write-quorum-loss topology proof deliberately does NOT run here: this
     // preflight runs before prepare_fault_fixture creates the Tenant, so
     // reading the Tenant's pool geometry would NotFound on a fresh run. The
@@ -1892,7 +1986,7 @@ fn require_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Res
         FaultBackend::ChaosMeshPodChaos => chaos_mesh::require_podchaos_crd(cluster),
         FaultBackend::ChaosMeshNetworkChaos => chaos_mesh::require_networkchaos_crd(cluster),
         FaultBackend::ChaosMeshStressChaos => chaos_mesh::require_stresschaos_crd(cluster),
-        FaultBackend::DeviceMapper => require_dm_flakey_preflight(config),
+        FaultBackend::DeviceMapper => Ok(()),
         FaultBackend::PlannedReliabilityWorkflow => {
             bail!("planned reliability workflow scenarios are catalog-only and cannot execute yet")
         }
@@ -1908,26 +2002,6 @@ where
         .args(args)
         .run_checked()
         .with_context(|| format!("{program} is required for the selected fault scenario"))?;
-    Ok(())
-}
-
-fn require_dm_flakey_preflight(config: &FaultTestConfig) -> Result<()> {
-    config
-        .dm_name
-        .as_deref()
-        .context("RUSTFS_FAULT_TEST_DM_NAME is required for dm-flakey")?;
-    config
-        .dm_node
-        .as_deref()
-        .context("RUSTFS_FAULT_TEST_DM_NODE is required for dm-flakey")?;
-    config
-        .dm_mount_path
-        .as_deref()
-        .context("RUSTFS_FAULT_TEST_DM_MOUNT_PATH is required for dm-flakey")?;
-    config
-        .dm_fault_table
-        .as_deref()
-        .context("RUSTFS_FAULT_TEST_DM_FAULT_TABLE is required for dm-flakey")?;
     Ok(())
 }
 
@@ -2248,6 +2322,14 @@ impl FaultLifecyclePort for DmFlakeyFaultHandle {
     fn ensure_active(&self, stage: &str) -> Result<()> {
         self.guard.ensure_active(stage)?;
         Ok(())
+    }
+
+    fn requires_recovery_boundary(&self) -> bool {
+        self.guard.requires_crash_boundary()
+    }
+
+    fn prepare_recovery_boundary(&mut self, timeout: Duration, started_at_ms: u64) -> Result<()> {
+        self.guard.prepare_recovery_boundary(timeout, started_at_ms)
     }
 
     fn delete(&mut self, _timeout: Duration) -> Result<()> {
@@ -3665,6 +3747,73 @@ struct MixedWorkloadResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CrashWindowEvidence {
+    scenario: String,
+    run_id: String,
+    fault_active_at_ms: u64,
+    crash_boundary_started_at_ms: u64,
+    committed_versioned_mutations: usize,
+    trigger_operation_id: String,
+    trigger_kind: OperationKind,
+    trigger_key: String,
+    trigger_version_id: String,
+    trigger_acknowledged_at_ms: u64,
+    ack_to_crash_boundary_ms: u64,
+}
+
+fn crash_window_evidence(
+    records: &[OperationRecord],
+    scenario: &str,
+    run_id: &str,
+    fault_active_at_ms: u64,
+    crash_boundary_started_at_ms: u64,
+) -> Result<CrashWindowEvidence> {
+    let committed = records
+        .iter()
+        .filter(|record| {
+            record.scenario == scenario
+                && record.outcome == OperationOutcome::Ok
+                && record.durability_cohort == Some(DurabilityCohort::FaultActive)
+                && matches!(
+                    record.kind,
+                    OperationKind::Put
+                        | OperationKind::Delete
+                        | OperationKind::CompleteMultipartUpload
+                )
+                && record.version_id.is_some()
+                && record.ended_at_ms >= fault_active_at_ms
+                && record.ended_at_ms <= crash_boundary_started_at_ms
+        })
+        .collect::<Vec<_>>();
+    let trigger = committed
+        .iter()
+        .max_by_key(|record| record.ended_at_ms)
+        .copied()
+        .context(
+            "drop_writes crash window contained no successfully acknowledged versioned PUT, DELETE marker, or multipart completion; refusing a vacuous durability verdict",
+        )?;
+    Ok(CrashWindowEvidence {
+        scenario: scenario.to_string(),
+        run_id: run_id.to_string(),
+        fault_active_at_ms,
+        crash_boundary_started_at_ms,
+        committed_versioned_mutations: committed.len(),
+        trigger_operation_id: trigger.id.clone(),
+        trigger_kind: trigger.kind,
+        trigger_key: trigger
+            .key
+            .clone()
+            .context("crash trigger mutation is missing its object key")?,
+        trigger_version_id: trigger
+            .version_id
+            .clone()
+            .context("crash trigger mutation is missing its version id")?,
+        trigger_acknowledged_at_ms: trigger.ended_at_ms,
+        ack_to_crash_boundary_ms: crash_boundary_started_at_ms.saturating_sub(trigger.ended_at_ms),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct WorkloadSummary {
     seed: u64,
     object_count: usize,
@@ -3823,8 +3972,7 @@ mod tests {
         stable_pod_fingerprint, target_pods_from_json, unmount_success_log_lines, warp_bucket_name,
         write_quorum_loss_topology_shape,
     };
-    use crate::fault::history::ByteRange;
-    use crate::fault::history::OperationOutcome;
+    use crate::fault::history::{ByteRange, OperationOutcome, OperationRecord};
 
     /// The ranged-GET sampler must be a pure function of (seed, index): zero
     /// percent and tiny objects never sample, derived ranges always stay in
@@ -4263,6 +4411,67 @@ mod tests {
 
         assert!(summary.require_fault_evidence(false).is_ok());
         assert!(summary.require_fault_evidence(true).is_err());
+    }
+
+    #[test]
+    fn crash_window_evidence_selects_the_latest_versioned_mutation_ack() {
+        let records = [
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-1",
+                "scenario": "dm-flakey-versioned-hot",
+                "kind": "put",
+                "bucket": "bucket",
+                "key": "key-a",
+                "value_sha256": "abc",
+                "size_bytes": 4096,
+                "version_id": "version-a",
+                "started_at_ms": 110,
+                "ended_at_ms": 120,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "fault_active",
+                "fault_window_relation": "during_fault"
+            }))
+            .expect("first record"),
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-2",
+                "scenario": "dm-flakey-versioned-hot",
+                "kind": "delete",
+                "bucket": "bucket",
+                "key": "key-b",
+                "value_sha256": null,
+                "size_bytes": null,
+                "version_id": "delete-marker-b",
+                "started_at_ms": 130,
+                "ended_at_ms": 140,
+                "outcome": "ok",
+                "http_status": 204,
+                "error": null,
+                "durability_cohort": "fault_active",
+                "fault_window_relation": "during_fault"
+            }))
+            .expect("second record"),
+        ];
+
+        let evidence =
+            super::crash_window_evidence(&records, "dm-flakey-versioned-hot", "run-1", 100, 150)
+                .expect("evidence");
+
+        assert_eq!(evidence.scenario, "dm-flakey-versioned-hot");
+        assert_eq!(evidence.run_id, "run-1");
+        assert_eq!(evidence.committed_versioned_mutations, 2);
+        assert_eq!(evidence.trigger_operation_id, "op-2");
+        assert_eq!(evidence.trigger_version_id, "delete-marker-b");
+        assert_eq!(evidence.ack_to_crash_boundary_ms, 10);
+    }
+
+    #[test]
+    fn crash_window_evidence_rejects_a_vacuous_window() {
+        assert!(
+            super::crash_window_evidence(&[], "dm-flakey-versioned-hot", "run-1", 100, 150,)
+                .is_err()
+        );
     }
 
     #[test]
