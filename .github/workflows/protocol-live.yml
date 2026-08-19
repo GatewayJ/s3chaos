@@ -1,0 +1,102 @@
+name: RustFS protocol live gate
+
+on:
+  schedule:
+    - cron: "17 18 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: protocol-live-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFS_PROTOCOL_TEST_DEDICATED: "1"
+
+jobs:
+  native-regression:
+    name: Native full regression
+    runs-on: [self-hosted, linux, rustfs-protocol]
+    environment: rustfs-protocol-test
+    timeout-minutes: 60
+    env:
+      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
+      RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
+      RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate live test configuration
+        run: |
+          test -n "$RUSTFS_PROTOCOL_TEST_ENDPOINT"
+          test -n "$RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY"
+          test -n "$RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY"
+      - name: Run native full regression
+        run: scripts/protocol-test.sh suite-run protocol/examples/full-regression.yaml
+      - name: Upload native artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-native-${{ github.run_id }}
+          path: target/protocol-tests
+          if-no-files-found: error
+
+  expiration-regression:
+    name: STS expiration regression
+    needs: native-regression
+    if: always()
+    runs-on: [self-hosted, linux, rustfs-protocol]
+    environment: rustfs-protocol-test
+    timeout-minutes: 30
+    env:
+      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
+      RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
+      RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate live test configuration
+        run: |
+          test -n "$RUSTFS_PROTOCOL_TEST_ENDPOINT"
+          test -n "$RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY"
+          test -n "$RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY"
+      - name: Run STS expiration regression
+        run: scripts/protocol-test.sh suite-run protocol/examples/slow-regression.yaml
+      - name: Upload expiration artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-expiration-${{ github.run_id }}
+          path: target/protocol-tests
+          if-no-files-found: error
+
+  mint-regression:
+    name: Mint strict compatibility
+    needs: expiration-regression
+    if: always()
+    runs-on: [self-hosted, linux, rustfs-protocol]
+    environment: rustfs-protocol-test
+    timeout-minutes: 60
+    env:
+      RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
+      RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
+      RUSTFS_PROTOCOL_COMPAT_SERVER_ENDPOINT: ${{ secrets.RUSTFS_PROTOCOL_COMPAT_SERVER_ENDPOINT }}
+      RUSTFS_PROTOCOL_COMPAT_STRICT: "1"
+      RUSTFS_PROTOCOL_COMPAT_ARTIFACTS_DIR: target/protocol-compatibility/mint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Mint configuration
+        run: |
+          command -v docker
+          test -n "$RUSTFS_PROTOCOL_COMPAT_SERVER_ENDPOINT"
+          test -n "$RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY"
+          test -n "$RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY"
+      - name: Run strict Mint compatibility gate
+        run: bash scripts/protocol-compatibility.sh mint
+      - name: Upload Mint artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-mint-${{ github.run_id }}
+          path: target/protocol-compatibility/mint
+          if-no-files-found: error

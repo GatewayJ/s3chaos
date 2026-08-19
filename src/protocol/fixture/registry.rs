@@ -40,12 +40,14 @@ pub enum ResourceState {
 pub enum ResourceKind {
     Bucket,
     BucketPolicy,
+    PublicAccessBlock,
     ExternalIdentitySubject,
     IamGroup,
     IamGroupMembership,
     IamPolicy,
     IamPolicyAttachment,
     IamUser,
+    MultipartUpload,
     ObjectPrefix,
     StsSession,
 }
@@ -55,12 +57,14 @@ impl ResourceKind {
         match self {
             Self::Bucket => "bucket",
             Self::BucketPolicy => "bucket-policy",
+            Self::PublicAccessBlock => "public-access-block",
             Self::ExternalIdentitySubject => "external-identity-subject",
             Self::IamGroup => "iam-group",
             Self::IamGroupMembership => "iam-group-membership",
             Self::IamPolicy => "iam-policy",
             Self::IamPolicyAttachment => "iam-policy-attachment",
             Self::IamUser => "iam-user",
+            Self::MultipartUpload => "multipart-upload",
             Self::ObjectPrefix => "object-prefix",
             Self::StsSession => "sts-session",
         }
@@ -68,7 +72,10 @@ impl ResourceKind {
 
     fn cleanup_rank(self) -> usize {
         match self {
-            Self::BucketPolicy | Self::IamPolicyAttachment => 0,
+            Self::BucketPolicy
+            | Self::PublicAccessBlock
+            | Self::IamPolicyAttachment
+            | Self::MultipartUpload => 0,
             Self::ObjectPrefix | Self::IamGroupMembership => 1,
             Self::IamPolicy => 2,
             Self::IamGroup | Self::ExternalIdentitySubject => 3,
@@ -108,6 +115,8 @@ pub struct ResourceHandle {
     pub identity_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_identity: Option<ProtocolExternalIdentityCoordinates>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -141,6 +150,7 @@ struct ResourcePlan {
     is_group: Option<bool>,
     identity_provider: Option<String>,
     external_identity: Option<ProtocolExternalIdentityCoordinates>,
+    upload_id: Option<String>,
 }
 
 impl ResourceRegistry {
@@ -220,6 +230,7 @@ impl ResourceRegistry {
             is_group: None,
             identity_provider: None,
             external_identity: None,
+            upload_id: None,
         })
     }
 
@@ -241,6 +252,7 @@ impl ResourceRegistry {
             is_group: plan.is_group,
             identity_provider: plan.identity_provider,
             external_identity: plan.external_identity,
+            upload_id: plan.upload_id,
             last_error: None,
         };
         ensure!(
@@ -298,7 +310,67 @@ impl ResourceRegistry {
             is_group: None,
             identity_provider: None,
             external_identity: None,
+            upload_id: None,
         })
+    }
+
+    pub fn plan_multipart_upload(
+        &mut self,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        owning_case_id: impl Into<String>,
+        depends_on: Vec<String>,
+    ) -> Result<ResourceHandle> {
+        let bucket = bucket.into();
+        let key = key.into();
+        self.plan_internal(ResourcePlan {
+            kind: ResourceKind::MultipartUpload,
+            name: format!("{bucket}/{key}"),
+            owning_case_id: owning_case_id.into(),
+            owner_phase: "case".to_string(),
+            depends_on,
+            bucket: Some(bucket),
+            key_prefix: Some(key),
+            policy: None,
+            principal: None,
+            group: None,
+            member: None,
+            is_group: None,
+            identity_provider: None,
+            external_identity: None,
+            upload_id: None,
+        })
+    }
+
+    pub fn set_multipart_upload_id(&mut self, resource_id: &str, upload_id: &str) -> Result<()> {
+        ensure!(
+            !upload_id.is_empty(),
+            "multipart upload id must not be empty"
+        );
+        let resource = self
+            .resources
+            .iter_mut()
+            .find(|resource| resource.id == resource_id)
+            .with_context(|| format!("unknown resource handle {resource_id}"))?;
+        ensure!(
+            resource.kind == ResourceKind::MultipartUpload,
+            "resource {resource_id} is not a multipart upload"
+        );
+        ensure!(
+            resource.upload_id.is_none() || resource.upload_id.as_deref() == Some(upload_id),
+            "multipart upload id is immutable once recorded"
+        );
+        let previous = resource.upload_id.replace(upload_id.to_string());
+        if let Err(error) = self.persist() {
+            let resource = self
+                .resources
+                .iter_mut()
+                .find(|resource| resource.id == resource_id)
+                .expect("resource remains present after persist failure");
+            resource.upload_id = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn plan_policy_attachment(
@@ -345,6 +417,7 @@ impl ResourceRegistry {
             is_group: Some(is_group),
             identity_provider: None,
             external_identity: None,
+            upload_id: None,
         })
     }
 
@@ -383,6 +456,7 @@ impl ResourceRegistry {
             is_group: None,
             identity_provider: None,
             external_identity: None,
+            upload_id: None,
         })
     }
 
@@ -458,6 +532,7 @@ impl ResourceRegistry {
             is_group: None,
             identity_provider: Some(provider.into()),
             external_identity: None,
+            upload_id: None,
         })
     }
 
@@ -483,6 +558,7 @@ impl ResourceRegistry {
             is_group: None,
             identity_provider: None,
             external_identity: Some(external_identity),
+            upload_id: None,
         })
     }
 

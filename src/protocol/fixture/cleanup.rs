@@ -223,6 +223,21 @@ async fn verify_resource_absent(
                 resource.name
             ))),
         },
+        ResourceKind::PublicAccessBlock => match s3.get_public_access_block(&resource.name).await {
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "NoSuchPublicAccessBlockConfiguration" | "NoSuchBucket"
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(CleanupError::S3(error)),
+            Ok(_) => Err(CleanupError::NotConverged(format!(
+                "public access block {} is still visible after deletion",
+                resource.name
+            ))),
+        },
         ResourceKind::ExternalIdentitySubject => {
             let provider = external_identity.ok_or_else(|| {
                 CleanupError::Contract("external identity cleanup port is unavailable".to_string())
@@ -235,6 +250,26 @@ async fn verify_resource_absent(
                     resource.name
                 ))),
                 Err(error) => Err(CleanupError::ExternalIdentity(error)),
+            }
+        }
+        ResourceKind::MultipartUpload => {
+            let bucket = resource.bucket.as_deref().ok_or_else(|| {
+                CleanupError::Contract("multipart upload resource omitted bucket".to_string())
+            })?;
+            let key = resource.key_prefix.as_deref().ok_or_else(|| {
+                CleanupError::Contract("multipart upload resource omitted object key".to_string())
+            })?;
+            let uploads = s3
+                .list_multipart_uploads(bucket, key)
+                .await
+                .map_err(CleanupError::S3)?;
+            if uploads.is_empty() {
+                Ok(())
+            } else {
+                Err(CleanupError::NotConverged(format!(
+                    "{} multipart upload(s) remain for {bucket}/{key}",
+                    uploads.len()
+                )))
             }
         }
         ResourceKind::ObjectPrefix => {
@@ -363,6 +398,31 @@ async fn cleanup_resource(
             .delete_bucket_policy(&resource.name)
             .await
             .map_err(CleanupError::S3),
+        ResourceKind::PublicAccessBlock => s3
+            .delete_public_access_block(&resource.name)
+            .await
+            .map_err(CleanupError::S3),
+        ResourceKind::MultipartUpload => {
+            let bucket = resource.bucket.as_deref().ok_or_else(|| {
+                CleanupError::Contract("multipart upload resource omitted bucket".to_string())
+            })?;
+            let key = resource.key_prefix.as_deref().ok_or_else(|| {
+                CleanupError::Contract("multipart upload resource omitted object key".to_string())
+            })?;
+            let upload_ids = if let Some(upload_id) = &resource.upload_id {
+                vec![upload_id.clone()]
+            } else {
+                s3.list_multipart_uploads(bucket, key)
+                    .await
+                    .map_err(CleanupError::S3)?
+            };
+            for upload_id in upload_ids {
+                s3.abort_multipart_upload(bucket, key, &upload_id)
+                    .await
+                    .map_err(CleanupError::S3)?;
+            }
+            Ok(())
+        }
         ResourceKind::ExternalIdentitySubject => {
             let provider = external_identity.ok_or_else(|| {
                 CleanupError::Contract("external identity cleanup port is unavailable".to_string())
@@ -471,12 +531,19 @@ impl CleanupError {
             (ResourceKind::BucketPolicy, Self::S3(error)) => {
                 matches!(error.code.as_str(), "NoSuchBucketPolicy" | "NoSuchBucket")
             }
+            (ResourceKind::PublicAccessBlock, Self::S3(error)) => matches!(
+                error.code.as_str(),
+                "NoSuchPublicAccessBlockConfiguration" | "NoSuchBucket"
+            ),
             (ResourceKind::ExternalIdentitySubject, Self::ExternalIdentity(error)) => {
                 error.code == "NoSuchExternalIdentitySubject"
             }
             (ResourceKind::Bucket, Self::S3(error)) => error.code == "NoSuchBucket",
             (ResourceKind::ObjectPrefix, Self::S3(error)) => {
                 matches!(error.code.as_str(), "NoSuchBucket" | "NoSuchKey")
+            }
+            (ResourceKind::MultipartUpload, Self::S3(error)) => {
+                matches!(error.code.as_str(), "NoSuchBucket" | "NoSuchUpload")
             }
             (ResourceKind::IamUser, Self::Admin(error)) => {
                 matches!(error.code.as_str(), "NoSuchUser" | "NoSuchEntity")
@@ -575,6 +642,7 @@ mod tests {
         version_list_calls: Arc<AtomicUsize>,
         versions: Arc<Mutex<Vec<ProtocolObjectVersion>>>,
         objects: Arc<Mutex<Vec<String>>>,
+        multipart_uploads: Arc<Mutex<Vec<(String, String, String)>>>,
     }
 
     #[derive(Clone)]
@@ -906,6 +974,40 @@ mod tests {
                 .retain(|version| version.key != key || version.version_id != version_id);
             Ok(())
         }
+
+        async fn abort_multipart_upload(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+        ) -> std::result::Result<(), ProtocolS3Error> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(format!("abort-multipart:{bucket}:{key}:{upload_id}"));
+            self.multipart_uploads
+                .lock()
+                .expect("multipart uploads")
+                .retain(|upload| {
+                    upload != &(bucket.to_string(), key.to_string(), upload_id.to_string())
+                });
+            Ok(())
+        }
+
+        async fn list_multipart_uploads(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
+            Ok(self
+                .multipart_uploads
+                .lock()
+                .expect("multipart uploads")
+                .iter()
+                .filter(|upload| upload.0 == bucket && upload.1 == key)
+                .map(|upload| upload.2.clone())
+                .collect())
+        }
     }
 
     fn transient_error() -> ProtocolS3Error {
@@ -994,6 +1096,54 @@ mod tests {
                 "delete-version:key:v1",
                 "delete-version:key:marker",
                 "delete-object:current",
+                "delete-bucket:bucket",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_multipart_creation_is_discovered_aborted_and_verified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut registry =
+            ResourceRegistry::create(dir.path(), "run", fingerprint()).expect("registry");
+        let bucket = registry
+            .plan(ResourceKind::Bucket, "bucket", "case", Vec::new())
+            .expect("bucket");
+        registry
+            .transition(&bucket.id, ResourceState::Creating, None)
+            .expect("creating bucket");
+        registry
+            .transition(&bucket.id, ResourceState::Created, None)
+            .expect("created bucket");
+        let upload = registry
+            .plan_multipart_upload(
+                "bucket",
+                "cases/case/object",
+                "case",
+                vec![bucket.id.clone()],
+            )
+            .expect("multipart upload");
+        registry
+            .transition(&upload.id, ResourceState::Creating, None)
+            .expect("creating multipart upload");
+        let s3 = FakeS3 {
+            multipart_uploads: Arc::new(Mutex::new(vec![(
+                "bucket".to_string(),
+                "cases/case/object".to_string(),
+                "upload-1".to_string(),
+            )])),
+            ..FakeS3::default()
+        };
+
+        let report = cleanup_registered_resources(&mut registry, &FakeAdmin, &s3).await;
+
+        assert!(report.succeeded, "{report:?}");
+        assert!(registry.pending_cleanup().next().is_none());
+        assert!(s3.multipart_uploads.lock().expect("uploads").is_empty());
+        assert_eq!(
+            *s3.calls.lock().expect("calls"),
+            vec![
+                "abort-multipart:bucket:cases/case/object:upload-1",
                 "delete-bucket:bucket",
             ]
         );

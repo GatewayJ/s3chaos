@@ -106,7 +106,7 @@ where
             )
             .await
         }
-        "s3-compatibility" => {
+        "s3-compatibility" | "public-access-block" => {
             compatibility::run_compatibility_case(case_id, namer, registry, services.admin_s3).await
         }
         "iam-user" | "iam-policy" | "iam-group" => {

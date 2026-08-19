@@ -20,12 +20,19 @@ use aws_sdk_s3::{
     config::Region,
     error::{ProvideErrorMetadata, SdkError},
     primitives::ByteStream,
+    types::{
+        BucketVersioningStatus, CompletedMultipartUpload, CompletedPart as AwsCompletedPart,
+        Delete, ObjectIdentifier, PublicAccessBlockConfiguration,
+    },
 };
 use std::fmt::Debug;
 
 use crate::protocol::{
     credentials::{ActorCredential, AdminCredentials},
-    ports::{ActorS3ClientFactory, ProtocolObjectVersion, ProtocolS3Error, ProtocolS3Port},
+    ports::{
+        ActorS3ClientFactory, ProtocolCompletedPart, ProtocolListObjectsResult,
+        ProtocolObjectVersion, ProtocolPublicAccessBlock, ProtocolS3Error, ProtocolS3Port,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -149,6 +156,16 @@ impl ProtocolS3Client {
         Ok(())
     }
 
+    pub async fn head_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+        self.client
+            .head_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?;
+        Ok(())
+    }
+
     pub async fn put_bucket_policy(
         &self,
         bucket: &str,
@@ -191,8 +208,16 @@ impl ProtocolS3Client {
     }
 
     pub async fn list_objects(&self, bucket: &str) -> Result<Vec<String>, ProtocolS3Error> {
+        Ok(self.list_objects_v2_summary(bucket).await?.keys)
+    }
+
+    pub async fn list_objects_v2_summary(
+        &self,
+        bucket: &str,
+    ) -> Result<ProtocolListObjectsResult, ProtocolS3Error> {
         let mut continuation = None;
         let mut keys = Vec::new();
+        let mut key_count = 0usize;
         loop {
             let output = self
                 .client
@@ -208,6 +233,23 @@ impl ProtocolS3Client {
                     .iter()
                     .filter_map(|object| object.key().map(str::to_string)),
             );
+            let page_key_count = output.key_count().ok_or_else(|| ProtocolS3Error {
+                code: "MissingListObjectsV2KeyCount".to_string(),
+                status: Some(200),
+                request_id: None,
+            })?;
+            let page_key_count = usize::try_from(page_key_count).map_err(|_| ProtocolS3Error {
+                code: "InvalidListObjectsV2KeyCount".to_string(),
+                status: Some(200),
+                request_id: None,
+            })?;
+            key_count = key_count
+                .checked_add(page_key_count)
+                .ok_or_else(|| ProtocolS3Error {
+                    code: "InvalidListObjectsV2KeyCount".to_string(),
+                    status: Some(200),
+                    request_id: None,
+                })?;
             if !output.is_truncated().unwrap_or(false) {
                 break;
             }
@@ -216,7 +258,7 @@ impl ProtocolS3Client {
                 break;
             }
         }
-        Ok(keys)
+        Ok(ProtocolListObjectsResult { keys, key_count })
     }
 
     pub async fn put_object(
@@ -262,6 +304,289 @@ impl ProtocolS3Client {
             .delete_object()
             .bucket(bucket)
             .key(key)
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?;
+        Ok(())
+    }
+
+    pub async fn copy_object(
+        &self,
+        bucket: &str,
+        source_key: &str,
+        destination_key: &str,
+    ) -> Result<(), ProtocolS3Error> {
+        self.client
+            .copy_object()
+            .bucket(bucket)
+            .key(destination_key)
+            .copy_source(format!("{bucket}/{source_key}"))
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?;
+        Ok(())
+    }
+
+    pub async fn delete_objects(
+        &self,
+        bucket: &str,
+        keys: &[String],
+    ) -> Result<Vec<String>, ProtocolS3Error> {
+        let objects = keys
+            .iter()
+            .map(|key| {
+                ObjectIdentifier::builder()
+                    .key(key)
+                    .build()
+                    .map_err(|_| local_s3_error("BuildObjectIdentifier"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .build()
+            .map_err(|_| local_s3_error("BuildDeleteObjectsRequest"))?;
+        let output = self
+            .client
+            .delete_objects()
+            .bucket(bucket)
+            .delete(delete)
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?;
+        if let Some(error) = output.errors().first() {
+            return Err(ProtocolS3Error {
+                code: error
+                    .code()
+                    .unwrap_or("DeleteObjectsEntryFailed")
+                    .to_string(),
+                status: Some(200),
+                request_id: None,
+            });
+        }
+        Ok(output
+            .deleted()
+            .iter()
+            .filter_map(|deleted| deleted.key().map(str::to_string))
+            .collect())
+    }
+
+    pub async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<String, ProtocolS3Error> {
+        self.client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?
+            .upload_id()
+            .map(str::to_string)
+            .ok_or_else(|| local_s3_error("MissingMultipartUploadId"))
+    }
+
+    pub async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: &[u8],
+    ) -> Result<String, ProtocolS3Error> {
+        self.client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?
+            .e_tag()
+            .map(str::to_string)
+            .ok_or_else(|| local_s3_error("MissingMultipartPartEtag"))
+    }
+
+    pub async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[ProtocolCompletedPart],
+    ) -> Result<(), ProtocolS3Error> {
+        let parts = parts
+            .iter()
+            .map(|part| {
+                AwsCompletedPart::builder()
+                    .part_number(part.part_number)
+                    .e_tag(&part.etag)
+                    .build()
+            })
+            .collect::<Vec<_>>();
+        let upload = CompletedMultipartUpload::builder()
+            .set_parts(Some(parts))
+            .build();
+        self.client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(upload)
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?;
+        Ok(())
+    }
+
+    pub async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), ProtocolS3Error> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?;
+        Ok(())
+    }
+
+    pub async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<String>, ProtocolS3Error> {
+        let mut key_marker = None;
+        let mut upload_id_marker = None;
+        let mut upload_ids = Vec::new();
+        loop {
+            let output = self
+                .client
+                .list_multipart_uploads()
+                .bucket(bucket)
+                .prefix(key)
+                .set_key_marker(key_marker)
+                .set_upload_id_marker(upload_id_marker)
+                .send()
+                .await
+                .map_err(|error| protocol_s3_error(&error))?;
+            upload_ids.extend(output.uploads().iter().filter_map(|upload| {
+                (upload.key() == Some(key))
+                    .then(|| upload.upload_id().map(str::to_string))
+                    .flatten()
+            }));
+            if !output.is_truncated().unwrap_or(false) {
+                break;
+            }
+            key_marker = output.next_key_marker().map(str::to_string);
+            upload_id_marker = output.next_upload_id_marker().map(str::to_string);
+            if key_marker.is_none() && upload_id_marker.is_none() {
+                return Err(local_s3_error("InvalidMultipartUploadListing"));
+            }
+        }
+        Ok(upload_ids)
+    }
+
+    pub async fn put_bucket_versioning(
+        &self,
+        bucket: &str,
+        enabled: bool,
+    ) -> Result<(), ProtocolS3Error> {
+        self.client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                aws_sdk_s3::types::VersioningConfiguration::builder()
+                    .status(if enabled {
+                        BucketVersioningStatus::Enabled
+                    } else {
+                        BucketVersioningStatus::Suspended
+                    })
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?;
+        Ok(())
+    }
+
+    pub async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Vec<u8>, ProtocolS3Error> {
+        let output = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?;
+        output
+            .body
+            .collect()
+            .await
+            .map(|body| body.into_bytes().to_vec())
+            .map_err(|_| local_s3_error("ResponseBodyError"))
+    }
+
+    pub async fn put_public_access_block(
+        &self,
+        bucket: &str,
+        configuration: ProtocolPublicAccessBlock,
+    ) -> Result<(), ProtocolS3Error> {
+        let configuration = PublicAccessBlockConfiguration::builder()
+            .block_public_acls(configuration.block_public_acls)
+            .ignore_public_acls(configuration.ignore_public_acls)
+            .block_public_policy(configuration.block_public_policy)
+            .restrict_public_buckets(configuration.restrict_public_buckets)
+            .build();
+        self.client
+            .put_public_access_block()
+            .bucket(bucket)
+            .public_access_block_configuration(configuration)
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?;
+        Ok(())
+    }
+
+    pub async fn get_public_access_block(
+        &self,
+        bucket: &str,
+    ) -> Result<ProtocolPublicAccessBlock, ProtocolS3Error> {
+        let output = self
+            .client
+            .get_public_access_block()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|error| protocol_s3_error(&error))?;
+        let configuration = output
+            .public_access_block_configuration()
+            .ok_or_else(|| local_s3_error("MissingPublicAccessBlockConfiguration"))?;
+        Ok(ProtocolPublicAccessBlock {
+            block_public_acls: configuration.block_public_acls().unwrap_or(false),
+            ignore_public_acls: configuration.ignore_public_acls().unwrap_or(false),
+            block_public_policy: configuration.block_public_policy().unwrap_or(false),
+            restrict_public_buckets: configuration.restrict_public_buckets().unwrap_or(false),
+        })
+    }
+
+    pub async fn delete_public_access_block(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+        self.client
+            .delete_public_access_block()
+            .bucket(bucket)
             .send()
             .await
             .map_err(|error| protocol_s3_error(&error))?;
@@ -358,6 +683,10 @@ impl ProtocolS3Port for ProtocolS3Client {
         ProtocolS3Client::delete_bucket(self, bucket).await
     }
 
+    async fn head_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+        ProtocolS3Client::head_bucket(self, bucket).await
+    }
+
     async fn put_bucket_policy(&self, bucket: &str, policy: &str) -> Result<(), ProtocolS3Error> {
         ProtocolS3Client::put_bucket_policy(self, bucket, policy).await
     }
@@ -372,6 +701,13 @@ impl ProtocolS3Port for ProtocolS3Client {
 
     async fn list_objects(&self, bucket: &str) -> Result<Vec<String>, ProtocolS3Error> {
         ProtocolS3Client::list_objects(self, bucket).await
+    }
+
+    async fn list_objects_v2_summary(
+        &self,
+        bucket: &str,
+    ) -> Result<ProtocolListObjectsResult, ProtocolS3Error> {
+        ProtocolS3Client::list_objects_v2_summary(self, bucket).await
     }
 
     async fn put_object(
@@ -389,6 +725,105 @@ impl ProtocolS3Port for ProtocolS3Client {
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ProtocolS3Error> {
         ProtocolS3Client::delete_object(self, bucket, key).await
+    }
+
+    async fn copy_object(
+        &self,
+        bucket: &str,
+        source_key: &str,
+        destination_key: &str,
+    ) -> Result<(), ProtocolS3Error> {
+        ProtocolS3Client::copy_object(self, bucket, source_key, destination_key).await
+    }
+
+    async fn delete_objects(
+        &self,
+        bucket: &str,
+        keys: &[String],
+    ) -> Result<Vec<String>, ProtocolS3Error> {
+        ProtocolS3Client::delete_objects(self, bucket, keys).await
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<String, ProtocolS3Error> {
+        ProtocolS3Client::create_multipart_upload(self, bucket, key).await
+    }
+
+    async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: &[u8],
+    ) -> Result<String, ProtocolS3Error> {
+        ProtocolS3Client::upload_part(self, bucket, key, upload_id, part_number, body).await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[ProtocolCompletedPart],
+    ) -> Result<(), ProtocolS3Error> {
+        ProtocolS3Client::complete_multipart_upload(self, bucket, key, upload_id, parts).await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), ProtocolS3Error> {
+        ProtocolS3Client::abort_multipart_upload(self, bucket, key, upload_id).await
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<String>, ProtocolS3Error> {
+        ProtocolS3Client::list_multipart_uploads(self, bucket, key).await
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        bucket: &str,
+        enabled: bool,
+    ) -> Result<(), ProtocolS3Error> {
+        ProtocolS3Client::put_bucket_versioning(self, bucket, enabled).await
+    }
+
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Vec<u8>, ProtocolS3Error> {
+        ProtocolS3Client::get_object_version(self, bucket, key, version_id).await
+    }
+
+    async fn put_public_access_block(
+        &self,
+        bucket: &str,
+        configuration: ProtocolPublicAccessBlock,
+    ) -> Result<(), ProtocolS3Error> {
+        ProtocolS3Client::put_public_access_block(self, bucket, configuration).await
+    }
+
+    async fn get_public_access_block(
+        &self,
+        bucket: &str,
+    ) -> Result<ProtocolPublicAccessBlock, ProtocolS3Error> {
+        ProtocolS3Client::get_public_access_block(self, bucket).await
+    }
+
+    async fn delete_public_access_block(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+        ProtocolS3Client::delete_public_access_block(self, bucket).await
     }
 
     async fn list_object_versions(
@@ -462,6 +897,14 @@ fn invalid_version_listing() -> ProtocolS3Error {
     ProtocolS3Error {
         code: "InvalidVersionListing".to_string(),
         status: Some(200),
+        request_id: None,
+    }
+}
+
+fn local_s3_error(code: &str) -> ProtocolS3Error {
+    ProtocolS3Error {
+        code: code.to_string(),
+        status: None,
         request_id: None,
     }
 }
