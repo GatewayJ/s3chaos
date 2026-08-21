@@ -3,6 +3,8 @@ kind: ProtocolNativeCompatibilityProfile
 name: rustfs-native-core
 source: ceph/s3-tests
 sourceRevision: 5522d1c351f75bc00ae0f64f742f3f095f5939d9
+sourceCaseCount: 976
+sourceIndexSha256: 8a23c7f3827e1f77d6b200c902e23b370117ea298c6a9b22e9475c94e7d5efe2
 nativeCases:
   - compat-bucket-head
   - compat-bucket-list-create-delete

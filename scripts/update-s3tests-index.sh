@@ -11,9 +11,16 @@ die() {
   exit 1
 }
 
-for command in curl tar rg sed sort find; do
+for command in awk curl tar rg sed sort find; do
   command -v "$command" >/dev/null 2>&1 || die "$command is required"
 done
+if command -v sha256sum >/dev/null 2>&1; then
+  hash_command=(sha256sum)
+elif command -v shasum >/dev/null 2>&1; then
+  hash_command=(shasum -a 256)
+else
+  die "sha256sum or shasum is required"
+fi
 
 temp_root=$(mktemp -d "${TMPDIR:-/tmp}/s3tests-index.XXXXXX")
 cleanup() {
@@ -37,5 +44,7 @@ index_temp="$temp_root/s3tests-source-index.txt"
 
 test_count=$(rg -c -v '^#' "$index_temp")
 [[ "$test_count" -ge 900 ]] || die "refuse suspiciously small source index: $test_count tests"
+index_sha256=$(sed '/^#/d;/^$/d' "$index_temp" | "${hash_command[@]}" | awk '{print $1}')
 mv "$index_temp" "$OUTPUT"
 echo "updated $OUTPUT with $test_count source tests at $REVISION"
+echo "set native-profile.yaml sourceCaseCount=$test_count sourceIndexSha256=$index_sha256"

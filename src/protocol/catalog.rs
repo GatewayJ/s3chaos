@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub const BUCKET_POLICY_AUTHENTICATED_USER_RW: &str = "bucket-policy-authenticated-user-rw";
 pub const BUCKET_POLICY_DELETE_RESTORES_PRIVATE: &str = "bucket-policy-delete-restores-private";
@@ -47,10 +47,31 @@ pub enum ProtocolIsolation {
     Suite,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtocolDomain {
+    Bucket,
+    Object,
+    Listing,
+    CopyDelete,
+    Multipart,
+    Versioning,
+    BucketConfig,
+    IntegrityEncryption,
+    Authorization,
+    Iam,
+    Sts,
+    S3Select,
+    Notification,
+    RequestValidation,
+    Other,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProtocolCase {
     pub id: &'static str,
+    pub domain: ProtocolDomain,
     pub group: &'static str,
     pub tags: &'static [&'static str],
     pub isolation: ProtocolIsolation,
@@ -79,13 +100,13 @@ const CASES: &[ProtocolCase] = &[
         BUCKET_POLICY_PREFIX_SCOPE,
         &["authz", "parallel-safe", "regression"],
     ),
-    compatibility_case(COMPAT_BUCKET_HEAD),
-    compatibility_case(COMPAT_BUCKET_LIST_CREATE_DELETE),
-    compatibility_case(COMPAT_LIST_OBJECTS_BASIC),
-    compatibility_case(COMPAT_MULTI_OBJECT_DELETE),
-    compatibility_case(COMPAT_MULTIPART_UPLOAD_SMALL),
-    compatibility_case(COMPAT_OBJECT_COPY_SAME_BUCKET),
-    compatibility_case(COMPAT_OBJECT_PUT_GET_DELETE),
+    compatibility_case(COMPAT_BUCKET_HEAD, ProtocolDomain::Bucket),
+    compatibility_case(COMPAT_BUCKET_LIST_CREATE_DELETE, ProtocolDomain::Bucket),
+    compatibility_case(COMPAT_LIST_OBJECTS_BASIC, ProtocolDomain::Listing),
+    compatibility_case(COMPAT_MULTI_OBJECT_DELETE, ProtocolDomain::CopyDelete),
+    compatibility_case(COMPAT_MULTIPART_UPLOAD_SMALL, ProtocolDomain::Multipart),
+    compatibility_case(COMPAT_OBJECT_COPY_SAME_BUCKET, ProtocolDomain::CopyDelete),
+    compatibility_case(COMPAT_OBJECT_PUT_GET_DELETE, ProtocolDomain::Object),
     compatibility_versioning_case(),
     iam_case(
         IAM_EXPLICIT_DENY_OVERRIDES_ALLOW,
@@ -114,6 +135,7 @@ const CASES: &[ProtocolCase] = &[
 const fn bucket_policy_case(id: &'static str, tags: &'static [&'static str]) -> ProtocolCase {
     ProtocolCase {
         id,
+        domain: ProtocolDomain::Authorization,
         group: "bucket-policy",
         tags,
         isolation: ProtocolIsolation::Case,
@@ -125,6 +147,7 @@ const fn bucket_policy_case(id: &'static str, tags: &'static [&'static str]) -> 
 const fn sts_case(id: &'static str, group: &'static str) -> ProtocolCase {
     ProtocolCase {
         id,
+        domain: ProtocolDomain::Sts,
         group,
         tags: &["authz", "regression"],
         isolation: ProtocolIsolation::Case,
@@ -136,6 +159,7 @@ const fn sts_case(id: &'static str, group: &'static str) -> ProtocolCase {
 const fn sts_expiration_case() -> ProtocolCase {
     ProtocolCase {
         id: STS_EXPIRED_TOKEN_DENIED,
+        domain: ProtocolDomain::Sts,
         group: "sts-session-policy",
         tags: &["authz", "regression", "slow"],
         isolation: ProtocolIsolation::Case,
@@ -147,6 +171,7 @@ const fn sts_expiration_case() -> ProtocolCase {
 const fn oidc_web_identity_case() -> ProtocolCase {
     ProtocolCase {
         id: OIDC_WEB_IDENTITY_BASIC,
+        domain: ProtocolDomain::Sts,
         group: "oidc-web-identity",
         tags: &["authz", "integration", "oidc", "regression"],
         isolation: ProtocolIsolation::Case,
@@ -162,9 +187,10 @@ const fn oidc_web_identity_case() -> ProtocolCase {
     }
 }
 
-const fn compatibility_case(id: &'static str) -> ProtocolCase {
+const fn compatibility_case(id: &'static str, domain: ProtocolDomain) -> ProtocolCase {
     ProtocolCase {
         id,
+        domain,
         group: "s3-compatibility",
         tags: &["ceph-style", "compatibility", "parallel-safe"],
         isolation: ProtocolIsolation::Case,
@@ -176,6 +202,7 @@ const fn compatibility_case(id: &'static str) -> ProtocolCase {
 const fn compatibility_versioning_case() -> ProtocolCase {
     ProtocolCase {
         id: COMPAT_VERSIONING_HEAD_REMOVAL,
+        domain: ProtocolDomain::Versioning,
         group: "s3-compatibility",
         tags: &["ceph-style", "compatibility", "parallel-safe", "versioning"],
         isolation: ProtocolIsolation::Case,
@@ -187,6 +214,7 @@ const fn compatibility_versioning_case() -> ProtocolCase {
 const fn public_access_block_case() -> ProtocolCase {
     ProtocolCase {
         id: PUBLIC_ACCESS_BLOCK_ROUND_TRIP,
+        domain: ProtocolDomain::BucketConfig,
         group: "public-access-block",
         tags: &["compatibility", "parallel-safe", "regression"],
         isolation: ProtocolIsolation::Case,
@@ -202,6 +230,7 @@ const fn iam_case(
 ) -> ProtocolCase {
     ProtocolCase {
         id,
+        domain: ProtocolDomain::Iam,
         group,
         tags,
         isolation: ProtocolIsolation::Case,
@@ -217,6 +246,7 @@ const fn iam_group_case(
 ) -> ProtocolCase {
     ProtocolCase {
         id,
+        domain: ProtocolDomain::Iam,
         group,
         tags,
         isolation: ProtocolIsolation::Case,
@@ -285,6 +315,12 @@ mod tests {
             ]
         );
         assert_eq!(ids.len(), ids.iter().collect::<BTreeSet<_>>().len());
+        assert!(
+            catalog
+                .iter()
+                .all(|case| case.domain != super::ProtocolDomain::Other),
+            "production catalog cases require an explicit protocol domain"
+        );
     }
 
     #[test]
