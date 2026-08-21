@@ -15,10 +15,16 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path};
 
 use crate::protocol::{
+    catalog::protocol_case,
+    compatibility::{
+        COMPATIBILITY_COVERAGE_FILE, CompatibilityCoverageReport, CompatibilityLiveStatus,
+        compatibility_coverage_report,
+    },
     fixture::registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
     preflight::ProtocolPreflightSummary,
     reporting::{
@@ -80,6 +86,7 @@ fn validate_contract(
         "preflight-summary.json",
         RESOURCE_REGISTRY_FILE,
         "cleanup-report.json",
+        COMPATIBILITY_COVERAGE_FILE,
         "protocol-suite-summary.json",
     ] {
         ensure!(
@@ -92,6 +99,8 @@ fn validate_contract(
     let preflight: ProtocolPreflightSummary = read_json(&root.join("preflight-summary.json"))?;
     let registry = ResourceRegistry::load(root)?;
     let cleanup: ProtocolCleanupReport = read_json(&root.join("cleanup-report.json"))?;
+    let compatibility: CompatibilityCoverageReport =
+        read_json(&root.join(COMPATIBILITY_COVERAGE_FILE))?;
     let summary: ProtocolSuiteSummary = read_json(&root.join("protocol-suite-summary.json"))?;
     ensure!(
         Path::new(&plan.artifact_root) == root,
@@ -110,7 +119,8 @@ fn validate_contract(
         summary.plan == "protocol-suite-plan.json"
             && summary.preflight == "preflight-summary.json"
             && summary.registry == RESOURCE_REGISTRY_FILE
-            && summary.cleanup == "cleanup-report.json",
+            && summary.cleanup == "cleanup-report.json"
+            && summary.compatibility_coverage == COMPATIBILITY_COVERAGE_FILE,
         "protocol suite summary contains invalid artifact references"
     );
 
@@ -180,6 +190,26 @@ fn validate_contract(
     ensure!(
         summary.status == expected_status,
         "protocol suite summary status does not match case and cleanup reports"
+    );
+    let live_compatibility = case_reports
+        .iter()
+        .zip(&case_cleanups)
+        .filter(|(report, _)| {
+            protocol_case(&report.case_id).is_some_and(|case| case.tags.contains(&"compatibility"))
+        })
+        .map(|(report, cleanup)| {
+            (
+                report.case_id.clone(),
+                match (report.status, cleanup.succeeded) {
+                    (ProtocolCaseStatus::Passed, true) => CompatibilityLiveStatus::Passed,
+                    _ => CompatibilityLiveStatus::Failed,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        compatibility == compatibility_coverage_report(&live_compatibility)?,
+        "compatibility coverage report does not match native case results"
     );
     if cleanup.succeeded {
         ensure!(

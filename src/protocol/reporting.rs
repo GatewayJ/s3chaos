@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::protocol::authorization::{
     ProtocolActorSource, ProtocolGrantSource, ProtocolPolicyEffect,
 };
+use crate::protocol::catalog::ProtocolDomain;
 use crate::protocol::credentials::ActorCredentialArtifact;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +72,7 @@ pub struct ProtocolCaseReport {
     pub api_version: String,
     pub kind: String,
     pub case_id: String,
+    pub domain: ProtocolDomain,
     pub status: ProtocolCaseStatus,
     pub actors: Vec<ActorCredentialArtifact>,
     pub assertions: Vec<ProtocolAssertion>,
@@ -132,6 +134,7 @@ pub struct ProtocolSuiteSummary {
     pub preflight: String,
     pub registry: String,
     pub cleanup: String,
+    pub compatibility_coverage: String,
     pub case_reports: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_summary: Option<String>,

@@ -59,6 +59,9 @@ impl ProtocolCaseExecution {
                 api_version: "rustfs.com/s3chaos/v1alpha1".to_string(),
                 kind: "ProtocolCaseReport".to_string(),
                 case_id: case_id.to_string(),
+                domain: protocol_case(case_id)
+                    .map(|case| case.domain)
+                    .unwrap_or(crate::protocol::catalog::ProtocolDomain::Other),
                 status: ProtocolCaseStatus::Failed,
                 actors: Vec::new(),
                 assertions: Vec::new(),
@@ -200,11 +203,15 @@ impl CaseContext {
 
     pub(crate) fn finish(self, result: anyhow::Result<()>) -> ProtocolCaseExecution {
         let failure = result.as_ref().err().map(ToString::to_string);
+        let domain = protocol_case(&self.case_id)
+            .map(|case| case.domain)
+            .unwrap_or(crate::protocol::catalog::ProtocolDomain::Other);
         ProtocolCaseExecution {
             report: ProtocolCaseReport {
                 api_version: "rustfs.com/s3chaos/v1alpha1".to_string(),
                 kind: "ProtocolCaseReport".to_string(),
                 case_id: self.case_id,
+                domain,
                 status: if result.is_ok() {
                     ProtocolCaseStatus::Passed
                 } else {

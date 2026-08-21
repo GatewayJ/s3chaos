@@ -14,19 +14,23 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use futures::future::join_all;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::protocol::{
     artifact_validation::validate_protocol_artifacts_and_write_report,
     cases::{ProtocolCaseExecution, ProtocolCaseServices, run_protocol_case},
+    catalog::protocol_case,
     clients::{
         admin::RustfsAdminClient,
         keycloak::KeycloakExternalIdentityProvider,
         s3::{AwsS3ClientFactory, ProtocolS3Client},
         sts::RustfsStsClient,
         web_identity::RustfsWebIdentityStsClient,
+    },
+    compatibility::{
+        COMPATIBILITY_COVERAGE_FILE, CompatibilityLiveStatus, compatibility_coverage_report,
     },
     credentials::{AdminCredentials, CredentialProvider, EnvCredentialProvider},
     fixture::{
@@ -304,6 +308,26 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         case_report_paths.push(relative_path(&artifact_root, &case_report_path)?);
         forbidden_case_secrets.extend(execution.forbidden_secrets.iter().cloned());
     }
+    let live_compatibility = case_executions
+        .iter()
+        .filter(|(execution, _)| {
+            protocol_case(&execution.report.case_id)
+                .is_some_and(|case| case.tags.contains(&"compatibility"))
+        })
+        .map(|(execution, cleanup)| {
+            (
+                execution.report.case_id.clone(),
+                match (execution.report.status, cleanup.succeeded) {
+                    (ProtocolCaseStatus::Passed, true) => CompatibilityLiveStatus::Passed,
+                    _ => CompatibilityLiveStatus::Failed,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    write_json(
+        &artifact_root.join(COMPATIBILITY_COVERAGE_FILE),
+        &compatibility_coverage_report(&live_compatibility)?,
+    )?;
 
     let passed = case_executions.iter().all(|(execution, cleanup)| {
         execution.report.status == ProtocolCaseStatus::Passed && cleanup.succeeded
@@ -379,6 +403,7 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         preflight: "preflight-summary.json".to_string(),
         registry: RESOURCE_REGISTRY_FILE.to_string(),
         cleanup: "cleanup-report.json".to_string(),
+        compatibility_coverage: COMPATIBILITY_COVERAGE_FILE.to_string(),
         case_reports: case_report_paths,
         failure_summary,
     };
@@ -932,6 +957,7 @@ mod tests {
         cleanup_suite_registries, validate_phase_one_artifacts, write_json, write_json_lines,
     };
     use crate::protocol::{
+        compatibility::{COMPATIBILITY_COVERAGE_FILE, compatibility_coverage_report},
         credentials::ActorCredential,
         fixture::registry::{
             RESOURCE_REGISTRY_FILE, ResourceKind, ResourceRegistry, ResourceState,
@@ -950,7 +976,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use std::{
-        collections::BTreeSet,
+        collections::{BTreeMap, BTreeSet},
         fs,
         sync::{Arc, Mutex},
     };
@@ -1079,6 +1105,7 @@ mod tests {
     fn planned_case(id: &str) -> ProtocolSuitePlanCase {
         ProtocolSuitePlanCase {
             id: id.to_string(),
+            domain: crate::protocol::catalog::ProtocolDomain::Other,
             group: "s3-compatibility".to_string(),
             tags: Vec::new(),
             requires: vec!["s3".to_string()],
@@ -1241,6 +1268,7 @@ mod tests {
             api_version: suite.api_version.clone(),
             kind: "ProtocolCaseReport".to_string(),
             case_id: "bucket-policy-authenticated-user-rw".to_string(),
+            domain: crate::protocol::catalog::ProtocolDomain::Authorization,
             status: ProtocolCaseStatus::Passed,
             actors: Vec::new(),
             assertions: Vec::new(),
@@ -1251,6 +1279,11 @@ mod tests {
         write_json(&case_dir.join("cleanup-report.json"), &cleanup).expect("case cleanup artifact");
         write_json_lines::<ProtocolAssertion>(&case_dir.join("operation-history.jsonl"), &[])
             .expect("case history artifact");
+        write_json(
+            &root.join(COMPATIBILITY_COVERAGE_FILE),
+            &compatibility_coverage_report(&BTreeMap::new()).expect("coverage report"),
+        )
+        .expect("coverage artifact");
         let summary = ProtocolSuiteSummary {
             api_version: suite.api_version,
             kind: "ProtocolSuiteSummary".to_string(),
@@ -1261,6 +1294,7 @@ mod tests {
             preflight: "preflight-summary.json".to_string(),
             registry: "resource-registry.json".to_string(),
             cleanup: "cleanup-report.json".to_string(),
+            compatibility_coverage: COMPATIBILITY_COVERAGE_FILE.to_string(),
             case_reports: vec![
                 "cases/bucket-policy-authenticated-user-rw/case-report.json".to_string(),
             ],

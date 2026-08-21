@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::protocol::{
+    catalog::ProtocolDomain,
     ports::ProtocolExternalIdentityProviderInfo,
     scheduler::{ProtocolLock, plan_protocol_schedule},
     suite::{ProtocolCleanupPolicy, ResolvedProtocolSuite},
@@ -161,6 +162,7 @@ pub struct ProtocolSuitePlanExecution {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProtocolSuitePlanCase {
     pub id: String,
+    pub domain: ProtocolDomain,
     pub group: String,
     pub tags: Vec<String>,
     pub requires: Vec<String>,
@@ -205,6 +207,7 @@ impl ProtocolSuitePlan {
                     .expect("every selected case is scheduled");
                 ProtocolSuitePlanCase {
                     id: case.id.to_string(),
+                    domain: case.domain,
                     group: case.group.to_string(),
                     tags: case.tags.iter().map(|tag| (*tag).to_string()).collect(),
                     requires: case

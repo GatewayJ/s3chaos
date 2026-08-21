@@ -10,15 +10,22 @@ The protocol harness has three deliberately separate coverage layers:
 
 The compatibility source is pinned to Ceph `s3-tests` revision
 `5522d1c351f75bc00ae0f64f742f3f095f5939d9`. The checked-in source index has
-976 pytest node ids. `protocol/compatibility/native-profile.yaml` is the
-machine-validated denominator for the native gate: all compatibility-tagged
-cases and the S3 operations they exercise must be listed, and every native case
-must have an implemented upstream mapping.
+976 pytest node ids. `protocol/compatibility/native-profile.yaml` pins the
+revision, node count, canonical index SHA-256, native case denominator, and S3
+operations. A changed revision or node set fails validation with expected and
+actual values.
+
+Implemented manifest entries declare either `exact-one-to-one` or
+`table-driven-many-to-one`. Table-driven entries sharing a native case require
+unique `variant` values. Unknown or duplicate references, missing native cases,
+and incomplete expected-divergence records fail validation. Protocol domains
+are derived centrally by the compatibility catalog and included in the status
+report, catalog, suite plan, and case reports.
 
 Current pinned classification:
 
-- 9 implemented native mappings (0.92% of the upstream index)
-- 965 unimplemented
+- 10 implemented reference nodes mapped to 9 native cases (1.02% of the upstream index)
+- 964 unimplemented
 - 2 excluded
 - 0 expected divergences
 
@@ -34,8 +41,14 @@ make protocol-suite-validate SUITE=protocol/examples/full-regression.yaml
 make protocol-suite-validate SUITE=protocol/examples/slow-regression.yaml
 ```
 
+The status JSON separates reference-node classification from native execution:
+`summary.nativeEncoded` counts Rust cases, while `nativeLivePassed`,
+`nativeLiveFailed`, and `nativeNotRun` describe live evidence. With no live
+artifact input, every encoded case is `not-run`.
+
 Refresh the pinned Ceph index only when intentionally changing the pinned
-revision, then review the generated diff:
+revision. The command prints the new `sourceCaseCount` and
+`sourceIndexSha256`; update the native profile and review the generated diff:
 
 ```bash
 make protocol-update-s3tests-index
@@ -73,6 +86,11 @@ prefix:
 ```bash
 make protocol-cleanup ARTIFACT_ROOT=target/protocol-tests/<run>
 ```
+
+Each run writes `compatibility-coverage.json`. It contains the pinned source
+drift check, global and per-domain counts, native-to-reference variants, and the
+live status derived from case reports. Artifact validation rejects a coverage
+file that disagrees with those reports.
 
 ## Live CI gate
 

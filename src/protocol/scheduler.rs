@@ -133,10 +133,11 @@ mod tests {
     use super::{
         ProtocolLock, ProtocolLockMode, ProtocolLockScope, locks_compatible, plan_protocol_schedule,
     };
-    use crate::protocol::catalog::{ProtocolCase, ProtocolIsolation};
+    use crate::protocol::catalog::{ProtocolCase, ProtocolDomain, ProtocolIsolation};
 
     const PARALLEL_A: ProtocolCase = ProtocolCase {
         id: "parallel-a",
+        domain: ProtocolDomain::Other,
         group: "test",
         tags: &["parallel-safe"],
         isolation: ProtocolIsolation::Case,
@@ -145,6 +146,7 @@ mod tests {
     };
     const PARALLEL_B: ProtocolCase = ProtocolCase {
         id: "parallel-b",
+        domain: ProtocolDomain::Other,
         group: "test",
         tags: &["parallel-safe"],
         isolation: ProtocolIsolation::Case,
@@ -153,6 +155,7 @@ mod tests {
     };
     const SERIAL: ProtocolCase = ProtocolCase {
         id: "serial",
+        domain: ProtocolDomain::Other,
         group: "test",
         tags: &[],
         isolation: ProtocolIsolation::Case,
@@ -161,6 +164,7 @@ mod tests {
     };
     const EXTERNAL_IDP: ProtocolCase = ProtocolCase {
         id: "external-idp",
+        domain: ProtocolDomain::Other,
         group: "test",
         tags: &[],
         isolation: ProtocolIsolation::Case,

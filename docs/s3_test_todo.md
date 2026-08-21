@@ -1035,15 +1035,17 @@ been promoted to the parallel-safe contract.
 - [x] Define and validate the bounded native compatibility profile.
 - [x] Add strict scheduled live RustFS and Mint gates.
 
-The native catalog imports nine exact Ceph-style semantics: bucket head and
-empty listing, key count, put/overwrite/get/delete, same-bucket copy,
+The native catalog maps ten Ceph reference nodes to nine native cases: bucket
+head, bucket lifecycle and empty listing variants, key count,
+put/overwrite/get/delete, same-bucket copy,
 multi-object delete, small multipart completion retry, version-head removal,
 and Public Access Block round-trip. The mapping and status lists live under
 `protocol/compatibility/` and are pinned to ceph/s3-tests revision
 `5522d1c351f75bc00ae0f64f742f3f095f5939d9`. A generated checked-in index
 classifies all 976 upstream pytest node ids. The CLI validates exact source
-coverage, disjoint statuses, resolvable native mappings, and the complete
-native profile in `native-profile.yaml`.
+coverage, disjoint statuses, one-to-one or table-driven mapping shape,
+resolvable native mappings, source-index drift, domain coverage, and the
+complete native profile in `native-profile.yaml`.
 
 Broader multi-SDK coverage remains an explicit outer compatibility layer:
 `scripts/protocol-compatibility.sh mint` runs a digest-pinned Mint image,
