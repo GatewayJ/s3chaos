@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use anyhow::{Context, Result, bail, ensure};
-use futures::future::join_all;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,52 +26,42 @@ use crate::protocol::{
         keycloak::KeycloakExternalIdentityProvider,
         s3::{AwsS3ClientFactory, ProtocolS3Client},
         sts::RustfsStsClient,
-        web_identity::RustfsWebIdentityStsClient,
     },
     compatibility::{
         COMPATIBILITY_COVERAGE_FILE, compatibility_coverage_report, compatibility_live_status,
     },
-    credentials::{AdminCredentials, CredentialProvider, EnvCredentialProvider},
+    credentials::{CredentialProvider, EnvCredentialProvider},
     fixture::{
-        cleanup::cleanup_registered_resources_with_external,
         naming::ProtocolResourceNamer,
         registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
     },
-    ports::{
-        ProtocolAdminCleanupPort, ProtocolAdminServerPort, ProtocolExternalIdentityPort,
-        ProtocolS3CleanupPort, ProtocolWebIdentityStsPort,
-    },
+    ports::{ProtocolAdminServerPort, ProtocolExternalIdentityPort, ProtocolWebIdentityStsPort},
     preflight::{
-        ProtocolPreflightSummary, ProtocolProbeCapabilities,
-        cleanup_interrupted_mutating_permission_probe, enforce_stale_resource_policy,
-        preflight_protocol_suite_with_external, run_mutating_permission_probe,
+        ProtocolProbeCapabilities, cleanup_interrupted_mutating_permission_probe,
+        run_mutating_permission_probe,
     },
     reporting::{
         PROTOCOL_JUNIT_FILE, ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary,
         ProtocolSuiteSummary, protocol_junit_xml,
     },
-    suite::{ResolvedProtocolSuite, resolve_protocol_endpoint, resolve_protocol_suite_yaml},
+    runner::{
+        artifacts::ProtocolArtifactWriter,
+        cleanup::{ProtocolCleanupCoordinator, load_cleanup_registry, registry_failure},
+        executor::{ProtocolCaseLifecycle, ProtocolShutdownSignal, ProtocolSuiteExecutor},
+        preflight::run_connected_preflight,
+        runtime::{
+            ConnectedProtocolRuntime, DisabledProtocolTimeout, MonotonicProtocolClock,
+            ProcessShutdownSignal, ensure_dedicated_target_acknowledgement, protocol_artifact_base,
+        },
+    },
     suite_plan::{
         ProtocolMutatingProbeStatus, ProtocolSuitePlan, ProtocolSuitePlanCase, TargetFingerprint,
     },
 };
 
-const DEFAULT_ARTIFACT_BASE: &str = "target/protocol-tests";
-
-struct ProtocolRunFixture {
-    suite: ResolvedProtocolSuite,
-    endpoint: String,
-    credentials: AdminCredentials,
-    admin: RustfsAdminClient,
-    s3: ProtocolS3Client,
-    sts: RustfsStsClient,
-    external_identity: Option<KeycloakExternalIdentityProvider>,
-    web_identity_sts: Option<RustfsWebIdentityStsClient>,
-    preflight: ProtocolPreflightSummary,
-}
-
-struct ProtocolCaseRunner<'a> {
+struct LiveProtocolCaseLifecycle<'a> {
     artifact_root: &'a Path,
+    artifacts: &'a ProtocolArtifactWriter,
     run_id: &'a str,
     fingerprint: &'a TargetFingerprint,
     namer: &'a ProtocolResourceNamer,
@@ -82,15 +71,17 @@ struct ProtocolCaseRunner<'a> {
     external_identity: Option<&'a dyn ProtocolExternalIdentityPort>,
     web_identity_sts: Option<&'a dyn ProtocolWebIdentityStsPort>,
     actor_clients: &'a AwsS3ClientFactory,
+    cleanup: &'a ProtocolCleanupCoordinator<'a, RustfsAdminClient, ProtocolS3Client>,
     api_version: &'a str,
 }
 
 pub async fn plan_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<ProtocolSuitePlan> {
-    let runtime = ProtocolRunFixture::connect(path).await?;
+    let runtime = ConnectedProtocolRuntime::connect(path).await?;
+    let preflight = run_connected_preflight(&runtime).await?;
     ProtocolSuitePlan::generated(
         &runtime.suite,
-        runtime.preflight.target_fingerprint.clone(),
-        (&runtime.preflight).into(),
+        preflight.target_fingerprint.clone(),
+        (&preflight).into(),
         protocol_artifact_base(),
     )
 }
@@ -98,27 +89,24 @@ pub async fn plan_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<Pro
 pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
     ensure_dedicated_target_acknowledgement()?;
     let path = path.as_ref();
-    let mut runtime = ProtocolRunFixture::connect(path).await?;
+    let runtime = ConnectedProtocolRuntime::connect(path).await?;
+    let mut preflight = run_connected_preflight(&runtime).await?;
     let mut plan = ProtocolSuitePlan::generated(
         &runtime.suite,
-        runtime.preflight.target_fingerprint.clone(),
-        (&runtime.preflight).into(),
+        preflight.target_fingerprint.clone(),
+        (&preflight).into(),
         protocol_artifact_base(),
     )?;
     let artifact_root = plan.artifact_root();
-    fs::create_dir_all(artifact_root.join("cases"))?;
-    fs::copy(path, artifact_root.join("protocol-suite.yaml"))
-        .with_context(|| format!("copy protocol suite source {}", path.display()))?;
-    write_json(&artifact_root.join("protocol-suite-plan.json"), &plan)?;
-    write_json(
-        &artifact_root.join("preflight-summary.json"),
-        &runtime.preflight,
-    )?;
+    let artifacts = ProtocolArtifactWriter::file(&artifact_root);
+    artifacts.initialize_run(path)?;
+    artifacts.write_json("protocol-suite-plan.json", &plan)?;
+    artifacts.write_json("preflight-summary.json", &preflight)?;
 
     let mut registry = ResourceRegistry::create(
         &artifact_root,
         &plan.run_id,
-        runtime.preflight.target_fingerprint.clone(),
+        preflight.target_fingerprint.clone(),
     )?;
     registry.set_versioned_cleanup(
         plan.cases
@@ -142,7 +130,7 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
     ));
     let probe_result = tokio::select! {
         probe = &mut probe_future => Ok(probe),
-        signal = shutdown_signal() => Err(signal),
+        signal = ProcessShutdownSignal.wait() => Err(signal),
     };
     drop(probe_future);
     let probe = match probe_result {
@@ -166,163 +154,100 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
             .await
         }
     };
-    runtime.preflight.mutating_permission_probe = probe.summary.clone();
-    plan.preflight = (&runtime.preflight).into();
-    write_json(&artifact_root.join("protocol-suite-plan.json"), &plan)?;
-    write_json(
-        &artifact_root.join("preflight-summary.json"),
-        &runtime.preflight,
-    )?;
-    write_json(
-        &artifact_root.join("preflight-cleanup-report.json"),
-        &probe.cleanup,
-    )?;
+    preflight.mutating_permission_probe = probe.summary.clone();
+    plan.preflight = (&preflight).into();
+    artifacts.write_json("protocol-suite-plan.json", &plan)?;
+    artifacts.write_json("preflight-summary.json", &preflight)?;
+    artifacts.write_json("preflight-cleanup-report.json", &probe.cleanup)?;
     let mut probe_forbidden_secrets = probe.forbidden_secrets;
 
     let selected_cases = plan.cases.clone();
     let actor_clients = AwsS3ClientFactory::new(&runtime.endpoint, &runtime.suite.target.region);
-    let preflight_failure = probe
+    let preflight_failure_message = probe
         .summary
         .error
         .clone()
         .unwrap_or_else(|| "mutating preflight probe failed".to_string());
-    let mut case_executions = Vec::with_capacity(selected_cases.len());
-    let mut stop_reason = None;
-    if probe.summary.status != ProtocolMutatingProbeStatus::Passed {
-        case_executions.extend(selected_cases.iter().map(|case| {
-            (
-                ProtocolCaseExecution::preflight_failed(&case.id, &preflight_failure),
-                ProtocolCleanupReport::empty(&runtime.suite.api_version),
-            )
-        }));
-    } else {
-        let wave_count = selected_cases
-            .iter()
-            .map(|case| case.wave_index)
-            .max()
-            .map_or(0, |wave| wave + 1);
-        for wave_index in 0..wave_count {
-            let wave = selected_cases
-                .iter()
-                .filter(|case| case.wave_index == wave_index)
-                .collect::<Vec<_>>();
-            if let Some(reason) = &stop_reason {
-                case_executions.extend(wave.iter().map(|case| {
-                    (
-                        ProtocolCaseExecution::not_run(&case.id, reason),
-                        ProtocolCleanupReport::empty(&runtime.suite.api_version),
-                    )
-                }));
-                continue;
-            }
-            let case_runner = ProtocolCaseRunner {
-                artifact_root: &artifact_root,
-                run_id: &plan.run_id,
-                fingerprint: &plan.target.fingerprint,
-                namer: &namer,
-                admin: &runtime.admin,
-                s3: &runtime.s3,
-                sts: &runtime.sts,
-                external_identity: runtime
-                    .external_identity
-                    .as_ref()
-                    .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
-                web_identity_sts: runtime
-                    .web_identity_sts
-                    .as_ref()
-                    .map(|sts| sts as &dyn ProtocolWebIdentityStsPort),
-                actor_clients: &actor_clients,
-                api_version: &runtime.suite.api_version,
-            };
-            let futures = wave.iter().map(|case| case_runner.run(case));
-            let wave_result = tokio::select! {
-                results = join_all(futures) => Ok(results),
-                signal = shutdown_signal() => Err(signal),
-            };
-            match wave_result {
-                Ok(results) => {
-                    for result in results {
-                        let (execution, cleanup) = result?;
-                        if !cleanup.succeeded && stop_reason.is_none() {
-                            stop_reason = Some(format!(
-                                "case {} cleanup failed; later waves were not started",
-                                execution.report.case_id
-                            ));
-                        }
-                        case_executions.push((execution, cleanup));
-                    }
-                }
-                Err(signal) => {
-                    stop_reason = Some(match signal {
-                        Ok(()) => "protocol suite interrupted; cleanup requested".to_string(),
-                        Err(error) => format!("protocol signal handler failed: {error}"),
-                    });
-                    for case in wave {
-                        let cleanup = cleanup_case_registry_if_present(
-                            &artifact_root,
-                            &case.id,
-                            &runtime.admin,
-                            &runtime.s3,
-                            runtime
-                                .external_identity
-                                .as_ref()
-                                .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
-                            &runtime.suite.api_version,
-                        )
-                        .await;
-                        case_executions
-                            .push((ProtocolCaseExecution::interrupted(&case.id), cleanup));
-                    }
-                }
-            }
-        }
-    }
-    let fallback_cleanup = cleanup_suite_registries(
+    let external_identity = runtime
+        .external_identity
+        .as_ref()
+        .map(|provider| provider as &dyn ProtocolExternalIdentityPort);
+    let cleanup = ProtocolCleanupCoordinator::new(
         &artifact_root,
-        &selected_cases,
-        &mut registry,
         &runtime.admin,
         &runtime.s3,
-        runtime
-            .external_identity
-            .as_ref()
-            .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
+        external_identity,
         &runtime.suite.api_version,
-    )
-    .await;
-    write_json(
-        &artifact_root.join("cleanup-report.json"),
-        &fallback_cleanup,
-    )?;
+    );
+    let case_lifecycle = LiveProtocolCaseLifecycle {
+        artifact_root: &artifact_root,
+        artifacts: &artifacts,
+        run_id: &plan.run_id,
+        fingerprint: &plan.target.fingerprint,
+        namer: &namer,
+        admin: &runtime.admin,
+        s3: &runtime.s3,
+        sts: &runtime.sts,
+        external_identity,
+        web_identity_sts: runtime
+            .web_identity_sts
+            .as_ref()
+            .map(|sts| sts as &dyn ProtocolWebIdentityStsPort),
+        actor_clients: &actor_clients,
+        cleanup: &cleanup,
+        api_version: &runtime.suite.api_version,
+    };
+    let clock = MonotonicProtocolClock::default();
+    let timeout = DisabledProtocolTimeout;
+    let executor = ProtocolSuiteExecutor::new(
+        &case_lifecycle,
+        &cleanup,
+        &ProcessShutdownSignal,
+        &clock,
+        &timeout,
+        &runtime.suite.api_version,
+    );
+    let preflight_failure = (probe.summary.status != ProtocolMutatingProbeStatus::Passed)
+        .then_some(preflight_failure_message.as_str());
+    let suite_execution = executor
+        .execute(&selected_cases, &mut registry, preflight_failure)
+        .await?;
+    let fallback_cleanup = suite_execution.fallback_cleanup;
+    let case_executions = suite_execution
+        .cases
+        .into_iter()
+        .map(|case| (case.execution, case.cleanup))
+        .collect::<Vec<_>>();
+    artifacts.write_json("cleanup-report.json", &fallback_cleanup)?;
 
     let mut case_report_paths = Vec::with_capacity(case_executions.len());
     let mut forbidden_case_secrets = Vec::new();
     for (execution, cleanup) in &case_executions {
-        let case_dir = artifact_root.join("cases").join(&execution.report.case_id);
-        fs::create_dir_all(&case_dir)?;
+        artifacts.create_case_dir(&execution.report.case_id)?;
+        let case_relative = Path::new("cases").join(&execution.report.case_id);
+        let case_dir = artifact_root.join(&case_relative);
         let case_report_path = case_dir.join("case-report.json");
-        write_json(&case_report_path, &execution.report)?;
-        write_json(&case_dir.join("cleanup-report.json"), cleanup)?;
-        write_json_lines(
-            &case_dir.join("operation-history.jsonl"),
+        artifacts.write_json(case_relative.join("case-report.json"), &execution.report)?;
+        artifacts.write_json(case_relative.join("cleanup-report.json"), cleanup)?;
+        artifacts.write_json_lines(
+            case_relative.join("operation-history.jsonl"),
             &execution.report.assertions,
         )?;
-        case_report_paths.push(relative_path(&artifact_root, &case_report_path)?);
+        case_report_paths.push(artifacts.relative_path(&case_report_path)?);
         forbidden_case_secrets.extend(execution.forbidden_secrets.iter().cloned());
     }
     let junit_cases = case_executions
         .iter()
         .map(|(execution, cleanup)| (&execution.report, cleanup.succeeded))
         .collect::<Vec<_>>();
-    fs::write(
-        artifact_root.join(PROTOCOL_JUNIT_FILE),
-        protocol_junit_xml(
+    artifacts.write_text(
+        PROTOCOL_JUNIT_FILE,
+        &protocol_junit_xml(
             &runtime.suite.metadata.name,
             &junit_cases,
             fallback_cleanup.succeeded,
         ),
-    )
-    .with_context(|| format!("write protocol artifact {PROTOCOL_JUNIT_FILE}"))?;
+    )?;
     let live_compatibility = case_executions
         .iter()
         .filter(|(execution, _)| {
@@ -340,8 +265,8 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
             )
         })
         .collect::<BTreeMap<_, _>>();
-    write_json(
-        &artifact_root.join(COMPATIBILITY_COVERAGE_FILE),
+    artifacts.write_json(
+        COMPATIBILITY_COVERAGE_FILE,
         &compatibility_coverage_report(&live_compatibility)?,
     )?;
 
@@ -381,14 +306,11 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
             case_id: Some(execution.report.case_id.clone()),
             evidence,
         };
-        write_json(
-            &artifact_root.join("protocol-failure-summary.json"),
-            &failure,
-        )?;
+        artifacts.write_json("protocol-failure-summary.json", &failure)?;
         Some("protocol-failure-summary.json".to_string())
     } else if !fallback_cleanup.succeeded {
-        write_json(
-            &artifact_root.join("protocol-failure-summary.json"),
+        artifacts.write_json(
+            "protocol-failure-summary.json",
             &ProtocolFailureSummary {
                 api_version: runtime.suite.api_version.clone(),
                 kind: "ProtocolFailureSummary".to_string(),
@@ -423,7 +345,7 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         case_reports: case_report_paths,
         failure_summary,
     };
-    write_json(&artifact_root.join("protocol-suite-summary.json"), &summary)?;
+    artifacts.write_json("protocol-suite-summary.json", &summary)?;
 
     let mut forbidden = vec![
         runtime.credentials.access_key().to_string(),
@@ -438,8 +360,8 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
     forbidden.append(&mut probe_forbidden_secrets);
     forbidden.extend(forbidden_case_secrets);
     if let Err(error) = validate_phase_one_artifacts(&artifact_root, &forbidden) {
-        write_json(
-            &artifact_root.join("protocol-failure-summary.json"),
+        artifacts.write_json(
+            "protocol-failure-summary.json",
             &ProtocolFailureSummary {
                 api_version: runtime.suite.api_version.clone(),
                 kind: "ProtocolFailureSummary".to_string(),
@@ -454,7 +376,7 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         )?;
         summary.status = ProtocolCaseStatus::Failed;
         summary.failure_summary = Some("protocol-failure-summary.json".to_string());
-        write_json(&artifact_root.join("protocol-suite-summary.json"), &summary)?;
+        artifacts.write_json("protocol-suite-summary.json", &summary)?;
         return Err(error).with_context(|| {
             format!(
                 "validate Phase 1 protocol artifacts at {}",
@@ -489,6 +411,7 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
         ProtocolS3Client::for_admin(&expected.endpoint, &expected.region, &credentials).await?;
     verify_cleanup_target(&admin, &expected).await?;
 
+    let artifacts = ProtocolArtifactWriter::file(artifact_root);
     let mut combined = ProtocolCleanupReport::empty(&root_registry.api_version);
     let cases_dir = artifact_root.join("cases");
     if cases_dir.is_dir() {
@@ -498,7 +421,7 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
                 for entry in read_dir {
                     match entry {
                         Ok(entry) => entries.push(entry),
-                        Err(error) => combined.append(cleanup_registry_failure(
+                        Err(error) => combined.append(registry_failure(
                             &root_registry.api_version,
                             &cases_dir,
                             error,
@@ -506,7 +429,7 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
                     }
                 }
             }
-            Err(error) => combined.append(cleanup_registry_failure(
+            Err(error) => combined.append(registry_failure(
                 &root_registry.api_version,
                 &cases_dir,
                 error,
@@ -517,7 +440,7 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) => {
-                    combined.append(cleanup_registry_failure(
+                    combined.append(registry_failure(
                         &root_registry.api_version,
                         &entry.path(),
                         error,
@@ -526,7 +449,7 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
                 }
             };
             if !file_type.is_dir() || file_type.is_symlink() {
-                combined.append(cleanup_registry_failure(
+                combined.append(registry_failure(
                     &root_registry.api_version,
                     &entry.path(),
                     "protocol case artifact must be a non-symlink directory",
@@ -540,7 +463,7 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
             let mut case_registry = match load_cleanup_registry(&registry_path) {
                 Ok(registry) => registry,
                 Err(error) => {
-                    combined.append(cleanup_registry_failure(
+                    combined.append(registry_failure(
                         &root_registry.api_version,
                         &registry_path,
                         error,
@@ -551,7 +474,7 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
             if case_registry.run_id != root_registry.run_id
                 || case_registry.target_fingerprint != expected
             {
-                combined.append(cleanup_registry_failure(
+                combined.append(registry_failure(
                     &root_registry.api_version,
                     &registry_path,
                     "refuse cleanup because case registry ownership differs from the suite",
@@ -561,7 +484,7 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
             let external_identity = match external_identity_for_registry(&case_registry) {
                 Ok(provider) => provider,
                 Err(error) => {
-                    combined.append(cleanup_registry_failure(
+                    combined.append(registry_failure(
                         &root_registry.api_version,
                         &registry_path,
                         error,
@@ -569,19 +492,23 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
                     continue;
                 }
             };
-            let cleanup = cleanup_registered_resources_with_external(
-                &mut case_registry,
+            let coordinator = ProtocolCleanupCoordinator::new(
+                artifact_root,
                 &admin,
                 &s3,
                 external_identity
                     .as_ref()
                     .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
-            )
-            .await;
-            if let Err(error) = write_json(&entry.path().join("cleanup-report.json"), &cleanup) {
-                combined.append(cleanup_registry_failure(
+                &root_registry.api_version,
+            );
+            let cleanup = coordinator.cleanup_registry(&mut case_registry).await;
+            let report_relative = Path::new("cases")
+                .join(entry.file_name())
+                .join("cleanup-report.json");
+            if let Err(error) = artifacts.write_json(&report_relative, &cleanup) {
+                combined.append(registry_failure(
                     &root_registry.api_version,
-                    &entry.path().join("cleanup-report.json"),
+                    &artifact_root.join(report_relative),
                     error,
                 ));
             }
@@ -589,19 +516,19 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
         }
     }
     let root_external_identity = external_identity_for_registry(&root_registry)?;
-    combined.append(
-        cleanup_registered_resources_with_external(
-            &mut root_registry,
-            &admin,
-            &s3,
-            root_external_identity
-                .as_ref()
-                .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
-        )
-        .await,
+    let api_version = root_registry.api_version.clone();
+    let root_coordinator = ProtocolCleanupCoordinator::new(
+        artifact_root,
+        &admin,
+        &s3,
+        root_external_identity
+            .as_ref()
+            .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
+        &api_version,
     );
+    combined.append(root_coordinator.cleanup_registry(&mut root_registry).await);
     let report_path = artifact_root.join("cleanup-report.json");
-    write_json(&report_path, &combined)?;
+    artifacts.write_json("cleanup-report.json", &combined)?;
     ensure!(
         combined.succeeded,
         "protocol cleanup left {} resource(s); inspect {}",
@@ -615,13 +542,14 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
     Ok(())
 }
 
-impl ProtocolCaseRunner<'_> {
-    async fn run(
+#[async_trait::async_trait]
+impl ProtocolCaseLifecycle for LiveProtocolCaseLifecycle<'_> {
+    async fn run_case(
         &self,
         case: &ProtocolSuitePlanCase,
     ) -> Result<(ProtocolCaseExecution, ProtocolCleanupReport)> {
         let case_dir = self.artifact_root.join("cases").join(&case.id);
-        fs::create_dir_all(&case_dir)?;
+        self.artifacts.create_case_dir(&case.id)?;
         let mut registry =
             ResourceRegistry::create(&case_dir, self.run_id, self.fingerprint.clone())?;
         registry.bind_case(
@@ -647,93 +575,11 @@ impl ProtocolCaseRunner<'_> {
             },
         )
         .await;
-        let cleanup = cleanup_registered_resources_with_external(
-            &mut registry,
-            self.admin,
-            self.s3,
-            self.external_identity,
-        )
-        .await;
+        let cleanup = self.cleanup.cleanup_registry(&mut registry).await;
         if cleanup.api_version != self.api_version {
             bail!("case {} cleanup apiVersion changed unexpectedly", case.id);
         }
         Ok((execution, cleanup))
-    }
-}
-
-async fn cleanup_case_registry_if_present(
-    artifact_root: &Path,
-    case_id: &str,
-    admin: &impl ProtocolAdminCleanupPort,
-    s3: &impl ProtocolS3CleanupPort,
-    external_identity: Option<&dyn ProtocolExternalIdentityPort>,
-    api_version: &str,
-) -> ProtocolCleanupReport {
-    let registry_path = artifact_root
-        .join("cases")
-        .join(case_id)
-        .join(RESOURCE_REGISTRY_FILE);
-    if !registry_path.is_file() {
-        return ProtocolCleanupReport::empty(api_version);
-    }
-    match ResourceRegistry::load_path(&registry_path) {
-        Ok(mut registry) => {
-            cleanup_registered_resources_with_external(&mut registry, admin, s3, external_identity)
-                .await
-        }
-        Err(error) => cleanup_registry_failure(api_version, &registry_path, error),
-    }
-}
-
-async fn cleanup_suite_registries(
-    artifact_root: &Path,
-    cases: &[ProtocolSuitePlanCase],
-    root_registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminCleanupPort,
-    s3: &impl ProtocolS3CleanupPort,
-    external_identity: Option<&dyn ProtocolExternalIdentityPort>,
-    api_version: &str,
-) -> ProtocolCleanupReport {
-    let mut combined = ProtocolCleanupReport::empty(api_version);
-    for case in cases {
-        combined.append(
-            cleanup_case_registry_if_present(
-                artifact_root,
-                &case.id,
-                admin,
-                s3,
-                external_identity,
-                api_version,
-            )
-            .await,
-        );
-    }
-    combined.append(
-        cleanup_registered_resources_with_external(root_registry, admin, s3, external_identity)
-            .await,
-    );
-    combined
-}
-
-fn cleanup_registry_failure(
-    api_version: &str,
-    registry_path: &Path,
-    error: impl std::fmt::Display,
-) -> ProtocolCleanupReport {
-    let resource = registry_path.display().to_string();
-    ProtocolCleanupReport {
-        api_version: api_version.to_string(),
-        kind: "ProtocolCleanupReport".to_string(),
-        attempts: vec![crate::protocol::reporting::ProtocolCleanupAttempt {
-            resource_id: format!("registry:{resource}"),
-            resource_kind: "registry".to_string(),
-            resource_name: resource.clone(),
-            retry_count: 0,
-            succeeded: false,
-            error: Some(error.to_string()),
-        }],
-        leftovers: vec![format!("registry:{resource}")],
-        succeeded: false,
     }
 }
 
@@ -763,16 +609,24 @@ async fn cleanup_protocol_registry(registry_path: PathBuf, report_path: PathBuf)
         ProtocolS3Client::for_admin(&expected.endpoint, &expected.region, &credentials).await?;
     verify_cleanup_target(&admin, &expected).await?;
     let external_identity = external_identity_for_registry(&registry)?;
-    let cleanup = cleanup_registered_resources_with_external(
-        &mut registry,
+    let api_version = registry.api_version.clone();
+    let report_parent = report_path
+        .parent()
+        .context("cleanup report path has no parent")?;
+    let coordinator = ProtocolCleanupCoordinator::new(
+        report_parent,
         &admin,
         &s3,
         external_identity
             .as_ref()
             .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
-    )
-    .await;
-    write_json(&report_path, &cleanup)?;
+        &api_version,
+    );
+    let cleanup = coordinator.cleanup_registry(&mut registry).await;
+    let report_name = report_path
+        .file_name()
+        .context("cleanup report path has no file name")?;
+    ProtocolArtifactWriter::file(report_parent).write_json(Path::new(report_name), &cleanup)?;
     ensure!(
         cleanup.succeeded,
         "protocol cleanup left {} resource(s); inspect {}",
@@ -784,16 +638,6 @@ async fn cleanup_protocol_registry(registry_path: PathBuf, report_path: PathBuf)
         registry_path.display()
     );
     Ok(())
-}
-
-fn load_cleanup_registry(path: &Path) -> Result<ResourceRegistry> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect resource registry {}", path.display()))?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "resource registry must be a regular non-symlink file"
-    );
-    ResourceRegistry::load_path(path)
 }
 
 fn external_identity_for_registry(
@@ -856,237 +700,32 @@ async fn verify_cleanup_target(
     Ok(())
 }
 
-async fn shutdown_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .context("install SIGTERM handler for protocol cleanup")?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result.context("listen for Ctrl-C")?,
-            _ = terminate.recv() => {}
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await.context("listen for Ctrl-C")
-    }
-}
-
-impl ProtocolRunFixture {
-    async fn connect(path: impl AsRef<Path>) -> Result<Self> {
-        let suite = resolve_protocol_suite_yaml(path)?;
-        let endpoint = resolve_protocol_endpoint(&suite.target.endpoint)?;
-        let credentials = EnvCredentialProvider.resolve(&suite.target.credentials.admin_profile)?;
-        let admin = RustfsAdminClient::new(&endpoint, &suite.target.region, credentials.clone())?;
-        let s3 = ProtocolS3Client::for_admin(&endpoint, &suite.target.region, &credentials).await?;
-        let sts = RustfsStsClient::new(&endpoint, &suite.target.region)?;
-        let (external_identity, web_identity_sts) = match &suite.target.external_identity {
-            Some(config) => (
-                Some(KeycloakExternalIdentityProvider::from_env(&config.profile)?),
-                Some(RustfsWebIdentityStsClient::new(&endpoint)?),
-            ),
-            None => (None, None),
-        };
-        let stale_resource_policy = stale_resource_policy()?;
-        let preflight = preflight_protocol_suite_with_external(
-            &suite,
-            &endpoint,
-            &admin,
-            &s3,
-            external_identity
-                .as_ref()
-                .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
-            stale_resource_policy,
-        )
-        .await?;
-        enforce_stale_resource_policy(&preflight)?;
-        Ok(Self {
-            suite,
-            endpoint,
-            credentials,
-            admin,
-            s3,
-            sts,
-            external_identity,
-            web_identity_sts,
-            preflight,
-        })
-    }
-}
-
-fn stale_resource_policy() -> Result<&'static str> {
-    if std::env::var("RUSTFS_PROTOCOL_TEST_ALLOW_STALE").as_deref() == Ok("1") {
-        ensure!(
-            std::env::var("CI").is_err(),
-            "RUSTFS_PROTOCOL_TEST_ALLOW_STALE is forbidden in CI"
-        );
-        Ok("warn-local-debug")
-    } else {
-        Ok("fail")
-    }
-}
-
-fn protocol_artifact_base() -> PathBuf {
-    std::env::var("RUSTFS_PROTOCOL_TEST_ARTIFACTS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ARTIFACT_BASE))
-}
-
-fn ensure_dedicated_target_acknowledgement() -> Result<()> {
-    ensure!(
-        std::env::var("RUSTFS_PROTOCOL_TEST_DEDICATED").as_deref() == Ok("1"),
-        "protocol tests require a dedicated RustFS target; set RUSTFS_PROTOCOL_TEST_DEDICATED=1 after verifying the target"
-    );
-    Ok(())
-}
-
-fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
-    fs::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))
-        .with_context(|| format!("write protocol artifact {}", path.display()))
-}
-
-fn write_json_lines<T: serde::Serialize>(path: &Path, values: &[T]) -> Result<()> {
-    let mut contents = String::new();
-    for value in values {
-        contents.push_str(&serde_json::to_string(value)?);
-        contents.push('\n');
-    }
-    fs::write(path, contents).with_context(|| format!("write protocol artifact {}", path.display()))
-}
-
-fn relative_path(root: &Path, path: &Path) -> Result<String> {
-    Ok(path
-        .strip_prefix(root)
-        .with_context(|| {
-            format!(
-                "protocol artifact {} is outside root {}",
-                path.display(),
-                root.display()
-            )
-        })?
-        .display()
-        .to_string())
-}
-
 fn validate_phase_one_artifacts(root: &Path, forbidden: &[String]) -> Result<()> {
     validate_protocol_artifacts_and_write_report(root, forbidden).map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        cleanup_suite_registries, validate_phase_one_artifacts, write_json, write_json_lines,
-    };
+    use super::validate_phase_one_artifacts;
     use crate::protocol::{
         compatibility::{COMPATIBILITY_COVERAGE_FILE, compatibility_coverage_report},
-        fixture::registry::{
-            RESOURCE_REGISTRY_FILE, ResourceKind, ResourceRegistry, ResourceState,
-        },
-        ports::{
-            ExclusiveBucketOwnership, ProtocolAdminCleanupPort, ProtocolAdminError,
-            ProtocolAdminServerPort, ProtocolS3CleanupPort, ProtocolS3Error, ProtocolServerInfo,
-        },
+        fixture::registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
+        ports::{ProtocolAdminError, ProtocolAdminServerPort, ProtocolServerInfo},
         preflight::{ProtocolPreflightSummary, ProtocolStaleResourceScan},
         reporting::{
             PROTOCOL_JUNIT_FILE, ProtocolAssertion, ProtocolCaseReport, ProtocolCaseStatus,
             ProtocolCleanupReport, ProtocolFailureSummary, ProtocolSuiteSummary,
             protocol_junit_xml,
         },
+        runner::artifacts::ProtocolArtifactWriter,
         suite::{ProtocolSuite, protocol_suite_template_yaml},
-        suite_plan::{ProtocolSuitePlan, ProtocolSuitePlanCase, TargetFingerprint},
+        suite_plan::{ProtocolSuitePlan, TargetFingerprint},
     };
     use async_trait::async_trait;
-    use std::{
-        collections::{BTreeMap, BTreeSet},
-        fs,
-        sync::{Arc, Mutex},
-    };
+    use std::{collections::BTreeMap, fs, path::Path};
 
     #[derive(Clone, Default)]
     struct CleanupAdmin;
-
-    #[async_trait]
-    impl ProtocolAdminCleanupPort for CleanupAdmin {
-        async fn users_with_prefix(
-            &self,
-            _prefix: &str,
-        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
-            Ok(Vec::new())
-        }
-
-        async fn remove_user(
-            &self,
-            _access_key: &str,
-        ) -> std::result::Result<(), ProtocolAdminError> {
-            Ok(())
-        }
-
-        async fn groups_with_prefix(
-            &self,
-            _prefix: &str,
-        ) -> Result<Vec<String>, ProtocolAdminError> {
-            Ok(Vec::new())
-        }
-        async fn group_contains_member(
-            &self,
-            _group: &str,
-            _member: &str,
-        ) -> Result<bool, ProtocolAdminError> {
-            Ok(false)
-        }
-        async fn update_group_members(
-            &self,
-            _group: &str,
-            _members: &[String],
-            _remove: bool,
-        ) -> Result<(), ProtocolAdminError> {
-            Ok(())
-        }
-        async fn remove_group(&self, _group: &str) -> Result<(), ProtocolAdminError> {
-            Ok(())
-        }
-        async fn policies_with_prefix(
-            &self,
-            _prefix: &str,
-        ) -> Result<Vec<String>, ProtocolAdminError> {
-            Ok(Vec::new())
-        }
-        async fn remove_policy(&self, _name: &str) -> Result<(), ProtocolAdminError> {
-            Ok(())
-        }
-        async fn detach_policy(
-            &self,
-            _policy: &str,
-            _principal: &str,
-            _is_group: bool,
-        ) -> Result<(), ProtocolAdminError> {
-            Ok(())
-        }
-        async fn policy_attached(
-            &self,
-            _policy: &str,
-            _principal: &str,
-            _is_group: bool,
-        ) -> Result<bool, ProtocolAdminError> {
-            Ok(false)
-        }
-        async fn revoke_sts_sessions_for_provider(
-            &self,
-            _parent_access_key: &str,
-            _provider: &str,
-        ) -> Result<(), ProtocolAdminError> {
-            Ok(())
-        }
-        async fn sts_sessions_with_parent_for_provider(
-            &self,
-            _parent_access_key: &str,
-            _provider: &str,
-        ) -> Result<Vec<String>, ProtocolAdminError> {
-            Ok(Vec::new())
-        }
-    }
 
     #[async_trait]
     impl ProtocolAdminServerPort for CleanupAdmin {
@@ -1097,169 +736,6 @@ mod tests {
                 region: None,
             })
         }
-    }
-
-    #[derive(Clone, Default)]
-    struct CleanupS3(Arc<Mutex<BTreeSet<String>>>);
-
-    #[async_trait]
-    impl ProtocolS3CleanupPort for CleanupS3 {
-        async fn cleanup_bucket_names(
-            &self,
-            prefix: &str,
-        ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
-            Ok(self
-                .0
-                .lock()
-                .expect("buckets")
-                .iter()
-                .filter(|name| name.starts_with(prefix))
-                .cloned()
-                .collect())
-        }
-
-        async fn cleanup_exclusive_bucket(
-            &self,
-            ownership: ExclusiveBucketOwnership<'_>,
-            _include_versions: bool,
-        ) -> Result<(), ProtocolS3Error> {
-            self.0.lock().expect("buckets").remove(ownership.bucket());
-            Ok(())
-        }
-        async fn cleanup_object_prefix(
-            &self,
-            _bucket: &str,
-            _prefix: &str,
-            _include_versions: bool,
-        ) -> Result<(), ProtocolS3Error> {
-            Ok(())
-        }
-        async fn cleanup_object_prefix_exists(
-            &self,
-            _bucket: &str,
-            _prefix: &str,
-            _include_versions: bool,
-        ) -> Result<bool, ProtocolS3Error> {
-            Ok(false)
-        }
-        async fn cleanup_abort_multipart_upload(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _upload_id: &str,
-        ) -> Result<(), ProtocolS3Error> {
-            Ok(())
-        }
-        async fn cleanup_multipart_upload_exists(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _upload_id: &str,
-        ) -> Result<bool, ProtocolS3Error> {
-            Ok(false)
-        }
-        async fn cleanup_delete_bucket_policy(&self, _bucket: &str) -> Result<(), ProtocolS3Error> {
-            Ok(())
-        }
-        async fn cleanup_bucket_policy_exists(
-            &self,
-            _bucket: &str,
-        ) -> Result<bool, ProtocolS3Error> {
-            Ok(false)
-        }
-        async fn cleanup_delete_public_access_block(
-            &self,
-            _bucket: &str,
-        ) -> Result<(), ProtocolS3Error> {
-            Ok(())
-        }
-        async fn cleanup_public_access_block_exists(
-            &self,
-            _bucket: &str,
-        ) -> Result<bool, ProtocolS3Error> {
-            Ok(false)
-        }
-    }
-
-    fn planned_case(id: &str) -> ProtocolSuitePlanCase {
-        ProtocolSuitePlanCase {
-            id: id.to_string(),
-            domain: crate::protocol::catalog::ProtocolDomain::Other,
-            group: "s3-compatibility".to_string(),
-            tags: Vec::new(),
-            requires: vec!["s3".to_string()],
-            isolation: "case".to_string(),
-            serial: false,
-            worker_index: 0,
-            wave_index: 0,
-            locks: Vec::new(),
-            artifact_dir: format!("cases/{id}"),
-            contract: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn corrupt_case_registry_does_not_skip_later_or_root_cleanup() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let fingerprint = TargetFingerprint::new(
-            "http://127.0.0.1:9000",
-            "us-east-1",
-            "deployment",
-            None,
-            None,
-        )
-        .expect("fingerprint");
-        let corrupt_dir = base.path().join("cases/corrupt");
-        fs::create_dir_all(&corrupt_dir).expect("corrupt case dir");
-        fs::write(corrupt_dir.join(RESOURCE_REGISTRY_FILE), "not-json").expect("corrupt registry");
-
-        let valid_dir = base.path().join("cases/valid");
-        let mut valid = ResourceRegistry::create(&valid_dir, "run", fingerprint.clone())
-            .expect("valid registry");
-        let valid_bucket = valid
-            .plan(ResourceKind::Bucket, "valid-bucket", "valid", Vec::new())
-            .expect("valid bucket");
-        valid
-            .transition(&valid_bucket.id, ResourceState::Creating, None)
-            .expect("creating");
-        valid
-            .transition(&valid_bucket.id, ResourceState::Created, None)
-            .expect("created");
-
-        let mut root =
-            ResourceRegistry::create(base.path(), "run", fingerprint).expect("root registry");
-        let root_bucket = root
-            .plan(ResourceKind::Bucket, "root-bucket", "preflight", Vec::new())
-            .expect("root bucket");
-        root.transition(&root_bucket.id, ResourceState::Creating, None)
-            .expect("creating");
-        root.transition(&root_bucket.id, ResourceState::Created, None)
-            .expect("created");
-
-        let s3 = CleanupS3(Arc::new(Mutex::new(BTreeSet::from([
-            "valid-bucket".to_string(),
-            "root-bucket".to_string(),
-        ]))));
-        let report = cleanup_suite_registries(
-            base.path(),
-            &[planned_case("corrupt"), planned_case("valid")],
-            &mut root,
-            &CleanupAdmin,
-            &s3,
-            None,
-            "rustfs.com/s3chaos/v1alpha1",
-        )
-        .await;
-
-        assert!(!report.succeeded);
-        assert!(
-            report
-                .attempts
-                .iter()
-                .any(|attempt| attempt.resource_kind == "registry")
-        );
-        assert!(s3.0.lock().expect("buckets").is_empty());
-        assert!(root.pending_cleanup().next().is_none());
     }
 
     #[tokio::test]
@@ -1327,14 +803,21 @@ mod tests {
         .expect("plan");
         let root = plan.artifact_root();
         let case_dir = root.join("cases/bucket-policy-authenticated-user-rw");
-        fs::create_dir_all(&case_dir).expect("case dir");
-        fs::write(
-            root.join("protocol-suite.yaml"),
-            protocol_suite_template_yaml(),
-        )
-        .expect("suite source");
-        write_json(&root.join("protocol-suite-plan.json"), &plan).expect("plan artifact");
-        write_json(&root.join("preflight-summary.json"), &preflight).expect("preflight artifact");
+        let artifacts = ProtocolArtifactWriter::file(&root);
+        let suite_source = tempfile::NamedTempFile::new().expect("suite source");
+        fs::write(suite_source.path(), protocol_suite_template_yaml()).expect("suite source");
+        artifacts
+            .initialize_run(suite_source.path())
+            .expect("initialize artifacts");
+        artifacts
+            .create_case_dir("bucket-policy-authenticated-user-rw")
+            .expect("case dir");
+        artifacts
+            .write_json("protocol-suite-plan.json", &plan)
+            .expect("plan artifact");
+        artifacts
+            .write_json("preflight-summary.json", &preflight)
+            .expect("preflight artifact");
         ResourceRegistry::create(&root, "run", fingerprint.clone()).expect("registry");
         let mut case_registry = ResourceRegistry::create(&case_dir, "run", fingerprint)
             .expect("case resource registry");
@@ -1351,7 +834,9 @@ mod tests {
             leftovers: Vec::new(),
             succeeded: true,
         };
-        write_json(&root.join("cleanup-report.json"), &cleanup).expect("cleanup artifact");
+        artifacts
+            .write_json("cleanup-report.json", &cleanup)
+            .expect("cleanup artifact");
         let case_report = ProtocolCaseReport {
             api_version: suite.api_version.clone(),
             kind: "ProtocolCaseReport".to_string(),
@@ -1364,15 +849,30 @@ mod tests {
             failure_phase: None,
             failure: None,
         };
-        write_json(&case_dir.join("case-report.json"), &case_report).expect("case artifact");
-        write_json(&case_dir.join("cleanup-report.json"), &cleanup).expect("case cleanup artifact");
-        write_json_lines::<ProtocolAssertion>(&case_dir.join("operation-history.jsonl"), &[])
+        artifacts
+            .write_json(
+                "cases/bucket-policy-authenticated-user-rw/case-report.json",
+                &case_report,
+            )
+            .expect("case artifact");
+        artifacts
+            .write_json(
+                "cases/bucket-policy-authenticated-user-rw/cleanup-report.json",
+                &cleanup,
+            )
+            .expect("case cleanup artifact");
+        artifacts
+            .write_json_lines::<ProtocolAssertion>(
+                "cases/bucket-policy-authenticated-user-rw/operation-history.jsonl",
+                &[],
+            )
             .expect("case history artifact");
-        write_json(
-            &root.join(COMPATIBILITY_COVERAGE_FILE),
-            &compatibility_coverage_report(&BTreeMap::new()).expect("coverage report"),
-        )
-        .expect("coverage artifact");
+        artifacts
+            .write_json(
+                COMPATIBILITY_COVERAGE_FILE,
+                &compatibility_coverage_report(&BTreeMap::new()).expect("coverage report"),
+            )
+            .expect("coverage artifact");
         let summary = ProtocolSuiteSummary {
             api_version: suite.api_version,
             kind: "ProtocolSuiteSummary".to_string(),
@@ -1389,30 +889,40 @@ mod tests {
             ],
             failure_summary: None,
         };
-        write_json(&root.join("protocol-suite-summary.json"), &summary).expect("summary artifact");
-        fs::write(
-            root.join(PROTOCOL_JUNIT_FILE),
-            protocol_junit_xml(
-                &summary.suite,
-                &[(&case_report, cleanup.succeeded)],
-                cleanup.succeeded,
-            ),
-        )
-        .expect("JUnit artifact");
+        artifacts
+            .write_json("protocol-suite-summary.json", &summary)
+            .expect("summary artifact");
+        artifacts
+            .write_text(
+                PROTOCOL_JUNIT_FILE,
+                &protocol_junit_xml(
+                    &summary.suite,
+                    &[(&case_report, cleanup.succeeded)],
+                    cleanup.succeeded,
+                ),
+            )
+            .expect("JUnit artifact");
 
         validate_phase_one_artifacts(&root, &["not-present-secret".to_string()])
             .expect("valid artifacts");
 
         let case_registry_path = case_dir.join(RESOURCE_REGISTRY_FILE);
+        let case_registry_relative =
+            Path::new("cases/bucket-policy-authenticated-user-rw").join(RESOURCE_REGISTRY_FILE);
         let valid_case_registry = case_registry.clone();
         fs::remove_file(&case_registry_path).expect("remove case registry");
         assert!(validate_phase_one_artifacts(&root, &[]).is_err());
-        write_json(&case_registry_path, &valid_case_registry).expect("restore case registry");
+        artifacts
+            .write_json(&case_registry_relative, &valid_case_registry)
+            .expect("restore case registry");
 
         let reject_registry_tampering = |tampered: &ResourceRegistry| {
-            write_json(&case_registry_path, tampered).expect("write tampered case registry");
+            artifacts
+                .write_json(&case_registry_relative, tampered)
+                .expect("write tampered case registry");
             assert!(validate_phase_one_artifacts(&root, &[]).is_err());
-            write_json(&case_registry_path, &valid_case_registry)
+            artifacts
+                .write_json(&case_registry_relative, &valid_case_registry)
                 .expect("restore valid case registry");
         };
 
@@ -1460,75 +970,88 @@ mod tests {
         let mut failed_cleanup = cleanup.clone();
         failed_cleanup.succeeded = false;
         failed_cleanup.leftovers = vec!["suite-resource".to_string()];
-        write_json(&root.join("cleanup-report.json"), &failed_cleanup)
+        artifacts
+            .write_json("cleanup-report.json", &failed_cleanup)
             .expect("failed suite cleanup artifact");
-        write_json(
-            &root.join("protocol-failure-summary.json"),
-            &ProtocolFailureSummary {
-                api_version: summary.api_version.clone(),
-                kind: "ProtocolFailureSummary".to_string(),
-                stage: "cleanup".to_string(),
-                classification: "cleanup-failed".to_string(),
-                case_id: None,
-                evidence: vec!["cleanup-report.json".to_string()],
-            },
-        )
-        .expect("suite cleanup failure summary");
+        artifacts
+            .write_json(
+                "protocol-failure-summary.json",
+                &ProtocolFailureSummary {
+                    api_version: summary.api_version.clone(),
+                    kind: "ProtocolFailureSummary".to_string(),
+                    stage: "cleanup".to_string(),
+                    classification: "cleanup-failed".to_string(),
+                    case_id: None,
+                    evidence: vec!["cleanup-report.json".to_string()],
+                },
+            )
+            .expect("suite cleanup failure summary");
         let mut failed_summary = summary.clone();
         failed_summary.status = ProtocolCaseStatus::Failed;
         failed_summary.failure_summary = Some("protocol-failure-summary.json".to_string());
-        write_json(&root.join("protocol-suite-summary.json"), &failed_summary)
+        artifacts
+            .write_json("protocol-suite-summary.json", &failed_summary)
             .expect("failed suite summary");
-        fs::write(
-            root.join(PROTOCOL_JUNIT_FILE),
-            protocol_junit_xml(&summary.suite, &[(&case_report, cleanup.succeeded)], true),
-        )
-        .expect("incorrect passing suite-cleanup JUnit artifact");
+        artifacts
+            .write_text(
+                PROTOCOL_JUNIT_FILE,
+                &protocol_junit_xml(&summary.suite, &[(&case_report, cleanup.succeeded)], true),
+            )
+            .expect("incorrect passing suite-cleanup JUnit artifact");
         assert!(validate_phase_one_artifacts(&root, &[]).is_err());
-        fs::write(
-            root.join(PROTOCOL_JUNIT_FILE),
-            protocol_junit_xml(
-                &summary.suite,
-                &[(&case_report, cleanup.succeeded)],
-                failed_cleanup.succeeded,
-            ),
-        )
-        .expect("failed suite-cleanup JUnit artifact");
+        artifacts
+            .write_text(
+                PROTOCOL_JUNIT_FILE,
+                &protocol_junit_xml(
+                    &summary.suite,
+                    &[(&case_report, cleanup.succeeded)],
+                    failed_cleanup.succeeded,
+                ),
+            )
+            .expect("failed suite-cleanup JUnit artifact");
         validate_phase_one_artifacts(&root, &[]).expect("suite cleanup failure is linked to JUnit");
 
-        write_json(&root.join("cleanup-report.json"), &cleanup).expect("restore cleanup artifact");
-        write_json(&root.join("protocol-suite-summary.json"), &summary)
+        artifacts
+            .write_json("cleanup-report.json", &cleanup)
+            .expect("restore cleanup artifact");
+        artifacts
+            .write_json("protocol-suite-summary.json", &summary)
             .expect("restore suite summary");
         fs::remove_file(root.join("protocol-failure-summary.json"))
             .expect("remove suite cleanup failure summary");
-        fs::write(
-            root.join(PROTOCOL_JUNIT_FILE),
-            protocol_junit_xml(
-                &summary.suite,
-                &[(&case_report, cleanup.succeeded)],
-                cleanup.succeeded,
-            ),
-        )
-        .expect("restore passing JUnit artifact");
+        artifacts
+            .write_text(
+                PROTOCOL_JUNIT_FILE,
+                &protocol_junit_xml(
+                    &summary.suite,
+                    &[(&case_report, cleanup.succeeded)],
+                    cleanup.succeeded,
+                ),
+            )
+            .expect("restore passing JUnit artifact");
         fs::remove_file(root.join(PROTOCOL_JUNIT_FILE)).expect("remove JUnit artifact");
         assert!(validate_phase_one_artifacts(&root, &[]).is_err());
-        fs::write(root.join(PROTOCOL_JUNIT_FILE), "<testsuite/>").expect("tampered JUnit");
+        artifacts
+            .write_text(PROTOCOL_JUNIT_FILE, "<testsuite/>")
+            .expect("tampered JUnit");
         assert!(validate_phase_one_artifacts(&root, &[]).is_err());
-        fs::write(
-            root.join(PROTOCOL_JUNIT_FILE),
-            protocol_junit_xml(
-                &summary.suite,
-                &[(&case_report, cleanup.succeeded)],
-                cleanup.succeeded,
-            ),
-        )
-        .expect("restore JUnit artifact");
+        artifacts
+            .write_text(
+                PROTOCOL_JUNIT_FILE,
+                &protocol_junit_xml(
+                    &summary.suite,
+                    &[(&case_report, cleanup.succeeded)],
+                    cleanup.succeeded,
+                ),
+            )
+            .expect("restore JUnit artifact");
         validate_phase_one_artifacts(&root, &[]).expect("restored JUnit artifacts");
-        fs::write(
-            root.join("credential-leak.json"),
-            r#"{"secretKey":"unknown-to-validator"}"#,
-        )
-        .expect("leak fixture");
+        artifacts
+            .write_text(
+                "credential-leak.json",
+                r#"{"secretKey":"unknown-to-validator"}"#,
+            )
+            .expect("leak fixture");
         assert!(validate_phase_one_artifacts(&root, &[]).is_err());
         let report: crate::protocol::reporting::ProtocolArtifactValidationReport =
             serde_json::from_str(
