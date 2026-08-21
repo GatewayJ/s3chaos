@@ -282,6 +282,8 @@ fn resolve_cases(selector: &ProtocolSuiteSelector) -> Result<Vec<&'static Protoc
             "unknown protocol case {case_id}"
         );
     }
+    ensure_unique_case_ids("selector.cases", &selector.cases)?;
+    ensure_unique_case_ids("selector.excludeCases", &selector.exclude_cases)?;
 
     let has_filters = !selector.groups.is_empty() || !selector.tags.is_empty();
     let is_default_selection = !has_filters && selector.cases.is_empty();
@@ -310,6 +312,17 @@ fn resolve_cases(selector: &ProtocolSuiteSelector) -> Result<Vec<&'static Protoc
     selected.retain(|case| !selector.exclude_cases.iter().any(|id| id == case.id));
     selected.sort_by_key(|case| case.id);
     Ok(selected)
+}
+
+fn ensure_unique_case_ids(field: &str, case_ids: &[String]) -> Result<()> {
+    let mut unique = BTreeSet::new();
+    for case_id in case_ids {
+        ensure!(
+            unique.insert(case_id),
+            "{field} contains duplicate protocol case {case_id}"
+        );
+    }
+    Ok(())
 }
 
 fn validate_dns_label(field: &str, value: &str, max_len: usize) -> Result<()> {
@@ -423,8 +436,16 @@ target:
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolSuite, protocol_suite_template_yaml, resolve_protocol_endpoint};
-    use crate::protocol::catalog::protocol_case_catalog;
+    use super::{
+        ProtocolSuite, ProtocolSuiteSelector, protocol_suite_template_yaml, resolve_cases,
+        resolve_protocol_endpoint,
+    };
+    use crate::protocol::catalog::{
+        COMPAT_BUCKET_HEAD, COMPAT_BUCKET_LIST_CREATE_DELETE, COMPAT_LIST_OBJECTS_BASIC,
+        COMPAT_MULTI_OBJECT_DELETE, COMPAT_MULTIPART_UPLOAD_SMALL, COMPAT_OBJECT_COPY_SAME_BUCKET,
+        COMPAT_OBJECT_PUT_GET_DELETE, COMPAT_VERSIONING_HEAD_REMOVAL,
+        PUBLIC_ACCESS_BLOCK_ROUND_TRIP, protocol_case_catalog,
+    };
 
     #[test]
     fn template_round_trips_and_selects_smoke_case() {
@@ -525,5 +546,83 @@ mod tests {
                 .iter()
                 .all(|case| !case.requires.contains(&"external-idp"))
         );
+    }
+
+    #[test]
+    fn compatibility_group_tag_and_case_selection_stays_stable() {
+        let s3_compatibility = [
+            COMPAT_BUCKET_HEAD,
+            COMPAT_BUCKET_LIST_CREATE_DELETE,
+            COMPAT_LIST_OBJECTS_BASIC,
+            COMPAT_MULTI_OBJECT_DELETE,
+            COMPAT_MULTIPART_UPLOAD_SMALL,
+            COMPAT_OBJECT_COPY_SAME_BUCKET,
+            COMPAT_OBJECT_PUT_GET_DELETE,
+            COMPAT_VERSIONING_HEAD_REMOVAL,
+        ];
+        let group = resolve_cases(&ProtocolSuiteSelector {
+            groups: vec!["s3-compatibility".to_string()],
+            ..ProtocolSuiteSelector::default()
+        })
+        .expect("compatibility group");
+        assert_eq!(
+            group.iter().map(|case| case.id).collect::<Vec<_>>(),
+            s3_compatibility
+        );
+
+        let tag = resolve_cases(&ProtocolSuiteSelector {
+            tags: vec!["compatibility".to_string()],
+            ..ProtocolSuiteSelector::default()
+        })
+        .expect("compatibility tag");
+        assert_eq!(
+            tag.iter().map(|case| case.id).collect::<Vec<_>>(),
+            [
+                COMPAT_BUCKET_HEAD,
+                COMPAT_BUCKET_LIST_CREATE_DELETE,
+                COMPAT_LIST_OBJECTS_BASIC,
+                COMPAT_MULTI_OBJECT_DELETE,
+                COMPAT_MULTIPART_UPLOAD_SMALL,
+                COMPAT_OBJECT_COPY_SAME_BUCKET,
+                COMPAT_OBJECT_PUT_GET_DELETE,
+                COMPAT_VERSIONING_HEAD_REMOVAL,
+                PUBLIC_ACCESS_BLOCK_ROUND_TRIP,
+            ]
+        );
+
+        for case_id in s3_compatibility
+            .into_iter()
+            .chain([PUBLIC_ACCESS_BLOCK_ROUND_TRIP])
+        {
+            let selected = resolve_cases(&ProtocolSuiteSelector {
+                cases: vec![case_id.to_string()],
+                ..ProtocolSuiteSelector::default()
+            })
+            .expect("explicit compatibility case");
+            assert_eq!(
+                selected.iter().map(|case| case.id).collect::<Vec<_>>(),
+                [case_id]
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_and_duplicate_case_ids_during_selection() {
+        let unknown = resolve_cases(&ProtocolSuiteSelector {
+            cases: vec!["unknown-compatibility-case".to_string()],
+            ..ProtocolSuiteSelector::default()
+        })
+        .expect_err("unknown case must fail");
+        assert!(unknown.to_string().contains("unknown protocol case"));
+
+        let duplicate = resolve_cases(&ProtocolSuiteSelector {
+            cases: vec![
+                COMPAT_BUCKET_HEAD.to_string(),
+                COMPAT_BUCKET_HEAD.to_string(),
+            ],
+            ..ProtocolSuiteSelector::default()
+        })
+        .expect_err("duplicate case must fail");
+        assert!(duplicate.to_string().contains("duplicate protocol case"));
     }
 }
