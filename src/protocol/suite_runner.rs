@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use crate::protocol::{
     artifact_validation::validate_protocol_artifacts_and_write_report,
     cases::{ProtocolCaseExecution, ProtocolCaseServices, run_protocol_case},
-    catalog::protocol_case,
+    catalog::{DEFAULT_PROTOCOL_VARIANT, protocol_case},
     clients::{
         admin::RustfsAdminClient,
         keycloak::KeycloakExternalIdentityProvider,
@@ -47,7 +47,8 @@ use crate::protocol::{
         preflight_protocol_suite_with_external, run_mutating_permission_probe,
     },
     reporting::{
-        ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary, ProtocolSuiteSummary,
+        PROTOCOL_JUNIT_FILE, ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary,
+        ProtocolSuiteSummary, protocol_junit_xml,
     },
     suite::{ResolvedProtocolSuite, resolve_protocol_endpoint, resolve_protocol_suite_yaml},
     suite_plan::{
@@ -308,6 +309,15 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         case_report_paths.push(relative_path(&artifact_root, &case_report_path)?);
         forbidden_case_secrets.extend(execution.forbidden_secrets.iter().cloned());
     }
+    let junit_cases = case_executions
+        .iter()
+        .map(|(execution, cleanup)| (&execution.report, cleanup.succeeded))
+        .collect::<Vec<_>>();
+    fs::write(
+        artifact_root.join(PROTOCOL_JUNIT_FILE),
+        protocol_junit_xml(&runtime.suite.metadata.name, &junit_cases),
+    )
+    .with_context(|| format!("write protocol artifact {PROTOCOL_JUNIT_FILE}"))?;
     let live_compatibility = case_executions
         .iter()
         .filter(|(execution, _)| {
@@ -609,6 +619,13 @@ impl ProtocolCaseRunner<'_> {
         fs::create_dir_all(&case_dir)?;
         let mut registry =
             ResourceRegistry::create(&case_dir, self.run_id, self.fingerprint.clone())?;
+        registry.bind_case(
+            &case.id,
+            case.contract
+                .as_ref()
+                .map(|contract| contract.variant_id.as_str())
+                .unwrap_or(DEFAULT_PROTOCOL_VARIANT),
+        )?;
         registry.set_versioned_cleanup(case.requires.iter().any(|item| item == "versioning"))?;
         let case_namer = self.namer.for_worker(case.worker_index);
         let execution = run_protocol_case(
@@ -969,8 +986,8 @@ mod tests {
         },
         preflight::{ProtocolPreflightSummary, ProtocolStaleResourceScan},
         reporting::{
-            ProtocolAssertion, ProtocolCaseReport, ProtocolCaseStatus, ProtocolCleanupReport,
-            ProtocolSuiteSummary,
+            PROTOCOL_JUNIT_FILE, ProtocolAssertion, ProtocolCaseReport, ProtocolCaseStatus,
+            ProtocolCleanupReport, ProtocolSuiteSummary, protocol_junit_xml,
         },
         suite::{ProtocolSuite, protocol_suite_template_yaml},
         suite_plan::{ProtocolSuitePlan, ProtocolSuitePlanCase, TargetFingerprint},
@@ -1116,6 +1133,7 @@ mod tests {
             wave_index: 0,
             locks: Vec::new(),
             artifact_dir: format!("cases/{id}"),
+            contract: None,
         }
     }
 
@@ -1269,6 +1287,7 @@ mod tests {
             api_version: suite.api_version.clone(),
             kind: "ProtocolCaseReport".to_string(),
             case_id: "bucket-policy-authenticated-user-rw".to_string(),
+            variant_id: crate::protocol::catalog::DEFAULT_PROTOCOL_VARIANT.to_string(),
             domain: crate::protocol::catalog::ProtocolDomain::Authorization,
             status: ProtocolCaseStatus::Passed,
             actors: Vec::new(),
@@ -1302,9 +1321,24 @@ mod tests {
             failure_summary: None,
         };
         write_json(&root.join("protocol-suite-summary.json"), &summary).expect("summary artifact");
+        fs::write(
+            root.join(PROTOCOL_JUNIT_FILE),
+            protocol_junit_xml(&summary.suite, &[(&case_report, cleanup.succeeded)]),
+        )
+        .expect("JUnit artifact");
 
         validate_phase_one_artifacts(&root, &["not-present-secret".to_string()])
             .expect("valid artifacts");
+        fs::remove_file(root.join(PROTOCOL_JUNIT_FILE)).expect("remove JUnit artifact");
+        assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+        fs::write(root.join(PROTOCOL_JUNIT_FILE), "<testsuite/>").expect("tampered JUnit");
+        assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+        fs::write(
+            root.join(PROTOCOL_JUNIT_FILE),
+            protocol_junit_xml(&summary.suite, &[(&case_report, cleanup.succeeded)]),
+        )
+        .expect("restore JUnit artifact");
+        validate_phase_one_artifacts(&root, &[]).expect("restored JUnit artifacts");
         fs::write(
             root.join("credential-leak.json"),
             r#"{"secretKey":"unknown-to-validator"}"#,

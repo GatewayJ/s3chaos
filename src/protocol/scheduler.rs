@@ -15,7 +15,11 @@
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::catalog::ProtocolCase;
+pub use crate::protocol::catalog::ProtocolLockMode;
+use crate::protocol::catalog::{
+    ProtocolCase, ProtocolLockResource, ProtocolResourceOwnership,
+    validate_protocol_case_descriptor,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -23,14 +27,9 @@ pub enum ProtocolLockScope {
     Tenant,
     BucketPrefix,
     IamPrefix,
+    Kms,
+    Sns,
     ExternalIdp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProtocolLockMode {
-    Shared,
-    Exclusive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +52,9 @@ pub fn plan_protocol_schedule(
     parallelism: usize,
 ) -> Result<Vec<Vec<ProtocolScheduledCase>>> {
     ensure!(parallelism > 0, "protocol parallelism must be positive");
+    for case in cases {
+        validate_protocol_case_descriptor(case)?;
+    }
     if parallelism > 1 {
         for case in cases {
             ensure!(
@@ -89,33 +91,46 @@ pub fn plan_protocol_schedule(
 }
 
 fn locks_for_case(case: &ProtocolCase) -> Vec<ProtocolLock> {
-    if case.serial {
-        let mut locks = vec![ProtocolLock {
-            scope: ProtocolLockScope::Tenant,
-            name: "target".to_string(),
-            mode: ProtocolLockMode::Exclusive,
-        }];
-        if case.requires.contains(&"external-idp") {
-            locks.push(ProtocolLock {
-                scope: ProtocolLockScope::ExternalIdp,
-                name: "configured-provider".to_string(),
-                mode: ProtocolLockMode::Exclusive,
-            });
-        }
-        return locks;
-    }
-    vec![
-        ProtocolLock {
-            scope: ProtocolLockScope::BucketPrefix,
-            name: case.id.to_string(),
-            mode: ProtocolLockMode::Exclusive,
-        },
-        ProtocolLock {
-            scope: ProtocolLockScope::IamPrefix,
-            name: case.id.to_string(),
-            mode: ProtocolLockMode::Exclusive,
-        },
-    ]
+    case.lock_requirements
+        .iter()
+        .map(|requirement| {
+            let scope = match requirement.resource {
+                ProtocolLockResource::Tenant => ProtocolLockScope::Tenant,
+                ProtocolLockResource::Bucket => ProtocolLockScope::BucketPrefix,
+                ProtocolLockResource::Identity => ProtocolLockScope::IamPrefix,
+                ProtocolLockResource::Kms => ProtocolLockScope::Kms,
+                ProtocolLockResource::Sns => ProtocolLockScope::Sns,
+                ProtocolLockResource::ExternalIdp => ProtocolLockScope::ExternalIdp,
+            };
+            let name = match requirement.resource {
+                ProtocolLockResource::Tenant
+                | ProtocolLockResource::Kms
+                | ProtocolLockResource::Sns => "target".to_string(),
+                ProtocolLockResource::ExternalIdp => "configured-provider".to_string(),
+                ProtocolLockResource::Bucket
+                    if case.ownership.iter().any(|ownership| {
+                        matches!(
+                            ownership,
+                            ProtocolResourceOwnership::SharedBucketPrefix
+                                | ProtocolResourceOwnership::SharedBucketKey
+                                | ProtocolResourceOwnership::SharedObjectVersion
+                                | ProtocolResourceOwnership::ExactMultipartUpload
+                        )
+                    }) =>
+                {
+                    "shared-bucket".to_string()
+                }
+                ProtocolLockResource::Bucket | ProtocolLockResource::Identity => {
+                    case.id.to_string()
+                }
+            };
+            ProtocolLock {
+                scope,
+                name,
+                mode: requirement.mode,
+            }
+        })
+        .collect()
 }
 
 fn locks_compatible(left: &[ProtocolLock], right: &[ProtocolLock]) -> bool {
@@ -133,48 +148,16 @@ mod tests {
     use super::{
         ProtocolLock, ProtocolLockMode, ProtocolLockScope, locks_compatible, plan_protocol_schedule,
     };
-    use crate::protocol::catalog::{ProtocolCase, ProtocolDomain, ProtocolIsolation};
-
-    const PARALLEL_A: ProtocolCase = ProtocolCase {
-        id: "parallel-a",
-        domain: ProtocolDomain::Other,
-        group: "test",
-        tags: &["parallel-safe"],
-        isolation: ProtocolIsolation::Case,
-        requires: &[],
-        serial: false,
-    };
-    const PARALLEL_B: ProtocolCase = ProtocolCase {
-        id: "parallel-b",
-        domain: ProtocolDomain::Other,
-        group: "test",
-        tags: &["parallel-safe"],
-        isolation: ProtocolIsolation::Case,
-        requires: &[],
-        serial: false,
-    };
-    const SERIAL: ProtocolCase = ProtocolCase {
-        id: "serial",
-        domain: ProtocolDomain::Other,
-        group: "test",
-        tags: &[],
-        isolation: ProtocolIsolation::Case,
-        requires: &[],
-        serial: true,
-    };
-    const EXTERNAL_IDP: ProtocolCase = ProtocolCase {
-        id: "external-idp",
-        domain: ProtocolDomain::Other,
-        group: "test",
-        tags: &[],
-        isolation: ProtocolIsolation::Case,
-        requires: &["external-idp"],
-        serial: true,
+    use crate::protocol::catalog::{
+        COMPAT_BUCKET_HEAD, COMPAT_OBJECT_PUT_GET_DELETE, IAM_GROUP_POLICY,
+        OIDC_WEB_IDENTITY_BASIC, protocol_case,
     };
 
     #[test]
     fn parallel_safe_cases_receive_distinct_workers_and_prefix_locks() {
-        let schedule = plan_protocol_schedule(&[&PARALLEL_A, &PARALLEL_B], 2).expect("schedule");
+        let parallel_a = protocol_case(COMPAT_BUCKET_HEAD).expect("parallel case");
+        let parallel_b = protocol_case(COMPAT_OBJECT_PUT_GET_DELETE).expect("parallel case");
+        let schedule = plan_protocol_schedule(&[parallel_a, parallel_b], 2).expect("schedule");
         assert_eq!(schedule.len(), 1);
         assert_eq!(schedule[0][0].worker_index, 0);
         assert_eq!(schedule[0][1].worker_index, 1);
@@ -183,13 +166,15 @@ mod tests {
 
     #[test]
     fn scheduler_rejects_serial_case_when_parallelism_is_requested() {
-        assert!(plan_protocol_schedule(&[&SERIAL], 2).is_err());
-        assert!(plan_protocol_schedule(&[&SERIAL], 1).is_ok());
+        let serial = protocol_case(IAM_GROUP_POLICY).expect("serial case");
+        assert!(plan_protocol_schedule(&[serial], 2).is_err());
+        assert!(plan_protocol_schedule(&[serial], 1).is_ok());
     }
 
     #[test]
     fn external_idp_case_receives_explicit_exclusive_lock() {
-        let schedule = plan_protocol_schedule(&[&EXTERNAL_IDP], 1).expect("schedule");
+        let external_idp = protocol_case(OIDC_WEB_IDENTITY_BASIC).expect("external case");
+        let schedule = plan_protocol_schedule(&[external_idp], 1).expect("schedule");
         assert!(schedule[0][0].locks.iter().any(|lock| {
             lock.scope == ProtocolLockScope::ExternalIdp && lock.mode == ProtocolLockMode::Exclusive
         }));

@@ -28,8 +28,9 @@ use crate::protocol::{
     fixture::registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
     preflight::ProtocolPreflightSummary,
     reporting::{
-        ProtocolArtifactValidationReport, ProtocolCaseReport, ProtocolCaseStatus,
-        ProtocolCleanupReport, ProtocolFailureSummary, ProtocolSuiteSummary,
+        PROTOCOL_JUNIT_FILE, ProtocolArtifactValidationReport, ProtocolCaseReport,
+        ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary, ProtocolSuiteSummary,
+        protocol_junit_xml,
     },
     suite_plan::ProtocolSuitePlan,
 };
@@ -87,6 +88,7 @@ fn validate_contract(
         RESOURCE_REGISTRY_FILE,
         "cleanup-report.json",
         COMPATIBILITY_COVERAGE_FILE,
+        PROTOCOL_JUNIT_FILE,
         "protocol-suite-summary.json",
     ] {
         ensure!(
@@ -139,13 +141,24 @@ fn validate_contract(
     );
     let mut case_reports = Vec::new();
     let mut case_cleanups = Vec::new();
-    for (case_id, report_path) in selected_cases.iter().zip(&summary.case_reports) {
+    for (planned_case, report_path) in plan.cases.iter().zip(&summary.case_reports) {
+        let case_id = &planned_case.id;
         let report_path = safe_relative_path(report_path)?;
         let report: ProtocolCaseReport = read_json(&root.join(report_path))?;
         ensure!(
             &report.case_id == case_id,
             "case report id {} does not match planned case {case_id}",
             report.case_id
+        );
+        let expected_variant = planned_case
+            .contract
+            .as_ref()
+            .map(|contract| contract.variant_id.as_str())
+            .unwrap_or(crate::protocol::catalog::DEFAULT_PROTOCOL_VARIANT);
+        ensure!(
+            report.variant_id == expected_variant,
+            "case report variant {} does not match planned case {case_id} variant {expected_variant}",
+            report.variant_id
         );
         let case_dir = report_path
             .parent()
@@ -177,6 +190,18 @@ fn validate_contract(
         case_cleanups.push(case_cleanup);
         case_reports.push(report);
     }
+    let junit_cases = case_reports
+        .iter()
+        .zip(&case_cleanups)
+        .map(|(report, cleanup)| (report, cleanup.succeeded))
+        .collect::<Vec<_>>();
+    let expected_junit = protocol_junit_xml(&summary.suite, &junit_cases);
+    let actual_junit = fs::read_to_string(root.join(PROTOCOL_JUNIT_FILE))
+        .with_context(|| format!("read protocol artifact {PROTOCOL_JUNIT_FILE}"))?;
+    ensure!(
+        actual_junit == expected_junit,
+        "protocol JUnit report does not match planned case/variant results"
+    );
     let expected_status = if case_reports
         .iter()
         .all(|report| report.status == ProtocolCaseStatus::Passed)

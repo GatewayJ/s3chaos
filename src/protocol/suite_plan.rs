@@ -19,7 +19,10 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::protocol::{
-    catalog::ProtocolDomain,
+    catalog::{
+        ProtocolCapability, ProtocolCase, ProtocolCleanupScope, ProtocolDomain, ProtocolExecutor,
+        ProtocolExpectedOutcome, ProtocolLockRequirement, ProtocolResourceOwnership,
+    },
     ports::ProtocolExternalIdentityProviderInfo,
     scheduler::{ProtocolLock, plan_protocol_schedule},
     suite::{ProtocolCleanupPolicy, ResolvedProtocolSuite},
@@ -172,6 +175,89 @@ pub struct ProtocolSuitePlanCase {
     pub wave_index: usize,
     pub locks: Vec<ProtocolLock>,
     pub artifact_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<ProtocolSuitePlanCaseContract>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolSuitePlanCaseContract {
+    pub variant_id: String,
+    pub executor: ProtocolExecutor,
+    pub capabilities: Vec<ProtocolCapability>,
+    pub lock_requirements: Vec<ProtocolLockRequirement>,
+    pub ownership: Vec<ProtocolResourceOwnership>,
+    pub cleanup_scopes: Vec<ProtocolCleanupScope>,
+    pub variants: Vec<ProtocolSuitePlanVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolSuitePlanVariant {
+    pub id: String,
+    pub expected: ProtocolSuitePlanExpectedOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ProtocolSuitePlanExpectedOutcome {
+    Success,
+    S3Error {
+        http_status: u16,
+        error_code: String,
+    },
+    Transport {
+        outcome: String,
+    },
+    ExpectedDivergence {
+        issue: String,
+    },
+}
+
+impl ProtocolSuitePlanCaseContract {
+    fn from_case(case: &ProtocolCase) -> Self {
+        Self {
+            variant_id: case.default_variant().id.to_string(),
+            executor: case.executor,
+            capabilities: case.capabilities.to_vec(),
+            lock_requirements: case.lock_requirements.to_vec(),
+            ownership: case.ownership.to_vec(),
+            cleanup_scopes: case.cleanup_scopes.to_vec(),
+            variants: case
+                .variants
+                .iter()
+                .map(|variant| ProtocolSuitePlanVariant {
+                    id: variant.id.to_string(),
+                    expected: ProtocolSuitePlanExpectedOutcome::from(variant.expected),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<ProtocolExpectedOutcome> for ProtocolSuitePlanExpectedOutcome {
+    fn from(outcome: ProtocolExpectedOutcome) -> Self {
+        match outcome {
+            ProtocolExpectedOutcome::Success => Self::Success,
+            ProtocolExpectedOutcome::S3Error {
+                http_status,
+                error_code,
+            } => Self::S3Error {
+                http_status,
+                error_code: error_code.to_string(),
+            },
+            ProtocolExpectedOutcome::Transport { outcome } => Self::Transport {
+                outcome: outcome.to_string(),
+            },
+            ProtocolExpectedOutcome::ExpectedDivergence { issue } => Self::ExpectedDivergence {
+                issue: issue.to_string(),
+            },
+        }
+    }
 }
 
 impl ProtocolSuitePlan {
@@ -203,18 +289,14 @@ impl ProtocolSuitePlan {
             .map(|case| {
                 let (wave_index, scheduled) = scheduled
                     .iter()
-                    .find(|(_, scheduled)| scheduled.case_id == case.id)
+                    .find(|(_, scheduled)| scheduled.case_id == case.id.as_str())
                     .expect("every selected case is scheduled");
                 ProtocolSuitePlanCase {
                     id: case.id.to_string(),
                     domain: case.domain,
                     group: case.group.to_string(),
                     tags: case.tags.iter().map(|tag| (*tag).to_string()).collect(),
-                    requires: case
-                        .requires
-                        .iter()
-                        .map(|requirement| (*requirement).to_string())
-                        .collect(),
+                    requires: case.capabilities.iter().map(ToString::to_string).collect(),
                     isolation: "case".to_string(),
                     serial: case.serial,
                     worker_index: scheduled.worker_index,
@@ -222,9 +304,10 @@ impl ProtocolSuitePlan {
                     locks: scheduled.locks.clone(),
                     artifact_dir: artifact_root
                         .join("cases")
-                        .join(case.id)
+                        .join(case.id.as_str())
                         .display()
                         .to_string(),
+                    contract: Some(ProtocolSuitePlanCaseContract::from_case(case)),
                 }
             })
             .collect();
@@ -304,7 +387,11 @@ fn normalize_endpoint(endpoint: String) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::TargetFingerprint;
+    use super::{ProtocolSuitePlanCaseContract, TargetFingerprint};
+    use crate::protocol::catalog::{
+        BUCKET_POLICY_MALFORMED_POLICY_REJECTED, ProtocolCapability, ProtocolCleanupScope,
+        protocol_case,
+    };
 
     #[test]
     fn fingerprint_normalizes_endpoint_and_is_stable() {
@@ -326,5 +413,28 @@ mod tests {
         .expect("fingerprint");
         assert_eq!(first, second);
         assert_eq!(first.sha256.len(), 64);
+    }
+
+    #[test]
+    fn plan_contract_serializes_typed_descriptor_without_changing_requires() {
+        let case = protocol_case(BUCKET_POLICY_MALFORMED_POLICY_REJECTED).expect("case");
+        let contract = ProtocolSuitePlanCaseContract::from_case(case);
+        assert_eq!(contract.variant_id, "default");
+        assert!(
+            contract
+                .capabilities
+                .contains(&ProtocolCapability::BucketPolicy)
+        );
+        assert!(
+            contract
+                .cleanup_scopes
+                .contains(&ProtocolCleanupScope::BucketPolicy)
+        );
+        let json = serde_json::to_value(contract).expect("contract JSON");
+        assert_eq!(json["variants"][0]["expected"]["kind"], "s3-error");
+        assert_eq!(
+            json["variants"][0]["expected"]["errorCode"],
+            "MalformedPolicy"
+        );
     }
 }

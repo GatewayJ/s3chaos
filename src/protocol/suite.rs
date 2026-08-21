@@ -18,7 +18,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use crate::protocol::catalog::{ProtocolCase, protocol_case, protocol_case_catalog};
+use crate::protocol::catalog::{
+    ProtocolCapability, ProtocolCase, protocol_case, protocol_case_catalog,
+    validate_protocol_catalog,
+};
 
 pub const PROTOCOL_SUITE_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
 pub const PROTOCOL_SUITE_KIND: &str = "ProtocolSuite";
@@ -171,6 +174,7 @@ impl ProtocolSuite {
     }
 
     pub fn resolve(&self) -> Result<ResolvedProtocolSuite> {
+        validate_protocol_catalog()?;
         ensure!(
             self.api_version == PROTOCOL_SUITE_API_VERSION,
             "unsupported ProtocolSuite apiVersion {}; expected {PROTOCOL_SUITE_API_VERSION}",
@@ -219,7 +223,7 @@ impl ProtocolSuite {
         );
         let requires_external_identity = cases
             .iter()
-            .any(|case| case.requires.contains(&"external-idp"));
+            .any(|case| case.has_capability(ProtocolCapability::ExternalIdp));
         if requires_external_identity {
             let external = self.target.external_identity.as_ref().context(
                 "target.externalIdentity is required when an external-idp case is selected",
@@ -291,7 +295,7 @@ fn resolve_cases(selector: &ProtocolSuiteSelector) -> Result<Vec<&'static Protoc
         catalog
             .iter()
             .filter(|case| {
-                (!is_default_selection || !case.requires.contains(&"external-idp"))
+                (!is_default_selection || !case.has_capability(ProtocolCapability::ExternalIdp))
                     && (selector.groups.is_empty()
                         || selector.groups.iter().any(|group| group == case.group))
                     && selector
@@ -309,7 +313,12 @@ fn resolve_cases(selector: &ProtocolSuiteSelector) -> Result<Vec<&'static Protoc
             selected.push(case);
         }
     }
-    selected.retain(|case| !selector.exclude_cases.iter().any(|id| id == case.id));
+    selected.retain(|case| {
+        !selector
+            .exclude_cases
+            .iter()
+            .any(|id| id == case.id.as_str())
+    });
     selected.sort_by_key(|case| case.id);
     Ok(selected)
 }
@@ -537,14 +546,14 @@ mod tests {
         let resolved = suite.resolve().expect("resolved default suite");
         let expected = protocol_case_catalog()
             .iter()
-            .filter(|case| !case.requires.contains(&"external-idp"))
+            .filter(|case| !case.has_capability(super::ProtocolCapability::ExternalIdp))
             .count();
         assert_eq!(resolved.cases.len(), expected);
         assert!(
             resolved
                 .cases
                 .iter()
-                .all(|case| !case.requires.contains(&"external-idp"))
+                .all(|case| !case.has_capability(super::ProtocolCapability::ExternalIdp))
         );
     }
 
