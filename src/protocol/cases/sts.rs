@@ -35,8 +35,9 @@ use crate::protocol::{
         resources::{IamFixture, PolicyGrant, create_and_attach_policy, setup_user_bucket},
     },
     ports::{
-        ActorS3ClientFactory, ProtocolAdminPort, ProtocolAssumeRoleRequest, ProtocolS3Port,
-        ProtocolStsPort,
+        ActorS3ClientFactory, ProtocolAssumeRoleRequest, ProtocolBucketPort,
+        ProtocolIdentityAdminPort, ProtocolListingPort, ProtocolObjectPort,
+        ProtocolPolicyAdminPort, ProtocolStsPort,
     },
     reporting::ProtocolAssertionClass,
 };
@@ -54,8 +55,8 @@ pub(crate) async fn run_sts_case<F>(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    admin_s3: &impl ProtocolS3Port,
+    admin: &(impl ProtocolIdentityAdminPort + ProtocolPolicyAdminPort),
+    admin_s3: &(impl ProtocolBucketPort + ProtocolObjectPort),
     sts: &impl ProtocolStsPort,
     actor_clients: &F,
 ) -> ProtocolCaseExecution
@@ -136,8 +137,8 @@ fn sts_dimensions(case_id: &str) -> ProtocolAuthorizationDimensions {
 async fn run_expired_token<F>(
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    admin_s3: &impl ProtocolS3Port,
+    admin: &(impl ProtocolIdentityAdminPort + ProtocolPolicyAdminPort),
+    admin_s3: &(impl ProtocolBucketPort + ProtocolObjectPort),
     sts: &impl ProtocolStsPort,
     actor_clients: &F,
     context: &mut CaseContext,
@@ -181,8 +182,8 @@ where
 async fn run_basic<F>(
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    admin_s3: &impl ProtocolS3Port,
+    admin: &(impl ProtocolIdentityAdminPort + ProtocolPolicyAdminPort),
+    admin_s3: &(impl ProtocolBucketPort + ProtocolObjectPort),
     sts: &impl ProtocolStsPort,
     actor_clients: &F,
     context: &mut CaseContext,
@@ -249,8 +250,8 @@ where
 async fn run_narrowing<F>(
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    admin_s3: &impl ProtocolS3Port,
+    admin: &(impl ProtocolIdentityAdminPort + ProtocolPolicyAdminPort),
+    admin_s3: &(impl ProtocolBucketPort + ProtocolObjectPort),
     sts: &impl ProtocolStsPort,
     actor_clients: &F,
     context: &mut CaseContext,
@@ -319,8 +320,8 @@ where
 async fn run_deny_put<F>(
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    admin_s3: &impl ProtocolS3Port,
+    admin: &(impl ProtocolIdentityAdminPort + ProtocolPolicyAdminPort),
+    admin_s3: &(impl ProtocolBucketPort + ProtocolObjectPort),
     sts: &impl ProtocolStsPort,
     actor_clients: &F,
     context: &mut CaseContext,
@@ -410,8 +411,8 @@ async fn setup_sts_fixture<A, S, T, F>(
     duration_seconds: u32,
 ) -> Result<(IamFixture<F::Client>, F::Client)>
 where
-    A: ProtocolAdminPort,
-    S: ProtocolS3Port,
+    A: ProtocolIdentityAdminPort + ProtocolPolicyAdminPort,
+    S: ProtocolBucketPort,
     T: ProtocolStsPort,
     F: ActorS3ClientFactory,
 {
@@ -542,9 +543,11 @@ mod tests {
             registry::ResourceRegistry,
         },
         ports::{
-            ActorS3ClientFactory, ProtocolAdminError, ProtocolAdminPort, ProtocolAssumeRoleRequest,
-            ProtocolObjectVersion, ProtocolS3Error, ProtocolS3Port, ProtocolServerInfo,
-            ProtocolStsError, ProtocolStsPort,
+            ActorS3ClientFactory, ExclusiveBucketOwnership, ProtocolAdminCleanupPort,
+            ProtocolAdminError, ProtocolAssumeRoleRequest, ProtocolBucketPort,
+            ProtocolIdentityAdminPort, ProtocolListObjectsResult, ProtocolListingPort,
+            ProtocolObjectPort, ProtocolPolicyAdminPort, ProtocolS3CleanupPort, ProtocolS3Error,
+            ProtocolSessionAdminPort, ProtocolStsError, ProtocolStsPort,
         },
         reporting::ProtocolCaseStatus,
         suite_plan::TargetFingerprint,
@@ -602,16 +605,7 @@ mod tests {
     #[derive(Clone)]
     struct FakeActorFactory(Arc<Mutex<State>>);
 
-    #[async_trait]
-    impl ProtocolAdminPort for FakeAdmin {
-        async fn server_info(&self) -> std::result::Result<ProtocolServerInfo, ProtocolAdminError> {
-            Ok(ProtocolServerInfo {
-                deployment_id: "fake".to_string(),
-                mode: None,
-                region: None,
-            })
-        }
-
+    impl FakeAdmin {
         async fn users_with_prefix(
             &self,
             prefix: &str,
@@ -640,13 +634,6 @@ mod tests {
                 .filter(|name| name.starts_with(prefix))
                 .cloned()
                 .collect())
-        }
-
-        async fn groups_with_prefix(
-            &self,
-            _prefix: &str,
-        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
-            Ok(Vec::new())
         }
 
         async fn create_user(
@@ -768,6 +755,157 @@ mod tests {
     }
 
     #[async_trait]
+    impl ProtocolIdentityAdminPort for FakeAdmin {
+        async fn users_with_prefix(&self, prefix: &str) -> Result<Vec<String>, ProtocolAdminError> {
+            FakeAdmin::users_with_prefix(self, prefix).await
+        }
+        async fn create_user(
+            &self,
+            credential: &ActorCredential,
+        ) -> Result<(), ProtocolAdminError> {
+            FakeAdmin::create_user(self, credential).await
+        }
+        async fn remove_user(&self, access_key: &str) -> Result<(), ProtocolAdminError> {
+            FakeAdmin::remove_user(self, access_key).await
+        }
+    }
+
+    #[async_trait]
+    impl ProtocolPolicyAdminPort for FakeAdmin {
+        async fn policies_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<String>, ProtocolAdminError> {
+            FakeAdmin::policies_with_prefix(self, prefix).await
+        }
+        async fn create_policy(
+            &self,
+            name: &str,
+            document: &str,
+        ) -> Result<(), ProtocolAdminError> {
+            FakeAdmin::create_policy(self, name, document).await
+        }
+        async fn remove_policy(&self, name: &str) -> Result<(), ProtocolAdminError> {
+            FakeAdmin::remove_policy(self, name).await
+        }
+        async fn attach_policy(
+            &self,
+            policy: &str,
+            principal: &str,
+            is_group: bool,
+        ) -> Result<(), ProtocolAdminError> {
+            FakeAdmin::attach_policy(self, policy, principal, is_group).await
+        }
+        async fn detach_policy(
+            &self,
+            policy: &str,
+            principal: &str,
+            is_group: bool,
+        ) -> Result<(), ProtocolAdminError> {
+            FakeAdmin::detach_policy(self, policy, principal, is_group).await
+        }
+        async fn policy_attached(
+            &self,
+            policy: &str,
+            principal: &str,
+            is_group: bool,
+        ) -> Result<bool, ProtocolAdminError> {
+            FakeAdmin::policy_attached(self, policy, principal, is_group).await
+        }
+    }
+
+    #[async_trait]
+    impl ProtocolSessionAdminPort for FakeAdmin {
+        async fn revoke_sts_sessions_for_provider(
+            &self,
+            parent_access_key: &str,
+            _provider: &str,
+        ) -> Result<(), ProtocolAdminError> {
+            FakeAdmin::revoke_sts_sessions(self, parent_access_key).await
+        }
+        async fn sts_sessions_with_parent_for_provider(
+            &self,
+            parent_access_key: &str,
+            _provider: &str,
+        ) -> Result<Vec<String>, ProtocolAdminError> {
+            FakeAdmin::sts_sessions_with_parent(self, parent_access_key).await
+        }
+    }
+
+    #[async_trait]
+    impl ProtocolAdminCleanupPort for FakeAdmin {
+        async fn users_with_prefix(&self, prefix: &str) -> Result<Vec<String>, ProtocolAdminError> {
+            FakeAdmin::users_with_prefix(self, prefix).await
+        }
+        async fn remove_user(&self, access_key: &str) -> Result<(), ProtocolAdminError> {
+            FakeAdmin::remove_user(self, access_key).await
+        }
+        async fn groups_with_prefix(
+            &self,
+            _prefix: &str,
+        ) -> Result<Vec<String>, ProtocolAdminError> {
+            Ok(Vec::new())
+        }
+        async fn group_contains_member(
+            &self,
+            _group: &str,
+            _member: &str,
+        ) -> Result<bool, ProtocolAdminError> {
+            Ok(false)
+        }
+        async fn update_group_members(
+            &self,
+            _group: &str,
+            _members: &[String],
+            _remove: bool,
+        ) -> Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+        async fn remove_group(&self, _group: &str) -> Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+        async fn policies_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<String>, ProtocolAdminError> {
+            FakeAdmin::policies_with_prefix(self, prefix).await
+        }
+        async fn remove_policy(&self, name: &str) -> Result<(), ProtocolAdminError> {
+            FakeAdmin::remove_policy(self, name).await
+        }
+        async fn detach_policy(
+            &self,
+            policy: &str,
+            principal: &str,
+            is_group: bool,
+        ) -> Result<(), ProtocolAdminError> {
+            FakeAdmin::detach_policy(self, policy, principal, is_group).await
+        }
+        async fn policy_attached(
+            &self,
+            policy: &str,
+            principal: &str,
+            is_group: bool,
+        ) -> Result<bool, ProtocolAdminError> {
+            FakeAdmin::policy_attached(self, policy, principal, is_group).await
+        }
+        async fn revoke_sts_sessions_for_provider(
+            &self,
+            parent_access_key: &str,
+            _provider: &str,
+        ) -> Result<(), ProtocolAdminError> {
+            FakeAdmin::revoke_sts_sessions(self, parent_access_key).await
+        }
+        async fn sts_sessions_with_parent_for_provider(
+            &self,
+            parent_access_key: &str,
+            _provider: &str,
+        ) -> Result<Vec<String>, ProtocolAdminError> {
+            FakeAdmin::sts_sessions_with_parent(self, parent_access_key).await
+        }
+    }
+
+    #[async_trait]
     impl ProtocolStsPort for FakeSts {
         async fn assume_role(
             &self,
@@ -824,8 +962,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl ProtocolS3Port for FakeS3 {
+    impl FakeS3 {
         async fn list_buckets_with_prefix(
             &self,
             prefix: &str,
@@ -852,14 +989,6 @@ mod tests {
 
         async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), ProtocolS3Error> {
             self.state.lock().expect("state").buckets.remove(bucket);
-            Ok(())
-        }
-
-        async fn put_bucket_policy(
-            &self,
-            _bucket: &str,
-            _policy: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
             Ok(())
         }
 
@@ -929,26 +1058,168 @@ mod tests {
                 .remove(&(bucket.to_string(), key.to_string()));
             Ok(())
         }
+    }
 
-        async fn list_object_versions(
+    #[async_trait]
+    impl ProtocolBucketPort for FakeS3 {
+        async fn list_buckets_with_prefix(
             &self,
-            _bucket: &str,
-        ) -> std::result::Result<Vec<ProtocolObjectVersion>, ProtocolS3Error> {
-            Ok(Vec::new())
+            prefix: &str,
+        ) -> Result<Vec<String>, ProtocolS3Error> {
+            FakeS3::list_buckets_with_prefix(self, prefix).await
         }
+        async fn create_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+            FakeS3::create_bucket(self, bucket).await
+        }
+        async fn delete_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+            FakeS3::delete_bucket(self, bucket).await
+        }
+        async fn head_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+            self.state
+                .lock()
+                .expect("state")
+                .buckets
+                .contains(bucket)
+                .then_some(())
+                .ok_or_else(s3_not_found)
+        }
+    }
 
-        async fn delete_object_version(
+    #[async_trait]
+    impl ProtocolListingPort for FakeS3 {
+        async fn list_objects(&self, bucket: &str) -> Result<Vec<String>, ProtocolS3Error> {
+            FakeS3::list_objects(self, bucket).await
+        }
+        async fn list_objects_v2_summary(
+            &self,
+            bucket: &str,
+        ) -> Result<ProtocolListObjectsResult, ProtocolS3Error> {
+            let keys = FakeS3::list_objects(self, bucket).await?;
+            Ok(ProtocolListObjectsResult {
+                key_count: keys.len(),
+                keys,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ProtocolObjectPort for FakeS3 {
+        async fn put_object(
             &self,
             bucket: &str,
             key: &str,
-            _version_id: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
+            body: &[u8],
+        ) -> Result<(), ProtocolS3Error> {
+            FakeS3::put_object(self, bucket, key, body).await
+        }
+        async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, ProtocolS3Error> {
+            FakeS3::get_object(self, bucket, key).await
+        }
+        async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ProtocolS3Error> {
+            FakeS3::delete_object(self, bucket, key).await
+        }
+        async fn copy_object(
+            &self,
+            bucket: &str,
+            source_key: &str,
+            destination_key: &str,
+        ) -> Result<(), ProtocolS3Error> {
+            let body = FakeS3::get_object(self, bucket, source_key).await?;
+            FakeS3::put_object(self, bucket, destination_key, &body).await
+        }
+        async fn delete_objects(
+            &self,
+            bucket: &str,
+            keys: &[String],
+        ) -> Result<Vec<String>, ProtocolS3Error> {
+            for key in keys {
+                FakeS3::delete_object(self, bucket, key).await?;
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl ProtocolS3CleanupPort for FakeS3 {
+        async fn cleanup_bucket_names(&self, prefix: &str) -> Result<Vec<String>, ProtocolS3Error> {
+            FakeS3::list_buckets_with_prefix(self, prefix).await
+        }
+        async fn cleanup_exclusive_bucket(
+            &self,
+            ownership: ExclusiveBucketOwnership<'_>,
+            _include_versions: bool,
+        ) -> Result<(), ProtocolS3Error> {
+            let bucket = ownership.bucket();
             self.state
                 .lock()
                 .expect("state")
                 .objects
-                .remove(&(bucket.to_string(), key.to_string()));
+                .retain(|(candidate, _), _| candidate != bucket);
+            FakeS3::delete_bucket(self, bucket).await
+        }
+        async fn cleanup_object_prefix(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            _include_versions: bool,
+        ) -> Result<(), ProtocolS3Error> {
+            self.state
+                .lock()
+                .expect("state")
+                .objects
+                .retain(|(candidate, key), _| candidate != bucket || !key.starts_with(prefix));
             Ok(())
+        }
+        async fn cleanup_object_prefix_exists(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            _include_versions: bool,
+        ) -> Result<bool, ProtocolS3Error> {
+            Ok(self
+                .state
+                .lock()
+                .expect("state")
+                .objects
+                .keys()
+                .any(|(candidate, key)| candidate == bucket && key.starts_with(prefix)))
+        }
+        async fn cleanup_abort_multipart_upload(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _upload_id: &str,
+        ) -> Result<(), ProtocolS3Error> {
+            Ok(())
+        }
+        async fn cleanup_multipart_upload_exists(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _upload_id: &str,
+        ) -> Result<bool, ProtocolS3Error> {
+            Ok(false)
+        }
+        async fn cleanup_delete_bucket_policy(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+            FakeS3::delete_bucket_policy(self, bucket).await
+        }
+        async fn cleanup_bucket_policy_exists(
+            &self,
+            _bucket: &str,
+        ) -> Result<bool, ProtocolS3Error> {
+            Ok(false)
+        }
+        async fn cleanup_delete_public_access_block(
+            &self,
+            _bucket: &str,
+        ) -> Result<(), ProtocolS3Error> {
+            Ok(())
+        }
+        async fn cleanup_public_access_block_exists(
+            &self,
+            _bucket: &str,
+        ) -> Result<bool, ProtocolS3Error> {
+            Ok(false)
         }
     }
 

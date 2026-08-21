@@ -24,14 +24,14 @@ use crate::protocol::{
             plan_object_prefix,
         },
     },
-    ports::ProtocolS3Port,
+    ports::{ProtocolBucketPort, ProtocolObjectPort, ProtocolVersioningPort},
 };
 
 pub(super) async fn run_head_removal(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    s3: &impl ProtocolS3Port,
+    s3: &(impl ProtocolBucketPort + ProtocolObjectPort + ProtocolVersioningPort),
     context: &mut CaseContext,
 ) -> Result<()> {
     enable_versioned_cleanup(registry)?;

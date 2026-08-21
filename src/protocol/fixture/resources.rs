@@ -20,7 +20,11 @@ use crate::protocol::{
         naming::ProtocolResourceNamer,
         registry::{ResourceHandle, ResourceKind, ResourceRegistry, ResourceState},
     },
-    ports::{ActorS3ClientFactory, ProtocolAdminPort, ProtocolPublicAccessBlock, ProtocolS3Port},
+    ports::{
+        ActorS3ClientFactory, ProtocolBucketConfigPort, ProtocolBucketPort,
+        ProtocolIdentityAdminPort, ProtocolMultipartPort, ProtocolPolicyAdminPort,
+        ProtocolPublicAccessBlock,
+    },
 };
 
 pub(crate) struct S3BucketFixture {
@@ -44,7 +48,7 @@ pub(crate) async fn create_s3_bucket(
     case_id: &str,
     bucket: &str,
     registry: &mut ResourceRegistry,
-    s3: &impl ProtocolS3Port,
+    s3: &impl ProtocolBucketPort,
 ) -> Result<S3BucketFixture> {
     let handle = registry.plan(ResourceKind::Bucket, bucket, case_id, Vec::new())?;
     transition_external(registry, &handle, "create bucket", s3.create_bucket(bucket)).await?;
@@ -84,7 +88,7 @@ pub(crate) async fn create_multipart_upload(
     key: &str,
     bucket_fixture: &S3BucketFixture,
     registry: &mut ResourceRegistry,
-    s3: &impl ProtocolS3Port,
+    s3: &impl ProtocolMultipartPort,
 ) -> Result<MultipartUploadFixture> {
     let handle = registry.plan_multipart_upload(
         bucket,
@@ -120,7 +124,7 @@ pub(crate) async fn create_public_access_block(
     configuration: ProtocolPublicAccessBlock,
     bucket_fixture: &S3BucketFixture,
     registry: &mut ResourceRegistry,
-    s3: &impl ProtocolS3Port,
+    s3: &impl ProtocolBucketConfigPort,
 ) -> Result<PublicAccessBlockFixture> {
     let handle = registry.plan(
         ResourceKind::PublicAccessBlock,
@@ -142,7 +146,7 @@ pub(crate) async fn delete_public_access_block(
     bucket: &str,
     fixture: &PublicAccessBlockFixture,
     registry: &mut ResourceRegistry,
-    s3: &impl ProtocolS3Port,
+    s3: &impl ProtocolBucketConfigPort,
 ) -> Result<()> {
     s3.delete_public_access_block(bucket).await?;
     registry.transition(&fixture.handle.id, ResourceState::CleanupAttempted, None)?;
@@ -176,8 +180,8 @@ pub(crate) async fn setup_user_bucket<F>(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    admin_s3: &impl ProtocolS3Port,
+    admin: &impl ProtocolIdentityAdminPort,
+    admin_s3: &impl ProtocolBucketPort,
     actor_clients: &F,
 ) -> Result<IamFixture<F::Client>>
 where
@@ -225,7 +229,7 @@ pub(crate) async fn create_and_attach_policy(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
+    admin: &impl ProtocolPolicyAdminPort,
     grant: PolicyGrant<'_>,
 ) -> Result<(ResourceHandle, ResourceHandle)> {
     let policy = namer.iam_policy(case_id, 0)?;

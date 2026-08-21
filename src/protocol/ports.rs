@@ -322,9 +322,198 @@ pub trait ProtocolExternalIdentityPort: Send + Sync {
     ) -> std::result::Result<(), ProtocolExternalIdentityError>;
 }
 
+/// Bucket lifecycle operations used by protocol cases and fixtures.
 #[async_trait]
-pub trait ProtocolAdminPort: Send + Sync {
+pub trait ProtocolBucketPort: Send + Sync {
+    async fn list_buckets_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> std::result::Result<Vec<String>, ProtocolS3Error>;
+    async fn create_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
+    async fn delete_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
+    async fn head_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
+}
+
+/// Object data-plane operations. Listing is intentionally a separate role.
+#[async_trait]
+pub trait ProtocolObjectPort: Send + Sync {
+    async fn put_object(&self, bucket: &str, key: &str, body: &[u8])
+    -> Result<(), ProtocolS3Error>;
+    async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, ProtocolS3Error>;
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ProtocolS3Error>;
+    async fn copy_object(
+        &self,
+        bucket: &str,
+        source_key: &str,
+        destination_key: &str,
+    ) -> Result<(), ProtocolS3Error>;
+    async fn delete_objects(
+        &self,
+        bucket: &str,
+        keys: &[String],
+    ) -> Result<Vec<String>, ProtocolS3Error>;
+}
+
+#[async_trait]
+pub trait ProtocolListingPort: Send + Sync {
+    async fn list_objects(&self, bucket: &str) -> Result<Vec<String>, ProtocolS3Error>;
+    async fn list_objects_v2_summary(
+        &self,
+        bucket: &str,
+    ) -> Result<ProtocolListObjectsResult, ProtocolS3Error>;
+}
+
+#[async_trait]
+pub trait ProtocolMultipartPort: Send + Sync {
+    async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<String, ProtocolS3Error>;
+    async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: &[u8],
+    ) -> Result<String, ProtocolS3Error>;
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[ProtocolCompletedPart],
+    ) -> Result<(), ProtocolS3Error>;
+    async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), ProtocolS3Error>;
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<String>, ProtocolS3Error>;
+}
+
+#[async_trait]
+pub trait ProtocolVersioningPort: Send + Sync {
+    async fn put_bucket_versioning(
+        &self,
+        bucket: &str,
+        enabled: bool,
+    ) -> Result<(), ProtocolS3Error>;
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Vec<u8>, ProtocolS3Error>;
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<ProtocolObjectVersion>, ProtocolS3Error>;
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<(), ProtocolS3Error>;
+}
+
+#[async_trait]
+pub trait ProtocolBucketConfigPort: Send + Sync {
+    async fn put_public_access_block(
+        &self,
+        bucket: &str,
+        configuration: ProtocolPublicAccessBlock,
+    ) -> Result<(), ProtocolS3Error>;
+    async fn get_public_access_block(
+        &self,
+        bucket: &str,
+    ) -> Result<ProtocolPublicAccessBlock, ProtocolS3Error>;
+    async fn delete_public_access_block(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
+}
+
+#[async_trait]
+pub trait ProtocolAuthorizationPort: Send + Sync {
+    async fn put_bucket_policy(&self, bucket: &str, policy: &str) -> Result<(), ProtocolS3Error>;
+    async fn get_bucket_policy(&self, bucket: &str) -> Result<String, ProtocolS3Error>;
+    async fn delete_bucket_policy(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
+}
+
+/// Proof that whole-bucket cleanup is allowed for a registry-owned bucket.
+///
+/// The constructor is crate-private so shared-bucket cleanup callers cannot accidentally pass a
+/// plain bucket name to a destructive whole-bucket operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExclusiveBucketOwnership<'a> {
+    bucket: &'a str,
+}
+
+impl<'a> ExclusiveBucketOwnership<'a> {
+    pub(crate) fn registry_owned(bucket: &'a str) -> Self {
+        Self { bucket }
+    }
+
+    pub fn bucket(self) -> &'a str {
+        self.bucket
+    }
+}
+
+/// Cleanup-only S3 boundary. Shared resources are addressed by exact prefix or upload ID, while
+/// whole-bucket deletion requires [`ExclusiveBucketOwnership`].
+#[async_trait]
+pub trait ProtocolS3CleanupPort: Send + Sync {
+    async fn cleanup_bucket_names(&self, prefix: &str) -> Result<Vec<String>, ProtocolS3Error>;
+    async fn cleanup_exclusive_bucket(
+        &self,
+        ownership: ExclusiveBucketOwnership<'_>,
+        include_versions: bool,
+    ) -> Result<(), ProtocolS3Error>;
+    async fn cleanup_object_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        include_versions: bool,
+    ) -> Result<(), ProtocolS3Error>;
+    async fn cleanup_object_prefix_exists(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        include_versions: bool,
+    ) -> Result<bool, ProtocolS3Error>;
+    async fn cleanup_abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), ProtocolS3Error>;
+    async fn cleanup_multipart_upload_exists(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<bool, ProtocolS3Error>;
+    async fn cleanup_delete_bucket_policy(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
+    async fn cleanup_bucket_policy_exists(&self, bucket: &str) -> Result<bool, ProtocolS3Error>;
+    async fn cleanup_delete_public_access_block(&self, bucket: &str)
+    -> Result<(), ProtocolS3Error>;
+    async fn cleanup_public_access_block_exists(
+        &self,
+        bucket: &str,
+    ) -> Result<bool, ProtocolS3Error>;
+}
+
+#[async_trait]
+pub trait ProtocolAdminServerPort: Send + Sync {
     async fn server_info(&self) -> std::result::Result<ProtocolServerInfo, ProtocolAdminError>;
+}
+
+#[async_trait]
+pub trait ProtocolIdentityAdminPort: Send + Sync {
     async fn users_with_prefix(
         &self,
         prefix: &str,
@@ -334,293 +523,223 @@ pub trait ProtocolAdminPort: Send + Sync {
         credential: &ActorCredential,
     ) -> std::result::Result<(), ProtocolAdminError>;
     async fn remove_user(&self, access_key: &str) -> std::result::Result<(), ProtocolAdminError>;
+}
 
-    async fn revoke_sts_sessions(
+#[async_trait]
+pub trait ProtocolGroupAdminPort: Send + Sync {
+    async fn groups_with_prefix(
         &self,
-        _parent_access_key: &str,
-    ) -> std::result::Result<(), ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol("RevokeStsSessionsUnsupported"))
-    }
+        prefix: &str,
+    ) -> std::result::Result<Vec<String>, ProtocolAdminError>;
+    async fn group_contains_member(
+        &self,
+        group: &str,
+        member: &str,
+    ) -> std::result::Result<bool, ProtocolAdminError>;
+    async fn update_group_members(
+        &self,
+        group: &str,
+        members: &[String],
+        remove: bool,
+    ) -> std::result::Result<(), ProtocolAdminError>;
+    async fn remove_group(&self, group: &str) -> std::result::Result<(), ProtocolAdminError>;
+}
 
+#[async_trait]
+pub trait ProtocolPolicyAdminPort: Send + Sync {
+    async fn policies_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> std::result::Result<Vec<String>, ProtocolAdminError>;
+    async fn create_policy(
+        &self,
+        name: &str,
+        document: &str,
+    ) -> std::result::Result<(), ProtocolAdminError>;
+    async fn remove_policy(&self, name: &str) -> std::result::Result<(), ProtocolAdminError>;
+    async fn attach_policy(
+        &self,
+        policy: &str,
+        principal: &str,
+        is_group: bool,
+    ) -> std::result::Result<(), ProtocolAdminError>;
+    async fn detach_policy(
+        &self,
+        policy: &str,
+        principal: &str,
+        is_group: bool,
+    ) -> std::result::Result<(), ProtocolAdminError>;
+    async fn policy_attached(
+        &self,
+        policy: &str,
+        principal: &str,
+        is_group: bool,
+    ) -> std::result::Result<bool, ProtocolAdminError>;
+}
+
+#[async_trait]
+pub trait ProtocolSessionAdminPort: Send + Sync {
     async fn revoke_sts_sessions_for_provider(
         &self,
         parent_access_key: &str,
         provider: &str,
-    ) -> std::result::Result<(), ProtocolAdminError> {
-        if provider == "builtin" {
-            self.revoke_sts_sessions(parent_access_key).await
-        } else {
-            Err(ProtocolAdminError::protocol(
-                "RevokeStsSessionsForProviderUnsupported",
-            ))
-        }
-    }
-
-    async fn policy_attached(
-        &self,
-        _policy: &str,
-        _principal: &str,
-        _is_group: bool,
-    ) -> std::result::Result<bool, ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol(
-            "PolicyAttachmentReadbackUnsupported",
-        ))
-    }
-
-    async fn group_contains_member(
-        &self,
-        _group: &str,
-        _member: &str,
-    ) -> std::result::Result<bool, ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol(
-            "GroupMembershipReadbackUnsupported",
-        ))
-    }
-
-    async fn sts_sessions_with_parent(
-        &self,
-        _parent_access_key: &str,
-    ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol("ListStsSessionsUnsupported"))
-    }
-
+    ) -> std::result::Result<(), ProtocolAdminError>;
     async fn sts_sessions_with_parent_for_provider(
         &self,
         parent_access_key: &str,
         provider: &str,
-    ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
-        if provider == "builtin" {
-            self.sts_sessions_with_parent(parent_access_key).await
-        } else {
-            Err(ProtocolAdminError::protocol(
-                "ListStsSessionsForProviderUnsupported",
-            ))
-        }
-    }
-
-    async fn policies_with_prefix(
-        &self,
-        _prefix: &str,
-    ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol("ListPoliciesUnsupported"))
-    }
-
-    async fn groups_with_prefix(
-        &self,
-        _prefix: &str,
-    ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol("ListGroupsUnsupported"))
-    }
-
-    async fn create_policy(
-        &self,
-        _name: &str,
-        _document: &str,
-    ) -> std::result::Result<(), ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol("CreatePolicyUnsupported"))
-    }
-
-    async fn remove_policy(&self, _name: &str) -> std::result::Result<(), ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol("RemovePolicyUnsupported"))
-    }
-
-    async fn attach_policy(
-        &self,
-        _policy: &str,
-        _principal: &str,
-        _is_group: bool,
-    ) -> std::result::Result<(), ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol("AttachPolicyUnsupported"))
-    }
-
-    async fn detach_policy(
-        &self,
-        _policy: &str,
-        _principal: &str,
-        _is_group: bool,
-    ) -> std::result::Result<(), ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol("DetachPolicyUnsupported"))
-    }
-
-    async fn update_group_members(
-        &self,
-        _group: &str,
-        _members: &[String],
-        _remove: bool,
-    ) -> std::result::Result<(), ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol(
-            "UpdateGroupMembersUnsupported",
-        ))
-    }
-
-    async fn remove_group(&self, _group: &str) -> std::result::Result<(), ProtocolAdminError> {
-        Err(ProtocolAdminError::protocol("RemoveGroupUnsupported"))
-    }
+    ) -> std::result::Result<Vec<String>, ProtocolAdminError>;
 }
 
+/// Cleanup-only admin boundary. It is intentionally independent from case roles so a cleanup fake
+/// never has to implement unrelated create or authorization operations.
 #[async_trait]
-pub trait ProtocolS3Port: Send + Sync {
-    async fn list_buckets_with_prefix(
+pub trait ProtocolAdminCleanupPort: Send + Sync {
+    async fn users_with_prefix(
         &self,
         prefix: &str,
-    ) -> std::result::Result<Vec<String>, ProtocolS3Error>;
-    async fn create_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
-    async fn delete_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
-    async fn head_bucket(&self, _bucket: &str) -> Result<(), ProtocolS3Error> {
-        Err(unsupported_s3_operation("HeadBucketUnsupported"))
-    }
-    async fn put_bucket_policy(&self, bucket: &str, policy: &str) -> Result<(), ProtocolS3Error>;
-    async fn get_bucket_policy(&self, _bucket: &str) -> Result<String, ProtocolS3Error> {
-        Err(ProtocolS3Error {
-            code: "GetBucketPolicyUnsupported".to_string(),
-            status: None,
-            request_id: None,
-        })
-    }
-    async fn delete_bucket_policy(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
-    async fn list_objects(&self, bucket: &str) -> Result<Vec<String>, ProtocolS3Error>;
-    async fn list_objects_v2_summary(
+    ) -> std::result::Result<Vec<String>, ProtocolAdminError>;
+    async fn remove_user(&self, access_key: &str) -> std::result::Result<(), ProtocolAdminError>;
+    async fn groups_with_prefix(
         &self,
-        bucket: &str,
-    ) -> Result<ProtocolListObjectsResult, ProtocolS3Error> {
-        let keys = self.list_objects(bucket).await?;
-        let key_count = keys.len();
-        Ok(ProtocolListObjectsResult { keys, key_count })
-    }
-    async fn put_object(&self, bucket: &str, key: &str, body: &[u8])
-    -> Result<(), ProtocolS3Error>;
-    async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, ProtocolS3Error>;
-    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ProtocolS3Error>;
-    async fn copy_object(
+        prefix: &str,
+    ) -> std::result::Result<Vec<String>, ProtocolAdminError>;
+    async fn group_contains_member(
         &self,
-        _bucket: &str,
-        _source_key: &str,
-        _destination_key: &str,
-    ) -> Result<(), ProtocolS3Error> {
-        Err(unsupported_s3_operation("CopyObjectUnsupported"))
-    }
-    async fn delete_objects(
+        group: &str,
+        member: &str,
+    ) -> std::result::Result<bool, ProtocolAdminError>;
+    async fn update_group_members(
         &self,
-        _bucket: &str,
-        _keys: &[String],
-    ) -> Result<Vec<String>, ProtocolS3Error> {
-        Err(unsupported_s3_operation("DeleteObjectsUnsupported"))
-    }
-    async fn create_multipart_upload(
+        group: &str,
+        members: &[String],
+        remove: bool,
+    ) -> std::result::Result<(), ProtocolAdminError>;
+    async fn remove_group(&self, group: &str) -> std::result::Result<(), ProtocolAdminError>;
+    async fn policies_with_prefix(
         &self,
-        _bucket: &str,
-        _key: &str,
-    ) -> Result<String, ProtocolS3Error> {
-        Err(unsupported_s3_operation("CreateMultipartUploadUnsupported"))
-    }
-    async fn upload_part(
+        prefix: &str,
+    ) -> std::result::Result<Vec<String>, ProtocolAdminError>;
+    async fn remove_policy(&self, name: &str) -> std::result::Result<(), ProtocolAdminError>;
+    async fn detach_policy(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _upload_id: &str,
-        _part_number: i32,
-        _body: &[u8],
-    ) -> Result<String, ProtocolS3Error> {
-        Err(unsupported_s3_operation("UploadPartUnsupported"))
-    }
-    async fn complete_multipart_upload(
+        policy: &str,
+        principal: &str,
+        is_group: bool,
+    ) -> std::result::Result<(), ProtocolAdminError>;
+    async fn policy_attached(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _upload_id: &str,
-        _parts: &[ProtocolCompletedPart],
-    ) -> Result<(), ProtocolS3Error> {
-        Err(unsupported_s3_operation(
-            "CompleteMultipartUploadUnsupported",
-        ))
-    }
-    async fn abort_multipart_upload(
+        policy: &str,
+        principal: &str,
+        is_group: bool,
+    ) -> std::result::Result<bool, ProtocolAdminError>;
+    async fn revoke_sts_sessions_for_provider(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _upload_id: &str,
-    ) -> Result<(), ProtocolS3Error> {
-        Err(unsupported_s3_operation("AbortMultipartUploadUnsupported"))
-    }
-    async fn list_multipart_uploads(
+        parent_access_key: &str,
+        provider: &str,
+    ) -> std::result::Result<(), ProtocolAdminError>;
+    async fn sts_sessions_with_parent_for_provider(
         &self,
-        _bucket: &str,
-        _key: &str,
-    ) -> Result<Vec<String>, ProtocolS3Error> {
-        Err(unsupported_s3_operation("ListMultipartUploadsUnsupported"))
-    }
-    async fn put_bucket_versioning(
-        &self,
-        _bucket: &str,
-        _enabled: bool,
-    ) -> Result<(), ProtocolS3Error> {
-        Err(unsupported_s3_operation("PutBucketVersioningUnsupported"))
-    }
-    async fn get_object_version(
-        &self,
-        _bucket: &str,
-        _key: &str,
-        _version_id: &str,
-    ) -> Result<Vec<u8>, ProtocolS3Error> {
-        Err(unsupported_s3_operation("GetObjectVersionUnsupported"))
-    }
-    async fn put_public_access_block(
-        &self,
-        _bucket: &str,
-        _configuration: ProtocolPublicAccessBlock,
-    ) -> Result<(), ProtocolS3Error> {
-        Err(unsupported_s3_operation("PutPublicAccessBlockUnsupported"))
-    }
-    async fn get_public_access_block(
-        &self,
-        _bucket: &str,
-    ) -> Result<ProtocolPublicAccessBlock, ProtocolS3Error> {
-        Err(unsupported_s3_operation("GetPublicAccessBlockUnsupported"))
-    }
-    async fn delete_public_access_block(&self, _bucket: &str) -> Result<(), ProtocolS3Error> {
-        Err(unsupported_s3_operation(
-            "DeletePublicAccessBlockUnsupported",
-        ))
-    }
-    async fn empty_bucket(
-        &self,
-        bucket: &str,
-        include_versions: bool,
-    ) -> Result<(), ProtocolS3Error> {
-        if include_versions {
-            for version in self.list_object_versions(bucket).await? {
-                self.delete_object_version(bucket, &version.key, &version.version_id)
-                    .await?;
-            }
-        }
-        for key in self.list_objects(bucket).await? {
-            self.delete_object(bucket, &key).await?;
-        }
-        Ok(())
-    }
-    async fn list_object_versions(
-        &self,
-        bucket: &str,
-    ) -> std::result::Result<Vec<ProtocolObjectVersion>, ProtocolS3Error>;
-    async fn delete_object_version(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: &str,
-    ) -> std::result::Result<(), ProtocolS3Error>;
+        parent_access_key: &str,
+        provider: &str,
+    ) -> std::result::Result<Vec<String>, ProtocolAdminError>;
 }
 
-fn unsupported_s3_operation(code: &str) -> ProtocolS3Error {
-    ProtocolS3Error {
-        code: code.to_string(),
-        status: None,
-        request_id: None,
-    }
+/// Role bundle used only at the case dispatch boundary. Individual cases immediately narrow this
+/// bundle to the roles declared in their own signatures.
+pub trait ProtocolAdminCasePorts:
+    ProtocolIdentityAdminPort
+    + ProtocolGroupAdminPort
+    + ProtocolPolicyAdminPort
+    + ProtocolSessionAdminPort
+{
 }
+
+impl<T> ProtocolAdminCasePorts for T where
+    T: ProtocolIdentityAdminPort
+        + ProtocolGroupAdminPort
+        + ProtocolPolicyAdminPort
+        + ProtocolSessionAdminPort
+{
+}
+
+/// Role bundle used only at the case dispatch boundary. Domain cases immediately narrow this
+/// bundle to the roles declared in their own signatures.
+pub trait ProtocolS3CasePorts:
+    ProtocolBucketPort
+    + ProtocolObjectPort
+    + ProtocolListingPort
+    + ProtocolMultipartPort
+    + ProtocolVersioningPort
+    + ProtocolBucketConfigPort
+    + ProtocolAuthorizationPort
+{
+}
+
+/// Roles shared by native compatibility cases. Authorization is excluded because these cases run
+/// with the administrative actor and do not exercise bucket-policy behavior.
+pub trait ProtocolS3CompatibilityPorts:
+    ProtocolBucketPort
+    + ProtocolObjectPort
+    + ProtocolListingPort
+    + ProtocolMultipartPort
+    + ProtocolVersioningPort
+    + ProtocolBucketConfigPort
+{
+}
+
+/// S3 capabilities exercised by preflight. Multipart is deliberately excluded because the probe
+/// does not create uploads.
+pub trait ProtocolS3PreflightPorts:
+    ProtocolBucketPort
+    + ProtocolObjectPort
+    + ProtocolListingPort
+    + ProtocolVersioningPort
+    + ProtocolBucketConfigPort
+    + ProtocolAuthorizationPort
+    + ProtocolS3CleanupPort
+{
+}
+
+impl<T> ProtocolS3PreflightPorts for T where
+    T: ProtocolBucketPort
+        + ProtocolObjectPort
+        + ProtocolListingPort
+        + ProtocolVersioningPort
+        + ProtocolBucketConfigPort
+        + ProtocolAuthorizationPort
+        + ProtocolS3CleanupPort
+{
+}
+
+impl<T> ProtocolS3CompatibilityPorts for T where
+    T: ProtocolBucketPort
+        + ProtocolObjectPort
+        + ProtocolListingPort
+        + ProtocolMultipartPort
+        + ProtocolVersioningPort
+        + ProtocolBucketConfigPort
+{
+}
+
+impl<T> ProtocolS3CasePorts for T where
+    T: ProtocolBucketPort
+        + ProtocolObjectPort
+        + ProtocolListingPort
+        + ProtocolMultipartPort
+        + ProtocolVersioningPort
+        + ProtocolBucketConfigPort
+        + ProtocolAuthorizationPort
+{
+}
+
+pub trait ProtocolAdminRuntimePorts: ProtocolAdminServerPort + ProtocolAdminCasePorts {}
+
+impl<T> ProtocolAdminRuntimePorts for T where T: ProtocolAdminServerPort + ProtocolAdminCasePorts {}
 
 #[async_trait]
 pub trait ActorS3ClientFactory: Send + Sync {
-    type Client: ProtocolS3Port;
+    type Client: ProtocolListingPort + ProtocolObjectPort;
 
     async fn for_actor(&self, credential: &ActorCredential) -> anyhow::Result<Self::Client>;
 }

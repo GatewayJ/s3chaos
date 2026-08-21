@@ -23,7 +23,11 @@ use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime};
 
 use crate::protocol::credentials::{ActorCredential, AdminCredentials};
-use crate::protocol::ports::{ProtocolAdminError, ProtocolAdminPort, ProtocolServerInfo};
+use crate::protocol::ports::{
+    ProtocolAdminCleanupPort, ProtocolAdminError, ProtocolAdminServerPort, ProtocolGroupAdminPort,
+    ProtocolIdentityAdminPort, ProtocolPolicyAdminPort, ProtocolServerInfo,
+    ProtocolSessionAdminPort,
+};
 
 const ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 type AdminResult<T> = std::result::Result<T, ProtocolAdminError>;
@@ -138,11 +142,6 @@ impl RustfsAdminClient {
         }
     }
 
-    pub async fn revoke_sts_sessions(&self, parent_access_key: &str) -> AdminResult<()> {
-        self.revoke_sts_sessions_for_provider(parent_access_key, "builtin")
-            .await
-    }
-
     pub async fn revoke_sts_sessions_for_provider(
         &self,
         parent_access_key: &str,
@@ -211,14 +210,6 @@ impl RustfsAdminClient {
             .get("members")
             .and_then(Value::as_array)
             .is_some_and(|members| members.iter().any(|item| item.as_str() == Some(member))))
-    }
-
-    pub async fn sts_sessions_with_parent(
-        &self,
-        parent_access_key: &str,
-    ) -> AdminResult<Vec<String>> {
-        self.sts_sessions_with_parent_for_provider(parent_access_key, "builtin")
-            .await
     }
 
     pub async fn sts_sessions_with_parent_for_provider(
@@ -502,11 +493,14 @@ fn policy_attachment_body(policy: &str, principal: &str, is_group: bool) -> Admi
 }
 
 #[async_trait::async_trait]
-impl ProtocolAdminPort for RustfsAdminClient {
+impl ProtocolAdminServerPort for RustfsAdminClient {
     async fn server_info(&self) -> AdminResult<ProtocolServerInfo> {
         RustfsAdminClient::server_info(self).await
     }
+}
 
+#[async_trait::async_trait]
+impl ProtocolIdentityAdminPort for RustfsAdminClient {
     async fn users_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
         RustfsAdminClient::users_with_prefix(self, prefix).await
     }
@@ -518,34 +512,16 @@ impl ProtocolAdminPort for RustfsAdminClient {
     async fn remove_user(&self, access_key: &str) -> AdminResult<()> {
         RustfsAdminClient::remove_user(self, access_key).await
     }
+}
 
-    async fn revoke_sts_sessions(&self, parent_access_key: &str) -> AdminResult<()> {
-        RustfsAdminClient::revoke_sts_sessions(self, parent_access_key).await
-    }
-
+#[async_trait::async_trait]
+impl ProtocolSessionAdminPort for RustfsAdminClient {
     async fn revoke_sts_sessions_for_provider(
         &self,
         parent_access_key: &str,
         provider: &str,
     ) -> AdminResult<()> {
         RustfsAdminClient::revoke_sts_sessions_for_provider(self, parent_access_key, provider).await
-    }
-
-    async fn policy_attached(
-        &self,
-        policy: &str,
-        principal: &str,
-        is_group: bool,
-    ) -> AdminResult<bool> {
-        RustfsAdminClient::policy_attached(self, policy, principal, is_group).await
-    }
-
-    async fn group_contains_member(&self, group: &str, member: &str) -> AdminResult<bool> {
-        RustfsAdminClient::group_contains_member(self, group, member).await
-    }
-
-    async fn sts_sessions_with_parent(&self, parent_access_key: &str) -> AdminResult<Vec<String>> {
-        RustfsAdminClient::sts_sessions_with_parent(self, parent_access_key).await
     }
 
     async fn sts_sessions_with_parent_for_provider(
@@ -556,13 +532,21 @@ impl ProtocolAdminPort for RustfsAdminClient {
         RustfsAdminClient::sts_sessions_with_parent_for_provider(self, parent_access_key, provider)
             .await
     }
+}
+
+#[async_trait::async_trait]
+impl ProtocolPolicyAdminPort for RustfsAdminClient {
+    async fn policy_attached(
+        &self,
+        policy: &str,
+        principal: &str,
+        is_group: bool,
+    ) -> AdminResult<bool> {
+        RustfsAdminClient::policy_attached(self, policy, principal, is_group).await
+    }
 
     async fn policies_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
         RustfsAdminClient::policies_with_prefix(self, prefix).await
-    }
-
-    async fn groups_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
-        RustfsAdminClient::groups_with_prefix(self, prefix).await
     }
 
     async fn create_policy(&self, name: &str, document: &str) -> AdminResult<()> {
@@ -590,6 +574,17 @@ impl ProtocolAdminPort for RustfsAdminClient {
     ) -> AdminResult<()> {
         RustfsAdminClient::detach_policy(self, policy, principal, is_group).await
     }
+}
+
+#[async_trait::async_trait]
+impl ProtocolGroupAdminPort for RustfsAdminClient {
+    async fn groups_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
+        RustfsAdminClient::groups_with_prefix(self, prefix).await
+    }
+
+    async fn group_contains_member(&self, group: &str, member: &str) -> AdminResult<bool> {
+        RustfsAdminClient::group_contains_member(self, group, member).await
+    }
 
     async fn update_group_members(
         &self,
@@ -602,6 +597,90 @@ impl ProtocolAdminPort for RustfsAdminClient {
 
     async fn remove_group(&self, group: &str) -> AdminResult<()> {
         RustfsAdminClient::remove_group(self, group).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ProtocolAdminCleanupPort for RustfsAdminClient {
+    async fn users_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
+        ProtocolIdentityAdminPort::users_with_prefix(self, prefix).await
+    }
+
+    async fn remove_user(&self, access_key: &str) -> AdminResult<()> {
+        ProtocolIdentityAdminPort::remove_user(self, access_key).await
+    }
+
+    async fn groups_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
+        ProtocolGroupAdminPort::groups_with_prefix(self, prefix).await
+    }
+
+    async fn group_contains_member(&self, group: &str, member: &str) -> AdminResult<bool> {
+        ProtocolGroupAdminPort::group_contains_member(self, group, member).await
+    }
+
+    async fn update_group_members(
+        &self,
+        group: &str,
+        members: &[String],
+        remove: bool,
+    ) -> AdminResult<()> {
+        ProtocolGroupAdminPort::update_group_members(self, group, members, remove).await
+    }
+
+    async fn remove_group(&self, group: &str) -> AdminResult<()> {
+        ProtocolGroupAdminPort::remove_group(self, group).await
+    }
+
+    async fn policies_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
+        ProtocolPolicyAdminPort::policies_with_prefix(self, prefix).await
+    }
+
+    async fn remove_policy(&self, name: &str) -> AdminResult<()> {
+        ProtocolPolicyAdminPort::remove_policy(self, name).await
+    }
+
+    async fn detach_policy(
+        &self,
+        policy: &str,
+        principal: &str,
+        is_group: bool,
+    ) -> AdminResult<()> {
+        ProtocolPolicyAdminPort::detach_policy(self, policy, principal, is_group).await
+    }
+
+    async fn policy_attached(
+        &self,
+        policy: &str,
+        principal: &str,
+        is_group: bool,
+    ) -> AdminResult<bool> {
+        ProtocolPolicyAdminPort::policy_attached(self, policy, principal, is_group).await
+    }
+
+    async fn revoke_sts_sessions_for_provider(
+        &self,
+        parent_access_key: &str,
+        provider: &str,
+    ) -> AdminResult<()> {
+        ProtocolSessionAdminPort::revoke_sts_sessions_for_provider(
+            self,
+            parent_access_key,
+            provider,
+        )
+        .await
+    }
+
+    async fn sts_sessions_with_parent_for_provider(
+        &self,
+        parent_access_key: &str,
+        provider: &str,
+    ) -> AdminResult<Vec<String>> {
+        ProtocolSessionAdminPort::sts_sessions_with_parent_for_provider(
+            self,
+            parent_access_key,
+            provider,
+        )
+        .await
     }
 }
 

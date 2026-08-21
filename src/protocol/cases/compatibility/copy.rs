@@ -24,14 +24,14 @@ use crate::protocol::{
         registry::ResourceRegistry,
         resources::{create_s3_bucket, mark_object_prefix_created, plan_object_prefix},
     },
-    ports::ProtocolS3Port,
+    ports::{ProtocolBucketPort, ProtocolObjectPort},
 };
 
 pub(super) async fn run_copy_object(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    s3: &impl ProtocolS3Port,
+    s3: &(impl ProtocolBucketPort + ProtocolObjectPort),
     context: &mut CaseContext,
 ) -> Result<()> {
     let bucket = namer.bucket(case_id, 0)?;

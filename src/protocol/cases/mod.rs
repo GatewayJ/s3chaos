@@ -25,8 +25,8 @@ use crate::protocol::{
     credentials::ActorCredential,
     fixture::{naming::ProtocolResourceNamer, registry::ResourceRegistry},
     ports::{
-        ActorS3ClientFactory, ProtocolAdminPort, ProtocolExternalIdentityPort, ProtocolS3Port,
-        ProtocolStsPort, ProtocolWebIdentityStsPort,
+        ActorS3ClientFactory, ProtocolAdminCasePorts, ProtocolExternalIdentityPort,
+        ProtocolS3CasePorts, ProtocolStsPort, ProtocolWebIdentityStsPort,
     },
     reporting::{ProtocolCaseReport, ProtocolCaseStatus},
 };
@@ -89,8 +89,8 @@ pub(crate) async fn run_protocol_case<A, S, T, F>(
     services: ProtocolCaseServices<'_, A, S, T, F>,
 ) -> ProtocolCaseExecution
 where
-    A: ProtocolAdminPort,
-    S: ProtocolS3Port,
+    A: ProtocolAdminCasePorts,
+    S: ProtocolS3CasePorts,
     T: ProtocolStsPort,
     F: ActorS3ClientFactory,
 {

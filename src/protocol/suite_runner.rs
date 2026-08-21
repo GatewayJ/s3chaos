@@ -39,7 +39,8 @@ use crate::protocol::{
         registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
     },
     ports::{
-        ProtocolAdminPort, ProtocolExternalIdentityPort, ProtocolS3Port, ProtocolWebIdentityStsPort,
+        ProtocolAdminCleanupPort, ProtocolAdminServerPort, ProtocolExternalIdentityPort,
+        ProtocolS3CleanupPort, ProtocolWebIdentityStsPort,
     },
     preflight::{
         ProtocolPreflightSummary, ProtocolProbeCapabilities,
@@ -642,8 +643,8 @@ impl ProtocolCaseRunner<'_> {
 async fn cleanup_case_registry_if_present(
     artifact_root: &Path,
     case_id: &str,
-    admin: &impl ProtocolAdminPort,
-    s3: &impl ProtocolS3Port,
+    admin: &impl ProtocolAdminCleanupPort,
+    s3: &impl ProtocolS3CleanupPort,
     external_identity: Option<&dyn ProtocolExternalIdentityPort>,
     api_version: &str,
 ) -> ProtocolCleanupReport {
@@ -667,8 +668,8 @@ async fn cleanup_suite_registries(
     artifact_root: &Path,
     cases: &[ProtocolSuitePlanCase],
     root_registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    s3: &impl ProtocolS3Port,
+    admin: &impl ProtocolAdminCleanupPort,
+    s3: &impl ProtocolS3CleanupPort,
     external_identity: Option<&dyn ProtocolExternalIdentityPort>,
     api_version: &str,
 ) -> ProtocolCleanupReport {
@@ -812,7 +813,7 @@ fn external_identity_for_registry(
 }
 
 async fn verify_cleanup_target(
-    admin: &impl ProtocolAdminPort,
+    admin: &impl ProtocolAdminServerPort,
     expected: &TargetFingerprint,
 ) -> Result<()> {
     ensure!(
@@ -959,13 +960,12 @@ mod tests {
     };
     use crate::protocol::{
         compatibility::{COMPATIBILITY_COVERAGE_FILE, compatibility_coverage_report},
-        credentials::ActorCredential,
         fixture::registry::{
             RESOURCE_REGISTRY_FILE, ResourceKind, ResourceRegistry, ResourceState,
         },
         ports::{
-            ProtocolAdminError, ProtocolAdminPort, ProtocolObjectVersion, ProtocolS3Error,
-            ProtocolS3Port, ProtocolServerInfo,
+            ExclusiveBucketOwnership, ProtocolAdminCleanupPort, ProtocolAdminError,
+            ProtocolAdminServerPort, ProtocolS3CleanupPort, ProtocolS3Error, ProtocolServerInfo,
         },
         preflight::{ProtocolPreflightSummary, ProtocolStaleResourceScan},
         reporting::{
@@ -986,27 +986,12 @@ mod tests {
     struct CleanupAdmin;
 
     #[async_trait]
-    impl ProtocolAdminPort for CleanupAdmin {
-        async fn server_info(&self) -> std::result::Result<ProtocolServerInfo, ProtocolAdminError> {
-            Ok(ProtocolServerInfo {
-                deployment_id: "deployment".to_string(),
-                mode: None,
-                region: None,
-            })
-        }
-
+    impl ProtocolAdminCleanupPort for CleanupAdmin {
         async fn users_with_prefix(
             &self,
             _prefix: &str,
         ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
             Ok(Vec::new())
-        }
-
-        async fn create_user(
-            &self,
-            _credential: &ActorCredential,
-        ) -> std::result::Result<(), ProtocolAdminError> {
-            Ok(())
         }
 
         async fn remove_user(
@@ -1015,14 +1000,89 @@ mod tests {
         ) -> std::result::Result<(), ProtocolAdminError> {
             Ok(())
         }
+
+        async fn groups_with_prefix(
+            &self,
+            _prefix: &str,
+        ) -> Result<Vec<String>, ProtocolAdminError> {
+            Ok(Vec::new())
+        }
+        async fn group_contains_member(
+            &self,
+            _group: &str,
+            _member: &str,
+        ) -> Result<bool, ProtocolAdminError> {
+            Ok(false)
+        }
+        async fn update_group_members(
+            &self,
+            _group: &str,
+            _members: &[String],
+            _remove: bool,
+        ) -> Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+        async fn remove_group(&self, _group: &str) -> Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+        async fn policies_with_prefix(
+            &self,
+            _prefix: &str,
+        ) -> Result<Vec<String>, ProtocolAdminError> {
+            Ok(Vec::new())
+        }
+        async fn remove_policy(&self, _name: &str) -> Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+        async fn detach_policy(
+            &self,
+            _policy: &str,
+            _principal: &str,
+            _is_group: bool,
+        ) -> Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+        async fn policy_attached(
+            &self,
+            _policy: &str,
+            _principal: &str,
+            _is_group: bool,
+        ) -> Result<bool, ProtocolAdminError> {
+            Ok(false)
+        }
+        async fn revoke_sts_sessions_for_provider(
+            &self,
+            _parent_access_key: &str,
+            _provider: &str,
+        ) -> Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+        async fn sts_sessions_with_parent_for_provider(
+            &self,
+            _parent_access_key: &str,
+            _provider: &str,
+        ) -> Result<Vec<String>, ProtocolAdminError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl ProtocolAdminServerPort for CleanupAdmin {
+        async fn server_info(&self) -> Result<ProtocolServerInfo, ProtocolAdminError> {
+            Ok(ProtocolServerInfo {
+                deployment_id: "deployment".to_string(),
+                mode: None,
+                region: None,
+            })
+        }
     }
 
     #[derive(Clone, Default)]
     struct CleanupS3(Arc<Mutex<BTreeSet<String>>>);
 
     #[async_trait]
-    impl ProtocolS3Port for CleanupS3 {
-        async fn list_buckets_with_prefix(
+    impl ProtocolS3CleanupPort for CleanupS3 {
+        async fn cleanup_bucket_names(
             &self,
             prefix: &str,
         ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
@@ -1036,70 +1096,66 @@ mod tests {
                 .collect())
         }
 
-        async fn create_bucket(&self, bucket: &str) -> std::result::Result<(), ProtocolS3Error> {
-            self.0.lock().expect("buckets").insert(bucket.to_string());
+        async fn cleanup_exclusive_bucket(
+            &self,
+            ownership: ExclusiveBucketOwnership<'_>,
+            _include_versions: bool,
+        ) -> Result<(), ProtocolS3Error> {
+            self.0.lock().expect("buckets").remove(ownership.bucket());
             Ok(())
         }
-
-        async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), ProtocolS3Error> {
-            self.0.lock().expect("buckets").remove(bucket);
-            Ok(())
-        }
-
-        async fn put_bucket_policy(
+        async fn cleanup_object_prefix(
             &self,
             _bucket: &str,
-            _policy: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
+            _prefix: &str,
+            _include_versions: bool,
+        ) -> Result<(), ProtocolS3Error> {
             Ok(())
         }
-        async fn delete_bucket_policy(
+        async fn cleanup_object_prefix_exists(
             &self,
             _bucket: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
-            Ok(())
+            _prefix: &str,
+            _include_versions: bool,
+        ) -> Result<bool, ProtocolS3Error> {
+            Ok(false)
         }
-        async fn list_objects(
-            &self,
-            _bucket: &str,
-        ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
-            Ok(Vec::new())
-        }
-        async fn put_object(
+        async fn cleanup_abort_multipart_upload(
             &self,
             _bucket: &str,
             _key: &str,
-            _body: &[u8],
-        ) -> std::result::Result<(), ProtocolS3Error> {
+            _upload_id: &str,
+        ) -> Result<(), ProtocolS3Error> {
             Ok(())
         }
-        async fn get_object(
+        async fn cleanup_multipart_upload_exists(
             &self,
             _bucket: &str,
             _key: &str,
-        ) -> std::result::Result<Vec<u8>, ProtocolS3Error> {
-            Ok(Vec::new())
+            _upload_id: &str,
+        ) -> Result<bool, ProtocolS3Error> {
+            Ok(false)
         }
-        async fn delete_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
+        async fn cleanup_delete_bucket_policy(&self, _bucket: &str) -> Result<(), ProtocolS3Error> {
             Ok(())
         }
-        async fn list_object_versions(
+        async fn cleanup_bucket_policy_exists(
             &self,
             _bucket: &str,
-        ) -> std::result::Result<Vec<ProtocolObjectVersion>, ProtocolS3Error> {
-            Ok(Vec::new())
+        ) -> Result<bool, ProtocolS3Error> {
+            Ok(false)
         }
-        async fn delete_object_version(
+        async fn cleanup_delete_public_access_block(
             &self,
             _bucket: &str,
-            _key: &str,
-            _version_id: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
+        ) -> Result<(), ProtocolS3Error> {
             Ok(())
+        }
+        async fn cleanup_public_access_block_exists(
+            &self,
+            _bucket: &str,
+        ) -> Result<bool, ProtocolS3Error> {
+            Ok(false)
         }
     }
 
