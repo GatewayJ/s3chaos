@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::protocol::catalog::{ProtocolDomain, protocol_case, protocol_case_catalog};
+use crate::protocol::{
+    catalog::{ProtocolDomain, protocol_case, protocol_case_catalog},
+    reporting::ProtocolCaseStatus,
+};
 
 pub const S3TESTS_REVISION: &str = "5522d1c351f75bc00ae0f64f742f3f095f5939d9";
 pub const COMPATIBILITY_COVERAGE_FILE: &str = "compatibility-coverage.json";
@@ -171,6 +174,20 @@ pub enum CompatibilityLiveStatus {
     NotRun,
     Passed,
     Failed,
+}
+
+pub fn compatibility_live_status(
+    case_status: ProtocolCaseStatus,
+    failure_phase: Option<&str>,
+    cleanup_succeeded: bool,
+) -> CompatibilityLiveStatus {
+    if matches!(failure_phase, Some("preflight" | "not-run")) {
+        return CompatibilityLiveStatus::NotRun;
+    }
+    match (case_status, cleanup_succeeded) {
+        (ProtocolCaseStatus::Passed, true) => CompatibilityLiveStatus::Passed,
+        _ => CompatibilityLiveStatus::Failed,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1112,5 +1129,29 @@ mod tests {
         assert_eq!(report.summary.native_live_passed, 1);
         assert_eq!(report.summary.native_live_failed, 1);
         assert_eq!(report.summary.native_not_run, 7);
+    }
+
+    #[test]
+    fn live_status_preserves_cases_that_never_executed() {
+        assert_eq!(
+            compatibility_live_status(ProtocolCaseStatus::Failed, Some("preflight"), true),
+            CompatibilityLiveStatus::NotRun
+        );
+        assert_eq!(
+            compatibility_live_status(ProtocolCaseStatus::Failed, Some("not-run"), true),
+            CompatibilityLiveStatus::NotRun
+        );
+        assert_eq!(
+            compatibility_live_status(ProtocolCaseStatus::Failed, Some("assertion"), true),
+            CompatibilityLiveStatus::Failed
+        );
+        assert_eq!(
+            compatibility_live_status(ProtocolCaseStatus::Passed, None, false),
+            CompatibilityLiveStatus::Failed
+        );
+        assert_eq!(
+            compatibility_live_status(ProtocolCaseStatus::Passed, None, true),
+            CompatibilityLiveStatus::Passed
+        );
     }
 }

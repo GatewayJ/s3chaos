@@ -30,7 +30,7 @@ use crate::protocol::{
         web_identity::RustfsWebIdentityStsClient,
     },
     compatibility::{
-        COMPATIBILITY_COVERAGE_FILE, CompatibilityLiveStatus, compatibility_coverage_report,
+        COMPATIBILITY_COVERAGE_FILE, compatibility_coverage_report, compatibility_live_status,
     },
     credentials::{AdminCredentials, CredentialProvider, EnvCredentialProvider},
     fixture::{
@@ -317,10 +317,11 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         .map(|(execution, cleanup)| {
             (
                 execution.report.case_id.clone(),
-                match (execution.report.status, cleanup.succeeded) {
-                    (ProtocolCaseStatus::Passed, true) => CompatibilityLiveStatus::Passed,
-                    _ => CompatibilityLiveStatus::Failed,
-                },
+                compatibility_live_status(
+                    execution.report.status,
+                    execution.report.failure_phase.as_deref(),
+                    cleanup.succeeded,
+                ),
             )
         })
         .collect::<BTreeMap<_, _>>();

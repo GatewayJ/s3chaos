@@ -22,8 +22,8 @@ use std::path::{Component, Path};
 use crate::protocol::{
     catalog::protocol_case,
     compatibility::{
-        COMPATIBILITY_COVERAGE_FILE, CompatibilityCoverageReport, CompatibilityLiveStatus,
-        compatibility_coverage_report,
+        COMPATIBILITY_COVERAGE_FILE, CompatibilityCoverageReport, compatibility_coverage_report,
+        compatibility_live_status,
     },
     fixture::registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
     preflight::ProtocolPreflightSummary,
@@ -200,10 +200,11 @@ fn validate_contract(
         .map(|(report, cleanup)| {
             (
                 report.case_id.clone(),
-                match (report.status, cleanup.succeeded) {
-                    (ProtocolCaseStatus::Passed, true) => CompatibilityLiveStatus::Passed,
-                    _ => CompatibilityLiveStatus::Failed,
-                },
+                compatibility_live_status(
+                    report.status,
+                    report.failure_phase.as_deref(),
+                    cleanup.succeeded,
+                ),
             )
         })
         .collect::<BTreeMap<_, _>>();
