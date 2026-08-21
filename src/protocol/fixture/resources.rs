@@ -20,8 +20,148 @@ use crate::protocol::{
         naming::ProtocolResourceNamer,
         registry::{ResourceHandle, ResourceKind, ResourceRegistry, ResourceState},
     },
-    ports::{ActorS3ClientFactory, ProtocolAdminPort, ProtocolS3Port},
+    ports::{ActorS3ClientFactory, ProtocolAdminPort, ProtocolPublicAccessBlock, ProtocolS3Port},
 };
+
+pub(crate) struct S3BucketFixture {
+    handle: ResourceHandle,
+}
+
+pub(crate) struct ObjectPrefixFixture {
+    handle: ResourceHandle,
+}
+
+pub(crate) struct MultipartUploadFixture {
+    handle: ResourceHandle,
+    pub(crate) upload_id: String,
+}
+
+pub(crate) struct PublicAccessBlockFixture {
+    handle: ResourceHandle,
+}
+
+pub(crate) async fn create_s3_bucket(
+    case_id: &str,
+    bucket: &str,
+    registry: &mut ResourceRegistry,
+    s3: &impl ProtocolS3Port,
+) -> Result<S3BucketFixture> {
+    let handle = registry.plan(ResourceKind::Bucket, bucket, case_id, Vec::new())?;
+    transition_external(registry, &handle, "create bucket", s3.create_bucket(bucket)).await?;
+    Ok(S3BucketFixture { handle })
+}
+
+pub(crate) fn plan_object_prefix(
+    case_id: &str,
+    bucket: &str,
+    bucket_fixture: &S3BucketFixture,
+    registry: &mut ResourceRegistry,
+) -> Result<ObjectPrefixFixture> {
+    let handle = registry.plan_object_prefix(
+        bucket,
+        format!("cases/{case_id}/"),
+        case_id,
+        vec![bucket_fixture.handle.id.clone()],
+    )?;
+    registry.transition(&handle.id, ResourceState::Creating, None)?;
+    Ok(ObjectPrefixFixture { handle })
+}
+
+pub(crate) fn mark_object_prefix_created(
+    registry: &mut ResourceRegistry,
+    fixture: &ObjectPrefixFixture,
+) -> Result<()> {
+    registry.transition(&fixture.handle.id, ResourceState::Created, None)
+}
+
+pub(crate) fn enable_versioned_cleanup(registry: &mut ResourceRegistry) -> Result<()> {
+    registry.set_versioned_cleanup(true)
+}
+
+pub(crate) async fn create_multipart_upload(
+    case_id: &str,
+    bucket: &str,
+    key: &str,
+    bucket_fixture: &S3BucketFixture,
+    registry: &mut ResourceRegistry,
+    s3: &impl ProtocolS3Port,
+) -> Result<MultipartUploadFixture> {
+    let handle = registry.plan_multipart_upload(
+        bucket,
+        key,
+        case_id,
+        vec![bucket_fixture.handle.id.clone()],
+    )?;
+    registry.transition(&handle.id, ResourceState::Creating, None)?;
+    let upload_id = match s3.create_multipart_upload(bucket, key).await {
+        Ok(upload_id) => upload_id,
+        Err(error) => {
+            return fail_resource(registry, &handle, "create multipart upload", error);
+        }
+    };
+    // Persist the remote identifier before marking the resource created so replay cleanup can
+    // still abort an upload if the process stops between these two registry writes.
+    registry.set_multipart_upload_id(&handle.id, &upload_id)?;
+    registry.transition(&handle.id, ResourceState::Created, None)?;
+    Ok(MultipartUploadFixture { handle, upload_id })
+}
+
+pub(crate) fn mark_multipart_upload_completed(
+    registry: &mut ResourceRegistry,
+    fixture: &MultipartUploadFixture,
+) -> Result<()> {
+    registry.transition(&fixture.handle.id, ResourceState::CleanupAttempted, None)?;
+    registry.transition(&fixture.handle.id, ResourceState::Cleaned, None)
+}
+
+pub(crate) async fn create_public_access_block(
+    case_id: &str,
+    bucket: &str,
+    configuration: ProtocolPublicAccessBlock,
+    bucket_fixture: &S3BucketFixture,
+    registry: &mut ResourceRegistry,
+    s3: &impl ProtocolS3Port,
+) -> Result<PublicAccessBlockFixture> {
+    let handle = registry.plan(
+        ResourceKind::PublicAccessBlock,
+        bucket,
+        case_id,
+        vec![bucket_fixture.handle.id.clone()],
+    )?;
+    transition_external(
+        registry,
+        &handle,
+        "create public access block",
+        s3.put_public_access_block(bucket, configuration),
+    )
+    .await?;
+    Ok(PublicAccessBlockFixture { handle })
+}
+
+pub(crate) async fn delete_public_access_block(
+    bucket: &str,
+    fixture: &PublicAccessBlockFixture,
+    registry: &mut ResourceRegistry,
+    s3: &impl ProtocolS3Port,
+) -> Result<()> {
+    s3.delete_public_access_block(bucket).await?;
+    registry.transition(&fixture.handle.id, ResourceState::CleanupAttempted, None)?;
+    registry.transition(&fixture.handle.id, ResourceState::Cleaned, None)
+}
+
+fn fail_resource<T, E>(
+    registry: &mut ResourceRegistry,
+    handle: &ResourceHandle,
+    action: &str,
+    error: E,
+) -> Result<T>
+where
+    E: std::fmt::Display,
+{
+    let message = format!("{action} failed: {error}");
+    registry.transition(&handle.id, ResourceState::Failed, Some(message.clone()))?;
+    Err(anyhow!(message))
+}
 
 pub(crate) struct IamFixture<C> {
     pub(crate) user_handle_id: String,
