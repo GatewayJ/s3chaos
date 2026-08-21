@@ -21,14 +21,21 @@ pub const BUCKET_POLICY_EXPLICIT_DENY_OVERRIDES_ALLOW: &str =
 pub const BUCKET_POLICY_MALFORMED_POLICY_REJECTED: &str = "bucket-policy-malformed-policy-rejected";
 pub const BUCKET_POLICY_PREFIX_SCOPE: &str = "bucket-policy-prefix-scope";
 pub const COMPAT_BUCKET_LIST_CREATE_DELETE: &str = "compat-bucket-list-create-delete";
+pub const COMPAT_BUCKET_HEAD: &str = "compat-bucket-head";
 pub const COMPAT_LIST_OBJECTS_BASIC: &str = "compat-list-objects-basic";
+pub const COMPAT_MULTIPART_UPLOAD_SMALL: &str = "compat-multipart-upload-small";
+pub const COMPAT_MULTI_OBJECT_DELETE: &str = "compat-multi-object-delete";
+pub const COMPAT_OBJECT_COPY_SAME_BUCKET: &str = "compat-object-copy-same-bucket";
 pub const COMPAT_OBJECT_PUT_GET_DELETE: &str = "compat-object-put-get-delete";
+pub const COMPAT_VERSIONING_HEAD_REMOVAL: &str = "compat-versioning-head-removal";
 pub const IAM_EXPLICIT_DENY_OVERRIDES_ALLOW: &str = "iam-explicit-deny-overrides-allow";
 pub const IAM_GROUP_POLICY: &str = "iam-group-policy";
 pub const IAM_USER_MANAGED_POLICY_READONLY: &str = "iam-user-managed-policy-readonly";
 pub const IAM_USER_MANAGED_POLICY_DETACH: &str = "iam-user-managed-policy-detach";
 pub const OIDC_WEB_IDENTITY_BASIC: &str = "oidc-web-identity-basic";
+pub const PUBLIC_ACCESS_BLOCK_ROUND_TRIP: &str = "public-access-block-round-trip";
 pub const STS_ASSUME_ROLE_BASIC: &str = "sts-assume-role-basic";
+pub const STS_EXPIRED_TOKEN_DENIED: &str = "sts-expired-token-denied";
 pub const STS_SESSION_POLICY_DENY_PUT: &str = "sts-session-policy-deny-put";
 pub const STS_SESSION_POLICY_NARROWS_ROLE: &str = "sts-session-policy-narrows-role";
 
@@ -72,9 +79,14 @@ const CASES: &[ProtocolCase] = &[
         BUCKET_POLICY_PREFIX_SCOPE,
         &["authz", "parallel-safe", "regression"],
     ),
+    compatibility_case(COMPAT_BUCKET_HEAD),
     compatibility_case(COMPAT_BUCKET_LIST_CREATE_DELETE),
     compatibility_case(COMPAT_LIST_OBJECTS_BASIC),
+    compatibility_case(COMPAT_MULTI_OBJECT_DELETE),
+    compatibility_case(COMPAT_MULTIPART_UPLOAD_SMALL),
+    compatibility_case(COMPAT_OBJECT_COPY_SAME_BUCKET),
     compatibility_case(COMPAT_OBJECT_PUT_GET_DELETE),
+    compatibility_versioning_case(),
     iam_case(
         IAM_EXPLICIT_DENY_OVERRIDES_ALLOW,
         "iam-user",
@@ -92,7 +104,9 @@ const CASES: &[ProtocolCase] = &[
         &["authz", "regression"],
     ),
     oidc_web_identity_case(),
+    public_access_block_case(),
     sts_case(STS_ASSUME_ROLE_BASIC, "sts-assume-role"),
+    sts_expiration_case(),
     sts_case(STS_SESSION_POLICY_DENY_PUT, "sts-session-policy"),
     sts_case(STS_SESSION_POLICY_NARROWS_ROLE, "sts-session-policy"),
 ];
@@ -113,6 +127,17 @@ const fn sts_case(id: &'static str, group: &'static str) -> ProtocolCase {
         id,
         group,
         tags: &["authz", "regression"],
+        isolation: ProtocolIsolation::Case,
+        requires: &["s3", "admin-api", "iam", "sts-assume-role"],
+        serial: true,
+    }
+}
+
+const fn sts_expiration_case() -> ProtocolCase {
+    ProtocolCase {
+        id: STS_EXPIRED_TOKEN_DENIED,
+        group: "sts-session-policy",
+        tags: &["authz", "regression", "slow"],
         isolation: ProtocolIsolation::Case,
         requires: &["s3", "admin-api", "iam", "sts-assume-role"],
         serial: true,
@@ -144,6 +169,28 @@ const fn compatibility_case(id: &'static str) -> ProtocolCase {
         tags: &["ceph-style", "compatibility", "parallel-safe"],
         isolation: ProtocolIsolation::Case,
         requires: &["s3"],
+        serial: false,
+    }
+}
+
+const fn compatibility_versioning_case() -> ProtocolCase {
+    ProtocolCase {
+        id: COMPAT_VERSIONING_HEAD_REMOVAL,
+        group: "s3-compatibility",
+        tags: &["ceph-style", "compatibility", "parallel-safe", "versioning"],
+        isolation: ProtocolIsolation::Case,
+        requires: &["s3", "versioning"],
+        serial: false,
+    }
+}
+
+const fn public_access_block_case() -> ProtocolCase {
+    ProtocolCase {
+        id: PUBLIC_ACCESS_BLOCK_ROUND_TRIP,
+        group: "public-access-block",
+        tags: &["compatibility", "parallel-safe", "regression"],
+        isolation: ProtocolIsolation::Case,
+        requires: &["s3", "public-access-block"],
         serial: false,
     }
 }
@@ -195,11 +242,13 @@ mod tests {
     use super::{
         BUCKET_POLICY_AUTHENTICATED_USER_RW, BUCKET_POLICY_DELETE_RESTORES_PRIVATE,
         BUCKET_POLICY_EXPLICIT_DENY_OVERRIDES_ALLOW, BUCKET_POLICY_MALFORMED_POLICY_REJECTED,
-        BUCKET_POLICY_PREFIX_SCOPE, COMPAT_BUCKET_LIST_CREATE_DELETE, COMPAT_LIST_OBJECTS_BASIC,
-        COMPAT_OBJECT_PUT_GET_DELETE, IAM_EXPLICIT_DENY_OVERRIDES_ALLOW, IAM_GROUP_POLICY,
+        BUCKET_POLICY_PREFIX_SCOPE, COMPAT_BUCKET_HEAD, COMPAT_BUCKET_LIST_CREATE_DELETE,
+        COMPAT_LIST_OBJECTS_BASIC, COMPAT_MULTI_OBJECT_DELETE, COMPAT_MULTIPART_UPLOAD_SMALL,
+        COMPAT_OBJECT_COPY_SAME_BUCKET, COMPAT_OBJECT_PUT_GET_DELETE,
+        COMPAT_VERSIONING_HEAD_REMOVAL, IAM_EXPLICIT_DENY_OVERRIDES_ALLOW, IAM_GROUP_POLICY,
         IAM_USER_MANAGED_POLICY_DETACH, IAM_USER_MANAGED_POLICY_READONLY, OIDC_WEB_IDENTITY_BASIC,
-        STS_ASSUME_ROLE_BASIC, STS_SESSION_POLICY_DENY_PUT, STS_SESSION_POLICY_NARROWS_ROLE,
-        protocol_case_catalog,
+        PUBLIC_ACCESS_BLOCK_ROUND_TRIP, STS_ASSUME_ROLE_BASIC, STS_EXPIRED_TOKEN_DENIED,
+        STS_SESSION_POLICY_DENY_PUT, STS_SESSION_POLICY_NARROWS_ROLE, protocol_case_catalog,
     };
     use std::collections::BTreeSet;
 
@@ -215,15 +264,22 @@ mod tests {
                 BUCKET_POLICY_EXPLICIT_DENY_OVERRIDES_ALLOW,
                 BUCKET_POLICY_MALFORMED_POLICY_REJECTED,
                 BUCKET_POLICY_PREFIX_SCOPE,
+                COMPAT_BUCKET_HEAD,
                 COMPAT_BUCKET_LIST_CREATE_DELETE,
                 COMPAT_LIST_OBJECTS_BASIC,
+                COMPAT_MULTI_OBJECT_DELETE,
+                COMPAT_MULTIPART_UPLOAD_SMALL,
+                COMPAT_OBJECT_COPY_SAME_BUCKET,
                 COMPAT_OBJECT_PUT_GET_DELETE,
+                COMPAT_VERSIONING_HEAD_REMOVAL,
                 IAM_EXPLICIT_DENY_OVERRIDES_ALLOW,
                 IAM_GROUP_POLICY,
                 IAM_USER_MANAGED_POLICY_READONLY,
                 IAM_USER_MANAGED_POLICY_DETACH,
                 OIDC_WEB_IDENTITY_BASIC,
+                PUBLIC_ACCESS_BLOCK_ROUND_TRIP,
                 STS_ASSUME_ROLE_BASIC,
+                STS_EXPIRED_TOKEN_DENIED,
                 STS_SESSION_POLICY_DENY_PUT,
                 STS_SESSION_POLICY_NARROWS_ROLE,
             ]
@@ -258,6 +314,7 @@ mod tests {
 
         for id in [
             STS_ASSUME_ROLE_BASIC,
+            STS_EXPIRED_TOKEN_DENIED,
             STS_SESSION_POLICY_DENY_PUT,
             STS_SESSION_POLICY_NARROWS_ROLE,
         ] {

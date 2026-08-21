@@ -24,7 +24,8 @@ use crate::protocol::{
     },
     ports::{
         ProtocolAdminPort, ProtocolAssumeRoleRequest, ProtocolExternalIdentityPort,
-        ProtocolExternalIdentityProviderInfo, ProtocolS3Port, ProtocolStsPort,
+        ProtocolExternalIdentityProviderInfo, ProtocolPublicAccessBlock, ProtocolS3Port,
+        ProtocolStsPort,
     },
     reporting::ProtocolCleanupReport,
     suite::ResolvedProtocolSuite,
@@ -200,6 +201,8 @@ pub(crate) struct ProtocolProbeCapabilities {
     pub iam: bool,
     pub iam_group: bool,
     pub assume_role: bool,
+    pub versioning: bool,
+    pub public_access_block: bool,
 }
 
 impl ProtocolProbeCapabilities {
@@ -215,6 +218,8 @@ impl ProtocolProbeCapabilities {
             iam: requires("iam"),
             iam_group: requires("iam-group"),
             assume_role: requires("sts-assume-role"),
+            versioning: requires("versioning"),
+            public_access_block: requires("public-access-block"),
         }
     }
 }
@@ -304,6 +309,7 @@ async fn run_probe_resources(
     forbidden_secrets: &mut Vec<String>,
 ) -> Result<(usize, usize)> {
     let case_id = "preflight-permission-probe";
+    registry.set_versioned_cleanup(capabilities.versioning)?;
     ensure!(
         !capabilities.assume_role || capabilities.iam,
         "AssumeRole preflight requires IAM"
@@ -339,6 +345,37 @@ async fn run_probe_resources(
     registry.transition(&bucket_handle.id, ResourceState::Creating, None)?;
     s3.create_bucket(&bucket).await?;
     registry.transition(&bucket_handle.id, ResourceState::Created, None)?;
+
+    if capabilities.versioning {
+        s3.put_bucket_versioning(&bucket, true).await?;
+    }
+
+    if capabilities.public_access_block {
+        let public_access_block_handle = registry.plan_for_phase(
+            ResourceKind::PublicAccessBlock,
+            &bucket,
+            case_id,
+            vec![bucket_handle.id.clone()],
+            "preflight",
+        )?;
+        registry.transition(
+            &public_access_block_handle.id,
+            ResourceState::Creating,
+            None,
+        )?;
+        let configuration = ProtocolPublicAccessBlock {
+            block_public_acls: true,
+            ignore_public_acls: true,
+            block_public_policy: true,
+            restrict_public_buckets: true,
+        };
+        s3.put_public_access_block(&bucket, configuration).await?;
+        ensure!(
+            s3.get_public_access_block(&bucket).await? == configuration,
+            "S3 preflight public access block round-trip changed the configuration"
+        );
+        registry.transition(&public_access_block_handle.id, ResourceState::Created, None)?;
+    }
 
     if capabilities.bucket_policy {
         let user_name = user_name
@@ -493,6 +530,9 @@ async fn run_probe_resources(
     registry.transition(&object_handle.id, ResourceState::Creating, None)?;
     let key = format!("{prefix}object");
     s3.put_object(&bucket, &key, b"preflight-object").await?;
+    if capabilities.versioning {
+        s3.put_object(&bucket, &key, b"preflight-object").await?;
+    }
     ensure!(
         s3.get_object(&bucket, &key).await? == b"preflight-object",
         "S3 preflight object round-trip changed the payload"
@@ -506,7 +546,20 @@ async fn run_probe_resources(
     );
     s3.delete_object(&bucket, &key).await?;
     registry.transition(&object_handle.id, ResourceState::Created, None)?;
-    Ok((0, 0))
+    let versions = if capabilities.versioning {
+        s3.list_object_versions(&bucket).await?
+    } else {
+        Vec::new()
+    };
+    let version_count = versions.iter().filter(|entry| !entry.delete_marker).count();
+    let delete_marker_count = versions.iter().filter(|entry| entry.delete_marker).count();
+    if capabilities.versioning {
+        ensure!(
+            version_count >= 2 && delete_marker_count >= 1,
+            "S3 preflight versioning did not preserve two versions and a delete marker"
+        );
+    }
+    Ok((version_count, delete_marker_count))
 }
 
 #[cfg(test)]
@@ -523,8 +576,8 @@ mod tests {
         },
         ports::{
             ProtocolAdminError, ProtocolAdminPort, ProtocolAssumeRoleRequest,
-            ProtocolObjectVersion, ProtocolS3Error, ProtocolS3Port, ProtocolServerInfo,
-            ProtocolStsError, ProtocolStsPort,
+            ProtocolObjectVersion, ProtocolPublicAccessBlock, ProtocolS3Error, ProtocolS3Port,
+            ProtocolServerInfo, ProtocolStsError, ProtocolStsPort,
         },
         preflight::{ProtocolPreflightSummary, ProtocolStaleResourceScan},
         suite_plan::{
@@ -548,6 +601,8 @@ mod tests {
         iam_memberships: Vec<(String, String)>,
         sts_sessions: Vec<(String, String)>,
         versioning_enable_count: usize,
+        versioning_enabled: bool,
+        public_access_block: Option<ProtocolPublicAccessBlock>,
         group_mutation_count: usize,
     }
 
@@ -911,15 +966,16 @@ mod tests {
             key: &str,
             _body: &[u8],
         ) -> std::result::Result<(), ProtocolS3Error> {
-            self.0
-                .lock()
-                .expect("state")
-                .versions
-                .push(ProtocolObjectVersion {
-                    key: key.to_string(),
-                    version_id: "v1".to_string(),
-                    delete_marker: false,
-                });
+            let mut state = self.0.lock().expect("state");
+            let version_id = format!("v{}", state.versions.len() + 1);
+            if !state.versioning_enabled {
+                state.versions.retain(|version| version.key != key);
+            }
+            state.versions.push(ProtocolObjectVersion {
+                key: key.to_string(),
+                version_id,
+                delete_marker: false,
+            });
             Ok(())
         }
 
@@ -936,11 +992,17 @@ mod tests {
             _bucket: &str,
             key: &str,
         ) -> std::result::Result<(), ProtocolS3Error> {
-            self.0
-                .lock()
-                .expect("state")
-                .versions
-                .retain(|version| version.key != key);
+            let mut state = self.0.lock().expect("state");
+            if state.versioning_enabled {
+                let version_id = format!("d{}", state.versions.len() + 1);
+                state.versions.push(ProtocolObjectVersion {
+                    key: key.to_string(),
+                    version_id,
+                    delete_marker: true,
+                });
+            } else {
+                state.versions.retain(|version| version.key != key);
+            }
             Ok(())
         }
 
@@ -962,6 +1024,49 @@ mod tests {
                 .expect("state")
                 .versions
                 .retain(|version| version.key != key || version.version_id != version_id);
+            Ok(())
+        }
+
+        async fn put_bucket_versioning(
+            &self,
+            _bucket: &str,
+            enabled: bool,
+        ) -> std::result::Result<(), ProtocolS3Error> {
+            let mut state = self.0.lock().expect("state");
+            state.versioning_enabled = enabled;
+            state.versioning_enable_count += usize::from(enabled);
+            Ok(())
+        }
+
+        async fn put_public_access_block(
+            &self,
+            _bucket: &str,
+            configuration: ProtocolPublicAccessBlock,
+        ) -> std::result::Result<(), ProtocolS3Error> {
+            self.0.lock().expect("state").public_access_block = Some(configuration);
+            Ok(())
+        }
+
+        async fn get_public_access_block(
+            &self,
+            _bucket: &str,
+        ) -> std::result::Result<ProtocolPublicAccessBlock, ProtocolS3Error> {
+            self.0
+                .lock()
+                .expect("state")
+                .public_access_block
+                .ok_or_else(|| ProtocolS3Error {
+                    code: "NoSuchPublicAccessBlockConfiguration".to_string(),
+                    status: Some(404),
+                    request_id: None,
+                })
+        }
+
+        async fn delete_public_access_block(
+            &self,
+            _bucket: &str,
+        ) -> std::result::Result<(), ProtocolS3Error> {
+            self.0.lock().expect("state").public_access_block = None;
             Ok(())
         }
     }
@@ -995,6 +1100,8 @@ mod tests {
                 iam: true,
                 iam_group: true,
                 assume_role: true,
+                versioning: true,
+                public_access_block: true,
             },
         )
         .await;
@@ -1004,8 +1111,8 @@ mod tests {
             ProtocolMutatingProbeStatus::Passed,
             "{execution:?}"
         );
-        assert_eq!(execution.summary.version_count, 0);
-        assert_eq!(execution.summary.delete_marker_count, 0);
+        assert_eq!(execution.summary.version_count, 2);
+        assert_eq!(execution.summary.delete_marker_count, 1);
         assert!(execution.cleanup.succeeded);
         assert!(registry.pending_cleanup().next().is_none());
         assert!(
@@ -1027,7 +1134,8 @@ mod tests {
             state.iam_attachments
         );
         assert!(state.iam_memberships.is_empty());
-        assert_eq!(state.versioning_enable_count, 0);
+        assert_eq!(state.versioning_enable_count, 1);
+        assert!(state.public_access_block.is_none());
     }
 
     #[tokio::test]
@@ -1086,6 +1194,8 @@ mod tests {
                 iam: true,
                 iam_group: false,
                 assume_role: false,
+                versioning: false,
+                public_access_block: false,
             },
         )
         .await;

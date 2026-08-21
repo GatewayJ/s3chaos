@@ -145,6 +145,26 @@ pub struct ProtocolObjectVersion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolListObjectsResult {
+    pub keys: Vec<String>,
+    pub key_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolCompletedPart {
+    pub part_number: i32,
+    pub etag: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolPublicAccessBlock {
+    pub block_public_acls: bool,
+    pub ignore_public_acls: bool,
+    pub block_public_policy: bool,
+    pub restrict_public_buckets: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolAssumeRoleRequest {
     pub duration_seconds: u32,
     pub session_policy: Option<String>,
@@ -446,6 +466,9 @@ pub trait ProtocolS3Port: Send + Sync {
     ) -> std::result::Result<Vec<String>, ProtocolS3Error>;
     async fn create_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
     async fn delete_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
+    async fn head_bucket(&self, _bucket: &str) -> Result<(), ProtocolS3Error> {
+        Err(unsupported_s3_operation("HeadBucketUnsupported"))
+    }
     async fn put_bucket_policy(&self, bucket: &str, policy: &str) -> Result<(), ProtocolS3Error>;
     async fn get_bucket_policy(&self, _bucket: &str) -> Result<String, ProtocolS3Error> {
         Err(ProtocolS3Error {
@@ -456,10 +479,109 @@ pub trait ProtocolS3Port: Send + Sync {
     }
     async fn delete_bucket_policy(&self, bucket: &str) -> Result<(), ProtocolS3Error>;
     async fn list_objects(&self, bucket: &str) -> Result<Vec<String>, ProtocolS3Error>;
+    async fn list_objects_v2_summary(
+        &self,
+        bucket: &str,
+    ) -> Result<ProtocolListObjectsResult, ProtocolS3Error> {
+        let keys = self.list_objects(bucket).await?;
+        let key_count = keys.len();
+        Ok(ProtocolListObjectsResult { keys, key_count })
+    }
     async fn put_object(&self, bucket: &str, key: &str, body: &[u8])
     -> Result<(), ProtocolS3Error>;
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, ProtocolS3Error>;
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ProtocolS3Error>;
+    async fn copy_object(
+        &self,
+        _bucket: &str,
+        _source_key: &str,
+        _destination_key: &str,
+    ) -> Result<(), ProtocolS3Error> {
+        Err(unsupported_s3_operation("CopyObjectUnsupported"))
+    }
+    async fn delete_objects(
+        &self,
+        _bucket: &str,
+        _keys: &[String],
+    ) -> Result<Vec<String>, ProtocolS3Error> {
+        Err(unsupported_s3_operation("DeleteObjectsUnsupported"))
+    }
+    async fn create_multipart_upload(
+        &self,
+        _bucket: &str,
+        _key: &str,
+    ) -> Result<String, ProtocolS3Error> {
+        Err(unsupported_s3_operation("CreateMultipartUploadUnsupported"))
+    }
+    async fn upload_part(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _upload_id: &str,
+        _part_number: i32,
+        _body: &[u8],
+    ) -> Result<String, ProtocolS3Error> {
+        Err(unsupported_s3_operation("UploadPartUnsupported"))
+    }
+    async fn complete_multipart_upload(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _upload_id: &str,
+        _parts: &[ProtocolCompletedPart],
+    ) -> Result<(), ProtocolS3Error> {
+        Err(unsupported_s3_operation(
+            "CompleteMultipartUploadUnsupported",
+        ))
+    }
+    async fn abort_multipart_upload(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _upload_id: &str,
+    ) -> Result<(), ProtocolS3Error> {
+        Err(unsupported_s3_operation("AbortMultipartUploadUnsupported"))
+    }
+    async fn list_multipart_uploads(
+        &self,
+        _bucket: &str,
+        _key: &str,
+    ) -> Result<Vec<String>, ProtocolS3Error> {
+        Err(unsupported_s3_operation("ListMultipartUploadsUnsupported"))
+    }
+    async fn put_bucket_versioning(
+        &self,
+        _bucket: &str,
+        _enabled: bool,
+    ) -> Result<(), ProtocolS3Error> {
+        Err(unsupported_s3_operation("PutBucketVersioningUnsupported"))
+    }
+    async fn get_object_version(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: &str,
+    ) -> Result<Vec<u8>, ProtocolS3Error> {
+        Err(unsupported_s3_operation("GetObjectVersionUnsupported"))
+    }
+    async fn put_public_access_block(
+        &self,
+        _bucket: &str,
+        _configuration: ProtocolPublicAccessBlock,
+    ) -> Result<(), ProtocolS3Error> {
+        Err(unsupported_s3_operation("PutPublicAccessBlockUnsupported"))
+    }
+    async fn get_public_access_block(
+        &self,
+        _bucket: &str,
+    ) -> Result<ProtocolPublicAccessBlock, ProtocolS3Error> {
+        Err(unsupported_s3_operation("GetPublicAccessBlockUnsupported"))
+    }
+    async fn delete_public_access_block(&self, _bucket: &str) -> Result<(), ProtocolS3Error> {
+        Err(unsupported_s3_operation(
+            "DeletePublicAccessBlockUnsupported",
+        ))
+    }
     async fn empty_bucket(
         &self,
         bucket: &str,
@@ -486,6 +608,14 @@ pub trait ProtocolS3Port: Send + Sync {
         key: &str,
         version_id: &str,
     ) -> std::result::Result<(), ProtocolS3Error>;
+}
+
+fn unsupported_s3_operation(code: &str) -> ProtocolS3Error {
+    ProtocolS3Error {
+        code: code.to_string(),
+        status: None,
+        request_id: None,
+    }
 }
 
 #[async_trait]

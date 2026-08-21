@@ -424,6 +424,7 @@ target:
 #[cfg(test)]
 mod tests {
     use super::{ProtocolSuite, protocol_suite_template_yaml, resolve_protocol_endpoint};
+    use crate::protocol::catalog::protocol_case_catalog;
 
     #[test]
     fn template_round_trips_and_selects_smoke_case() {
@@ -513,7 +514,11 @@ mod tests {
         );
         let suite: ProtocolSuite = serde_yaml_ng::from_str(&yaml).expect("default suite");
         let resolved = suite.resolve().expect("resolved default suite");
-        assert_eq!(resolved.cases.len(), 15);
+        let expected = protocol_case_catalog()
+            .iter()
+            .filter(|case| !case.requires.contains(&"external-idp"))
+            .count();
+        assert_eq!(resolved.cases.len(), expected);
         assert!(
             resolved
                 .cases

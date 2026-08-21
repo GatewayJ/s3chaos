@@ -1,0 +1,24 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: ProtocolSuite
+metadata:
+  name: rustfs-slow-regression
+selector:
+  cases:
+    - sts-expired-token-denied
+execution:
+  parallelism: 1
+  defaultIsolation: case
+  cleanup: always
+target:
+  endpoint: ${RUSTFS_PROTOCOL_TEST_ENDPOINT}
+  region: us-east-1
+  credentials:
+    adminProfile: root
+    provider: env
+  ownership:
+    mode: dedicated-tenant
+    resourcePrefixes:
+      bucket: s3c
+      identity: s3chaos
+  safety:
+    dedicatedTarget: required

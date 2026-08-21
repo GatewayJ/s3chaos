@@ -297,7 +297,7 @@ Case groups:
 - [x] `iam-policy`
 - [x] `sts-assume-role`
 - [x] `sts-session-policy`
-- [ ] `public-access-block`
+- [x] `public-access-block`
 - [x] `s3-compatibility`
 
 Future compatibility status lists (Phase 7 only):
@@ -773,9 +773,9 @@ Artifact contract rules:
       - Session policy permits get only.
       - Assert get works and put fails.
 
-- [ ] `sts-expired-token-denied`
-      - Create short-lived credentials if supported.
-      - Wait for expiration.
+- [x] `sts-expired-token-denied`
+      - Create credentials with RustFS's minimum lifetime.
+      - Wait for expiration in the dedicated slow suite.
       - Assert access fails with token expiration.
 
 ## RustFS Preflight Requirements
@@ -803,6 +803,7 @@ Preflight order:
 - [ ] Detect RustFS OIDC/WebIdentity setup only when OIDC-tagged cases are
       explicitly selected.
 - [x] Detect versioning support when cleanup needs versioned bucket cleanup.
+- [x] Detect Public Access Block support when its cases are selected.
 - [x] Detect that admin credentials can create, attach, detach, and delete IAM
       policies, users, groups, roles, and access keys needed by selected cases.
 - [x] Detect that admin credentials can put and delete bucket policies.
@@ -934,9 +935,10 @@ Phase 0 decisions:
 
 Implementation status: the offline contract, adapter boundary, success path,
 assertion-failure cleanup path, interruption cleanup path, and artifact linkage
-checks are implemented. The smoke case and the full 12-case bucket-policy,
-IAM, and STS catalog pass against a dedicated live RustFS target, including
-standalone artifact validation and zero-leftover cleanup.
+checks are implemented. The original 12-case bucket-policy, IAM, and STS set
+has passed against a dedicated live RustFS target, including standalone
+artifact validation and zero-leftover cleanup. New compatibility cases are
+covered by the scheduled live gate described in `docs/S3_PROTOCOL_TESTING.md`.
 
 Phase 1 is complete only when this flow works end to end:
 
@@ -999,13 +1001,13 @@ semantics while registering and cleaning the backing policy explicitly.
 - [x] Implement AssumeRole client.
 - [x] Implement basic AssumeRole case.
 - [x] Implement session policy narrowing cases.
-- [ ] Implement token expiration case where supported.
+- [x] Implement token expiration case where supported.
 - [x] Redact session credentials in artifacts.
 
-RustFS currently clamps `DurationSeconds` to a minimum of 900 seconds. The
-expiration case remains out of the executable catalog until RustFS provides a
-safe test-only shorter lifetime; making the default suite sleep for 15 minutes
-would make the harness operationally unusable.
+RustFS clamps `DurationSeconds` to a minimum of 900 seconds. The expiration case
+therefore lives in `protocol/examples/slow-regression.yaml`, outside the normal
+full suite. It waits for the real lifetime plus a small grace period and
+requires the signed S3 request to fail as `ExpiredToken`.
 
 ### Phase 6: Parallel Scheduler
 
@@ -1029,21 +1031,26 @@ been promoted to the parallel-safe contract.
       lists.
 - [x] Add optional Mint or SDK compatibility checks as a separate compatibility
       layer, not as the primary authorization test harness.
+- [x] Classify every test in the pinned Ceph source index.
+- [x] Define and validate the bounded native compatibility profile.
+- [x] Add strict scheduled live RustFS and Mint gates.
 
-The native catalog imports three bounded Ceph-style semantics under the
-`s3-compatibility` group: bucket listing/create visibility, basic key listing,
-and object put/get/delete. The mapping and status lists live under
+The native catalog imports nine exact Ceph-style semantics: bucket head and
+empty listing, key count, put/overwrite/get/delete, same-bucket copy,
+multi-object delete, small multipart completion retry, version-head removal,
+and Public Access Block round-trip. The mapping and status lists live under
 `protocol/compatibility/` and are pinned to ceph/s3-tests revision
-`5522d1c351f75bc00ae0f64f742f3f095f5939d9`. The CLI validates that statuses
-are disjoint, implemented entries resolve to compatibility-tagged native cases,
-and every future expected divergence has a reason, tracking reference, review
-condition, and fail/skip/warn disposition.
+`5522d1c351f75bc00ae0f64f742f3f095f5939d9`. A generated checked-in index
+classifies all 976 upstream pytest node ids. The CLI validates exact source
+coverage, disjoint statuses, resolvable native mappings, and the complete
+native profile in `native-profile.yaml`.
 
 Broader multi-SDK coverage remains an explicit outer compatibility layer:
 `scripts/protocol-compatibility.sh mint` runs a digest-pinned Mint image,
 requires a dedicated target acknowledgement, writes separate artifacts, and
-supports report-only or strict failure behavior. It does not affect native
-authorization suite selection or verdicts.
+supports report-only or strict failure behavior. The scheduled live workflow
+uses strict mode, so any Mint compatibility failure fails the job. It does not
+affect native authorization suite selection or verdicts.
 
 ## Open Decisions
 

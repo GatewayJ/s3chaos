@@ -371,6 +371,9 @@ fn class_for_error(error: &ProtocolS3Error) -> ProtocolAssertionClass {
         match error.code.as_str() {
             "NoSuchBucket" => ProtocolAssertionClass::NoSuchBucket,
             "NoSuchBucketPolicy" => ProtocolAssertionClass::NoSuchBucketPolicy,
+            "NoSuchPublicAccessBlockConfiguration" => {
+                ProtocolAssertionClass::NoSuchPublicAccessBlockConfiguration
+            }
             "NoSuchKey" | "NotFound" => ProtocolAssertionClass::NoSuchKey,
             "MalformedPolicy" => ProtocolAssertionClass::MalformedPolicy,
             "ExpiredToken" => ProtocolAssertionClass::ExpiredToken,

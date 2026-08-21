@@ -26,6 +26,10 @@ make fault-suite-plan SUITE=suite.yaml
 make fault-suite-run SUITE=suite.yaml
 make fault-cleanup
 make protocol-list
+make protocol-compatibility-status
+make protocol-suite-validate SUITE=protocol/examples/full-regression.yaml
+make protocol-suite-run SUITE=protocol/examples/full-regression.yaml
+make protocol-suite-run SUITE=protocol/examples/slow-regression.yaml
 make protocol-suite-validate SUITE=protocol/examples/oidc-keycloak.yaml
 make protocol-suite-run SUITE=protocol/examples/oidc-keycloak.yaml
 ```
@@ -46,3 +50,7 @@ setup, artifact contracts, and cleanup rules.
 
 See [docs/OIDC_PROTOCOL_TESTING.md](docs/OIDC_PROTOCOL_TESTING.md) for the
 Keycloak-backed `AssumeRoleWithWebIdentity` integration test.
+
+See [docs/S3_PROTOCOL_TESTING.md](docs/S3_PROTOCOL_TESTING.md) for native S3
+coverage, the pinned Ceph classification, live RustFS suites, strict Mint gate,
+artifacts, and cleanup.

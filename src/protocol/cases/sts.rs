@@ -14,6 +14,7 @@
 
 use anyhow::{Result, anyhow};
 use serde_json::json;
+use std::time::Duration;
 
 use crate::protocol::{
     authorization::{
@@ -22,10 +23,11 @@ use crate::protocol::{
     },
     cases::{
         CaseContext, ProtocolCaseExecution,
-        authz::{expect_access_denied, expect_eventual_ok},
+        authz::{expect_access_denied, expect_error_class, expect_eventual_ok},
     },
     catalog::{
-        STS_ASSUME_ROLE_BASIC, STS_SESSION_POLICY_DENY_PUT, STS_SESSION_POLICY_NARROWS_ROLE,
+        STS_ASSUME_ROLE_BASIC, STS_EXPIRED_TOKEN_DENIED, STS_SESSION_POLICY_DENY_PUT,
+        STS_SESSION_POLICY_NARROWS_ROLE,
     },
     fixture::{
         naming::ProtocolResourceNamer,
@@ -36,7 +38,17 @@ use crate::protocol::{
         ActorS3ClientFactory, ProtocolAdminPort, ProtocolAssumeRoleRequest, ProtocolS3Port,
         ProtocolStsPort,
     },
+    reporting::ProtocolAssertionClass,
 };
+
+#[cfg(not(test))]
+const EXPIRING_SESSION_DURATION_SECONDS: u32 = 900;
+#[cfg(test)]
+const EXPIRING_SESSION_DURATION_SECONDS: u32 = 1;
+#[cfg(not(test))]
+const EXPIRATION_GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const EXPIRATION_GRACE: Duration = Duration::from_millis(1);
 
 pub(crate) async fn run_sts_case<F>(
     case_id: &str,
@@ -88,6 +100,18 @@ where
             )
             .await
         }
+        STS_EXPIRED_TOKEN_DENIED => {
+            run_expired_token(
+                namer,
+                registry,
+                admin,
+                admin_s3,
+                sts,
+                actor_clients,
+                &mut context,
+            )
+            .await
+        }
         _ => Err(anyhow!("unsupported STS case {case_id}")),
     };
     context.finish(result)
@@ -107,6 +131,51 @@ fn sts_dimensions(case_id: &str) -> ProtocolAuthorizationDimensions {
             policy_effect: ProtocolPolicyEffect::Allow,
         }
     }
+}
+
+async fn run_expired_token<F>(
+    namer: &ProtocolResourceNamer,
+    registry: &mut ResourceRegistry,
+    admin: &impl ProtocolAdminPort,
+    admin_s3: &impl ProtocolS3Port,
+    sts: &impl ProtocolStsPort,
+    actor_clients: &F,
+    context: &mut CaseContext,
+) -> Result<()>
+where
+    F: ActorS3ClientFactory,
+{
+    let case_id = STS_EXPIRED_TOKEN_DENIED;
+    let (fixture, session_s3) = setup_sts_fixture(
+        case_id,
+        registry,
+        StsFixtureServices {
+            namer,
+            admin,
+            admin_s3,
+            sts,
+            actor_clients,
+        },
+        context,
+        SessionPolicySpec::None,
+        EXPIRING_SESSION_DURATION_SECONDS,
+    )
+    .await?;
+    context.current_phase = "expiration-wait".to_string();
+    tokio::time::sleep(
+        Duration::from_secs(EXPIRING_SESSION_DURATION_SECONDS as u64) + EXPIRATION_GRACE,
+    )
+    .await;
+    context.current_phase = "assertion".to_string();
+    expect_error_class(
+        context,
+        "sts-session",
+        "list-bucket-with-expired-token",
+        &fixture.bucket,
+        ProtocolAssertionClass::ExpiredToken,
+        || async { session_s3.list_objects(&fixture.bucket).await.map(|_| ()) },
+    )
+    .await
 }
 
 async fn run_basic<F>(
@@ -134,6 +203,7 @@ where
         },
         context,
         SessionPolicySpec::None,
+        900,
     )
     .await?;
     let prefix = format!("cases/{case_id}/");
@@ -202,6 +272,7 @@ where
         },
         context,
         SessionPolicySpec::WritePrefix(&allowed_prefix),
+        900,
     )
     .await?;
     let case_prefix = format!("cases/{case_id}/");
@@ -270,6 +341,7 @@ where
         },
         context,
         SessionPolicySpec::ReadOnly,
+        900,
     )
     .await?;
     let prefix = format!("cases/{case_id}/");
@@ -335,6 +407,7 @@ async fn setup_sts_fixture<A, S, T, F>(
     services: StsFixtureServices<'_, A, S, T, F>,
     context: &mut CaseContext,
     session_policy_spec: SessionPolicySpec<'_>,
+    duration_seconds: u32,
 ) -> Result<(IamFixture<F::Client>, F::Client)>
 where
     A: ProtocolAdminPort,
@@ -384,7 +457,7 @@ where
         .assume_role(
             &fixture.actor,
             &ProtocolAssumeRoleRequest {
-                duration_seconds: 900,
+                duration_seconds,
                 session_policy,
             },
             &session_handle.id,
@@ -454,10 +527,14 @@ fn session_read_policy(bucket: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parent_policy, run_sts_case, session_read_policy, session_write_policy};
+    use super::{
+        EXPIRING_SESSION_DURATION_SECONDS, parent_policy, run_sts_case, session_read_policy,
+        session_write_policy,
+    };
     use crate::protocol::{
         catalog::{
-            STS_ASSUME_ROLE_BASIC, STS_SESSION_POLICY_DENY_PUT, STS_SESSION_POLICY_NARROWS_ROLE,
+            STS_ASSUME_ROLE_BASIC, STS_EXPIRED_TOKEN_DENIED, STS_SESSION_POLICY_DENY_PUT,
+            STS_SESSION_POLICY_NARROWS_ROLE,
         },
         credentials::ActorCredential,
         fixture::{
@@ -478,6 +555,7 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         fs,
         sync::{Arc, Mutex},
+        time::Instant,
     };
 
     #[test]
@@ -495,6 +573,7 @@ mod tests {
     struct SessionInfo {
         parent: String,
         policy: Option<serde_json::Value>,
+        expires_at: Option<Instant>,
     }
 
     #[derive(Default)]
@@ -725,6 +804,8 @@ mod tests {
                 SessionInfo {
                     parent: parent_name,
                     policy,
+                    expires_at: (request.duration_seconds == EXPIRING_SESSION_DURATION_SECONDS)
+                        .then(Instant::now),
                 },
             );
             ActorCredential::temporary(
@@ -883,6 +964,13 @@ mod tests {
             };
             let state = self.state.lock().expect("state");
             let session = state.sessions.get(actor);
+            if session.is_some_and(|session| {
+                session
+                    .expires_at
+                    .is_some_and(|expires_at| Instant::now() >= expires_at)
+            }) {
+                return Err(s3_expired_token());
+            }
             let principal = session.map_or(actor, |session| session.parent.as_str());
             let resource = key.map_or_else(
                 || format!("arn:aws:s3:::{bucket}"),
@@ -923,6 +1011,7 @@ mod tests {
     async fn every_sts_case_passes_intersection_rules_and_cleans_sessions() {
         for case_id in [
             STS_ASSUME_ROLE_BASIC,
+            STS_EXPIRED_TOKEN_DENIED,
             STS_SESSION_POLICY_DENY_PUT,
             STS_SESSION_POLICY_NARROWS_ROLE,
         ] {
@@ -1029,6 +1118,14 @@ mod tests {
     fn s3_access_denied() -> ProtocolS3Error {
         ProtocolS3Error {
             code: "AccessDenied".to_string(),
+            status: Some(403),
+            request_id: Some("fake".to_string()),
+        }
+    }
+
+    fn s3_expired_token() -> ProtocolS3Error {
+        ProtocolS3Error {
+            code: "ExpiredToken".to_string(),
             status: Some(403),
             request_id: Some("fake".to_string()),
         }
