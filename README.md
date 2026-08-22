@@ -40,8 +40,12 @@ console/             Web console assets served by the run console
 
 The `s3chaos` CLI exposes machine-readable commands (`fault-catalog-json`,
 `protocol-catalog-json`, `protocol-compatibility-status-json`,
-`*-suite-json`, ...) used by scripts, CI, and the console. Run `s3chaos help`
-for the full list.
+`*-suite-json`, ...) used by scripts, CI, and the console. There is no
+installed binary on a fresh checkout; run commands via Cargo:
+
+```bash
+cargo run --quiet --bin s3chaos -- help
+```
 
 ## Build and Static Checks
 
@@ -67,14 +71,25 @@ make fault-console-serve                          # browse run artifacts
 make fault-cleanup                                # release cluster fixtures
 ```
 
-Scenario families include: I/O faults (`io-eio`, `io-read-mistake`,
-`io-latency`, `disk-full`, `on-disk-bitrot`, `dm-flakey*`), network faults
-(`network-partition-*`, `network-delay/loss/corrupt/duplicate`), pod faults
-(`pod-kill-one`, `pod-failure`, `pod-crash-versioned-hot`), stress
-(`stress-cpu`, `stress-memory`), quorum/heal operations (`quorum-p-*-io-fault`,
-`admin-heal`, `admin-decommission`, `admin-rebalance`,
-`fresh-volume-replacement`), and campaigns (`warp-under-chaos`,
-`long-run-chaos-campaign`). Run `make fault-list` for the authoritative list.
+Runnable scenario families (18 executable entries): I/O faults (`io-eio`,
+`io-read-mistake`, `io-latency`, `disk-full`, `dm-flakey*`), network faults
+(`network-partition-one`, `network-partition-write-quorum-loss`,
+`network-delay/loss/corrupt/duplicate`), pod faults (`pod-kill-one`,
+`pod-failure`, `pod-crash-versioned-hot`), stress (`stress-cpu`,
+`stress-memory`), and the `warp-under-chaos` benchmark campaign. A further
+eight catalog entries are roadmap placeholders with status `Planned`
+(`quorum-p-*-io-fault`, `fresh-volume-replacement`, all `admin-*` operations,
+`on-disk-bitrot`, `long-run-chaos-campaign`): they appear in
+`cargo run --bin s3chaos -- fault-catalog-json` but are filtered out of
+`make fault-list` and rejected by preflight and suite validation.
+
+The two `dm-flakey*` scenarios need host preparation beyond the environment
+variables below: a device-mapper flakey table over a dedicated block device,
+a static local PV/storage class, and scenario-specific variables
+(`RUSTFS_FAULT_TEST_DM_NAME`, `RUSTFS_FAULT_TEST_DM_NODE`,
+`RUSTFS_FAULT_TEST_DM_MOUNT_PATH`, plus a fault table name for legacy
+`dm-flakey`). The required setup lives in `src/fault/backends/host.rs`;
+there is no Make target that provisions the host devices.
 
 Required environment for non-static scenarios:
 
@@ -87,6 +102,8 @@ export RUSTFS_FAULT_TEST_SERVER_IMAGE='docker.io/rustfs/rustfs@sha256:<digest>'
 dedicated Kubernetes/K3s context and aborts if the current context differs.
 Workload size and concurrency are tunable via `RUSTFS_FAULT_TEST_WORKLOAD_*`
 variables; see `src/fault/config.rs`.
+`make fault-dashboard-install` mutates the current cluster (installs/upgrades
+the Chaos Mesh release via Helm); treat it like a live run.
 
 ## S3 Protocol Testing
 
@@ -102,8 +119,45 @@ Three coverage layers:
    `5522d1c351f75bc00ae0f64f742f3f095f5939d9`. The pin (revision, node count,
    index SHA-256) fails validation on drift. Regenerate only via
    `make protocol-update-s3tests-index`; never hand-edit.
-3. **Mint gate**: black-box SDK compatibility run via
-   `make protocol-compatibility-mint`.
+3. **Mint**: black-box SDK compatibility run via
+   `make protocol-compatibility-mint`. By default this is a non-gating
+   report: Mint failures are recorded in the artifacts while the command
+   still exits zero. Set `RUSTFS_PROTOCOL_COMPAT_STRICT=1` to make Mint
+   failures fail the command (CI's `mint-regression` job runs strict).
+
+A live protocol run requires more than the fault-side inputs:
+
+```bash
+export RUSTFS_PROTOCOL_COMPAT_SERVER_ENDPOINT=<host:port>       # or RUSTFS_PROTOCOL_TEST_ENDPOINT per suite
+export RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY=<key>
+export RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY=<secret>
+```
+
+Destructive execution additionally demands two acknowledgements that the
+target is a verified dedicated server:
+
+- `RUSTFS_PROTOCOL_TEST_DEDICATED=1`.
+- `RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT=<sha256>` pinning the exact server
+  identity. Run `make protocol-suite-plan SUITE=...` once: its JSON output
+  contains `target.fingerprint.sha256` computed from the server-reported
+  deployment id; copy that value into the variable. A changed server
+  fingerprint aborts the run instead of testing the wrong target.
+
+For the `oidc-keycloak` example profile you also need a prepared Keycloak
+realm and matching RustFS OIDC configuration:
+
+- Keycloak: dedicated realm, confidential client with direct access grants
+  enabled, and an ID-token protocol mapper of type "user attribute" mapping
+  the user attribute `policy` to an ID-token claim `policy` (multivalued
+  enabled; a single string is also accepted). The Keycloak admin user needs
+  permission to create and delete users in that realm.
+- RustFS server: `RUSTFS_IDENTITY_OPENID_ENABLE=on`,
+  `RUSTFS_IDENTITY_OPENID_CONFIG_URL=<issuer/discovery URL>`,
+  `RUSTFS_IDENTITY_OPENID_CLIENT_ID/_CLIENT_SECRET`, and
+  `RUSTFS_IDENTITY_OPENID_CLAIM_NAME=policy`.
+- s3chaos client: `RUSTFS_PROTOCOL_OIDC_ISSUER`, `_ADMIN_URL`, `_REALM`,
+  `_CLIENT_ID`, `_CLIENT_SECRET`, `_ADMIN_USERNAME`, `_ADMIN_PASSWORD`,
+  `_ADMIN_REALM` (see constants in `src/protocol/clients/keycloak.rs`).
 
 ```bash
 make protocol-list                                            # case catalog
@@ -112,9 +166,13 @@ make protocol-suite-template                                  # suite skeleton
 make protocol-suite-validate SUITE=protocol/examples/smoke.yaml
 make protocol-suite-plan SUITE=protocol/examples/smoke.yaml   # dry-run expansion
 make protocol-suite-run SUITE=protocol/examples/smoke.yaml    # live run
-make protocol-cleanup ARTIFACT_ROOT=target/protocol-tests/... # release fixtures
-make protocol-validate-artifacts ...                          # verify run artifacts
+make protocol-validate-artifacts ARTIFACT_ROOT=target/protocol-tests/<run>  # verify run artifacts first
+make protocol-cleanup ARTIFACT_ROOT=target/protocol-tests/<run>             # then release fixtures
 ```
+
+Validate before cleanup: for a failed or interrupted run the artifact root is
+the only record of what happened on the server, and cleanup deletes registered
+fixtures.
 
 ## CI
 
@@ -126,7 +184,11 @@ make protocol-validate-artifacts ...                          # verify run artif
 
 ## Requirements
 
-- Rust (see `Cargo.toml` edition/toolchain), `make`, `bash`.
+- Rust (see `Cargo.toml` edition/toolchain), `make`, `bash`, `jq` (the
+  fault scripts pipe catalogs through it), and `kubectl`.
+- Live runs additionally need Docker (the Mint layer), Helm (Chaos Mesh
+  install), and for `dm-flakey*` scenarios hosts with prepared device-mapper
+  flakey tables as described above.
 - Live runs additionally need: a dedicated Kubernetes/K3s cluster, Chaos Mesh
   installed for chaos-backed scenarios (host device-mapper scenarios need
   `dm-flakey` capable hosts), `kubectl` access via a dedicated context, and

@@ -106,15 +106,19 @@ covers. `make fault-check` lints only `scripts/fault-test.sh`;
 scripts on both sides, also run `bash -n` on any touched script not covered
 by the chosen umbrella gate.
 
-Live cluster or live-server runs (`fault-run`, `fault-run-dm`,
-`fault-suite-run`, `protocol-suite-run`, `protocol-compatibility-mint`)
-require a prepared cluster or dedicated server and explicit user request;
-never start one as a side effect of an unrelated task. After an authorized
-live run, validate the artifacts (`fault-validate-artifacts` /
-`protocol-validate-artifacts`) and then clean up (`fault-cleanup` /
-`protocol-cleanup`) using the exact `ARTIFACT_ROOT` emitted by the run's own
-output; never guess the path. Do not pass `--allow-non-loopback` to the
-console unless the user asks for it.
+Any command that mutates the cluster or a live server requires a prepared
+target and explicit user request; this includes `fault-run`, `fault-run-dm`,
+`fault-suite-run`, `fault-dashboard-install` (Helm-installs Chaos Mesh),
+`fault-cleanup`, `protocol-suite-run`, `protocol-compatibility-mint`, and
+`protocol-cleanup`. Never start one as a side effect of an unrelated task.
+After an authorized live run, validate the artifacts
+(`fault-validate-artifacts <scenario> <artifact-root>` /
+`protocol-validate-artifacts ARTIFACT_ROOT=<root>`) BEFORE cleaning up
+(`fault-cleanup` / `protocol-cleanup`) using the exact `ARTIFACT_ROOT`
+emitted by the run's own output; never guess the path. Validation must
+precede cleanup because cleanup deletes registered fixtures — the artifact
+root is the only record of a failed or interrupted run. Do not pass
+`--allow-non-loopback` to the console unless the user asks for it.
 
 Never weaken a gate to get green: do not suppress lints, ignore tests, or
 relax assertions unless changing that policy is itself the reviewed task.
