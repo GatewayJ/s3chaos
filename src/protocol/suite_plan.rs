@@ -159,9 +159,13 @@ pub struct ProtocolSuitePlanTarget {
 pub struct ProtocolSuitePlanExecution {
     pub parallelism: usize,
     pub cleanup: ProtocolCleanupPolicy,
+    #[serde(default)]
     pub timeouts: ProtocolExecutionTimeouts,
+    #[serde(default)]
     pub eventual_consistency: ProtocolEventualConsistencyPolicy,
+    #[serde(default)]
     pub cleanup_retry: ProtocolCleanupRetryPolicy,
+    #[serde(default)]
     pub product_case_retry: ProtocolProductCaseRetryPolicy,
 }
 
@@ -187,6 +191,18 @@ pub struct ProtocolCleanupRetryPolicy {
     pub mutation_max_attempts: usize,
     pub verification_max_attempts: usize,
     pub initial_backoff_millis: u64,
+    #[serde(default = "default_creating_settlement_attempts")]
+    pub creating_settlement_attempts: usize,
+    #[serde(default = "default_creating_settlement_interval_millis")]
+    pub creating_settlement_interval_millis: u64,
+}
+
+const fn default_creating_settlement_attempts() -> usize {
+    4
+}
+
+const fn default_creating_settlement_interval_millis() -> u64 {
+    5_000
 }
 
 impl Default for ProtocolCleanupRetryPolicy {
@@ -200,12 +216,15 @@ impl ProtocolCleanupRetryPolicy {
         mutation_max_attempts: 4,
         verification_max_attempts: 8,
         initial_backoff_millis: 100,
+        creating_settlement_attempts: default_creating_settlement_attempts(),
+        creating_settlement_interval_millis: default_creating_settlement_interval_millis(),
     };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProtocolProductCaseRetryPolicy {
+    #[default]
     Never,
 }
 
@@ -441,7 +460,8 @@ fn normalize_endpoint(endpoint: String) -> Result<String> {
 mod tests {
     use super::{
         ProtocolCleanupRetryPolicy, ProtocolEventualConsistencyPolicy,
-        ProtocolProductCaseRetryPolicy, ProtocolSuitePlanCaseContract, TargetFingerprint,
+        ProtocolProductCaseRetryPolicy, ProtocolSuitePlanCaseContract, ProtocolSuitePlanExecution,
+        TargetFingerprint,
     };
     use crate::protocol::catalog::{
         BUCKET_POLICY_MALFORMED_POLICY_REJECTED, ProtocolCapability, ProtocolCleanupScope,
@@ -503,11 +523,36 @@ mod tests {
         assert_eq!(cleanup.mutation_max_attempts, 4);
         assert_eq!(cleanup.verification_max_attempts, 8);
         assert_eq!(cleanup.initial_backoff_millis, 100);
+        assert_eq!(cleanup.creating_settlement_attempts, 4);
+        assert_eq!(cleanup.creating_settlement_interval_millis, 5_000);
 
         assert_eq!(
             serde_json::to_value(ProtocolProductCaseRetryPolicy::Never)
                 .expect("product retry policy"),
             "never"
+        );
+    }
+
+    #[test]
+    fn v1alpha1_plan_execution_defaults_new_runtime_safety_fields() {
+        let execution: ProtocolSuitePlanExecution = serde_json::from_value(serde_json::json!({
+            "parallelism": 1,
+            "cleanup": "always"
+        }))
+        .expect("legacy execution artifact");
+
+        assert_eq!(execution.timeouts, Default::default());
+        assert_eq!(
+            execution.eventual_consistency,
+            ProtocolEventualConsistencyPolicy::default()
+        );
+        assert_eq!(
+            execution.cleanup_retry,
+            ProtocolCleanupRetryPolicy::default()
+        );
+        assert_eq!(
+            execution.product_case_retry,
+            ProtocolProductCaseRetryPolicy::Never
         );
     }
 }

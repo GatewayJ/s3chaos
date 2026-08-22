@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::future::join_all;
+use futures::{StreamExt, stream::FuturesUnordered};
 
 use crate::protocol::{
     cases::ProtocolCaseExecution, reporting::ProtocolCleanupReport,
@@ -40,6 +40,7 @@ pub(crate) trait ProtocolClock: Sync {
 
 #[async_trait]
 pub(crate) trait ProtocolTimeoutPolicy: Sync {
+    fn suite_budget_exhausted(&self, elapsed_millis: u128) -> bool;
     async fn wait_for_case(&self, case_id: &str, started_at_millis: u128) -> Result<()>;
     async fn wait_for_suite(
         &self,
@@ -142,32 +143,56 @@ where
                     continue;
                 }
 
-                let futures = wave.iter().map(|case| async move {
-                    let started_at_millis = self.clock.now_millis();
-                    tokio::select! {
-                        result = self.case_lifecycle.run_case(case) => {
-                            CaseControl::Completed(Box::new(result))
-                        }
-                        timeout = self.timeout.wait_for_case(&case.id, started_at_millis) => {
-                            CaseControl::TimedOut(timeout)
-                        }
-                    }
-                });
                 let elapsed_millis = self
                     .clock
                     .now_millis()
                     .saturating_sub(suite_started_at_millis);
-                let wave_result = tokio::select! {
-                    biased;
-                    signal = self.shutdown.wait() => Err((ExecutionControl::Shutdown, signal)),
-                    timeout = self.timeout.wait_for_suite(suite_started_at_millis, elapsed_millis) => {
-                        Err((ExecutionControl::SuiteTimeout, timeout))
-                    },
-                    results = join_all(futures) => Ok(results),
-                };
-                match wave_result {
-                    Ok(results) => {
-                        for (case, result) in wave.into_iter().zip(results) {
+                if self.timeout.suite_budget_exhausted(elapsed_millis) {
+                    stop_reason = Some(
+                        "protocol suite budget exhausted; later waves were not started".to_string(),
+                    );
+                    cases.extend(wave.iter().map(|case| ExecutedProtocolCase {
+                        execution: ProtocolCaseExecution::not_run(
+                            &case.id,
+                            "protocol suite budget was exhausted before this wave started",
+                        ),
+                        cleanup: ProtocolCleanupReport::empty(self.api_version),
+                    }));
+                    continue;
+                }
+
+                let mut futures = wave
+                    .iter()
+                    .enumerate()
+                    .map(|(index, case)| async move {
+                        let started_at_millis = self.clock.now_millis();
+                        tokio::select! {
+                            biased;
+                            result = self.case_lifecycle.run_case(case) => {
+                                (index, CaseControl::Completed(Box::new(result)))
+                            }
+                            timeout = self.timeout.wait_for_case(&case.id, started_at_millis) => {
+                                (index, CaseControl::TimedOut(timeout))
+                            }
+                        }
+                    })
+                    .collect::<FuturesUnordered<_>>();
+                let suite_timeout = self
+                    .timeout
+                    .wait_for_suite(suite_started_at_millis, elapsed_millis);
+                let shutdown = self.shutdown.wait();
+                tokio::pin!(suite_timeout, shutdown);
+                let mut wave_results = (0..wave.len())
+                    .map(|_| None)
+                    .collect::<Vec<Option<ExecutedProtocolCase>>>();
+                let mut wave_stop = None;
+
+                while !futures.is_empty() {
+                    tokio::select! {
+                        biased;
+                        result = futures.next() => {
+                            let (index, result) = result.expect("pending case future");
+                            let case = wave[index];
                             let (execution, cleanup) = match result {
                                 CaseControl::Completed(result) => match *result {
                                     Ok(completed) => completed,
@@ -214,30 +239,45 @@ where
                                     execution.report.case_id
                                 ));
                             }
-                            cases.push(ExecutedProtocolCase { execution, cleanup });
+                            wave_results[index] = Some(ExecutedProtocolCase { execution, cleanup });
+                        }
+                        signal = &mut shutdown => {
+                            wave_stop = Some((ExecutionControl::Shutdown, signal));
+                            break;
+                        }
+                        timeout = &mut suite_timeout => {
+                            wave_stop = Some((ExecutionControl::SuiteTimeout, timeout));
+                            break;
                         }
                     }
-                    Err((control, outcome)) => {
-                        stop_reason = Some(match (control, outcome) {
-                            (ExecutionControl::Shutdown, Ok(())) => {
-                                "protocol suite interrupted; cleanup requested".to_string()
-                            }
-                            (ExecutionControl::Shutdown, Err(error)) => {
-                                format!("protocol signal handler failed: {error}")
-                            }
-                            (ExecutionControl::SuiteTimeout, Ok(())) => {
-                                "protocol suite budget exhausted; cleanup requested".to_string()
-                            }
-                            (ExecutionControl::SuiteTimeout, Err(error)) => {
-                                format!("protocol suite timeout handler failed: {error}")
-                            }
-                        });
-                        for case in wave {
+                }
+                drop(futures);
+
+                if let Some((control, outcome)) = wave_stop {
+                    let reason = match (control, outcome) {
+                        (ExecutionControl::Shutdown, Ok(())) => {
+                            "protocol suite interrupted; cleanup requested".to_string()
+                        }
+                        (ExecutionControl::Shutdown, Err(error)) => {
+                            format!("protocol signal handler failed: {error}")
+                        }
+                        (ExecutionControl::SuiteTimeout, Ok(())) => {
+                            "protocol suite budget exhausted; cleanup requested".to_string()
+                        }
+                        (ExecutionControl::SuiteTimeout, Err(error)) => {
+                            format!("protocol suite timeout handler failed: {error}")
+                        }
+                    };
+                    if stop_reason.is_none() {
+                        stop_reason = Some(reason);
+                    }
+                    for (index, case) in wave.iter().enumerate() {
+                        if wave_results[index].is_none() {
                             let cleanup = self
                                 .cleanup
                                 .cleanup_case_registry_if_present(&case.id)
                                 .await;
-                            cases.push(ExecutedProtocolCase {
+                            wave_results[index] = Some(ExecutedProtocolCase {
                                 execution: match control {
                                     ExecutionControl::Shutdown => {
                                         ProtocolCaseExecution::interrupted(&case.id)
@@ -251,6 +291,11 @@ where
                         }
                     }
                 }
+                cases.extend(
+                    wave_results
+                        .into_iter()
+                        .map(|result| result.expect("every wave case has a result")),
+                );
             }
         }
 
@@ -285,6 +330,7 @@ mod tests {
             atomic::{AtomicU64, Ordering},
         },
     };
+    use tokio::sync::Notify;
 
     struct FakeLifecycle {
         invoked: Arc<Mutex<Vec<String>>>,
@@ -308,6 +354,32 @@ mod tests {
             let mut cleanup = ProtocolCleanupReport::empty("rustfs.com/s3chaos/v1alpha1");
             cleanup.succeeded = !self.cleanup_failures.contains(&case.id);
             Ok((ProtocolCaseExecution::interrupted(&case.id), cleanup))
+        }
+    }
+
+    struct SplitLifecycle {
+        invoked: Arc<Mutex<Vec<String>>>,
+        fast_completed: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ProtocolCaseLifecycle for SplitLifecycle {
+        async fn run_case(
+            &self,
+            case: &ProtocolSuitePlanCase,
+        ) -> Result<(ProtocolCaseExecution, ProtocolCleanupReport)> {
+            self.invoked
+                .lock()
+                .expect("invocations")
+                .push(case.id.clone());
+            if case.id == "slow" {
+                pending::<()>().await;
+            }
+            self.fast_completed.notify_one();
+            Ok((
+                ProtocolCaseExecution::interrupted(&case.id),
+                ProtocolCleanupReport::empty("rustfs.com/s3chaos/v1alpha1"),
+            ))
         }
     }
 
@@ -372,6 +444,10 @@ mod tests {
 
     #[async_trait]
     impl ProtocolTimeoutPolicy for NeverTimeout {
+        fn suite_budget_exhausted(&self, _elapsed_millis: u128) -> bool {
+            false
+        }
+
         async fn wait_for_case(&self, _case_id: &str, _started_at_millis: u128) -> Result<()> {
             pending().await
         }
@@ -390,6 +466,10 @@ mod tests {
 
     #[async_trait]
     impl ProtocolTimeoutPolicy for ImmediateCaseTimeout {
+        fn suite_budget_exhausted(&self, _elapsed_millis: u128) -> bool {
+            false
+        }
+
         async fn wait_for_case(&self, case_id: &str, started_at_millis: u128) -> Result<()> {
             self.0
                 .lock()
@@ -411,6 +491,10 @@ mod tests {
 
     #[async_trait]
     impl ProtocolTimeoutPolicy for ImmediateSuiteTimeout {
+        fn suite_budget_exhausted(&self, _elapsed_millis: u128) -> bool {
+            false
+        }
+
         async fn wait_for_case(&self, _case_id: &str, _started_at_millis: u128) -> Result<()> {
             pending().await
         }
@@ -420,6 +504,28 @@ mod tests {
             _suite_started_at_millis: u128,
             _elapsed_millis: u128,
         ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TimeoutAfterFastCase(Arc<Notify>);
+
+    #[async_trait]
+    impl ProtocolTimeoutPolicy for TimeoutAfterFastCase {
+        fn suite_budget_exhausted(&self, _elapsed_millis: u128) -> bool {
+            false
+        }
+
+        async fn wait_for_case(&self, _case_id: &str, _started_at_millis: u128) -> Result<()> {
+            pending().await
+        }
+
+        async fn wait_for_suite(
+            &self,
+            _suite_started_at_millis: u128,
+            _elapsed_millis: u128,
+        ) -> Result<()> {
+            self.0.notified().await;
             Ok(())
         }
     }
@@ -587,7 +693,7 @@ mod tests {
             .await
             .expect("execution");
 
-        assert_eq!(*invoked.lock().expect("invocations"), Vec::<String>::new());
+        assert_eq!(*invoked.lock().expect("invocations"), vec!["active"]);
         assert_eq!(result.cases.len(), 2);
         assert_eq!(
             result.cases[0].execution.report.failure_phase.as_deref(),
@@ -600,6 +706,48 @@ mod tests {
         assert_eq!(
             *cleanup.interrupted.lock().expect("interrupted"),
             vec!["active"]
+        );
+    }
+
+    #[tokio::test]
+    async fn suite_timeout_preserves_cases_that_completed_in_the_active_wave() {
+        let invoked = Arc::new(Mutex::new(Vec::new()));
+        let fast_completed = Arc::new(Notify::new());
+        let lifecycle = SplitLifecycle {
+            invoked: invoked.clone(),
+            fast_completed: fast_completed.clone(),
+        };
+        let timeout = TimeoutAfterFastCase(fast_completed);
+        let cleanup = FakeCleanup::default();
+        let clock = FakeClock(AtomicU64::new(100));
+        let mut cleanup_state = ();
+        let cases = [planned_case("fast", 0), planned_case("slow", 0)];
+        let executor = ProtocolSuiteExecutor::new(
+            &lifecycle,
+            &cleanup,
+            &NeverShutdown,
+            &clock,
+            &timeout,
+            "rustfs.com/s3chaos/v1alpha1",
+        );
+
+        let result = executor
+            .execute(&cases, &mut cleanup_state, None)
+            .await
+            .expect("execution");
+
+        assert_eq!(*invoked.lock().expect("invocations"), vec!["fast", "slow"]);
+        assert_eq!(
+            result.cases[0].execution.report.failure_phase.as_deref(),
+            Some("interrupted")
+        );
+        assert_eq!(
+            result.cases[1].execution.report.failure_phase.as_deref(),
+            Some("suite-timeout")
+        );
+        assert_eq!(
+            *cleanup.interrupted.lock().expect("interrupted"),
+            vec!["slow"]
         );
     }
 

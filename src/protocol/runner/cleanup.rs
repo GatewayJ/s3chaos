@@ -181,7 +181,10 @@ mod tests {
     use std::{
         collections::BTreeSet,
         fs,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     #[derive(Clone, Default)]
@@ -278,7 +281,11 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct CleanupS3(Arc<Mutex<BTreeSet<String>>>);
+    struct CleanupS3(
+        Arc<Mutex<BTreeSet<String>>>,
+        Arc<AtomicUsize>,
+        Option<usize>,
+    );
 
     #[async_trait]
     impl ProtocolS3CleanupPort for CleanupS3 {
@@ -301,6 +308,13 @@ mod tests {
             ownership: ExclusiveBucketOwnership<'_>,
             _include_versions: bool,
         ) -> Result<(), ProtocolS3Error> {
+            let call = self.1.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.2 == Some(call) {
+                self.0
+                    .lock()
+                    .expect("buckets")
+                    .insert(ownership.bucket().to_string());
+            }
             self.0.lock().expect("buckets").remove(ownership.bucket());
             Ok(())
         }
@@ -422,10 +436,14 @@ mod tests {
         root.transition(&root_bucket.id, ResourceState::Created, None)
             .expect("created");
 
-        let s3 = CleanupS3(Arc::new(Mutex::new(BTreeSet::from([
-            "valid-bucket".to_string(),
-            "root-bucket".to_string(),
-        ]))));
+        let s3 = CleanupS3(
+            Arc::new(Mutex::new(BTreeSet::from([
+                "valid-bucket".to_string(),
+                "root-bucket".to_string(),
+            ]))),
+            Arc::default(),
+            None,
+        );
         let coordinator = ProtocolCleanupCoordinator::new(
             base.path(),
             &CleanupAdmin,
@@ -447,5 +465,47 @@ mod tests {
         assert!(s3.0.lock().expect("buckets").is_empty());
         assert!(root.pending_cleanup().next().is_none());
         assert!(base.path().exists(), "cleanup must preserve artifact root");
+    }
+
+    #[tokio::test]
+    async fn creating_resource_waits_for_late_mutation_before_cleanup_succeeds() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let fingerprint = TargetFingerprint::new(
+            "http://127.0.0.1:9000",
+            "us-east-1",
+            "deployment",
+            None,
+            None,
+        )
+        .expect("fingerprint");
+        let mut registry =
+            ResourceRegistry::create(base.path(), "run", fingerprint).expect("registry");
+        let bucket = registry
+            .plan(ResourceKind::Bucket, "late-bucket", "case", Vec::new())
+            .expect("bucket");
+        registry
+            .transition(&bucket.id, ResourceState::Creating, None)
+            .expect("creating");
+        let s3 = CleanupS3(Arc::default(), Arc::default(), Some(2));
+        let coordinator = ProtocolCleanupCoordinator::new(
+            base.path(),
+            &CleanupAdmin,
+            &s3,
+            None,
+            "rustfs.com/s3chaos/v1alpha1",
+        );
+
+        let report = coordinator.cleanup_registry(&mut registry).await;
+
+        assert!(report.succeeded);
+        assert_eq!(s3.1.load(Ordering::SeqCst), 4);
+        assert!(s3.0.lock().expect("buckets").is_empty());
+        assert!(registry.pending_cleanup().next().is_none());
+        assert!(
+            report.attempts[0]
+                .retry_history
+                .iter()
+                .any(|entry| entry.phase.starts_with("creating-settlement"))
+        );
     }
 }

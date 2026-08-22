@@ -10,8 +10,8 @@ execution:
   defaultIsolation: case
   cleanup: always
   timeouts:
-    caseSeconds: 180
-    suiteSeconds: 600
+    caseSeconds: 1020
+    suiteSeconds: 1200
 target:
   endpoint: ${RUSTFS_PROTOCOL_TEST_ENDPOINT}
   region: us-east-1

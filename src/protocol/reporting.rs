@@ -72,7 +72,7 @@ pub struct ProtocolAssertion {
     pub retry_count: usize,
     pub elapsed_millis: u128,
     pub phase: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eventual_consistency: Option<ProtocolEventualConsistencyObservation>,
 }
 
@@ -423,7 +423,13 @@ fn protocol_domain_name(domain: ProtocolDomain) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolCaseReport, ProtocolCaseStatus, protocol_junit_xml};
+    use super::{
+        ProtocolAssertion, ProtocolAssertionClass, ProtocolCaseReport, ProtocolCaseStatus,
+        protocol_junit_xml,
+    };
+    use crate::protocol::authorization::{
+        ProtocolActorSource, ProtocolGrantSource, ProtocolPolicyEffect,
+    };
     use crate::protocol::catalog::ProtocolDomain;
 
     fn report(
@@ -529,5 +535,33 @@ mod tests {
         assert!(xml.contains(
             "<failure type=\"cleanup\" message=\"cleanup\">suite-level fallback cleanup failed"
         ));
+    }
+
+    #[test]
+    fn v1alpha1_assertion_defaults_missing_eventual_consistency() {
+        let assertion = ProtocolAssertion {
+            actor_id: "actor".to_string(),
+            actor_source: ProtocolActorSource::IamUser,
+            grant_source: ProtocolGrantSource::BucketPolicy,
+            policy_effect: ProtocolPolicyEffect::Allow,
+            operation: "GetObject".to_string(),
+            bucket: "bucket".to_string(),
+            object_key: Some("key".to_string()),
+            expected: ProtocolAssertionClass::Ok,
+            actual: ProtocolAssertionClass::Ok,
+            raw_error_code: None,
+            http_status: Some(200),
+            request_id: Some("request".to_string()),
+            retry_count: 0,
+            elapsed_millis: 1,
+            phase: "assertion".to_string(),
+            eventual_consistency: None,
+        };
+        let legacy = serde_json::to_value(&assertion).expect("legacy assertion JSON");
+        assert!(legacy.get("eventualConsistency").is_none());
+
+        let decoded: ProtocolAssertion =
+            serde_json::from_value(legacy).expect("legacy assertion artifact");
+        assert_eq!(decoded, assertion);
     }
 }

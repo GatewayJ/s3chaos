@@ -483,7 +483,7 @@ mod tests {
         COMPAT_BUCKET_HEAD, COMPAT_BUCKET_LIST_CREATE_DELETE, COMPAT_LIST_OBJECTS_BASIC,
         COMPAT_MULTI_OBJECT_DELETE, COMPAT_MULTIPART_UPLOAD_SMALL, COMPAT_OBJECT_COPY_SAME_BUCKET,
         COMPAT_OBJECT_PUT_GET_DELETE, COMPAT_VERSIONING_HEAD_REMOVAL,
-        PUBLIC_ACCESS_BLOCK_ROUND_TRIP, protocol_case_catalog,
+        PUBLIC_ACCESS_BLOCK_ROUND_TRIP, STS_EXPIRED_TOKEN_DENIED, protocol_case_catalog,
     };
 
     #[test]
@@ -493,6 +493,22 @@ mod tests {
         let resolved = suite.resolve().expect("resolved suite");
         assert_eq!(resolved.cases.len(), 1);
         assert_eq!(resolved.cases[0].id, "bucket-policy-authenticated-user-rw");
+    }
+
+    #[test]
+    fn slow_regression_budget_exceeds_the_expired_session_wait() {
+        let suite = ProtocolSuite::from_yaml_path(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("protocol/examples/slow-regression.yaml"),
+        )
+        .expect("slow suite")
+        .resolve()
+        .expect("resolved slow suite");
+
+        assert_eq!(suite.cases.len(), 1);
+        assert_eq!(suite.cases[0].id, STS_EXPIRED_TOKEN_DENIED);
+        assert!(suite.execution.timeouts.case_seconds > 905);
+        assert!(suite.execution.timeouts.suite_seconds > suite.execution.timeouts.case_seconds);
     }
 
     #[test]

@@ -112,6 +112,10 @@ impl BudgetedProtocolTimeout {
 
 #[async_trait]
 impl ProtocolTimeoutPolicy for BudgetedProtocolTimeout {
+    fn suite_budget_exhausted(&self, elapsed_millis: u128) -> bool {
+        elapsed_millis >= self.suite_timeout.as_millis()
+    }
+
     async fn wait_for_case(&self, _case_id: &str, _started_at_millis: u128) -> Result<()> {
         tokio::time::sleep(self.case_timeout).await;
         Ok(())

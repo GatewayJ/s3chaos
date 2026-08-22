@@ -174,10 +174,10 @@ fn validate_contract(
             "case {case_id} operation history differs from its case report assertions"
         );
         let case_cleanup = read_json::<ProtocolCleanupReport>(&cleanup_path)?;
-        if planned_case.contract.is_some() {
+        if planned_case.contract.is_some() && !case_registry_path.is_file() {
             ensure!(
-                case_registry_path.is_file(),
-                "case {case_id} typed plan is missing its resource registry"
+                case_provably_never_started(&report, &case_cleanup),
+                "case {case_id} typed plan is missing its resource registry without proof that execution never started"
             );
         }
         if case_registry_path.is_file() {
@@ -302,6 +302,23 @@ fn validate_contract(
         }
         Ok(())
     })
+}
+
+fn case_provably_never_started(
+    report: &ProtocolCaseReport,
+    cleanup: &ProtocolCleanupReport,
+) -> bool {
+    report.status == ProtocolCaseStatus::Failed
+        && matches!(
+            report.failure_phase.as_deref(),
+            Some("preflight" | "not-run")
+        )
+        && report.failure.is_some()
+        && report.actors.is_empty()
+        && report.assertions.is_empty()
+        && cleanup.attempts.is_empty()
+        && cleanup.leftovers.is_empty()
+        && cleanup.succeeded
 }
 
 fn reject_sensitive_fields(path: &Path, value: &Value) -> Result<()> {
