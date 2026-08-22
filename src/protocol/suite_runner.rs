@@ -589,9 +589,7 @@ pub async fn cleanup_protocol_registry_path(registry_path: impl AsRef<Path>) -> 
         registry_path.file_name().and_then(|name| name.to_str()) == Some(RESOURCE_REGISTRY_FILE),
         "standalone protocol cleanup requires a file named {RESOURCE_REGISTRY_FILE}"
     );
-    let parent = registry_path
-        .parent()
-        .context("resource registry path has no parent")?;
+    let parent = artifact_parent(registry_path, "resource registry path has no parent")?;
     cleanup_protocol_registry(
         registry_path.to_path_buf(),
         parent.join("cleanup-report.json"),
@@ -610,9 +608,7 @@ async fn cleanup_protocol_registry(registry_path: PathBuf, report_path: PathBuf)
     verify_cleanup_target(&admin, &expected).await?;
     let external_identity = external_identity_for_registry(&registry)?;
     let api_version = registry.api_version.clone();
-    let report_parent = report_path
-        .parent()
-        .context("cleanup report path has no parent")?;
+    let report_parent = artifact_parent(&report_path, "cleanup report path has no parent")?;
     let coordinator = ProtocolCleanupCoordinator::new(
         report_parent,
         &admin,
@@ -638,6 +634,15 @@ async fn cleanup_protocol_registry(registry_path: PathBuf, report_path: PathBuf)
         registry_path.display()
     );
     Ok(())
+}
+
+fn artifact_parent<'a>(path: &'a Path, missing_parent: &'static str) -> Result<&'a Path> {
+    let parent = path.parent().context(missing_parent)?;
+    Ok(if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    })
 }
 
 fn external_identity_for_registry(
@@ -706,7 +711,7 @@ fn validate_phase_one_artifacts(root: &Path, forbidden: &[String]) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::validate_phase_one_artifacts;
+    use super::{artifact_parent, validate_phase_one_artifacts};
     use crate::protocol::{
         compatibility::{COMPATIBILITY_COVERAGE_FILE, compatibility_coverage_report},
         fixture::registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
@@ -736,6 +741,18 @@ mod tests {
                 region: None,
             })
         }
+    }
+
+    #[test]
+    fn relative_registry_path_uses_current_directory_as_artifact_parent() {
+        assert_eq!(
+            artifact_parent(
+                Path::new(RESOURCE_REGISTRY_FILE),
+                "resource registry path has no parent"
+            )
+            .expect("relative registry parent"),
+            Path::new(".")
+        );
     }
 
     #[tokio::test]

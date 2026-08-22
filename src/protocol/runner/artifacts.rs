@@ -14,8 +14,10 @@
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
+#[cfg(unix)]
+use std::fs::File;
 use std::{
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::Write,
     path::{Component, Path, PathBuf},
 };
@@ -91,7 +93,7 @@ impl ProtocolArtifactSink for FileProtocolArtifactSink {
                     temporary.display()
                 )
             })?;
-            File::open(parent)?.sync_all()?;
+            sync_parent_directory(parent)?;
             Ok(())
         })();
         if result.is_err() {
@@ -99,6 +101,19 @@ impl ProtocolArtifactSink for FileProtocolArtifactSink {
         }
         result.with_context(|| format!("write protocol artifact {}", path.display()))
     }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<()> {
+    // Opening directories as ordinary files is not portable (notably on Windows). The artifact
+    // file itself is still synced before the atomic rename.
+    Ok(())
 }
 
 /// Serializes all run artifacts through one root-scoped boundary.
