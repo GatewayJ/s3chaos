@@ -63,6 +63,24 @@ pub struct ProtocolSuiteExecution {
     pub parallelism: usize,
     pub default_isolation: ProtocolSuiteIsolation,
     pub cleanup: ProtocolCleanupPolicy,
+    #[serde(default)]
+    pub timeouts: ProtocolExecutionTimeouts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolExecutionTimeouts {
+    pub case_seconds: u64,
+    pub suite_seconds: u64,
+}
+
+impl Default for ProtocolExecutionTimeouts {
+    fn default() -> Self {
+        Self {
+            case_seconds: 180,
+            suite_seconds: 3_600,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +211,15 @@ impl ProtocolSuite {
         ensure!(
             self.execution.default_isolation == ProtocolSuiteIsolation::Case,
             "execution.defaultIsolation must be case in Phase 1"
+        );
+        ensure!(
+            (1..=3_600).contains(&self.execution.timeouts.case_seconds),
+            "execution.timeouts.caseSeconds must be between 1 and 3600"
+        );
+        ensure!(
+            self.execution.timeouts.suite_seconds >= self.execution.timeouts.case_seconds
+                && self.execution.timeouts.suite_seconds <= 21_600,
+            "execution.timeouts.suiteSeconds must be at least caseSeconds and at most 21600"
         );
         ensure!(
             !self.target.endpoint.trim().is_empty(),
@@ -427,6 +454,9 @@ execution:
   parallelism: 1
   defaultIsolation: case
   cleanup: always
+  timeouts:
+    caseSeconds: 180
+    suiteSeconds: 3600
 target:
   endpoint: ${RUSTFS_PROTOCOL_TEST_ENDPOINT}
   region: us-east-1
@@ -453,7 +483,7 @@ mod tests {
         COMPAT_BUCKET_HEAD, COMPAT_BUCKET_LIST_CREATE_DELETE, COMPAT_LIST_OBJECTS_BASIC,
         COMPAT_MULTI_OBJECT_DELETE, COMPAT_MULTIPART_UPLOAD_SMALL, COMPAT_OBJECT_COPY_SAME_BUCKET,
         COMPAT_OBJECT_PUT_GET_DELETE, COMPAT_VERSIONING_HEAD_REMOVAL,
-        PUBLIC_ACCESS_BLOCK_ROUND_TRIP, protocol_case_catalog,
+        PUBLIC_ACCESS_BLOCK_ROUND_TRIP, STS_EXPIRED_TOKEN_DENIED, protocol_case_catalog,
     };
 
     #[test]
@@ -463,6 +493,22 @@ mod tests {
         let resolved = suite.resolve().expect("resolved suite");
         assert_eq!(resolved.cases.len(), 1);
         assert_eq!(resolved.cases[0].id, "bucket-policy-authenticated-user-rw");
+    }
+
+    #[test]
+    fn slow_regression_budget_exceeds_the_expired_session_wait() {
+        let suite = ProtocolSuite::from_yaml_path(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("protocol/examples/slow-regression.yaml"),
+        )
+        .expect("slow suite")
+        .resolve()
+        .expect("resolved slow suite");
+
+        assert_eq!(suite.cases.len(), 1);
+        assert_eq!(suite.cases[0].id, STS_EXPIRED_TOKEN_DENIED);
+        assert!(suite.execution.timeouts.case_seconds > 905);
+        assert!(suite.execution.timeouts.suite_seconds > suite.execution.timeouts.case_seconds);
     }
 
     #[test]
@@ -503,6 +549,13 @@ mod tests {
 
         let zero = protocol_suite_template_yaml().replace("parallelism: 1", "parallelism: 0");
         let suite = serde_yaml_ng::from_str::<ProtocolSuite>(&zero).expect("zero parse");
+        assert!(suite.resolve().is_err());
+
+        let inverted_timeout = protocol_suite_template_yaml()
+            .replace("caseSeconds: 180", "caseSeconds: 601")
+            .replace("suiteSeconds: 3600", "suiteSeconds: 600");
+        let suite =
+            serde_yaml_ng::from_str::<ProtocolSuite>(&inverted_timeout).expect("timeout parse");
         assert!(suite.resolve().is_err());
     }
 

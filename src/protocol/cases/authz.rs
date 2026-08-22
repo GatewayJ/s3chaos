@@ -13,20 +13,22 @@
 // limitations under the License.
 
 use anyhow::{Result, bail, ensure};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use crate::protocol::{
     authorization::ProtocolAuthorizationDimensions,
     cases::CaseContext,
     ports::ProtocolS3Error,
-    reporting::{ProtocolAssertion, ProtocolAssertionClass},
+    reporting::{
+        ProtocolAssertion, ProtocolAssertionClass, ProtocolEventualConsistencyObservation,
+    },
+    runner::retry::{eventual_consistency_policy, wait_for_eventual_retry},
 };
 
-const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
-#[cfg(not(test))]
-const PROPAGATION_INTERVAL: Duration = Duration::from_millis(500);
-#[cfg(test)]
-const PROPAGATION_INTERVAL: Duration = Duration::from_millis(1);
+fn propagation_timeout() -> Duration {
+    Duration::from_millis(eventual_consistency_policy().deadline_millis)
+}
 
 pub(crate) async fn expect_access_denied<T, F, Fut>(
     context: &mut CaseContext,
@@ -117,7 +119,7 @@ where
     loop {
         match invoke().await {
             Err(error) if error.is_access_denied() => {
-                record(
+                record_eventual(
                     context,
                     assertion(
                         context.dimensions,
@@ -134,12 +136,12 @@ where
                 );
                 return Ok(());
             }
-            Ok(_) if started.elapsed() < PROPAGATION_TIMEOUT => {
+            Ok(_) if started.elapsed() < propagation_timeout() => {
                 retries += 1;
-                tokio::time::sleep(PROPAGATION_INTERVAL).await;
+                wait_for_eventual_retry().await;
             }
             Ok(_) => {
-                record(
+                record_eventual(
                     context,
                     assertion(
                         context.dimensions,
@@ -158,7 +160,7 @@ where
             }
             Err(error) => {
                 let actual = class_for_error(&error);
-                record(
+                record_eventual(
                     context,
                     assertion(
                         context.dimensions,
@@ -269,7 +271,7 @@ where
     loop {
         match invoke().await {
             Ok(value) => {
-                record(
+                record_eventual(
                     context,
                     assertion(
                         context.dimensions,
@@ -288,14 +290,14 @@ where
             }
             Err(error)
                 if is_transient_propagation_error(context, &error)
-                    && started.elapsed() < PROPAGATION_TIMEOUT =>
+                    && started.elapsed() < propagation_timeout() =>
             {
                 retries += 1;
-                tokio::time::sleep(PROPAGATION_INTERVAL).await;
+                wait_for_eventual_retry().await;
             }
             Err(error) => {
                 let actual = class_for_error(&error);
-                record(
+                record_eventual(
                     context,
                     assertion(
                         context.dimensions,
@@ -332,6 +334,16 @@ fn record(context: &mut CaseContext, mut assertion: ProtocolAssertion) {
     context.assertions.push(assertion);
 }
 
+fn record_eventual(context: &mut CaseContext, mut assertion: ProtocolAssertion) {
+    let policy = eventual_consistency_policy();
+    assertion.eventual_consistency = Some(ProtocolEventualConsistencyObservation {
+        deadline_millis: policy.deadline_millis,
+        interval_millis: policy.interval_millis,
+        last_observed: format!("{:?}", assertion.actual),
+    });
+    record(context, assertion);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn assertion(
     dimensions: ProtocolAuthorizationDimensions,
@@ -361,6 +373,7 @@ fn assertion(
         retry_count,
         elapsed_millis: elapsed.as_millis(),
         phase: String::new(),
+        eventual_consistency: None,
     }
 }
 
@@ -396,7 +409,7 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retries_invalid_client_token_during_sts_propagation() {
         let mut context = CaseContext::new(
             "sts-propagation",
@@ -432,5 +445,12 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(context.assertions[0].retry_count, 1);
+        let observation = context.assertions[0]
+            .eventual_consistency
+            .as_ref()
+            .expect("eventual consistency observation");
+        assert_eq!(observation.deadline_millis, 15_000);
+        assert_eq!(observation.interval_millis, 500);
+        assert_eq!(observation.last_observed, "Ok");
     }
 }

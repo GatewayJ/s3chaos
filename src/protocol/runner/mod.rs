@@ -16,4 +16,5 @@ pub(crate) mod artifacts;
 pub(crate) mod cleanup;
 pub(crate) mod executor;
 pub(crate) mod preflight;
+pub(crate) mod retry;
 pub(crate) mod runtime;

@@ -15,7 +15,9 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -769,24 +771,41 @@ impl ResourceRegistry {
         fs::create_dir_all(parent)?;
         let temporary = parent.join(format!(".resource-registry-{}.tmp", Uuid::new_v4()));
         let bytes = serde_json::to_vec_pretty(self)?;
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .with_context(|| format!("create temporary registry {}", temporary.display()))?;
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(&temporary, &self.path).with_context(|| {
-            format!(
-                "replace resource registry {} with {}",
-                self.path.display(),
-                temporary.display()
-            )
-        })?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        let result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .with_context(|| format!("create temporary registry {}", temporary.display()))?;
+            file.write_all(&bytes)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::rename(&temporary, &self.path).with_context(|| {
+                format!(
+                    "replace resource registry {} with {}",
+                    self.path.display(),
+                    temporary.display()
+                )
+            })?;
+            sync_parent_directory(parent)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn validate_dynamic_resource(

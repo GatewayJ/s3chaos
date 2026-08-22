@@ -17,7 +17,7 @@ use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
     Client,
-    config::Region,
+    config::{Region, timeout::TimeoutConfig},
     error::{ProvideErrorMetadata, SdkError},
     primitives::ByteStream,
     types::{
@@ -25,7 +25,7 @@ use aws_sdk_s3::{
         Delete, ObjectIdentifier, PublicAccessBlockConfiguration,
     },
 };
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 use crate::protocol::{
     credentials::{ActorCredential, AdminCredentials},
@@ -114,6 +114,12 @@ impl ProtocolS3Client {
             .await;
         let config = aws_sdk_s3::config::Builder::from(&shared)
             .force_path_style(true)
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_secs(15))
+                    .operation_attempt_timeout(Duration::from_secs(10))
+                    .build(),
+            )
             .build();
         Ok(Self {
             client: Client::from_conf(config),

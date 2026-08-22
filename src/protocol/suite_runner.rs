@@ -50,7 +50,7 @@ use crate::protocol::{
         executor::{ProtocolCaseLifecycle, ProtocolShutdownSignal, ProtocolSuiteExecutor},
         preflight::run_connected_preflight,
         runtime::{
-            ConnectedProtocolRuntime, DisabledProtocolTimeout, MonotonicProtocolClock,
+            BudgetedProtocolTimeout, ConnectedProtocolRuntime, MonotonicProtocolClock,
             ProcessShutdownSignal, ensure_dedicated_target_acknowledgement, protocol_artifact_base,
         },
     },
@@ -198,7 +198,7 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         api_version: &runtime.suite.api_version,
     };
     let clock = MonotonicProtocolClock::default();
-    let timeout = DisabledProtocolTimeout;
+    let timeout = BudgetedProtocolTimeout::new(plan.execution.timeouts);
     let executor = ProtocolSuiteExecutor::new(
         &case_lifecycle,
         &cleanup,
@@ -929,9 +929,84 @@ mod tests {
         let valid_case_registry = case_registry.clone();
         fs::remove_file(&case_registry_path).expect("remove case registry");
         assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+
+        let not_run_report = crate::protocol::cases::ProtocolCaseExecution::not_run(
+            "bucket-policy-authenticated-user-rw",
+            "prior wave timed out",
+        )
+        .report;
+        artifacts
+            .write_json(
+                "cases/bucket-policy-authenticated-user-rw/case-report.json",
+                &not_run_report,
+            )
+            .expect("not-run case report");
+        artifacts
+            .write_json(
+                "protocol-failure-summary.json",
+                &ProtocolFailureSummary {
+                    api_version: summary.api_version.clone(),
+                    kind: "ProtocolFailureSummary".to_string(),
+                    stage: "not-run".to_string(),
+                    classification: "protocol-case-failure".to_string(),
+                    case_id: Some(not_run_report.case_id.clone()),
+                    evidence: vec![
+                        "cases/bucket-policy-authenticated-user-rw/case-report.json".to_string(),
+                    ],
+                },
+            )
+            .expect("not-run failure summary");
+        let mut not_run_summary = summary.clone();
+        not_run_summary.status = ProtocolCaseStatus::Failed;
+        not_run_summary.failure_summary = Some("protocol-failure-summary.json".to_string());
+        artifacts
+            .write_json("protocol-suite-summary.json", &not_run_summary)
+            .expect("not-run suite summary");
+        artifacts
+            .write_text(
+                PROTOCOL_JUNIT_FILE,
+                &protocol_junit_xml(
+                    &summary.suite,
+                    &[(&not_run_report, cleanup.succeeded)],
+                    cleanup.succeeded,
+                ),
+            )
+            .expect("not-run JUnit artifact");
+        validate_phase_one_artifacts(&root, &[])
+            .expect("never-started case does not require a registry");
+
+        artifacts
+            .write_json(
+                "cases/bucket-policy-authenticated-user-rw/case-report.json",
+                &case_report,
+            )
+            .expect("restore case report");
+        artifacts
+            .write_json("protocol-suite-summary.json", &summary)
+            .expect("restore suite summary");
+        artifacts
+            .write_text(
+                PROTOCOL_JUNIT_FILE,
+                &protocol_junit_xml(
+                    &summary.suite,
+                    &[(&case_report, cleanup.succeeded)],
+                    cleanup.succeeded,
+                ),
+            )
+            .expect("restore JUnit after not-run fixture");
+        fs::remove_file(root.join("protocol-failure-summary.json"))
+            .expect("remove not-run failure summary");
         artifacts
             .write_json(&case_registry_relative, &valid_case_registry)
             .expect("restore case registry");
+
+        artifacts
+            .write_text(&case_registry_relative, "{\"apiVersion\":")
+            .expect("partial registry fixture");
+        assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+        artifacts
+            .write_json(&case_registry_relative, &valid_case_registry)
+            .expect("restore registry after partial write fixture");
 
         let reject_registry_tampering = |tampered: &ResourceRegistry| {
             artifacts

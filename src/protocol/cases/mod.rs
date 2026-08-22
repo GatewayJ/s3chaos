@@ -45,6 +45,26 @@ impl ProtocolCaseExecution {
         )
     }
 
+    pub fn case_timed_out(case_id: &str) -> Self {
+        Self::failed(
+            case_id,
+            "case-timeout",
+            "protocol case timeout expired; cleanup requested",
+        )
+    }
+
+    pub fn suite_timed_out(case_id: &str) -> Self {
+        Self::failed(
+            case_id,
+            "suite-timeout",
+            "protocol suite budget exhausted; cleanup requested",
+        )
+    }
+
+    pub fn harness_failed(case_id: &str, message: impl Into<String>) -> Self {
+        Self::failed(case_id, "harness", message)
+    }
+
     pub fn preflight_failed(case_id: &str, message: impl Into<String>) -> Self {
         Self::failed(case_id, "preflight", message)
     }
