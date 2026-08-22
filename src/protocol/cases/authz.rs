@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use anyhow::{Result, bail, ensure};
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 use tokio::time::Instant;
 
 use crate::protocol::{
@@ -22,6 +22,7 @@ use crate::protocol::{
     ports::ProtocolS3Error,
     reporting::{
         ProtocolAssertion, ProtocolAssertionClass, ProtocolEventualConsistencyObservation,
+        ProtocolExchangeSummary,
     },
     runner::retry::{eventual_consistency_policy, wait_for_eventual_retry},
 };
@@ -357,6 +358,17 @@ fn assertion(
     retry_count: usize,
     elapsed: Duration,
 ) -> ProtocolAssertion {
+    let raw_error_code = error.as_ref().map(|error| error.code.clone());
+    let http_status = error.as_ref().and_then(|error| error.status);
+    let request_id = error.as_ref().and_then(|error| error.request_id.clone());
+    let mut allowed_response_headers = BTreeMap::new();
+    if let Some(request_id) = &request_id {
+        allowed_response_headers.insert("x-amz-request-id".to_string(), request_id.clone());
+    }
+    let resource = match object_key {
+        Some(key) => format!("/{bucket}/{key}"),
+        None => format!("/{bucket}"),
+    };
     ProtocolAssertion {
         actor_id: actor_id.to_string(),
         actor_source: dimensions.actor_source,
@@ -367,13 +379,41 @@ fn assertion(
         object_key: object_key.map(str::to_string),
         expected,
         actual,
-        raw_error_code: error.as_ref().map(|error| error.code.clone()),
-        http_status: error.as_ref().and_then(|error| error.status),
-        request_id: error.and_then(|error| error.request_id),
+        raw_error_code: raw_error_code.clone(),
+        http_status,
+        request_id: request_id.clone(),
         retry_count,
         elapsed_millis: elapsed.as_millis(),
         phase: String::new(),
         eventual_consistency: None,
+        exchange: ProtocolExchangeSummary {
+            method: method_for_operation(operation).to_string(),
+            resource,
+            allowed_response_headers,
+            status: http_status,
+            s3_error_code: raw_error_code,
+            request_id,
+            duration_millis: elapsed.as_millis(),
+        },
+    }
+}
+
+fn method_for_operation(operation: &str) -> &'static str {
+    if operation.starts_with("head-") {
+        "HEAD"
+    } else if operation.starts_with("get-") || operation.starts_with("list-") {
+        "GET"
+    } else if operation.starts_with("delete-objects") {
+        "POST"
+    } else if operation.starts_with("delete-") || operation.starts_with("abort-") {
+        "DELETE"
+    } else if operation.starts_with("put-")
+        || operation.starts_with("copy-")
+        || operation.starts_with("upload-part")
+    {
+        "PUT"
+    } else {
+        "POST"
     }
 }
 
@@ -398,7 +438,7 @@ fn class_for_error(error: &ProtocolS3Error) -> ProtocolAssertionClass {
 
 #[cfg(test)]
 mod tests {
-    use super::expect_eventual_ok;
+    use super::{assertion, expect_access_denied, expect_eventual_ok, method_for_operation};
     use crate::protocol::{
         authorization::{
             ProtocolActorSource, ProtocolAuthorizationDimensions, ProtocolGrantSource,
@@ -406,8 +446,20 @@ mod tests {
         },
         cases::CaseContext,
         ports::ProtocolS3Error,
+        reporting::{ProtocolAssertionClass, ProtocolExchangeSummary},
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    fn dimensions() -> ProtocolAuthorizationDimensions {
+        ProtocolAuthorizationDimensions {
+            actor_source: ProtocolActorSource::IamUser,
+            grant_source: ProtocolGrantSource::BucketPolicy,
+            policy_effect: ProtocolPolicyEffect::Allow,
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn retries_invalid_client_token_during_sts_propagation() {
@@ -452,5 +504,75 @@ mod tests {
         assert_eq!(observation.deadline_millis, 15_000);
         assert_eq!(observation.interval_millis, 500);
         assert_eq!(observation.last_observed, "Ok");
+    }
+
+    #[tokio::test]
+    async fn records_bounded_request_and_response_diagnostics() {
+        let mut context = CaseContext::new(
+            "diagnostic",
+            ProtocolAuthorizationDimensions {
+                actor_source: ProtocolActorSource::IamUser,
+                grant_source: ProtocolGrantSource::BucketPolicy,
+                policy_effect: ProtocolPolicyEffect::ExplicitDeny,
+            },
+        );
+        expect_access_denied::<(), _, _>(
+            &mut context,
+            "denied-user",
+            "get-object",
+            "bucket",
+            Some("key"),
+            || async {
+                Err(ProtocolS3Error {
+                    code: "AccessDenied".to_string(),
+                    status: Some(403),
+                    request_id: Some("request-123".to_string()),
+                })
+            },
+        )
+        .await
+        .expect("expected denial");
+
+        let exchange = &context.assertions[0].exchange;
+        assert_eq!(exchange.method, "GET");
+        assert_eq!(exchange.resource, "/bucket/key");
+        assert_eq!(exchange.status, Some(403));
+        assert_eq!(exchange.s3_error_code.as_deref(), Some("AccessDenied"));
+        assert_eq!(exchange.request_id.as_deref(), Some("request-123"));
+        assert_eq!(
+            exchange
+                .allowed_response_headers
+                .get("x-amz-request-id")
+                .map(String::as_str),
+            Some("request-123")
+        );
+    }
+
+    #[test]
+    fn maps_protocol_operations_to_http_methods() {
+        assert_eq!(method_for_operation("head-object"), "HEAD");
+        assert_eq!(method_for_operation("delete-objects"), "POST");
+        assert_eq!(method_for_operation("abort-multipart-upload"), "DELETE");
+        assert_eq!(method_for_operation("upload-part"), "PUT");
+    }
+
+    #[test]
+    fn successful_exchange_does_not_invent_an_http_status() {
+        let recorded = assertion(
+            dimensions(),
+            "actor",
+            "get-object",
+            "bucket",
+            Some("key"),
+            ProtocolAssertionClass::Ok,
+            ProtocolAssertionClass::Ok,
+            None,
+            0,
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(recorded.http_status, None);
+        assert_eq!(recorded.exchange.status, None);
+        assert_ne!(recorded.exchange, ProtocolExchangeSummary::default());
     }
 }

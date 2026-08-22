@@ -65,6 +65,8 @@ pub struct ProtocolSuiteExecution {
     pub cleanup: ProtocolCleanupPolicy,
     #[serde(default)]
     pub timeouts: ProtocolExecutionTimeouts,
+    #[serde(default)]
+    pub artifact_retention: ProtocolArtifactRetentionPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +83,13 @@ impl Default for ProtocolExecutionTimeouts {
             suite_seconds: 3_600,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtocolArtifactRetentionPolicy {
+    #[default]
+    Preserve,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,6 +466,7 @@ execution:
   timeouts:
     caseSeconds: 180
     suiteSeconds: 3600
+  artifactRetention: preserve
 target:
   endpoint: ${RUSTFS_PROTOCOL_TEST_ENDPOINT}
   region: us-east-1

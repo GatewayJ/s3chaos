@@ -34,7 +34,8 @@ use s3chaos::protocol::{
     suite::{protocol_suite_template_yaml, resolve_protocol_suite_yaml},
     suite_runner::{
         cleanup_protocol_artifact_root, cleanup_protocol_registry_path,
-        plan_protocol_suite_from_yaml, run_protocol_suite_from_yaml,
+        plan_protocol_suite_from_yaml, reproduce_protocol_case_from_artifacts,
+        run_protocol_suite_from_yaml,
     },
 };
 use std::net::SocketAddr;
@@ -63,6 +64,7 @@ async fn main() -> Result<()> {
         "protocol-cleanup" => cleanup_protocol_artifacts(args).await,
         "protocol-suite-json" => print_protocol_suite_json(args),
         "protocol-suite-plan" => print_protocol_suite_plan(args).await,
+        "protocol-suite-reproduce" => reproduce_protocol_case(args).await,
         "protocol-suite-run" => run_protocol_suite(args).await,
         "protocol-suite-template" => print_protocol_suite_template(),
         "protocol-suite-validate" => validate_protocol_suite(args),
@@ -93,11 +95,26 @@ fn print_help() -> Result<()> {
     println!("  protocol-cleanup --registry <resource-registry.json>");
     println!("  protocol-suite-json <suite.yaml>");
     println!("  protocol-suite-plan <suite.yaml>");
+    println!("  protocol-suite-reproduce <artifact-root> <case-id>");
     println!("  protocol-suite-run <suite.yaml>");
     println!("  protocol-suite-template");
     println!("  protocol-suite-validate <suite.yaml>");
     println!("  protocol-validate-artifacts <artifact-root>");
     Ok(())
+}
+
+async fn reproduce_protocol_case(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let artifact_root = args
+        .next()
+        .context("protocol-suite-reproduce requires artifact root")?;
+    let case_id = args
+        .next()
+        .context("protocol-suite-reproduce requires case id")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-suite-reproduce accepts exactly one artifact root and case id"
+    );
+    reproduce_protocol_case_from_artifacts(artifact_root, &case_id).await
 }
 
 fn validate_protocol_artifacts(mut args: impl Iterator<Item = String>) -> Result<()> {
