@@ -61,6 +61,20 @@ RUSTFS_PROTOCOL_OIDC_ADMIN_USERNAME=<realm administrator>
 RUSTFS_PROTOCOL_OIDC_ADMIN_PASSWORD=<administrator password>
 ```
 
+Before the destructive run, obtain and review the server-verified fingerprint
+from the non-mutating suite plan:
+
+```bash
+PLAN_JSON="$(scripts/protocol-test.sh suite-plan protocol/examples/oidc-keycloak.yaml)"
+jq '.target.fingerprint' <<<"$PLAN_JSON"
+export RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT="$(
+  jq -er '.target.fingerprint.sha256' <<<"$PLAN_JSON"
+)"
+```
+
+`suite-run` repeats preflight and refuses execution if the observed target no
+longer matches this fingerprint.
+
 Optional variables:
 
 ```text

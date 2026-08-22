@@ -28,9 +28,10 @@ use crate::protocol::{
     fixture::registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
     preflight::ProtocolPreflightSummary,
     reporting::{
-        PROTOCOL_JUNIT_FILE, ProtocolArtifactValidationReport, ProtocolCaseOutcome,
-        ProtocolCaseReport, ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary,
-        ProtocolSuiteSummary, protocol_junit_xml,
+        PROTOCOL_FLAKE_HISTORY_FILE, PROTOCOL_JUNIT_FILE, ProtocolArtifactValidationReport,
+        ProtocolCaseOutcome, ProtocolCaseReport, ProtocolCaseStatus, ProtocolCleanupReport,
+        ProtocolFailureSummary, ProtocolFlakeHistory, ProtocolSuiteSummary, protocol_flake_signals,
+        protocol_flake_status, protocol_junit_xml,
     },
     runner::artifacts::ProtocolArtifactWriter,
     suite_plan::{ProtocolSuitePlan, ProtocolSuitePlanCaseContract},
@@ -89,6 +90,7 @@ fn validate_contract(
         RESOURCE_REGISTRY_FILE,
         "cleanup-report.json",
         COMPATIBILITY_COVERAGE_FILE,
+        PROTOCOL_FLAKE_HISTORY_FILE,
         PROTOCOL_JUNIT_FILE,
         "protocol-suite-summary.json",
     ] {
@@ -104,6 +106,7 @@ fn validate_contract(
     let cleanup: ProtocolCleanupReport = read_json(&root.join("cleanup-report.json"))?;
     let compatibility: CompatibilityCoverageReport =
         read_json(&root.join(COMPATIBILITY_COVERAGE_FILE))?;
+    let flake_history: ProtocolFlakeHistory = read_json(&root.join(PROTOCOL_FLAKE_HISTORY_FILE))?;
     let summary: ProtocolSuiteSummary = read_json(&root.join("protocol-suite-summary.json"))?;
     ensure!(
         Path::new(&plan.artifact_root) == root,
@@ -119,11 +122,19 @@ fn validate_contract(
         "protocol run id differs across plan, registry, and summary"
     );
     ensure!(
+        plan.profile == summary.profile
+            && plan.target.fingerprint.sha256 == summary.target_fingerprint
+            && plan.preflight.capability_matrix == preflight.capability_matrix
+            && preflight.capability_matrix == summary.capability_matrix,
+        "protocol profile, target fingerprint, or capability matrix differs across artifacts"
+    );
+    ensure!(
         summary.plan == "protocol-suite-plan.json"
             && summary.preflight == "preflight-summary.json"
             && summary.registry == RESOURCE_REGISTRY_FILE
             && summary.cleanup == "cleanup-report.json"
-            && summary.compatibility_coverage == COMPATIBILITY_COVERAGE_FILE,
+            && summary.compatibility_coverage == COMPATIBILITY_COVERAGE_FILE
+            && summary.flaky_history == PROTOCOL_FLAKE_HISTORY_FILE,
         "protocol suite summary contains invalid artifact references"
     );
 
@@ -135,6 +146,21 @@ fn validate_contract(
     ensure!(
         selected_cases == preflight.selected_cases,
         "protocol selected cases differ between plan and preflight"
+    );
+    let required_capabilities = plan
+        .cases
+        .iter()
+        .flat_map(|case| case.requires.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    let checked_capabilities = preflight
+        .capability_matrix
+        .iter()
+        .map(|check| check.capability.as_str())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        required_capabilities == checked_capabilities
+            && checked_capabilities.len() == preflight.capability_matrix.len(),
+        "protocol capability matrix does not exactly cover planned requirements"
     );
     ensure!(
         summary.case_reports.len() == selected_cases.len()
@@ -175,6 +201,10 @@ fn validate_contract(
                         ProtocolCaseStatus::Passed,
                         ProtocolCaseOutcome::ExpectedDivergence
                     )
+                    | (
+                        ProtocolCaseStatus::Skipped,
+                        ProtocolCaseOutcome::CapabilitySkipped
+                    )
                     | (ProtocolCaseStatus::Failed, ProtocolCaseOutcome::Failed)
                     | (ProtocolCaseStatus::Failed, ProtocolCaseOutcome::NotRun)
             ),
@@ -196,6 +226,21 @@ fn validate_contract(
                     .command
                     .starts_with("s3chaos protocol-suite-reproduce "),
             "case {case_id} reproduction metadata differs from the plan"
+        );
+        let expected_capabilities = preflight
+            .capability_matrix
+            .iter()
+            .filter(|check| {
+                planned_case
+                    .requires
+                    .iter()
+                    .any(|required| required == check.capability.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        ensure!(
+            report.capabilities == expected_capabilities,
+            "case {case_id} capability states differ from preflight"
         );
         let case_dir = report_path
             .parent()
@@ -274,7 +319,7 @@ fn validate_contract(
     );
     let expected_status = if case_reports
         .iter()
-        .all(|report| report.status == ProtocolCaseStatus::Passed)
+        .all(|report| report.status != ProtocolCaseStatus::Failed)
         && case_cleanups.iter().all(|cleanup| cleanup.succeeded)
         && cleanup.succeeded
     {
@@ -285,6 +330,28 @@ fn validate_contract(
     ensure!(
         summary.status == expected_status,
         "protocol suite summary status does not match case and cleanup reports"
+    );
+    let current_history = flake_history
+        .entries
+        .iter()
+        .filter(|entry| entry.run_id == plan.run_id)
+        .collect::<Vec<_>>();
+    ensure!(
+        flake_history.profile == plan.profile
+            && current_history.len() == case_reports.len()
+            && current_history
+                .iter()
+                .all(|entry| entry.implicit_retry_count == 0)
+            && current_history
+                .iter()
+                .zip(&case_reports)
+                .all(|(entry, report)| {
+                    entry.case_id == report.case_id
+                        && entry.variant_id == report.variant_id
+                        && entry.status == protocol_flake_status(report)
+                })
+            && flake_history.signals == protocol_flake_signals(&flake_history.entries),
+        "protocol flaky-history signal differs from current results or records an implicit retry"
     );
     let live_compatibility = case_reports
         .iter()

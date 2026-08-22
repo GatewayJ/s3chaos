@@ -23,6 +23,18 @@ require_admin_credentials() {
   [[ -n "${RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY:-}" ]] || die "RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY is required"
 }
 
+reject_ci_overrides() {
+  [[ -z "${CI:-}" ]] && return 0
+  local name
+  for name in \
+    RUSTFS_PROTOCOL_TEST_ALLOW_STALE \
+    RUSTFS_PROTOCOL_TEST_ALLOW_WIDE_CLEANUP \
+    RUSTFS_PROTOCOL_TEST_DEBUG \
+    RUSTFS_PROTOCOL_TEST_SKIP_TARGET_FINGERPRINT; do
+    [[ -z "${!name:-}" ]] || die "$name is forbidden in CI protocol profiles"
+  done
+}
+
 run_cli() {
   cargo run --quiet --manifest-path "$MANIFEST_PATH" --bin s3chaos -- "$@"
 }
@@ -47,11 +59,30 @@ case "$command" in
     require_runtime_credentials
     run_cli protocol-suite-plan "$2"
     ;;
+  profile-validate)
+    [[ $# -eq 3 ]] || die "profile-validate requires PROFILE and SUITE"
+    reject_ci_overrides
+    run_cli protocol-ci-profile-validate "$2" "$3"
+    ;;
+  profile-run)
+    [[ $# -eq 3 ]] || die "profile-run requires PROFILE and SUITE"
+    reject_ci_overrides
+    require_runtime_credentials
+    [[ "${RUSTFS_PROTOCOL_TEST_DEDICATED:-}" == "1" ]] || \
+      die "set RUSTFS_PROTOCOL_TEST_DEDICATED=1 only for a verified dedicated target"
+    [[ -n "${RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT:-}" ]] || \
+      die "RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT is required"
+    export RUSTFS_PROTOCOL_CI_PROFILE="$2"
+    run_cli protocol-ci-profile-validate "$2" "$3"
+    run_cli protocol-suite-run "$3"
+    ;;
   suite-run)
     [[ $# -eq 2 ]] || die "suite-run requires exactly one suite path"
     require_runtime_credentials
     [[ "${RUSTFS_PROTOCOL_TEST_DEDICATED:-}" == "1" ]] || \
       die "set RUSTFS_PROTOCOL_TEST_DEDICATED=1 only for a verified dedicated target"
+    [[ -n "${RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT:-}" ]] || \
+      die "RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT is required"
     run_cli protocol-suite-run "$2"
     ;;
   cleanup)
@@ -76,6 +107,8 @@ Commands:
   suite-template
   suite-validate SUITE
   suite-plan SUITE
+  profile-validate PROFILE SUITE
+  profile-run PROFILE SUITE
   suite-run SUITE
   cleanup ARTIFACT_ROOT
   cleanup --registry RESOURCE_REGISTRY

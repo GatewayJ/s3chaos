@@ -6,6 +6,7 @@ selector:
   cases:
     - oidc-web-identity-basic
 execution:
+  profile: external
   parallelism: 1
   defaultIsolation: case
   cleanup: always

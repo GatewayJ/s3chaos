@@ -1,18 +1,15 @@
 apiVersion: rustfs.com/s3chaos/v1alpha1
 kind: ProtocolSuite
 metadata:
-  name: rustfs-slow-regression
+  name: rustfs-smoke
 selector:
-  cases:
-    - sts-expired-token-denied
+  tags:
+    - smoke
 execution:
-  profile: slow
+  profile: smoke
   parallelism: 1
   defaultIsolation: case
   cleanup: always
-  timeouts:
-    caseSeconds: 1020
-    suiteSeconds: 1200
 target:
   endpoint: ${RUSTFS_PROTOCOL_TEST_ENDPOINT}
   region: us-east-1

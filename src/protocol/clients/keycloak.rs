@@ -52,6 +52,12 @@ pub struct KeycloakExternalIdentityProvider {
     http: reqwest::Client,
 }
 
+pub(crate) enum KeycloakEnvironment {
+    Configured(Box<KeycloakExternalIdentityProvider>),
+    Missing,
+    Broken(String),
+}
+
 struct KeycloakProviderConfig {
     profile: String,
     issuer: reqwest::Url,
@@ -90,6 +96,35 @@ struct KeycloakUser {
 }
 
 impl KeycloakExternalIdentityProvider {
+    pub(crate) fn from_optional_env(profile: impl Into<String>) -> KeycloakEnvironment {
+        const REQUIRED: &[&str] = &[
+            ISSUER_ENV,
+            ADMIN_URL_ENV,
+            REALM_ENV,
+            CLIENT_ID_ENV,
+            CLIENT_SECRET_ENV,
+            ADMIN_USERNAME_ENV,
+            ADMIN_PASSWORD_ENV,
+        ];
+        let configured = REQUIRED
+            .iter()
+            .filter(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+            .count();
+        if configured == 0 {
+            return KeycloakEnvironment::Missing;
+        }
+        if configured != REQUIRED.len() {
+            return KeycloakEnvironment::Broken(format!(
+                "Keycloak external profile is partially configured ({configured}/{} required variables)",
+                REQUIRED.len()
+            ));
+        }
+        match Self::from_env(profile) {
+            Ok(provider) => KeycloakEnvironment::Configured(Box::new(provider)),
+            Err(error) => KeycloakEnvironment::Broken(error.to_string()),
+        }
+    }
+
     pub fn from_env(profile: impl Into<String>) -> Result<Self> {
         let config = KeycloakProviderConfig {
             profile: profile.into(),

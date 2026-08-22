@@ -23,6 +23,7 @@ use crate::protocol::catalog::ProtocolDomain;
 use crate::protocol::credentials::ActorCredentialArtifact;
 
 pub const PROTOCOL_JUNIT_FILE: &str = "protocol-junit.xml";
+pub const PROTOCOL_FLAKE_HISTORY_FILE: &str = "protocol-flake-history.json";
 
 fn default_protocol_variant() -> String {
     crate::protocol::catalog::DEFAULT_PROTOCOL_VARIANT.to_string()
@@ -32,6 +33,7 @@ fn default_protocol_variant() -> String {
 #[serde(rename_all = "kebab-case")]
 pub enum ProtocolCaseStatus {
     Passed,
+    Skipped,
     Failed,
 }
 
@@ -144,6 +146,8 @@ pub struct ProtocolCaseReport {
     pub status: ProtocolCaseStatus,
     pub outcome: ProtocolCaseOutcome,
     pub duration_millis: u128,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<crate::protocol::catalog::ProtocolCapabilityCheck>,
     pub actors: Vec<ActorCredentialArtifact>,
     pub assertions: Vec<ProtocolAssertion>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -267,16 +271,87 @@ pub struct ProtocolSuiteSummary {
     pub kind: String,
     pub suite: String,
     pub run_id: String,
+    pub profile: crate::protocol::suite::ProtocolExecutionProfile,
+    pub target_fingerprint: String,
+    pub capability_matrix: Vec<crate::protocol::catalog::ProtocolCapabilityCheck>,
     pub status: ProtocolCaseStatus,
     pub plan: String,
     pub preflight: String,
     pub registry: String,
     pub cleanup: String,
     pub compatibility_coverage: String,
+    pub flaky_history: String,
     pub case_reports: Vec<String>,
     pub case_results: Vec<ProtocolCaseResultSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolFlakeHistory {
+    pub api_version: String,
+    pub kind: String,
+    pub profile: crate::protocol::suite::ProtocolExecutionProfile,
+    pub entries: Vec<ProtocolFlakeHistoryEntry>,
+    pub signals: Vec<ProtocolFlakeSignal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolFlakeHistoryEntry {
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    pub case_id: String,
+    pub variant_id: String,
+    pub status: ProtocolCaseStatus,
+    pub implicit_retry_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolFlakeSignal {
+    pub case_id: String,
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub flaky: bool,
+}
+
+pub(crate) fn protocol_flake_status(report: &ProtocolCaseReport) -> ProtocolCaseStatus {
+    if matches!(
+        report.failure_phase.as_deref(),
+        Some("preflight" | "not-run" | "capability-skip")
+    ) {
+        ProtocolCaseStatus::Skipped
+    } else {
+        report.status
+    }
+}
+
+pub(crate) fn protocol_flake_signals(
+    entries: &[ProtocolFlakeHistoryEntry],
+) -> Vec<ProtocolFlakeSignal> {
+    let mut counts = BTreeMap::<String, (usize, usize, usize)>::new();
+    for entry in entries {
+        let counts = counts.entry(entry.case_id.clone()).or_default();
+        match entry.status {
+            ProtocolCaseStatus::Passed => counts.0 += 1,
+            ProtocolCaseStatus::Failed => counts.1 += 1,
+            ProtocolCaseStatus::Skipped => counts.2 += 1,
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(case_id, (passed, failed, skipped))| ProtocolFlakeSignal {
+            case_id,
+            passed,
+            failed,
+            skipped,
+            flaky: passed > 0 && failed > 0,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,6 +450,22 @@ pub fn protocol_junit_xml(
                 &mut xml,
                 "cleanupLeftovers",
                 &cleanup_failure.leftovers.join(","),
+            );
+        }
+        for capability in &report.capabilities {
+            write_junit_property(
+                &mut xml,
+                &format!("capability.{}", capability.capability),
+                match capability.state {
+                    crate::protocol::catalog::ProtocolCapabilityState::Pass => "pass",
+                    crate::protocol::catalog::ProtocolCapabilityState::Skip => "skip",
+                    crate::protocol::catalog::ProtocolCapabilityState::Fail => "fail",
+                },
+            );
+            write_junit_property(
+                &mut xml,
+                &format!("capabilityReason.{}", capability.capability),
+                &capability.reason,
             );
         }
         if let Some(phase) = &report.failure_phase {
@@ -545,7 +636,10 @@ mod tests {
     use crate::protocol::authorization::{
         ProtocolActorSource, ProtocolGrantSource, ProtocolPolicyEffect,
     };
-    use crate::protocol::catalog::ProtocolDomain;
+    use crate::protocol::catalog::{
+        ProtocolCapability, ProtocolCapabilityCheck, ProtocolCapabilitySource,
+        ProtocolCapabilityState, ProtocolDomain,
+    };
 
     fn report(
         case_id: &str,
@@ -563,12 +657,15 @@ mod tests {
             status,
             outcome: if phase == Some("not-run") {
                 ProtocolCaseOutcome::NotRun
+            } else if phase == Some("capability-skip") {
+                ProtocolCaseOutcome::CapabilitySkipped
             } else if status == ProtocolCaseStatus::Passed {
                 ProtocolCaseOutcome::Passed
             } else {
                 ProtocolCaseOutcome::Failed
             },
             duration_millis: 125,
+            capabilities: Vec::new(),
             actors: Vec::new(),
             assertions: Vec::new(),
             failure_phase: phase.map(ToString::to_string),
@@ -607,6 +704,19 @@ mod tests {
             Some("not-run"),
             Some("stopped after prior failure"),
         );
+        let mut capability_skip = report(
+            "capability-skip",
+            "default",
+            ProtocolCaseStatus::Skipped,
+            Some("capability-skip"),
+            Some("optional external provider is missing"),
+        );
+        capability_skip.capabilities = vec![ProtocolCapabilityCheck {
+            capability: ProtocolCapability::ExternalIdp,
+            source: ProtocolCapabilitySource::External,
+            state: ProtocolCapabilityState::Skip,
+            reason: "optional external provider is missing".to_string(),
+        }];
         let preflight = report(
             "preflight",
             "default",
@@ -661,6 +771,7 @@ mod tests {
                 &passed,
                 &failed,
                 &not_run,
+                &capability_skip,
                 &preflight,
                 &interrupted,
                 &timeout,
@@ -672,7 +783,7 @@ mod tests {
         );
         assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
         assert!(xml.contains(
-            "<testsuite name=\"suite&lt;&amp;&quot;&apos;\" tests=\"10\" failures=\"5\" skipped=\"3\">"
+            "<testsuite name=\"suite&lt;&amp;&quot;&apos;\" tests=\"11\" failures=\"5\" skipped=\"4\">"
         ));
         assert!(xml.contains("name=\"passed&lt;&amp;::v&quot;1\""));
         assert!(xml.contains("name=\"failureClassification\" value=\"preflight\""));
@@ -684,6 +795,8 @@ mod tests {
         assert!(xml.contains("<skipped message=\"not-run\">"));
         assert!(xml.contains("<skipped message=\"capability-skipped\">"));
         assert!(xml.contains("<skipped message=\"expected-divergence\">"));
+        assert!(xml.contains("name=\"capability.external-idp\" value=\"skip\""));
+        assert!(xml.contains("name=\"capabilityReason.external-idp\""));
         assert!(xml.contains("expected &lt;ok&gt; &amp; got &apos;bad&apos;"));
         assert!(xml.contains('\u{fffd}'));
         assert!(!xml.contains("expected <ok>"));

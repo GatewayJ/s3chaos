@@ -74,6 +74,34 @@ impl ProtocolCaseExecution {
         Self::terminal(case_id, ProtocolCaseOutcome::NotRun, "not-run", message)
     }
 
+    pub fn capability_skipped(case_id: &str, message: impl Into<String>) -> Self {
+        Self {
+            report: ProtocolCaseReport {
+                api_version: "rustfs.com/s3chaos/v1alpha1".to_string(),
+                kind: "ProtocolCaseReport".to_string(),
+                case_id: case_id.to_string(),
+                variant_id: DEFAULT_PROTOCOL_VARIANT.to_string(),
+                domain: protocol_case(case_id)
+                    .map(|case| case.domain)
+                    .unwrap_or(crate::protocol::catalog::ProtocolDomain::Other),
+                status: ProtocolCaseStatus::Skipped,
+                outcome: ProtocolCaseOutcome::CapabilitySkipped,
+                duration_millis: 0,
+                capabilities: Vec::new(),
+                actors: Vec::new(),
+                assertions: Vec::new(),
+                failure_phase: Some("capability-skip".to_string()),
+                failure: Some(message.into()),
+                failure_classification: Some("capability-skip".to_string()),
+                cleanup_succeeded: true,
+                cleanup_failure: None,
+                evidence: Vec::new(),
+                reproduction: None,
+            },
+            forbidden_secrets: Vec::new(),
+        }
+    }
+
     fn failed(case_id: &str, phase: &str, message: impl Into<String>) -> Self {
         Self::terminal(case_id, ProtocolCaseOutcome::Failed, phase, message)
     }
@@ -104,6 +132,7 @@ impl ProtocolCaseExecution {
                 },
                 outcome,
                 duration_millis: 0,
+                capabilities: Vec::new(),
                 actors: Vec::new(),
                 assertions: Vec::new(),
                 failure_phase: Some(phase.to_string()),
@@ -185,9 +214,9 @@ where
             let (Some(external_identity), Some(web_identity_sts)) =
                 (services.external_identity, services.web_identity_sts)
             else {
-                return ProtocolCaseExecution::preflight_failed(
+                return ProtocolCaseExecution::capability_skipped(
                     case_id,
-                    "OIDC case requires external identity and WebIdentity STS ports",
+                    "OIDC case skipped because its optional external identity capability is unavailable",
                 );
             };
             oidc::run_oidc_case(
@@ -272,6 +301,7 @@ impl CaseContext {
                     ProtocolCaseOutcome::Failed
                 },
                 duration_millis: self.started.elapsed().as_millis(),
+                capabilities: Vec::new(),
                 actors: self.actors.iter().map(ActorCredential::artifact).collect(),
                 assertions: self.assertions,
                 failure_phase,

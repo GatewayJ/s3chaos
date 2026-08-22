@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use crate::protocol::{
     artifact_validation::validate_protocol_artifacts_and_write_report,
     cases::{ProtocolCaseExecution, ProtocolCaseServices, run_protocol_case},
-    catalog::{DEFAULT_PROTOCOL_VARIANT, protocol_case},
+    catalog::{
+        DEFAULT_PROTOCOL_VARIANT, ProtocolCapabilitySource, ProtocolCapabilityState, protocol_case,
+    },
     clients::{
         admin::RustfsAdminClient,
         keycloak::KeycloakExternalIdentityProvider,
@@ -37,13 +39,15 @@ use crate::protocol::{
     },
     ports::{ProtocolAdminServerPort, ProtocolExternalIdentityPort, ProtocolWebIdentityStsPort},
     preflight::{
-        ProtocolProbeCapabilities, cleanup_interrupted_mutating_permission_probe,
-        run_mutating_permission_probe,
+        ProtocolMutatingProbeExecution, ProtocolProbeCapabilities, capability_failures,
+        cleanup_interrupted_mutating_permission_probe, run_mutating_permission_probe,
     },
     reporting::{
-        PROTOCOL_JUNIT_FILE, ProtocolCaseCleanupFailure, ProtocolCaseOutcome,
-        ProtocolCaseResultSummary, ProtocolCaseStatus, ProtocolCleanupReport,
-        ProtocolFailureSummary, ProtocolReproduction, ProtocolSuiteSummary, protocol_junit_xml,
+        PROTOCOL_FLAKE_HISTORY_FILE, PROTOCOL_JUNIT_FILE, ProtocolCaseCleanupFailure,
+        ProtocolCaseOutcome, ProtocolCaseResultSummary, ProtocolCaseStatus, ProtocolCleanupReport,
+        ProtocolFailureSummary, ProtocolFlakeHistory, ProtocolFlakeHistoryEntry,
+        ProtocolReproduction, ProtocolSuiteSummary, protocol_flake_signals, protocol_flake_status,
+        protocol_junit_xml,
     },
     runner::{
         artifacts::ProtocolArtifactWriter,
@@ -52,12 +56,14 @@ use crate::protocol::{
         preflight::run_connected_preflight,
         runtime::{
             BudgetedProtocolTimeout, ConnectedProtocolRuntime, MonotonicProtocolClock,
-            ProcessShutdownSignal, ensure_dedicated_target_acknowledgement, protocol_artifact_base,
+            ProcessShutdownSignal, ensure_dedicated_target_acknowledgement,
+            ensure_dedicated_target_fingerprint, protocol_artifact_base,
         },
     },
     suite::{ProtocolSuite, ProtocolSuiteSelector},
     suite_plan::{
-        ProtocolMutatingProbeStatus, ProtocolSuitePlan, ProtocolSuitePlanCase, TargetFingerprint,
+        ProtocolMutatingProbeStatus, ProtocolMutatingProbeSummary, ProtocolSuitePlan,
+        ProtocolSuitePlanCase, TargetFingerprint,
     },
 };
 
@@ -135,6 +141,7 @@ async fn run_protocol_suite(
     ensure_dedicated_target_acknowledgement()?;
     let runtime = ConnectedProtocolRuntime::connect(path).await?;
     let mut preflight = run_connected_preflight(&runtime).await?;
+    ensure_dedicated_target_fingerprint(&preflight.target_fingerprint)?;
     if let Some(expected) = expected_fingerprint {
         ensure!(
             &preflight.target_fingerprint == expected,
@@ -171,42 +178,79 @@ async fn run_protocol_suite(
         &plan.run_id,
     )?;
 
-    let probe_capabilities = ProtocolProbeCapabilities::from_suite(&runtime.suite);
-    let mut probe_future = Box::pin(run_mutating_permission_probe(
-        &namer,
-        &mut registry,
-        &runtime.admin,
-        &runtime.s3,
-        Some(&runtime.sts),
-        probe_capabilities,
-    ));
-    let probe_result = tokio::select! {
-        probe = &mut probe_future => Ok(probe),
-        signal = ProcessShutdownSignal.wait() => Err(signal),
-    };
-    drop(probe_future);
-    let probe = match probe_result {
-        Ok(probe) => probe,
-        Err(signal) => {
-            let reason = match signal {
-                Ok(()) => {
-                    "protocol suite interrupted during mutating preflight probe; cleanup requested"
-                        .to_string()
-                }
-                Err(error) => format!(
-                    "protocol signal handler failed during mutating preflight probe: {error}"
-                ),
-            };
-            cleanup_interrupted_mutating_permission_probe(
-                &mut registry,
-                &runtime.admin,
-                &runtime.s3,
-                reason,
-            )
-            .await
+    let capability_failure = capability_failures(&preflight)
+        .first()
+        .map(|failure| (failure.capability, failure.reason.clone()));
+    let probe = if let Some((capability, reason)) = &capability_failure {
+        ProtocolMutatingProbeExecution {
+            summary: ProtocolMutatingProbeSummary {
+                status: ProtocolMutatingProbeStatus::Failed,
+                synthetic_case_id: "preflight-permission-probe".to_string(),
+                version_count: 0,
+                delete_marker_count: 0,
+                cleanup_succeeded: true,
+                cleanup_report: Some("preflight-cleanup-report.json".to_string()),
+                error: Some(format!(
+                    "required capability {} failed before mutation: {}",
+                    capability, reason
+                )),
+            },
+            cleanup: ProtocolCleanupReport::empty(&runtime.suite.api_version),
+            forbidden_secrets: Vec::new(),
+        }
+    } else {
+        let probe_capabilities = ProtocolProbeCapabilities::from_suite(&runtime.suite);
+        let mut probe_future = Box::pin(run_mutating_permission_probe(
+            &namer,
+            &mut registry,
+            &runtime.admin,
+            &runtime.s3,
+            Some(&runtime.sts),
+            probe_capabilities,
+        ));
+        let probe_result = tokio::select! {
+            probe = &mut probe_future => Ok(probe),
+            signal = ProcessShutdownSignal.wait() => Err(signal),
+        };
+        drop(probe_future);
+        match probe_result {
+            Ok(probe) => probe,
+            Err(signal) => {
+                let reason = match signal {
+                    Ok(()) => {
+                        "protocol suite interrupted during mutating preflight probe; cleanup requested"
+                            .to_string()
+                    }
+                    Err(error) => format!(
+                        "protocol signal handler failed during mutating preflight probe: {error}"
+                    ),
+                };
+                cleanup_interrupted_mutating_permission_probe(
+                    &mut registry,
+                    &runtime.admin,
+                    &runtime.s3,
+                    reason,
+                )
+                .await
+            }
         }
     };
     preflight.mutating_permission_probe = probe.summary.clone();
+    if capability_failure.is_none() && probe.summary.status == ProtocolMutatingProbeStatus::Failed {
+        let reason = probe
+            .summary
+            .error
+            .as_deref()
+            .unwrap_or("mutating permission probe failed");
+        for capability in &mut preflight.capability_matrix {
+            if capability.source == ProtocolCapabilitySource::BuiltIn
+                && capability.state == ProtocolCapabilityState::Pass
+            {
+                capability.state = ProtocolCapabilityState::Fail;
+                capability.reason = format!("mutating preflight failed: {reason}");
+            }
+        }
+    }
     plan.preflight = (&preflight).into();
     artifacts.write_json("protocol-suite-plan.json", &plan)?;
     artifacts.write_json("preflight-summary.json", &preflight)?;
@@ -215,10 +259,12 @@ async fn run_protocol_suite(
 
     let selected_cases = plan.cases.clone();
     let actor_clients = AwsS3ClientFactory::new(&runtime.endpoint, &runtime.suite.target.region);
-    let preflight_failure_message = probe
-        .summary
-        .error
-        .clone()
+    let preflight_failure_message = capability_failure
+        .as_ref()
+        .map(|(capability, reason)| {
+            format!("required capability {} failed: {}", capability, reason)
+        })
+        .or_else(|| probe.summary.error.clone())
         .unwrap_or_else(|| "mutating preflight probe failed".to_string());
     let external_identity = runtime
         .external_identity
@@ -259,7 +305,8 @@ async fn run_protocol_suite(
         &timeout,
         &runtime.suite.api_version,
     );
-    let preflight_failure = (probe.summary.status != ProtocolMutatingProbeStatus::Passed)
+    let preflight_failure = (capability_failure.is_some()
+        || probe.summary.status != ProtocolMutatingProbeStatus::Passed)
         .then_some(preflight_failure_message.as_str());
     let suite_execution = executor
         .execute(&selected_cases, &mut registry, preflight_failure)
@@ -270,6 +317,24 @@ async fn run_protocol_suite(
         .into_iter()
         .map(|case| (case.execution, case.cleanup))
         .collect::<Vec<_>>();
+    for (execution, _) in &mut case_executions {
+        let planned = plan
+            .cases
+            .iter()
+            .find(|case| case.id == execution.report.case_id)
+            .expect("executed case belongs to the plan");
+        execution.report.capabilities = preflight
+            .capability_matrix
+            .iter()
+            .filter(|check| {
+                planned
+                    .requires
+                    .iter()
+                    .any(|required| required == check.capability.as_str())
+            })
+            .cloned()
+            .collect();
+    }
     artifacts.write_json("cleanup-report.json", &fallback_cleanup)?;
 
     for (execution, cleanup) in &mut case_executions {
@@ -339,9 +404,11 @@ async fn run_protocol_suite(
         COMPATIBILITY_COVERAGE_FILE,
         &compatibility_coverage_report(&live_compatibility)?,
     )?;
+    let flake_history = update_protocol_flake_history(&artifact_root, &plan, &case_executions)?;
+    artifacts.write_json(PROTOCOL_FLAKE_HISTORY_FILE, &flake_history)?;
 
     let passed = case_executions.iter().all(|(execution, cleanup)| {
-        execution.report.status == ProtocolCaseStatus::Passed && cleanup.succeeded
+        execution.report.status != ProtocolCaseStatus::Failed && cleanup.succeeded
     }) && fallback_cleanup.succeeded;
     let first_failure = case_executions.iter().find(|(execution, cleanup)| {
         execution.report.status == ProtocolCaseStatus::Failed || !cleanup.succeeded
@@ -408,6 +475,9 @@ async fn run_protocol_suite(
         kind: "ProtocolSuiteSummary".to_string(),
         suite: runtime.suite.metadata.name.clone(),
         run_id: plan.run_id.clone(),
+        profile: runtime.suite.execution.profile,
+        target_fingerprint: plan.target.fingerprint.sha256.clone(),
+        capability_matrix: preflight.capability_matrix.clone(),
         status: if passed {
             ProtocolCaseStatus::Passed
         } else {
@@ -418,6 +488,7 @@ async fn run_protocol_suite(
         registry: RESOURCE_REGISTRY_FILE.to_string(),
         cleanup: "cleanup-report.json".to_string(),
         compatibility_coverage: COMPATIBILITY_COVERAGE_FILE.to_string(),
+        flaky_history: PROTOCOL_FLAKE_HISTORY_FILE.to_string(),
         case_reports: case_report_paths,
         case_results,
         failure_summary,
@@ -623,6 +694,59 @@ fn apply_cleanup_diagnostics(
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn update_protocol_flake_history(
+    artifact_root: &Path,
+    plan: &ProtocolSuitePlan,
+    cases: &[(ProtocolCaseExecution, ProtocolCleanupReport)],
+) -> Result<ProtocolFlakeHistory> {
+    let artifact_base = artifact_root
+        .parent()
+        .and_then(Path::parent)
+        .context("protocol artifact root is missing suite/base parents")?;
+    let history_relative = Path::new(".history").join(format!("{}.json", plan.profile));
+    let history_path = artifact_base.join(&history_relative);
+    let mut entries = if history_path.is_file() {
+        let existing: ProtocolFlakeHistory =
+            serde_json::from_str(&fs::read_to_string(&history_path).with_context(|| {
+                format!("read protocol flake history {}", history_path.display())
+            })?)?;
+        ensure!(
+            existing.profile == plan.profile,
+            "protocol flake history profile changed unexpectedly"
+        );
+        existing.entries
+    } else {
+        Vec::new()
+    };
+    entries.extend(
+        cases
+            .iter()
+            .map(|(execution, _)| ProtocolFlakeHistoryEntry {
+                run_id: plan.run_id.clone(),
+                source_revision: plan.source_revision.clone(),
+                case_id: execution.report.case_id.clone(),
+                variant_id: execution.report.variant_id.clone(),
+                status: protocol_flake_status(&execution.report),
+                implicit_retry_count: 0,
+            }),
+    );
+    if entries.len() > 2_000 {
+        entries.drain(..entries.len() - 2_000);
+    }
+    let signals = protocol_flake_signals(&entries);
+    let history = ProtocolFlakeHistory {
+        api_version: "rustfs.com/s3chaos/v1alpha1".to_string(),
+        kind: "ProtocolFlakeHistory".to_string(),
+        profile: plan.profile,
+        entries,
+        signals,
+    };
+    let writer = ProtocolArtifactWriter::file(artifact_base);
+    writer.create_dir(".history")?;
+    writer.write_json(history_relative, &history)?;
+    Ok(history)
 }
 
 pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> Result<()> {
@@ -943,14 +1067,20 @@ mod tests {
     };
     use crate::protocol::{
         cases::ProtocolCaseExecution,
+        catalog::{
+            ProtocolCapability, ProtocolCapabilityCheck, ProtocolCapabilitySource,
+            ProtocolCapabilityState,
+        },
         compatibility::{COMPATIBILITY_COVERAGE_FILE, compatibility_coverage_report},
         fixture::registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
         ports::{ProtocolAdminError, ProtocolAdminServerPort, ProtocolServerInfo},
         preflight::{ProtocolPreflightSummary, ProtocolStaleResourceScan},
         reporting::{
-            PROTOCOL_JUNIT_FILE, ProtocolAssertion, ProtocolCaseOutcome, ProtocolCaseReport,
-            ProtocolCaseResultSummary, ProtocolCaseStatus, ProtocolCleanupReport,
-            ProtocolFailureSummary, ProtocolReproduction, ProtocolSuiteSummary, protocol_junit_xml,
+            PROTOCOL_FLAKE_HISTORY_FILE, PROTOCOL_JUNIT_FILE, ProtocolAssertion,
+            ProtocolCaseOutcome, ProtocolCaseReport, ProtocolCaseResultSummary, ProtocolCaseStatus,
+            ProtocolCleanupReport, ProtocolFailureSummary, ProtocolFlakeHistory,
+            ProtocolFlakeHistoryEntry, ProtocolReproduction, ProtocolSuiteSummary,
+            protocol_flake_signals, protocol_flake_status, protocol_junit_xml,
         },
         runner::artifacts::ProtocolArtifactWriter,
         suite::{ProtocolSuite, protocol_suite_template_yaml},
@@ -1056,6 +1186,54 @@ mod tests {
         serde_json::to_vec(&cleanup).expect("cleanup diagnostics remain serializable");
     }
 
+    #[test]
+    fn flaky_history_is_a_signal_without_implicit_retries() {
+        let entries = [
+            ProtocolFlakeHistoryEntry {
+                run_id: "passed-run".to_string(),
+                source_revision: Some("revision".to_string()),
+                case_id: "case".to_string(),
+                variant_id: "default".to_string(),
+                status: ProtocolCaseStatus::Passed,
+                implicit_retry_count: 0,
+            },
+            ProtocolFlakeHistoryEntry {
+                run_id: "failed-run".to_string(),
+                source_revision: Some("revision".to_string()),
+                case_id: "case".to_string(),
+                variant_id: "default".to_string(),
+                status: ProtocolCaseStatus::Failed,
+                implicit_retry_count: 0,
+            },
+        ];
+        let signals = protocol_flake_signals(&entries);
+        assert_eq!(signals.len(), 1);
+        assert!(signals[0].flaky);
+        assert_eq!(signals[0].passed, 1);
+        assert_eq!(signals[0].failed, 1);
+        assert!(entries.iter().all(|entry| entry.implicit_retry_count == 0));
+    }
+
+    #[test]
+    fn flaky_history_does_not_treat_unexecuted_cases_as_failures() {
+        let preflight = ProtocolCaseExecution::preflight_failed("case", "preflight failed");
+        let not_run = ProtocolCaseExecution::not_run("case", "suite timed out");
+        let harness_failure = ProtocolCaseExecution::harness_failed("case", "executor failed");
+
+        assert_eq!(
+            protocol_flake_status(&preflight.report),
+            ProtocolCaseStatus::Skipped
+        );
+        assert_eq!(
+            protocol_flake_status(&not_run.report),
+            ProtocolCaseStatus::Skipped
+        );
+        assert_eq!(
+            protocol_flake_status(&harness_failure.report),
+            ProtocolCaseStatus::Failed
+        );
+    }
+
     #[tokio::test]
     async fn standalone_cleanup_rejects_synthetic_s3_fingerprint() {
         let fingerprint = TargetFingerprint::new(
@@ -1093,6 +1271,20 @@ mod tests {
             None,
         )
         .expect("fingerprint");
+        let capability_matrix = [
+            ProtocolCapability::S3,
+            ProtocolCapability::AdminApi,
+            ProtocolCapability::BucketPolicy,
+            ProtocolCapability::Identity,
+        ]
+        .into_iter()
+        .map(|capability| ProtocolCapabilityCheck {
+            capability,
+            source: ProtocolCapabilitySource::BuiltIn,
+            state: ProtocolCapabilityState::Pass,
+            reason: "available".to_string(),
+        })
+        .collect::<Vec<_>>();
         let preflight = ProtocolPreflightSummary {
             api_version: suite.api_version.clone(),
             kind: "ProtocolPreflightSummary".to_string(),
@@ -1101,6 +1293,7 @@ mod tests {
             admin_api_reachable: true,
             external_identity: None,
             selected_cases: vec!["bucket-policy-authenticated-user-rw".to_string()],
+            capability_matrix: capability_matrix.clone(),
             stale_resources: ProtocolStaleResourceScan {
                 bucket_prefix: "s3c".to_string(),
                 identity_prefix: "s3chaos".to_string(),
@@ -1164,6 +1357,7 @@ mod tests {
             status: ProtocolCaseStatus::Passed,
             outcome: ProtocolCaseOutcome::Passed,
             duration_millis: 125,
+            capabilities: capability_matrix.clone(),
             actors: Vec::new(),
             assertions: Vec::new(),
             failure_phase: None,
@@ -1214,6 +1408,24 @@ mod tests {
                 &compatibility_coverage_report(&BTreeMap::new()).expect("coverage report"),
             )
             .expect("coverage artifact");
+        let flake_entry = ProtocolFlakeHistoryEntry {
+            run_id: plan.run_id.clone(),
+            source_revision: plan.source_revision.clone(),
+            case_id: case_report.case_id.clone(),
+            variant_id: case_report.variant_id.clone(),
+            status: protocol_flake_status(&case_report),
+            implicit_retry_count: 0,
+        };
+        let flake_history = ProtocolFlakeHistory {
+            api_version: suite.api_version.clone(),
+            kind: "ProtocolFlakeHistory".to_string(),
+            profile: plan.profile,
+            entries: vec![flake_entry.clone()],
+            signals: protocol_flake_signals(&[flake_entry]),
+        };
+        artifacts
+            .write_json(PROTOCOL_FLAKE_HISTORY_FILE, &flake_history)
+            .expect("flake history artifact");
         let case_report_path =
             "cases/bucket-policy-authenticated-user-rw/case-report.json".to_string();
         let summary = ProtocolSuiteSummary {
@@ -1221,12 +1433,16 @@ mod tests {
             kind: "ProtocolSuiteSummary".to_string(),
             suite: suite.metadata.name,
             run_id: "run".to_string(),
+            profile: plan.profile,
+            target_fingerprint: plan.target.fingerprint.sha256.clone(),
+            capability_matrix,
             status: ProtocolCaseStatus::Passed,
             plan: "protocol-suite-plan.json".to_string(),
             preflight: "preflight-summary.json".to_string(),
             registry: "resource-registry.json".to_string(),
             cleanup: "cleanup-report.json".to_string(),
             compatibility_coverage: COMPATIBILITY_COVERAGE_FILE.to_string(),
+            flaky_history: PROTOCOL_FLAKE_HISTORY_FILE.to_string(),
             case_reports: vec![case_report_path.clone()],
             case_results: vec![
                 ProtocolCaseResultSummary::from_report(&case_report, case_report_path.clone())
@@ -1246,6 +1462,16 @@ mod tests {
 
         validate_phase_one_artifacts(&root, &["not-present-secret".to_string()])
             .expect("valid artifacts");
+
+        let mut inconsistent_flake_history = flake_history.clone();
+        inconsistent_flake_history.signals.clear();
+        artifacts
+            .write_json(PROTOCOL_FLAKE_HISTORY_FILE, &inconsistent_flake_history)
+            .expect("inconsistent flake history");
+        assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+        artifacts
+            .write_json(PROTOCOL_FLAKE_HISTORY_FILE, &flake_history)
+            .expect("restore flake history");
 
         let mut inconsistent_summary = summary.clone();
         inconsistent_summary.case_results[0].duration_millis += 1;
@@ -1314,6 +1540,26 @@ mod tests {
                 &not_run_report,
             )
             .expect("not-run case report");
+        let not_run_flake_entry = ProtocolFlakeHistoryEntry {
+            run_id: plan.run_id.clone(),
+            source_revision: plan.source_revision.clone(),
+            case_id: not_run_report.case_id.clone(),
+            variant_id: not_run_report.variant_id.clone(),
+            status: protocol_flake_status(&not_run_report),
+            implicit_retry_count: 0,
+        };
+        artifacts
+            .write_json(
+                PROTOCOL_FLAKE_HISTORY_FILE,
+                &ProtocolFlakeHistory {
+                    api_version: summary.api_version.clone(),
+                    kind: "ProtocolFlakeHistory".to_string(),
+                    profile: plan.profile,
+                    entries: vec![not_run_flake_entry.clone()],
+                    signals: protocol_flake_signals(&[not_run_flake_entry]),
+                },
+            )
+            .expect("not-run flake history");
         artifacts
             .write_json(
                 "protocol-failure-summary.json",
@@ -1363,6 +1609,9 @@ mod tests {
                 &protocol_junit_xml(&summary.suite, &[&case_report], cleanup.succeeded),
             )
             .expect("restore JUnit after not-run fixture");
+        artifacts
+            .write_json(PROTOCOL_FLAKE_HISTORY_FILE, &flake_history)
+            .expect("restore flake history after not-run fixture");
         fs::remove_file(root.join("protocol-failure-summary.json"))
             .expect("remove not-run failure summary");
         artifacts

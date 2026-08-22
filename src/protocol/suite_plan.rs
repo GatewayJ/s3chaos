@@ -20,14 +20,15 @@ use uuid::Uuid;
 
 use crate::protocol::{
     catalog::{
-        ProtocolCapability, ProtocolCase, ProtocolCleanupScope, ProtocolDomain, ProtocolExecutor,
-        ProtocolExpectedOutcome, ProtocolLockRequirement, ProtocolResourceOwnership,
+        ProtocolCapability, ProtocolCapabilityCheck, ProtocolCase, ProtocolCleanupScope,
+        ProtocolDomain, ProtocolExecutor, ProtocolExpectedOutcome, ProtocolLockRequirement,
+        ProtocolResourceOwnership,
     },
     ports::ProtocolExternalIdentityProviderInfo,
     scheduler::{ProtocolLock, plan_protocol_schedule},
     suite::{
-        ProtocolArtifactRetentionPolicy, ProtocolCleanupPolicy, ProtocolExecutionTimeouts,
-        ResolvedProtocolSuite,
+        ProtocolArtifactRetentionPolicy, ProtocolCleanupPolicy, ProtocolExecutionProfile,
+        ProtocolExecutionTimeouts, ResolvedProtocolSuite,
     },
 };
 
@@ -86,6 +87,7 @@ pub struct ProtocolSuitePlan {
     pub kind: String,
     pub suite: String,
     pub run_id: String,
+    pub profile: ProtocolExecutionProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_revision: Option<String>,
     pub artifact_root: String,
@@ -102,6 +104,7 @@ pub struct ProtocolSuitePlanPreflight {
     pub admin_api_reachable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_identity: Option<ProtocolExternalIdentityProviderInfo>,
+    pub capability_matrix: Vec<ProtocolCapabilityCheck>,
     pub stale_buckets: Vec<String>,
     pub stale_identities: Vec<String>,
     pub stale_resource_policy: String,
@@ -389,6 +392,7 @@ impl ProtocolSuitePlan {
             kind: PROTOCOL_SUITE_PLAN_KIND.to_string(),
             suite: suite.metadata.name.clone(),
             run_id,
+            profile: suite.execution.profile,
             source_revision: std::env::var("S3CHAOS_SOURCE_REVISION")
                 .ok()
                 .or_else(|| std::env::var("GITHUB_SHA").ok())
