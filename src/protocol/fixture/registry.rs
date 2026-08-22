@@ -20,7 +20,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-use crate::protocol::{ports::ProtocolExternalIdentityCoordinates, suite_plan::TargetFingerprint};
+use crate::protocol::{
+    catalog::{
+        ProtocolCleanupScope, ProtocolLockRequirement, ProtocolResourceOwnership, protocol_case,
+        validate_protocol_case_descriptor,
+    },
+    ports::ProtocolExternalIdentityCoordinates,
+    suite_plan::TargetFingerprint,
+};
 
 pub const RESOURCE_REGISTRY_FILE: &str = "resource-registry.json";
 
@@ -94,6 +101,12 @@ pub struct ResourceHandle {
     pub name: String,
     pub owning_case_id: String,
     pub owner_phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<ProtocolResourceOwnership>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_scope: Option<ProtocolCleanupScope>,
     pub state: ResourceState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
@@ -130,9 +143,21 @@ pub struct ResourceRegistry {
     pub target_fingerprint: TargetFingerprint,
     #[serde(default)]
     pub versioned_cleanup: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<ProtocolRegistryContract>,
     pub resources: Vec<ResourceHandle>,
     #[serde(skip)]
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolRegistryContract {
+    pub case_id: String,
+    pub variant_id: String,
+    pub ownership: Vec<ProtocolResourceOwnership>,
+    pub cleanup_scopes: Vec<ProtocolCleanupScope>,
+    pub lock_requirements: Vec<ProtocolLockRequirement>,
 }
 
 struct ResourcePlan {
@@ -171,6 +196,7 @@ impl ResourceRegistry {
             run_id: run_id.into(),
             target_fingerprint,
             versioned_cleanup: false,
+            contract: None,
             resources: Vec::new(),
             path: artifact_root.as_ref().join(RESOURCE_REGISTRY_FILE),
         };
@@ -190,6 +216,44 @@ impl ResourceRegistry {
             .with_context(|| format!("parse resource registry {}", path.display()))?;
         registry.path = path;
         Ok(registry)
+    }
+
+    /// Binds a per-case registry to the descriptor that authorizes its dynamic resources.
+    /// Existing unbound registries remain readable for preflight and artifact compatibility.
+    pub fn bind_case(&mut self, case_id: &str, variant_id: &str) -> Result<()> {
+        ensure!(
+            self.resources.is_empty(),
+            "resource registry must be bound before resources are planned"
+        );
+        let case = protocol_case(case_id)
+            .with_context(|| format!("unknown protocol resource owner {case_id}"))?;
+        validate_protocol_case_descriptor(case)?;
+        ensure!(
+            case.variant(variant_id).is_some(),
+            "unknown protocol variant {variant_id} for case {case_id}"
+        );
+        let contract = ProtocolRegistryContract {
+            case_id: case_id.to_string(),
+            variant_id: variant_id.to_string(),
+            ownership: case.ownership.to_vec(),
+            cleanup_scopes: case.cleanup_scopes.to_vec(),
+            lock_requirements: case.lock_requirements.to_vec(),
+        };
+        if let Some(existing) = &self.contract {
+            ensure!(
+                existing.case_id == contract.case_id && existing.variant_id == contract.variant_id,
+                "resource registry is already bound to {}/{}",
+                existing.case_id,
+                existing.variant_id
+            );
+            return Ok(());
+        }
+        self.contract = Some(contract);
+        if let Err(error) = self.persist() {
+            self.contract = None;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn set_versioned_cleanup(&mut self, enabled: bool) -> Result<()> {
@@ -235,12 +299,25 @@ impl ResourceRegistry {
     }
 
     fn plan_internal(&mut self, plan: ResourcePlan) -> Result<ResourceHandle> {
+        for dependency in &plan.depends_on {
+            ensure!(
+                self.resources
+                    .iter()
+                    .any(|resource| resource.id == *dependency),
+                "resource plan references unknown dependency {dependency}"
+            );
+        }
+        let (variant_id, ownership, cleanup_scope) =
+            validate_dynamic_resource(self.contract.as_ref(), &plan)?;
         let handle = ResourceHandle {
             id: format!("resource-{}", Uuid::new_v4()),
             kind: plan.kind,
             name: plan.name,
             owning_case_id: plan.owning_case_id,
             owner_phase: plan.owner_phase,
+            variant_id,
+            ownership,
+            cleanup_scope,
             state: ResourceState::Planned,
             depends_on: plan.depends_on,
             bucket: plan.bucket,
@@ -712,6 +789,106 @@ impl ResourceRegistry {
     }
 }
 
+fn validate_dynamic_resource(
+    contract: Option<&ProtocolRegistryContract>,
+    plan: &ResourcePlan,
+) -> Result<(
+    Option<String>,
+    Option<ProtocolResourceOwnership>,
+    Option<ProtocolCleanupScope>,
+)> {
+    let Some(contract) = contract else {
+        return Ok((None, None, None));
+    };
+    ensure!(
+        plan.owning_case_id == contract.case_id,
+        "resource owner {} exceeds registry owner {}",
+        plan.owning_case_id,
+        contract.case_id
+    );
+    let (ownership, cleanup_scope) = match plan.kind {
+        ResourceKind::Bucket => (
+            ProtocolResourceOwnership::ExclusiveBucket,
+            ProtocolCleanupScope::OwnedBucket,
+        ),
+        ResourceKind::BucketPolicy => (
+            ProtocolResourceOwnership::ExclusiveBucket,
+            ProtocolCleanupScope::BucketPolicy,
+        ),
+        ResourceKind::PublicAccessBlock => (
+            ProtocolResourceOwnership::ExclusiveBucket,
+            ProtocolCleanupScope::BucketConfiguration,
+        ),
+        ResourceKind::ObjectPrefix => (
+            if contract
+                .ownership
+                .contains(&ProtocolResourceOwnership::ExclusiveBucket)
+            {
+                ProtocolResourceOwnership::ExclusiveBucket
+            } else {
+                ProtocolResourceOwnership::SharedBucketPrefix
+            },
+            ProtocolCleanupScope::ObjectPrefix,
+        ),
+        ResourceKind::MultipartUpload => (
+            if contract
+                .ownership
+                .contains(&ProtocolResourceOwnership::ExactMultipartUpload)
+            {
+                ProtocolResourceOwnership::ExactMultipartUpload
+            } else if contract
+                .ownership
+                .contains(&ProtocolResourceOwnership::ExclusiveBucket)
+            {
+                ProtocolResourceOwnership::ExclusiveBucket
+            } else if contract
+                .ownership
+                .contains(&ProtocolResourceOwnership::SharedBucketKey)
+            {
+                ProtocolResourceOwnership::SharedBucketKey
+            } else {
+                ProtocolResourceOwnership::SharedBucketPrefix
+            },
+            ProtocolCleanupScope::MultipartUpload,
+        ),
+        ResourceKind::ExternalIdentitySubject => (
+            ProtocolResourceOwnership::ExternalIdentity,
+            ProtocolCleanupScope::ExternalIdentity,
+        ),
+        ResourceKind::StsSession => (
+            ProtocolResourceOwnership::IdentityPrefix,
+            ProtocolCleanupScope::StsSession,
+        ),
+        ResourceKind::IamGroup
+        | ResourceKind::IamGroupMembership
+        | ResourceKind::IamPolicy
+        | ResourceKind::IamPolicyAttachment
+        | ResourceKind::IamUser => (
+            ProtocolResourceOwnership::IdentityPrefix,
+            ProtocolCleanupScope::Identity,
+        ),
+    };
+    ensure!(
+        contract.ownership.contains(&ownership),
+        "resource {:?} exceeds case {} ownership {:?}",
+        plan.kind,
+        contract.case_id,
+        contract.ownership
+    );
+    ensure!(
+        contract.cleanup_scopes.contains(&cleanup_scope),
+        "resource {:?} cleanup {:?} exceeds case {} contract",
+        plan.kind,
+        cleanup_scope,
+        contract.case_id
+    );
+    Ok((
+        Some(contract.variant_id.clone()),
+        Some(ownership),
+        Some(cleanup_scope),
+    ))
+}
+
 fn valid_transition(from: ResourceState, to: ResourceState) -> bool {
     matches!(
         (from, to),
@@ -731,7 +908,13 @@ fn valid_transition(from: ResourceState, to: ResourceState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ResourceKind, ResourceRegistry, ResourceState};
-    use crate::protocol::suite_plan::TargetFingerprint;
+    use crate::protocol::{
+        catalog::{
+            COMPAT_OBJECT_PUT_GET_DELETE, ProtocolCleanupScope, ProtocolLockResource,
+            ProtocolResourceOwnership,
+        },
+        suite_plan::TargetFingerprint,
+    };
 
     fn fingerprint() -> TargetFingerprint {
         TargetFingerprint::new(
@@ -865,5 +1048,86 @@ mod tests {
             .expect("bucket");
         registry.resources[0].depends_on = vec![handle.id];
         assert!(registry.cleanup_order().is_err());
+    }
+
+    #[test]
+    fn bound_registry_persists_descriptor_and_rejects_out_of_scope_resource() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut registry =
+            ResourceRegistry::create(dir.path(), "run", fingerprint()).expect("registry");
+        registry
+            .bind_case(COMPAT_OBJECT_PUT_GET_DELETE, "default")
+            .expect("bind case");
+        let bucket = registry
+            .plan(
+                ResourceKind::Bucket,
+                "bucket",
+                COMPAT_OBJECT_PUT_GET_DELETE,
+                Vec::new(),
+            )
+            .expect("bucket");
+        let objects = registry
+            .plan_object_prefix(
+                "bucket",
+                "cases/compat-object-put-get-delete/",
+                COMPAT_OBJECT_PUT_GET_DELETE,
+                vec![bucket.id],
+            )
+            .expect("objects");
+        assert_eq!(
+            objects.ownership,
+            Some(ProtocolResourceOwnership::ExclusiveBucket)
+        );
+        assert_eq!(
+            objects.cleanup_scope,
+            Some(ProtocolCleanupScope::ObjectPrefix)
+        );
+        assert!(
+            registry
+                .plan(
+                    ResourceKind::IamUser,
+                    "foreign-user",
+                    COMPAT_OBJECT_PUT_GET_DELETE,
+                    Vec::new(),
+                )
+                .is_err()
+        );
+
+        let reloaded = ResourceRegistry::load(dir.path()).expect("reloaded");
+        let contract = reloaded.contract.expect("bound contract");
+        assert_eq!(contract.case_id, COMPAT_OBJECT_PUT_GET_DELETE);
+        assert_eq!(contract.variant_id, "default");
+        assert!(
+            contract
+                .ownership
+                .contains(&ProtocolResourceOwnership::ExclusiveBucket)
+        );
+        assert!(
+            contract
+                .lock_requirements
+                .iter()
+                .any(|lock| lock.resource == ProtocolLockResource::Bucket)
+        );
+    }
+
+    #[test]
+    fn registry_rejects_unknown_case_variant_and_cross_case_owner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut registry =
+            ResourceRegistry::create(dir.path(), "run", fingerprint()).expect("registry");
+        assert!(registry.bind_case("unknown-case", "default").is_err());
+        assert!(
+            registry
+                .bind_case(COMPAT_OBJECT_PUT_GET_DELETE, "unknown-variant")
+                .is_err()
+        );
+        registry
+            .bind_case(COMPAT_OBJECT_PUT_GET_DELETE, "default")
+            .expect("bind case");
+        assert!(
+            registry
+                .plan(ResourceKind::Bucket, "bucket", "foreign-case", Vec::new())
+                .is_err()
+        );
     }
 }

@@ -21,7 +21,7 @@ mod sts;
 
 use crate::protocol::{
     authorization::ProtocolAuthorizationDimensions,
-    catalog::protocol_case,
+    catalog::{DEFAULT_PROTOCOL_VARIANT, ProtocolExecutor, protocol_case},
     credentials::ActorCredential,
     fixture::{naming::ProtocolResourceNamer, registry::ResourceRegistry},
     ports::{
@@ -59,6 +59,7 @@ impl ProtocolCaseExecution {
                 api_version: "rustfs.com/s3chaos/v1alpha1".to_string(),
                 kind: "ProtocolCaseReport".to_string(),
                 case_id: case_id.to_string(),
+                variant_id: DEFAULT_PROTOCOL_VARIANT.to_string(),
                 domain: protocol_case(case_id)
                     .map(|case| case.domain)
                     .unwrap_or(crate::protocol::catalog::ProtocolDomain::Other),
@@ -97,8 +98,8 @@ where
     let Some(case) = protocol_case(case_id) else {
         return ProtocolCaseExecution::not_run(case_id, "case is not present in protocol catalog");
     };
-    match case.group {
-        "bucket-policy" => {
+    match case.executor {
+        ProtocolExecutor::BucketPolicy => {
             bucket_policy::run_bucket_policy_case(
                 case_id,
                 namer,
@@ -109,10 +110,10 @@ where
             )
             .await
         }
-        "s3-compatibility" | "public-access-block" => {
+        ProtocolExecutor::Compatibility => {
             compatibility::run_compatibility_case(case_id, namer, registry, services.admin_s3).await
         }
-        "iam-user" | "iam-policy" | "iam-group" => {
+        ProtocolExecutor::Iam => {
             iam::run_iam_case(
                 case_id,
                 namer,
@@ -123,7 +124,7 @@ where
             )
             .await
         }
-        "sts-assume-role" | "sts-session-policy" => {
+        ProtocolExecutor::Sts => {
             sts::run_sts_case(
                 case_id,
                 namer,
@@ -135,7 +136,7 @@ where
             )
             .await
         }
-        "oidc-web-identity" => {
+        ProtocolExecutor::OidcWebIdentity => {
             let (Some(external_identity), Some(web_identity_sts)) =
                 (services.external_identity, services.web_identity_sts)
             else {
@@ -158,10 +159,6 @@ where
             )
             .await
         }
-        group => ProtocolCaseExecution::not_run(
-            case_id,
-            format!("protocol case group {group} has no executor"),
-        ),
     }
 }
 
@@ -211,6 +208,7 @@ impl CaseContext {
                 api_version: "rustfs.com/s3chaos/v1alpha1".to_string(),
                 kind: "ProtocolCaseReport".to_string(),
                 case_id: self.case_id,
+                variant_id: DEFAULT_PROTOCOL_VARIANT.to_string(),
                 domain,
                 status: if result.is_ok() {
                     ProtocolCaseStatus::Passed

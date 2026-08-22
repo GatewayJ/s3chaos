@@ -16,6 +16,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{
+    catalog::ProtocolCapability,
     credentials::ActorCredential,
     fixture::{
         cleanup::cleanup_registered_resources,
@@ -89,7 +90,7 @@ pub async fn preflight_protocol_suite_with_external(
     let requires_admin_api = suite
         .cases
         .iter()
-        .any(|case| case.requires.contains(&"admin-api"));
+        .any(|case| case.has_capability(ProtocolCapability::AdminApi));
     let server_info = if requires_admin_api {
         Some(admin.server_info().await?)
     } else {
@@ -99,7 +100,7 @@ pub async fn preflight_protocol_suite_with_external(
     let requires_external_identity = suite
         .cases
         .iter()
-        .any(|case| case.requires.contains(&"external-idp"));
+        .any(|case| case.has_capability(ProtocolCapability::ExternalIdp));
     let external_identity = if requires_external_identity {
         Some(
             external_identity
@@ -133,16 +134,16 @@ pub async fn preflight_protocol_suite_with_external(
     let requires_iam = suite
         .cases
         .iter()
-        .any(|case| case.requires.contains(&"iam"));
+        .any(|case| case.has_capability(ProtocolCapability::Iam));
     let requires_iam_group = suite
         .cases
         .iter()
-        .any(|case| case.requires.contains(&"iam-group"));
+        .any(|case| case.has_capability(ProtocolCapability::IamGroup));
     let requires_identity = requires_iam
         || suite
             .cases
             .iter()
-            .any(|case| case.requires.contains(&"identity"));
+            .any(|case| case.has_capability(ProtocolCapability::Identity));
     let mut identities = Vec::new();
     if requires_identity {
         identities.extend(admin.users_with_prefix(&identity_prefix).await?);
@@ -211,15 +212,15 @@ impl ProtocolProbeCapabilities {
             suite
                 .cases
                 .iter()
-                .any(|case| case.requires.contains(&capability))
+                .any(|case| case.has_capability(capability))
         };
         Self {
-            bucket_policy: requires("bucket-policy"),
-            iam: requires("iam"),
-            iam_group: requires("iam-group"),
-            assume_role: requires("sts-assume-role"),
-            versioning: requires("versioning"),
-            public_access_block: requires("public-access-block"),
+            bucket_policy: requires(ProtocolCapability::BucketPolicy),
+            iam: requires(ProtocolCapability::Iam),
+            iam_group: requires(ProtocolCapability::IamGroup),
+            assume_role: requires(ProtocolCapability::StsAssumeRole),
+            versioning: requires(ProtocolCapability::Versioning),
+            public_access_block: requires(ProtocolCapability::PublicAccessBlock),
         }
     }
 }
