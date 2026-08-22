@@ -176,8 +176,13 @@ pub struct ProtocolArtifactValidationReport {
 
 /// Renders the stable protocol JUnit artifact from the same case and cleanup results used by the
 /// JSON suite summary. `not-run` is represented as skipped; preflight, interruption, assertion,
-/// and cleanup failures remain failures so CI cannot mistake an incomplete suite for a pass.
-pub fn protocol_junit_xml(suite: &str, cases: &[(&ProtocolCaseReport, bool)]) -> String {
+/// case cleanup, and suite cleanup failures remain failures so CI cannot mistake an incomplete
+/// or cleanup-contaminated suite for a pass.
+pub fn protocol_junit_xml(
+    suite: &str,
+    cases: &[(&ProtocolCaseReport, bool)],
+    suite_cleanup_succeeded: bool,
+) -> String {
     let statuses = cases
         .iter()
         .map(|(report, cleanup_succeeded)| junit_status(report, *cleanup_succeeded))
@@ -185,7 +190,8 @@ pub fn protocol_junit_xml(suite: &str, cases: &[(&ProtocolCaseReport, bool)]) ->
     let failures = statuses
         .iter()
         .filter(|status| matches!(status, ProtocolJunitStatus::Failed { .. }))
-        .count();
+        .count()
+        + usize::from(!suite_cleanup_succeeded);
     let skipped = statuses
         .iter()
         .filter(|status| matches!(status, ProtocolJunitStatus::Skipped { .. }))
@@ -196,7 +202,7 @@ pub fn protocol_junit_xml(suite: &str, cases: &[(&ProtocolCaseReport, bool)]) ->
         xml,
         r#"<testsuite name="{}" tests="{}" failures="{}" skipped="{}">"#,
         escape_xml(suite),
-        cases.len(),
+        cases.len() + 1,
         failures,
         skipped
     )
@@ -246,6 +252,31 @@ pub fn protocol_junit_xml(suite: &str, cases: &[(&ProtocolCaseReport, bool)]) ->
         }
         writeln!(xml, "  </testcase>").expect("write to String");
     }
+    writeln!(
+        xml,
+        r#"  <testcase name="suite-cleanup" classname="s3chaos.protocol.cleanup">"#
+    )
+    .expect("write to String");
+    writeln!(xml, "    <properties>").expect("write to String");
+    write_junit_property(&mut xml, "scope", "suite");
+    write_junit_property(
+        &mut xml,
+        "status",
+        if suite_cleanup_succeeded {
+            "passed"
+        } else {
+            "cleanup-failed"
+        },
+    );
+    writeln!(xml, "    </properties>").expect("write to String");
+    if !suite_cleanup_succeeded {
+        writeln!(
+            xml,
+            r#"    <failure type="cleanup" message="cleanup">suite-level fallback cleanup failed; inspect cleanup-report.json</failure>"#
+        )
+        .expect("write to String");
+    }
+    writeln!(xml, "  </testcase>").expect("write to String");
     writeln!(xml, "</testsuite>").expect("write to String");
     xml
 }
@@ -429,10 +460,11 @@ mod tests {
                 (&interrupted, true),
                 (&cleanup, false),
             ],
+            true,
         );
         assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
         assert!(xml.contains(
-            "<testsuite name=\"suite&lt;&amp;&quot;&apos;\" tests=\"6\" failures=\"4\" skipped=\"1\">"
+            "<testsuite name=\"suite&lt;&amp;&quot;&apos;\" tests=\"7\" failures=\"4\" skipped=\"1\">"
         ));
         assert!(xml.contains("name=\"passed&lt;&amp;::v&quot;1\""));
         assert!(xml.contains("value=\"preflight-failed\""));
@@ -442,5 +474,22 @@ mod tests {
         assert!(xml.contains("expected &lt;ok&gt; &amp; got &apos;bad&apos;"));
         assert!(xml.contains('\u{fffd}'));
         assert!(!xml.contains("expected <ok>"));
+        assert!(xml.contains("name=\"suite-cleanup\""));
+        assert!(xml.contains("<property name=\"scope\" value=\"suite\"/>"));
+    }
+
+    #[test]
+    fn junit_reports_suite_cleanup_failure() {
+        let passed = report("passed", "default", ProtocolCaseStatus::Passed, None, None);
+        let xml = protocol_junit_xml("suite", &[(&passed, true)], false);
+
+        assert!(
+            xml.contains("<testsuite name=\"suite\" tests=\"2\" failures=\"1\" skipped=\"0\">")
+        );
+        assert!(xml.contains("name=\"suite-cleanup\""));
+        assert!(xml.contains("<property name=\"status\" value=\"cleanup-failed\"/>"));
+        assert!(xml.contains(
+            "<failure type=\"cleanup\" message=\"cleanup\">suite-level fallback cleanup failed"
+        ));
     }
 }

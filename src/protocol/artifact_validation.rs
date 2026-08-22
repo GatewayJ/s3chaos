@@ -32,7 +32,7 @@ use crate::protocol::{
         ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary, ProtocolSuiteSummary,
         protocol_junit_xml,
     },
-    suite_plan::ProtocolSuitePlan,
+    suite_plan::{ProtocolSuitePlan, ProtocolSuitePlanCaseContract},
 };
 
 pub const PROTOCOL_ARTIFACT_VALIDATION_REPORT: &str = "protocol-artifact-validation-report.json";
@@ -173,6 +173,12 @@ fn validate_contract(
             "case {case_id} operation history differs from its case report assertions"
         );
         let case_cleanup = read_json::<ProtocolCleanupReport>(&cleanup_path)?;
+        if planned_case.contract.is_some() {
+            ensure!(
+                case_registry_path.is_file(),
+                "case {case_id} typed plan is missing its resource registry"
+            );
+        }
         if case_registry_path.is_file() {
             let case_registry = ResourceRegistry::load_path(&case_registry_path)?;
             ensure!(
@@ -180,6 +186,9 @@ fn validate_contract(
                     && case_registry.target_fingerprint == plan.target.fingerprint,
                 "case {case_id} registry ownership differs from the suite"
             );
+            if let Some(planned_contract) = &planned_case.contract {
+                validate_registry_contract(case_id, planned_contract, &case_registry)?;
+            }
             if case_cleanup.succeeded {
                 ensure!(
                     case_registry.pending_cleanup().next().is_none(),
@@ -195,7 +204,7 @@ fn validate_contract(
         .zip(&case_cleanups)
         .map(|(report, cleanup)| (report, cleanup.succeeded))
         .collect::<Vec<_>>();
-    let expected_junit = protocol_junit_xml(&summary.suite, &junit_cases);
+    let expected_junit = protocol_junit_xml(&summary.suite, &junit_cases, cleanup.succeeded);
     let actual_junit = fs::read_to_string(root.join(PROTOCOL_JUNIT_FILE))
         .with_context(|| format!("read protocol artifact {PROTOCOL_JUNIT_FILE}"))?;
     ensure!(
@@ -326,6 +335,41 @@ fn reject_sensitive_fields(path: &Path, value: &Value) -> Result<()> {
         }
         _ => {}
     }
+    Ok(())
+}
+
+fn validate_registry_contract(
+    case_id: &str,
+    planned: &ProtocolSuitePlanCaseContract,
+    registry: &ResourceRegistry,
+) -> Result<()> {
+    let recorded = registry
+        .contract
+        .as_ref()
+        .with_context(|| format!("case {case_id} registry omitted its typed contract"))?;
+    ensure!(
+        recorded.case_id == case_id,
+        "case {case_id} registry contract records owner {}",
+        recorded.case_id
+    );
+    ensure!(
+        recorded.variant_id == planned.variant_id,
+        "case {case_id} registry variant {} differs from planned variant {}",
+        recorded.variant_id,
+        planned.variant_id
+    );
+    ensure!(
+        recorded.ownership == planned.ownership,
+        "case {case_id} registry ownership differs from the planned contract"
+    );
+    ensure!(
+        recorded.cleanup_scopes == planned.cleanup_scopes,
+        "case {case_id} registry cleanup scopes differ from the planned contract"
+    );
+    ensure!(
+        recorded.lock_requirements == planned.lock_requirements,
+        "case {case_id} registry lock requirements differ from the planned contract"
+    );
     Ok(())
 }
 

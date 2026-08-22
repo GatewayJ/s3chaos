@@ -315,7 +315,11 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         .collect::<Vec<_>>();
     fs::write(
         artifact_root.join(PROTOCOL_JUNIT_FILE),
-        protocol_junit_xml(&runtime.suite.metadata.name, &junit_cases),
+        protocol_junit_xml(
+            &runtime.suite.metadata.name,
+            &junit_cases,
+            fallback_cleanup.succeeded,
+        ),
     )
     .with_context(|| format!("write protocol artifact {PROTOCOL_JUNIT_FILE}"))?;
     let live_compatibility = case_executions
@@ -987,7 +991,8 @@ mod tests {
         preflight::{ProtocolPreflightSummary, ProtocolStaleResourceScan},
         reporting::{
             PROTOCOL_JUNIT_FILE, ProtocolAssertion, ProtocolCaseReport, ProtocolCaseStatus,
-            ProtocolCleanupReport, ProtocolSuiteSummary, protocol_junit_xml,
+            ProtocolCleanupReport, ProtocolFailureSummary, ProtocolSuiteSummary,
+            protocol_junit_xml,
         },
         suite::{ProtocolSuite, protocol_suite_template_yaml},
         suite_plan::{ProtocolSuitePlan, ProtocolSuitePlanCase, TargetFingerprint},
@@ -1274,7 +1279,15 @@ mod tests {
         .expect("suite source");
         write_json(&root.join("protocol-suite-plan.json"), &plan).expect("plan artifact");
         write_json(&root.join("preflight-summary.json"), &preflight).expect("preflight artifact");
-        ResourceRegistry::create(&root, "run", fingerprint).expect("registry");
+        ResourceRegistry::create(&root, "run", fingerprint.clone()).expect("registry");
+        let mut case_registry = ResourceRegistry::create(&case_dir, "run", fingerprint)
+            .expect("case resource registry");
+        case_registry
+            .bind_case(
+                "bucket-policy-authenticated-user-rw",
+                crate::protocol::catalog::DEFAULT_PROTOCOL_VARIANT,
+            )
+            .expect("bind case resource contract");
         let cleanup = ProtocolCleanupReport {
             api_version: suite.api_version.clone(),
             kind: "ProtocolCleanupReport".to_string(),
@@ -1323,19 +1336,135 @@ mod tests {
         write_json(&root.join("protocol-suite-summary.json"), &summary).expect("summary artifact");
         fs::write(
             root.join(PROTOCOL_JUNIT_FILE),
-            protocol_junit_xml(&summary.suite, &[(&case_report, cleanup.succeeded)]),
+            protocol_junit_xml(
+                &summary.suite,
+                &[(&case_report, cleanup.succeeded)],
+                cleanup.succeeded,
+            ),
         )
         .expect("JUnit artifact");
 
         validate_phase_one_artifacts(&root, &["not-present-secret".to_string()])
             .expect("valid artifacts");
+
+        let case_registry_path = case_dir.join(RESOURCE_REGISTRY_FILE);
+        let valid_case_registry = case_registry.clone();
+        fs::remove_file(&case_registry_path).expect("remove case registry");
+        assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+        write_json(&case_registry_path, &valid_case_registry).expect("restore case registry");
+
+        let reject_registry_tampering = |tampered: &ResourceRegistry| {
+            write_json(&case_registry_path, tampered).expect("write tampered case registry");
+            assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+            write_json(&case_registry_path, &valid_case_registry)
+                .expect("restore valid case registry");
+        };
+
+        let mut tampered = valid_case_registry.clone();
+        tampered.contract = None;
+        reject_registry_tampering(&tampered);
+
+        let mut tampered = valid_case_registry.clone();
+        tampered.contract.as_mut().expect("contract").case_id = "different-case".to_string();
+        reject_registry_tampering(&tampered);
+
+        let mut tampered = valid_case_registry.clone();
+        tampered.contract.as_mut().expect("contract").variant_id = "different-variant".to_string();
+        reject_registry_tampering(&tampered);
+
+        let mut tampered = valid_case_registry.clone();
+        tampered
+            .contract
+            .as_mut()
+            .expect("contract")
+            .ownership
+            .pop();
+        reject_registry_tampering(&tampered);
+
+        let mut tampered = valid_case_registry.clone();
+        tampered
+            .contract
+            .as_mut()
+            .expect("contract")
+            .cleanup_scopes
+            .pop();
+        reject_registry_tampering(&tampered);
+
+        let mut tampered = valid_case_registry.clone();
+        tampered
+            .contract
+            .as_mut()
+            .expect("contract")
+            .lock_requirements
+            .pop();
+        reject_registry_tampering(&tampered);
+
+        validate_phase_one_artifacts(&root, &[]).expect("restored registry contract");
+
+        let mut failed_cleanup = cleanup.clone();
+        failed_cleanup.succeeded = false;
+        failed_cleanup.leftovers = vec!["suite-resource".to_string()];
+        write_json(&root.join("cleanup-report.json"), &failed_cleanup)
+            .expect("failed suite cleanup artifact");
+        write_json(
+            &root.join("protocol-failure-summary.json"),
+            &ProtocolFailureSummary {
+                api_version: summary.api_version.clone(),
+                kind: "ProtocolFailureSummary".to_string(),
+                stage: "cleanup".to_string(),
+                classification: "cleanup-failed".to_string(),
+                case_id: None,
+                evidence: vec!["cleanup-report.json".to_string()],
+            },
+        )
+        .expect("suite cleanup failure summary");
+        let mut failed_summary = summary.clone();
+        failed_summary.status = ProtocolCaseStatus::Failed;
+        failed_summary.failure_summary = Some("protocol-failure-summary.json".to_string());
+        write_json(&root.join("protocol-suite-summary.json"), &failed_summary)
+            .expect("failed suite summary");
+        fs::write(
+            root.join(PROTOCOL_JUNIT_FILE),
+            protocol_junit_xml(&summary.suite, &[(&case_report, cleanup.succeeded)], true),
+        )
+        .expect("incorrect passing suite-cleanup JUnit artifact");
+        assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+        fs::write(
+            root.join(PROTOCOL_JUNIT_FILE),
+            protocol_junit_xml(
+                &summary.suite,
+                &[(&case_report, cleanup.succeeded)],
+                failed_cleanup.succeeded,
+            ),
+        )
+        .expect("failed suite-cleanup JUnit artifact");
+        validate_phase_one_artifacts(&root, &[]).expect("suite cleanup failure is linked to JUnit");
+
+        write_json(&root.join("cleanup-report.json"), &cleanup).expect("restore cleanup artifact");
+        write_json(&root.join("protocol-suite-summary.json"), &summary)
+            .expect("restore suite summary");
+        fs::remove_file(root.join("protocol-failure-summary.json"))
+            .expect("remove suite cleanup failure summary");
+        fs::write(
+            root.join(PROTOCOL_JUNIT_FILE),
+            protocol_junit_xml(
+                &summary.suite,
+                &[(&case_report, cleanup.succeeded)],
+                cleanup.succeeded,
+            ),
+        )
+        .expect("restore passing JUnit artifact");
         fs::remove_file(root.join(PROTOCOL_JUNIT_FILE)).expect("remove JUnit artifact");
         assert!(validate_phase_one_artifacts(&root, &[]).is_err());
         fs::write(root.join(PROTOCOL_JUNIT_FILE), "<testsuite/>").expect("tampered JUnit");
         assert!(validate_phase_one_artifacts(&root, &[]).is_err());
         fs::write(
             root.join(PROTOCOL_JUNIT_FILE),
-            protocol_junit_xml(&summary.suite, &[(&case_report, cleanup.succeeded)]),
+            protocol_junit_xml(
+                &summary.suite,
+                &[(&case_report, cleanup.succeeded)],
+                cleanup.succeeded,
+            ),
         )
         .expect("restore JUnit artifact");
         validate_phase_one_artifacts(&root, &[]).expect("restored JUnit artifacts");
