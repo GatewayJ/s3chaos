@@ -1,0 +1,250 @@
+# dm-flakey Operations
+
+This runbook prepares and tears down the host device-mapper and Kubernetes
+storage required by the `dm-flakey` and `dm-flakey-versioned-hot` scenarios.
+Use only dedicated lab hosts and storage. Verify every node, device, mount,
+PersistentVolume, and path before applying or removing resources.
+
+`dm-flakey` and `dm-flakey-versioned-hot` are explicit scenarios that need a
+dedicated static Local PV setup and privileged helper access on the fault
+namespace.
+
+There is no Make target that installs this environment. Prepare the host storage
+and Kubernetes Local PVs first, then use `fault-preflight` to verify them.
+
+## dm-flakey Host Storage
+
+Prefer real dedicated block devices. The loop-file commands below are for lab
+clusters only. Run them on the Kubernetes nodes that will host the four static
+Local PVs.
+
+On the node that will receive the device-mapper fault:
+
+```bash
+export LAB=/data/rustfs/rustfs-fault-lab
+export DM_NAME=rustfs-fault-dm
+
+sudo mkdir -p "$LAB/volume"
+sudo truncate -s 120G "$LAB/disk.img"
+export BACKING="$(sudo losetup --find --show "$LAB/disk.img")"
+export SECTORS="$(sudo blockdev --getsz "$BACKING")"
+sudo dmsetup create "$DM_NAME" --table "0 $SECTORS linear $BACKING 0"
+sudo mkfs.ext4 -F "/dev/mapper/$DM_NAME"
+sudo mount "/dev/mapper/$DM_NAME" "$LAB/volume"
+sudo chmod 0777 "$LAB/volume"
+
+sudo dmsetup table "$DM_NAME"
+findmnt -n -o SOURCE --target "$LAB/volume"
+```
+
+On each of the other three nodes:
+
+```bash
+export LAB=/data/rustfs/rustfs-fault-lab
+
+sudo mkdir -p "$LAB/volume"
+sudo truncate -s 120G "$LAB/disk.img"
+export BACKING="$(sudo losetup --find --show "$LAB/disk.img")"
+sudo mkfs.ext4 -F "$BACKING"
+sudo mount "$BACKING" "$LAB/volume"
+sudo chmod 0777 "$LAB/volume"
+findmnt -n -o SOURCE --target "$LAB/volume"
+```
+
+## dm-flakey Kubernetes Storage
+
+Create one `kubernetes.io/no-provisioner` StorageClass and exactly four `100Gi`
+Local PVs for the fault StorageClass. Each PV must point at the host path created
+above and must use node affinity for its real node name.
+
+```bash
+export RUSTFS_FAULT_TEST_EXPECTED_CONTEXT='<dedicated-context>'
+export DM_STORAGE_CLASS=rustfs-fault-dm
+export DM_MOUNT_PATH=/data/rustfs/rustfs-fault-lab/volume
+
+kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ${DM_STORAGE_CLASS}
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+EOF
+```
+
+Repeat this PV manifest for each of the four worker nodes, changing
+`<pv-name>` and `<node-name>` each time:
+
+```bash
+kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: <pv-name>
+  labels:
+    app.kubernetes.io/managed-by: s3chaos
+    rustfs.com/fault-storage: dm-flakey
+spec:
+  capacity:
+    storage: 100Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ${DM_STORAGE_CLASS}
+  local:
+    path: ${DM_MOUNT_PATH}
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - <node-name>
+EOF
+```
+
+Pre-create or update the fault namespace so the helper pod can run privileged
+and the runner can prove ownership:
+
+```bash
+export RUSTFS_FAULT_TEST_NAMESPACE="${RUSTFS_FAULT_TEST_NAMESPACE:-rustfs-fault-test}"
+export RUSTFS_FAULT_TEST_TENANT="${RUSTFS_FAULT_TEST_TENANT:-fault-test-tenant}"
+
+kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \
+  create namespace "$RUSTFS_FAULT_TEST_NAMESPACE" --dry-run=client -o yaml | \
+  kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" apply -f -
+kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \
+  label namespace "$RUSTFS_FAULT_TEST_NAMESPACE" \
+  app.kubernetes.io/managed-by=s3chaos \
+  pod-security.kubernetes.io/enforce=privileged \
+  --overwrite
+kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \
+  annotate namespace "$RUSTFS_FAULT_TEST_NAMESPACE" \
+  "rustfs.com/fault-test-tenant=$RUSTFS_FAULT_TEST_TENANT" \
+  --overwrite
+```
+
+Verify the storage setup before running the scenario:
+
+```bash
+kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \
+  get storageclass "$DM_STORAGE_CLASS"
+kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \
+  get pv -o wide | grep "$DM_STORAGE_CLASS"
+kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \
+  get namespace "$RUSTFS_FAULT_TEST_NAMESPACE" --show-labels
+```
+
+The device-mapper scenario preflight requires exactly four `Available` or
+`Bound` `100Gi` PVs in the selected static StorageClass.
+
+## dm-flakey Run
+
+Required variables on the machine that runs the s3chaos command:
+
+```bash
+export RUSTFS_FAULT_TEST_SERVER_IMAGE='docker.io/rustfs/rustfs@sha256:<digest>'
+export RUSTFS_FAULT_TEST_STORAGE_CLASS=rustfs-fault-dm
+export RUSTFS_FAULT_TEST_DM_NAME=rustfs-fault-dm
+export RUSTFS_FAULT_TEST_DM_NODE='<dm-node-name>'
+export RUSTFS_FAULT_TEST_DM_MOUNT_PATH=/data/rustfs/rustfs-fault-lab/volume
+export RUSTFS_FAULT_TEST_DM_FAULT_TABLE='0 <sectors> flakey <backing-device> 0 1 15'
+```
+
+Use the `SECTORS` and `BACKING` values from the DM node host-storage setup for
+`<sectors>` and `<backing-device>`. `RUSTFS_FAULT_TEST_DM_FAULT_TABLE` is
+required only by the legacy `dm-flakey` EIO scenario. The
+`dm-flakey-versioned-hot` crash proxy ignores it and derives a fail-closed
+`drop_writes` table from the live, single-segment linear table.
+
+Optional:
+
+```bash
+export RUSTFS_FAULT_TEST_DM_RECOVERY_TABLE='<dmsetup recovery table>'
+export RUSTFS_FAULT_TEST_DM_HELPER_IMAGE='rancher/mirrored-library-busybox:1.37.0'
+```
+
+Run:
+
+```bash
+make fault-preflight SCENARIO=dm-flakey
+make fault-run-dm
+```
+
+Run the soft-power-loss proxy with the same host/PV variables but without a
+fault-table variable:
+
+```bash
+unset RUSTFS_FAULT_TEST_DM_FAULT_TABLE
+make fault-preflight SCENARIO=dm-flakey-versioned-hot
+make fault-run SCENARIO=dm-flakey-versioned-hot
+```
+
+Its recovery boundary is intentionally owned by the host backend:
+
+1. Prove the Local PV, Pod, node, mount, mapper source, and active linear table.
+2. Switch to `up=0`, `down=86400`, `drop_writes` using `--nolockfs`, so the
+   switch does not synchronize filesystem dirty state.
+3. Run the versioned workload and require at least one successful PUT, delete
+   marker, or multipart completion with a version ID.
+4. Add a run-owned `NoSchedule` taint, force-delete the owning Pod, and unmount
+   the filesystem while `drop_writes` is still active. The unmount flush is
+   acknowledged but discarded, then releases the page cache.
+5. Restore the exact pre-injection linear table, remount with the captured
+   filesystem type/options, remove the taint, and wait for the replacement Pod
+   and Tenant to stabilize before lineage verification.
+
+The adapter refuses multi-segment or non-linear recovery tables, refuses to
+overwrite a pre-existing crash-containment taint, and keeps the node tainted if
+storage cannot be remounted. A configured recovery-table override must exactly
+match the table observed before crash injection.
+
+The Rust test reads the original `dmsetup table` as the recovery table when
+`RUSTFS_FAULT_TEST_DM_RECOVERY_TABLE` is unset. On normal failure paths it
+restores that table, but operators must still verify host storage manually after
+the run.
+
+## dm-flakey Cleanup
+
+`fault-cleanup` removes the owned Kubernetes namespace and managed Chaos
+resources only. It does not remove the static StorageClass, PVs, loop devices,
+mounts, or device-mapper device.
+
+Before removing host storage, confirm the active mount source, device-mapper
+table, and loop-device path still match this runbook's dedicated lab paths.
+Stop if any resolved target differs.
+
+```bash
+export RUSTFS_FAULT_TEST_EXPECTED_CONTEXT='<run-context>'
+export RUSTFS_FAULT_TEST_NAMESPACE='<run-namespace>'
+export RUSTFS_FAULT_TEST_TENANT='<run-tenant>'
+make fault-cleanup
+kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \
+  delete pv -l rustfs.com/fault-storage=dm-flakey
+kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \
+  delete storageclass rustfs-fault-dm
+```
+
+On the DM node:
+
+```bash
+sudo umount /data/rustfs/rustfs-fault-lab/volume
+sudo dmsetup remove rustfs-fault-dm
+sudo losetup -j /data/rustfs/rustfs-fault-lab/disk.img
+export LOOP_DEVICE='<verified-loop-device-from-losetup-output>'
+sudo losetup -d "$LOOP_DEVICE"
+sudo rm -rf /data/rustfs/rustfs-fault-lab
+```
+
+On the other three nodes:
+
+```bash
+sudo umount /data/rustfs/rustfs-fault-lab/volume
+sudo losetup -j /data/rustfs/rustfs-fault-lab/disk.img
+export LOOP_DEVICE='<verified-loop-device-from-losetup-output>'
+sudo losetup -d "$LOOP_DEVICE"
+sudo rm -rf /data/rustfs/rustfs-fault-lab
+```

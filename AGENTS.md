@@ -21,8 +21,11 @@ clearest evidence about RustFS behavior.
   the smallest change that satisfies the request.
 - State assumptions only when they affect behavior or verification. Ask only
   when a wrong assumption would materially change the result.
-- Start implementation from the latest `origin/main` and confirm the requested
-  change is not already present.
+- Preserve the checked-out branch when the task targets an existing branch,
+  pull request, or release line. For new work with no applicable task branch or
+  user-selected base, start from the latest `origin/main` and confirm the
+  requested change is not already present. Never switch branches or discard
+  existing work merely to satisfy this default.
 
 ## Repository Layout
 
@@ -111,14 +114,22 @@ target and explicit user request; this includes `fault-run`, `fault-run-dm`,
 `fault-suite-run`, `fault-dashboard-install` (Helm-installs Chaos Mesh),
 `fault-cleanup`, `protocol-suite-run`, `protocol-compatibility-mint`, and
 `protocol-cleanup`. Never start one as a side effect of an unrelated task.
-After an authorized live run, validate the artifacts
-(`fault-validate-artifacts <scenario> <artifact-root>` /
-`protocol-validate-artifacts ARTIFACT_ROOT=<root>`) BEFORE cleaning up
-(`fault-cleanup` / `protocol-cleanup`) using the exact `ARTIFACT_ROOT`
-emitted by the run's own output; never guess the path. Validation must
-precede cleanup because cleanup deletes registered fixtures — the artifact
-root is the only record of a failed or interrupted run. Do not pass
-`--allow-non-loopback` to the console unless the user asks for it.
+After an authorized live run, validate artifacts before cleanup so failed or
+interrupted evidence can be investigated while live state still exists:
+
+- Protocol cleanup is artifact-scoped. Run
+  `make protocol-validate-artifacts ARTIFACT_ROOT=<root>` and then
+  `make protocol-cleanup ARTIFACT_ROOT=<root>` with the exact
+  `ARTIFACT_ROOT` emitted by that run; never guess the path.
+- Fault cleanup is cluster-scoped, not artifact-scoped: `fault-cleanup` does
+  not consume `ARTIFACT_ROOT`. Validate the exact run with
+  `cargo run --quiet --bin s3chaos -- fault-validate-artifacts <scenario> <artifact-root>`,
+  then confirm the run's Kubernetes context, namespace, and tenant. Pin that
+  context through `RUSTFS_FAULT_TEST_EXPECTED_CONTEXT` before running
+  `make fault-cleanup`; never assume that an artifact path selects the cleanup
+  target.
+
+Do not pass `--allow-non-loopback` to the console unless the user asks for it.
 
 Never weaken a gate to get green: do not suppress lints, ignore tests, or
 relax assertions unless changing that policy is itself the reviewed task.

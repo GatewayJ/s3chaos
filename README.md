@@ -68,6 +68,11 @@ make fault-suite-validate SUITE=suite.yaml        # static suite validation
 make fault-suite-plan SUITE=suite.yaml            # dry-run expansion
 make fault-suite-run SUITE=suite.yaml             # live run (needs a cluster)
 make fault-console-serve                          # browse run artifacts
+
+# Pin the context, namespace, and tenant recorded in the run's target proof.
+export RUSTFS_FAULT_TEST_EXPECTED_CONTEXT='<run-context>'
+export RUSTFS_FAULT_TEST_NAMESPACE='<run-namespace>'
+export RUSTFS_FAULT_TEST_TENANT='<run-tenant>'
 make fault-cleanup                                # release cluster fixtures
 ```
 
@@ -82,14 +87,17 @@ eight catalog entries are roadmap placeholders with status `Planned`
 `on-disk-bitrot`, `long-run-chaos-campaign`): they appear in
 `cargo run --bin s3chaos -- fault-catalog-json` but are filtered out of
 `make fault-list` and rejected by preflight and suite validation.
+The ordered durability work queue and its safety prerequisites remain in
+[`docs/DURABILITY_FAULT_TESTING_TODO.md`](docs/DURABILITY_FAULT_TESTING_TODO.md).
 
 The two `dm-flakey*` scenarios need host preparation beyond the environment
 variables below: a device-mapper flakey table over a dedicated block device,
 a static local PV/storage class, and scenario-specific variables
 (`RUSTFS_FAULT_TEST_DM_NAME`, `RUSTFS_FAULT_TEST_DM_NODE`,
 `RUSTFS_FAULT_TEST_DM_MOUNT_PATH`, plus a fault table name for legacy
-`dm-flakey`). The required setup lives in `src/fault/backends/host.rs`;
-there is no Make target that provisions the host devices.
+`dm-flakey`). Follow [`docs/DM_FLAKEY.md`](docs/DM_FLAKEY.md) for the complete
+host device, static Local PV, privileged namespace, run, and teardown process.
+There is no Make target that provisions or removes the host devices.
 
 Required environment for non-static scenarios:
 
@@ -104,6 +112,9 @@ Workload size and concurrency are tunable via `RUSTFS_FAULT_TEST_WORKLOAD_*`
 variables; see `src/fault/config.rs`.
 `make fault-dashboard-install` mutates the current cluster (installs/upgrades
 the Chaos Mesh release via Helm); treat it like a live run.
+`make fault-cleanup` is scoped by the current Kubernetes context, namespace,
+and tenant; it does not consume an artifact root. Verify those values against
+the run and pin `RUSTFS_FAULT_TEST_EXPECTED_CONTEXT` before cleanup.
 
 ## S3 Protocol Testing
 
