@@ -181,7 +181,12 @@ pub fn compatibility_live_status(
     failure_phase: Option<&str>,
     cleanup_succeeded: bool,
 ) -> CompatibilityLiveStatus {
-    if matches!(failure_phase, Some("preflight" | "not-run")) {
+    if case_status == ProtocolCaseStatus::Skipped
+        || matches!(
+            failure_phase,
+            Some("preflight" | "not-run" | "capability-skip")
+        )
+    {
         return CompatibilityLiveStatus::NotRun;
     }
     match (case_status, cleanup_succeeded) {

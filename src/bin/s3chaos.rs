@@ -31,7 +31,10 @@ use s3chaos::protocol::{
     artifact_validation::validate_protocol_artifacts_and_write_report,
     catalog::protocol_catalog_json,
     compatibility::compatibility_catalog_json,
-    suite::{protocol_suite_template_yaml, resolve_protocol_suite_yaml},
+    suite::{
+        ProtocolExecutionProfile, protocol_suite_template_yaml, resolve_protocol_suite_yaml,
+        validate_protocol_ci_environment, validate_protocol_execution_profile_as,
+    },
     suite_runner::{
         cleanup_protocol_artifact_root, cleanup_protocol_registry_path,
         plan_protocol_suite_from_yaml, reproduce_protocol_case_from_artifacts,
@@ -62,6 +65,7 @@ async fn main() -> Result<()> {
         "protocol-catalog-json" => print_protocol_catalog_json(),
         "protocol-compatibility-status-json" => print_protocol_compatibility_status_json(),
         "protocol-cleanup" => cleanup_protocol_artifacts(args).await,
+        "protocol-ci-profile-validate" => validate_protocol_ci_profile(args),
         "protocol-suite-json" => print_protocol_suite_json(args),
         "protocol-suite-plan" => print_protocol_suite_plan(args).await,
         "protocol-suite-reproduce" => reproduce_protocol_case(args).await,
@@ -93,6 +97,7 @@ fn print_help() -> Result<()> {
     println!("  protocol-compatibility-status-json");
     println!("  protocol-cleanup <artifact-root>");
     println!("  protocol-cleanup --registry <resource-registry.json>");
+    println!("  protocol-ci-profile-validate <smoke|full|slow|external> <suite.yaml>");
     println!("  protocol-suite-json <suite.yaml>");
     println!("  protocol-suite-plan <suite.yaml>");
     println!("  protocol-suite-reproduce <artifact-root> <case-id>");
@@ -115,6 +120,25 @@ async fn reproduce_protocol_case(mut args: impl Iterator<Item = String>) -> Resu
         "protocol-suite-reproduce accepts exactly one artifact root and case id"
     );
     reproduce_protocol_case_from_artifacts(artifact_root, &case_id).await
+}
+
+fn validate_protocol_ci_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
+    validate_protocol_ci_environment()?;
+    let profile = args
+        .next()
+        .context("protocol-ci-profile-validate requires profile")?
+        .parse::<ProtocolExecutionProfile>()?;
+    let suite = args
+        .next()
+        .context("protocol-ci-profile-validate requires suite path")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-ci-profile-validate accepts exactly one profile and suite path"
+    );
+    let suite = resolve_protocol_suite_yaml(suite)?;
+    validate_protocol_execution_profile_as(&suite, Some(profile))?;
+    println!("validated {profile} protocol profile");
+    Ok(())
 }
 
 fn validate_protocol_artifacts(mut args: impl Iterator<Item = String>) -> Result<()> {

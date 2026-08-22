@@ -154,6 +154,17 @@ impl<S: ProtocolArtifactSink> ProtocolArtifactWriter<S> {
         self.sink.create_dir_all(&self.root.join(relative))
     }
 
+    pub(crate) fn create_dir(&self, relative: impl AsRef<Path>) -> Result<()> {
+        let relative = relative.as_ref();
+        self.validate_relative(relative)?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new("."));
+        self.sink.validate_destination(
+            &self.root,
+            &self.root.join(parent).join(".directory-boundary"),
+        )?;
+        self.sink.create_dir_all(&self.root.join(relative))
+    }
+
     pub(crate) fn write_json(
         &self,
         relative: impl AsRef<Path>,

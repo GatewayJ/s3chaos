@@ -14,9 +14,13 @@
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::protocol::{
-    catalog::ProtocolCapability,
+    catalog::{
+        ProtocolCapability, ProtocolCapabilityCheck, ProtocolCapabilitySource,
+        ProtocolCapabilityState,
+    },
     credentials::ActorCredential,
     fixture::{
         cleanup::cleanup_registered_resources,
@@ -48,8 +52,17 @@ pub struct ProtocolPreflightSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_identity: Option<ProtocolExternalIdentityProviderInfo>,
     pub selected_cases: Vec<String>,
+    pub capability_matrix: Vec<ProtocolCapabilityCheck>,
     pub stale_resources: ProtocolStaleResourceScan,
     pub mutating_permission_probe: ProtocolMutatingProbeSummary,
+}
+
+pub fn capability_failures(summary: &ProtocolPreflightSummary) -> Vec<&ProtocolCapabilityCheck> {
+    summary
+        .capability_matrix
+        .iter()
+        .filter(|check| check.state == ProtocolCapabilityState::Fail)
+        .collect()
 }
 
 impl From<&ProtocolPreflightSummary> for ProtocolSuitePlanPreflight {
@@ -58,6 +71,7 @@ impl From<&ProtocolPreflightSummary> for ProtocolSuitePlanPreflight {
             endpoint_reachable: summary.endpoint_reachable,
             admin_api_reachable: summary.admin_api_reachable,
             external_identity: summary.external_identity.clone(),
+            capability_matrix: summary.capability_matrix.clone(),
             stale_buckets: summary.stale_resources.buckets.clone(),
             stale_identities: summary.stale_resources.identities.clone(),
             stale_resource_policy: summary.stale_resources.policy.clone(),
@@ -82,6 +96,7 @@ pub async fn preflight_protocol_suite_with_external(
     admin: &(impl ProtocolAdminRuntimePorts + ProtocolAdminCleanupPort),
     s3: &impl ProtocolS3PreflightPorts,
     external_identity: Option<&dyn ProtocolExternalIdentityPort>,
+    external_identity_configuration_error: Option<&str>,
     stale_resource_policy: &str,
 ) -> Result<ProtocolPreflightSummary> {
     ensure!(
@@ -92,23 +107,38 @@ pub async fn preflight_protocol_suite_with_external(
         .cases
         .iter()
         .any(|case| case.has_capability(ProtocolCapability::AdminApi));
-    let server_info = if requires_admin_api {
-        Some(admin.server_info().await?)
-    } else {
-        admin.server_info().await.ok()
+    let mut failures = BTreeMap::<ProtocolCapability, String>::new();
+    let server_info = match admin.server_info().await {
+        Ok(info) => Some(info),
+        Err(error) => {
+            if requires_admin_api {
+                failures.insert(ProtocolCapability::AdminApi, error.to_string());
+            }
+            None
+        }
     };
     let admin_api_reachable = server_info.is_some();
     let requires_external_identity = suite
         .cases
         .iter()
         .any(|case| case.has_capability(ProtocolCapability::ExternalIdp));
+    let mut external_missing = false;
     let external_identity = if requires_external_identity {
-        Some(
-            external_identity
-                .context("selected protocol cases require an external identity provider")?
-                .provider_info()
-                .await?,
-        )
+        if let Some(error) = external_identity_configuration_error {
+            failures.insert(ProtocolCapability::ExternalIdp, error.to_string());
+            None
+        } else if let Some(provider) = external_identity {
+            match provider.provider_info().await {
+                Ok(info) => Some(info),
+                Err(error) => {
+                    failures.insert(ProtocolCapability::ExternalIdp, error.to_string());
+                    None
+                }
+            }
+        } else {
+            external_missing = true;
+            None
+        }
     } else {
         None
     };
@@ -131,7 +161,13 @@ pub async fn preflight_protocol_suite_with_external(
     };
     let bucket_prefix = suite.target.ownership.resource_prefixes.bucket.clone();
     let identity_prefix = suite.target.ownership.resource_prefixes.identity.clone();
-    let buckets = s3.list_buckets_with_prefix(&bucket_prefix).await?;
+    let buckets = match s3.list_buckets_with_prefix(&bucket_prefix).await {
+        Ok(buckets) => buckets,
+        Err(error) => {
+            failures.insert(ProtocolCapability::S3, error.to_string());
+            Vec::new()
+        }
+    };
     let requires_iam = suite
         .cases
         .iter()
@@ -140,26 +176,52 @@ pub async fn preflight_protocol_suite_with_external(
         .cases
         .iter()
         .any(|case| case.has_capability(ProtocolCapability::IamGroup));
-    let requires_identity = requires_iam
-        || suite
-            .cases
-            .iter()
-            .any(|case| case.has_capability(ProtocolCapability::Identity));
+    let requires_identity = suite
+        .cases
+        .iter()
+        .any(|case| case.has_capability(ProtocolCapability::Identity));
     let mut identities = Vec::new();
-    if requires_identity {
-        identities
-            .extend(ProtocolIdentityAdminPort::users_with_prefix(admin, &identity_prefix).await?);
+    if requires_identity || requires_iam {
+        match ProtocolIdentityAdminPort::users_with_prefix(admin, &identity_prefix).await {
+            Ok(users) => identities.extend(users),
+            Err(error) => {
+                record_user_scan_failure(
+                    &mut failures,
+                    requires_identity,
+                    requires_iam,
+                    error.to_string(),
+                );
+            }
+        }
     }
     if requires_iam {
-        identities
-            .extend(ProtocolPolicyAdminPort::policies_with_prefix(admin, &identity_prefix).await?);
+        match ProtocolPolicyAdminPort::policies_with_prefix(admin, &identity_prefix).await {
+            Ok(policies) => identities.extend(policies),
+            Err(error) => {
+                failures.insert(ProtocolCapability::Iam, error.to_string());
+            }
+        }
     }
     if requires_iam_group {
-        identities
-            .extend(ProtocolGroupAdminPort::groups_with_prefix(admin, &identity_prefix).await?);
+        match ProtocolGroupAdminPort::groups_with_prefix(admin, &identity_prefix).await {
+            Ok(groups) => identities.extend(groups),
+            Err(error) => {
+                failures.insert(ProtocolCapability::IamGroup, error.to_string());
+            }
+        }
     }
     identities.sort();
     identities.dedup();
+
+    let required = suite
+        .cases
+        .iter()
+        .flat_map(|case| case.capabilities.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let capability_matrix = required
+        .into_iter()
+        .map(|capability| capability_check(capability, &failures, external_missing))
+        .collect();
 
     Ok(ProtocolPreflightSummary {
         api_version: suite.api_version.clone(),
@@ -169,6 +231,7 @@ pub async fn preflight_protocol_suite_with_external(
         admin_api_reachable,
         external_identity,
         selected_cases: suite.cases.iter().map(|case| case.id.to_string()).collect(),
+        capability_matrix,
         stale_resources: ProtocolStaleResourceScan {
             bucket_prefix,
             identity_prefix,
@@ -191,6 +254,63 @@ pub fn enforce_stale_resource_policy(summary: &ProtocolPreflightSummary) -> Resu
         );
     }
     Ok(())
+}
+
+fn capability_check(
+    capability: ProtocolCapability,
+    failures: &BTreeMap<ProtocolCapability, String>,
+    external_missing: bool,
+) -> ProtocolCapabilityCheck {
+    let source = if capability == ProtocolCapability::ExternalIdp {
+        ProtocolCapabilitySource::External
+    } else {
+        ProtocolCapabilitySource::BuiltIn
+    };
+    let (state, reason) = if let Some(error) = failures.get(&capability) {
+        (
+            ProtocolCapabilityState::Fail,
+            format!("capability probe failed: {error}"),
+        )
+    } else if capability == ProtocolCapability::ExternalIdp && external_missing {
+        (
+            ProtocolCapabilityState::Skip,
+            "optional external identity provider is not configured".to_string(),
+        )
+    } else if matches!(
+        capability,
+        ProtocolCapability::Kms | ProtocolCapability::Sns
+    ) {
+        (
+            ProtocolCapabilityState::Fail,
+            "required built-in capability has no registered protocol adapter".to_string(),
+        )
+    } else {
+        (
+            ProtocolCapabilityState::Pass,
+            "required adapter is available; destructive permissions are verified by the mutating preflight probe"
+                .to_string(),
+        )
+    };
+    ProtocolCapabilityCheck {
+        capability,
+        source,
+        state,
+        reason,
+    }
+}
+
+fn record_user_scan_failure(
+    failures: &mut BTreeMap<ProtocolCapability, String>,
+    requires_identity: bool,
+    requires_iam: bool,
+    error: String,
+) {
+    if requires_identity {
+        failures.insert(ProtocolCapability::Identity, error.clone());
+    }
+    if requires_iam {
+        failures.insert(ProtocolCapability::Iam, error);
+    }
 }
 
 #[derive(Debug)]
@@ -574,10 +694,11 @@ async fn run_probe_resources(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProtocolProbeCapabilities, cleanup_interrupted_mutating_permission_probe,
-        enforce_stale_resource_policy, run_mutating_permission_probe,
+        ProtocolProbeCapabilities, capability_check, cleanup_interrupted_mutating_permission_probe,
+        enforce_stale_resource_policy, record_user_scan_failure, run_mutating_permission_probe,
     };
     use crate::protocol::{
+        catalog::{ProtocolCapability, ProtocolCapabilitySource, ProtocolCapabilityState},
         credentials::ActorCredential,
         fixture::{
             naming::ProtocolResourceNamer,
@@ -598,7 +719,21 @@ mod tests {
         },
     };
     use async_trait::async_trait;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
+
+    #[test]
+    fn iam_user_scan_failure_marks_the_required_iam_capability_failed() {
+        let mut failures = BTreeMap::new();
+        record_user_scan_failure(&mut failures, false, true, "user scan failed".to_string());
+
+        let check = capability_check(ProtocolCapability::Iam, &failures, false);
+        assert_eq!(check.state, ProtocolCapabilityState::Fail);
+        assert!(check.reason.contains("user scan failed"));
+        assert!(!failures.contains_key(&ProtocolCapability::Identity));
+    }
 
     #[derive(Default)]
     struct State {
@@ -1762,6 +1897,7 @@ mod tests {
             admin_api_reachable: true,
             external_identity: None,
             selected_cases: Vec::new(),
+            capability_matrix: Vec::new(),
             stale_resources: ProtocolStaleResourceScan {
                 bucket_prefix: "s3c".to_string(),
                 identity_prefix: "s3chaos".to_string(),
@@ -1772,5 +1908,28 @@ mod tests {
             mutating_permission_probe: ProtocolMutatingProbeSummary::not_run(),
         };
         assert!(enforce_stale_resource_policy(&summary).is_err());
+    }
+
+    #[test]
+    fn capability_matrix_distinguishes_missing_external_and_required_builtin() {
+        let external = capability_check(ProtocolCapability::ExternalIdp, &BTreeMap::new(), true);
+        assert_eq!(external.source, ProtocolCapabilitySource::External);
+        assert_eq!(external.state, ProtocolCapabilityState::Skip);
+
+        let kms = capability_check(ProtocolCapability::Kms, &BTreeMap::new(), false);
+        assert_eq!(kms.source, ProtocolCapabilitySource::BuiltIn);
+        assert_eq!(kms.state, ProtocolCapabilityState::Fail);
+
+        let mut failures = BTreeMap::new();
+        failures.insert(
+            ProtocolCapability::ExternalIdp,
+            "invalid issuer".to_string(),
+        );
+        let broken = capability_check(ProtocolCapability::ExternalIdp, &failures, false);
+        assert_eq!(broken.state, ProtocolCapabilityState::Fail);
+        assert!(broken.reason.contains("invalid issuer"));
+
+        let s3 = capability_check(ProtocolCapability::S3, &BTreeMap::new(), false);
+        assert_eq!(s3.state, ProtocolCapabilityState::Pass);
     }
 }

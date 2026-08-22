@@ -64,12 +64,24 @@ export RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY=...
 export RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY=...
 export RUSTFS_PROTOCOL_TEST_DEDICATED=1
 
+# Non-mutating planning reports the server-verified target fingerprint.
+PLAN_JSON="$(scripts/protocol-test.sh suite-plan protocol/examples/full-regression.yaml)"
+jq '.target.fingerprint' <<<"$PLAN_JSON"
+export RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT="$(
+  jq -er '.target.fingerprint.sha256' <<<"$PLAN_JSON"
+)"
+
 make protocol-suite-run SUITE=protocol/examples/full-regression.yaml
 make protocol-suite-run SUITE=protocol/examples/slow-regression.yaml
 ```
 
-The full suite selects every non-OIDC catalog case except the deliberately slow
-`sts-expired-token-denied` case. The slow suite requests RustFS's minimum
+Review the planned endpoint and deployment identity before exporting the
+fingerprint. `suite-run` compares it with a fresh preflight observation and
+fails closed if the target changed.
+
+The full suite selects non-OIDC catalog cases except the smoke-tagged case and
+the deliberately slow `sts-expired-token-denied` case; CI runs those in their
+dedicated profiles. The slow suite requests RustFS's minimum
 900-second STS lifetime, waits for expiry, and requires `ExpiredToken` from a
 signed S3 request. OIDC remains an explicit separate suite because it owns
 external identity-provider state.
@@ -94,19 +106,30 @@ file that disagrees with those reports.
 
 ## Live CI gate
 
-`.github/workflows/protocol-live.yml` runs weekly and on manual dispatch on a
-self-hosted runner labelled `rustfs-protocol`. The protected
+`.github/workflows/protocol-live.yml` runs the smoke profile for same-repository
+pull requests that change the protocol harness, and runs every profile weekly
+or on manual dispatch. Fork pull requests never receive the protected live-test
+credentials. Jobs use a self-hosted runner labelled `rustfs-protocol`. The protected
 `rustfs-protocol-test` environment must provide:
 
 - `RUSTFS_PROTOCOL_TEST_ENDPOINT`
+- `RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT`, pinned to the SHA-256 fingerprint
+  reported by the dedicated RustFS deployment
 - `RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY`
 - `RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY`
 - `RUSTFS_PROTOCOL_COMPAT_SERVER_ENDPOINT` for Docker/Mint reachability
 
-The workflow runs the native full suite, the STS expiration suite, and the
-digest-pinned Mint image. Mint uses `RUSTFS_PROTOCOL_COMPAT_STRICT=1`, so
-compatibility failures fail the job. All three jobs upload their artifacts even
-when the test command fails.
+The live profiles are deliberately disjoint: `smoke` contains deterministic
+smoke-tagged cases without external identity dependencies, `full` excludes smoke,
+slow, and external cases, `slow` contains only slow cases, and `external` contains
+only cases that require an external identity provider. Missing external configuration produces
+a structured capability skip; partial, invalid, or unreachable configuration is
+a failure. Each job preserves per-profile history as a diagnostic signal without
+retrying or changing the current run's result.
+
+The scheduled workflow also runs the digest-pinned Mint image. Mint uses
+`RUSTFS_PROTOCOL_COMPAT_STRICT=1`, so compatibility failures fail the job. All
+jobs upload their artifacts even when the test command fails.
 
 Classification coverage is not product conformance. The status JSON reports
 the entire pinned upstream denominator, while native and Mint results are the

@@ -142,6 +142,30 @@ impl fmt::Display for ProtocolCapability {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtocolCapabilitySource {
+    BuiltIn,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtocolCapabilityState {
+    Pass,
+    Skip,
+    Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolCapabilityCheck {
+    pub capability: ProtocolCapability,
+    pub source: ProtocolCapabilitySource,
+    pub state: ProtocolCapabilityState,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProtocolExecutor {
@@ -784,8 +808,8 @@ fn validate_expected_outcome(case_id: ProtocolCaseId, variant: &ProtocolVariant)
         }
         ProtocolExpectedOutcome::ExpectedDivergence { issue } => {
             ensure!(
-                !issue.trim().is_empty(),
-                "divergence issue must not be empty"
+                issue.starts_with("https://github.com/rustfs/backlog/issues/"),
+                "expected divergence must link to a rustfs/backlog issue"
             );
             Ok(())
         }
@@ -1083,6 +1107,25 @@ mod tests {
         assert!(
             serde_json::from_str::<super::ProtocolCapability>("\"future-capability\"").is_err()
         );
+    }
+
+    #[test]
+    fn expected_divergence_requires_a_backlog_issue_link() {
+        let invalid = super::ProtocolVariant {
+            id: super::ProtocolVariantId::new("divergence"),
+            expected: super::ProtocolExpectedOutcome::ExpectedDivergence { issue: "#1995" },
+        };
+        assert!(
+            super::validate_expected_outcome(super::ProtocolCaseId::new("case"), &invalid).is_err()
+        );
+        let valid = super::ProtocolVariant {
+            id: super::ProtocolVariantId::new("divergence"),
+            expected: super::ProtocolExpectedOutcome::ExpectedDivergence {
+                issue: "https://github.com/rustfs/backlog/issues/1995",
+            },
+        };
+        super::validate_expected_outcome(super::ProtocolCaseId::new("case"), &valid)
+            .expect("tracked divergence");
     }
 
     #[test]

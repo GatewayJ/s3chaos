@@ -4,8 +4,10 @@ metadata:
   name: rustfs-full-regression
 selector:
   excludeCases:
+    - bucket-policy-authenticated-user-rw
     - sts-expired-token-denied
 execution:
+  profile: full
   parallelism: 1
   defaultIsolation: case
   cleanup: always

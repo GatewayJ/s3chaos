@@ -1,6 +1,13 @@
 name: RustFS protocol live gate
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/protocol-live.yml"
+      - "protocol/**"
+      - "scripts/protocol-test.sh"
+      - "src/protocol/**"
+      - "src/bin/s3chaos.rs"
   schedule:
     - cron: "17 18 * * 0"
   workflow_dispatch:
@@ -14,25 +21,76 @@ env:
   RUSTFS_PROTOCOL_TEST_DEDICATED: "1"
 
 jobs:
-  native-regression:
-    name: Native full regression
+  smoke:
+    name: Native smoke gate
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, rustfs-protocol]
     environment: rustfs-protocol-test
-    timeout-minutes: 60
+    timeout-minutes: 20
     env:
       RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
+      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
       RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
       RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Restore smoke history
+        uses: actions/cache/restore@v4
+        with:
+          path: target/protocol-tests/.history
+          key: protocol-smoke-history-${{ github.run_id }}
+          restore-keys: protocol-smoke-history-
+      - name: Run smoke profile
+        run: scripts/protocol-test.sh profile-run smoke protocol/examples/smoke.yaml
+      - name: Save smoke history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: target/protocol-tests/.history
+          key: protocol-smoke-history-${{ github.run_id }}
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-smoke-${{ github.run_id }}
+          path: target/protocol-tests
+          if-no-files-found: error
+
+  native-regression:
+    name: Native full regression
+    needs: smoke
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux, rustfs-protocol]
+    environment: rustfs-protocol-test
+    timeout-minutes: 60
+    env:
+      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
+      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
+      RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
+      RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Restore full history
+        uses: actions/cache/restore@v4
+        with:
+          path: target/protocol-tests/.history
+          key: protocol-full-history-${{ github.run_id }}
+          restore-keys: protocol-full-history-
       - name: Validate live test configuration
         run: |
           test -n "$RUSTFS_PROTOCOL_TEST_ENDPOINT"
           test -n "$RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY"
           test -n "$RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY"
       - name: Run native full regression
-        run: scripts/protocol-test.sh suite-run protocol/examples/full-regression.yaml
+        run: scripts/protocol-test.sh profile-run full protocol/examples/full-regression.yaml
+      - name: Save full history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: target/protocol-tests/.history
+          key: protocol-full-history-${{ github.run_id }}
       - name: Upload native artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -44,24 +102,37 @@ jobs:
   expiration-regression:
     name: STS expiration regression
     needs: native-regression
-    if: always()
+    if: ${{ github.event_name != 'pull_request' && always() }}
     runs-on: [self-hosted, linux, rustfs-protocol]
     environment: rustfs-protocol-test
     timeout-minutes: 30
     env:
       RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
+      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
       RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
       RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Restore slow history
+        uses: actions/cache/restore@v4
+        with:
+          path: target/protocol-tests/.history
+          key: protocol-slow-history-${{ github.run_id }}
+          restore-keys: protocol-slow-history-
       - name: Validate live test configuration
         run: |
           test -n "$RUSTFS_PROTOCOL_TEST_ENDPOINT"
           test -n "$RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY"
           test -n "$RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY"
       - name: Run STS expiration regression
-        run: scripts/protocol-test.sh suite-run protocol/examples/slow-regression.yaml
+        run: scripts/protocol-test.sh profile-run slow protocol/examples/slow-regression.yaml
+      - name: Save slow history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: target/protocol-tests/.history
+          key: protocol-slow-history-${{ github.run_id }}
       - name: Upload expiration artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -70,10 +141,54 @@ jobs:
           path: target/protocol-tests
           if-no-files-found: error
 
+  external-regression:
+    name: External identity profile
+    needs: native-regression
+    if: ${{ github.event_name != 'pull_request' && always() }}
+    runs-on: [self-hosted, linux, rustfs-protocol]
+    environment: rustfs-protocol-test
+    timeout-minutes: 45
+    env:
+      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
+      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
+      RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
+      RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
+      RUSTFS_PROTOCOL_OIDC_ISSUER: ${{ secrets.RUSTFS_PROTOCOL_OIDC_ISSUER }}
+      RUSTFS_PROTOCOL_OIDC_ADMIN_URL: ${{ secrets.RUSTFS_PROTOCOL_OIDC_ADMIN_URL }}
+      RUSTFS_PROTOCOL_OIDC_REALM: ${{ secrets.RUSTFS_PROTOCOL_OIDC_REALM }}
+      RUSTFS_PROTOCOL_OIDC_CLIENT_ID: ${{ secrets.RUSTFS_PROTOCOL_OIDC_CLIENT_ID }}
+      RUSTFS_PROTOCOL_OIDC_CLIENT_SECRET: ${{ secrets.RUSTFS_PROTOCOL_OIDC_CLIENT_SECRET }}
+      RUSTFS_PROTOCOL_OIDC_ADMIN_USERNAME: ${{ secrets.RUSTFS_PROTOCOL_OIDC_ADMIN_USERNAME }}
+      RUSTFS_PROTOCOL_OIDC_ADMIN_PASSWORD: ${{ secrets.RUSTFS_PROTOCOL_OIDC_ADMIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Restore external history
+        uses: actions/cache/restore@v4
+        with:
+          path: target/protocol-tests/.history
+          key: protocol-external-history-${{ github.run_id }}
+          restore-keys: protocol-external-history-
+      - name: Run external profile
+        run: scripts/protocol-test.sh profile-run external protocol/examples/oidc-keycloak.yaml
+      - name: Save external history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: target/protocol-tests/.history
+          key: protocol-external-history-${{ github.run_id }}
+      - name: Upload external artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-external-${{ github.run_id }}
+          path: target/protocol-tests
+          if-no-files-found: error
+
   mint-regression:
     name: Mint strict compatibility
-    needs: expiration-regression
-    if: always()
+    needs: [expiration-regression, external-regression]
+    if: ${{ github.event_name != 'pull_request' && always() }}
     runs-on: [self-hosted, linux, rustfs-protocol]
     environment: rustfs-protocol-test
     timeout-minutes: 60

@@ -21,14 +21,17 @@ use std::{
 
 use crate::protocol::{
     clients::{
-        admin::RustfsAdminClient, keycloak::KeycloakExternalIdentityProvider, s3::ProtocolS3Client,
-        sts::RustfsStsClient, web_identity::RustfsWebIdentityStsClient,
+        admin::RustfsAdminClient,
+        keycloak::{KeycloakEnvironment, KeycloakExternalIdentityProvider},
+        s3::ProtocolS3Client,
+        sts::RustfsStsClient,
+        web_identity::RustfsWebIdentityStsClient,
     },
     credentials::{AdminCredentials, CredentialProvider, EnvCredentialProvider},
     runner::executor::{ProtocolClock, ProtocolShutdownSignal, ProtocolTimeoutPolicy},
     suite::{
         ProtocolExecutionTimeouts, ResolvedProtocolSuite, resolve_protocol_endpoint,
-        resolve_protocol_suite_yaml,
+        resolve_protocol_suite_yaml, validate_protocol_ci_environment,
     },
 };
 
@@ -46,6 +49,7 @@ pub(crate) struct ConnectedProtocolRuntime {
     pub(crate) s3: ProtocolS3Client,
     pub(crate) sts: RustfsStsClient,
     pub(crate) external_identity: Option<KeycloakExternalIdentityProvider>,
+    pub(crate) external_identity_configuration_error: Option<String>,
     pub(crate) web_identity_sts: Option<RustfsWebIdentityStsClient>,
 }
 
@@ -57,13 +61,20 @@ impl ConnectedProtocolRuntime {
         let admin = RustfsAdminClient::new(&endpoint, &suite.target.region, credentials.clone())?;
         let s3 = ProtocolS3Client::for_admin(&endpoint, &suite.target.region, &credentials).await?;
         let sts = RustfsStsClient::new(&endpoint, &suite.target.region)?;
-        let (external_identity, web_identity_sts) = match &suite.target.external_identity {
-            Some(config) => (
-                Some(KeycloakExternalIdentityProvider::from_env(&config.profile)?),
-                Some(RustfsWebIdentityStsClient::new(&endpoint)?),
-            ),
-            None => (None, None),
-        };
+        let (external_identity, external_identity_configuration_error, web_identity_sts) =
+            match &suite.target.external_identity {
+                Some(config) => {
+                    let web_identity_sts = Some(RustfsWebIdentityStsClient::new(&endpoint)?);
+                    match KeycloakExternalIdentityProvider::from_optional_env(&config.profile) {
+                        KeycloakEnvironment::Configured(provider) => {
+                            (Some(*provider), None, web_identity_sts)
+                        }
+                        KeycloakEnvironment::Missing => (None, None, web_identity_sts),
+                        KeycloakEnvironment::Broken(error) => (None, Some(error), web_identity_sts),
+                    }
+                }
+                None => (None, None, None),
+            };
         Ok(Self {
             suite,
             endpoint,
@@ -72,6 +83,7 @@ impl ConnectedProtocolRuntime {
             s3,
             sts,
             external_identity,
+            external_identity_configuration_error,
             web_identity_sts,
         })
     }
@@ -163,9 +175,66 @@ pub(crate) fn protocol_artifact_base() -> PathBuf {
 }
 
 pub(crate) fn ensure_dedicated_target_acknowledgement() -> Result<()> {
+    validate_protocol_ci_environment()?;
     ensure!(
         std::env::var("RUSTFS_PROTOCOL_TEST_DEDICATED").as_deref() == Ok("1"),
         "protocol tests require a dedicated RustFS target; set RUSTFS_PROTOCOL_TEST_DEDICATED=1 after verifying the target"
     );
     Ok(())
+}
+
+pub(crate) fn ensure_dedicated_target_fingerprint(
+    fingerprint: &crate::protocol::suite_plan::TargetFingerprint,
+) -> Result<()> {
+    let expected = std::env::var("RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT").context(
+        "RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT is required for destructive protocol tests",
+    )?;
+    validate_dedicated_target_fingerprint(fingerprint, &expected)
+}
+
+fn validate_dedicated_target_fingerprint(
+    fingerprint: &crate::protocol::suite_plan::TargetFingerprint,
+    expected: &str,
+) -> Result<()> {
+    ensure!(
+        !fingerprint.deployment_id.starts_with("s3-endpoint:"),
+        "protocol destructive tests require a server-verified deployment fingerprint"
+    );
+    ensure!(
+        expected == fingerprint.sha256,
+        "refuse destructive protocol tests because the dedicated target fingerprint changed: expected {expected}, observed {}",
+        fingerprint.sha256
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_dedicated_target_fingerprint;
+    use crate::protocol::suite_plan::TargetFingerprint;
+
+    #[test]
+    fn destructive_target_gate_requires_server_identity_and_exact_pin() {
+        let verified = TargetFingerprint::new(
+            "http://127.0.0.1:9000",
+            "us-east-1",
+            "deployment",
+            None,
+            None,
+        )
+        .expect("fingerprint");
+        validate_dedicated_target_fingerprint(&verified, &verified.sha256)
+            .expect("matching fingerprint");
+        assert!(validate_dedicated_target_fingerprint(&verified, "changed").is_err());
+
+        let synthetic = TargetFingerprint::new(
+            "http://127.0.0.1:9000",
+            "us-east-1",
+            "s3-endpoint:http://127.0.0.1:9000",
+            None,
+            None,
+        )
+        .expect("synthetic fingerprint");
+        assert!(validate_dedicated_target_fingerprint(&synthetic, &synthetic.sha256).is_err());
+    }
 }

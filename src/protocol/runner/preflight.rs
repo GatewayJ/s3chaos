@@ -21,6 +21,7 @@ use crate::protocol::{
         preflight_protocol_suite_with_external,
     },
     runner::runtime::ConnectedProtocolRuntime,
+    suite::{validate_protocol_ci_environment, validate_protocol_execution_profile},
 };
 
 /// Runs target inspection after the composition root has built its adapters.
@@ -29,6 +30,8 @@ use crate::protocol::{
 pub(crate) async fn run_connected_preflight(
     runtime: &ConnectedProtocolRuntime,
 ) -> Result<ProtocolPreflightSummary> {
+    validate_protocol_ci_environment()?;
+    validate_protocol_execution_profile(&runtime.suite)?;
     let preflight = preflight_protocol_suite_with_external(
         &runtime.suite,
         &runtime.endpoint,
@@ -38,6 +41,7 @@ pub(crate) async fn run_connected_preflight(
             .external_identity
             .as_ref()
             .map(|provider| provider as &dyn ProtocolExternalIdentityPort),
+        runtime.external_identity_configuration_error.as_deref(),
         stale_resource_policy()?,
     )
     .await?;

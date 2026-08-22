@@ -60,6 +60,8 @@ pub struct ProtocolSuiteSelector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProtocolSuiteExecution {
+    #[serde(default)]
+    pub profile: ProtocolExecutionProfile,
     pub parallelism: usize,
     pub default_isolation: ProtocolSuiteIsolation,
     pub cleanup: ProtocolCleanupPolicy,
@@ -90,6 +92,50 @@ impl Default for ProtocolExecutionTimeouts {
 pub enum ProtocolArtifactRetentionPolicy {
     #[default]
     Preserve,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtocolExecutionProfile {
+    #[default]
+    Custom,
+    Smoke,
+    Full,
+    Slow,
+    External,
+}
+
+impl ProtocolExecutionProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Custom => "custom",
+            Self::Smoke => "smoke",
+            Self::Full => "full",
+            Self::Slow => "slow",
+            Self::External => "external",
+        }
+    }
+}
+
+impl std::fmt::Display for ProtocolExecutionProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ProtocolExecutionProfile {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "custom" => Ok(Self::Custom),
+            "smoke" => Ok(Self::Smoke),
+            "full" => Ok(Self::Full),
+            "slow" => Ok(Self::Slow),
+            "external" => Ok(Self::External),
+            _ => bail!("unknown protocol execution profile {value}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +236,69 @@ pub struct ResolvedProtocolSuite {
     pub execution: ProtocolSuiteExecution,
     pub target: ProtocolSuiteTarget,
     pub cases: Vec<&'static ProtocolCase>,
+}
+
+pub fn validate_protocol_execution_profile(suite: &ResolvedProtocolSuite) -> Result<()> {
+    let expected = std::env::var("RUSTFS_PROTOCOL_CI_PROFILE")
+        .ok()
+        .map(|profile| profile.parse())
+        .transpose()?;
+    validate_protocol_execution_profile_as(suite, expected)
+}
+
+pub fn validate_protocol_ci_environment() -> Result<()> {
+    if std::env::var("CI").is_ok() {
+        for name in [
+            "RUSTFS_PROTOCOL_TEST_ALLOW_STALE",
+            "RUSTFS_PROTOCOL_TEST_ALLOW_WIDE_CLEANUP",
+            "RUSTFS_PROTOCOL_TEST_DEBUG",
+            "RUSTFS_PROTOCOL_TEST_SKIP_TARGET_FINGERPRINT",
+        ] {
+            ensure!(
+                std::env::var(name).is_err(),
+                "{name} is forbidden in CI protocol profiles"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_protocol_execution_profile_as(
+    suite: &ResolvedProtocolSuite,
+    expected: Option<ProtocolExecutionProfile>,
+) -> Result<()> {
+    if let Some(expected) = expected {
+        ensure!(
+            expected == suite.execution.profile,
+            "suite profile {} does not match requested CI profile {expected}",
+            suite.execution.profile
+        );
+    }
+    for case in &suite.cases {
+        let allowed = match suite.execution.profile {
+            ProtocolExecutionProfile::Custom => true,
+            ProtocolExecutionProfile::Smoke => {
+                case.tags.contains(&"smoke")
+                    && !case.has_capability(ProtocolCapability::ExternalIdp)
+            }
+            ProtocolExecutionProfile::Full => {
+                !case.tags.contains(&"smoke")
+                    && !case.tags.contains(&"slow")
+                    && !case.has_capability(ProtocolCapability::ExternalIdp)
+            }
+            ProtocolExecutionProfile::Slow => case.tags.contains(&"slow"),
+            ProtocolExecutionProfile::External => {
+                case.has_capability(ProtocolCapability::ExternalIdp)
+            }
+        };
+        ensure!(
+            allowed,
+            "case {} is not allowed by {} protocol profile",
+            case.id,
+            suite.execution.profile
+        );
+    }
+    Ok(())
 }
 
 impl ProtocolSuite {
@@ -460,6 +569,7 @@ selector:
   tags:
     - smoke
 execution:
+  profile: smoke
   parallelism: 1
   defaultIsolation: case
   cleanup: always
@@ -486,8 +596,9 @@ target:
 #[cfg(test)]
 mod tests {
     use super::{
-        ProtocolSuite, ProtocolSuiteSelector, protocol_suite_template_yaml, resolve_cases,
-        resolve_protocol_endpoint,
+        ProtocolExecutionProfile, ProtocolSuite, ProtocolSuiteSelector,
+        protocol_suite_template_yaml, resolve_cases, resolve_protocol_endpoint,
+        validate_protocol_execution_profile_as,
     };
     use crate::protocol::catalog::{
         COMPAT_BUCKET_HEAD, COMPAT_BUCKET_LIST_CREATE_DELETE, COMPAT_LIST_OBJECTS_BASIC,
@@ -503,6 +614,54 @@ mod tests {
         let resolved = suite.resolve().expect("resolved suite");
         assert_eq!(resolved.cases.len(), 1);
         assert_eq!(resolved.cases[0].id, "bucket-policy-authenticated-user-rw");
+        validate_protocol_execution_profile_as(&resolved, Some(ProtocolExecutionProfile::Smoke))
+            .expect("smoke profile");
+    }
+
+    #[test]
+    fn omitted_profile_preserves_unconstrained_legacy_suite_semantics() {
+        let yaml = protocol_suite_template_yaml()
+            .replace("  profile: smoke\n", "")
+            .replace(
+                "  groups:\n    - bucket-policy\n  tags:\n    - smoke\n",
+                "  cases:\n    - compat-object-put-get-delete\n",
+            );
+        let suite: ProtocolSuite = serde_yaml_ng::from_str(&yaml).expect("legacy suite");
+        let resolved = suite.resolve().expect("resolved legacy suite");
+
+        assert_eq!(resolved.execution.profile, ProtocolExecutionProfile::Custom);
+        validate_protocol_execution_profile_as(&resolved, None)
+            .expect("custom profile does not constrain legacy selection");
+    }
+
+    #[test]
+    fn ci_profiles_reject_mismatched_or_wide_case_selection() {
+        let resolve_example = |name: &str| {
+            ProtocolSuite::from_yaml_path(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("protocol/examples")
+                    .join(name),
+            )
+            .expect("profile suite")
+            .resolve()
+            .expect("resolved profile suite")
+        };
+        let full = resolve_example("full-regression.yaml");
+        validate_protocol_execution_profile_as(&full, Some(ProtocolExecutionProfile::Full))
+            .expect("full profile");
+        assert!(full.cases.iter().all(|case| !case.tags.contains(&"smoke")));
+        assert!(
+            validate_protocol_execution_profile_as(&full, Some(ProtocolExecutionProfile::Smoke))
+                .is_err()
+        );
+
+        let slow = resolve_example("slow-regression.yaml");
+        validate_protocol_execution_profile_as(&slow, Some(ProtocolExecutionProfile::Slow))
+            .expect("slow profile");
+
+        let external = resolve_example("oidc-keycloak.yaml");
+        validate_protocol_execution_profile_as(&external, Some(ProtocolExecutionProfile::External))
+            .expect("external profile");
     }
 
     #[test]
