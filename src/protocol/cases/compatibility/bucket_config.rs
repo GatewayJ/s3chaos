@@ -24,7 +24,7 @@ use crate::protocol::{
         registry::ResourceRegistry,
         resources::{create_public_access_block, create_s3_bucket, delete_public_access_block},
     },
-    ports::{ProtocolPublicAccessBlock, ProtocolS3Port},
+    ports::{ProtocolBucketConfigPort, ProtocolBucketPort, ProtocolPublicAccessBlock},
     reporting::ProtocolAssertionClass,
 };
 
@@ -32,7 +32,7 @@ pub(super) async fn run_public_access_block(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    s3: &impl ProtocolS3Port,
+    s3: &(impl ProtocolBucketConfigPort + ProtocolBucketPort),
     context: &mut CaseContext,
 ) -> Result<()> {
     let bucket = namer.bucket(case_id, 0)?;

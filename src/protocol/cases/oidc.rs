@@ -33,7 +33,8 @@ use crate::protocol::{
         resources::transition_external,
     },
     ports::{
-        ActorS3ClientFactory, ProtocolAdminPort, ProtocolExternalIdentityPort, ProtocolS3Port,
+        ActorS3ClientFactory, ProtocolBucketPort, ProtocolExternalIdentityPort,
+        ProtocolListingPort, ProtocolObjectPort, ProtocolPolicyAdminPort,
         ProtocolWebIdentityRequest, ProtocolWebIdentityStsPort,
     },
 };
@@ -53,8 +54,8 @@ pub(crate) async fn run_oidc_case<A, S, F>(
     services: OidcCaseServices<'_, A, S, F>,
 ) -> ProtocolCaseExecution
 where
-    A: ProtocolAdminPort,
-    S: ProtocolS3Port,
+    A: ProtocolPolicyAdminPort,
+    S: ProtocolBucketPort + ProtocolObjectPort,
     F: ActorS3ClientFactory,
 {
     let mut context = CaseContext::new(
@@ -79,8 +80,8 @@ async fn run_basic<A, S, F>(
     context: &mut CaseContext,
 ) -> Result<()>
 where
-    A: ProtocolAdminPort,
-    S: ProtocolS3Port,
+    A: ProtocolPolicyAdminPort,
+    S: ProtocolBucketPort + ProtocolObjectPort,
     F: ActorS3ClientFactory,
 {
     let case_id = OIDC_WEB_IDENTITY_BASIC;
@@ -271,11 +272,12 @@ mod tests {
             registry::{ResourceKind, ResourceRegistry},
         },
         ports::{
-            ActorS3ClientFactory, ProtocolAdminError, ProtocolAdminPort,
+            ActorS3ClientFactory, ProtocolAdminError, ProtocolBucketPort,
             ProtocolExternalIdentityCoordinates, ProtocolExternalIdentityError,
             ProtocolExternalIdentityPort, ProtocolExternalIdentityProviderInfo,
-            ProtocolObjectVersion, ProtocolS3Error, ProtocolS3Port, ProtocolServerInfo,
-            ProtocolStsError, ProtocolWebIdentityRequest, ProtocolWebIdentityStsPort,
+            ProtocolListObjectsResult, ProtocolListingPort, ProtocolObjectPort,
+            ProtocolPolicyAdminPort, ProtocolS3Error, ProtocolStsError, ProtocolWebIdentityRequest,
+            ProtocolWebIdentityStsPort,
         },
         reporting::ProtocolCaseStatus,
         suite_plan::TargetFingerprint,
@@ -319,36 +321,21 @@ mod tests {
     }
 
     #[async_trait]
-    impl ProtocolAdminPort for FakeAdmin {
-        async fn server_info(&self) -> std::result::Result<ProtocolServerInfo, ProtocolAdminError> {
-            Ok(ProtocolServerInfo {
-                deployment_id: "deployment".to_string(),
-                mode: None,
-                region: None,
-            })
-        }
-
-        async fn users_with_prefix(
+    impl ProtocolPolicyAdminPort for FakeAdmin {
+        async fn policies_with_prefix(
             &self,
-            _prefix: &str,
+            prefix: &str,
         ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
-            Ok(Vec::new())
+            Ok(self
+                .state
+                .lock()
+                .expect("state")
+                .policies
+                .iter()
+                .filter(|name| name.starts_with(prefix))
+                .cloned()
+                .collect())
         }
-
-        async fn create_user(
-            &self,
-            _credential: &ActorCredential,
-        ) -> std::result::Result<(), ProtocolAdminError> {
-            Ok(())
-        }
-
-        async fn remove_user(
-            &self,
-            _access_key: &str,
-        ) -> std::result::Result<(), ProtocolAdminError> {
-            Ok(())
-        }
-
         async fn create_policy(
             &self,
             name: &str,
@@ -361,10 +348,39 @@ mod tests {
                 .insert(name.to_string());
             Ok(())
         }
+
+        async fn remove_policy(&self, name: &str) -> Result<(), ProtocolAdminError> {
+            self.state.lock().expect("state").policies.remove(name);
+            Ok(())
+        }
+
+        async fn attach_policy(
+            &self,
+            _policy: &str,
+            _principal: &str,
+            _is_group: bool,
+        ) -> Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+        async fn detach_policy(
+            &self,
+            _policy: &str,
+            _principal: &str,
+            _is_group: bool,
+        ) -> Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+        async fn policy_attached(
+            &self,
+            _policy: &str,
+            _principal: &str,
+            _is_group: bool,
+        ) -> Result<bool, ProtocolAdminError> {
+            Ok(false)
+        }
     }
 
-    #[async_trait]
-    impl ProtocolS3Port for FakeS3 {
+    impl FakeS3 {
         async fn list_buckets_with_prefix(
             &self,
             prefix: &str,
@@ -391,21 +407,6 @@ mod tests {
 
         async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), ProtocolS3Error> {
             self.state.lock().expect("state").buckets.remove(bucket);
-            Ok(())
-        }
-
-        async fn put_bucket_policy(
-            &self,
-            _bucket: &str,
-            _policy: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
-            Ok(())
-        }
-
-        async fn delete_bucket_policy(
-            &self,
-            _bucket: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
             Ok(())
         }
 
@@ -474,21 +475,88 @@ mod tests {
             }
             Ok(())
         }
+    }
 
-        async fn list_object_versions(
+    #[async_trait]
+    impl ProtocolBucketPort for FakeS3 {
+        async fn list_buckets_with_prefix(
             &self,
-            _bucket: &str,
-        ) -> std::result::Result<Vec<ProtocolObjectVersion>, ProtocolS3Error> {
-            Ok(Vec::new())
+            prefix: &str,
+        ) -> Result<Vec<String>, ProtocolS3Error> {
+            FakeS3::list_buckets_with_prefix(self, prefix).await
         }
+        async fn create_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+            FakeS3::create_bucket(self, bucket).await
+        }
+        async fn delete_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+            FakeS3::delete_bucket(self, bucket).await
+        }
+        async fn head_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+            self.state
+                .lock()
+                .expect("state")
+                .buckets
+                .contains_key(bucket)
+                .then_some(())
+                .ok_or_else(|| ProtocolS3Error {
+                    code: "NoSuchBucket".to_string(),
+                    status: Some(404),
+                    request_id: None,
+                })
+        }
+    }
 
-        async fn delete_object_version(
+    #[async_trait]
+    impl ProtocolListingPort for FakeS3 {
+        async fn list_objects(&self, bucket: &str) -> Result<Vec<String>, ProtocolS3Error> {
+            FakeS3::list_objects(self, bucket).await
+        }
+        async fn list_objects_v2_summary(
             &self,
-            _bucket: &str,
-            _key: &str,
-            _version_id: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
-            Ok(())
+            bucket: &str,
+        ) -> Result<ProtocolListObjectsResult, ProtocolS3Error> {
+            let keys = FakeS3::list_objects(self, bucket).await?;
+            Ok(ProtocolListObjectsResult {
+                key_count: keys.len(),
+                keys,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ProtocolObjectPort for FakeS3 {
+        async fn put_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            body: &[u8],
+        ) -> Result<(), ProtocolS3Error> {
+            FakeS3::put_object(self, bucket, key, body).await
+        }
+        async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, ProtocolS3Error> {
+            FakeS3::get_object(self, bucket, key).await
+        }
+        async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ProtocolS3Error> {
+            FakeS3::delete_object(self, bucket, key).await
+        }
+        async fn copy_object(
+            &self,
+            bucket: &str,
+            source_key: &str,
+            destination_key: &str,
+        ) -> Result<(), ProtocolS3Error> {
+            let body = FakeS3::get_object(self, bucket, source_key).await?;
+            FakeS3::put_object(self, bucket, destination_key, &body).await
+        }
+        async fn delete_objects(
+            &self,
+            bucket: &str,
+            keys: &[String],
+        ) -> Result<Vec<String>, ProtocolS3Error> {
+            for key in keys {
+                FakeS3::delete_object(self, bucket, key).await?;
+            }
+            Ok(Vec::new())
         }
     }
 

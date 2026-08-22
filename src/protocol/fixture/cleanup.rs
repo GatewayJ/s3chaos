@@ -18,24 +18,25 @@ use std::time::Duration;
 use crate::protocol::{
     fixture::registry::{ResourceHandle, ResourceKind, ResourceRegistry, ResourceState},
     ports::{
-        ProtocolAdminError, ProtocolAdminPort, ProtocolExternalIdentityError,
-        ProtocolExternalIdentityPort, ProtocolS3Error, ProtocolS3Port,
+        ExclusiveBucketOwnership, ProtocolAdminCleanupPort, ProtocolAdminError,
+        ProtocolExternalIdentityError, ProtocolExternalIdentityPort, ProtocolS3CleanupPort,
+        ProtocolS3Error,
     },
     reporting::{ProtocolCleanupAttempt, ProtocolCleanupReport},
 };
 
 pub(crate) async fn cleanup_registered_resources(
     registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    s3: &impl ProtocolS3Port,
+    admin: &impl ProtocolAdminCleanupPort,
+    s3: &impl ProtocolS3CleanupPort,
 ) -> ProtocolCleanupReport {
     cleanup_registered_resources_with_external(registry, admin, s3, None).await
 }
 
 pub(crate) async fn cleanup_registered_resources_with_external(
     registry: &mut ResourceRegistry,
-    admin: &impl ProtocolAdminPort,
-    s3: &impl ProtocolS3Port,
+    admin: &impl ProtocolAdminCleanupPort,
+    s3: &impl ProtocolS3CleanupPort,
     external_identity: Option<&dyn ProtocolExternalIdentityPort>,
 ) -> ProtocolCleanupReport {
     let mut resources = match registry.cleanup_order() {
@@ -157,8 +158,8 @@ struct CleanupFailure {
 
 async fn cleanup_resource_with_retry(
     resource: &ResourceHandle,
-    admin: &impl ProtocolAdminPort,
-    s3: &impl ProtocolS3Port,
+    admin: &impl ProtocolAdminCleanupPort,
+    s3: &impl ProtocolS3CleanupPort,
     external_identity: Option<&dyn ProtocolExternalIdentityPort>,
     versioned_cleanup: bool,
 ) -> std::result::Result<CleanupSuccess, CleanupFailure> {
@@ -201,39 +202,36 @@ async fn cleanup_resource_with_retry(
 
 async fn verify_resource_absent(
     resource: &ResourceHandle,
-    admin: &impl ProtocolAdminPort,
-    s3: &impl ProtocolS3Port,
+    admin: &impl ProtocolAdminCleanupPort,
+    s3: &impl ProtocolS3CleanupPort,
     external_identity: Option<&dyn ProtocolExternalIdentityPort>,
     versioned_cleanup: bool,
 ) -> std::result::Result<(), CleanupError> {
     match resource.kind {
         ResourceKind::Bucket => verify_exact_absence(
             resource,
-            s3.list_buckets_with_prefix(&resource.name)
+            s3.cleanup_bucket_names(&resource.name)
                 .await
                 .map_err(CleanupError::S3)?,
         ),
-        ResourceKind::BucketPolicy => match s3.get_bucket_policy(&resource.name).await {
-            Err(error) if matches!(error.code.as_str(), "NoSuchBucketPolicy" | "NoSuchBucket") => {
-                Ok(())
-            }
-            Err(error) => Err(CleanupError::S3(error)),
-            Ok(_) => Err(CleanupError::NotConverged(format!(
+        ResourceKind::BucketPolicy => match s3
+            .cleanup_bucket_policy_exists(&resource.name)
+            .await
+            .map_err(CleanupError::S3)?
+        {
+            false => Ok(()),
+            true => Err(CleanupError::NotConverged(format!(
                 "bucket policy {} is still visible after deletion",
                 resource.name
             ))),
         },
-        ResourceKind::PublicAccessBlock => match s3.get_public_access_block(&resource.name).await {
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    "NoSuchPublicAccessBlockConfiguration" | "NoSuchBucket"
-                ) =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(CleanupError::S3(error)),
-            Ok(_) => Err(CleanupError::NotConverged(format!(
+        ResourceKind::PublicAccessBlock => match s3
+            .cleanup_public_access_block_exists(&resource.name)
+            .await
+            .map_err(CleanupError::S3)?
+        {
+            false => Ok(()),
+            true => Err(CleanupError::NotConverged(format!(
                 "public access block {} is still visible after deletion",
                 resource.name
             ))),
@@ -259,16 +257,16 @@ async fn verify_resource_absent(
             let key = resource.key_prefix.as_deref().ok_or_else(|| {
                 CleanupError::Contract("multipart upload resource omitted object key".to_string())
             })?;
-            let uploads = s3
-                .list_multipart_uploads(bucket, key)
+            let upload_id = multipart_upload_id(resource)?;
+            let exists = s3
+                .cleanup_multipart_upload_exists(bucket, key, upload_id)
                 .await
                 .map_err(CleanupError::S3)?;
-            if uploads.is_empty() {
+            if !exists {
                 Ok(())
             } else {
                 Err(CleanupError::NotConverged(format!(
-                    "{} multipart upload(s) remain for {bucket}/{key}",
-                    uploads.len()
+                    "multipart upload {upload_id} remains for {bucket}/{key}",
                 )))
             }
         }
@@ -279,18 +277,10 @@ async fn verify_resource_absent(
             let prefix = resource.key_prefix.as_deref().ok_or_else(|| {
                 CleanupError::Contract("object prefix resource omitted key prefix".to_string())
             })?;
-            let current = s3.list_objects(bucket).await.map_err(CleanupError::S3)?;
-            let versions = if versioned_cleanup {
-                s3.list_object_versions(bucket)
-                    .await
-                    .map_err(CleanupError::S3)?
-            } else {
-                Vec::new()
-            };
-            if current.iter().any(|key| key.starts_with(prefix))
-                || versions
-                    .iter()
-                    .any(|version| version.key.starts_with(prefix))
+            if s3
+                .cleanup_object_prefix_exists(bucket, prefix, versioned_cleanup)
+                .await
+                .map_err(CleanupError::S3)?
             {
                 Err(CleanupError::NotConverged(format!(
                     "object prefix {bucket}/{prefix} is still visible after cleanup"
@@ -388,18 +378,18 @@ fn verify_exact_absence(
 
 async fn cleanup_resource(
     resource: &ResourceHandle,
-    admin: &impl ProtocolAdminPort,
-    s3: &impl ProtocolS3Port,
+    admin: &impl ProtocolAdminCleanupPort,
+    s3: &impl ProtocolS3CleanupPort,
     external_identity: Option<&dyn ProtocolExternalIdentityPort>,
     versioned_cleanup: bool,
 ) -> std::result::Result<(), CleanupError> {
     match resource.kind {
         ResourceKind::BucketPolicy => s3
-            .delete_bucket_policy(&resource.name)
+            .cleanup_delete_bucket_policy(&resource.name)
             .await
             .map_err(CleanupError::S3),
         ResourceKind::PublicAccessBlock => s3
-            .delete_public_access_block(&resource.name)
+            .cleanup_delete_public_access_block(&resource.name)
             .await
             .map_err(CleanupError::S3),
         ResourceKind::MultipartUpload => {
@@ -409,19 +399,10 @@ async fn cleanup_resource(
             let key = resource.key_prefix.as_deref().ok_or_else(|| {
                 CleanupError::Contract("multipart upload resource omitted object key".to_string())
             })?;
-            let upload_ids = if let Some(upload_id) = &resource.upload_id {
-                vec![upload_id.clone()]
-            } else {
-                s3.list_multipart_uploads(bucket, key)
-                    .await
-                    .map_err(CleanupError::S3)?
-            };
-            for upload_id in upload_ids {
-                s3.abort_multipart_upload(bucket, key, &upload_id)
-                    .await
-                    .map_err(CleanupError::S3)?;
-            }
-            Ok(())
+            let upload_id = multipart_upload_id(resource)?;
+            s3.cleanup_abort_multipart_upload(bucket, key, upload_id)
+                .await
+                .map_err(CleanupError::S3)
         }
         ResourceKind::ExternalIdentitySubject => {
             let provider = external_identity.ok_or_else(|| {
@@ -437,18 +418,20 @@ async fn cleanup_resource(
             let bucket = resource.bucket.as_deref().ok_or_else(|| {
                 CleanupError::Contract("object prefix resource omitted bucket".to_string())
             })?;
-            s3.empty_bucket(bucket, versioned_cleanup)
+            let prefix = resource.key_prefix.as_deref().ok_or_else(|| {
+                CleanupError::Contract("object prefix resource omitted key prefix".to_string())
+            })?;
+            s3.cleanup_object_prefix(bucket, prefix, versioned_cleanup)
                 .await
                 .map_err(CleanupError::S3)
         }
-        ResourceKind::Bucket => {
-            s3.empty_bucket(&resource.name, versioned_cleanup)
-                .await
-                .map_err(CleanupError::S3)?;
-            s3.delete_bucket(&resource.name)
-                .await
-                .map_err(CleanupError::S3)
-        }
+        ResourceKind::Bucket => s3
+            .cleanup_exclusive_bucket(
+                ExclusiveBucketOwnership::registry_owned(&resource.name),
+                versioned_cleanup,
+            )
+            .await
+            .map_err(CleanupError::S3),
         ResourceKind::IamPolicyAttachment => {
             let policy = resource.policy.as_deref().ok_or_else(|| {
                 CleanupError::Contract("IAM policy attachment omitted policy".to_string())
@@ -499,6 +482,15 @@ async fn cleanup_resource(
                 .map_err(CleanupError::Admin)
         }
     }
+}
+
+fn multipart_upload_id(resource: &ResourceHandle) -> std::result::Result<&str, CleanupError> {
+    resource.upload_id.as_deref().ok_or_else(|| {
+        CleanupError::Contract(format!(
+            "multipart upload {} omitted uploadId; refusing unscoped cleanup",
+            resource.name
+        ))
+    })
 }
 
 fn verify_external_identity(
@@ -604,13 +596,13 @@ impl fmt::Display for CleanupError {
 mod tests {
     use super::{cleanup_registered_resources, cleanup_registered_resources_with_external};
     use crate::protocol::{
-        credentials::{ActorCredential, ExternalIdentityCredential, WebIdentityToken},
+        credentials::{ExternalIdentityCredential, WebIdentityToken},
         fixture::registry::{ResourceKind, ResourceRegistry, ResourceState},
         ports::{
-            ProtocolAdminError, ProtocolAdminPort, ProtocolExternalIdentityCoordinates,
-            ProtocolExternalIdentityError, ProtocolExternalIdentityPort,
-            ProtocolExternalIdentityProviderInfo, ProtocolObjectVersion, ProtocolS3Error,
-            ProtocolS3Port, ProtocolServerInfo,
+            ExclusiveBucketOwnership, ProtocolAdminCleanupPort, ProtocolAdminError,
+            ProtocolExternalIdentityCoordinates, ProtocolExternalIdentityError,
+            ProtocolExternalIdentityPort, ProtocolExternalIdentityProviderInfo,
+            ProtocolObjectVersion, ProtocolS3CleanupPort, ProtocolS3Error,
         },
         suite_plan::TargetFingerprint,
     };
@@ -700,27 +692,12 @@ mod tests {
     }
 
     #[async_trait]
-    impl ProtocolAdminPort for FakeAdmin {
-        async fn server_info(&self) -> std::result::Result<ProtocolServerInfo, ProtocolAdminError> {
-            Ok(ProtocolServerInfo {
-                deployment_id: "deployment".to_string(),
-                mode: None,
-                region: None,
-            })
-        }
-
+    impl ProtocolAdminCleanupPort for FakeAdmin {
         async fn users_with_prefix(
             &self,
             _prefix: &str,
         ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
             Ok(Vec::new())
-        }
-
-        async fn create_user(
-            &self,
-            _credential: &ActorCredential,
-        ) -> std::result::Result<(), ProtocolAdminError> {
-            Ok(())
         }
 
         async fn remove_user(
@@ -729,30 +706,88 @@ mod tests {
         ) -> std::result::Result<(), ProtocolAdminError> {
             Ok(())
         }
-    }
 
-    #[async_trait]
-    impl ProtocolAdminPort for EventuallyConsistentAdmin {
-        async fn server_info(&self) -> std::result::Result<ProtocolServerInfo, ProtocolAdminError> {
-            Ok(ProtocolServerInfo {
-                deployment_id: "deployment".to_string(),
-                mode: None,
-                region: None,
-            })
-        }
-
-        async fn users_with_prefix(
+        async fn groups_with_prefix(
             &self,
             _prefix: &str,
         ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
             Ok(Vec::new())
         }
 
-        async fn create_user(
+        async fn group_contains_member(
             &self,
-            _credential: &ActorCredential,
+            _group: &str,
+            _member: &str,
+        ) -> std::result::Result<bool, ProtocolAdminError> {
+            Ok(false)
+        }
+
+        async fn update_group_members(
+            &self,
+            _group: &str,
+            _members: &[String],
+            _remove: bool,
         ) -> std::result::Result<(), ProtocolAdminError> {
             Ok(())
+        }
+
+        async fn remove_group(&self, _group: &str) -> std::result::Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+
+        async fn policies_with_prefix(
+            &self,
+            _prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(Vec::new())
+        }
+
+        async fn remove_policy(&self, _name: &str) -> std::result::Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+
+        async fn detach_policy(
+            &self,
+            _policy: &str,
+            _principal: &str,
+            _is_group: bool,
+        ) -> std::result::Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+
+        async fn policy_attached(
+            &self,
+            _policy: &str,
+            _principal: &str,
+            _is_group: bool,
+        ) -> std::result::Result<bool, ProtocolAdminError> {
+            Ok(false)
+        }
+
+        async fn revoke_sts_sessions_for_provider(
+            &self,
+            _parent_access_key: &str,
+            _provider: &str,
+        ) -> std::result::Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+
+        async fn sts_sessions_with_parent_for_provider(
+            &self,
+            _parent_access_key: &str,
+            _provider: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl ProtocolAdminCleanupPort for EventuallyConsistentAdmin {
+        async fn users_with_prefix(
+            &self,
+            _prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(Vec::new())
         }
 
         async fn remove_user(
@@ -780,9 +815,10 @@ mod tests {
             Ok(())
         }
 
-        async fn revoke_sts_sessions(
+        async fn revoke_sts_sessions_for_provider(
             &self,
             _parent_access_key: &str,
+            _provider: &str,
         ) -> std::result::Result<(), ProtocolAdminError> {
             Ok(())
         }
@@ -814,9 +850,10 @@ mod tests {
                 .is_ok())
         }
 
-        async fn sts_sessions_with_parent(
+        async fn sts_sessions_with_parent_for_provider(
             &self,
             _parent_access_key: &str,
+            _provider: &str,
         ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
             if self
                 .session_visibility
@@ -830,11 +867,33 @@ mod tests {
                 Ok(Vec::new())
             }
         }
+
+        async fn groups_with_prefix(
+            &self,
+            _prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(Vec::new())
+        }
+
+        async fn remove_group(&self, _group: &str) -> std::result::Result<(), ProtocolAdminError> {
+            Ok(())
+        }
+
+        async fn policies_with_prefix(
+            &self,
+            _prefix: &str,
+        ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
+            Ok(Vec::new())
+        }
+
+        async fn remove_policy(&self, _name: &str) -> std::result::Result<(), ProtocolAdminError> {
+            Ok(())
+        }
     }
 
     #[async_trait]
-    impl ProtocolS3Port for FakeS3 {
-        async fn list_buckets_with_prefix(
+    impl ProtocolS3CleanupPort for FakeS3 {
+        async fn cleanup_bucket_names(
             &self,
             prefix: &str,
         ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
@@ -851,46 +910,142 @@ mod tests {
             }
         }
 
-        async fn create_bucket(&self, _bucket: &str) -> std::result::Result<(), ProtocolS3Error> {
-            Ok(())
-        }
-
-        async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), ProtocolS3Error> {
+        async fn cleanup_exclusive_bucket(
+            &self,
+            ownership: ExclusiveBucketOwnership<'_>,
+            include_versions: bool,
+        ) -> std::result::Result<(), ProtocolS3Error> {
+            if include_versions {
+                let versions = self.versions.lock().expect("versions").clone();
+                for version in versions {
+                    self.calls.lock().expect("calls").push(format!(
+                        "delete-version:{}:{}",
+                        version.key, version.version_id
+                    ));
+                    self.versions.lock().expect("versions").retain(|candidate| {
+                        candidate.key != version.key || candidate.version_id != version.version_id
+                    });
+                }
+            }
+            let objects = self.objects.lock().expect("objects").clone();
+            for key in objects {
+                self.calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("delete-object:{key}"));
+            }
+            self.objects.lock().expect("objects").clear();
             self.calls
                 .lock()
                 .expect("calls")
-                .push(format!("delete-bucket:{bucket}"));
+                .push(format!("delete-bucket:{}", ownership.bucket()));
             Ok(())
         }
 
-        async fn put_bucket_policy(
+        async fn cleanup_object_prefix(
             &self,
             _bucket: &str,
-            _policy: &str,
+            prefix: &str,
+            include_versions: bool,
         ) -> std::result::Result<(), ProtocolS3Error> {
+            if include_versions {
+                let owned = self
+                    .versions
+                    .lock()
+                    .expect("versions")
+                    .iter()
+                    .filter(|version| version.key.starts_with(prefix))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for version in owned {
+                    self.calls.lock().expect("calls").push(format!(
+                        "delete-version:{}:{}",
+                        version.key, version.version_id
+                    ));
+                    self.versions.lock().expect("versions").retain(|candidate| {
+                        candidate.key != version.key || candidate.version_id != version.version_id
+                    });
+                }
+            }
+            let owned = self
+                .objects
+                .lock()
+                .expect("objects")
+                .iter()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in owned {
+                self.calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("delete-object:{key}"));
+                self.objects
+                    .lock()
+                    .expect("objects")
+                    .retain(|candidate| candidate != &key);
+            }
             Ok(())
         }
 
-        async fn get_bucket_policy(
+        async fn cleanup_object_prefix_exists(
             &self,
             _bucket: &str,
-        ) -> std::result::Result<String, ProtocolS3Error> {
-            if let Some(error) = self
-                .policy_readback_error
+            prefix: &str,
+            include_versions: bool,
+        ) -> std::result::Result<bool, ProtocolS3Error> {
+            if self
+                .objects
                 .lock()
-                .expect("policy readback")
-                .clone()
+                .expect("objects")
+                .iter()
+                .any(|key| key.starts_with(prefix))
             {
-                return Err(error);
+                return Ok(true);
             }
-            Err(ProtocolS3Error {
-                code: "NoSuchBucketPolicy".to_string(),
-                status: Some(404),
-                request_id: None,
-            })
+            Ok(include_versions
+                && self
+                    .versions
+                    .lock()
+                    .expect("versions")
+                    .iter()
+                    .any(|version| version.key.starts_with(prefix)))
         }
 
-        async fn delete_bucket_policy(
+        async fn cleanup_abort_multipart_upload(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+        ) -> std::result::Result<(), ProtocolS3Error> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(format!("abort-multipart:{bucket}:{key}:{upload_id}"));
+            self.multipart_uploads
+                .lock()
+                .expect("multipart uploads")
+                .retain(|upload| {
+                    upload != &(bucket.to_string(), key.to_string(), upload_id.to_string())
+                });
+            Ok(())
+        }
+
+        async fn cleanup_multipart_upload_exists(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+        ) -> std::result::Result<bool, ProtocolS3Error> {
+            Ok(self
+                .multipart_uploads
+                .lock()
+                .expect("multipart uploads")
+                .iter()
+                .any(|upload| upload.0 == bucket && upload.1 == key && upload.2 == upload_id))
+        }
+
+        async fn cleanup_delete_bucket_policy(
             &self,
             bucket: &str,
         ) -> std::result::Result<(), ProtocolS3Error> {
@@ -910,103 +1065,33 @@ mod tests {
             Ok(())
         }
 
-        async fn list_objects(
+        async fn cleanup_bucket_policy_exists(
             &self,
             _bucket: &str,
-        ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
-            Ok(self.objects.lock().expect("objects").clone())
+        ) -> std::result::Result<bool, ProtocolS3Error> {
+            if let Some(error) = self
+                .policy_readback_error
+                .lock()
+                .expect("policy readback")
+                .clone()
+            {
+                return Err(error);
+            }
+            Ok(false)
         }
 
-        async fn put_object(
+        async fn cleanup_delete_public_access_block(
             &self,
             _bucket: &str,
-            _key: &str,
-            _body: &[u8],
         ) -> std::result::Result<(), ProtocolS3Error> {
             Ok(())
         }
 
-        async fn get_object(
+        async fn cleanup_public_access_block_exists(
             &self,
             _bucket: &str,
-            _key: &str,
-        ) -> std::result::Result<Vec<u8>, ProtocolS3Error> {
-            Ok(Vec::new())
-        }
-
-        async fn delete_object(
-            &self,
-            _bucket: &str,
-            key: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
-            self.calls
-                .lock()
-                .expect("calls")
-                .push(format!("delete-object:{key}"));
-            self.objects
-                .lock()
-                .expect("objects")
-                .retain(|item| item != key);
-            Ok(())
-        }
-
-        async fn list_object_versions(
-            &self,
-            _bucket: &str,
-        ) -> std::result::Result<Vec<ProtocolObjectVersion>, ProtocolS3Error> {
-            self.version_list_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.versions.lock().expect("versions").clone())
-        }
-
-        async fn delete_object_version(
-            &self,
-            _bucket: &str,
-            key: &str,
-            version_id: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
-            self.calls
-                .lock()
-                .expect("calls")
-                .push(format!("delete-version:{key}:{version_id}"));
-            self.versions
-                .lock()
-                .expect("versions")
-                .retain(|version| version.key != key || version.version_id != version_id);
-            Ok(())
-        }
-
-        async fn abort_multipart_upload(
-            &self,
-            bucket: &str,
-            key: &str,
-            upload_id: &str,
-        ) -> std::result::Result<(), ProtocolS3Error> {
-            self.calls
-                .lock()
-                .expect("calls")
-                .push(format!("abort-multipart:{bucket}:{key}:{upload_id}"));
-            self.multipart_uploads
-                .lock()
-                .expect("multipart uploads")
-                .retain(|upload| {
-                    upload != &(bucket.to_string(), key.to_string(), upload_id.to_string())
-                });
-            Ok(())
-        }
-
-        async fn list_multipart_uploads(
-            &self,
-            bucket: &str,
-            key: &str,
-        ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
-            Ok(self
-                .multipart_uploads
-                .lock()
-                .expect("multipart uploads")
-                .iter()
-                .filter(|upload| upload.0 == bucket && upload.1 == key)
-                .map(|upload| upload.2.clone())
-                .collect())
+        ) -> std::result::Result<bool, ProtocolS3Error> {
+            Ok(false)
         }
     }
 
@@ -1102,36 +1187,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupted_multipart_creation_is_discovered_aborted_and_verified() {
+    async fn recorded_multipart_upload_is_aborted_and_verified_by_upload_id() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut registry =
             ResourceRegistry::create(dir.path(), "run", fingerprint()).expect("registry");
-        let bucket = registry
-            .plan(ResourceKind::Bucket, "bucket", "case", Vec::new())
-            .expect("bucket");
-        registry
-            .transition(&bucket.id, ResourceState::Creating, None)
-            .expect("creating bucket");
-        registry
-            .transition(&bucket.id, ResourceState::Created, None)
-            .expect("created bucket");
         let upload = registry
-            .plan_multipart_upload(
-                "bucket",
-                "cases/case/object",
-                "case",
-                vec![bucket.id.clone()],
-            )
+            .plan_multipart_upload("bucket", "cases/case/object", "case", Vec::new())
             .expect("multipart upload");
         registry
             .transition(&upload.id, ResourceState::Creating, None)
             .expect("creating multipart upload");
+        registry
+            .set_multipart_upload_id(&upload.id, "upload-1")
+            .expect("record upload id");
+        registry
+            .transition(&upload.id, ResourceState::Created, None)
+            .expect("created multipart upload");
         let s3 = FakeS3 {
-            multipart_uploads: Arc::new(Mutex::new(vec![(
-                "bucket".to_string(),
-                "cases/case/object".to_string(),
-                "upload-1".to_string(),
-            )])),
+            multipart_uploads: Arc::new(Mutex::new(vec![
+                (
+                    "bucket".to_string(),
+                    "cases/case/object".to_string(),
+                    "upload-1".to_string(),
+                ),
+                (
+                    "bucket".to_string(),
+                    "cases/case/object".to_string(),
+                    "foreign-upload".to_string(),
+                ),
+            ])),
             ..FakeS3::default()
         };
 
@@ -1139,13 +1223,128 @@ mod tests {
 
         assert!(report.succeeded, "{report:?}");
         assert!(registry.pending_cleanup().next().is_none());
-        assert!(s3.multipart_uploads.lock().expect("uploads").is_empty());
+        assert_eq!(
+            *s3.multipart_uploads.lock().expect("uploads"),
+            vec![(
+                "bucket".to_string(),
+                "cases/case/object".to_string(),
+                "foreign-upload".to_string(),
+            )]
+        );
         assert_eq!(
             *s3.calls.lock().expect("calls"),
+            vec!["abort-multipart:bucket:cases/case/object:upload-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_without_upload_id_refuses_unscoped_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut registry =
+            ResourceRegistry::create(dir.path(), "run", fingerprint()).expect("registry");
+        let upload = registry
+            .plan_multipart_upload("bucket", "shared/key", "case", Vec::new())
+            .expect("multipart upload");
+        registry
+            .transition(&upload.id, ResourceState::Creating, None)
+            .expect("creating multipart upload");
+        let s3 = FakeS3 {
+            multipart_uploads: Arc::new(Mutex::new(vec![(
+                "bucket".to_string(),
+                "shared/key".to_string(),
+                "foreign-upload".to_string(),
+            )])),
+            ..FakeS3::default()
+        };
+
+        let report = cleanup_registered_resources(&mut registry, &FakeAdmin, &s3).await;
+
+        assert!(!report.succeeded);
+        assert!(
+            report.attempts[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("refusing unscoped cleanup"))
+        );
+        assert_eq!(s3.multipart_uploads.lock().expect("uploads").len(), 1);
+        assert!(s3.calls.lock().expect("calls").is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_bucket_prefix_cleanup_preserves_foreign_objects_and_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut registry =
+            ResourceRegistry::create(dir.path(), "run", fingerprint()).expect("registry");
+        registry
+            .set_versioned_cleanup(true)
+            .expect("enable versioned cleanup");
+        let prefix = registry
+            .plan_object_prefix("shared", "cases/owned/", "case", Vec::new())
+            .expect("object prefix");
+        registry
+            .transition(&prefix.id, ResourceState::Creating, None)
+            .expect("creating prefix");
+        registry
+            .transition(&prefix.id, ResourceState::Created, None)
+            .expect("created prefix");
+        let s3 = FakeS3 {
+            objects: Arc::new(Mutex::new(vec![
+                "cases/owned/current".to_string(),
+                "foreign/current".to_string(),
+            ])),
+            versions: Arc::new(Mutex::new(vec![
+                ProtocolObjectVersion {
+                    key: "cases/owned/version".to_string(),
+                    version_id: "v1".to_string(),
+                    delete_marker: false,
+                },
+                ProtocolObjectVersion {
+                    key: "cases/owned/marker".to_string(),
+                    version_id: "m1".to_string(),
+                    delete_marker: true,
+                },
+                ProtocolObjectVersion {
+                    key: "foreign/version".to_string(),
+                    version_id: "foreign-v1".to_string(),
+                    delete_marker: false,
+                },
+                ProtocolObjectVersion {
+                    key: "foreign/marker".to_string(),
+                    version_id: "foreign-m1".to_string(),
+                    delete_marker: true,
+                },
+            ])),
+            ..FakeS3::default()
+        };
+
+        let report = cleanup_registered_resources(&mut registry, &FakeAdmin, &s3).await;
+
+        assert!(report.succeeded, "{report:?}");
+        assert_eq!(
+            *s3.objects.lock().expect("objects"),
+            vec!["foreign/current"]
+        );
+        assert_eq!(
+            *s3.versions.lock().expect("versions"),
             vec![
-                "abort-multipart:bucket:cases/case/object:upload-1",
-                "delete-bucket:bucket",
+                ProtocolObjectVersion {
+                    key: "foreign/version".to_string(),
+                    version_id: "foreign-v1".to_string(),
+                    delete_marker: false,
+                },
+                ProtocolObjectVersion {
+                    key: "foreign/marker".to_string(),
+                    version_id: "foreign-m1".to_string(),
+                    delete_marker: true,
+                },
             ]
+        );
+        assert!(
+            !s3.calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|call| call == "delete-bucket:shared")
         );
     }
 

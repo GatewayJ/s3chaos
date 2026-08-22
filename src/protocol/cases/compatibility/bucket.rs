@@ -22,14 +22,14 @@ use crate::protocol::{
     fixture::{
         naming::ProtocolResourceNamer, registry::ResourceRegistry, resources::create_s3_bucket,
     },
-    ports::ProtocolS3Port,
+    ports::{ProtocolBucketPort, ProtocolListingPort},
 };
 
 pub(super) async fn run_head(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    s3: &impl ProtocolS3Port,
+    s3: &impl ProtocolBucketPort,
     context: &mut CaseContext,
 ) -> Result<()> {
     let bucket = namer.bucket(case_id, 0)?;
@@ -45,7 +45,7 @@ pub(super) async fn run_list_create_delete(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    s3: &impl ProtocolS3Port,
+    s3: &(impl ProtocolBucketPort + ProtocolListingPort),
     context: &mut CaseContext,
 ) -> Result<()> {
     let bucket = namer.bucket(case_id, 0)?;

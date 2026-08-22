@@ -30,8 +30,11 @@ use std::fmt::Debug;
 use crate::protocol::{
     credentials::{ActorCredential, AdminCredentials},
     ports::{
-        ActorS3ClientFactory, ProtocolCompletedPart, ProtocolListObjectsResult,
-        ProtocolObjectVersion, ProtocolPublicAccessBlock, ProtocolS3Error, ProtocolS3Port,
+        ActorS3ClientFactory, ExclusiveBucketOwnership, ProtocolAuthorizationPort,
+        ProtocolBucketConfigPort, ProtocolBucketPort, ProtocolCompletedPart,
+        ProtocolListObjectsResult, ProtocolListingPort, ProtocolMultipartPort, ProtocolObjectPort,
+        ProtocolObjectVersion, ProtocolPublicAccessBlock, ProtocolS3CleanupPort, ProtocolS3Error,
+        ProtocolVersioningPort,
     },
 };
 
@@ -667,7 +670,7 @@ impl ProtocolS3Client {
 }
 
 #[async_trait::async_trait]
-impl ProtocolS3Port for ProtocolS3Client {
+impl ProtocolBucketPort for ProtocolS3Client {
     async fn list_buckets_with_prefix(
         &self,
         prefix: &str,
@@ -686,7 +689,10 @@ impl ProtocolS3Port for ProtocolS3Client {
     async fn head_bucket(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
         ProtocolS3Client::head_bucket(self, bucket).await
     }
+}
 
+#[async_trait::async_trait]
+impl ProtocolAuthorizationPort for ProtocolS3Client {
     async fn put_bucket_policy(&self, bucket: &str, policy: &str) -> Result<(), ProtocolS3Error> {
         ProtocolS3Client::put_bucket_policy(self, bucket, policy).await
     }
@@ -698,7 +704,10 @@ impl ProtocolS3Port for ProtocolS3Client {
     async fn delete_bucket_policy(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
         ProtocolS3Client::delete_bucket_policy(self, bucket).await
     }
+}
 
+#[async_trait::async_trait]
+impl ProtocolListingPort for ProtocolS3Client {
     async fn list_objects(&self, bucket: &str) -> Result<Vec<String>, ProtocolS3Error> {
         ProtocolS3Client::list_objects(self, bucket).await
     }
@@ -709,7 +718,10 @@ impl ProtocolS3Port for ProtocolS3Client {
     ) -> Result<ProtocolListObjectsResult, ProtocolS3Error> {
         ProtocolS3Client::list_objects_v2_summary(self, bucket).await
     }
+}
 
+#[async_trait::async_trait]
+impl ProtocolObjectPort for ProtocolS3Client {
     async fn put_object(
         &self,
         bucket: &str,
@@ -743,7 +755,10 @@ impl ProtocolS3Port for ProtocolS3Client {
     ) -> Result<Vec<String>, ProtocolS3Error> {
         ProtocolS3Client::delete_objects(self, bucket, keys).await
     }
+}
 
+#[async_trait::async_trait]
+impl ProtocolMultipartPort for ProtocolS3Client {
     async fn create_multipart_upload(
         &self,
         bucket: &str,
@@ -789,7 +804,10 @@ impl ProtocolS3Port for ProtocolS3Client {
     ) -> Result<Vec<String>, ProtocolS3Error> {
         ProtocolS3Client::list_multipart_uploads(self, bucket, key).await
     }
+}
 
+#[async_trait::async_trait]
+impl ProtocolVersioningPort for ProtocolS3Client {
     async fn put_bucket_versioning(
         &self,
         bucket: &str,
@@ -807,6 +825,25 @@ impl ProtocolS3Port for ProtocolS3Client {
         ProtocolS3Client::get_object_version(self, bucket, key, version_id).await
     }
 
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+    ) -> std::result::Result<Vec<ProtocolObjectVersion>, ProtocolS3Error> {
+        ProtocolS3Client::list_object_versions(self, bucket).await
+    }
+
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> std::result::Result<(), ProtocolS3Error> {
+        ProtocolS3Client::delete_object_version(self, bucket, key, version_id).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ProtocolBucketConfigPort for ProtocolS3Client {
     async fn put_public_access_block(
         &self,
         bucket: &str,
@@ -825,21 +862,150 @@ impl ProtocolS3Port for ProtocolS3Client {
     async fn delete_public_access_block(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
         ProtocolS3Client::delete_public_access_block(self, bucket).await
     }
+}
 
-    async fn list_object_versions(
-        &self,
-        bucket: &str,
-    ) -> std::result::Result<Vec<ProtocolObjectVersion>, ProtocolS3Error> {
-        ProtocolS3Client::list_object_versions(self, bucket).await
+#[async_trait::async_trait]
+impl ProtocolS3CleanupPort for ProtocolS3Client {
+    async fn cleanup_bucket_names(&self, prefix: &str) -> Result<Vec<String>, ProtocolS3Error> {
+        ProtocolS3Client::list_buckets_with_prefix(self, prefix).await
     }
 
-    async fn delete_object_version(
+    async fn cleanup_exclusive_bucket(
+        &self,
+        ownership: ExclusiveBucketOwnership<'_>,
+        include_versions: bool,
+    ) -> Result<(), ProtocolS3Error> {
+        let bucket = ownership.bucket();
+        if include_versions {
+            for version in ProtocolS3Client::list_object_versions(self, bucket).await? {
+                ProtocolS3Client::delete_object_version(
+                    self,
+                    bucket,
+                    &version.key,
+                    &version.version_id,
+                )
+                .await?;
+            }
+        }
+        for key in ProtocolS3Client::list_objects(self, bucket).await? {
+            ProtocolS3Client::delete_object(self, bucket, &key).await?;
+        }
+        ProtocolBucketPort::delete_bucket(self, bucket).await
+    }
+
+    async fn cleanup_object_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        include_versions: bool,
+    ) -> Result<(), ProtocolS3Error> {
+        if include_versions {
+            for version in ProtocolS3Client::list_object_versions(self, bucket)
+                .await?
+                .into_iter()
+                .filter(|version| version.key.starts_with(prefix))
+            {
+                ProtocolS3Client::delete_object_version(
+                    self,
+                    bucket,
+                    &version.key,
+                    &version.version_id,
+                )
+                .await?;
+            }
+        }
+        for key in ProtocolS3Client::list_objects(self, bucket)
+            .await?
+            .into_iter()
+            .filter(|key| key.starts_with(prefix))
+        {
+            ProtocolS3Client::delete_object(self, bucket, &key).await?;
+        }
+        Ok(())
+    }
+
+    async fn cleanup_object_prefix_exists(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        include_versions: bool,
+    ) -> Result<bool, ProtocolS3Error> {
+        if ProtocolS3Client::list_objects(self, bucket)
+            .await?
+            .iter()
+            .any(|key| key.starts_with(prefix))
+        {
+            return Ok(true);
+        }
+        if !include_versions {
+            return Ok(false);
+        }
+        Ok(ProtocolS3Client::list_object_versions(self, bucket)
+            .await?
+            .iter()
+            .any(|version| version.key.starts_with(prefix)))
+    }
+
+    async fn cleanup_abort_multipart_upload(
         &self,
         bucket: &str,
         key: &str,
-        version_id: &str,
-    ) -> std::result::Result<(), ProtocolS3Error> {
-        ProtocolS3Client::delete_object_version(self, bucket, key, version_id).await
+        upload_id: &str,
+    ) -> Result<(), ProtocolS3Error> {
+        ProtocolMultipartPort::abort_multipart_upload(self, bucket, key, upload_id).await
+    }
+
+    async fn cleanup_multipart_upload_exists(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<bool, ProtocolS3Error> {
+        Ok(
+            ProtocolMultipartPort::list_multipart_uploads(self, bucket, key)
+                .await?
+                .iter()
+                .any(|candidate| candidate == upload_id),
+        )
+    }
+
+    async fn cleanup_delete_bucket_policy(&self, bucket: &str) -> Result<(), ProtocolS3Error> {
+        ProtocolS3Client::delete_bucket_policy(self, bucket).await
+    }
+
+    async fn cleanup_bucket_policy_exists(&self, bucket: &str) -> Result<bool, ProtocolS3Error> {
+        match ProtocolS3Client::get_bucket_policy(self, bucket).await {
+            Ok(_) => Ok(true),
+            Err(error) if matches!(error.code.as_str(), "NoSuchBucketPolicy" | "NoSuchBucket") => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn cleanup_delete_public_access_block(
+        &self,
+        bucket: &str,
+    ) -> Result<(), ProtocolS3Error> {
+        ProtocolS3Client::delete_public_access_block(self, bucket).await
+    }
+
+    async fn cleanup_public_access_block_exists(
+        &self,
+        bucket: &str,
+    ) -> Result<bool, ProtocolS3Error> {
+        match ProtocolS3Client::get_public_access_block(self, bucket).await {
+            Ok(_) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "NoSuchPublicAccessBlockConfiguration" | "NoSuchBucket"
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 

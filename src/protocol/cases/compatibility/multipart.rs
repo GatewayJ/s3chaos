@@ -27,14 +27,14 @@ use crate::protocol::{
             mark_object_prefix_created, plan_object_prefix,
         },
     },
-    ports::{ProtocolCompletedPart, ProtocolS3Port},
+    ports::{ProtocolBucketPort, ProtocolCompletedPart, ProtocolMultipartPort, ProtocolObjectPort},
 };
 
 pub(super) async fn run_upload(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    s3: &impl ProtocolS3Port,
+    s3: &(impl ProtocolBucketPort + ProtocolMultipartPort + ProtocolObjectPort),
     context: &mut CaseContext,
 ) -> Result<()> {
     let bucket = namer.bucket(case_id, 0)?;

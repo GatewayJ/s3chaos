@@ -35,14 +35,14 @@ use crate::protocol::{
         PUBLIC_ACCESS_BLOCK_ROUND_TRIP,
     },
     fixture::{naming::ProtocolResourceNamer, registry::ResourceRegistry},
-    ports::ProtocolS3Port,
+    ports::ProtocolS3CompatibilityPorts,
 };
 
 pub(crate) async fn run_compatibility_case(
     case_id: &str,
     namer: &ProtocolResourceNamer,
     registry: &mut ResourceRegistry,
-    s3: &impl ProtocolS3Port,
+    s3: &impl ProtocolS3CompatibilityPorts,
 ) -> ProtocolCaseExecution {
     let mut context = CaseContext::new(
         case_id,
