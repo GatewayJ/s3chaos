@@ -15,7 +15,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path};
 
@@ -28,9 +28,9 @@ use crate::protocol::{
     fixture::registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
     preflight::ProtocolPreflightSummary,
     reporting::{
-        PROTOCOL_JUNIT_FILE, ProtocolArtifactValidationReport, ProtocolCaseReport,
-        ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary, ProtocolSuiteSummary,
-        protocol_junit_xml,
+        PROTOCOL_JUNIT_FILE, ProtocolArtifactValidationReport, ProtocolCaseOutcome,
+        ProtocolCaseReport, ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary,
+        ProtocolSuiteSummary, protocol_junit_xml,
     },
     runner::artifacts::ProtocolArtifactWriter,
     suite_plan::{ProtocolSuitePlan, ProtocolSuitePlanCaseContract},
@@ -137,7 +137,8 @@ fn validate_contract(
         "protocol selected cases differ between plan and preflight"
     );
     ensure!(
-        summary.case_reports.len() == selected_cases.len(),
+        summary.case_reports.len() == selected_cases.len()
+            && summary.case_results.len() == selected_cases.len(),
         "protocol suite summary case report count differs from the plan"
     );
     let mut case_reports = Vec::new();
@@ -146,6 +147,7 @@ fn validate_contract(
         let case_id = &planned_case.id;
         let report_path = safe_relative_path(report_path)?;
         let report: ProtocolCaseReport = read_json(&root.join(report_path))?;
+        validate_evidence_paths(root, &report.evidence)?;
         ensure!(
             &report.case_id == case_id,
             "case report id {} does not match planned case {case_id}",
@@ -161,6 +163,40 @@ fn validate_contract(
             "case report variant {} does not match planned case {case_id} variant {expected_variant}",
             report.variant_id
         );
+        ensure!(
+            matches!(
+                (report.status, report.outcome),
+                (ProtocolCaseStatus::Passed, ProtocolCaseOutcome::Passed)
+                    | (
+                        ProtocolCaseStatus::Passed,
+                        ProtocolCaseOutcome::CapabilitySkipped
+                    )
+                    | (
+                        ProtocolCaseStatus::Passed,
+                        ProtocolCaseOutcome::ExpectedDivergence
+                    )
+                    | (ProtocolCaseStatus::Failed, ProtocolCaseOutcome::Failed)
+                    | (ProtocolCaseStatus::Failed, ProtocolCaseOutcome::NotRun)
+            ),
+            "case {case_id} status and outcome disagree"
+        );
+        let reproduction = report
+            .reproduction
+            .as_ref()
+            .with_context(|| format!("case {case_id} omitted reproduction metadata"))?;
+        ensure!(
+            reproduction.suite == plan.suite
+                && reproduction.case_id == *case_id
+                && reproduction.variant_id == expected_variant
+                && reproduction.original_run_id == plan.run_id
+                && reproduction.target_fingerprint == plan.target.fingerprint.sha256
+                && reproduction.capability_profile == planned_case.requires
+                && reproduction.seed == "deterministic-no-randomized-order"
+                && reproduction
+                    .command
+                    .starts_with("s3chaos protocol-suite-reproduce "),
+            "case {case_id} reproduction metadata differs from the plan"
+        );
         let case_dir = report_path
             .parent()
             .context("case report artifact has no parent directory")?;
@@ -174,6 +210,21 @@ fn validate_contract(
             "case {case_id} operation history differs from its case report assertions"
         );
         let case_cleanup = read_json::<ProtocolCleanupReport>(&cleanup_path)?;
+        ensure!(
+            report.cleanup_succeeded == case_cleanup.succeeded,
+            "case {case_id} cleanup status differs between result and cleanup report"
+        );
+        ensure!(
+            report.cleanup_failure.is_some() == !case_cleanup.succeeded,
+            "case {case_id} cleanup failure diagnostics differ from its cleanup report"
+        );
+        if let Some(cleanup_failure) = &report.cleanup_failure {
+            ensure!(
+                cleanup_failure.classification == "cleanup-failure"
+                    && cleanup_failure.leftovers == case_cleanup.leftovers,
+                "case {case_id} cleanup failure details differ from its cleanup report"
+            );
+        }
         if planned_case.contract.is_some() && !case_registry_path.is_file() {
             ensure!(
                 case_provably_never_started(&report, &case_cleanup),
@@ -196,21 +247,30 @@ fn validate_contract(
                     "case {case_id} cleanup succeeded while its registry has leftovers"
                 );
             }
+            validate_cleanup_registry(case_id, &case_cleanup, &case_registry)?;
         }
         case_cleanups.push(case_cleanup);
         case_reports.push(report);
     }
-    let junit_cases = case_reports
-        .iter()
-        .zip(&case_cleanups)
-        .map(|(report, cleanup)| (report, cleanup.succeeded))
-        .collect::<Vec<_>>();
+    let junit_cases = case_reports.iter().collect::<Vec<_>>();
     let expected_junit = protocol_junit_xml(&summary.suite, &junit_cases, cleanup.succeeded);
     let actual_junit = fs::read_to_string(root.join(PROTOCOL_JUNIT_FILE))
         .with_context(|| format!("read protocol artifact {PROTOCOL_JUNIT_FILE}"))?;
     ensure!(
         actual_junit == expected_junit,
         "protocol JUnit report does not match planned case/variant results"
+    );
+    let expected_case_results = case_reports
+        .iter()
+        .zip(&summary.case_reports)
+        .map(|(report, path)| {
+            crate::protocol::reporting::ProtocolCaseResultSummary::from_report(report, path.clone())
+                .context("case report omitted reproduction metadata")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        summary.case_results == expected_case_results,
+        "protocol suite JSON summary differs from case report results"
     );
     let expected_status = if case_reports
         .iter()
@@ -260,7 +320,8 @@ fn validate_contract(
                 "passing protocol suite must not reference a failure summary"
             );
             let path = safe_relative_path(path)?;
-            let _: ProtocolFailureSummary = read_json(&root.join(path))?;
+            let failure: ProtocolFailureSummary = read_json(&root.join(path))?;
+            validate_evidence_paths(root, &failure.evidence)?;
         }
         None => ensure!(
             summary.status == ProtocolCaseStatus::Passed,
@@ -388,6 +449,55 @@ fn validate_registry_contract(
         recorded.lock_requirements == planned.lock_requirements,
         "case {case_id} registry lock requirements differ from the planned contract"
     );
+    Ok(())
+}
+
+fn validate_cleanup_registry(
+    case_id: &str,
+    cleanup: &ProtocolCleanupReport,
+    registry: &ResourceRegistry,
+) -> Result<()> {
+    let pending = registry
+        .pending_cleanup()
+        .map(|resource| resource.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let leftovers = cleanup
+        .leftovers
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        pending == leftovers,
+        "case {case_id} cleanup leftovers differ from its final registry state"
+    );
+    ensure!(
+        cleanup.succeeded == pending.is_empty(),
+        "case {case_id} cleanup success differs from its final registry state"
+    );
+    let registered = registry
+        .resources
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for attempt in &cleanup.attempts {
+        ensure!(
+            attempt.resource_kind == "registry"
+                || registered.contains(attempt.resource_id.as_str()),
+            "case {case_id} cleanup attempt {} is absent from its registry",
+            attempt.resource_id
+        );
+    }
+    Ok(())
+}
+
+fn validate_evidence_paths(root: &Path, evidence: &[String]) -> Result<()> {
+    for reference in evidence {
+        let relative = safe_relative_path(reference)?;
+        ensure!(
+            root.join(relative).is_file(),
+            "protocol evidence path {reference} does not identify a file"
+        );
+    }
     Ok(())
 }
 

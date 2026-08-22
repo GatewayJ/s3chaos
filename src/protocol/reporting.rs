@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::Write;
+use std::{collections::BTreeMap, fmt::Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +33,28 @@ fn default_protocol_variant() -> String {
 pub enum ProtocolCaseStatus {
     Passed,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtocolCaseOutcome {
+    Passed,
+    Failed,
+    NotRun,
+    CapabilitySkipped,
+    ExpectedDivergence,
+}
+
+impl ProtocolCaseOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::NotRun => "not-run",
+            Self::CapabilitySkipped => "capability-skipped",
+            Self::ExpectedDivergence => "expected-divergence",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +96,8 @@ pub struct ProtocolAssertion {
     pub phase: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eventual_consistency: Option<ProtocolEventualConsistencyObservation>,
+    #[serde(default)]
+    pub exchange: ProtocolExchangeSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +106,30 @@ pub struct ProtocolEventualConsistencyObservation {
     pub deadline_millis: u64,
     pub interval_millis: u64,
     pub last_observed: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolExchangeSummary {
+    pub method: String,
+    pub resource: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub allowed_response_headers: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub duration_millis: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolCaseCleanupFailure {
+    pub classification: String,
+    pub message: String,
+    pub leftovers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,12 +142,71 @@ pub struct ProtocolCaseReport {
     pub variant_id: String,
     pub domain: ProtocolDomain,
     pub status: ProtocolCaseStatus,
+    pub outcome: ProtocolCaseOutcome,
+    pub duration_millis: u128,
     pub actors: Vec<ActorCredentialArtifact>,
     pub assertions: Vec<ProtocolAssertion>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_classification: Option<String>,
+    #[serde(default)]
+    pub cleanup_succeeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_failure: Option<ProtocolCaseCleanupFailure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reproduction: Option<ProtocolReproduction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolReproduction {
+    pub command: String,
+    pub suite: String,
+    pub case_id: String,
+    pub variant_id: String,
+    pub seed: String,
+    pub original_run_id: String,
+    pub target_fingerprint: String,
+    pub capability_profile: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolCaseResultSummary {
+    pub case_id: String,
+    pub variant_id: String,
+    pub outcome: ProtocolCaseOutcome,
+    pub duration_millis: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_classification: Option<String>,
+    pub cleanup_succeeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_failure: Option<ProtocolCaseCleanupFailure>,
+    pub report: String,
+    pub evidence: Vec<String>,
+    pub reproduction: ProtocolReproduction,
+}
+
+impl ProtocolCaseResultSummary {
+    pub fn from_report(report: &ProtocolCaseReport, report_path: String) -> Option<Self> {
+        Some(Self {
+            case_id: report.case_id.clone(),
+            variant_id: report.variant_id.clone(),
+            outcome: report.outcome,
+            duration_millis: report.duration_millis,
+            failure_classification: report.failure_classification.clone(),
+            cleanup_succeeded: report.cleanup_succeeded,
+            cleanup_failure: report.cleanup_failure.clone(),
+            report: report_path,
+            evidence: report.evidence.clone(),
+            reproduction: report.reproduction.clone()?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +274,7 @@ pub struct ProtocolSuiteSummary {
     pub cleanup: String,
     pub compatibility_coverage: String,
     pub case_reports: Vec<String>,
+    pub case_results: Vec<ProtocolCaseResultSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_summary: Option<String>,
 }
@@ -201,12 +309,12 @@ pub struct ProtocolArtifactValidationReport {
 /// or cleanup-contaminated suite for a pass.
 pub fn protocol_junit_xml(
     suite: &str,
-    cases: &[(&ProtocolCaseReport, bool)],
+    cases: &[&ProtocolCaseReport],
     suite_cleanup_succeeded: bool,
 ) -> String {
     let statuses = cases
         .iter()
-        .map(|(report, cleanup_succeeded)| junit_status(report, *cleanup_succeeded))
+        .map(|report| junit_status(report))
         .collect::<Vec<_>>();
     let failures = statuses
         .iter()
@@ -228,22 +336,63 @@ pub fn protocol_junit_xml(
         skipped
     )
     .expect("write to String");
-    for ((report, _), status) in cases.iter().zip(&statuses) {
+    for (report, status) in cases.iter().zip(&statuses) {
         writeln!(
             xml,
-            r#"  <testcase name="{}::{}" classname="s3chaos.protocol.{}">"#,
+            r#"  <testcase name="{}::{}" classname="s3chaos.protocol.{}" time="{:.3}">"#,
             escape_xml(&report.case_id),
             escape_xml(&report.variant_id),
-            protocol_domain_name(report.domain)
+            protocol_domain_name(report.domain),
+            report.duration_millis as f64 / 1_000.0,
         )
         .expect("write to String");
         writeln!(xml, "    <properties>").expect("write to String");
         write_junit_property(&mut xml, "caseId", &report.case_id);
         write_junit_property(&mut xml, "variantId", &report.variant_id);
         write_junit_property(&mut xml, "domain", protocol_domain_name(report.domain));
-        write_junit_property(&mut xml, "status", status.name());
+        write_junit_property(&mut xml, "status", report.outcome.as_str());
+        write_junit_property(
+            &mut xml,
+            "durationMillis",
+            &report.duration_millis.to_string(),
+        );
+        write_junit_property(
+            &mut xml,
+            "cleanupSucceeded",
+            &report.cleanup_succeeded.to_string(),
+        );
+        if let Some(classification) = &report.failure_classification {
+            write_junit_property(&mut xml, "failureClassification", classification);
+        }
+        if let Some(cleanup_failure) = &report.cleanup_failure {
+            write_junit_property(
+                &mut xml,
+                "cleanupFailureClassification",
+                &cleanup_failure.classification,
+            );
+            write_junit_property(&mut xml, "cleanupFailure", &cleanup_failure.message);
+            write_junit_property(
+                &mut xml,
+                "cleanupLeftovers",
+                &cleanup_failure.leftovers.join(","),
+            );
+        }
         if let Some(phase) = &report.failure_phase {
             write_junit_property(&mut xml, "failurePhase", phase);
+        }
+        if let Some(reproduction) = &report.reproduction {
+            write_junit_property(&mut xml, "reproductionCommand", &reproduction.command);
+            write_junit_property(
+                &mut xml,
+                "targetFingerprint",
+                &reproduction.target_fingerprint,
+            );
+            write_junit_property(
+                &mut xml,
+                "capabilityProfile",
+                &reproduction.capability_profile.join(","),
+            );
+            write_junit_property(&mut xml, "seed", &reproduction.seed);
         }
         writeln!(xml, "    </properties>").expect("write to String");
         match status {
@@ -315,58 +464,23 @@ enum ProtocolJunitStatus<'a> {
     },
 }
 
-impl ProtocolJunitStatus<'_> {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Passed => "passed",
-            Self::Skipped { .. } => "not-run",
-            Self::Failed {
-                failure_type: "preflight",
-                ..
-            } => "preflight-failed",
-            Self::Failed {
-                failure_type: "interrupted",
-                ..
-            } => "interrupted",
-            Self::Failed {
-                failure_type: "case-timeout",
-                ..
-            } => "case-timeout",
-            Self::Failed {
-                failure_type: "suite-timeout",
-                ..
-            } => "suite-timeout",
-            Self::Failed {
-                failure_type: "cleanup",
-                ..
-            } => "cleanup-failed",
-            Self::Failed { .. } => "failed",
-        }
-    }
-}
-
-fn junit_status(report: &ProtocolCaseReport, cleanup_succeeded: bool) -> ProtocolJunitStatus<'_> {
-    if !cleanup_succeeded {
-        return ProtocolJunitStatus::Failed {
-            failure_type: "cleanup",
-            detail: "protocol cleanup failed",
-        };
-    }
-    if report.status == ProtocolCaseStatus::Passed {
-        return ProtocolJunitStatus::Passed;
-    }
-    let phase = report.failure_phase.as_deref().unwrap_or("case");
+fn junit_status(report: &ProtocolCaseReport) -> ProtocolJunitStatus<'_> {
     let detail = report.failure.as_deref().unwrap_or("protocol case failed");
-    if phase == "not-run" {
-        ProtocolJunitStatus::Skipped {
-            reason: phase,
+    match report.outcome {
+        ProtocolCaseOutcome::Passed => ProtocolJunitStatus::Passed,
+        ProtocolCaseOutcome::NotRun
+        | ProtocolCaseOutcome::CapabilitySkipped
+        | ProtocolCaseOutcome::ExpectedDivergence => ProtocolJunitStatus::Skipped {
+            reason: report.outcome.as_str(),
             detail,
-        }
-    } else {
-        ProtocolJunitStatus::Failed {
-            failure_type: phase,
+        },
+        ProtocolCaseOutcome::Failed => ProtocolJunitStatus::Failed {
+            failure_type: report
+                .failure_classification
+                .as_deref()
+                .unwrap_or("protocol-case-failure"),
             detail,
-        }
+        },
     }
 }
 
@@ -424,7 +538,8 @@ fn protocol_domain_name(domain: ProtocolDomain) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProtocolAssertion, ProtocolAssertionClass, ProtocolCaseReport, ProtocolCaseStatus,
+        ProtocolAssertion, ProtocolAssertionClass, ProtocolCaseCleanupFailure, ProtocolCaseOutcome,
+        ProtocolCaseReport, ProtocolCaseStatus, ProtocolExchangeSummary, ProtocolReproduction,
         protocol_junit_xml,
     };
     use crate::protocol::authorization::{
@@ -446,10 +561,32 @@ mod tests {
             variant_id: variant_id.to_string(),
             domain: ProtocolDomain::RequestValidation,
             status,
+            outcome: if phase == Some("not-run") {
+                ProtocolCaseOutcome::NotRun
+            } else if status == ProtocolCaseStatus::Passed {
+                ProtocolCaseOutcome::Passed
+            } else {
+                ProtocolCaseOutcome::Failed
+            },
+            duration_millis: 125,
             actors: Vec::new(),
             assertions: Vec::new(),
             failure_phase: phase.map(ToString::to_string),
             failure: failure.map(ToString::to_string),
+            failure_classification: phase.map(ToString::to_string),
+            cleanup_succeeded: true,
+            cleanup_failure: None,
+            evidence: Vec::new(),
+            reproduction: Some(ProtocolReproduction {
+                command: "s3chaos protocol-suite-reproduce artifacts case".to_string(),
+                suite: "suite".to_string(),
+                case_id: case_id.to_string(),
+                variant_id: variant_id.to_string(),
+                seed: "deterministic-no-randomized-order".to_string(),
+                original_run_id: "run".to_string(),
+                target_fingerprint: "fingerprint".to_string(),
+                capability_profile: vec!["s3".to_string()],
+            }),
         }
     }
 
@@ -491,30 +628,62 @@ mod tests {
             Some("case-timeout"),
             Some("case budget expired"),
         );
-        let cleanup = report("cleanup", "default", ProtocolCaseStatus::Passed, None, None);
+        let mut capability = report(
+            "capability",
+            "default",
+            ProtocolCaseStatus::Passed,
+            Some("capability"),
+            Some("external provider is not configured"),
+        );
+        capability.outcome = ProtocolCaseOutcome::CapabilitySkipped;
+        let mut divergence = report(
+            "divergence",
+            "default",
+            ProtocolCaseStatus::Passed,
+            Some("expected-divergence"),
+            Some("tracked compatibility difference"),
+        );
+        divergence.outcome = ProtocolCaseOutcome::ExpectedDivergence;
+        let mut cleanup = report("cleanup", "default", ProtocolCaseStatus::Passed, None, None);
+        cleanup.status = ProtocolCaseStatus::Failed;
+        cleanup.outcome = ProtocolCaseOutcome::Failed;
+        cleanup.cleanup_succeeded = false;
+        cleanup.failure_classification = Some("cleanup-failure".to_string());
+        cleanup.failure = Some("cleanup failed".to_string());
+        cleanup.cleanup_failure = Some(ProtocolCaseCleanupFailure {
+            classification: "cleanup-failure".to_string(),
+            message: "cleanup failed".to_string(),
+            leftovers: vec!["object:key".to_string()],
+        });
         let xml = protocol_junit_xml(
             "suite<&\"'",
             &[
-                (&passed, true),
-                (&failed, true),
-                (&not_run, true),
-                (&preflight, true),
-                (&interrupted, true),
-                (&timeout, true),
-                (&cleanup, false),
+                &passed,
+                &failed,
+                &not_run,
+                &preflight,
+                &interrupted,
+                &timeout,
+                &capability,
+                &divergence,
+                &cleanup,
             ],
             true,
         );
         assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
         assert!(xml.contains(
-            "<testsuite name=\"suite&lt;&amp;&quot;&apos;\" tests=\"8\" failures=\"5\" skipped=\"1\">"
+            "<testsuite name=\"suite&lt;&amp;&quot;&apos;\" tests=\"10\" failures=\"5\" skipped=\"3\">"
         ));
         assert!(xml.contains("name=\"passed&lt;&amp;::v&quot;1\""));
-        assert!(xml.contains("value=\"preflight-failed\""));
-        assert!(xml.contains("value=\"interrupted\""));
-        assert!(xml.contains("value=\"case-timeout\""));
-        assert!(xml.contains("value=\"cleanup-failed\""));
+        assert!(xml.contains("name=\"failureClassification\" value=\"preflight\""));
+        assert!(xml.contains("name=\"failureClassification\" value=\"interrupted\""));
+        assert!(xml.contains("name=\"failureClassification\" value=\"case-timeout\""));
+        assert!(xml.contains("name=\"failureClassification\" value=\"cleanup-failure\""));
+        assert!(xml.contains("name=\"cleanupFailureClassification\" value=\"cleanup-failure\""));
+        assert!(xml.contains("time=\"0.125\""));
         assert!(xml.contains("<skipped message=\"not-run\">"));
+        assert!(xml.contains("<skipped message=\"capability-skipped\">"));
+        assert!(xml.contains("<skipped message=\"expected-divergence\">"));
         assert!(xml.contains("expected &lt;ok&gt; &amp; got &apos;bad&apos;"));
         assert!(xml.contains('\u{fffd}'));
         assert!(!xml.contains("expected <ok>"));
@@ -525,7 +694,7 @@ mod tests {
     #[test]
     fn junit_reports_suite_cleanup_failure() {
         let passed = report("passed", "default", ProtocolCaseStatus::Passed, None, None);
-        let xml = protocol_junit_xml("suite", &[(&passed, true)], false);
+        let xml = protocol_junit_xml("suite", &[&passed], false);
 
         assert!(
             xml.contains("<testsuite name=\"suite\" tests=\"2\" failures=\"1\" skipped=\"0\">")
@@ -556,8 +725,13 @@ mod tests {
             elapsed_millis: 1,
             phase: "assertion".to_string(),
             eventual_consistency: None,
+            exchange: ProtocolExchangeSummary::default(),
         };
-        let legacy = serde_json::to_value(&assertion).expect("legacy assertion JSON");
+        let mut legacy = serde_json::to_value(&assertion).expect("legacy assertion JSON");
+        legacy
+            .as_object_mut()
+            .expect("assertion object")
+            .remove("exchange");
         assert!(legacy.get("eventualConsistency").is_none());
 
         let decoded: ProtocolAssertion =

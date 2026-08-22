@@ -41,8 +41,9 @@ use crate::protocol::{
         run_mutating_permission_probe,
     },
     reporting::{
-        PROTOCOL_JUNIT_FILE, ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary,
-        ProtocolSuiteSummary, protocol_junit_xml,
+        PROTOCOL_JUNIT_FILE, ProtocolCaseCleanupFailure, ProtocolCaseOutcome,
+        ProtocolCaseResultSummary, ProtocolCaseStatus, ProtocolCleanupReport,
+        ProtocolFailureSummary, ProtocolReproduction, ProtocolSuiteSummary, protocol_junit_xml,
     },
     runner::{
         artifacts::ProtocolArtifactWriter,
@@ -54,6 +55,7 @@ use crate::protocol::{
             ProcessShutdownSignal, ensure_dedicated_target_acknowledgement, protocol_artifact_base,
         },
     },
+    suite::{ProtocolSuite, ProtocolSuiteSelector},
     suite_plan::{
         ProtocolMutatingProbeStatus, ProtocolSuitePlan, ProtocolSuitePlanCase, TargetFingerprint,
     },
@@ -87,10 +89,60 @@ pub async fn plan_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<Pro
 }
 
 pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
+    run_protocol_suite(path.as_ref(), None).await
+}
+
+pub async fn reproduce_protocol_case_from_artifacts(
+    artifact_root: impl AsRef<Path>,
+    case_id: &str,
+) -> Result<()> {
+    let artifact_root = artifact_root.as_ref();
+    let plan: ProtocolSuitePlan = serde_json::from_str(
+        &fs::read_to_string(artifact_root.join("protocol-suite-plan.json"))
+            .context("read protocol suite plan for reproduction")?,
+    )
+    .context("parse protocol suite plan for reproduction")?;
+    let planned_case = plan
+        .cases
+        .iter()
+        .find(|case| case.id == case_id)
+        .with_context(|| format!("case {case_id} was not part of run {}", plan.run_id))?;
+    let mut suite = ProtocolSuite::from_yaml_path(artifact_root.join("protocol-suite.yaml"))?;
+    ensure!(
+        suite.metadata.name == plan.suite,
+        "protocol source suite does not match the recorded plan"
+    );
+    suite.selector = ProtocolSuiteSelector {
+        cases: vec![planned_case.id.clone()],
+        ..ProtocolSuiteSelector::default()
+    };
+    let relative = Path::new("cases")
+        .join(case_id)
+        .join("reproduction-suite.yaml");
+    let artifacts = ProtocolArtifactWriter::file(artifact_root);
+    artifacts.write_text(&relative, &serde_yaml_ng::to_string(&suite)?)?;
+    run_protocol_suite(
+        &artifact_root.join(relative),
+        Some(&plan.target.fingerprint),
+    )
+    .await
+}
+
+async fn run_protocol_suite(
+    path: &Path,
+    expected_fingerprint: Option<&TargetFingerprint>,
+) -> Result<()> {
     ensure_dedicated_target_acknowledgement()?;
-    let path = path.as_ref();
     let runtime = ConnectedProtocolRuntime::connect(path).await?;
     let mut preflight = run_connected_preflight(&runtime).await?;
+    if let Some(expected) = expected_fingerprint {
+        ensure!(
+            &preflight.target_fingerprint == expected,
+            "refuse reproduction because target fingerprint changed: expected {}, observed {}",
+            expected.sha256,
+            preflight.target_fingerprint.sha256
+        );
+    }
     let mut plan = ProtocolSuitePlan::generated(
         &runtime.suite,
         preflight.target_fingerprint.clone(),
@@ -213,12 +265,30 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         .execute(&selected_cases, &mut registry, preflight_failure)
         .await?;
     let fallback_cleanup = suite_execution.fallback_cleanup;
-    let case_executions = suite_execution
+    let mut case_executions = suite_execution
         .cases
         .into_iter()
         .map(|case| (case.execution, case.cleanup))
         .collect::<Vec<_>>();
     artifacts.write_json("cleanup-report.json", &fallback_cleanup)?;
+
+    for (execution, cleanup) in &mut case_executions {
+        reconcile_case_cleanup(
+            cleanup,
+            &fallback_cleanup,
+            &artifact_root
+                .join("cases")
+                .join(&execution.report.case_id)
+                .join(RESOURCE_REGISTRY_FILE),
+        );
+        finalize_case_report(
+            &mut execution.report,
+            cleanup,
+            &plan,
+            &runtime.suite.metadata.name,
+            &artifact_root,
+        )?;
+    }
 
     let mut case_report_paths = Vec::with_capacity(case_executions.len());
     let mut forbidden_case_secrets = Vec::new();
@@ -238,7 +308,7 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
     }
     let junit_cases = case_executions
         .iter()
-        .map(|(execution, cleanup)| (&execution.report, cleanup.succeeded))
+        .map(|(execution, _)| &execution.report)
         .collect::<Vec<_>>();
     artifacts.write_text(
         PROTOCOL_JUNIT_FILE,
@@ -277,18 +347,16 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         execution.report.status == ProtocolCaseStatus::Failed || !cleanup.succeeded
     });
     let failure_summary = if let Some((execution, cleanup)) = first_failure {
-        let (stage, classification) = if execution.report.status == ProtocolCaseStatus::Failed {
-            (
-                execution
-                    .report
-                    .failure_phase
-                    .clone()
-                    .unwrap_or_else(|| "case".to_string()),
-                "protocol-case-failure".to_string(),
-            )
-        } else {
-            ("cleanup".to_string(), "cleanup-failure".to_string())
-        };
+        let stage = execution
+            .report
+            .failure_phase
+            .clone()
+            .unwrap_or_else(|| "case".to_string());
+        let classification = execution
+            .report
+            .failure_classification
+            .clone()
+            .unwrap_or_else(|| "protocol-case-failure".to_string());
         let case_base = format!("cases/{}", execution.report.case_id);
         let mut evidence = vec![
             format!("{case_base}/case-report.json"),
@@ -327,6 +395,14 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
     } else {
         None
     };
+    let case_results = case_executions
+        .iter()
+        .zip(&case_report_paths)
+        .map(|((execution, _), report_path)| {
+            ProtocolCaseResultSummary::from_report(&execution.report, report_path.clone())
+                .context("final protocol case report omitted reproduction metadata")
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut summary = ProtocolSuiteSummary {
         api_version: runtime.suite.api_version.clone(),
         kind: "ProtocolSuiteSummary".to_string(),
@@ -343,6 +419,7 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         cleanup: "cleanup-report.json".to_string(),
         compatibility_coverage: COMPATIBILITY_COVERAGE_FILE.to_string(),
         case_reports: case_report_paths,
+        case_results,
         failure_summary,
     };
     artifacts.write_json("protocol-suite-summary.json", &summary)?;
@@ -397,6 +474,155 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         artifact_root.display()
     );
     Ok(())
+}
+
+fn reconcile_case_cleanup(
+    cleanup: &mut ProtocolCleanupReport,
+    fallback_cleanup: &ProtocolCleanupReport,
+    registry_path: &Path,
+) {
+    if !registry_path.is_file() {
+        return;
+    }
+    let registry = match ResourceRegistry::load_path(registry_path) {
+        Ok(registry) => registry,
+        Err(error) => {
+            let registry_id = format!("registry:{}", registry_path.display());
+            let mut failure = ProtocolCleanupReport::empty(&cleanup.api_version);
+            if let Some(attempt) = fallback_cleanup
+                .attempts
+                .iter()
+                .find(|attempt| attempt.resource_id == registry_id)
+            {
+                failure.attempts.push(attempt.clone());
+                failure.leftovers.push(registry_id);
+                failure.succeeded = false;
+            } else {
+                failure = registry_failure(&cleanup.api_version, registry_path, error);
+            }
+            append_cleanup_without_duplicates(cleanup, failure);
+            return;
+        }
+    };
+    let resource_ids = registry
+        .resources
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let matching_fallback = ProtocolCleanupReport {
+        api_version: cleanup.api_version.clone(),
+        kind: "ProtocolCleanupReport".to_string(),
+        attempts: fallback_cleanup
+            .attempts
+            .iter()
+            .filter(|attempt| resource_ids.contains(attempt.resource_id.as_str()))
+            .cloned()
+            .collect(),
+        leftovers: Vec::new(),
+        succeeded: true,
+    };
+    append_cleanup_without_duplicates(cleanup, matching_fallback);
+    cleanup.leftovers = registry
+        .pending_cleanup()
+        .map(|resource| resource.id.clone())
+        .collect();
+    cleanup.succeeded = cleanup.leftovers.is_empty();
+}
+
+fn append_cleanup_without_duplicates(
+    cleanup: &mut ProtocolCleanupReport,
+    other: ProtocolCleanupReport,
+) {
+    for attempt in other.attempts {
+        if !cleanup.attempts.iter().any(|current| {
+            current.resource_id == attempt.resource_id
+                && current.succeeded == attempt.succeeded
+                && current.retry_count == attempt.retry_count
+                && current.error == attempt.error
+        }) {
+            cleanup.attempts.push(attempt);
+        }
+    }
+    for leftover in other.leftovers {
+        if !cleanup.leftovers.contains(&leftover) {
+            cleanup.leftovers.push(leftover);
+        }
+    }
+    cleanup.succeeded = cleanup.succeeded && other.succeeded;
+}
+
+fn finalize_case_report(
+    report: &mut crate::protocol::reporting::ProtocolCaseReport,
+    cleanup: &ProtocolCleanupReport,
+    plan: &ProtocolSuitePlan,
+    suite: &str,
+    artifact_root: &Path,
+) -> Result<()> {
+    let planned = plan
+        .cases
+        .iter()
+        .find(|case| case.id == report.case_id)
+        .with_context(|| format!("case {} is absent from protocol plan", report.case_id))?;
+    let case_base = format!("cases/{}", report.case_id);
+    apply_cleanup_diagnostics(report, cleanup);
+    report.evidence = vec![
+        format!("{case_base}/case-report.json"),
+        format!("{case_base}/cleanup-report.json"),
+        format!("{case_base}/operation-history.jsonl"),
+    ];
+    if artifact_root
+        .join(&case_base)
+        .join(RESOURCE_REGISTRY_FILE)
+        .is_file()
+    {
+        report
+            .evidence
+            .push(format!("{case_base}/{RESOURCE_REGISTRY_FILE}"));
+    }
+    report.reproduction = Some(ProtocolReproduction {
+        command: format!(
+            "s3chaos protocol-suite-reproduce {} {}",
+            shell_quote(&artifact_root.display().to_string()),
+            shell_quote(&report.case_id)
+        ),
+        suite: suite.to_string(),
+        case_id: report.case_id.clone(),
+        variant_id: report.variant_id.clone(),
+        seed: "deterministic-no-randomized-order".to_string(),
+        original_run_id: plan.run_id.clone(),
+        target_fingerprint: plan.target.fingerprint.sha256.clone(),
+        capability_profile: planned.requires.clone(),
+    });
+    Ok(())
+}
+
+fn apply_cleanup_diagnostics(
+    report: &mut crate::protocol::reporting::ProtocolCaseReport,
+    cleanup: &ProtocolCleanupReport,
+) {
+    report.cleanup_succeeded = cleanup.succeeded;
+    report.cleanup_failure = (!cleanup.succeeded).then(|| ProtocolCaseCleanupFailure {
+        classification: "cleanup-failure".to_string(),
+        message: format!(
+            "protocol cleanup failed with {} leftover resource(s)",
+            cleanup.leftovers.len()
+        ),
+        leftovers: cleanup.leftovers.clone(),
+    });
+    if !cleanup.succeeded && report.outcome != ProtocolCaseOutcome::Failed {
+        report.status = ProtocolCaseStatus::Failed;
+        report.outcome = ProtocolCaseOutcome::Failed;
+        report.failure_phase = Some("cleanup".to_string());
+        report.failure_classification = Some("cleanup-failure".to_string());
+        report.failure = report
+            .cleanup_failure
+            .as_ref()
+            .map(|failure| failure.message.clone());
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> Result<()> {
@@ -711,16 +937,20 @@ fn validate_phase_one_artifacts(root: &Path, forbidden: &[String]) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::{artifact_parent, validate_phase_one_artifacts};
+    use super::{
+        apply_cleanup_diagnostics, artifact_parent, reconcile_case_cleanup,
+        validate_phase_one_artifacts,
+    };
     use crate::protocol::{
+        cases::ProtocolCaseExecution,
         compatibility::{COMPATIBILITY_COVERAGE_FILE, compatibility_coverage_report},
         fixture::registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
         ports::{ProtocolAdminError, ProtocolAdminServerPort, ProtocolServerInfo},
         preflight::{ProtocolPreflightSummary, ProtocolStaleResourceScan},
         reporting::{
-            PROTOCOL_JUNIT_FILE, ProtocolAssertion, ProtocolCaseReport, ProtocolCaseStatus,
-            ProtocolCleanupReport, ProtocolFailureSummary, ProtocolSuiteSummary,
-            protocol_junit_xml,
+            PROTOCOL_JUNIT_FILE, ProtocolAssertion, ProtocolCaseOutcome, ProtocolCaseReport,
+            ProtocolCaseResultSummary, ProtocolCaseStatus, ProtocolCleanupReport,
+            ProtocolFailureSummary, ProtocolReproduction, ProtocolSuiteSummary, protocol_junit_xml,
         },
         runner::artifacts::ProtocolArtifactWriter,
         suite::{ProtocolSuite, protocol_suite_template_yaml},
@@ -753,6 +983,77 @@ mod tests {
             .expect("relative registry parent"),
             Path::new(".")
         );
+    }
+
+    #[test]
+    fn cleanup_failure_does_not_overwrite_primary_case_failure() {
+        let mut report = ProtocolCaseExecution::harness_failed("case", "primary failure").report;
+        let cleanup = ProtocolCleanupReport {
+            api_version: report.api_version.clone(),
+            kind: "ProtocolCleanupReport".to_string(),
+            attempts: Vec::new(),
+            leftovers: vec!["object:key".to_string()],
+            succeeded: false,
+        };
+
+        apply_cleanup_diagnostics(&mut report, &cleanup);
+
+        assert_eq!(report.failure_phase.as_deref(), Some("harness"));
+        assert_eq!(
+            report.failure_classification.as_deref(),
+            Some("protocol-case-failure")
+        );
+        assert_eq!(report.failure.as_deref(), Some("primary failure"));
+        let cleanup_failure = report.cleanup_failure.expect("cleanup failure");
+        assert_eq!(cleanup_failure.classification, "cleanup-failure");
+        assert_eq!(cleanup_failure.leftovers, vec!["object:key"]);
+    }
+
+    #[test]
+    fn cleanup_only_failure_becomes_the_primary_case_failure() {
+        let mut report = ProtocolCaseExecution::harness_failed("case", "unused").report;
+        report.status = ProtocolCaseStatus::Passed;
+        report.outcome = ProtocolCaseOutcome::Passed;
+        report.failure_phase = None;
+        report.failure = None;
+        report.failure_classification = None;
+        let cleanup = ProtocolCleanupReport {
+            api_version: report.api_version.clone(),
+            kind: "ProtocolCleanupReport".to_string(),
+            attempts: Vec::new(),
+            leftovers: vec!["bucket:test".to_string()],
+            succeeded: false,
+        };
+
+        apply_cleanup_diagnostics(&mut report, &cleanup);
+
+        assert_eq!(report.status, ProtocolCaseStatus::Failed);
+        assert_eq!(report.outcome, ProtocolCaseOutcome::Failed);
+        assert_eq!(report.failure_phase.as_deref(), Some("cleanup"));
+        assert_eq!(
+            report.failure_classification.as_deref(),
+            Some("cleanup-failure")
+        );
+    }
+
+    #[test]
+    fn corrupt_case_registry_is_recorded_without_aborting_diagnostics() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let registry_path = directory.path().join(RESOURCE_REGISTRY_FILE);
+        fs::write(&registry_path, "{\"apiVersion\":").expect("corrupt registry");
+        let mut cleanup = ProtocolCleanupReport::empty("rustfs.com/s3chaos/v1alpha1");
+        let fallback = crate::protocol::runner::cleanup::registry_failure(
+            "rustfs.com/s3chaos/v1alpha1",
+            &registry_path,
+            "fallback could not load registry",
+        );
+
+        reconcile_case_cleanup(&mut cleanup, &fallback, &registry_path);
+
+        assert!(!cleanup.succeeded);
+        assert_eq!(cleanup.attempts.len(), 1);
+        assert_eq!(cleanup.leftovers.len(), 1);
+        serde_json::to_vec(&cleanup).expect("cleanup diagnostics remain serializable");
     }
 
     #[tokio::test]
@@ -861,10 +1162,33 @@ mod tests {
             variant_id: crate::protocol::catalog::DEFAULT_PROTOCOL_VARIANT.to_string(),
             domain: crate::protocol::catalog::ProtocolDomain::Authorization,
             status: ProtocolCaseStatus::Passed,
+            outcome: ProtocolCaseOutcome::Passed,
+            duration_millis: 125,
             actors: Vec::new(),
             assertions: Vec::new(),
             failure_phase: None,
             failure: None,
+            failure_classification: None,
+            cleanup_succeeded: true,
+            cleanup_failure: None,
+            evidence: vec![
+                "cases/bucket-policy-authenticated-user-rw/case-report.json".to_string(),
+                "cases/bucket-policy-authenticated-user-rw/cleanup-report.json".to_string(),
+                "cases/bucket-policy-authenticated-user-rw/operation-history.jsonl".to_string(),
+                format!(
+                    "cases/bucket-policy-authenticated-user-rw/{RESOURCE_REGISTRY_FILE}"
+                ),
+            ],
+            reproduction: Some(ProtocolReproduction {
+                command: "s3chaos protocol-suite-reproduce 'artifacts' 'bucket-policy-authenticated-user-rw'".to_string(),
+                suite: plan.suite.clone(),
+                case_id: "bucket-policy-authenticated-user-rw".to_string(),
+                variant_id: crate::protocol::catalog::DEFAULT_PROTOCOL_VARIANT.to_string(),
+                seed: "deterministic-no-randomized-order".to_string(),
+                original_run_id: plan.run_id.clone(),
+                target_fingerprint: plan.target.fingerprint.sha256.clone(),
+                capability_profile: plan.cases[0].requires.clone(),
+            }),
         };
         artifacts
             .write_json(
@@ -890,6 +1214,8 @@ mod tests {
                 &compatibility_coverage_report(&BTreeMap::new()).expect("coverage report"),
             )
             .expect("coverage artifact");
+        let case_report_path =
+            "cases/bucket-policy-authenticated-user-rw/case-report.json".to_string();
         let summary = ProtocolSuiteSummary {
             api_version: suite.api_version,
             kind: "ProtocolSuiteSummary".to_string(),
@@ -901,8 +1227,10 @@ mod tests {
             registry: "resource-registry.json".to_string(),
             cleanup: "cleanup-report.json".to_string(),
             compatibility_coverage: COMPATIBILITY_COVERAGE_FILE.to_string(),
-            case_reports: vec![
-                "cases/bucket-policy-authenticated-user-rw/case-report.json".to_string(),
+            case_reports: vec![case_report_path.clone()],
+            case_results: vec![
+                ProtocolCaseResultSummary::from_report(&case_report, case_report_path.clone())
+                    .expect("case result"),
             ],
             failure_summary: None,
         };
@@ -912,16 +1240,56 @@ mod tests {
         artifacts
             .write_text(
                 PROTOCOL_JUNIT_FILE,
-                &protocol_junit_xml(
-                    &summary.suite,
-                    &[(&case_report, cleanup.succeeded)],
-                    cleanup.succeeded,
-                ),
+                &protocol_junit_xml(&summary.suite, &[&case_report], cleanup.succeeded),
             )
             .expect("JUnit artifact");
 
         validate_phase_one_artifacts(&root, &["not-present-secret".to_string()])
             .expect("valid artifacts");
+
+        let mut inconsistent_summary = summary.clone();
+        inconsistent_summary.case_results[0].duration_millis += 1;
+        artifacts
+            .write_json("protocol-suite-summary.json", &inconsistent_summary)
+            .expect("inconsistent summary");
+        assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+        artifacts
+            .write_json("protocol-suite-summary.json", &summary)
+            .expect("restore summary");
+
+        let mut invalid_evidence_report = case_report.clone();
+        invalid_evidence_report
+            .evidence
+            .push("../escape".to_string());
+        artifacts
+            .write_json(
+                "cases/bucket-policy-authenticated-user-rw/case-report.json",
+                &invalid_evidence_report,
+            )
+            .expect("invalid evidence report");
+        assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+        artifacts
+            .write_json(
+                "cases/bucket-policy-authenticated-user-rw/case-report.json",
+                &case_report,
+            )
+            .expect("restore case report");
+
+        let mut inconsistent_case_cleanup = cleanup.clone();
+        inconsistent_case_cleanup.leftovers = vec!["unregistered-resource".to_string()];
+        artifacts
+            .write_json(
+                "cases/bucket-policy-authenticated-user-rw/cleanup-report.json",
+                &inconsistent_case_cleanup,
+            )
+            .expect("inconsistent cleanup report");
+        assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+        artifacts
+            .write_json(
+                "cases/bucket-policy-authenticated-user-rw/cleanup-report.json",
+                &cleanup,
+            )
+            .expect("restore case cleanup report");
 
         let case_registry_path = case_dir.join(RESOURCE_REGISTRY_FILE);
         let case_registry_relative =
@@ -930,11 +1298,16 @@ mod tests {
         fs::remove_file(&case_registry_path).expect("remove case registry");
         assert!(validate_phase_one_artifacts(&root, &[]).is_err());
 
-        let not_run_report = crate::protocol::cases::ProtocolCaseExecution::not_run(
-            "bucket-policy-authenticated-user-rw",
-            "prior wave timed out",
-        )
-        .report;
+        let mut not_run_report = case_report.clone();
+        not_run_report.status = ProtocolCaseStatus::Failed;
+        not_run_report.outcome = ProtocolCaseOutcome::NotRun;
+        not_run_report.duration_millis = 0;
+        not_run_report.failure_phase = Some("not-run".to_string());
+        not_run_report.failure = Some("prior wave timed out".to_string());
+        not_run_report.failure_classification = Some("not-run".to_string());
+        not_run_report
+            .evidence
+            .retain(|path| !path.ends_with(RESOURCE_REGISTRY_FILE));
         artifacts
             .write_json(
                 "cases/bucket-policy-authenticated-user-rw/case-report.json",
@@ -948,7 +1321,7 @@ mod tests {
                     api_version: summary.api_version.clone(),
                     kind: "ProtocolFailureSummary".to_string(),
                     stage: "not-run".to_string(),
-                    classification: "protocol-case-failure".to_string(),
+                    classification: "not-run".to_string(),
                     case_id: Some(not_run_report.case_id.clone()),
                     evidence: vec![
                         "cases/bucket-policy-authenticated-user-rw/case-report.json".to_string(),
@@ -958,6 +1331,10 @@ mod tests {
             .expect("not-run failure summary");
         let mut not_run_summary = summary.clone();
         not_run_summary.status = ProtocolCaseStatus::Failed;
+        not_run_summary.case_results = vec![
+            ProtocolCaseResultSummary::from_report(&not_run_report, case_report_path.clone())
+                .expect("not-run case result"),
+        ];
         not_run_summary.failure_summary = Some("protocol-failure-summary.json".to_string());
         artifacts
             .write_json("protocol-suite-summary.json", &not_run_summary)
@@ -965,11 +1342,7 @@ mod tests {
         artifacts
             .write_text(
                 PROTOCOL_JUNIT_FILE,
-                &protocol_junit_xml(
-                    &summary.suite,
-                    &[(&not_run_report, cleanup.succeeded)],
-                    cleanup.succeeded,
-                ),
+                &protocol_junit_xml(&summary.suite, &[&not_run_report], cleanup.succeeded),
             )
             .expect("not-run JUnit artifact");
         validate_phase_one_artifacts(&root, &[])
@@ -987,11 +1360,7 @@ mod tests {
         artifacts
             .write_text(
                 PROTOCOL_JUNIT_FILE,
-                &protocol_junit_xml(
-                    &summary.suite,
-                    &[(&case_report, cleanup.succeeded)],
-                    cleanup.succeeded,
-                ),
+                &protocol_junit_xml(&summary.suite, &[&case_report], cleanup.succeeded),
             )
             .expect("restore JUnit after not-run fixture");
         fs::remove_file(root.join("protocol-failure-summary.json"))
@@ -1087,18 +1456,14 @@ mod tests {
         artifacts
             .write_text(
                 PROTOCOL_JUNIT_FILE,
-                &protocol_junit_xml(&summary.suite, &[(&case_report, cleanup.succeeded)], true),
+                &protocol_junit_xml(&summary.suite, &[&case_report], true),
             )
             .expect("incorrect passing suite-cleanup JUnit artifact");
         assert!(validate_phase_one_artifacts(&root, &[]).is_err());
         artifacts
             .write_text(
                 PROTOCOL_JUNIT_FILE,
-                &protocol_junit_xml(
-                    &summary.suite,
-                    &[(&case_report, cleanup.succeeded)],
-                    failed_cleanup.succeeded,
-                ),
+                &protocol_junit_xml(&summary.suite, &[&case_report], failed_cleanup.succeeded),
             )
             .expect("failed suite-cleanup JUnit artifact");
         validate_phase_one_artifacts(&root, &[]).expect("suite cleanup failure is linked to JUnit");
@@ -1114,11 +1479,7 @@ mod tests {
         artifacts
             .write_text(
                 PROTOCOL_JUNIT_FILE,
-                &protocol_junit_xml(
-                    &summary.suite,
-                    &[(&case_report, cleanup.succeeded)],
-                    cleanup.succeeded,
-                ),
+                &protocol_junit_xml(&summary.suite, &[&case_report], cleanup.succeeded),
             )
             .expect("restore passing JUnit artifact");
         fs::remove_file(root.join(PROTOCOL_JUNIT_FILE)).expect("remove JUnit artifact");
@@ -1130,11 +1491,7 @@ mod tests {
         artifacts
             .write_text(
                 PROTOCOL_JUNIT_FILE,
-                &protocol_junit_xml(
-                    &summary.suite,
-                    &[(&case_report, cleanup.succeeded)],
-                    cleanup.succeeded,
-                ),
+                &protocol_junit_xml(&summary.suite, &[&case_report], cleanup.succeeded),
             )
             .expect("restore JUnit artifact");
         validate_phase_one_artifacts(&root, &[]).expect("restored JUnit artifacts");

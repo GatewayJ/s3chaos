@@ -28,8 +28,9 @@ use crate::protocol::{
         ActorS3ClientFactory, ProtocolAdminCasePorts, ProtocolExternalIdentityPort,
         ProtocolS3CasePorts, ProtocolStsPort, ProtocolWebIdentityStsPort,
     },
-    reporting::{ProtocolCaseReport, ProtocolCaseStatus},
+    reporting::{ProtocolCaseOutcome, ProtocolCaseReport, ProtocolCaseStatus},
 };
+use std::time::Instant;
 
 pub struct ProtocolCaseExecution {
     pub report: ProtocolCaseReport,
@@ -70,10 +71,19 @@ impl ProtocolCaseExecution {
     }
 
     pub fn not_run(case_id: &str, message: impl Into<String>) -> Self {
-        Self::failed(case_id, "not-run", message)
+        Self::terminal(case_id, ProtocolCaseOutcome::NotRun, "not-run", message)
     }
 
     fn failed(case_id: &str, phase: &str, message: impl Into<String>) -> Self {
+        Self::terminal(case_id, ProtocolCaseOutcome::Failed, phase, message)
+    }
+
+    fn terminal(
+        case_id: &str,
+        outcome: ProtocolCaseOutcome,
+        phase: &str,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             report: ProtocolCaseReport {
                 api_version: "rustfs.com/s3chaos/v1alpha1".to_string(),
@@ -83,11 +93,26 @@ impl ProtocolCaseExecution {
                 domain: protocol_case(case_id)
                     .map(|case| case.domain)
                     .unwrap_or(crate::protocol::catalog::ProtocolDomain::Other),
-                status: ProtocolCaseStatus::Failed,
+                status: if matches!(
+                    outcome,
+                    ProtocolCaseOutcome::CapabilitySkipped
+                        | ProtocolCaseOutcome::ExpectedDivergence
+                ) {
+                    ProtocolCaseStatus::Passed
+                } else {
+                    ProtocolCaseStatus::Failed
+                },
+                outcome,
+                duration_millis: 0,
                 actors: Vec::new(),
                 assertions: Vec::new(),
                 failure_phase: Some(phase.to_string()),
                 failure: Some(message.into()),
+                failure_classification: Some(classify_failure(phase).to_string()),
+                cleanup_succeeded: true,
+                cleanup_failure: None,
+                evidence: Vec::new(),
+                reproduction: None,
             },
             forbidden_secrets: Vec::new(),
         }
@@ -189,6 +214,7 @@ pub(crate) struct CaseContext {
     forbidden_secrets: Vec<String>,
     pub current_phase: String,
     pub dimensions: ProtocolAuthorizationDimensions,
+    started: Instant,
 }
 
 impl CaseContext {
@@ -200,6 +226,7 @@ impl CaseContext {
             forbidden_secrets: Vec::new(),
             current_phase: "setup".to_string(),
             dimensions,
+            started: Instant::now(),
         }
     }
 
@@ -220,6 +247,10 @@ impl CaseContext {
 
     pub(crate) fn finish(self, result: anyhow::Result<()>) -> ProtocolCaseExecution {
         let failure = result.as_ref().err().map(ToString::to_string);
+        let failure_phase = failure.as_ref().map(|_| self.current_phase.clone());
+        let failure_classification = failure
+            .as_ref()
+            .map(|_| classify_failure(&self.current_phase).to_string());
         let domain = protocol_case(&self.case_id)
             .map(|case| case.domain)
             .unwrap_or(crate::protocol::catalog::ProtocolDomain::Other);
@@ -235,12 +266,36 @@ impl CaseContext {
                 } else {
                     ProtocolCaseStatus::Failed
                 },
+                outcome: if result.is_ok() {
+                    ProtocolCaseOutcome::Passed
+                } else {
+                    ProtocolCaseOutcome::Failed
+                },
+                duration_millis: self.started.elapsed().as_millis(),
                 actors: self.actors.iter().map(ActorCredential::artifact).collect(),
                 assertions: self.assertions,
-                failure_phase: failure.as_ref().map(|_| self.current_phase),
+                failure_phase,
                 failure,
+                failure_classification,
+                cleanup_succeeded: true,
+                cleanup_failure: None,
+                evidence: Vec::new(),
+                reproduction: None,
             },
             forbidden_secrets: self.forbidden_secrets,
         }
+    }
+}
+
+fn classify_failure(phase: &str) -> &'static str {
+    match phase {
+        "not-run" => "not-run",
+        "preflight" => "preflight-failure",
+        "interrupted" => "interrupted",
+        "case-timeout" => "case-timeout",
+        "suite-timeout" => "suite-timeout",
+        "capability" => "capability-skip",
+        "expected-divergence" => "expected-divergence",
+        _ => "protocol-case-failure",
     }
 }

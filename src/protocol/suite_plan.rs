@@ -25,7 +25,10 @@ use crate::protocol::{
     },
     ports::ProtocolExternalIdentityProviderInfo,
     scheduler::{ProtocolLock, plan_protocol_schedule},
-    suite::{ProtocolCleanupPolicy, ProtocolExecutionTimeouts, ResolvedProtocolSuite},
+    suite::{
+        ProtocolArtifactRetentionPolicy, ProtocolCleanupPolicy, ProtocolExecutionTimeouts,
+        ResolvedProtocolSuite,
+    },
 };
 
 pub const PROTOCOL_SUITE_PLAN_KIND: &str = "ProtocolSuitePlan";
@@ -167,6 +170,8 @@ pub struct ProtocolSuitePlanExecution {
     pub cleanup_retry: ProtocolCleanupRetryPolicy,
     #[serde(default)]
     pub product_case_retry: ProtocolProductCaseRetryPolicy,
+    #[serde(default)]
+    pub artifact_retention: ProtocolArtifactRetentionPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,6 +415,7 @@ impl ProtocolSuitePlan {
                 eventual_consistency: ProtocolEventualConsistencyPolicy::default(),
                 cleanup_retry: ProtocolCleanupRetryPolicy::default(),
                 product_case_retry: ProtocolProductCaseRetryPolicy::Never,
+                artifact_retention: suite.execution.artifact_retention,
             },
             cases,
         })
