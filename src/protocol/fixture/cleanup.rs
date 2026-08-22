@@ -22,7 +22,8 @@ use crate::protocol::{
         ProtocolExternalIdentityError, ProtocolExternalIdentityPort, ProtocolS3CleanupPort,
         ProtocolS3Error,
     },
-    reporting::{ProtocolCleanupAttempt, ProtocolCleanupReport},
+    reporting::{ProtocolCleanupAttempt, ProtocolCleanupReport, ProtocolCleanupRetryObservation},
+    suite_plan::ProtocolCleanupRetryPolicy,
 };
 
 pub(crate) async fn cleanup_registered_resources(
@@ -54,6 +55,7 @@ pub(crate) async fn cleanup_registered_resources_with_external(
                     resource_kind: "registry".to_string(),
                     resource_name: registry.path().display().to_string(),
                     retry_count: 0,
+                    retry_history: Vec::new(),
                     succeeded: false,
                     error: Some(error.to_string()),
                 }],
@@ -122,6 +124,10 @@ pub(crate) async fn cleanup_registered_resources_with_external(
                 .as_ref()
                 .map(|success| success.retry_count)
                 .unwrap_or_else(|failure| failure.retry_count),
+            retry_history: cleanup_result
+                .as_ref()
+                .map(|success| success.retry_history.clone())
+                .unwrap_or_else(|failure| failure.retry_history.clone()),
             succeeded,
             error: (!errors.is_empty()).then(|| errors.join("; ")),
         });
@@ -140,19 +146,24 @@ pub(crate) async fn cleanup_registered_resources_with_external(
     }
 }
 
-const CLEANUP_MUTATION_MAX_ATTEMPTS: usize = 4;
-const CLEANUP_VERIFY_MAX_ATTEMPTS: usize = 8;
+const CLEANUP_MUTATION_MAX_ATTEMPTS: usize =
+    ProtocolCleanupRetryPolicy::STANDARD.mutation_max_attempts;
+const CLEANUP_VERIFY_MAX_ATTEMPTS: usize =
+    ProtocolCleanupRetryPolicy::STANDARD.verification_max_attempts;
 #[cfg(not(test))]
-const CLEANUP_RETRY_BASE: Duration = Duration::from_millis(100);
+const CLEANUP_RETRY_BASE: Duration =
+    Duration::from_millis(ProtocolCleanupRetryPolicy::STANDARD.initial_backoff_millis);
 #[cfg(test)]
 const CLEANUP_RETRY_BASE: Duration = Duration::from_millis(1);
 
 struct CleanupSuccess {
     retry_count: usize,
+    retry_history: Vec<ProtocolCleanupRetryObservation>,
 }
 
 struct CleanupFailure {
     retry_count: usize,
+    retry_history: Vec<ProtocolCleanupRetryObservation>,
     error: CleanupError,
 }
 
@@ -164,6 +175,7 @@ async fn cleanup_resource_with_retry(
     versioned_cleanup: bool,
 ) -> std::result::Result<CleanupSuccess, CleanupFailure> {
     let mut retry_count = 0;
+    let mut retry_history = Vec::new();
     let mut mutation_attempt = 0;
     loop {
         mutation_attempt += 1;
@@ -174,11 +186,22 @@ async fn cleanup_resource_with_retry(
                 if error.is_transient() && mutation_attempt < CLEANUP_MUTATION_MAX_ATTEMPTS =>
             {
                 let multiplier = 1u32 << (mutation_attempt - 1);
-                tokio::time::sleep(CLEANUP_RETRY_BASE * multiplier).await;
+                let backoff = CLEANUP_RETRY_BASE * multiplier;
+                retry_history.push(ProtocolCleanupRetryObservation {
+                    phase: "mutation".to_string(),
+                    attempt: mutation_attempt,
+                    backoff_millis: backoff.as_millis().min(u64::MAX as u128) as u64,
+                    error: error.to_string(),
+                });
+                tokio::time::sleep(backoff).await;
                 retry_count += 1;
             }
             Err(error) => {
-                return Err(CleanupFailure { retry_count, error });
+                return Err(CleanupFailure {
+                    retry_count,
+                    retry_history,
+                    error,
+                });
             }
         }
     }
@@ -189,13 +212,31 @@ async fn cleanup_resource_with_retry(
         match verify_resource_absent(resource, admin, s3, external_identity, versioned_cleanup)
             .await
         {
-            Ok(()) => return Ok(CleanupSuccess { retry_count }),
+            Ok(()) => {
+                return Ok(CleanupSuccess {
+                    retry_count,
+                    retry_history,
+                });
+            }
             Err(error) if error.is_transient() && verify_attempt < CLEANUP_VERIFY_MAX_ATTEMPTS => {
                 let multiplier = 1u32 << (verify_attempt - 1);
-                tokio::time::sleep(CLEANUP_RETRY_BASE * multiplier).await;
+                let backoff = CLEANUP_RETRY_BASE * multiplier;
+                retry_history.push(ProtocolCleanupRetryObservation {
+                    phase: "verification".to_string(),
+                    attempt: verify_attempt,
+                    backoff_millis: backoff.as_millis().min(u64::MAX as u128) as u64,
+                    error: error.to_string(),
+                });
+                tokio::time::sleep(backoff).await;
                 retry_count += 1;
             }
-            Err(error) => return Err(CleanupFailure { retry_count, error }),
+            Err(error) => {
+                return Err(CleanupFailure {
+                    retry_count,
+                    retry_history,
+                    error,
+                });
+            }
         }
     }
 }
@@ -1136,6 +1177,12 @@ mod tests {
         let report = cleanup_registered_resources(&mut registry, &FakeAdmin, &s3).await;
         assert!(report.succeeded);
         assert_eq!(report.attempts[0].retry_count, 2);
+        assert_eq!(report.attempts[0].retry_history.len(), 2);
+        assert!(
+            report.attempts[0].retry_history.iter().all(
+                |retry| retry.phase == "mutation" && retry.error.contains("ServiceUnavailable")
+            )
+        );
         assert_eq!(s3.calls.lock().expect("calls").len(), 3);
     }
 
@@ -1371,6 +1418,12 @@ mod tests {
 
         assert!(report.succeeded);
         assert_eq!(report.attempts[0].retry_count, 2);
+        assert!(
+            report.attempts[0]
+                .retry_history
+                .iter()
+                .all(|retry| retry.phase == "verification")
+        );
         assert_eq!(
             s3.calls
                 .lock()

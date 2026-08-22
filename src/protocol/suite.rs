@@ -63,6 +63,24 @@ pub struct ProtocolSuiteExecution {
     pub parallelism: usize,
     pub default_isolation: ProtocolSuiteIsolation,
     pub cleanup: ProtocolCleanupPolicy,
+    #[serde(default)]
+    pub timeouts: ProtocolExecutionTimeouts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolExecutionTimeouts {
+    pub case_seconds: u64,
+    pub suite_seconds: u64,
+}
+
+impl Default for ProtocolExecutionTimeouts {
+    fn default() -> Self {
+        Self {
+            case_seconds: 180,
+            suite_seconds: 3_600,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +211,15 @@ impl ProtocolSuite {
         ensure!(
             self.execution.default_isolation == ProtocolSuiteIsolation::Case,
             "execution.defaultIsolation must be case in Phase 1"
+        );
+        ensure!(
+            (1..=3_600).contains(&self.execution.timeouts.case_seconds),
+            "execution.timeouts.caseSeconds must be between 1 and 3600"
+        );
+        ensure!(
+            self.execution.timeouts.suite_seconds >= self.execution.timeouts.case_seconds
+                && self.execution.timeouts.suite_seconds <= 21_600,
+            "execution.timeouts.suiteSeconds must be at least caseSeconds and at most 21600"
         );
         ensure!(
             !self.target.endpoint.trim().is_empty(),
@@ -427,6 +454,9 @@ execution:
   parallelism: 1
   defaultIsolation: case
   cleanup: always
+  timeouts:
+    caseSeconds: 180
+    suiteSeconds: 3600
 target:
   endpoint: ${RUSTFS_PROTOCOL_TEST_ENDPOINT}
   region: us-east-1
@@ -503,6 +533,13 @@ mod tests {
 
         let zero = protocol_suite_template_yaml().replace("parallelism: 1", "parallelism: 0");
         let suite = serde_yaml_ng::from_str::<ProtocolSuite>(&zero).expect("zero parse");
+        assert!(suite.resolve().is_err());
+
+        let inverted_timeout = protocol_suite_template_yaml()
+            .replace("caseSeconds: 180", "caseSeconds: 601")
+            .replace("suiteSeconds: 3600", "suiteSeconds: 600");
+        let suite =
+            serde_yaml_ng::from_str::<ProtocolSuite>(&inverted_timeout).expect("timeout parse");
         assert!(suite.resolve().is_err());
     }
 

@@ -145,6 +145,7 @@ pub(crate) fn registry_failure(
             resource_kind: "registry".to_string(),
             resource_name: resource.clone(),
             retry_count: 0,
+            retry_history: Vec::new(),
             succeeded: false,
             error: Some(error.to_string()),
         }],

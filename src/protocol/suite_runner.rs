@@ -50,7 +50,7 @@ use crate::protocol::{
         executor::{ProtocolCaseLifecycle, ProtocolShutdownSignal, ProtocolSuiteExecutor},
         preflight::run_connected_preflight,
         runtime::{
-            ConnectedProtocolRuntime, DisabledProtocolTimeout, MonotonicProtocolClock,
+            BudgetedProtocolTimeout, ConnectedProtocolRuntime, MonotonicProtocolClock,
             ProcessShutdownSignal, ensure_dedicated_target_acknowledgement, protocol_artifact_base,
         },
     },
@@ -198,7 +198,7 @@ pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> 
         api_version: &runtime.suite.api_version,
     };
     let clock = MonotonicProtocolClock::default();
-    let timeout = DisabledProtocolTimeout;
+    let timeout = BudgetedProtocolTimeout::new(plan.execution.timeouts);
     let executor = ProtocolSuiteExecutor::new(
         &case_lifecycle,
         &cleanup,
@@ -932,6 +932,14 @@ mod tests {
         artifacts
             .write_json(&case_registry_relative, &valid_case_registry)
             .expect("restore case registry");
+
+        artifacts
+            .write_text(&case_registry_relative, "{\"apiVersion\":")
+            .expect("partial registry fixture");
+        assert!(validate_phase_one_artifacts(&root, &[]).is_err());
+        artifacts
+            .write_json(&case_registry_relative, &valid_case_registry)
+            .expect("restore registry after partial write fixture");
 
         let reject_registry_tampering = |tampered: &ResourceRegistry| {
             artifacts

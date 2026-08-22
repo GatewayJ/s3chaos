@@ -163,7 +163,7 @@ where
     )
     .await?;
     context.current_phase = "expiration-wait".to_string();
-    tokio::time::sleep(
+    crate::protocol::runner::retry::wait_for_required_delay(
         Duration::from_secs(EXPIRING_SESSION_DURATION_SECONDS as u64) + EXPIRATION_GRACE,
     )
     .await;

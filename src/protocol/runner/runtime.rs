@@ -15,9 +15,8 @@
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use std::{
-    future::pending,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::protocol::{
@@ -27,7 +26,10 @@ use crate::protocol::{
     },
     credentials::{AdminCredentials, CredentialProvider, EnvCredentialProvider},
     runner::executor::{ProtocolClock, ProtocolShutdownSignal, ProtocolTimeoutPolicy},
-    suite::{ResolvedProtocolSuite, resolve_protocol_endpoint, resolve_protocol_suite_yaml},
+    suite::{
+        ProtocolExecutionTimeouts, ResolvedProtocolSuite, resolve_protocol_endpoint,
+        resolve_protocol_suite_yaml,
+    },
 };
 
 const DEFAULT_ARTIFACT_BASE: &str = "target/protocol-tests";
@@ -93,13 +95,36 @@ impl ProtocolClock for MonotonicProtocolClock {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct DisabledProtocolTimeout;
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BudgetedProtocolTimeout {
+    case_timeout: Duration,
+    suite_timeout: Duration,
+}
+
+impl BudgetedProtocolTimeout {
+    pub(crate) fn new(timeouts: ProtocolExecutionTimeouts) -> Self {
+        Self {
+            case_timeout: Duration::from_secs(timeouts.case_seconds),
+            suite_timeout: Duration::from_secs(timeouts.suite_seconds),
+        }
+    }
+}
 
 #[async_trait]
-impl ProtocolTimeoutPolicy for DisabledProtocolTimeout {
-    async fn wait_for_wave(&self, _wave_index: usize, _started_at_millis: u128) -> Result<()> {
-        pending().await
+impl ProtocolTimeoutPolicy for BudgetedProtocolTimeout {
+    async fn wait_for_case(&self, _case_id: &str, _started_at_millis: u128) -> Result<()> {
+        tokio::time::sleep(self.case_timeout).await;
+        Ok(())
+    }
+
+    async fn wait_for_suite(
+        &self,
+        _suite_started_at_millis: u128,
+        elapsed_millis: u128,
+    ) -> Result<()> {
+        let elapsed = Duration::from_millis(elapsed_millis.min(u64::MAX as u128) as u64);
+        tokio::time::sleep(self.suite_timeout.saturating_sub(elapsed)).await;
+        Ok(())
     }
 }
 

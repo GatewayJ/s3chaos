@@ -25,7 +25,7 @@ use crate::protocol::{
     },
     ports::ProtocolExternalIdentityProviderInfo,
     scheduler::{ProtocolLock, plan_protocol_schedule},
-    suite::{ProtocolCleanupPolicy, ResolvedProtocolSuite},
+    suite::{ProtocolCleanupPolicy, ProtocolExecutionTimeouts, ResolvedProtocolSuite},
 };
 
 pub const PROTOCOL_SUITE_PLAN_KIND: &str = "ProtocolSuitePlan";
@@ -159,6 +159,54 @@ pub struct ProtocolSuitePlanTarget {
 pub struct ProtocolSuitePlanExecution {
     pub parallelism: usize,
     pub cleanup: ProtocolCleanupPolicy,
+    pub timeouts: ProtocolExecutionTimeouts,
+    pub eventual_consistency: ProtocolEventualConsistencyPolicy,
+    pub cleanup_retry: ProtocolCleanupRetryPolicy,
+    pub product_case_retry: ProtocolProductCaseRetryPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolEventualConsistencyPolicy {
+    pub deadline_millis: u64,
+    pub interval_millis: u64,
+}
+
+impl Default for ProtocolEventualConsistencyPolicy {
+    fn default() -> Self {
+        Self {
+            deadline_millis: 15_000,
+            interval_millis: 500,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolCleanupRetryPolicy {
+    pub mutation_max_attempts: usize,
+    pub verification_max_attempts: usize,
+    pub initial_backoff_millis: u64,
+}
+
+impl Default for ProtocolCleanupRetryPolicy {
+    fn default() -> Self {
+        Self::STANDARD
+    }
+}
+
+impl ProtocolCleanupRetryPolicy {
+    pub const STANDARD: Self = Self {
+        mutation_max_attempts: 4,
+        verification_max_attempts: 8,
+        initial_backoff_millis: 100,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtocolProductCaseRetryPolicy {
+    Never,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +387,10 @@ impl ProtocolSuitePlan {
             execution: ProtocolSuitePlanExecution {
                 parallelism: suite.execution.parallelism,
                 cleanup: suite.execution.cleanup,
+                timeouts: suite.execution.timeouts,
+                eventual_consistency: ProtocolEventualConsistencyPolicy::default(),
+                cleanup_retry: ProtocolCleanupRetryPolicy::default(),
+                product_case_retry: ProtocolProductCaseRetryPolicy::Never,
             },
             cases,
         })
@@ -387,7 +439,10 @@ fn normalize_endpoint(endpoint: String) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolSuitePlanCaseContract, TargetFingerprint};
+    use super::{
+        ProtocolCleanupRetryPolicy, ProtocolEventualConsistencyPolicy,
+        ProtocolProductCaseRetryPolicy, ProtocolSuitePlanCaseContract, TargetFingerprint,
+    };
     use crate::protocol::catalog::{
         BUCKET_POLICY_MALFORMED_POLICY_REJECTED, ProtocolCapability, ProtocolCleanupScope,
         protocol_case,
@@ -435,6 +490,24 @@ mod tests {
         assert_eq!(
             json["variants"][0]["expected"]["errorCode"],
             "MalformedPolicy"
+        );
+    }
+
+    #[test]
+    fn runtime_safety_policy_is_explicit_and_bounded() {
+        let eventual = ProtocolEventualConsistencyPolicy::default();
+        assert_eq!(eventual.deadline_millis, 15_000);
+        assert_eq!(eventual.interval_millis, 500);
+
+        let cleanup = ProtocolCleanupRetryPolicy::default();
+        assert_eq!(cleanup.mutation_max_attempts, 4);
+        assert_eq!(cleanup.verification_max_attempts, 8);
+        assert_eq!(cleanup.initial_backoff_millis, 100);
+
+        assert_eq!(
+            serde_json::to_value(ProtocolProductCaseRetryPolicy::Never)
+                .expect("product retry policy"),
+            "never"
         );
     }
 }

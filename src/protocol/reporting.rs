@@ -72,6 +72,16 @@ pub struct ProtocolAssertion {
     pub retry_count: usize,
     pub elapsed_millis: u128,
     pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eventual_consistency: Option<ProtocolEventualConsistencyObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolEventualConsistencyObservation {
+    pub deadline_millis: u64,
+    pub interval_millis: u64,
+    pub last_observed: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,9 +137,20 @@ pub struct ProtocolCleanupAttempt {
     pub resource_kind: String,
     pub resource_name: String,
     pub retry_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retry_history: Vec<ProtocolCleanupRetryObservation>,
     pub succeeded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolCleanupRetryObservation {
+    pub phase: String,
+    pub attempt: usize,
+    pub backoff_millis: u64,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +329,14 @@ impl ProtocolJunitStatus<'_> {
                 ..
             } => "interrupted",
             Self::Failed {
+                failure_type: "case-timeout",
+                ..
+            } => "case-timeout",
+            Self::Failed {
+                failure_type: "suite-timeout",
+                ..
+            } => "suite-timeout",
+            Self::Failed {
                 failure_type: "cleanup",
                 ..
             } => "cleanup-failed",
@@ -449,6 +478,13 @@ mod tests {
             Some("interrupted"),
             Some("signal received"),
         );
+        let timeout = report(
+            "timeout",
+            "default",
+            ProtocolCaseStatus::Failed,
+            Some("case-timeout"),
+            Some("case budget expired"),
+        );
         let cleanup = report("cleanup", "default", ProtocolCaseStatus::Passed, None, None);
         let xml = protocol_junit_xml(
             "suite<&\"'",
@@ -458,17 +494,19 @@ mod tests {
                 (&not_run, true),
                 (&preflight, true),
                 (&interrupted, true),
+                (&timeout, true),
                 (&cleanup, false),
             ],
             true,
         );
         assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
         assert!(xml.contains(
-            "<testsuite name=\"suite&lt;&amp;&quot;&apos;\" tests=\"7\" failures=\"4\" skipped=\"1\">"
+            "<testsuite name=\"suite&lt;&amp;&quot;&apos;\" tests=\"8\" failures=\"5\" skipped=\"1\">"
         ));
         assert!(xml.contains("name=\"passed&lt;&amp;::v&quot;1\""));
         assert!(xml.contains("value=\"preflight-failed\""));
         assert!(xml.contains("value=\"interrupted\""));
+        assert!(xml.contains("value=\"case-timeout\""));
         assert!(xml.contains("value=\"cleanup-failed\""));
         assert!(xml.contains("<skipped message=\"not-run\">"));
         assert!(xml.contains("expected &lt;ok&gt; &amp; got &apos;bad&apos;"));
