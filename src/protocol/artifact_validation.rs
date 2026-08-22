@@ -32,6 +32,7 @@ use crate::protocol::{
         ProtocolCaseStatus, ProtocolCleanupReport, ProtocolFailureSummary, ProtocolSuiteSummary,
         protocol_junit_xml,
     },
+    runner::artifacts::ProtocolArtifactWriter,
     suite_plan::{ProtocolSuitePlan, ProtocolSuitePlanCaseContract},
 };
 
@@ -59,7 +60,7 @@ pub fn validate_protocol_artifacts_and_write_report(
         checked_files,
         errors,
     };
-    write_json(&root.join(PROTOCOL_ARTIFACT_VALIDATION_REPORT), &report)?;
+    ProtocolArtifactWriter::file(root).write_json(PROTOCOL_ARTIFACT_VALIDATION_REPORT, &report)?;
     if let Err(error) = validation {
         bail!(
             "protocol artifact validation failed: {error}; report: {}",
@@ -441,9 +442,4 @@ fn scan_files(
         }
     }
     Ok(())
-}
-
-fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
-    fs::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))
-        .with_context(|| format!("write protocol artifact {}", path.display()))
 }
