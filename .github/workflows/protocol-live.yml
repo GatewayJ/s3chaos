@@ -8,8 +8,6 @@ on:
       - "scripts/protocol-test.sh"
       - "src/protocol/**"
       - "src/bin/s3chaos.rs"
-  schedule:
-    - cron: "17 18 * * 0"
   workflow_dispatch:
 
 concurrency:
