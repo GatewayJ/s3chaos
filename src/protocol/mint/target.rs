@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use k8s_openapi::api::{
     authorization::v1::{ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec},
-    core::v1::{Namespace, Pod},
+    core::v1::{Namespace, Pod, Service},
+    discovery::v1::EndpointSlice,
 };
 use kube::{
     Api, Client, Error as KubeError, ResourceExt,
@@ -45,6 +49,19 @@ const RUN_ID_LABEL: &str = "rustfs.com/mint-run-id";
 const EXPIRES_AT_ANNOTATION: &str = "rustfs.com/mint-expires-at";
 const MAX_LEASE_SECONDS: i64 = 24 * 60 * 60;
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024 * 1024;
+const TARGET_PREFLIGHT_OPERATIONS: u64 = 5;
+const DIAGNOSTIC_OPERATIONS: u64 = 5;
+// The interruption path bounds Docker CLI termination, removes the owned
+// container immediately, and performs the normal idempotent cleanup retry.
+const CONTAINER_CLEANUP_OPERATIONS: u64 = 5;
+const NAMESPACE_TEARDOWN_OPERATIONS: u64 = 2;
+const SESSION_OPERATION_BUDGET_MULTIPLIER: u64 = TARGET_PREFLIGHT_OPERATIONS
+    + DIAGNOSTIC_OPERATIONS
+    + CONTAINER_CLEANUP_OPERATIONS
+    + NAMESPACE_TEARDOWN_OPERATIONS;
+const ADMIN_PREFLIGHT_SECONDS: u64 = 15;
+const SESSION_LOCAL_OVERHEAD_SECONDS: u64 = 60;
+const ENDPOINT_SLICE_SERVICE_LABEL: &str = "kubernetes.io/service-name";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -77,6 +94,8 @@ pub struct MintTargetSpec {
     pub created_at: String,
     pub expires_at: String,
     pub server_endpoint: String,
+    pub service_name: String,
+    pub service_port: u16,
     pub enable_https: bool,
     pub region: String,
     pub target_fingerprint: String,
@@ -95,6 +114,18 @@ impl MintTargetSpec {
     }
 
     pub fn validate_at(&self, now: &str) -> Result<()> {
+        self.validate_active_at(now)?;
+        let expires_at = parse_timestamp(&self.expires_at, "Mint target expiresAt")?;
+        let now = parse_timestamp(now, "current time")?;
+        let required_seconds = self.required_session_seconds()?;
+        ensure!(
+            (expires_at - now).whole_seconds() >= required_seconds,
+            "Mint target lease has insufficient remaining time: require {required_seconds}s for preflight, Mint, diagnostics, and teardown"
+        );
+        Ok(())
+    }
+
+    fn validate_active_at(&self, now: &str) -> Result<()> {
         self.validate_contract()?;
         let created_at = parse_timestamp(&self.created_at, "Mint target createdAt")?;
         let expires_at = parse_timestamp(&self.expires_at, "Mint target expiresAt")?;
@@ -102,6 +133,19 @@ impl MintTargetSpec {
         ensure!(created_at <= now, "Mint target lease is not active yet");
         ensure!(now < expires_at, "Mint target lease has expired");
         Ok(())
+    }
+
+    fn required_session_seconds(&self) -> Result<i64> {
+        let seconds = self
+            .timeouts
+            .operation_seconds
+            .checked_mul(SESSION_OPERATION_BUDGET_MULTIPLIER)
+            .and_then(|value| value.checked_add(self.timeouts.mint_seconds))
+            .and_then(|value| value.checked_add(self.timeouts.teardown_seconds))
+            .and_then(|value| value.checked_add(ADMIN_PREFLIGHT_SECONDS))
+            .and_then(|value| value.checked_add(SESSION_LOCAL_OVERHEAD_SECONDS))
+            .context("Mint session timeout budget overflow")?;
+        i64::try_from(seconds).context("Mint session timeout budget exceeds i64")
     }
 
     pub fn validate_contract(&self) -> Result<()> {
@@ -119,6 +163,8 @@ impl MintTargetSpec {
         Uuid::parse_str(&self.namespace_uid)
             .context("Mint namespaceUid must be a Kubernetes UUID")?;
         ensure_nonempty("Mint server endpoint", &self.server_endpoint)?;
+        validate_dns_label("Mint Service name", &self.service_name)?;
+        ensure!(self.service_port > 0, "Mint Service port must be positive");
         ensure!(
             !self.server_endpoint.contains(['@', '\n', '\r', '\0'])
                 && !self.server_endpoint.chars().any(char::is_whitespace),
@@ -130,10 +176,11 @@ impl MintTargetSpec {
             endpoint.username().is_empty()
                 && endpoint.password().is_none()
                 && endpoint.host_str().is_some()
+                && endpoint.port_or_known_default() == Some(self.service_port)
                 && endpoint.path() == "/"
                 && endpoint.query().is_none()
                 && endpoint.fragment().is_none(),
-            "Mint server endpoint must contain only an HTTP(S) authority"
+            "Mint server endpoint must contain only an HTTP(S) authority on servicePort"
         );
         ensure_nonempty("Mint region", &self.region)?;
         validate_raw_sha256("Mint target fingerprint", &self.target_fingerprint)?;
@@ -188,6 +235,17 @@ pub struct MintPodProof {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MintServiceProof {
+    pub name: String,
+    pub uid: String,
+    pub port: u16,
+    pub endpoint_host: String,
+    pub endpoint_slice_uids: Vec<String>,
+    pub backend_pod_uids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MintTargetProof {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
@@ -195,6 +253,7 @@ pub struct MintTargetProof {
     pub namespace: MintNamespaceProof,
     pub namespace_pod_count: usize,
     pub rustfs_pods: Vec<MintPodProof>,
+    pub service: MintServiceProof,
     pub rustfs_image_digest: String,
     pub delete_allowed: bool,
     pub server: TargetFingerprint,
@@ -243,7 +302,7 @@ pub async fn verify_mint_target_ready(
     now: &str,
 ) -> Result<MintTargetProof> {
     validate_namespace_proof(spec, namespace_proof)?;
-    spec.validate_at(now)?;
+    spec.validate_active_at(now)?;
     let client = client_for_context(&spec.context)
         .await
         .with_context(|| format!("connect to Kubernetes context {:?}", spec.context))?;
@@ -255,14 +314,36 @@ pub async fn verify_mint_target_ready(
     .await
     .context("time out reading Mint namespace pods")??;
     let rustfs_pods = validate_target_pods(spec, &pods.items)?;
-    ensure_namespace_delete_allowed(client, spec).await?;
-    let server = inspect_mint_target(
-        &spec.server_endpoint,
-        spec.enable_https,
-        &spec.region,
-        &spec.target_fingerprint,
+    let services: Api<Service> = Api::namespaced(client.clone(), &spec.namespace);
+    let service = timeout(
+        Duration::from_secs(spec.timeouts.operation_seconds),
+        services.get(&spec.service_name),
     )
-    .await?;
+    .await
+    .context("time out reading Mint Service ownership")??;
+    let endpoint_slices: Api<EndpointSlice> = Api::namespaced(client.clone(), &spec.namespace);
+    let slices = timeout(
+        Duration::from_secs(spec.timeouts.operation_seconds),
+        endpoint_slices.list(&ListParams::default().labels(&format!(
+            "{ENDPOINT_SLICE_SERVICE_LABEL}={}",
+            spec.service_name
+        ))),
+    )
+    .await
+    .context("time out reading Mint Service EndpointSlices")??;
+    let service = validate_target_service(spec, &service, &slices.items, &rustfs_pods)?;
+    ensure_namespace_delete_allowed(client, spec).await?;
+    let server = timeout(
+        Duration::from_secs(ADMIN_PREFLIGHT_SECONDS),
+        inspect_mint_target(
+            &spec.server_endpoint,
+            spec.enable_https,
+            &spec.region,
+            &spec.target_fingerprint,
+        ),
+    )
+    .await
+    .context("time out querying the Mint target identity")??;
 
     Ok(MintTargetProof {
         api_version: API_VERSION.to_string(),
@@ -270,6 +351,7 @@ pub async fn verify_mint_target_ready(
         namespace: namespace_proof.clone(),
         namespace_pod_count: pods.items.len(),
         rustfs_pods,
+        service,
         rustfs_image_digest: spec.rustfs_image_digest.clone(),
         delete_allowed: true,
         server,
@@ -454,7 +536,7 @@ fn validate_namespace_ownership(
     namespace: &Namespace,
     now: &str,
 ) -> Result<MintNamespaceProof> {
-    spec.validate_at(now)?;
+    spec.validate_active_at(now)?;
     validate_namespace_ownership_without_lease_time(spec, namespace)?;
     Ok(MintNamespaceProof {
         context: spec.context.clone(),
@@ -568,9 +650,14 @@ fn validate_target_pods(spec: &MintTargetSpec, pods: &[Pod]) -> Result<Vec<MintP
             "RustFS pod {} is not Ready",
             pod.name_any()
         );
+        let uid = pod
+            .metadata
+            .uid
+            .clone()
+            .with_context(|| format!("RustFS pod {} has no Kubernetes UID", pod.name_any()))?;
         rustfs_pods.push(MintPodProof {
             name: pod.name_any(),
-            uid: pod.metadata.uid.clone().unwrap_or_default(),
+            uid,
             node_name: pod
                 .spec
                 .as_ref()
@@ -588,6 +675,212 @@ fn validate_target_pods(spec: &MintTargetSpec, pods: &[Pod]) -> Result<Vec<MintP
     );
     rustfs_pods.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(rustfs_pods)
+}
+
+fn validate_target_service(
+    spec: &MintTargetSpec,
+    service: &Service,
+    endpoint_slices: &[EndpointSlice],
+    rustfs_pods: &[MintPodProof],
+) -> Result<MintServiceProof> {
+    let service_uid = service
+        .metadata
+        .uid
+        .clone()
+        .context("Mint Service has no Kubernetes UID")?;
+    let run_id = service
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(RUN_ID_LABEL))
+        .map(String::as_str);
+    let service_spec = service.spec.as_ref().context("Mint Service has no spec")?;
+    let selector_run_id = service_spec
+        .selector
+        .as_ref()
+        .and_then(|selector| selector.get(RUN_ID_LABEL))
+        .map(String::as_str);
+    ensure!(
+        service.name_any() == spec.service_name
+            && run_id == Some(spec.run_id.as_str())
+            && selector_run_id == Some(spec.run_id.as_str()),
+        "Mint Service identity, ownership, or run selector does not match the exact target spec"
+    );
+
+    let matching_ports = service_spec
+        .ports
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|port| {
+            port.port == i32::from(spec.service_port)
+                && port.protocol.as_deref().unwrap_or("TCP") == "TCP"
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        matching_ports.len() == 1,
+        "Mint Service must expose exactly one TCP port {}",
+        spec.service_port
+    );
+    let service_port_name = matching_ports[0]
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty());
+
+    let (endpoint_host, endpoint_port) = mint_endpoint_authority(spec)?;
+    ensure!(
+        endpoint_port == spec.service_port,
+        "Mint server endpoint port {endpoint_port} does not match Service port {}",
+        spec.service_port
+    );
+    let mut service_addresses = BTreeSet::from([
+        normalize_endpoint_host(&spec.service_name),
+        normalize_endpoint_host(&format!("{}.{}", spec.service_name, spec.namespace)),
+        normalize_endpoint_host(&format!("{}.{}.svc", spec.service_name, spec.namespace)),
+        normalize_endpoint_host(&format!(
+            "{}.{}.svc.cluster.local",
+            spec.service_name, spec.namespace
+        )),
+    ]);
+    for address in service_spec
+        .cluster_ip
+        .iter()
+        .chain(service_spec.cluster_ips.iter().flatten())
+        .chain(service_spec.external_ips.iter().flatten())
+    {
+        if !address.is_empty() && address != "None" {
+            service_addresses.insert(normalize_endpoint_host(address));
+        }
+    }
+    if let Some(ingresses) = service
+        .status
+        .as_ref()
+        .and_then(|status| status.load_balancer.as_ref())
+        .and_then(|load_balancer| load_balancer.ingress.as_ref())
+    {
+        for ingress in ingresses {
+            for address in ingress.ip.iter().chain(ingress.hostname.iter()) {
+                service_addresses.insert(normalize_endpoint_host(address));
+            }
+        }
+    }
+    ensure!(
+        service_addresses.contains(&endpoint_host),
+        "Mint server endpoint host {endpoint_host:?} is not an address or DNS name of Service {:?}",
+        spec.service_name
+    );
+
+    ensure!(
+        !endpoint_slices.is_empty(),
+        "Mint Service has no EndpointSlices"
+    );
+    let proved_pods = rustfs_pods
+        .iter()
+        .map(|pod| (pod.uid.as_str(), pod.name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut endpoint_slice_uids = BTreeSet::new();
+    let mut backend_pod_uids = BTreeSet::new();
+    let mut ready_backends = 0usize;
+    for slice in endpoint_slices {
+        let slice_uid =
+            slice.metadata.uid.clone().with_context(|| {
+                format!("EndpointSlice {} has no Kubernetes UID", slice.name_any())
+            })?;
+        let service_label = slice
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(ENDPOINT_SLICE_SERVICE_LABEL))
+            .map(String::as_str);
+        let owned_by_service = slice
+            .metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|owner| {
+                owner.api_version == "v1"
+                    && owner.kind == "Service"
+                    && owner.name == spec.service_name
+                    && owner.uid == service_uid
+                    && owner.controller == Some(true)
+            });
+        ensure!(
+            service_label == Some(spec.service_name.as_str()) && owned_by_service,
+            "EndpointSlice {} is not owned by the exact Mint Service UID",
+            slice.name_any()
+        );
+        let exposes_service_port = slice
+            .ports
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|port| {
+                port.port.is_some()
+                    && port.protocol.as_deref().unwrap_or("TCP") == "TCP"
+                    && match service_port_name {
+                        Some(name) => port.name.as_deref() == Some(name),
+                        None => port.name.as_deref().is_none_or(str::is_empty),
+                    }
+            });
+        ensure!(
+            exposes_service_port,
+            "EndpointSlice {} does not expose the selected Mint Service port",
+            slice.name_any()
+        );
+        endpoint_slice_uids.insert(slice_uid);
+
+        for endpoint in &slice.endpoints {
+            let target = endpoint.target_ref.as_ref().with_context(|| {
+                format!(
+                    "EndpointSlice {} contains an endpoint without a targetRef",
+                    slice.name_any()
+                )
+            })?;
+            let target_uid = target.uid.as_deref().with_context(|| {
+                format!(
+                    "EndpointSlice {} contains a Pod targetRef without a UID",
+                    slice.name_any()
+                )
+            })?;
+            let expected_name = proved_pods.get(target_uid).with_context(|| {
+                format!(
+                    "EndpointSlice {} targets unproved Pod UID {target_uid}",
+                    slice.name_any()
+                )
+            })?;
+            ensure!(
+                target.api_version.as_deref() == Some("v1")
+                    && target.kind.as_deref() == Some("Pod")
+                    && target.namespace.as_deref() == Some(spec.namespace.as_str())
+                    && target.name.as_deref() == Some(*expected_name),
+                "EndpointSlice {} targetRef does not identify the proved RustFS Pod",
+                slice.name_any()
+            );
+            backend_pod_uids.insert(target_uid.to_string());
+            if endpoint
+                .conditions
+                .as_ref()
+                .and_then(|conditions| conditions.ready)
+                == Some(true)
+            {
+                ready_backends += 1;
+            }
+        }
+    }
+    ensure!(
+        ready_backends > 0,
+        "Mint Service has no Ready RustFS backend"
+    );
+
+    Ok(MintServiceProof {
+        name: spec.service_name.clone(),
+        uid: service_uid,
+        port: spec.service_port,
+        endpoint_host,
+        endpoint_slice_uids: endpoint_slice_uids.into_iter().collect(),
+        backend_pod_uids: backend_pod_uids.into_iter().collect(),
+    })
 }
 
 async fn ensure_namespace_delete_allowed(client: Client, spec: &MintTargetSpec) -> Result<()> {
@@ -664,6 +957,27 @@ fn mint_admin_endpoint(server_endpoint: &str, enable_https: bool) -> Result<Stri
     } else {
         Ok(format!("{scheme}://{server_endpoint}"))
     }
+}
+
+pub(crate) fn mint_endpoint_authority(spec: &MintTargetSpec) -> Result<(String, u16)> {
+    let endpoint = reqwest::Url::parse(&mint_admin_endpoint(
+        &spec.server_endpoint,
+        spec.enable_https,
+    )?)
+    .context("parse Mint server endpoint authority")?;
+    let host = endpoint
+        .host_str()
+        .context("Mint server endpoint has no host")?;
+    let port = endpoint
+        .port_or_known_default()
+        .context("Mint server endpoint has no explicit or scheme-default port")?;
+    Ok((normalize_endpoint_host(host), port))
+}
+
+fn normalize_endpoint_host(host: &str) -> String {
+    host.trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 fn validate_timeouts(timeouts: MintTargetTimeouts) -> Result<()> {
@@ -748,8 +1062,14 @@ fn kube_error_is_not_found(error: &KubeError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::api::core::v1::{ContainerStatus, PodCondition, PodSpec, PodStatus};
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use k8s_openapi::api::{
+        core::v1::{
+            ContainerStatus, ObjectReference, PodCondition, PodSpec, PodStatus, ServicePort,
+            ServiceSpec,
+        },
+        discovery::v1::{Endpoint, EndpointConditions, EndpointPort},
+    };
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
     use std::collections::BTreeMap;
 
     const DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
@@ -766,7 +1086,9 @@ mod tests {
             namespace_uid: UID.to_string(),
             created_at: "2026-08-24T00:00:00Z".to_string(),
             expires_at: "2026-08-24T12:00:00Z".to_string(),
-            server_endpoint: "rustfs.example:9000".to_string(),
+            server_endpoint: "rustfs.rustfs-mint-20260824-001.svc:9000".to_string(),
+            service_name: "rustfs".to_string(),
+            service_port: 9000,
             enable_https: false,
             region: "us-east-1".to_string(),
             target_fingerprint: FINGERPRINT.to_string(),
@@ -829,12 +1151,95 @@ mod tests {
         }
     }
 
+    fn service(spec: &MintTargetSpec) -> Service {
+        Service {
+            metadata: ObjectMeta {
+                name: Some(spec.service_name.clone()),
+                uid: Some("service-uid".to_string()),
+                labels: Some(BTreeMap::from([(
+                    RUN_ID_LABEL.to_string(),
+                    spec.run_id.clone(),
+                )])),
+                ..ObjectMeta::default()
+            },
+            spec: Some(ServiceSpec {
+                cluster_ip: Some("10.96.0.10".to_string()),
+                ports: Some(vec![ServicePort {
+                    name: Some("s3".to_string()),
+                    port: i32::from(spec.service_port),
+                    protocol: Some("TCP".to_string()),
+                    ..ServicePort::default()
+                }]),
+                selector: Some(BTreeMap::from([(
+                    RUN_ID_LABEL.to_string(),
+                    spec.run_id.clone(),
+                )])),
+                ..ServiceSpec::default()
+            }),
+            ..Service::default()
+        }
+    }
+
+    fn endpoint_slice(spec: &MintTargetSpec, pod: &Pod) -> EndpointSlice {
+        EndpointSlice {
+            address_type: "IPv4".to_string(),
+            endpoints: vec![Endpoint {
+                addresses: vec!["10.42.0.10".to_string()],
+                conditions: Some(EndpointConditions {
+                    ready: Some(true),
+                    ..EndpointConditions::default()
+                }),
+                target_ref: Some(ObjectReference {
+                    api_version: Some("v1".to_string()),
+                    kind: Some("Pod".to_string()),
+                    name: pod.metadata.name.clone(),
+                    namespace: Some(spec.namespace.clone()),
+                    uid: pod.metadata.uid.clone(),
+                    ..ObjectReference::default()
+                }),
+                ..Endpoint::default()
+            }],
+            metadata: ObjectMeta {
+                name: Some("rustfs-abcde".to_string()),
+                uid: Some("endpoint-slice-uid".to_string()),
+                labels: Some(BTreeMap::from([(
+                    ENDPOINT_SLICE_SERVICE_LABEL.to_string(),
+                    spec.service_name.clone(),
+                )])),
+                owner_references: Some(vec![OwnerReference {
+                    api_version: "v1".to_string(),
+                    controller: Some(true),
+                    kind: "Service".to_string(),
+                    name: spec.service_name.clone(),
+                    uid: "service-uid".to_string(),
+                    ..OwnerReference::default()
+                }]),
+                ..ObjectMeta::default()
+            },
+            ports: Some(vec![EndpointPort {
+                name: Some("s3".to_string()),
+                port: Some(9000),
+                protocol: Some("TCP".to_string()),
+                ..EndpointPort::default()
+            }]),
+        }
+    }
+
     #[test]
     fn target_spec_requires_a_current_short_lived_exact_lease() {
         spec()
             .validate_at("2026-08-24T01:00:00Z")
             .expect("active lease");
+        assert_eq!(spec().required_session_seconds().expect("budget"), 4_485);
         assert!(spec().validate_at("2026-08-24T13:00:00Z").is_err());
+        let insufficient = spec()
+            .validate_at("2026-08-24T11:00:00Z")
+            .expect_err("lease cannot cover a full Mint session");
+        assert!(
+            insufficient
+                .to_string()
+                .contains("insufficient remaining time")
+        );
         let mut long = spec();
         long.expires_at = "2026-08-26T00:00:00Z".to_string();
         assert!(long.validate_at("2026-08-24T01:00:00Z").is_err());
@@ -850,6 +1255,10 @@ mod tests {
         let mut credential_endpoint = spec();
         credential_endpoint.server_endpoint = "admin:secret@rustfs.example:9000".to_string();
         assert!(credential_endpoint.validate_contract().is_err());
+
+        let mut wrong_service_port = spec();
+        wrong_service_port.service_port = 9001;
+        assert!(wrong_service_port.validate_contract().is_err());
     }
 
     #[test]
@@ -887,6 +1296,52 @@ mod tests {
             "rustfs/rustfs@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
                 .to_string();
         assert!(validate_target_pods(&spec, &[drifted]).is_err());
+
+        let mut missing_uid = pod(&spec, "missing-uid");
+        missing_uid.metadata.uid = None;
+        assert!(validate_target_pods(&spec, &[missing_uid]).is_err());
+    }
+
+    #[test]
+    fn service_proof_binds_endpoint_slices_to_proved_pod_uids() {
+        let spec = spec();
+        let pod = pod(&spec, "rustfs-0");
+        let pod_proofs = validate_target_pods(&spec, std::slice::from_ref(&pod)).expect("pods");
+        let service = service(&spec);
+        let slice = endpoint_slice(&spec, &pod);
+        let proof =
+            validate_target_service(&spec, &service, std::slice::from_ref(&slice), &pod_proofs)
+                .expect("Service-backed endpoint");
+        assert_eq!(proof.backend_pod_uids, vec!["rustfs-0-uid"]);
+
+        let mut foreign = slice;
+        foreign.endpoints[0]
+            .target_ref
+            .as_mut()
+            .expect("targetRef")
+            .uid = Some("foreign-pod-uid".to_string());
+        assert!(validate_target_service(&spec, &service, &[foreign], &pod_proofs).is_err());
+
+        let mut foreign_owner = endpoint_slice(&spec, &pod);
+        foreign_owner
+            .metadata
+            .owner_references
+            .as_mut()
+            .expect("ownerReferences")[0]
+            .uid = "foreign-service-uid".to_string();
+        assert!(validate_target_service(&spec, &service, &[foreign_owner], &pod_proofs).is_err());
+
+        let mut outside = spec.clone();
+        outside.server_endpoint = "different.example:9000".to_string();
+        assert!(
+            validate_target_service(
+                &outside,
+                &service,
+                &[endpoint_slice(&spec, &pod)],
+                &pod_proofs
+            )
+            .is_err()
+        );
     }
 
     #[test]

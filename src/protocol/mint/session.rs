@@ -31,8 +31,8 @@ use super::{
     artifacts::{ensure_mint_artifact_tree_safe, sanitize_mint_bytes},
     target::{
         MintNamespaceProof, MintTargetDiagnostic, MintTargetProof, MintTargetSpec,
-        MintTargetTeardownProof, collect_mint_target_diagnostics, prove_mint_namespace,
-        teardown_mint_target, timestamp_now, verify_mint_target_ready,
+        MintTargetTeardownProof, collect_mint_target_diagnostics, mint_endpoint_authority,
+        prove_mint_namespace, teardown_mint_target, timestamp_now, verify_mint_target_ready,
     },
     validate_mint_artifacts_and_write_report, write_mint_artifacts,
 };
@@ -50,10 +50,14 @@ const SESSION_SUMMARY_FILE: &str = "mint-session-summary.json";
 const SESSION_JUNIT_FILE: &str = "mint-session-junit.xml";
 const SESSION_EXIT_CODE_FILE: &str = "mint-session-exit-code.txt";
 const SESSION_CREDENTIAL_SCAN_FILE: &str = "mint-session-credential-scan.json";
+const MINT_PUBLICATION_ERROR_FILE: &str = "mint-publication-error.txt";
 pub const MINT_SESSION_VALIDATION_FILE: &str = "mint-session-validation.json";
 const MINT_ARTIFACT_DIR: &str = "mint";
 const KUBERNETES_ARTIFACT_DIR: &str = "kubernetes";
 const MAX_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
+const ADMIN_ACCESS_KEY_ENV: &str = "RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY";
+const ADMIN_SECRET_KEY_ENV: &str = "RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY";
+const ADMIN_SESSION_TOKEN_ENV: &str = "RUSTFS_PROTOCOL_TEST_ADMIN_SESSION_TOKEN";
 
 #[derive(Debug, Clone)]
 pub struct MintSessionRequest {
@@ -145,6 +149,7 @@ struct MintSessionLifecycle {
     namespace_proof_persisted: bool,
     target_proof_persisted: bool,
     mint_artifacts_published: bool,
+    admin_session_token_used: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +319,7 @@ pub async fn run_mint_session(request: MintSessionRequest) -> Result<MintSession
         namespace_proof_persisted: false,
         target_proof_persisted: false,
         mint_artifacts_published: false,
+        admin_session_token_used: admin_session_token_used(),
     };
     write_lifecycle(&writer, &mut lifecycle, &request.forbidden_material)?;
     let mut cancellation = install_process_cancellation();
@@ -384,6 +390,12 @@ pub async fn run_mint_session(request: MintSessionRequest) -> Result<MintSession
             stderr: Vec::new(),
         };
         let mut mint_gate_status = None;
+        if target_proof.is_some()
+            && failure_codes.is_empty()
+            && cancellation_requested(&cancellation)
+        {
+            failure_codes.push(MintSessionFailureCode::MintInterrupted);
+        }
         if target_proof.is_some() && failure_codes.is_empty() {
             capture = run_mint_container(&request, &mut cancellation).await;
             match capture.process_disposition {
@@ -439,7 +451,16 @@ pub async fn run_mint_session(request: MintSessionRequest) -> Result<MintSession
                         failure_codes.push(MintSessionFailureCode::MintGateFailed);
                     }
                 }
-                Err(_) => failure_codes.push(MintSessionFailureCode::MintPublicationFailed),
+                Err(error) => {
+                    failure_codes.push(MintSessionFailureCode::MintPublicationFailed);
+                    write_failure_detail(
+                        &writer,
+                        MINT_PUBLICATION_ERROR_FILE,
+                        &error,
+                        &request.forbidden_material,
+                    )
+                    .with_context(|| format!("preserve Mint publication failure: {error:#}"))?;
+                }
             }
             lifecycle.phase = MintSessionPhase::MintFinished;
             write_lifecycle(&writer, &mut lifecycle, &request.forbidden_material)?;
@@ -601,6 +622,7 @@ pub async fn cleanup_mint_session(
     forbidden_material: &[String],
 ) -> Result<MintSessionPublication> {
     let artifact_root = artifact_root.as_ref();
+    ensure_safe_session_root(artifact_root)?;
     let spec: MintTargetSpec = read_json(&artifact_root.join(TARGET_SPEC_FILE))?;
     spec.validate_contract()?;
     let namespace_proof: MintNamespaceProof =
@@ -608,6 +630,7 @@ pub async fn cleanup_mint_session(
             "Mint cleanup requires a persisted namespace ownership proof; refusing unproven deletion",
         )?;
     let writer = ProtocolArtifactWriter::file(artifact_root);
+    let session_token_used = interrupted_session_token_used(artifact_root);
     let existing_cleanup =
         read_json::<MintCleanupReport>(&artifact_root.join(CLEANUP_REPORT_FILE)).ok();
     if let Some(existing) = existing_cleanup.as_ref()
@@ -621,63 +644,76 @@ pub async fn cleanup_mint_session(
 
     let previously_absent =
         existing_cleanup.filter(|cleanup| cleanup_proves_target_absent(&spec, cleanup));
-    let (diagnostics_collected, cleanup, mut failure_codes) =
-        if let Some(cleanup) = previously_absent {
-            let diagnostics_collected =
-                read_diagnostics_collected(artifact_root, &spec.run_id).unwrap_or(false);
-            let mut failure_codes = vec![MintSessionFailureCode::RecoveryCleanup];
-            failure_codes.extend(cleanup.failure_codes.iter().copied());
-            if !diagnostics_collected {
-                failure_codes.push(MintSessionFailureCode::DiagnosticCollectionFailed);
-            }
-            (diagnostics_collected, cleanup, failure_codes)
+    let (diagnostics_collected, cleanup, mut failure_codes) = if let Some(cleanup) =
+        previously_absent
+    {
+        let diagnostics_collected =
+            read_diagnostics_collected(artifact_root, &spec.run_id).unwrap_or(false);
+        let mut failure_codes = vec![MintSessionFailureCode::RecoveryCleanup];
+        failure_codes.extend(cleanup.failure_codes.iter().copied());
+        if !diagnostics_collected {
+            failure_codes.push(MintSessionFailureCode::DiagnosticCollectionFailed);
+        }
+        (diagnostics_collected, cleanup, failure_codes)
+    } else {
+        let scan_available =
+            recovery_scan_material_available(forbidden_material, session_token_used);
+        let mut diagnostics = if scan_available {
+            collect_mint_target_diagnostics(&spec).await
         } else {
-            let mut diagnostics = collect_mint_target_diagnostics(&spec).await;
+            vec![MintTargetDiagnostic {
+                    file_name: "recovery-diagnostics-skipped.txt".to_string(),
+                    contents: b"Recovery diagnostics were not captured because the original credential material was unavailable for redaction.\n".to_vec(),
+                    succeeded: false,
+                }]
+        };
+        if scan_available {
             for diagnostic in &mut diagnostics {
                 diagnostic.file_name = format!("recovery-{}", diagnostic.file_name);
             }
-            let diagnostics_collected =
-                write_diagnostics(&writer, &diagnostics, forbidden_material, &spec.run_id)
-                    .unwrap_or(false);
-            let container = remove_owned_mint_container(&spec).await;
-            let container_absent = container.is_ok();
-            let teardown = teardown_mint_target(&spec, &namespace_proof, &timestamp_now()?).await;
-            let namespace_absent = teardown.is_ok();
-            let cleanup_errors = container
-                .as_ref()
-                .err()
-                .into_iter()
-                .chain(teardown.as_ref().err())
-                .map(|error| safe_error_message(error, forbidden_material))
-                .collect::<Vec<_>>();
-            let mut failure_codes = vec![MintSessionFailureCode::RecoveryCleanup];
-            if !diagnostics_collected {
-                failure_codes.push(MintSessionFailureCode::DiagnosticCollectionFailed);
-            }
-            if !container_absent {
-                failure_codes.push(MintSessionFailureCode::ContainerCleanupFailed);
-            }
-            if !namespace_absent {
-                failure_codes.push(MintSessionFailureCode::TargetTeardownFailed);
-            }
-            let cleanup = MintCleanupReport {
-                api_version: API_VERSION.to_string(),
-                kind: "MintCleanupReport".to_string(),
-                status: if container_absent && namespace_absent {
-                    MintTeardownStatus::Passed
-                } else {
-                    MintTeardownStatus::Failed
-                },
-                container_name: spec.container_name(),
-                container_absent,
-                namespace_absent,
-                teardown_proof: teardown.ok(),
-                failure_codes: failure_codes.clone(),
-                errors: cleanup_errors,
-            };
-            write_safe_json(&writer, CLEANUP_REPORT_FILE, &cleanup, forbidden_material)?;
-            (diagnostics_collected, cleanup, failure_codes)
+        }
+        let diagnostics_collected =
+            write_diagnostics(&writer, &diagnostics, forbidden_material, &spec.run_id)
+                .unwrap_or(false);
+        let container = remove_owned_mint_container(&spec).await;
+        let container_absent = container.is_ok();
+        let teardown = teardown_mint_target(&spec, &namespace_proof, &timestamp_now()?).await;
+        let namespace_absent = teardown.is_ok();
+        let cleanup_errors = container
+            .as_ref()
+            .err()
+            .into_iter()
+            .chain(teardown.as_ref().err())
+            .map(|error| safe_error_message(error, forbidden_material))
+            .collect::<Vec<_>>();
+        let mut failure_codes = vec![MintSessionFailureCode::RecoveryCleanup];
+        if !diagnostics_collected {
+            failure_codes.push(MintSessionFailureCode::DiagnosticCollectionFailed);
+        }
+        if !container_absent {
+            failure_codes.push(MintSessionFailureCode::ContainerCleanupFailed);
+        }
+        if !namespace_absent {
+            failure_codes.push(MintSessionFailureCode::TargetTeardownFailed);
+        }
+        let cleanup = MintCleanupReport {
+            api_version: API_VERSION.to_string(),
+            kind: "MintCleanupReport".to_string(),
+            status: if container_absent && namespace_absent {
+                MintTeardownStatus::Passed
+            } else {
+                MintTeardownStatus::Failed
+            },
+            container_name: spec.container_name(),
+            container_absent,
+            namespace_absent,
+            teardown_proof: teardown.ok(),
+            failure_codes: failure_codes.clone(),
+            errors: cleanup_errors,
         };
+        write_safe_json(&writer, CLEANUP_REPORT_FILE, &cleanup, forbidden_material)?;
+        (diagnostics_collected, cleanup, failure_codes)
+    };
     let mint_artifacts_published = artifact_root.join(MINT_ARTIFACT_DIR).is_dir()
         && validate_mint_artifacts_and_write_report(
             artifact_root.join(MINT_ARTIFACT_DIR),
@@ -694,6 +730,7 @@ pub async fn cleanup_mint_session(
         namespace_proof_persisted: true,
         target_proof_persisted: artifact_root.join(TARGET_PROOF_FILE).is_file(),
         mint_artifacts_published,
+        admin_session_token_used: session_token_used,
     };
     write_safe_json(&writer, LIFECYCLE_FILE, &lifecycle, forbidden_material)?;
     failure_codes.push(MintSessionFailureCode::RecoveryCleanup);
@@ -1090,6 +1127,9 @@ async fn run_mint_container(
     request: &MintSessionRequest,
     cancellation: &mut watch::Receiver<bool>,
 ) -> OwnedMintCapture {
+    if cancellation_requested(cancellation) {
+        return interrupted_before_container_start();
+    }
     let mut docker_process_started = false;
     match run_mint_container_inner(request, cancellation, &mut docker_process_started).await {
         Ok(capture) => capture,
@@ -1165,6 +1205,9 @@ async fn run_mint_container_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    if cancellation_requested(cancellation) {
+        return Ok(interrupted_before_container_start());
+    }
     let mut child = command.spawn().context("start pinned Mint container")?;
     *docker_process_started = true;
     let mut process_disposition;
@@ -1176,14 +1219,22 @@ async fn run_mint_container_inner(
         _ = tokio::time::sleep(Duration::from_secs(request.target.timeouts.mint_seconds)) => {
             process_disposition = MintProcessDisposition::TimedOut;
             let _ = child.start_kill();
-            let _ = child.wait().await;
+            let _ = timeout(
+                Duration::from_secs(request.target.timeouts.operation_seconds),
+                child.wait(),
+            )
+            .await;
             return capture_after_interruption(request, &capture, process_disposition).await;
         }
         changed = cancellation.changed() => {
             changed.context("listen for Mint cancellation")?;
             process_disposition = MintProcessDisposition::Interrupted;
             let _ = child.start_kill();
-            let _ = child.wait().await;
+            let _ = timeout(
+                Duration::from_secs(request.target.timeouts.operation_seconds),
+                child.wait(),
+            )
+            .await;
             return capture_after_interruption(request, &capture, process_disposition).await;
         }
     };
@@ -1207,6 +1258,18 @@ async fn run_mint_container_inner(
         stdout: read_bounded(&capture.stdout())?,
         stderr: read_bounded(&capture.stderr())?,
     })
+}
+
+fn interrupted_before_container_start() -> OwnedMintCapture {
+    OwnedMintCapture {
+        process_disposition: MintProcessDisposition::Interrupted,
+        container_started: false,
+        container_exit_code: None,
+        infrastructure_failure: None,
+        log: None,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }
 }
 
 async fn capture_after_interruption(
@@ -1306,6 +1369,34 @@ fn cancellation_requested(cancellation: &watch::Receiver<bool>) -> bool {
     *cancellation.borrow()
 }
 
+fn admin_session_token_used() -> bool {
+    std::env::var(ADMIN_SESSION_TOKEN_ENV).is_ok_and(|value| !value.is_empty())
+}
+
+fn interrupted_session_token_used(artifact_root: &Path) -> bool {
+    read_json::<MintSessionLifecycle>(&artifact_root.join(LIFECYCLE_FILE))
+        .map(|lifecycle| lifecycle.admin_session_token_used)
+        .unwrap_or(true)
+}
+
+fn recovery_scan_material_available(
+    forbidden_material: &[String],
+    session_token_used: bool,
+) -> bool {
+    [
+        Some(ADMIN_ACCESS_KEY_ENV),
+        Some(ADMIN_SECRET_KEY_ENV),
+        session_token_used.then_some(ADMIN_SESSION_TOKEN_ENV),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|name| {
+        std::env::var(name).is_ok_and(|value| {
+            !value.is_empty() && forbidden_material.iter().any(|material| material == &value)
+        })
+    })
+}
+
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect Mint capture {}", path.display()))?;
@@ -1390,6 +1481,15 @@ fn validate_mint_session_artifacts(
             && lifecycle.phase == MintSessionPhase::Finished,
         "Mint session lifecycle is not terminal or disagrees with target identity"
     );
+    if summary
+        .failure_codes
+        .contains(&MintSessionFailureCode::MintPublicationFailed)
+    {
+        ensure!(
+            artifact_root.join(MINT_PUBLICATION_ERROR_FILE).is_file(),
+            "Mint publication failure lacks its sanitized error artifact"
+        );
+    }
     ensure!(
         credential_scan.run_id == spec.run_id
             && !credential_scan.redaction_token.is_empty()
@@ -1429,6 +1529,12 @@ fn validate_mint_session_artifacts(
     }
     if lifecycle.target_proof_persisted {
         let proof: MintTargetProof = read_json(&artifact_root.join(TARGET_PROOF_FILE))?;
+        let (expected_endpoint_host, expected_service_port) = mint_endpoint_authority(&spec)?;
+        let proved_pod_uids = proof
+            .rustfs_pods
+            .iter()
+            .map(|pod| pod.uid.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
         let expected_endpoint = if spec.server_endpoint.contains("://") {
             spec.server_endpoint.clone()
         } else {
@@ -1450,6 +1556,25 @@ fn validate_mint_session_artifacts(
                 && proof.server.sha256 == spec.target_fingerprint
                 && proof.server.region == spec.region
                 && proof.rustfs_image_digest == spec.rustfs_image_digest
+                && proof.service.name == spec.service_name
+                && proof.service.port == expected_service_port
+                && proof.service.endpoint_host == expected_endpoint_host
+                && !proof.service.uid.is_empty()
+                && strictly_sorted_unique(&proof.service.endpoint_slice_uids)
+                && strictly_sorted_unique(&proof.service.backend_pod_uids)
+                && !proof.service.endpoint_slice_uids.is_empty()
+                && !proof.service.backend_pod_uids.is_empty()
+                && proof
+                    .service
+                    .endpoint_slice_uids
+                    .iter()
+                    .chain(&proof.service.backend_pod_uids)
+                    .all(|uid| !uid.is_empty())
+                && proof
+                    .service
+                    .backend_pod_uids
+                    .iter()
+                    .all(|uid| proved_pod_uids.contains(uid.as_str()))
                 && proof.delete_allowed
                 && !proof.rustfs_pods.is_empty()
                 && proof.namespace_pod_count >= proof.rustfs_pods.len()
@@ -1576,6 +1701,10 @@ fn validate_mint_session_artifacts(
     );
     ensure_mint_artifact_tree_safe(artifact_root, forbidden_material)?;
     Ok(())
+}
+
+fn strictly_sorted_unique(values: &[String]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn expected_artifact_references(lifecycle: &MintSessionLifecycle) -> MintSessionArtifactReferences {
@@ -1765,7 +1894,10 @@ fn placeholder_known_failures() -> MintKnownFailures {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{mint::target::MintPodProof, suite_plan::TargetFingerprint};
+    use crate::protocol::{
+        mint::target::{MintPodProof, MintServiceProof},
+        suite_plan::TargetFingerprint,
+    };
 
     fn lifecycle() -> MintSessionLifecycle {
         MintSessionLifecycle {
@@ -1778,6 +1910,7 @@ mod tests {
             namespace_proof_persisted: true,
             target_proof_persisted: true,
             mint_artifacts_published: true,
+            admin_session_token_used: false,
         }
     }
 
@@ -1812,6 +1945,62 @@ mod tests {
             stdout: Vec::new(),
             stderr: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_spawn_never_starts_docker() {
+        let (sender, mut cancellation) = watch::channel(false);
+        sender.send(true).expect("request cancellation");
+        let capture = run_mint_container(&request(), &mut cancellation).await;
+        assert_eq!(
+            capture.process_disposition,
+            MintProcessDisposition::Interrupted
+        );
+        assert!(!capture.container_started);
+        assert_eq!(capture.container_exit_code, None);
+    }
+
+    #[test]
+    fn recovery_without_original_scan_material_skips_live_captures() {
+        assert!(!recovery_scan_material_available(&[], false));
+        assert!(!recovery_scan_material_available(&[], true));
+    }
+
+    #[test]
+    fn publication_error_detail_is_redacted_before_persistence() {
+        let root = std::env::temp_dir().join(format!("s3chaos-mint-error-test-{}", Uuid::new_v4()));
+        fs::create_dir(&root).expect("artifact root");
+        let writer = ProtocolArtifactWriter::file(&root);
+        let error = anyhow::anyhow!("Mint output contained recovery-secret");
+        write_failure_detail(
+            &writer,
+            MINT_PUBLICATION_ERROR_FILE,
+            &error,
+            &["recovery-secret".to_string()],
+        )
+        .expect("sanitized failure detail");
+        let persisted =
+            fs::read_to_string(root.join(MINT_PUBLICATION_ERROR_FILE)).expect("failure detail");
+        assert!(!persisted.contains("recovery-secret"));
+        assert!(persisted.contains("REDACTED"));
+        fs::remove_dir_all(root).expect("remove test artifacts");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_rejects_a_symlink_root_before_reading_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("s3chaos-mint-root-test-{}", Uuid::new_v4()));
+        let link = root.with_extension("link");
+        fs::create_dir(&root).expect("artifact root");
+        symlink(&root, &link).expect("artifact symlink");
+        let error = cleanup_mint_session(&link, &[])
+            .await
+            .expect_err("symlink root must be rejected");
+        assert!(error.to_string().contains("not a symlink"));
+        fs::remove_file(link).expect("remove symlink");
+        fs::remove_dir_all(root).expect("remove test artifacts");
     }
 
     #[test]
@@ -1927,6 +2116,14 @@ mod tests {
                 ready: true,
                 restart_count: 0,
             }],
+            service: MintServiceProof {
+                name: request.target.service_name.clone(),
+                uid: "service-uid".to_string(),
+                port: request.target.service_port,
+                endpoint_host: "rustfs-mint.example".to_string(),
+                endpoint_slice_uids: vec!["endpoint-slice-uid".to_string()],
+                backend_pod_uids: vec!["pod-uid".to_string()],
+            },
             rustfs_image_digest: request.target.rustfs_image_digest.clone(),
             delete_allowed: true,
             server: TargetFingerprint {

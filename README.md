@@ -160,8 +160,10 @@ rustfs.com/mint-run-id=<run-id>
 rustfs.com/mint-expires-at=<same RFC3339 value as target expiresAt>
 ```
 
-The target file pins the exact kube context, namespace UID, lease, endpoint,
-region, RustFS container image digest, and server fingerprint. It is a
+The target file pins the exact kube context, namespace UID, lease, Service,
+endpoint, region, RustFS container image digest, and server fingerprint. The
+endpoint must be an address or DNS name advertised by that Service, whose
+owned EndpointSlices must resolve only to the proved RustFS Pod UIDs. It is a
 destructive hand-off: after ownership and readiness are proven, s3chaos owns
 the whole namespace and will delete it with a Kubernetes UID precondition.
 Do not point it at a shared or long-lived namespace.
