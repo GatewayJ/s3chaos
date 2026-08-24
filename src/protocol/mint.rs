@@ -52,11 +52,14 @@ impl MintProfile {
         Ok(profile)
     }
 
-    pub fn image_digest(&self) -> &str {
-        self.image
+    pub fn image_digest(&self) -> Result<&str> {
+        let (repository, digest) = self
+            .image
             .rsplit_once('@')
-            .map(|(_, digest)| digest)
-            .expect("validated Mint image contains a digest")
+            .context("Mint profile image must include an immutable digest")?;
+        ensure_nonempty("Mint image repository", repository)?;
+        validate_sha256("Mint image digest", digest)?;
+        Ok(digest)
     }
 }
 
@@ -470,6 +473,13 @@ pub fn evaluate_mint_run(
         let key = MintFunctionKey::new(&function.suite, &function.function);
         let observed = observed_by_key.get(&key).copied().unwrap_or_default();
         let known_failure = known_by_key.get(&key).copied();
+        if observed.not_applicable > 0 && !function.allow_na {
+            diagnostics.push(MintDiagnostic::function(
+                MintDiagnosticCode::UnexpectedNotApplicable,
+                &key,
+            ));
+            incomplete = true;
+        }
         let status = if observed.failed > 0 {
             if known_failure.is_some() {
                 has_known_failure = true;
@@ -486,13 +496,6 @@ pub fn evaluate_mint_run(
             has_pass = true;
             MintFunctionStatus::Passed
         } else if observed.not_applicable > 0 {
-            if !function.allow_na {
-                diagnostics.push(MintDiagnostic::function(
-                    MintDiagnosticCode::UnexpectedNotApplicable,
-                    &key,
-                ));
-                incomplete = true;
-            }
             MintFunctionStatus::NotApplicable
         } else {
             diagnostics.push(MintDiagnostic::function(
@@ -638,7 +641,7 @@ fn validate_contract(
     validate_inventory(inventory)?;
     validate_known_failures(known_failures)?;
     ensure!(
-        inventory.image_digest == profile.image_digest(),
+        inventory.image_digest == profile.image_digest()?,
         "Mint inventory image digest does not match profile"
     );
     ensure!(
@@ -690,12 +693,7 @@ fn validate_contract(
 fn validate_profile(profile: &MintProfile) -> Result<()> {
     validate_header(&profile.api_version, &profile.kind, PROFILE_KIND)?;
     ensure_nonempty("Mint profile name", &profile.name)?;
-    let (repository, digest) = profile
-        .image
-        .rsplit_once('@')
-        .context("Mint profile image must include an immutable digest")?;
-    ensure_nonempty("Mint image repository", repository)?;
-    validate_sha256("Mint image digest", digest)?;
+    profile.image_digest()?;
     ensure_nonempty("Mint platform", &profile.platform)?;
     validate_suites(&profile.suites)?;
     ensure_nonempty("Mint region", &profile.region)?;
@@ -714,6 +712,7 @@ fn validate_inventory(inventory: &MintInventory) -> Result<()> {
     );
     let suites = exact_set(&inventory.suites);
     let mut keys = BTreeSet::new();
+    let mut function_suites = BTreeSet::new();
     for function in &inventory.functions {
         validate_exact_key(&function.suite, &function.function)?;
         ensure!(
@@ -727,6 +726,13 @@ fn validate_inventory(inventory: &MintInventory) -> Result<()> {
             "duplicate Mint inventory function {}/{}",
             function.suite,
             function.function
+        );
+        function_suites.insert(function.suite.as_str());
+    }
+    for suite in &inventory.suites {
+        ensure!(
+            function_suites.contains(suite.as_str()),
+            "Mint inventory suite {suite} has no functions"
         );
     }
     Ok(())
@@ -1154,6 +1160,41 @@ mod tests {
     }
 
     #[test]
+    fn disallowed_na_cannot_be_masked_by_pass_or_known_failure() {
+        let passed_log = br#"{"name":"minio-go","function":"make-bucket","status":"PASS"}
+{"name":"minio-go","function":"make-bucket","status":"NA"}
+{"name":"minio-go","function":"object-lock","status":"NA"}"#;
+        let passed = evaluate_mint_run(
+            &profile(),
+            &inventory(),
+            &known_failures(Vec::new()),
+            observation(Some(passed_log), Some(0)),
+            "2026-08-23",
+        )
+        .expect("evaluate pass and NA");
+
+        let known_failed_log = br#"{"name":"minio-go","function":"make-bucket","status":"FAIL"}
+{"name":"minio-go","function":"make-bucket","status":"NA"}
+{"name":"minio-go","function":"object-lock","status":"NA"}"#;
+        let known_failed = evaluate_mint_run(
+            &profile(),
+            &inventory(),
+            &known_failures(vec![known("make-bucket", "2026-12-31")]),
+            observation(Some(known_failed_log), Some(1)),
+            "2026-08-23",
+        )
+        .expect("evaluate known failure and NA");
+
+        for evaluation in [passed, known_failed] {
+            assert_eq!(evaluation.execution_status, MintExecutionStatus::Incomplete);
+            assert_eq!(evaluation.gate_status, MintGateStatus::Failed);
+            assert!(evaluation.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == MintDiagnosticCode::UnexpectedNotApplicable
+            }));
+        }
+    }
+
+    #[test]
     fn allowed_na_can_complete_without_claiming_compatibility_pass() {
         let mut inventory = inventory();
         inventory.functions.remove(0);
@@ -1216,6 +1257,18 @@ mod tests {
     }
 
     #[test]
+    fn inventory_requires_a_function_for_every_declared_suite() {
+        let mut incomplete_inventory = inventory();
+        incomplete_inventory.suites.push("awscli".to_string());
+
+        let error = MintInventory::from_yaml(
+            &serde_yaml_ng::to_string(&incomplete_inventory).expect("serialize inventory"),
+        )
+        .expect_err("suite without functions must fail");
+        assert!(error.to_string().contains("suite awscli has no functions"));
+    }
+
+    #[test]
     fn repeated_unknown_function_produces_one_drift_diagnostic() {
         let log = br#"{"name":"minio-go","function":"new-function","status":"PASS"}
 {"name":"minio-go","function":"new-function","status":"PASS"}"#;
@@ -1253,9 +1306,13 @@ targetFingerprint: {FINGERPRINT}
 "#
         );
         let parsed = MintProfile::from_yaml(&yaml).expect("profile");
-        assert_eq!(parsed.image_digest(), DIGEST);
+        assert_eq!(parsed.image_digest().expect("digest"), DIGEST);
 
         let unpinned = yaml.replace(&format!("minio/mint:edge@{DIGEST}"), "minio/mint:edge");
         assert!(MintProfile::from_yaml(&unpinned).is_err());
+
+        let mut unvalidated = profile();
+        unvalidated.image = "minio/mint:edge".to_string();
+        assert!(unvalidated.image_digest().is_err());
     }
 }
