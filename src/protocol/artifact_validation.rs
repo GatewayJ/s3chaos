@@ -36,6 +36,15 @@ pub const PROTOCOL_ARTIFACT_VALIDATION_REPORT: &str = "protocol-artifact-validat
 const MAX_FILES: usize = 10_000;
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const LEGACY_COMPATIBILITY_COVERAGE_FILE: &str = "compatibility-coverage.json";
+const LEGACY_COMPATIBILITY_COVERAGE_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
+const LEGACY_COMPATIBILITY_COVERAGE_KIND: &str = "ProtocolCompatibilityCoverageReport";
+
+#[derive(Debug, serde::Deserialize)]
+struct LegacyCompatibilityCoverageEnvelope {
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+    kind: String,
+}
 
 pub fn validate_protocol_artifacts_and_write_report(
     root: impl AsRef<Path>,
@@ -134,7 +143,7 @@ fn validate_contract(
             path == LEGACY_COMPATIBILITY_COVERAGE_FILE,
             "protocol suite summary contains an invalid legacy compatibility coverage reference"
         );
-        let _: Value = read_json(&root.join(path))?;
+        validate_legacy_compatibility_coverage(&root.join(path))?;
     }
 
     let selected_cases = plan
@@ -564,6 +573,16 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
         .with_context(|| format!("parse protocol JSON artifact {}", path.display()))
 }
 
+fn validate_legacy_compatibility_coverage(path: &Path) -> Result<()> {
+    let envelope: LegacyCompatibilityCoverageEnvelope = read_json(path)?;
+    ensure!(
+        envelope.api_version == LEGACY_COMPATIBILITY_COVERAGE_API_VERSION
+            && envelope.kind == LEGACY_COMPATIBILITY_COVERAGE_KIND,
+        "legacy compatibility coverage artifact has an unsupported apiVersion or kind"
+    );
+    Ok(())
+}
+
 fn read_json_lines<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read protocol JSONL artifact {}", path.display()))?;
@@ -614,4 +633,32 @@ fn scan_files(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_compatibility_coverage_requires_expected_envelope() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join(LEGACY_COMPATIBILITY_COVERAGE_FILE);
+
+        fs::write(
+            &path,
+            r#"{"apiVersion":"rustfs.com/s3chaos/v1alpha1","kind":"ProtocolCompatibilityCoverageReport"}"#,
+        )
+        .expect("legacy coverage artifact");
+        validate_legacy_compatibility_coverage(&path).expect("valid legacy envelope");
+
+        for invalid in [
+            "null",
+            "{}",
+            r#"{"apiVersion":"rustfs.com/s3chaos/v2","kind":"ProtocolCompatibilityCoverageReport"}"#,
+            r#"{"apiVersion":"rustfs.com/s3chaos/v1alpha1","kind":"UnexpectedReport"}"#,
+        ] {
+            fs::write(&path, invalid).expect("invalid legacy coverage artifact");
+            assert!(validate_legacy_compatibility_coverage(&path).is_err());
+        }
+    }
 }
