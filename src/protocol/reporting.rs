@@ -279,7 +279,8 @@ pub struct ProtocolSuiteSummary {
     pub preflight: String,
     pub registry: String,
     pub cleanup: String,
-    pub compatibility_coverage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility_coverage: Option<String>,
     pub flaky_history: String,
     pub case_reports: Vec<String>,
     pub case_results: Vec<ProtocolCaseResultSummary>,

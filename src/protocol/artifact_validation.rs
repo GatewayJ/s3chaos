@@ -15,16 +15,11 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path};
 
 use crate::protocol::{
-    catalog::protocol_case,
-    compatibility::{
-        COMPATIBILITY_COVERAGE_FILE, CompatibilityCoverageReport, compatibility_coverage_report,
-        compatibility_live_status,
-    },
     fixture::registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
     preflight::ProtocolPreflightSummary,
     reporting::{
@@ -40,6 +35,16 @@ use crate::protocol::{
 pub const PROTOCOL_ARTIFACT_VALIDATION_REPORT: &str = "protocol-artifact-validation-report.json";
 const MAX_FILES: usize = 10_000;
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const LEGACY_COMPATIBILITY_COVERAGE_FILE: &str = "compatibility-coverage.json";
+const LEGACY_COMPATIBILITY_COVERAGE_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
+const LEGACY_COMPATIBILITY_COVERAGE_KIND: &str = "ProtocolCompatibilityCoverageReport";
+
+#[derive(Debug, serde::Deserialize)]
+struct LegacyCompatibilityCoverageEnvelope {
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+    kind: String,
+}
 
 pub fn validate_protocol_artifacts_and_write_report(
     root: impl AsRef<Path>,
@@ -89,7 +94,6 @@ fn validate_contract(
         "preflight-summary.json",
         RESOURCE_REGISTRY_FILE,
         "cleanup-report.json",
-        COMPATIBILITY_COVERAGE_FILE,
         PROTOCOL_FLAKE_HISTORY_FILE,
         PROTOCOL_JUNIT_FILE,
         "protocol-suite-summary.json",
@@ -104,8 +108,6 @@ fn validate_contract(
     let preflight: ProtocolPreflightSummary = read_json(&root.join("preflight-summary.json"))?;
     let registry = ResourceRegistry::load(root)?;
     let cleanup: ProtocolCleanupReport = read_json(&root.join("cleanup-report.json"))?;
-    let compatibility: CompatibilityCoverageReport =
-        read_json(&root.join(COMPATIBILITY_COVERAGE_FILE))?;
     let flake_history: ProtocolFlakeHistory = read_json(&root.join(PROTOCOL_FLAKE_HISTORY_FILE))?;
     let summary: ProtocolSuiteSummary = read_json(&root.join("protocol-suite-summary.json"))?;
     ensure!(
@@ -133,10 +135,16 @@ fn validate_contract(
             && summary.preflight == "preflight-summary.json"
             && summary.registry == RESOURCE_REGISTRY_FILE
             && summary.cleanup == "cleanup-report.json"
-            && summary.compatibility_coverage == COMPATIBILITY_COVERAGE_FILE
             && summary.flaky_history == PROTOCOL_FLAKE_HISTORY_FILE,
         "protocol suite summary contains invalid artifact references"
     );
+    if let Some(path) = &summary.compatibility_coverage {
+        ensure!(
+            path == LEGACY_COMPATIBILITY_COVERAGE_FILE,
+            "protocol suite summary contains an invalid legacy compatibility coverage reference"
+        );
+        validate_legacy_compatibility_coverage(&root.join(path))?;
+    }
 
     let selected_cases = plan
         .cases
@@ -353,27 +361,6 @@ fn validate_contract(
             && flake_history.signals == protocol_flake_signals(&flake_history.entries),
         "protocol flaky-history signal differs from current results or records an implicit retry"
     );
-    let live_compatibility = case_reports
-        .iter()
-        .zip(&case_cleanups)
-        .filter(|(report, _)| {
-            protocol_case(&report.case_id).is_some_and(|case| case.tags.contains(&"compatibility"))
-        })
-        .map(|(report, cleanup)| {
-            (
-                report.case_id.clone(),
-                compatibility_live_status(
-                    report.status,
-                    report.failure_phase.as_deref(),
-                    cleanup.succeeded,
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    ensure!(
-        compatibility == compatibility_coverage_report(&live_compatibility)?,
-        "compatibility coverage report does not match native case results"
-    );
     if cleanup.succeeded {
         ensure!(
             registry.pending_cleanup().next().is_none(),
@@ -586,6 +573,16 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
         .with_context(|| format!("parse protocol JSON artifact {}", path.display()))
 }
 
+fn validate_legacy_compatibility_coverage(path: &Path) -> Result<()> {
+    let envelope: LegacyCompatibilityCoverageEnvelope = read_json(path)?;
+    ensure!(
+        envelope.api_version == LEGACY_COMPATIBILITY_COVERAGE_API_VERSION
+            && envelope.kind == LEGACY_COMPATIBILITY_COVERAGE_KIND,
+        "legacy compatibility coverage artifact has an unsupported apiVersion or kind"
+    );
+    Ok(())
+}
+
 fn read_json_lines<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read protocol JSONL artifact {}", path.display()))?;
@@ -636,4 +633,32 @@ fn scan_files(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_compatibility_coverage_requires_expected_envelope() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join(LEGACY_COMPATIBILITY_COVERAGE_FILE);
+
+        fs::write(
+            &path,
+            r#"{"apiVersion":"rustfs.com/s3chaos/v1alpha1","kind":"ProtocolCompatibilityCoverageReport"}"#,
+        )
+        .expect("legacy coverage artifact");
+        validate_legacy_compatibility_coverage(&path).expect("valid legacy envelope");
+
+        for invalid in [
+            "null",
+            "{}",
+            r#"{"apiVersion":"rustfs.com/s3chaos/v2","kind":"ProtocolCompatibilityCoverageReport"}"#,
+            r#"{"apiVersion":"rustfs.com/s3chaos/v1alpha1","kind":"UnexpectedReport"}"#,
+        ] {
+            fs::write(&path, invalid).expect("invalid legacy coverage artifact");
+            assert!(validate_legacy_compatibility_coverage(&path).is_err());
+        }
+    }
 }

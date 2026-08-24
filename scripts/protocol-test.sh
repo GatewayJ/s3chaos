@@ -44,9 +44,6 @@ case "$command" in
   list)
     run_cli protocol-catalog-json
     ;;
-  compatibility-status)
-    run_cli protocol-compatibility-status-json
-    ;;
   suite-template)
     run_cli protocol-suite-template
     ;;
@@ -103,7 +100,6 @@ Usage: scripts/protocol-test.sh COMMAND [ARGS]
 
 Commands:
   list
-  compatibility-status
   suite-template
   suite-validate SUITE
   suite-plan SUITE
