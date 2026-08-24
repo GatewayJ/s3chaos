@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use time::{Date, macros::format_description};
 
@@ -28,6 +31,18 @@ const KNOWN_FAILURES_KIND: &str = "MintKnownFailures";
 pub enum MintMode {
     Core,
     Full,
+}
+
+impl FromStr for MintMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "core" => Ok(Self::Core),
+            "full" => Ok(Self::Full),
+            _ => bail!("unsupported Mint mode {value:?}; expected core or full"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +60,34 @@ pub struct MintProfile {
     pub target_fingerprint: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintProfileSpec {
+    pub name: String,
+    pub image: String,
+    pub platform: String,
+    pub mode: MintMode,
+    pub suites: Vec<String>,
+    pub region: String,
+    pub target_fingerprint: String,
+}
+
 impl MintProfile {
+    pub fn new(spec: MintProfileSpec) -> Result<Self> {
+        let profile = Self {
+            api_version: API_VERSION.to_string(),
+            kind: PROFILE_KIND.to_string(),
+            name: spec.name,
+            image: spec.image,
+            platform: spec.platform,
+            mode: spec.mode,
+            suites: spec.suites,
+            region: spec.region,
+            target_fingerprint: spec.target_fingerprint,
+        };
+        validate_profile(&profile)?;
+        Ok(profile)
+    }
+
     pub fn from_yaml(raw: &str) -> Result<Self> {
         let profile = serde_yaml_ng::from_str(raw).context("parse Mint profile")?;
         validate_profile(&profile)?;
@@ -842,6 +884,13 @@ fn parse_date(value: &str, label: &str) -> Result<Date> {
         .with_context(|| format!("parse {label} {value:?} as YYYY-MM-DD"))
 }
 
+mod artifacts;
+
+pub use artifacts::{
+    MINT_ARTIFACT_VALIDATION_FILE, MintArtifactPublication, MintCapturedRun,
+    validate_mint_artifacts_and_write_report, write_mint_artifacts,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,6 +958,58 @@ mod tests {
             introduced_at: "2026-01-01".to_string(),
             review_by: review_by.to_string(),
         }
+    }
+
+    #[test]
+    fn repository_default_contract_is_exact_and_evaluable() {
+        let inventory = MintInventory::from_yaml(include_str!(
+            "../../protocol/mint/aws-sdk-php-core-inventory.yaml"
+        ))
+        .expect("repository inventory");
+        let known_failures = MintKnownFailures::from_yaml(include_str!(
+            "../../protocol/mint/aws-sdk-php-core-known-failures.yaml"
+        ))
+        .expect("repository known failures");
+        let profile = MintProfile::new(MintProfileSpec {
+            name: "rustfs-mint-core".to_string(),
+            image: format!("minio/mint:edge@{DIGEST}"),
+            platform: "linux/amd64".to_string(),
+            mode: MintMode::Core,
+            suites: vec!["aws-sdk-php".to_string()],
+            region: "us-east-1".to_string(),
+            target_fingerprint: FINGERPRINT.to_string(),
+        })
+        .expect("profile");
+        let mut log = Vec::new();
+        for function in &inventory.functions {
+            serde_json::to_writer(
+                &mut log,
+                &serde_json::json!({
+                    "name": function.suite,
+                    "function": function.function,
+                    "status": "PASS"
+                }),
+            )
+            .expect("log record");
+            log.push(b'\n');
+        }
+
+        let evaluation = evaluate_mint_run(
+            &profile,
+            &inventory,
+            &known_failures,
+            observation(Some(&log), Some(0)),
+            "2026-08-24",
+        )
+        .expect("evaluate default contract");
+
+        assert_eq!(evaluation.execution_status, MintExecutionStatus::Complete);
+        assert_eq!(
+            evaluation.compatibility_status,
+            MintCompatibilityStatus::Passed
+        );
+        assert_eq!(evaluation.gate_status, MintGateStatus::Passed);
+        assert_eq!(evaluation.counts.total, 13);
     }
 
     fn observation(log: Option<&[u8]>, exit_code: Option<i32>) -> MintRunObservation<'_> {

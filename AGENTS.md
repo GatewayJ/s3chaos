@@ -34,7 +34,7 @@ clearest evidence about RustFS behavior.
   post-recovery verification, run lifecycle, console.
 - `src/protocol/` — S3 protocol harness: native cases (`cases/`), capability
   catalog (`catalog/`), S3/STS/admin/Keycloak clients, fixture registry with
-  durable cleanup, preflight, runner, reporting.
+  durable cleanup, preflight, runner, Mint evaluation, and reporting.
 - `src/framework/` — shared Kubernetes/kubectl plumbing: kube client,
   port-forward, tenant factory, wait helpers.
 - `src/bin/s3chaos.rs` — CLI entry point (`s3chaos` binary); the
@@ -128,6 +128,11 @@ interrupted evidence can be investigated while live state still exists:
   context through `RUSTFS_FAULT_TEST_EXPECTED_CONTEXT` before running
   `make fault-cleanup`; never assume that an artifact path selects the cleanup
   target.
+
+Mint runs publish a separate artifact contract. Validate the exact artifact
+root printed by the command with
+`make protocol-validate-mint-artifacts ARTIFACT_ROOT=<root>`. Mint capture files
+remain outside that root until credential scanning and redaction complete.
 
 Do not pass `--allow-non-loopback` to the console unless the user asks for it.
 

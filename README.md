@@ -131,10 +131,10 @@ Three coverage layers:
    index SHA-256) fails validation on drift. Regenerate only via
    `make protocol-update-s3tests-index`; never hand-edit.
 3. **Mint**: black-box SDK compatibility run via
-   `make protocol-compatibility-mint`. By default this is a non-gating
-   report: Mint failures are recorded in the artifacts while the command
-   still exits zero. Set `RUSTFS_PROTOCOL_COMPAT_STRICT=1` to make Mint
-   failures fail the command (CI's `mint-regression` job runs strict).
+   `make protocol-compatibility-mint`. The default audited profile pins the
+   `aws-sdk-php` core suite, image digest, platform, exact function inventory,
+   and known-failure baseline. Its exit status follows the structured Mint
+   gate rather than the container exit code alone.
 
 A live protocol run requires more than the fault-side inputs:
 
@@ -142,6 +142,7 @@ A live protocol run requires more than the fault-side inputs:
 export RUSTFS_PROTOCOL_COMPAT_SERVER_ENDPOINT=<host:port>       # or RUSTFS_PROTOCOL_TEST_ENDPOINT per suite
 export RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY=<key>
 export RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY=<secret>
+export RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT=sha256:<target-fingerprint>
 ```
 
 Destructive execution additionally demands two acknowledgements that the
@@ -173,6 +174,8 @@ realm and matching RustFS OIDC configuration:
 ```bash
 make protocol-list                                            # case catalog
 make protocol-compatibility-status                            # classification report
+make protocol-compatibility-mint                              # audited Mint run
+make protocol-validate-mint-artifacts ARTIFACT_ROOT=target/protocol-compatibility/mint/<run>
 make protocol-suite-template                                  # suite skeleton
 make protocol-suite-validate SUITE=protocol/examples/smoke.yaml
 make protocol-suite-plan SUITE=protocol/examples/smoke.yaml   # dry-run expansion
@@ -190,8 +193,9 @@ fixtures.
 - `.github/workflows/ci.yml`: fmt/clippy/tests plus static validation of
   protocol contracts, all example profiles, and shell lint. No cluster needed.
 - `.github/workflows/protocol-live.yml`: live RustFS suites (smoke gate,
-  native regression, expiration regression, external OIDC regression, Mint)
-  on a self-hosted runner, scheduled and dispatchable.
+  native regression, expiration regression, external OIDC regression) on a
+  self-hosted runner. Full live execution is manually dispatchable. Mint is
+  run separately from a prepared compatibility server.
 
 ## Requirements
 

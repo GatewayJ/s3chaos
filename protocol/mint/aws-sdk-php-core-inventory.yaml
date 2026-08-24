@@ -1,0 +1,47 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: MintInventory
+imageDigest: sha256:08a05e68893c68be2a83b6f79556853ed6aa3c6c9e64c823a00853e4e55d2200
+platform: linux/amd64
+mode: core
+suites:
+  - aws-sdk-php
+functions:
+  - suite: aws-sdk-php
+    function: 'getBucketLocation ( array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'listBuckets ( array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'listObjects ( array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'listMultipartUploads ( array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'headBucket ( array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'headObject ( array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'getObject ( array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'copyObject ( array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'deleteObjects (array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'createMultipartUpload ( array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'uploadPart ( array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'abortMultipartupload ( array $params = [] )'
+    allowNa: false
+  - suite: aws-sdk-php
+    function: 'getBucketPolicy ( array $params = [] )'
+    allowNa: false
