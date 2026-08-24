@@ -850,7 +850,10 @@ fn validate_target_service(
                 )
             })?;
             ensure!(
-                target.api_version.as_deref() == Some("v1")
+                target
+                    .api_version
+                    .as_deref()
+                    .is_none_or(|api_version| api_version == "v1")
                     && target.kind.as_deref() == Some("Pod")
                     && target.namespace.as_deref() == Some(spec.namespace.as_str())
                     && target.name.as_deref() == Some(*expected_name),
@@ -1313,6 +1316,25 @@ mod tests {
             validate_target_service(&spec, &service, std::slice::from_ref(&slice), &pod_proofs)
                 .expect("Service-backed endpoint");
         assert_eq!(proof.backend_pod_uids, vec!["rustfs-0-uid"]);
+
+        let mut omitted_api_version = endpoint_slice(&spec, &pod);
+        omitted_api_version.endpoints[0]
+            .target_ref
+            .as_mut()
+            .expect("targetRef")
+            .api_version = None;
+        validate_target_service(&spec, &service, &[omitted_api_version], &pod_proofs)
+            .expect("Kubernetes may omit core/v1 from an EndpointSlice targetRef");
+
+        let mut wrong_api_version = endpoint_slice(&spec, &pod);
+        wrong_api_version.endpoints[0]
+            .target_ref
+            .as_mut()
+            .expect("targetRef")
+            .api_version = Some("apps/v1".to_string());
+        assert!(
+            validate_target_service(&spec, &service, &[wrong_api_version], &pod_proofs).is_err()
+        );
 
         let mut foreign = slice;
         foreign.endpoints[0]
