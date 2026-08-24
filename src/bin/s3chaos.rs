@@ -30,6 +30,11 @@ use s3chaos::fault::{
 use s3chaos::protocol::{
     artifact_validation::validate_protocol_artifacts_and_write_report,
     catalog::protocol_catalog_json,
+    mint::{
+        MintCapturedRun, MintInfrastructureFailure, MintInventory, MintKnownFailures, MintMode,
+        MintProfile, MintProfileSpec, validate_mint_artifacts_and_write_report, verify_mint_target,
+        write_mint_artifacts,
+    },
     suite::{
         ProtocolExecutionProfile, protocol_suite_template_yaml, resolve_protocol_suite_yaml,
         validate_protocol_ci_environment, validate_protocol_execution_profile_as,
@@ -40,7 +45,9 @@ use s3chaos::protocol::{
         run_protocol_suite_from_yaml,
     },
 };
-use std::net::SocketAddr;
+use std::{fs, io::ErrorKind, net::SocketAddr, path::Path};
+
+const MAX_MINT_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,6 +69,9 @@ async fn main() -> Result<()> {
         "fault-validate-artifacts" => validate_fault_artifacts_command(args),
         "fault-run-spec-equal" => validate_fault_run_spec_equivalence(args),
         "protocol-catalog-json" => print_protocol_catalog_json(),
+        "protocol-mint-evaluate" => evaluate_mint_artifacts(args),
+        "protocol-mint-verify-target" => verify_mint_target_command(args).await,
+        "protocol-mint-validate-artifacts" => validate_mint_artifacts(args),
         "protocol-cleanup" => cleanup_protocol_artifacts(args).await,
         "protocol-ci-profile-validate" => validate_protocol_ci_profile(args),
         "protocol-suite-json" => print_protocol_suite_json(args),
@@ -92,6 +102,11 @@ fn print_help() -> Result<()> {
     println!("  fault-validate-artifacts <scenario> <artifact-root> [--validation-summary-tsv]");
     println!("  fault-run-spec-equal <run-spec.json> <run-spec.yaml>");
     println!("  protocol-catalog-json");
+    println!(
+        "  protocol-mint-evaluate <inventory.yaml> <known-failures.yaml> <log.json> <stdout.log> <stderr.log> <container-exit-code> <verified-target-fingerprint> <evaluated-at> <artifact-root>"
+    );
+    println!("  protocol-mint-verify-target");
+    println!("  protocol-mint-validate-artifacts <artifact-root>");
     println!("  protocol-cleanup <artifact-root>");
     println!("  protocol-cleanup --registry <resource-registry.json>");
     println!("  protocol-ci-profile-validate <smoke|full|slow|external> <suite.yaml>");
@@ -186,6 +201,191 @@ async fn cleanup_protocol_artifacts(mut args: impl Iterator<Item = String>) -> R
 fn print_protocol_catalog_json() -> Result<()> {
     println!("{}", protocol_catalog_json()?);
     Ok(())
+}
+
+fn evaluate_mint_artifacts(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let inventory_path = next_arg(&mut args, "Mint inventory path")?;
+    let known_failures_path = next_arg(&mut args, "Mint known-failures path")?;
+    let log_path = next_arg(&mut args, "Mint log path")?;
+    let stdout_path = next_arg(&mut args, "Mint stdout path")?;
+    let stderr_path = next_arg(&mut args, "Mint stderr path")?;
+    let container_exit_code = next_arg(&mut args, "Mint container exit code")?
+        .parse::<i32>()
+        .context("parse Mint container exit code")?;
+    let target_fingerprint = next_arg(&mut args, "verified Mint target fingerprint")?;
+    let evaluated_at = next_arg(&mut args, "Mint evaluation timestamp")?;
+    let artifact_root = next_arg(&mut args, "Mint artifact root")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-mint-evaluate accepts exactly nine arguments"
+    );
+
+    let inventory = MintInventory::from_yaml(
+        &fs::read_to_string(&inventory_path)
+            .with_context(|| format!("read Mint inventory {inventory_path}"))?,
+    )?;
+    let known_failures = MintKnownFailures::from_yaml(
+        &fs::read_to_string(&known_failures_path)
+            .with_context(|| format!("read Mint known failures {known_failures_path}"))?,
+    )?;
+    let mode = required_env("RUSTFS_PROTOCOL_COMPAT_MINT_MODE")?.parse::<MintMode>()?;
+    let suites = required_env("RUSTFS_PROTOCOL_COMPAT_MINT_SUITES")?
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let region = required_env("RUSTFS_PROTOCOL_COMPAT_REGION")?;
+    let expected_fingerprint = required_env("RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT")?;
+    validate_verified_mint_target_fingerprint(&target_fingerprint, &expected_fingerprint)?;
+    let profile = MintProfile::new(MintProfileSpec {
+        name: std::env::var("RUSTFS_PROTOCOL_COMPAT_PROFILE_NAME")
+            .unwrap_or_else(|_| "rustfs-mint-core".to_string()),
+        image: required_env("RUSTFS_PROTOCOL_COMPAT_MINT_IMAGE")?,
+        platform: required_env("RUSTFS_PROTOCOL_COMPAT_MINT_PLATFORM")?,
+        mode,
+        suites,
+        region,
+        target_fingerprint,
+    })?;
+    let log = read_optional_bounded_file(Path::new(&log_path), "Mint log")?;
+    let stdout = read_bounded_file(Path::new(&stdout_path), "captured Mint stdout")?;
+    let stderr = read_bounded_file(Path::new(&stderr_path), "captured Mint stderr")?;
+    let infrastructure_failure = mint_infrastructure_failure(container_exit_code);
+    let container_started =
+        infrastructure_failure != Some(MintInfrastructureFailure::ContainerStart);
+    let forbidden = mint_forbidden_material();
+    let publication = write_mint_artifacts(
+        &artifact_root,
+        &profile,
+        &inventory,
+        &known_failures,
+        MintCapturedRun {
+            container_started,
+            container_exit_code: Some(container_exit_code),
+            infrastructure_failure,
+            log: log.as_deref(),
+            stdout: &stdout,
+            stderr: &stderr,
+        },
+        &evaluated_at,
+        &forbidden,
+    )?;
+    print!("{}", publication.terminal_summary);
+    println!("artifacts: {artifact_root}");
+    ensure!(
+        publication.gate_exit_code == 0,
+        "Mint gate failed; inspect {artifact_root}"
+    );
+    Ok(())
+}
+
+async fn verify_mint_target_command(mut args: impl Iterator<Item = String>) -> Result<()> {
+    ensure!(
+        args.next().is_none(),
+        "protocol-mint-verify-target accepts no arguments"
+    );
+    let region = required_env("RUSTFS_PROTOCOL_COMPAT_REGION")?;
+    let fingerprint = verify_mint_target_from_env(&region).await?;
+    println!("{fingerprint}");
+    Ok(())
+}
+
+async fn verify_mint_target_from_env(region: &str) -> Result<String> {
+    let enable_https = match std::env::var("RUSTFS_PROTOCOL_COMPAT_ENABLE_HTTPS")
+        .unwrap_or_else(|_| "0".to_string())
+        .as_str()
+    {
+        "0" => false,
+        "1" => true,
+        value => bail!("RUSTFS_PROTOCOL_COMPAT_ENABLE_HTTPS must be 0 or 1, got {value:?}"),
+    };
+    verify_mint_target(
+        &required_env("RUSTFS_PROTOCOL_COMPAT_SERVER_ENDPOINT")?,
+        enable_https,
+        region,
+        &required_env("RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT")?,
+    )
+    .await
+}
+
+fn validate_verified_mint_target_fingerprint(verified: &str, expected: &str) -> Result<()> {
+    ensure!(
+        verified == format!("sha256:{expected}"),
+        "verified Mint target fingerprint disagrees with RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT"
+    );
+    Ok(())
+}
+
+fn validate_mint_artifacts(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let artifact_root = next_arg(&mut args, "Mint artifact root")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-mint-validate-artifacts accepts exactly one argument"
+    );
+    let report =
+        validate_mint_artifacts_and_write_report(&artifact_root, &mint_forbidden_material())?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn next_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
+    args.next().with_context(|| format!("missing {name}"))
+}
+
+fn required_env(name: &str) -> Result<String> {
+    let value = std::env::var(name).with_context(|| format!("{name} is required"))?;
+    ensure!(!value.trim().is_empty(), "{name} must not be empty");
+    Ok(value)
+}
+
+fn mint_forbidden_material() -> Vec<String> {
+    [
+        "RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY",
+        "RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY",
+        "RUSTFS_PROTOCOL_TEST_ADMIN_SESSION_TOKEN",
+        "ACCESS_KEY",
+        "SECRET_KEY",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var(name).ok())
+    .filter(|value| !value.is_empty())
+    .collect()
+}
+
+fn mint_infrastructure_failure(exit_code: i32) -> Option<MintInfrastructureFailure> {
+    if (125..=127).contains(&exit_code) {
+        Some(MintInfrastructureFailure::ContainerStart)
+    } else if exit_code >= 128 {
+        Some(MintInfrastructureFailure::ContainerRuntime)
+    } else {
+        None
+    }
+}
+
+fn read_bounded_file(path: &Path, description: &str) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {description} {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "{description} {} must be a regular file, not a symlink",
+        path.display()
+    );
+    ensure!(
+        metadata.len() <= MAX_MINT_CAPTURE_BYTES,
+        "{description} {} exceeds the {} byte limit",
+        path.display(),
+        MAX_MINT_CAPTURE_BYTES
+    );
+    fs::read(path).with_context(|| format!("read {description} {}", path.display()))
+}
+
+fn read_optional_bounded_file(path: &Path, description: &str) -> Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => read_bounded_file(path, description).map(Some),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect {description} {}", path.display()))
+        }
+    }
 }
 
 fn print_protocol_suite_json(mut args: impl Iterator<Item = String>) -> Result<()> {
@@ -441,11 +641,40 @@ fn validate_fault_run_spec_equivalence(mut args: impl Iterator<Item = String>) -
 
 #[cfg(test)]
 mod tests {
-    use super::parse_fault_console_serve_args;
+    use super::{
+        mint_infrastructure_failure, parse_fault_console_serve_args,
+        validate_verified_mint_target_fingerprint,
+    };
+    use s3chaos::protocol::mint::MintInfrastructureFailure;
     use std::net::SocketAddr;
 
     fn args<'a>(items: &'a [&'a str]) -> impl Iterator<Item = String> + 'a {
         items.iter().map(|item| item.to_string())
+    }
+
+    #[test]
+    fn mint_docker_exit_codes_distinguish_start_and_runtime_failures() {
+        assert_eq!(mint_infrastructure_failure(1), None);
+        assert_eq!(
+            mint_infrastructure_failure(125),
+            Some(MintInfrastructureFailure::ContainerStart)
+        );
+        assert_eq!(
+            mint_infrastructure_failure(127),
+            Some(MintInfrastructureFailure::ContainerStart)
+        );
+        assert_eq!(
+            mint_infrastructure_failure(137),
+            Some(MintInfrastructureFailure::ContainerRuntime)
+        );
+    }
+
+    #[test]
+    fn mint_evaluation_requires_the_preflight_fingerprint() {
+        let expected = "1111111111111111111111111111111111111111111111111111111111111111";
+        validate_verified_mint_target_fingerprint(&format!("sha256:{expected}"), expected)
+            .expect("matching verified fingerprint");
+        assert!(validate_verified_mint_target_fingerprint("sha256:changed", expected).is_err());
     }
 
     #[test]

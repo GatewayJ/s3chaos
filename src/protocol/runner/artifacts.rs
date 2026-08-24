@@ -192,6 +192,10 @@ impl<S: ProtocolArtifactSink> ProtocolArtifactWriter<S> {
         self.write(relative, contents.as_bytes())
     }
 
+    pub(crate) fn write_bytes(&self, relative: impl AsRef<Path>, contents: &[u8]) -> Result<()> {
+        self.write(relative, contents)
+    }
+
     pub(crate) fn relative_path(&self, path: &Path) -> Result<String> {
         Ok(path
             .strip_prefix(&self.root)
