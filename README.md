@@ -10,8 +10,7 @@ on Kubernetes:
   verifies recovery and data integrity.
 - **S3 protocol compatibility** (`src/protocol/`): exercises RustFS's S3 API
   surface with native test cases across authorization, IAM, STS, OIDC,
-  bucket policy, and compatibility domains, validated against a pinned Ceph
-  `s3-tests` classification.
+  bucket policy, and a bounded compatibility supplement alongside Mint.
 
 ## Architecture
 
@@ -31,16 +30,14 @@ src/
                      port-forward, tenant factory, wait helpers
 scripts/             Shell entry points invoked by Make targets
 protocol/
-  compatibility/     Pinned Ceph s3-tests classification (revision, node
-                     count, index SHA-256 pinned in native-profile.yaml)
   examples/          Ready-to-run suite YAMLs: smoke, full-regression,
                      slow-regression, oidc-keycloak
 console/             Web console assets served by the run console
 ```
 
 The `s3chaos` CLI exposes machine-readable commands (`fault-catalog-json`,
-`protocol-catalog-json`, `protocol-compatibility-status-json`,
-`*-suite-json`, ...) used by scripts, CI, and the console. There is no
+`protocol-catalog-json`, `*-suite-json`, ...) used by scripts, CI, and the
+console. There is no
 installed binary on a fresh checkout; run commands via Cargo:
 
 ```bash
@@ -118,19 +115,14 @@ the run and pin `RUSTFS_FAULT_TEST_EXPECTED_CONTEXT` before cleanup.
 
 ## S3 Protocol Testing
 
-Three coverage layers:
+Two complementary execution layers:
 
 1. **Native cases** (`src/protocol/cases/`): Rust test cases over authz,
    IAM, STS, OIDC (Keycloak-backed `AssumeRoleWithWebIdentity`), bucket
-   policy, and a bounded compatibility profile, with fixture ownership and
-   durable cleanup.
-2. **Pinned Ceph classification** (`protocol/compatibility/`): every upstream
-   Ceph `s3-tests` node classified as implemented / unimplemented / excluded /
-   expected-divergence against revision
-   `5522d1c351f75bc00ae0f64f742f3f095f5939d9`. The pin (revision, node count,
-   index SHA-256) fails validation on drift. Regenerate only via
-   `make protocol-update-s3tests-index`; never hand-edit.
-3. **Mint**: black-box SDK compatibility run via
+   policy, and a bounded compatibility supplement, with fixture ownership and
+   durable cleanup. Native case results do not claim coverage of an external
+   conformance suite.
+2. **Mint**: black-box SDK compatibility run via
    `make protocol-compatibility-mint`. The default audited profile pins the
    `aws-sdk-php` core suite, image digest, platform, exact function inventory,
    and known-failure baseline. Its exit status follows the structured Mint
@@ -142,7 +134,7 @@ A live protocol run requires more than the fault-side inputs:
 export RUSTFS_PROTOCOL_COMPAT_SERVER_ENDPOINT=<host:port>       # or RUSTFS_PROTOCOL_TEST_ENDPOINT per suite
 export RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY=<key>
 export RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY=<secret>
-export RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT=sha256:<target-fingerprint>
+export RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT=<verified 64-character SHA-256>
 ```
 
 Destructive execution additionally demands two acknowledgements that the
@@ -173,7 +165,6 @@ realm and matching RustFS OIDC configuration:
 
 ```bash
 make protocol-list                                            # case catalog
-make protocol-compatibility-status                            # classification report
 make protocol-compatibility-mint                              # audited Mint run
 make protocol-validate-mint-artifacts ARTIFACT_ROOT=target/protocol-compatibility/mint/<run>
 make protocol-suite-template                                  # suite skeleton

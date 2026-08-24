@@ -17,6 +17,7 @@ use std::{fmt::Write as _, fs, path::Path};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
 
 use super::{
     API_VERSION, MintCompatibilityStatus, MintDiagnostic, MintDiagnosticCode, MintEvaluation,
@@ -40,7 +41,6 @@ const MINT_CONTAINER_EXIT_CODE_FILE: &str = "container-exit-code.txt";
 const MINT_GATE_EXIT_CODE_FILE: &str = "exit-code.txt";
 const MINT_CREDENTIAL_SCAN_FILE: &str = "mint-credential-scan.json";
 pub const MINT_ARTIFACT_VALIDATION_FILE: &str = "mint-artifact-validation.json";
-const REDACTION: &[u8] = b"[REDACTED]";
 const MAX_ARTIFACT_FILES: usize = 1_000;
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -125,6 +125,7 @@ struct MintCredentialScanReport {
     #[serde(rename = "apiVersion")]
     api_version: String,
     kind: String,
+    redaction_token: String,
     detected: bool,
     files: Vec<MintCredentialScanFile>,
 }
@@ -181,11 +182,15 @@ pub fn write_mint_artifacts(
     let gate_exit_code = i32::from(evaluation.gate_status == MintGateStatus::Failed);
 
     let patterns = forbidden_patterns(forbidden_material);
-    let (stdout, stdout_redacted) = redact_bytes(captured.stdout, &patterns);
-    let (stderr, stderr_redacted) = redact_bytes(captured.stderr, &patterns);
+    let redaction_token = Uuid::new_v4().to_string();
+    let redaction_marker = redaction_marker(&redaction_token);
+    let (stdout, stdout_redacted) =
+        redact_bytes(captured.stdout, &patterns, redaction_marker.as_bytes());
+    let (stderr, stderr_redacted) =
+        redact_bytes(captured.stderr, &patterns, redaction_marker.as_bytes());
     let (published_log, log_path, log_redacted) = match captured.log {
         Some(log) => {
-            let (contents, redacted) = redact_bytes(log, &patterns);
+            let (contents, redacted) = redact_bytes(log, &patterns, redaction_marker.as_bytes());
             let path = if redacted {
                 MINT_REDACTED_LOG_FILE
             } else {
@@ -198,6 +203,7 @@ pub fn write_mint_artifacts(
     let credential_scan = MintCredentialScanReport {
         api_version: API_VERSION.to_string(),
         kind: "MintCredentialScanReport".to_string(),
+        redaction_token,
         detected: stdout_redacted || stderr_redacted || log_redacted,
         files: [
             Some(MintCredentialScanFile {
@@ -273,9 +279,7 @@ pub fn write_mint_artifacts(
     }
 
     let artifact_root = artifact_root.as_ref();
-    ensure_unused_artifact_root(artifact_root)?;
-    fs::create_dir_all(artifact_root)
-        .with_context(|| format!("create Mint artifact root {}", artifact_root.display()))?;
+    claim_artifact_root(artifact_root)?;
     let writer = ProtocolArtifactWriter::file(artifact_root);
     writer.write_json(MINT_PROFILE_FILE, profile)?;
     writer.write_json(MINT_INVENTORY_FILE, inventory)?;
@@ -470,6 +474,9 @@ fn validate_mint_artifacts(artifact_root: &Path, forbidden_material: &[String]) 
             && credential_scan.kind == "MintCredentialScanReport",
         "invalid Mint credential scan report header"
     );
+    Uuid::parse_str(&credential_scan.redaction_token)
+        .context("Mint credential scan contains an invalid redaction token")?;
+    let redaction_marker = redaction_marker(&credential_scan.redaction_token);
     let stdout = fs::read(artifact_root.join(MINT_STDOUT_FILE))?;
     let stderr = fs::read(artifact_root.join(MINT_STDERR_FILE))?;
     let expected_scan_files = [
@@ -477,20 +484,20 @@ fn validate_mint_artifacts(artifact_root: &Path, forbidden_material: &[String]) 
             "stdout",
             MINT_STDOUT_FILE,
             &stdout,
-            None,
+            redaction_marker.as_bytes(),
         )),
         Some(expected_scan_file(
             "stderr",
             MINT_STDERR_FILE,
             &stderr,
-            None,
+            redaction_marker.as_bytes(),
         )),
         summary.artifacts.log.as_deref().map(|path| {
             expected_scan_file(
                 "log.json",
                 path,
                 log.as_deref().unwrap_or_default(),
-                Some(path == MINT_REDACTED_LOG_FILE),
+                redaction_marker.as_bytes(),
             )
         }),
     ]
@@ -519,9 +526,9 @@ fn expected_scan_file(
     source: &str,
     published_as: &str,
     contents: &[u8],
-    known_redacted: Option<bool>,
+    redaction_marker: &[u8],
 ) -> MintCredentialScanFile {
-    let redacted = known_redacted.unwrap_or_else(|| contains_subslice(contents, REDACTION));
+    let redacted = contains_subslice(contents, redaction_marker);
     MintCredentialScanFile {
         source: source.to_string(),
         published_as: published_as.to_string(),
@@ -578,19 +585,25 @@ fn scan_artifact_tree(
     Ok(())
 }
 
-fn ensure_unused_artifact_root(root: &Path) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
+fn claim_artifact_root(root: &Path) -> Result<()> {
+    ensure!(
+        root.file_name().is_some(),
+        "Mint artifact root must identify a new run directory"
+    );
+    if let Some(parent) = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("create Mint artifact parent directory {}", parent.display())
+        })?;
     }
-    ensure!(
-        root.is_dir(),
-        "Mint artifact root exists and is not a directory"
-    );
-    ensure!(
-        fs::read_dir(root)?.next().is_none(),
-        "Mint artifact root must be empty to prevent evidence overwrite"
-    );
-    Ok(())
+    fs::create_dir(root).with_context(|| {
+        format!(
+            "claim Mint artifact root {}; the run directory must not already exist",
+            root.display()
+        )
+    })
 }
 
 fn validate_timestamp(value: &str) -> Result<()> {
@@ -617,7 +630,11 @@ fn forbidden_patterns(forbidden_material: &[String]) -> Vec<Vec<u8>> {
     patterns
 }
 
-fn redact_bytes(contents: &[u8], patterns: &[Vec<u8>]) -> (Vec<u8>, bool) {
+fn redaction_marker(token: &str) -> String {
+    format!("[REDACTED:{token}]")
+}
+
+fn redact_bytes(contents: &[u8], patterns: &[Vec<u8>], redaction_marker: &[u8]) -> (Vec<u8>, bool) {
     let mut output = Vec::with_capacity(contents.len());
     let mut index = 0;
     let mut redacted = false;
@@ -626,7 +643,7 @@ fn redact_bytes(contents: &[u8], patterns: &[Vec<u8>]) -> (Vec<u8>, bool) {
             .iter()
             .find(|pattern| contents[index..].starts_with(pattern))
         {
-            output.extend_from_slice(REDACTION);
+            output.extend_from_slice(redaction_marker);
             index += pattern.len();
             redacted = true;
         } else {
@@ -985,6 +1002,12 @@ mod tests {
         }
     }
 
+    fn published_redaction_marker(root: &Path) -> Vec<u8> {
+        let scan: MintCredentialScanReport =
+            read_json(&root.join(MINT_CREDENTIAL_SCAN_FILE)).expect("credential scan");
+        redaction_marker(&scan.redaction_token).into_bytes()
+    }
+
     #[test]
     fn publication_redacts_captured_credentials_and_remains_self_consistent() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -1013,7 +1036,10 @@ mod tests {
         assert_eq!(publication.gate_exit_code, 0);
         let stdout = fs::read(root.join(MINT_STDOUT_FILE)).expect("stdout");
         assert!(!contains_subslice(&stdout, access_key.as_bytes()));
-        assert!(contains_subslice(&stdout, REDACTION));
+        assert!(contains_subslice(
+            &stdout,
+            &published_redaction_marker(&root)
+        ));
         assert!(root.join(MINT_LOG_FILE).is_file());
         assert!(root.join(MINT_ARTIFACT_VALIDATION_FILE).is_file());
         validate_mint_artifacts_and_write_report(&root, &[access_key])
@@ -1048,7 +1074,70 @@ mod tests {
         assert!(!root.join(MINT_LOG_FILE).exists());
         let redacted = fs::read(root.join(MINT_REDACTED_LOG_FILE)).expect("redacted log");
         assert!(!contains_subslice(&redacted, secret.as_bytes()));
-        assert!(contains_subslice(&redacted, REDACTION));
+        assert!(contains_subslice(
+            &redacted,
+            &published_redaction_marker(&root)
+        ));
+    }
+
+    #[test]
+    fn literal_redacted_text_does_not_claim_credential_redaction() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join("artifacts");
+        let log = br#"{"name":"sdk","function":"put-object","status":"PASS"}"#;
+        write_mint_artifacts(
+            &root,
+            &profile(),
+            &inventory(),
+            &known_failures(),
+            MintCapturedRun {
+                container_started: true,
+                container_exit_code: Some(0),
+                infrastructure_failure: None,
+                log: Some(log),
+                stdout: b"SDK diagnostic: [REDACTED]\n",
+                stderr: b"safe",
+            },
+            "2026-08-24T03:00:00Z",
+            &[],
+        )
+        .expect("publish literal marker");
+
+        let scan: MintCredentialScanReport =
+            read_json(&root.join(MINT_CREDENTIAL_SCAN_FILE)).expect("credential scan");
+        assert!(!scan.detected);
+        assert!(scan.files.iter().all(|file| !file.redacted));
+        validate_mint_artifacts_and_write_report(&root, &[])
+            .expect("literal marker remains valid evidence");
+    }
+
+    #[test]
+    fn artifact_root_claim_allows_exactly_one_concurrent_publisher() {
+        use std::{
+            sync::{Arc, Barrier},
+            thread,
+        };
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = Arc::new(directory.path().join("artifacts"));
+        let barrier = Arc::new(Barrier::new(2));
+        let attempts = (0..2)
+            .map(|_| {
+                let root = Arc::clone(&root);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    claim_artifact_root(root.as_path()).is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        let successes = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().expect("claim thread"))
+            .filter(|succeeded| *succeeded)
+            .count();
+
+        assert_eq!(successes, 1);
     }
 
     #[test]

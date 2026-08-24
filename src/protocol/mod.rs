@@ -17,7 +17,6 @@ pub mod authorization;
 mod cases;
 pub mod catalog;
 mod clients;
-pub mod compatibility;
 pub mod credentials;
 mod fixture;
 pub mod mint;

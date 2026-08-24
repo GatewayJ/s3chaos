@@ -8,9 +8,8 @@ CONSOLE_ALLOW_NON_LOOPBACK ?=
 FAULT_SCRIPT := $(CURDIR)/scripts/fault-test.sh
 PROTOCOL_SCRIPT := $(CURDIR)/scripts/protocol-test.sh
 PROTOCOL_COMPAT_SCRIPT := $(CURDIR)/scripts/protocol-compatibility.sh
-PROTOCOL_S3TESTS_INDEX_SCRIPT := $(CURDIR)/scripts/update-s3tests-index.sh
 
-.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-preflight fault-run fault-run-dm fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup protocol-check protocol-list protocol-compatibility-status protocol-compatibility-mint protocol-update-s3tests-index protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts
+.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-preflight fault-run fault-run-dm fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup protocol-check protocol-list protocol-compatibility-mint protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts
 
 check: fmt-check clippy test
 
@@ -76,13 +75,9 @@ fault-cleanup:
 protocol-check: check
 	bash -n $(PROTOCOL_SCRIPT)
 	bash -n $(PROTOCOL_COMPAT_SCRIPT)
-	bash -n $(PROTOCOL_S3TESTS_INDEX_SCRIPT)
 
 protocol-list:
 	@bash $(PROTOCOL_SCRIPT) list
-
-protocol-compatibility-status:
-	@bash $(PROTOCOL_SCRIPT) compatibility-status
 
 protocol-compatibility-mint:
 	bash $(PROTOCOL_COMPAT_SCRIPT) mint
@@ -90,9 +85,6 @@ protocol-compatibility-mint:
 protocol-validate-mint-artifacts:
 	@test -n "$(ARTIFACT_ROOT)" || (echo "ARTIFACT_ROOT is required, for example: make protocol-validate-mint-artifacts ARTIFACT_ROOT=target/protocol-compatibility/mint/<run>" >&2; exit 1)
 	cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- protocol-mint-validate-artifacts "$(ARTIFACT_ROOT)"
-
-protocol-update-s3tests-index:
-	bash $(PROTOCOL_S3TESTS_INDEX_SCRIPT)
 
 protocol-suite-template:
 	@bash $(PROTOCOL_SCRIPT) suite-template

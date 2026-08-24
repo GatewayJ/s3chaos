@@ -13,24 +13,19 @@
 // limitations under the License.
 
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::protocol::{
     artifact_validation::validate_protocol_artifacts_and_write_report,
     cases::{ProtocolCaseExecution, ProtocolCaseServices, run_protocol_case},
-    catalog::{
-        DEFAULT_PROTOCOL_VARIANT, ProtocolCapabilitySource, ProtocolCapabilityState, protocol_case,
-    },
+    catalog::{DEFAULT_PROTOCOL_VARIANT, ProtocolCapabilitySource, ProtocolCapabilityState},
     clients::{
         admin::RustfsAdminClient,
         keycloak::KeycloakExternalIdentityProvider,
         s3::{AwsS3ClientFactory, ProtocolS3Client},
         sts::RustfsStsClient,
-    },
-    compatibility::{
-        COMPATIBILITY_COVERAGE_FILE, compatibility_coverage_report, compatibility_live_status,
     },
     credentials::{CredentialProvider, EnvCredentialProvider},
     fixture::{
@@ -383,27 +378,6 @@ async fn run_protocol_suite(
             fallback_cleanup.succeeded,
         ),
     )?;
-    let live_compatibility = case_executions
-        .iter()
-        .filter(|(execution, _)| {
-            protocol_case(&execution.report.case_id)
-                .is_some_and(|case| case.tags.contains(&"compatibility"))
-        })
-        .map(|(execution, cleanup)| {
-            (
-                execution.report.case_id.clone(),
-                compatibility_live_status(
-                    execution.report.status,
-                    execution.report.failure_phase.as_deref(),
-                    cleanup.succeeded,
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    artifacts.write_json(
-        COMPATIBILITY_COVERAGE_FILE,
-        &compatibility_coverage_report(&live_compatibility)?,
-    )?;
     let flake_history = update_protocol_flake_history(&artifact_root, &plan, &case_executions)?;
     artifacts.write_json(PROTOCOL_FLAKE_HISTORY_FILE, &flake_history)?;
 
@@ -487,7 +461,7 @@ async fn run_protocol_suite(
         preflight: "preflight-summary.json".to_string(),
         registry: RESOURCE_REGISTRY_FILE.to_string(),
         cleanup: "cleanup-report.json".to_string(),
-        compatibility_coverage: COMPATIBILITY_COVERAGE_FILE.to_string(),
+        compatibility_coverage: None,
         flaky_history: PROTOCOL_FLAKE_HISTORY_FILE.to_string(),
         case_reports: case_report_paths,
         case_results,
@@ -1071,7 +1045,6 @@ mod tests {
             ProtocolCapability, ProtocolCapabilityCheck, ProtocolCapabilitySource,
             ProtocolCapabilityState,
         },
-        compatibility::{COMPATIBILITY_COVERAGE_FILE, compatibility_coverage_report},
         fixture::registry::{RESOURCE_REGISTRY_FILE, ResourceRegistry},
         ports::{ProtocolAdminError, ProtocolAdminServerPort, ProtocolServerInfo},
         preflight::{ProtocolPreflightSummary, ProtocolStaleResourceScan},
@@ -1087,7 +1060,7 @@ mod tests {
         suite_plan::{ProtocolSuitePlan, TargetFingerprint},
     };
     use async_trait::async_trait;
-    use std::{collections::BTreeMap, fs, path::Path};
+    use std::{fs, path::Path};
 
     #[derive(Clone, Default)]
     struct CleanupAdmin;
@@ -1402,12 +1375,6 @@ mod tests {
                 &[],
             )
             .expect("case history artifact");
-        artifacts
-            .write_json(
-                COMPATIBILITY_COVERAGE_FILE,
-                &compatibility_coverage_report(&BTreeMap::new()).expect("coverage report"),
-            )
-            .expect("coverage artifact");
         let flake_entry = ProtocolFlakeHistoryEntry {
             run_id: plan.run_id.clone(),
             source_revision: plan.source_revision.clone(),
@@ -1441,7 +1408,7 @@ mod tests {
             preflight: "preflight-summary.json".to_string(),
             registry: "resource-registry.json".to_string(),
             cleanup: "cleanup-report.json".to_string(),
-            compatibility_coverage: COMPATIBILITY_COVERAGE_FILE.to_string(),
+            compatibility_coverage: None,
             flaky_history: PROTOCOL_FLAKE_HISTORY_FILE.to_string(),
             case_reports: vec![case_report_path.clone()],
             case_results: vec![
@@ -1462,6 +1429,25 @@ mod tests {
 
         validate_phase_one_artifacts(&root, &["not-present-secret".to_string()])
             .expect("valid artifacts");
+
+        let mut legacy_summary = summary.clone();
+        legacy_summary.compatibility_coverage = Some("compatibility-coverage.json".to_string());
+        artifacts
+            .write_json(
+                "compatibility-coverage.json",
+                &serde_json::json!({
+                    "apiVersion": "rustfs.com/s3chaos/v1alpha1",
+                    "kind": "ProtocolCompatibilityCoverageReport"
+                }),
+            )
+            .expect("legacy coverage artifact");
+        artifacts
+            .write_json("protocol-suite-summary.json", &legacy_summary)
+            .expect("legacy summary artifact");
+        validate_phase_one_artifacts(&root, &[]).expect("legacy summary remains readable");
+        artifacts
+            .write_json("protocol-suite-summary.json", &summary)
+            .expect("restore current summary");
 
         let mut inconsistent_flake_history = flake_history.clone();
         inconsistent_flake_history.signals.clear();

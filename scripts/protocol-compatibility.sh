@@ -66,6 +66,9 @@ run_mint() {
   export RUSTFS_PROTOCOL_COMPAT_MINT_MODE=$mint_mode
   export RUSTFS_PROTOCOL_COMPAT_MINT_SUITES=$suites_spec
   export RUSTFS_PROTOCOL_COMPAT_REGION=$SERVER_REGION
+  local verified_target_fingerprint
+  verified_target_fingerprint=$(cargo run --quiet --manifest-path "$MANIFEST_PATH" --bin s3chaos -- \
+    protocol-mint-verify-target)
   set +e
   docker run --rm \
     --platform "$mint_platform" \
@@ -89,6 +92,7 @@ run_mint() {
     "$stdout_file" \
     "$stderr_file" \
     "$mint_rc" \
+    "$verified_target_fingerprint" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     "$artifact_dir"
   gate_rc=$?
@@ -110,7 +114,7 @@ Required environment:
   RUSTFS_PROTOCOL_COMPAT_SERVER_ENDPOINT=host:port
   RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY=...
   RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY=...
-  RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT=sha256:...
+  RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT=<verified 64-character SHA-256>
 
 Optional environment:
   RUSTFS_PROTOCOL_COMPAT_MINT_SUITES="aws-sdk-php"

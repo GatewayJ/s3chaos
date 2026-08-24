@@ -885,11 +885,13 @@ fn parse_date(value: &str, label: &str) -> Result<Date> {
 }
 
 mod artifacts;
+mod target;
 
 pub use artifacts::{
     MINT_ARTIFACT_VALIDATION_FILE, MintArtifactPublication, MintCapturedRun,
     validate_mint_artifacts_and_write_report, write_mint_artifacts,
 };
+pub use target::verify_mint_target;
 
 #[cfg(test)]
 mod tests {
