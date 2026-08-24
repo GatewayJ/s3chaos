@@ -634,6 +634,27 @@ fn redaction_marker(token: &str) -> String {
     format!("[REDACTED:{token}]")
 }
 
+pub(super) fn sanitize_mint_bytes(
+    contents: &[u8],
+    forbidden_material: &[String],
+    redaction_token: &str,
+) -> (Vec<u8>, bool) {
+    redact_bytes(
+        contents,
+        &forbidden_patterns(forbidden_material),
+        redaction_marker(redaction_token).as_bytes(),
+    )
+}
+
+pub(super) fn ensure_mint_artifact_tree_safe(
+    artifact_root: &Path,
+    forbidden_material: &[String],
+) -> Result<()> {
+    let patterns = forbidden_patterns(forbidden_material);
+    let mut checked_files = 0;
+    scan_artifact_tree(artifact_root, artifact_root, &patterns, &mut checked_files)
+}
+
 fn redact_bytes(contents: &[u8], patterns: &[Vec<u8>], redaction_marker: &[u8]) -> (Vec<u8>, bool) {
     let mut output = Vec::with_capacity(contents.len());
     let mut index = 0;

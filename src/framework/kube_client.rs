@@ -14,7 +14,8 @@
 
 use anyhow::Result;
 use kube::{
-    Api, Client,
+    Api, Client, Config,
+    config::{KubeConfigOptions, Kubeconfig},
     core::{ApiResource, DynamicObject, GroupVersionKind},
 };
 
@@ -22,6 +23,20 @@ pub async fn default_client() -> Result<Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     Ok(Client::try_default().await?)
+}
+
+pub async fn client_for_context(context: &str) -> Result<Client> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let kubeconfig = Kubeconfig::read()?;
+    let config = Config::from_custom_kubeconfig(
+        kubeconfig,
+        &KubeConfigOptions {
+            context: Some(context.to_string()),
+            ..KubeConfigOptions::default()
+        },
+    )
+    .await?;
+    Ok(Client::try_from(config)?)
 }
 
 pub fn tenant_api(client: Client, namespace: &str) -> Api<DynamicObject> {
