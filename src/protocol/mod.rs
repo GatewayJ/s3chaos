@@ -20,6 +20,7 @@ mod clients;
 pub mod compatibility;
 pub mod credentials;
 mod fixture;
+pub mod mint;
 mod ports;
 mod preflight;
 pub mod reporting;
