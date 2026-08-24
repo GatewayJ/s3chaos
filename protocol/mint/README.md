@@ -11,3 +11,50 @@ digest, platform, mode, and suite set. Known failures use exact suite/function
 keys and require an owner, issue, introduction date, and review date. The
 archived Mint codebase and its bundled SDK versions must be reviewed before
 expanding this profile or replacing it with a maintained SDK matrix.
+
+## Ephemeral target hand-off
+
+Mint is triggered manually after an external deployment command has created a
+new RustFS Kubernetes namespace. Copy `ephemeral-target.example.yaml` and fill
+in live values after the deployment is Ready. `namespaceUid` comes from the
+namespace metadata, `serviceName` and `servicePort` identify the Service used
+by `serverEndpoint`, `rustfsImageDigest` comes from each RustFS container
+status `imageID`, and `targetFingerprint` is the unprefixed 64-character
+server identity fingerprint. The endpoint host must exactly match the Service
+DNS name, ClusterIP, external IP, or load-balancer ingress advertised by
+Kubernetes.
+
+The namespace is accepted only when its UID, lease annotation, manager label,
+run-id label, pod ownership, Ready state, RustFS image digest, and server
+fingerprint all agree with the file. The Service must carry and select the same
+run id, and every selected EndpointSlice must be owned by that exact Service
+UID and refer only to the proved RustFS Pod UIDs. The Kubernetes identity must
+also be allowed to delete that exact namespace. Mint is not started if any
+check fails. The remaining lease at session start must cover the configured
+Mint timeout, every bounded preflight/diagnostic/cleanup operation, and target
+teardown.
+
+Run `make protocol-compatibility-mint` with
+`RUSTFS_PROTOCOL_MINT_TARGET_SPEC` pointing to the file. The command runs the
+pinned Mint container, sanitizes captured output, collects bounded Kubernetes
+resources/events/RustFS logs, then deletes the namespace with a UID
+precondition and verifies it is absent. The outer session artifact contains
+target proofs, lifecycle state, cleanup report, JSON/JUnit/exit status, and a
+nested `mint/` result contract.
+
+SIGINT, SIGTERM, timeout, test failure, and ordinary process errors enter the
+same teardown path. After a host crash or `SIGKILL`, replay only from the exact
+artifact root:
+
+```bash
+make protocol-mint-cleanup ARTIFACT_ROOT=target/protocol-compatibility/mint/<run>
+make protocol-validate-mint-session ARTIFACT_ROOT=target/protocol-compatibility/mint/<run>
+```
+
+Recovery refuses deletion unless the artifact root contains a persisted
+namespace ownership proof matching the target spec. Historical artifacts are
+never stored inside or deleted with the namespace. Re-export the original
+admin access key, secret key, and session token (when one was used) if recovery
+should capture fresh Kubernetes diagnostics. Without that redaction material,
+recovery records that diagnostics were skipped and proceeds with proof-bound
+cleanup without collecting RustFS logs.

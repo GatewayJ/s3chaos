@@ -125,8 +125,10 @@ Two complementary execution layers:
 2. **Mint**: black-box SDK compatibility run via
    `make protocol-compatibility-mint`. The default audited profile pins the
    `aws-sdk-php` core suite, image digest, platform, exact function inventory,
-   and known-failure baseline. Its exit status follows the structured Mint
-   gate rather than the container exit code alone.
+   and known-failure baseline. It accepts only a leased, run-owned Kubernetes
+   namespace, captures RustFS evidence, and deletes that namespace after every
+   completed, failed, timed-out, or interrupted run. Its exit status requires
+   both the structured Mint gate and verified teardown to pass.
 
 A live protocol run requires more than the fault-side inputs:
 
@@ -147,6 +149,33 @@ target is a verified dedicated server:
   deployment id; copy that value into the variable. A changed server
   fingerprint aborts the run instead of testing the wrong target.
 
+Mint has a stricter target boundary. Deploy RustFS into a new namespace on the
+independent test server, label that namespace and every pod with the same run
+id, then create a target file from
+`protocol/mint/ephemeral-target.example.yaml`. The namespace must have:
+
+```text
+app.kubernetes.io/managed-by=s3chaos-mint
+rustfs.com/mint-run-id=<run-id>
+rustfs.com/mint-expires-at=<same RFC3339 value as target expiresAt>
+```
+
+The target file pins the exact kube context, namespace UID, lease, Service,
+endpoint, region, RustFS container image digest, and server fingerprint. The
+endpoint must be an address or DNS name advertised by that Service, whose
+owned EndpointSlices must resolve only to the proved RustFS Pod UIDs. It is a
+destructive hand-off: after ownership and readiness are proven, s3chaos owns
+the whole namespace and will delete it with a Kubernetes UID precondition.
+Do not point it at a shared or long-lived namespace.
+
+```bash
+export RUSTFS_PROTOCOL_TEST_DEDICATED=1
+export RUSTFS_PROTOCOL_MINT_TARGET_SPEC=/path/to/ephemeral-target.yaml
+export RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY=<key>
+export RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY=<secret>
+make protocol-compatibility-mint
+```
+
 For the `oidc-keycloak` example profile you also need a prepared Keycloak
 realm and matching RustFS OIDC configuration:
 
@@ -166,7 +195,9 @@ realm and matching RustFS OIDC configuration:
 ```bash
 make protocol-list                                            # case catalog
 make protocol-compatibility-mint                              # audited Mint run
-make protocol-validate-mint-artifacts ARTIFACT_ROOT=target/protocol-compatibility/mint/<run>
+make protocol-validate-mint-session ARTIFACT_ROOT=target/protocol-compatibility/mint/<run>
+make protocol-validate-mint-artifacts ARTIFACT_ROOT=target/protocol-compatibility/mint/<run>/mint
+make protocol-mint-cleanup ARTIFACT_ROOT=target/protocol-compatibility/mint/<run> # crash recovery only
 make protocol-suite-template                                  # suite skeleton
 make protocol-suite-validate SUITE=protocol/examples/smoke.yaml
 make protocol-suite-plan SUITE=protocol/examples/smoke.yaml   # dry-run expansion
@@ -186,7 +217,8 @@ fixtures.
 - `.github/workflows/protocol-live.yml`: live RustFS suites (smoke gate,
   native regression, expiration regression, external OIDC regression) on a
   self-hosted runner. Full live execution is manually dispatchable. Mint is
-  run separately from a prepared compatibility server.
+  run by command on the independent Kubernetes test server; no Mint workflow
+  or schedule is installed by this repository.
 
 ## Requirements
 

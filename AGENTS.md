@@ -120,8 +120,13 @@ interrupted evidence can be investigated while live state still exists:
 
 Mint runs publish a separate artifact contract. Validate the exact artifact
 root printed by the command with
-`make protocol-validate-mint-artifacts ARTIFACT_ROOT=<root>`. Mint capture files
-remain outside that root until credential scanning and redaction complete.
+`make protocol-validate-mint-session ARTIFACT_ROOT=<root>`. The nested Mint
+result can be validated with
+`make protocol-validate-mint-artifacts ARTIFACT_ROOT=<root>/mint`. Mint capture
+files remain outside that root until credential scanning and redaction
+complete. If the process was killed before teardown, recover only with
+`make protocol-mint-cleanup ARTIFACT_ROOT=<root>`; cleanup requires the exact
+persisted namespace ownership proof and never infers a target from the path.
 
 Do not pass `--allow-non-loopback` to the console unless the user asks for it.
 

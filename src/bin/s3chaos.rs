@@ -32,8 +32,9 @@ use s3chaos::protocol::{
     catalog::protocol_catalog_json,
     mint::{
         MintCapturedRun, MintInfrastructureFailure, MintInventory, MintKnownFailures, MintMode,
-        MintProfile, MintProfileSpec, validate_mint_artifacts_and_write_report, verify_mint_target,
-        write_mint_artifacts,
+        MintProfile, MintProfileSpec, MintSessionRequest, MintTargetSpec, cleanup_mint_session,
+        run_mint_session, timestamp_now, validate_mint_artifacts_and_write_report,
+        validate_mint_session_artifacts_and_write_report, verify_mint_target, write_mint_artifacts,
     },
     suite::{
         ProtocolExecutionProfile, protocol_suite_template_yaml, resolve_protocol_suite_yaml,
@@ -70,8 +71,11 @@ async fn main() -> Result<()> {
         "fault-run-spec-equal" => validate_fault_run_spec_equivalence(args),
         "protocol-catalog-json" => print_protocol_catalog_json(),
         "protocol-mint-evaluate" => evaluate_mint_artifacts(args),
+        "protocol-mint-run" => run_mint_session_command(args).await,
+        "protocol-mint-cleanup" => cleanup_mint_session_command(args).await,
         "protocol-mint-verify-target" => verify_mint_target_command(args).await,
         "protocol-mint-validate-artifacts" => validate_mint_artifacts(args),
+        "protocol-mint-validate-session" => validate_mint_session_artifacts(args),
         "protocol-cleanup" => cleanup_protocol_artifacts(args).await,
         "protocol-ci-profile-validate" => validate_protocol_ci_profile(args),
         "protocol-suite-json" => print_protocol_suite_json(args),
@@ -105,8 +109,13 @@ fn print_help() -> Result<()> {
     println!(
         "  protocol-mint-evaluate <inventory.yaml> <known-failures.yaml> <log.json> <stdout.log> <stderr.log> <container-exit-code> <verified-target-fingerprint> <evaluated-at> <artifact-root>"
     );
+    println!(
+        "  protocol-mint-run <target.yaml> <inventory.yaml> <known-failures.yaml> <artifact-root>"
+    );
+    println!("  protocol-mint-cleanup <artifact-root>");
     println!("  protocol-mint-verify-target");
     println!("  protocol-mint-validate-artifacts <artifact-root>");
+    println!("  protocol-mint-validate-session <artifact-root>");
     println!("  protocol-cleanup <artifact-root>");
     println!("  protocol-cleanup --registry <resource-registry.json>");
     println!("  protocol-ci-profile-validate <smoke|full|slow|external> <suite.yaml>");
@@ -117,6 +126,85 @@ fn print_help() -> Result<()> {
     println!("  protocol-suite-template");
     println!("  protocol-suite-validate <suite.yaml>");
     println!("  protocol-validate-artifacts <artifact-root>");
+    Ok(())
+}
+
+async fn run_mint_session_command(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let target_path = next_arg(&mut args, "Mint ephemeral target path")?;
+    let inventory_path = next_arg(&mut args, "Mint inventory path")?;
+    let known_failures_path = next_arg(&mut args, "Mint known-failures path")?;
+    let artifact_root = next_arg(&mut args, "Mint session artifact root")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-mint-run accepts exactly four arguments"
+    );
+    let target = MintTargetSpec::from_yaml(
+        &fs::read_to_string(&target_path)
+            .with_context(|| format!("read Mint ephemeral target {target_path}"))?,
+        &timestamp_now()?,
+    )?;
+    let inventory = MintInventory::from_yaml(
+        &fs::read_to_string(&inventory_path)
+            .with_context(|| format!("read Mint inventory {inventory_path}"))?,
+    )?;
+    let known_failures = MintKnownFailures::from_yaml(
+        &fs::read_to_string(&known_failures_path)
+            .with_context(|| format!("read Mint known failures {known_failures_path}"))?,
+    )?;
+    let mode = required_env("RUSTFS_PROTOCOL_COMPAT_MINT_MODE")?.parse::<MintMode>()?;
+    let suites = required_env("RUSTFS_PROTOCOL_COMPAT_MINT_SUITES")?
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let publication = run_mint_session(MintSessionRequest {
+        artifact_root: artifact_root.into(),
+        target,
+        profile_name: std::env::var("RUSTFS_PROTOCOL_COMPAT_PROFILE_NAME")
+            .unwrap_or_else(|_| "rustfs-mint-core".to_string()),
+        mint_image: required_env("RUSTFS_PROTOCOL_COMPAT_MINT_IMAGE")?,
+        mint_platform: required_env("RUSTFS_PROTOCOL_COMPAT_MINT_PLATFORM")?,
+        mint_mode: mode,
+        mint_suites: suites,
+        inventory,
+        known_failures,
+        forbidden_material: mint_forbidden_material(),
+    })
+    .await?;
+    print!("{}", publication.terminal_summary);
+    ensure!(
+        publication.gate_exit_code == 0,
+        "Mint session gate failed; inspect {}",
+        publication.artifact_root.display()
+    );
+    Ok(())
+}
+
+async fn cleanup_mint_session_command(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let artifact_root = next_arg(&mut args, "Mint session artifact root")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-mint-cleanup accepts exactly one argument"
+    );
+    let publication = cleanup_mint_session(&artifact_root, &mint_forbidden_material()).await?;
+    print!("{}", publication.terminal_summary);
+    ensure!(
+        publication.cleanup_exit_code == 0,
+        "Mint recovery cleanup failed; inspect {artifact_root}"
+    );
+    Ok(())
+}
+
+fn validate_mint_session_artifacts(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let artifact_root = next_arg(&mut args, "Mint session artifact root")?;
+    ensure!(
+        args.next().is_none(),
+        "protocol-mint-validate-session accepts exactly one argument"
+    );
+    let report = validate_mint_session_artifacts_and_write_report(
+        &artifact_root,
+        &mint_forbidden_material(),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
