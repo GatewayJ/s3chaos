@@ -1,8 +1,0 @@
-apiVersion: rustfs.com/s3chaos/v1alpha1
-kind: ProtocolCompatibilityStatus
-status: expected-divergence
-source: ceph/s3-tests
-sourceRevision: 5522d1c351f75bc00ae0f64f742f3f095f5939d9
-entries: []
-# Each future entry must include reason, rustfsBehavior, expectedBehavior,
-# tracking, reviewCondition, and disposition (fail, skip, or warn).

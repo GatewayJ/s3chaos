@@ -48,11 +48,10 @@ jobs:
 
       - name: Validate protocol contracts and suites
         run: |
-          cargo run --quiet --bin s3chaos -- protocol-compatibility-status-json > /dev/null
           scripts/protocol-test.sh profile-validate smoke protocol/examples/smoke.yaml
           scripts/protocol-test.sh profile-validate full protocol/examples/full-regression.yaml
           scripts/protocol-test.sh profile-validate slow protocol/examples/slow-regression.yaml
           scripts/protocol-test.sh profile-validate external protocol/examples/oidc-keycloak.yaml
 
       - name: Shell lint test entrypoints
-        run: bash -n scripts/fault-test.sh scripts/protocol-test.sh scripts/protocol-compatibility.sh scripts/update-s3tests-index.sh
+        run: bash -n scripts/fault-test.sh scripts/protocol-test.sh scripts/protocol-compatibility.sh

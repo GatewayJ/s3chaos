@@ -30,7 +30,6 @@ use s3chaos::fault::{
 use s3chaos::protocol::{
     artifact_validation::validate_protocol_artifacts_and_write_report,
     catalog::protocol_catalog_json,
-    compatibility::compatibility_catalog_json,
     suite::{
         ProtocolExecutionProfile, protocol_suite_template_yaml, resolve_protocol_suite_yaml,
         validate_protocol_ci_environment, validate_protocol_execution_profile_as,
@@ -63,7 +62,6 @@ async fn main() -> Result<()> {
         "fault-validate-artifacts" => validate_fault_artifacts_command(args),
         "fault-run-spec-equal" => validate_fault_run_spec_equivalence(args),
         "protocol-catalog-json" => print_protocol_catalog_json(),
-        "protocol-compatibility-status-json" => print_protocol_compatibility_status_json(),
         "protocol-cleanup" => cleanup_protocol_artifacts(args).await,
         "protocol-ci-profile-validate" => validate_protocol_ci_profile(args),
         "protocol-suite-json" => print_protocol_suite_json(args),
@@ -94,7 +92,6 @@ fn print_help() -> Result<()> {
     println!("  fault-validate-artifacts <scenario> <artifact-root> [--validation-summary-tsv]");
     println!("  fault-run-spec-equal <run-spec.json> <run-spec.yaml>");
     println!("  protocol-catalog-json");
-    println!("  protocol-compatibility-status-json");
     println!("  protocol-cleanup <artifact-root>");
     println!("  protocol-cleanup --registry <resource-registry.json>");
     println!("  protocol-ci-profile-validate <smoke|full|slow|external> <suite.yaml>");
@@ -188,11 +185,6 @@ async fn cleanup_protocol_artifacts(mut args: impl Iterator<Item = String>) -> R
 
 fn print_protocol_catalog_json() -> Result<()> {
     println!("{}", protocol_catalog_json()?);
-    Ok(())
-}
-
-fn print_protocol_compatibility_status_json() -> Result<()> {
-    println!("{}", compatibility_catalog_json()?);
     Ok(())
 }
 

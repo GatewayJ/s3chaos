@@ -40,7 +40,6 @@ clearest evidence about RustFS behavior.
 - `src/bin/s3chaos.rs` — CLI entry point (`s3chaos` binary); the
   `src/bin/s3chaos/` directory holds its console server module.
 - `scripts/` — thin shell entry points invoked by Make targets.
-- `protocol/compatibility/` — pinned Ceph s3-tests classification data.
 
 ## Sources of Truth
 
@@ -56,15 +55,6 @@ clearest evidence about RustFS behavior.
   `src/framework/` for existing equivalents.
 - Comments explain non-obvious invariants or reasons. Do not narrate code or
   record change history.
-
-## Compatibility Data Is Pinned
-
-The Ceph s3-tests classification under `protocol/compatibility/` is pinned by
-revision, case count (`sourceCaseCount`), and canonical index SHA-256
-(`native-profile.yaml`). Never hand-edit classification counts or index
-entries; regenerate via `make protocol-update-s3tests-index` (requires network
-access). When the revision or case set drifts, validation must fail with
-expected and actual values.
 
 ## Verification
 
@@ -98,14 +88,13 @@ Additionally run the matching static gate before any live run:
 ```bash
 make fault-suite-validate SUITE=...    # suite YAML changes
 make protocol-suite-validate SUITE=...
-make protocol-compatibility-status     # catalog/classification changes
 ```
 
 For fault-side or protocol-side script changes, `make fault-check` and
 `make protocol-check` each run `check` plus shell lint for their scripts;
 run at most one umbrella gate and skip the individual checks it already
 covers. `make fault-check` lints only `scripts/fault-test.sh`;
-`make protocol-check` lints the other three scripts — for a diff touching
+`make protocol-check` lints both protocol scripts — for a diff touching
 scripts on both sides, also run `bash -n` on any touched script not covered
 by the chosen umbrella gate.
 
@@ -165,7 +154,7 @@ Risk and review shape:
 Available domain lenses are correctness, simplicity, test coverage, security
 (credentials, secrets, untrusted input), concurrency/durability (async shared
 state, cancellation, timeouts, persisted run state), and compatibility (S3
-semantics versus AWS/Ceph behavior, pinned classification consistency). Select
+semantics versus AWS and Mint behavior). Select
 lenses by changed behavior, not by path name alone.
 
 A finding must name a concrete input/state/interleaving and wrong outcome, or a
