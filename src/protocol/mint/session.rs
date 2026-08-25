@@ -1302,9 +1302,8 @@ async fn remove_owned_mint_container(spec: &MintTargetSpec) -> Result<()> {
     )
     .await?;
     if !inspect.status.success() {
-        let stderr = String::from_utf8_lossy(&inspect.stderr);
         ensure!(
-            stderr.contains("No such object") || stderr.contains("No such container"),
+            docker_inspect_reports_absent(&inspect.stderr),
             "failed to inspect the exact Mint container before cleanup"
         );
         return Ok(());
@@ -1323,6 +1322,18 @@ async fn remove_owned_mint_container(spec: &MintTargetSpec) -> Result<()> {
 
 fn docker_container_ownership_matches(spec: &MintTargetSpec, labels: &[u8]) -> bool {
     String::from_utf8_lossy(labels).trim() == format!("{}|{}", spec.run_id, spec.namespace_uid)
+}
+
+fn docker_inspect_reports_absent(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_ascii_lowercase();
+    [
+        "error: no such object:",
+        "error: no such container:",
+        "error response from daemon: no such object:",
+        "error response from daemon: no such container:",
+    ]
+    .iter()
+    .any(|prefix| stderr.starts_with(prefix))
 }
 
 async fn bounded_docker_output(
@@ -2079,6 +2090,18 @@ mod tests {
         assert!(!docker_container_ownership_matches(
             &target,
             format!("{}|22222222-2222-4222-8222-222222222222", target.run_id).as_bytes()
+        ));
+        assert!(docker_inspect_reports_absent(
+            b"error: no such object: s3chaos-mint-run"
+        ));
+        assert!(docker_inspect_reports_absent(
+            b"Error response from daemon: No such container: s3chaos-mint-run"
+        ));
+        assert!(!docker_inspect_reports_absent(
+            b"permission denied while trying to connect to the Docker daemon"
+        ));
+        assert!(!docker_inspect_reports_absent(
+            b"permission denied: no such object: s3chaos-mint-run"
         ));
     }
 
