@@ -219,8 +219,9 @@ pub enum AvailabilityStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FailureClassification {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClassification {
     RecoveryTailReadLatency,
     CommittedObjectUnavailable,
     ListUnavailableOrUnknown,
@@ -279,7 +280,7 @@ impl FailureClassification {
             .find(|classification| classification.as_str() == name)
     }
 
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::RecoveryTailReadLatency => "recovery_tail_read_latency",
             Self::CommittedObjectUnavailable => "committed_object_unavailable",
@@ -307,7 +308,7 @@ impl FailureClassification {
         }
     }
 
-    pub(crate) const fn is_s3_model(self) -> bool {
+    pub const fn is_s3_model(self) -> bool {
         matches!(
             self,
             Self::RecoveryTailReadLatency
@@ -318,7 +319,7 @@ impl FailureClassification {
         )
     }
 
-    const fn responsibility_domain(self) -> ResponsibilityDomain {
+    pub const fn responsibility_domain(self) -> ResponsibilityDomain {
         match self {
             Self::RecoveryTailReadLatency
             | Self::CommittedObjectUnavailable
@@ -342,6 +343,35 @@ impl FailureClassification {
             | Self::EnvironmentOrWorkload
             | Self::WorkloadOrProduct
             | Self::NoSignal => ResponsibilityDomain::Unknown,
+        }
+    }
+
+    pub const fn severity(self) -> FailureSeverity {
+        match self {
+            Self::RecoveryTailReadLatency => FailureSeverity::Degraded,
+            Self::CommittedObjectUnavailable | Self::ListUnavailableOrUnknown => {
+                FailureSeverity::FailAvailability
+            }
+            Self::DataCorruption => FailureSeverity::FailCorrectness,
+            Self::HarnessError
+            | Self::TestHarness
+            | Self::TestOrEnvironment
+            | Self::EnvironmentOrFaultBackend => FailureSeverity::Infra,
+            Self::AmbiguousWriteMaterialized
+            | Self::WorkloadExecutionError
+            | Self::ArtifactValidationFailed
+            | Self::CheckerExecutionError
+            | Self::PreflightFailed
+            | Self::HealthGuardFailed
+            | Self::FaultBackendUnavailable
+            | Self::FaultNotActive
+            | Self::FaultNotRecovered
+            | Self::Unknown
+            | Self::CheckerOrEnvironment
+            | Self::ProductOrEnvironment
+            | Self::EnvironmentOrWorkload
+            | Self::WorkloadOrProduct
+            | Self::NoSignal => FailureSeverity::NeedsInvestigation,
         }
     }
 }
@@ -660,7 +690,7 @@ impl FailureClassificationDetails {
     fn from_classification(classification: FailureClassification) -> Self {
         match classification {
             FailureClassification::RecoveryTailReadLatency => Self {
-                severity: FailureSeverity::Degraded,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Passed,
                 availability: AvailabilityStatus::RecoveredAfterTailLatency,
                 data_loss: Some(false),
@@ -668,7 +698,7 @@ impl FailureClassificationDetails {
                 recovered_within_window: Some(true),
             },
             FailureClassification::CommittedObjectUnavailable => Self {
-                severity: FailureSeverity::FailAvailability,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::CommittedObjectUnavailable,
                 data_loss: None,
@@ -676,7 +706,7 @@ impl FailureClassificationDetails {
                 recovered_within_window: Some(false),
             },
             FailureClassification::ListUnavailableOrUnknown => Self {
-                severity: FailureSeverity::FailAvailability,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::ListUnavailableOrUnknown,
                 data_loss: None,
@@ -684,7 +714,7 @@ impl FailureClassificationDetails {
                 recovered_within_window: Some(false),
             },
             FailureClassification::DataCorruption => Self {
-                severity: FailureSeverity::FailCorrectness,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Failed,
                 availability: AvailabilityStatus::Unknown,
                 data_loss: None,
@@ -692,7 +722,7 @@ impl FailureClassificationDetails {
                 recovered_within_window: None,
             },
             FailureClassification::AmbiguousWriteMaterialized => Self {
-                severity: FailureSeverity::NeedsInvestigation,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::Unknown,
                 data_loss: None,
@@ -703,7 +733,7 @@ impl FailureClassificationDetails {
             | FailureClassification::TestHarness
             | FailureClassification::TestOrEnvironment
             | FailureClassification::EnvironmentOrFaultBackend => Self {
-                severity: FailureSeverity::Infra,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::Unknown,
                 data_loss: None,
@@ -724,7 +754,7 @@ impl FailureClassificationDetails {
             | FailureClassification::EnvironmentOrWorkload
             | FailureClassification::WorkloadOrProduct
             | FailureClassification::NoSignal => Self {
-                severity: FailureSeverity::NeedsInvestigation,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::Unknown,
                 data_loss: None,

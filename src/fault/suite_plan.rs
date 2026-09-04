@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -26,11 +26,14 @@ use crate::fault::{
         FaultTarget, FaultWorkloadMode,
     },
     reporting::FailureSeverity,
-    scenarios::{FaultScenario, FaultScenarioSpec, apply_catalog_defaults, scenario_spec},
+    scenarios::{
+        FaultDetectorContract, FaultScenario, FaultScenarioSpec, apply_catalog_defaults,
+        scenario_spec,
+    },
     spec::FaultRunArtifactSpec,
     suite::{
-        ResolvedFaultSuite, ResolvedFaultSuiteScenario, ResolvedFaultSuiteWorkloadOverride,
-        resolve_fault_suite_yaml,
+        FaultExpectedFailure, ResolvedFaultSuite, ResolvedFaultSuiteScenario,
+        ResolvedFaultSuiteWorkloadOverride, resolve_fault_suite_yaml,
     },
     workload::{WorkloadHotspot, WorkloadOperationMix, WorkloadPlan, WorkloadSizeClass},
 };
@@ -38,7 +41,7 @@ use crate::fault::{
 pub const FAULT_SUITE_PLAN_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
 pub const FAULT_SUITE_PLAN_KIND: &str = "FaultSuitePlan";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlan {
     #[serde(rename = "apiVersion")]
@@ -57,7 +60,7 @@ pub struct FaultSuitePlan {
     pub attempts: Vec<FaultSuitePlanAttempt>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanCluster {
     pub context: String,
@@ -69,7 +72,7 @@ pub struct FaultSuitePlanCluster {
     pub use_cluster_ip: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanBudgets {
     pub stop_on_first_failure: bool,
@@ -85,7 +88,7 @@ pub struct FaultSuitePlanBudgets {
     pub minimum_required_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanAttempt {
     pub index: usize,
@@ -97,6 +100,9 @@ pub struct FaultSuitePlanAttempt {
     pub impact_policy: String,
     pub expected_backend: String,
     pub catalog_target: String,
+    pub detector: FaultDetectorContract,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_failure: Option<FaultExpectedFailure>,
     pub fault_duration_seconds: u64,
     pub workload: FaultSuitePlanWorkload,
     pub faults: Vec<FaultSuitePlanFault>,
@@ -108,7 +114,7 @@ pub struct FaultSuitePlanAttempt {
     pub budget: FaultSuitePlanBudgetImpact,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanWorkload {
     pub mode: String,
@@ -128,14 +134,14 @@ pub struct FaultSuitePlanWorkload {
     pub seed: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanPayloadClass {
     pub size_bytes: usize,
     pub object_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanFault {
     pub name: String,
@@ -151,7 +157,7 @@ pub struct FaultSuitePlanFault {
     pub conflict_domain: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanTarget {
     pub kind: String,
@@ -160,14 +166,14 @@ pub struct FaultSuitePlanTarget {
     pub path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanTargetProof {
     pub required: bool,
     pub artifact: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanSelection {
     pub kind: String,
@@ -175,7 +181,7 @@ pub struct FaultSuitePlanSelection {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanArtifacts {
     pub attempt_dir: String,
@@ -184,7 +190,7 @@ pub struct FaultSuitePlanArtifacts {
     pub event_stream: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanBudgetImpact {
     pub fault_duration_seconds: u64,
@@ -416,6 +422,8 @@ impl FaultSuitePlanAttempt {
             impact_policy: input.spec.impact_policy.as_str().to_string(),
             expected_backend: input.spec.backend.as_str().to_string(),
             catalog_target: input.spec.target.to_string(),
+            detector: input.spec.detector.contract(),
+            expected_failure: input.scenario.expected_failure.clone(),
             fault_duration_seconds: input.config.duration.as_secs(),
             workload: FaultSuitePlanWorkload {
                 mode: workload_mode_name(input.fault_plan.workload_mode).to_string(),
@@ -806,6 +814,10 @@ mod tests {
                         "impactPolicy": "client-disruption-required",
                         "expectedBackend": "chaos-mesh-io-chaos",
                         "catalogTarget": "one RustFS container data volume selected by tenant label and configured RustFS volume path",
+                        "detector": {
+                            "qualification": "gate-candidate",
+                            "detects": ["data-shard-loss", "silent-data-corruption"]
+                        },
                         "faultDurationSeconds": 600,
                         "workload": {
                             "mode": "s3-mixed",
@@ -877,6 +889,10 @@ mod tests {
                         "impactPolicy": "client-disruption-optional",
                         "expectedBackend": "chaos-mesh-network-chaos",
                         "catalogTarget": "one RustFS Pod selected by tenant label with delayed peer traffic inside the e2e namespace",
+                        "detector": {
+                            "qualification": "gate-candidate",
+                            "detects": ["recovery-availability-regression", "silent-data-corruption"]
+                        },
                         "faultDurationSeconds": 480,
                         "workload": {
                             "mode": "s3-mixed",
@@ -953,6 +969,57 @@ mod tests {
                 "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1"
             )
         );
+    }
+
+    #[test]
+    fn suite_plan_preserves_expected_failure_and_detector_contracts() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: vulnerable-mode-calibration
+scenarios:
+  - name: io-eio
+    expectedFailure:
+      classification: data_corruption
+      severity: fail_correctness
+      responsibilityDomain: product
+      evidenceRefs:
+        - checker-report.json
+        - fault-evidence.json
+        - run-events.jsonl
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+
+        let expansion = build_fault_suite_plan_expansion(suite, base, "suite-fixed".to_string())
+            .expect("suite plan expansion");
+        let attempt = &expansion.plan.attempts[0];
+
+        assert_eq!(attempt.detector, expansion.suite.scenarios[0].detector);
+        assert_eq!(
+            attempt.expected_failure,
+            expansion.suite.scenarios[0].expected_failure
+        );
+        let json = serde_json::to_value(attempt).expect("attempt json");
+        assert_eq!(json["expectedFailure"]["classification"], "data_corruption");
+        assert_eq!(
+            json["expectedFailure"]["evidenceRefs"],
+            json!([
+                "checker-report.json",
+                "fault-evidence.json",
+                "run-events.jsonl"
+            ])
+        );
+        assert_eq!(json["detector"]["detects"][0], "data-shard-loss");
+        let encoded = expansion.plan.to_json().expect("plan json");
+        let decoded = serde_json::from_str::<super::FaultSuitePlan>(&encoded).expect("plan decode");
+        assert_eq!(decoded, expansion.plan);
     }
 
     #[test]

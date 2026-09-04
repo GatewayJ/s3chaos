@@ -19,11 +19,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::fault::{
-    artifact_validation::{ArtifactValidationOptions, validate_fault_artifacts_and_write_report},
+    artifact_validation::{
+        ArtifactValidationOptions, validate_fault_artifacts_and_write_report,
+        validate_written_failure_summary,
+    },
     config::FaultTestConfig,
     reporting::{FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain},
     runner::run_scenario_with_config_and_reference_root,
-    suite::ResolvedFaultSuite,
+    suite::{FaultExpectedFailure, ResolvedFaultSuite},
     suite_plan::{
         attempt_minimum_required_duration, build_fault_suite_plan_expansion, suite_run_id,
     },
@@ -66,6 +69,7 @@ pub enum SuiteRunStatus {
 pub enum SuiteAttemptStatus {
     Running,
     Succeeded,
+    ExpectedFailure,
     Failed,
 }
 
@@ -159,6 +163,12 @@ pub struct FaultSuiteRunAttempt {
     pub ended_at_ms: Option<u64>,
     pub artifacts_dir: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_failure: Option<FaultExpectedFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_failure_matched: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_disruptions: Option<usize>,
@@ -228,6 +238,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
             &planned.plan.scenario,
             planned.plan.repetition,
             attempt_dir,
+            planned.plan.expected_failure.clone(),
         );
         write_attempt_started(&mut summary, &summary_path, attempt.clone())?;
 
@@ -253,8 +264,25 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                         report.recommitted,
                         report.committed,
                     );
-                    replace_last_attempt(&mut summary, attempt);
-                    if let Some(max_disruptions) =
+                    if planned.plan.expected_failure.is_some() {
+                        let attempt_error = format!(
+                            "scenario {} repetition {} succeeded, but the suite required the typed expected failure signal",
+                            planned.plan.scenario, planned.plan.repetition
+                        );
+                        attempt.fail(attempt_error.clone(), None);
+                        stop_after_attempt_failure = should_stop_after_attempt_failure(
+                            &execution_plan.suite.budgets.continue_on_severities,
+                            execution_plan.suite.budgets.stop_on_first_failure,
+                            None,
+                        );
+                        summary.record_attempt_failure(
+                            &attempt,
+                            None,
+                            None,
+                            attempt_error,
+                            stop_after_attempt_failure,
+                        );
+                    } else if let Some(max_disruptions) =
                         execution_plan.suite.budgets.max_client_disruptions
                         && summary.total_client_disruptions > max_disruptions
                     {
@@ -262,9 +290,11 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                             "suite maxClientDisruptions budget {max_disruptions} was exceeded with {} disruptions",
                             summary.total_client_disruptions
                         ));
+                        replace_last_attempt(&mut summary, attempt);
                         write_summary(&summary_path, &summary)?;
                         break 'suite;
                     }
+                    replace_last_attempt(&mut summary, attempt);
                 }
                 Err(error) => {
                     let (attempt_error, failure_summary_artifact, forced_stop) =
@@ -291,6 +321,34 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
             Err(error) => {
                 let (attempt_error, failure_summary, failure_severity) =
                     attempt_failure_details(&planned.plan, error.to_string());
+                let expected_failure_result =
+                    planned.plan.expected_failure.as_ref().map(|expected| {
+                        validate_expected_failure(
+                            &suite_root,
+                            &planned.plan,
+                            expected,
+                            failure_summary.as_ref(),
+                        )
+                    });
+                if let Some(Ok(failure_summary_artifact)) = expected_failure_result.as_ref() {
+                    attempt.satisfy_expected_failure(
+                        failure_summary
+                            .as_ref()
+                            .expect("validated expected failure has a failure summary"),
+                        failure_summary_artifact.clone(),
+                    );
+                    replace_last_attempt(&mut summary, attempt);
+                    write_summary(&summary_path, &summary)?;
+                    continue 'suite;
+                }
+
+                let attempt_error = match expected_failure_result {
+                    Some(Err(mismatch)) => {
+                        format!("{attempt_error}; expected failure did not match: {mismatch}")
+                    }
+                    Some(Ok(_)) => unreachable!("matched expected failure returned above"),
+                    None => attempt_error,
+                };
                 attempt.fail(attempt_error.clone(), failure_summary.as_ref());
                 let failure_message = format!(
                     "scenario {} repetition {} failed: {attempt_error}",
@@ -432,6 +490,25 @@ fn read_attempt_failure_summary(plan: &FaultSuitePlanAttempt) -> Result<Option<F
     let summary = serde_json::from_str::<FailureSummary>(&raw)
         .with_context(|| format!("parse failure summary {}", path.display()))?;
     Ok(Some(summary))
+}
+
+fn validate_expected_failure(
+    suite_root: &Path,
+    plan: &FaultSuitePlanAttempt,
+    expected: &FaultExpectedFailure,
+    observed: Option<&FailureSummary>,
+) -> Result<String> {
+    let observed = observed.context("failure-summary.json is missing or unreadable")?;
+    let path = Path::new(&plan.artifacts.case_dir).join("failure-summary.json");
+    validate_written_failure_summary(suite_root, &path)
+        .context("failure-summary.json does not satisfy the artifact contract")?;
+    expected.validate_observed(
+        observed.classification(),
+        observed.severity(),
+        observed.responsibility_domain(),
+        observed.primary_evidence_refs(),
+    )?;
+    Ok(path.display().to_string())
 }
 
 fn attempt_failure_details(
@@ -611,7 +688,13 @@ impl FaultSuiteRunSummary {
 }
 
 impl FaultSuiteRunAttempt {
-    fn running(index: usize, scenario: &str, repetition: usize, artifacts_dir: &Path) -> Self {
+    fn running(
+        index: usize,
+        scenario: &str,
+        repetition: usize,
+        artifacts_dir: &Path,
+        expected_failure: Option<FaultExpectedFailure>,
+    ) -> Self {
         Self {
             index,
             scenario: scenario.to_string(),
@@ -620,6 +703,9 @@ impl FaultSuiteRunAttempt {
             started_at_ms: now_ms(),
             ended_at_ms: None,
             artifacts_dir: artifacts_dir.display().to_string(),
+            expected_failure,
+            expected_failure_matched: None,
+            failure_summary: None,
             seed: None,
             client_disruptions: None,
             recommitted: None,
@@ -647,6 +733,9 @@ impl FaultSuiteRunAttempt {
     fn fail(&mut self, error: String, failure_summary: Option<&FailureSummary>) {
         self.status = SuiteAttemptStatus::Failed;
         self.ended_at_ms = Some(now_ms());
+        if self.expected_failure.is_some() {
+            self.expected_failure_matched = Some(false);
+        }
         if let Some(summary) = failure_summary {
             self.severity = Some(summary.severity());
             self.classification = Some(summary.classification().to_string());
@@ -661,6 +750,31 @@ impl FaultSuiteRunAttempt {
         }
         self.error = Some(error);
     }
+
+    fn satisfy_expected_failure(
+        &mut self,
+        failure_summary: &FailureSummary,
+        failure_summary_artifact: String,
+    ) {
+        self.status = SuiteAttemptStatus::ExpectedFailure;
+        self.ended_at_ms = Some(now_ms());
+        self.expected_failure_matched = Some(true);
+        self.failure_summary = Some(failure_summary_artifact);
+        self.severity = Some(failure_summary.severity());
+        self.classification = Some(failure_summary.classification().to_string());
+        self.phase = failure_summary.phase();
+        self.s3_model_classification = failure_summary
+            .s3_model_classification()
+            .map(ToString::to_string);
+        self.run_failure_reason = failure_summary
+            .run_failure_reason()
+            .map(ToString::to_string);
+        self.responsibility_domain = failure_summary.responsibility_domain();
+        if !failure_summary.evidence_classifications().is_empty() {
+            self.evidence_classifications =
+                Some(failure_summary.evidence_classifications().to_vec());
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -674,9 +788,10 @@ fn now_ms() -> u64 {
 mod tests {
     use super::{
         FaultSuiteRunAttempt, FaultSuiteRunFailureKind, FaultSuiteRunSummary, FaultSuiteStopReason,
-        SuiteRunStatus, artifact_validation_failure_details, attempt_failure_details,
-        build_fault_suite_execution_plan, should_stop_after_attempt_failure,
-        suite_duration_budget_failure,
+        SuiteAttemptStatus, SuiteRunStatus, artifact_validation_failure_details,
+        attempt_failure_details, build_fault_suite_execution_plan,
+        should_stop_after_attempt_failure, suite_duration_budget_failure,
+        validate_expected_failure,
     };
     use crate::fault::{
         config::FaultTestConfig,
@@ -1024,7 +1139,7 @@ scenarios:
         .expect("known classification")
         .with_recovered_within_seconds(Some(27));
         let mut first_attempt =
-            FaultSuiteRunAttempt::running(1, "io-eio", 1, Path::new("attempts/0001"));
+            FaultSuiteRunAttempt::running(1, "io-eio", 1, Path::new("attempts/0001"), None);
         first_attempt.fail("tail latency".to_string(), Some(&degraded));
         summary.record_attempt_failure(
             &first_attempt,
@@ -1052,7 +1167,7 @@ scenarios:
         .expect("known classification")
         .with_evidence_classifications(["ambiguous_write_materialized", "data_corruption"]);
         let mut second_attempt =
-            FaultSuiteRunAttempt::running(2, "network-delay", 1, Path::new("attempts/0002"));
+            FaultSuiteRunAttempt::running(2, "network-delay", 1, Path::new("attempts/0002"), None);
         second_attempt.fail("hash mismatch".to_string(), Some(&hard_failure));
         assert_eq!(
             second_attempt.evidence_classifications.as_deref(),
@@ -1191,6 +1306,7 @@ scenarios:
             &planned.scenario,
             planned.repetition,
             Path::new(&planned.artifacts.attempt_dir),
+            None,
         );
         attempt.fail(attempt_error, summary.as_ref());
         assert_eq!(attempt.severity, Some(FailureSeverity::Degraded));
@@ -1264,6 +1380,7 @@ scenarios:
             &planned.scenario,
             planned.repetition,
             Path::new(&planned.artifacts.attempt_dir),
+            None,
         );
         attempt.fail(attempt_error, None);
         assert_eq!(attempt.severity, None);
@@ -1323,6 +1440,90 @@ scenarios:
         ));
     }
 
+    #[test]
+    fn typed_expected_failure_requires_valid_summary_and_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite = expected_failure_suite();
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+        base.cluster.artifacts_dir = dir.path().to_path_buf();
+        let execution = build_fault_suite_execution_plan(suite, base, "suite-fixed".to_string())
+            .expect("suite execution plan");
+        let planned = &execution.plan.attempts[0];
+        let case_dir = Path::new(&planned.artifacts.case_dir);
+        fs::create_dir_all(case_dir).expect("case dir");
+        for artifact in [
+            "checker-report.json",
+            "fault-evidence.json",
+            "run-events.jsonl",
+        ] {
+            fs::write(case_dir.join(artifact), "{}").expect("evidence");
+        }
+        let observed = FailureSummary::new(
+            "io-eio",
+            "checker-verdict",
+            "data_corruption",
+            "hash mismatch",
+        )
+        .expect("failure summary");
+        write_failure_summary(
+            case_dir,
+            serde_json::to_value(&observed).expect("summary json"),
+        );
+        let expected = planned.expected_failure.as_ref().expect("expected failure");
+
+        let summary_artifact = validate_expected_failure(
+            dir.path().join("rustfs-smoke/suite-fixed").as_path(),
+            planned,
+            expected,
+            Some(&observed),
+        )
+        .expect("matched expected failure");
+        let mut attempt = FaultSuiteRunAttempt::running(
+            planned.index,
+            &planned.scenario,
+            planned.repetition,
+            Path::new(&planned.artifacts.attempt_dir),
+            Some(expected.clone()),
+        );
+        attempt.satisfy_expected_failure(&observed, summary_artifact.clone());
+
+        assert_eq!(attempt.status, SuiteAttemptStatus::ExpectedFailure);
+        assert_eq!(attempt.expected_failure_matched, Some(true));
+        assert_eq!(
+            attempt.failure_summary.as_deref(),
+            Some(summary_artifact.as_str())
+        );
+        let mut run_summary =
+            FaultSuiteRunSummary::started(&execution.suite, "suite-fixed".to_string());
+        run_summary.attempts.push(attempt);
+        run_summary.succeed();
+        assert_eq!(run_summary.status, SuiteRunStatus::Succeeded);
+        assert!(run_summary.failures.is_empty());
+        let summary_json = serde_json::to_value(&run_summary).expect("suite summary json");
+        assert_eq!(summary_json["attempts"][0]["status"], "expected-failure");
+        assert_eq!(summary_json["attempts"][0]["expectedFailureMatched"], true);
+
+        fs::remove_file(case_dir.join("fault-evidence.json")).expect("remove evidence");
+        let error = validate_expected_failure(
+            dir.path().join("rustfs-smoke/suite-fixed").as_path(),
+            planned,
+            expected,
+            Some(&observed),
+        )
+        .expect_err("missing evidence cannot match");
+        assert!(error.to_string().contains("artifact contract"));
+
+        let error = validate_expected_failure(
+            dir.path().join("rustfs-smoke/suite-fixed").as_path(),
+            planned,
+            expected,
+            None,
+        )
+        .expect_err("missing signal cannot match");
+        assert!(error.to_string().contains("missing or unreadable"));
+    }
+
     fn single_scenario_suite() -> crate::fault::suite::ResolvedFaultSuite {
         serde_yaml_ng::from_str::<FaultSuite>(
             r#"
@@ -1333,6 +1534,30 @@ metadata:
 scenarios:
   - name: io-eio
     faultDuration: 10m
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite")
+    }
+
+    fn expected_failure_suite() -> crate::fault::suite::ResolvedFaultSuite {
+        serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    expectedFailure:
+      classification: data_corruption
+      severity: fail_correctness
+      responsibilityDomain: product
+      evidenceRefs:
+        - checker-report.json
+        - fault-evidence.json
+        - run-events.jsonl
 "#,
         )
         .expect("suite yaml")

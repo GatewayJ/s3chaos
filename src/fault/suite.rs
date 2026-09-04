@@ -14,14 +14,14 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
 use crate::fault::{
     plan::FaultInjectionParameters,
-    reporting::FailureSeverity,
-    scenarios::{FaultScenarioStatus, scenario_spec},
+    reporting::{FailureClassification, FailureSeverity, ResponsibilityDomain},
+    scenarios::{FaultDetectorContract, FaultScenarioStatus, scenario_spec},
     workload::{WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadDistribution},
 };
 
@@ -88,6 +88,120 @@ pub struct FaultSuiteScenario {
     pub workload_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload: Option<FaultSuiteWorkloadOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_failure: Option<FaultExpectedFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FaultExpectedFailure {
+    pub classification: FailureClassification,
+    pub severity: FailureSeverity,
+    pub responsibility_domain: ResponsibilityDomain,
+    pub evidence_refs: Vec<FaultExpectedEvidenceRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum FaultExpectedEvidenceRef {
+    #[serde(rename = "recovery-stability-report.json")]
+    RecoveryStabilityReport,
+    #[serde(rename = "checker-pre-recommit-report.json")]
+    CheckerPreRecommitReport,
+    #[serde(rename = "checker-report.json")]
+    CheckerReport,
+    #[serde(rename = "fault-evidence.json")]
+    FaultEvidence,
+    #[serde(rename = "run-events.jsonl")]
+    RunEvents,
+}
+
+impl FaultExpectedEvidenceRef {
+    pub const fn file_name(self) -> &'static str {
+        match self {
+            Self::RecoveryStabilityReport => "recovery-stability-report.json",
+            Self::CheckerPreRecommitReport => "checker-pre-recommit-report.json",
+            Self::CheckerReport => "checker-report.json",
+            Self::FaultEvidence => "fault-evidence.json",
+            Self::RunEvents => "run-events.jsonl",
+        }
+    }
+}
+
+impl FaultExpectedFailure {
+    fn validate(&self, scenario: &str) -> Result<()> {
+        ensure!(
+            self.classification.is_s3_model(),
+            "scenario {scenario} expectedFailure.classification must be a product S3-model classification, got {}",
+            self.classification.as_str()
+        );
+        ensure!(
+            self.severity == self.classification.severity(),
+            "scenario {scenario} expectedFailure.severity {:?} does not match classification {} severity {:?}",
+            self.severity,
+            self.classification.as_str(),
+            self.classification.severity()
+        );
+        ensure!(
+            self.responsibility_domain == self.classification.responsibility_domain(),
+            "scenario {scenario} expectedFailure.responsibilityDomain {:?} does not match classification {} responsibility {:?}",
+            self.responsibility_domain,
+            self.classification.as_str(),
+            self.classification.responsibility_domain()
+        );
+        ensure!(
+            !self.evidence_refs.is_empty(),
+            "scenario {scenario} expectedFailure.evidenceRefs must not be empty"
+        );
+        let unique = self.evidence_refs.iter().copied().collect::<BTreeSet<_>>();
+        ensure!(
+            unique.len() == self.evidence_refs.len(),
+            "scenario {scenario} expectedFailure.evidenceRefs contains duplicates"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_observed(
+        &self,
+        classification: &str,
+        severity: FailureSeverity,
+        responsibility_domain: Option<ResponsibilityDomain>,
+        evidence_refs: &[String],
+    ) -> Result<()> {
+        ensure!(
+            classification == self.classification.as_str(),
+            "expected classification {}, observed {classification}",
+            self.classification.as_str()
+        );
+        ensure!(
+            severity == self.severity,
+            "expected severity {:?}, observed {:?}",
+            self.severity,
+            severity
+        );
+        ensure!(
+            responsibility_domain == Some(self.responsibility_domain),
+            "expected responsibility {:?}, observed {:?}",
+            self.responsibility_domain,
+            responsibility_domain
+        );
+        ensure!(
+            !evidence_refs.is_empty(),
+            "expected failure has no primary evidence refs"
+        );
+        let observed = evidence_refs
+            .iter()
+            .filter_map(|reference| Path::new(reference).file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        for expected in &self.evidence_refs {
+            ensure!(
+                observed.contains(expected.file_name()),
+                "expected failure is missing primary evidence ref {}",
+                expected.file_name()
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +292,8 @@ pub struct ResolvedFaultSuiteScenario {
     pub workload_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workload: Option<ResolvedFaultSuiteWorkloadOverride>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_failure: Option<FaultExpectedFailure>,
     pub priority: String,
     pub isolation: String,
     pub backend: String,
@@ -186,6 +302,7 @@ pub struct ResolvedFaultSuiteScenario {
     pub requires_chaos_mesh: bool,
     pub crds: Vec<String>,
     pub required_tools: Vec<String>,
+    pub detector: FaultDetectorContract,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -357,6 +474,9 @@ impl ResolvedFaultSuiteScenario {
             "scenario {} must not set both workloadProfile and workload",
             scenario.name
         );
+        if let Some(expected_failure) = &scenario.expected_failure {
+            expected_failure.validate(&scenario.name)?;
+        }
         let params = scenario.params.clone().unwrap_or_default();
         if let Some(params) = &scenario.params {
             params.validate_explicit_for_schema(spec.param_schema)?;
@@ -400,6 +520,7 @@ impl ResolvedFaultSuiteScenario {
             percent: scenario.percent,
             workload_profile: scenario.workload_profile.clone(),
             workload,
+            expected_failure: scenario.expected_failure.clone(),
             priority: spec.priority.as_str().to_string(),
             isolation: spec.isolation.as_str().to_string(),
             backend: spec.backend.as_str().to_string(),
@@ -412,6 +533,7 @@ impl ResolvedFaultSuiteScenario {
                 .iter()
                 .map(|tool| (*tool).to_string())
                 .collect(),
+            detector: spec.detector.contract(),
         })
     }
 }
@@ -648,10 +770,11 @@ impl Default for FaultSuiteBudgets {
 
 #[cfg(test)]
 mod tests {
-    use super::{FaultSuite, parse_duration_seconds};
+    use super::{FaultExpectedEvidenceRef, FaultSuite, parse_duration_seconds};
     use crate::fault::{
-        plan::FaultInjectionParameters, reporting::FailureSeverity,
-        scenarios::QUORUM_P_IO_FAULT_SCENARIO,
+        plan::FaultInjectionParameters,
+        reporting::{FailureClassification, FailureSeverity, ResponsibilityDomain},
+        scenarios::{DetectorQualification, QUORUM_P_IO_FAULT_SCENARIO},
     };
 
     #[test]
@@ -735,6 +858,171 @@ scenarios:
             resolved.budgets.continue_on_severities,
             vec![FailureSeverity::Degraded]
         );
+    }
+
+    #[test]
+    fn resolves_typed_expected_failure_contract() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: vulnerable-mode-calibration
+scenarios:
+  - name: io-eio
+    expectedFailure:
+      classification: data_corruption
+      severity: fail_correctness
+      responsibilityDomain: product
+      evidenceRefs:
+        - checker-report.json
+        - fault-evidence.json
+        - run-events.jsonl
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved diagnostic suite");
+
+        let scenario = &suite.scenarios[0];
+        let expected = scenario
+            .expected_failure
+            .as_ref()
+            .expect("expected failure");
+        assert_eq!(
+            expected.classification,
+            FailureClassification::DataCorruption
+        );
+        assert_eq!(expected.severity, FailureSeverity::FailCorrectness);
+        assert_eq!(
+            expected.responsibility_domain,
+            ResponsibilityDomain::Product
+        );
+        assert_eq!(
+            expected.evidence_refs,
+            vec![
+                FaultExpectedEvidenceRef::CheckerReport,
+                FaultExpectedEvidenceRef::FaultEvidence,
+                FaultExpectedEvidenceRef::RunEvents,
+            ]
+        );
+        assert_eq!(
+            scenario.detector.qualification,
+            DetectorQualification::GateCandidate
+        );
+    }
+
+    #[test]
+    fn rejects_expected_failure_with_unknown_classification() {
+        let error = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: calibration
+scenarios:
+  - name: io-eio
+    expectedFailure:
+      classification: data_corrupton
+      severity: fail_correctness
+      responsibilityDomain: product
+      evidenceRefs: [checker-report.json]
+"#,
+        )
+        .expect_err("unknown typed classification");
+
+        assert!(error.to_string().contains("data_corrupton"));
+    }
+
+    #[test]
+    fn rejects_expected_failure_without_product_signal_or_evidence() {
+        let no_signal = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: calibration
+scenarios:
+  - name: io-eio
+    expectedFailure:
+      classification: no_signal
+      severity: needs_investigation
+      responsibilityDomain: unknown
+      evidenceRefs: [run-events.jsonl]
+"#,
+        )
+        .expect("typed yaml")
+        .resolve()
+        .expect_err("no signal is not a detector hit");
+        assert!(no_signal.to_string().contains("product S3-model"));
+
+        let missing_evidence = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: calibration
+scenarios:
+  - name: io-eio
+    expectedFailure:
+      classification: data_corruption
+      severity: fail_correctness
+      responsibilityDomain: product
+      evidenceRefs: []
+"#,
+        )
+        .expect("typed yaml")
+        .resolve()
+        .expect_err("evidence is mandatory");
+        assert!(missing_evidence.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn rejects_expected_failure_inconsistent_with_classification() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: calibration
+scenarios:
+  - name: io-eio
+    expectedFailure:
+      classification: data_corruption
+      severity: fail_availability
+      responsibilityDomain: product
+      evidenceRefs: [checker-report.json]
+"#,
+        )
+        .expect("typed yaml");
+
+        let error = suite.resolve().expect_err("mismatched severity");
+        assert!(error.to_string().contains("does not match classification"));
+    }
+
+    #[test]
+    fn expected_failure_requires_every_declared_evidence_ref() {
+        let expected = super::FaultExpectedFailure {
+            classification: FailureClassification::DataCorruption,
+            severity: FailureSeverity::FailCorrectness,
+            responsibility_domain: ResponsibilityDomain::Product,
+            evidence_refs: vec![
+                FaultExpectedEvidenceRef::CheckerReport,
+                FaultExpectedEvidenceRef::FaultEvidence,
+            ],
+        };
+        let refs = vec!["attempt/case/checker-report.json".to_string()];
+
+        let error = expected
+            .validate_observed(
+                "data_corruption",
+                FailureSeverity::FailCorrectness,
+                Some(ResponsibilityDomain::Product),
+                &refs,
+            )
+            .expect_err("missing fault evidence");
+
+        assert!(error.to_string().contains("fault-evidence.json"));
     }
 
     #[test]

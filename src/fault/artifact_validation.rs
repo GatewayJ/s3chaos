@@ -396,6 +396,7 @@ pub fn validate_fault_artifacts(
 }
 
 fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -> Result<()> {
+    let catalog_spec = scenarios::scenario_spec(&options.scenario)?;
     ensure!(
         spec.api_version == FAULT_RUN_API_VERSION,
         "run-spec apiVersion {:?} does not match {FAULT_RUN_API_VERSION}",
@@ -410,6 +411,11 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
         spec.scenario.name == options.scenario,
         "run-spec scenario {:?} does not match selected scenario {:?}",
         spec.scenario.name,
+        options.scenario
+    );
+    ensure!(
+        spec.scenario.detector == catalog_spec.detector.contract(),
+        "run-spec scenario detector contract does not match the catalog for {:?}",
         options.scenario
     );
     ensure!(
@@ -1708,6 +1714,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_run_spec_detector_contract_drift() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        rewrite_run_spec_detector(
+            &case_dir,
+            json!({
+                "qualification": "gate-candidate",
+                "detects": ["commit-metadata-loss"]
+            }),
+        );
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        let error = validate_fault_artifacts(&options).expect_err("detector drift");
+
+        assert!(error.to_string().contains("detector contract"));
+    }
+
+    #[test]
     fn validation_wrapper_writes_report_artifact() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_success_artifacts(dir.path(), "io-eio");
@@ -2837,7 +2872,11 @@ mod tests {
                 "isolation": "fresh-tenant",
                 "impact_policy": "client-disruption-required",
                 "boundary": "rustfs-workload/fault-injection",
-                "validation": "clean checker"
+                "validation": "clean checker",
+                "detector": {
+                    "qualification": "gate-candidate",
+                    "detects": ["data-shard-loss", "silent-data-corruption"]
+                }
             },
             "workload": {
                 "mode": "s3-mixed",
@@ -3090,6 +3129,25 @@ mod tests {
         )
         .expect("parse run spec");
         spec["workload"]["versioning"] = json!(versioning);
+        fs::write(
+            &json_path,
+            serde_json::to_string_pretty(&spec).expect("json"),
+        )
+        .expect("write run spec json");
+        fs::write(
+            case_dir.join("run-spec.yaml"),
+            serde_yaml_ng::to_string(&spec).expect("yaml"),
+        )
+        .expect("write run spec yaml");
+    }
+
+    fn rewrite_run_spec_detector(case_dir: &std::path::Path, detector: serde_json::Value) {
+        let json_path = case_dir.join("run-spec.json");
+        let mut spec = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(&json_path).expect("read run spec"),
+        )
+        .expect("parse run spec");
+        spec["scenario"]["detector"] = detector;
         fs::write(
             &json_path,
             serde_json::to_string_pretty(&spec).expect("json"),
