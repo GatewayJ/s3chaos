@@ -23,7 +23,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::fault::{
-    backends::chaos_mesh::{NetworkPartitionEvidenceContract, validate_network_partition_snapshot},
+    backends::chaos_mesh::{
+        NetworkPartitionEvidenceContract, VolumeTargetEvidenceContract, iochaos_record_pod_id,
+        validate_fixed_volume_snapshot, validate_network_partition_snapshot,
+    },
     checker::RecoveryStabilityReport,
     checker::{CheckerReport, RecoveryStabilityClassification},
     config::{
@@ -33,8 +36,11 @@ use crate::fault::{
     },
     events::{RunEvent, RunEventStatus},
     history::{DurabilityCohort, OperationKind, OperationOutcome, OperationRecord},
-    plan::{FaultPlan, FaultPlanOptions, FaultWorkloadMode},
-    preflight::{PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus},
+    plan::{FaultPlan, FaultPlanOptions, FaultSelection, FaultWorkloadMode},
+    preflight::{
+        PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus,
+        target_pod_has_bound_volume,
+    },
     quorum::require_fresh_runtime_observation,
     reporting::{
         AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity, FailureVerdict,
@@ -337,6 +343,9 @@ pub fn validate_fault_artifacts(
     if options.scenario == scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
         validate_write_quorum_runtime_evidence(&evidence, &target_proof, &json_spec)?;
     }
+    if fixed_volume_fault(&json_spec).is_some() {
+        validate_fixed_volume_runtime_evidence(&evidence, &target_proof, &json_spec)?;
+    }
     validate_fault_window_evidence(&evidence)?;
     if options.scenario == DM_FLAKEY_VERSIONED_HOT_SCENARIO {
         validate_dm_crash_artifacts(
@@ -554,6 +563,9 @@ fn validate_run_spec_catalog_contract(
         FaultPlanOptions {
             rustfs_volume_path: options.expected_rustfs_volume_path.clone(),
             scenario_parameters: artifact_fault.parameters.clone(),
+            volume_selection: (artifact_fault.target.kind == "rustfs-volume"
+                && artifact_fault.selection.kind == "fixed-targets")
+                .then_some(FaultSelection::FixedTargets(artifact_fault.selection.value)),
         },
     )
     .context("rebuild canonical fault plan for artifact validation")?;
@@ -1010,22 +1022,127 @@ fn validate_write_quorum_runtime_evidence(
     Ok(())
 }
 
-fn target_pod_has_bound_volume(pod: &crate::fault::preflight::TargetResolvedPodProof) -> bool {
-    !pod.persistent_volume_claims.is_empty()
-        && pod.persistent_volume_claims.iter().all(|claim| {
-            claim
-                .volume_name
-                .as_deref()
-                .is_some_and(|volume| !volume.is_empty())
-                && claim.persistent_volume.as_ref().is_some_and(|pv| {
-                    !pv.name.is_empty()
-                        && pv.node.as_deref().is_some_and(|node| !node.is_empty())
-                        && pv
-                            .device_or_path
-                            .as_deref()
-                            .is_some_and(|path| !path.is_empty())
-                })
-        })
+fn fixed_volume_fault(spec: &FaultRunSpec) -> Option<&FaultRunFaultSpec> {
+    let [fault] = spec.faults.as_slice() else {
+        return None;
+    };
+    (fault.target.kind == "rustfs-volume"
+        && fault.selection.kind == "fixed-targets"
+        && matches!(
+            fault.kind.as_str(),
+            "rustfs_volume_io_error"
+                | "rustfs_volume_latency"
+                | "rustfs_volume_read_mistake"
+                | "rustfs_volume_enospc"
+        ))
+    .then_some(fault)
+}
+
+fn validate_fixed_volume_runtime_evidence(
+    evidence: &FaultEvidenceArtifact,
+    proof: &TargetProof,
+    spec: &FaultRunSpec,
+) -> Result<()> {
+    let fault = fixed_volume_fault(spec)
+        .context("fixed volume runtime proof requires one fixed-target volume fault")?;
+    let expected_count = usize::try_from(fault.selection.value)?;
+    let active_targets = evidence
+        .fixed_volume_targets_at_fault_activation
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let workload_targets = evidence
+        .fixed_volume_targets_at_workload_snapshot
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        active_targets.len() == expected_count
+            && active_targets.len() == evidence.fixed_volume_targets_at_fault_activation.len(),
+        "fault-evidence.json must persist exactly {} unique active fixed volume targets",
+        fault.selection.value
+    );
+    ensure!(
+        workload_targets == active_targets
+            && workload_targets.len() == evidence.fixed_volume_targets_at_workload_snapshot.len(),
+        "fault-evidence.json fixed volume target set changed across workload snapshots"
+    );
+
+    let proved_pods = proof
+        .resolved_pods
+        .iter()
+        .map(|pod| (format!("{}/{}", proof.namespace, pod.name), pod))
+        .collect::<BTreeMap<_, _>>();
+    let selected_pods = active_targets
+        .iter()
+        .map(|target| iochaos_record_pod_id(target))
+        .collect::<Result<BTreeSet<_>>>()?;
+    ensure!(
+        selected_pods.len() == active_targets.len(),
+        "fault-evidence.json contains multiple fixed volume target records for one Pod"
+    );
+    for pod_id in &selected_pods {
+        let pod = proved_pods.get(pod_id).with_context(|| {
+            format!("fixed volume target {pod_id:?} is absent from target-proof.json")
+        })?;
+        ensure!(
+            pod.ready && target_pod_has_bound_volume(pod),
+            "fixed volume target {pod_id:?} lacks Ready Pod/PVC/PV/device proof"
+        );
+    }
+
+    let candidate_pod_ids = proved_pods.keys().cloned().collect::<BTreeSet<_>>();
+    let volume_path = fault
+        .target
+        .path
+        .as_deref()
+        .context("fixed volume run-spec target has no path")?;
+    for (stage, snapshots, persisted_targets) in [
+        ("active", &evidence.active_snapshots, &active_targets),
+        (
+            "after-workload",
+            &evidence.workload_snapshots,
+            &workload_targets,
+        ),
+    ] {
+        ensure!(
+            snapshots.len() == 1,
+            "fault-evidence.json {stage} stage must contain exactly one IOChaos snapshot"
+        );
+        let snapshot = &snapshots[0];
+        ensure!(
+            snapshot.get("stage").and_then(Value::as_str) == Some(stage)
+                && snapshot.get("resource_kind").and_then(Value::as_str) == Some("iochaos"),
+            "fault-evidence.json {stage} fixed volume snapshot metadata is invalid"
+        );
+        let resource = snapshot
+            .get("chaos_status")
+            .context("fault-evidence.json fixed volume snapshot has no IOChaos object")?;
+        ensure!(
+            snapshot.get("resource_name").and_then(Value::as_str)
+                == resource.pointer("/metadata/name").and_then(Value::as_str),
+            "fault-evidence.json fixed volume snapshot resource name is inconsistent"
+        );
+        let snapshot_targets = validate_fixed_volume_snapshot(
+            resource,
+            &VolumeTargetEvidenceContract {
+                chaos_namespace: &spec.cluster.chaos_namespace,
+                target_namespace: &spec.cluster.namespace,
+                tenant: &spec.cluster.tenant,
+                run_id: &spec.metadata.run_id,
+                scenario: &spec.scenario.name,
+                volume_path,
+                expected_targets: fault.selection.value,
+                candidate_pod_ids: &candidate_pod_ids,
+            },
+        )
+        .with_context(|| format!("validate {stage} IOChaos runtime evidence"))?;
+        ensure!(
+            &snapshot_targets == persisted_targets,
+            "fault-evidence.json persisted fixed volume targets do not match the {stage} IOChaos snapshot"
+        );
+    }
+    Ok(())
 }
 
 fn validate_run_spec_target(
@@ -1851,6 +1968,10 @@ struct FaultEvidenceArtifact {
     pods_at_fault_activation: Vec<PodIdentityArtifact>,
     #[serde(default)]
     pods_at_workload_snapshot: Vec<PodIdentityArtifact>,
+    #[serde(default)]
+    fixed_volume_targets_at_fault_activation: Vec<String>,
+    #[serde(default)]
+    fixed_volume_targets_at_workload_snapshot: Vec<String>,
     pods_after: Vec<PodIdentityArtifact>,
     active_snapshots: Vec<Value>,
     workload_snapshots: Vec<Value>,
@@ -2092,14 +2213,17 @@ mod tests {
     use super::{
         ArtifactValidationOptions, FailureSummaryArtifact, FaultEvidenceArtifact,
         WorkloadSummaryArtifact, recursive_find, validate_fault_artifacts,
-        validate_fault_artifacts_and_write_report, validate_run_spec, validate_target_proof,
-        validate_write_quorum_runtime_evidence,
+        validate_fault_artifacts_and_write_report, validate_fixed_volume_runtime_evidence,
+        validate_run_spec, validate_target_proof, validate_write_quorum_runtime_evidence,
     };
     use crate::fault::{
         config::FaultTestConfig,
         history::{OperationOutcome, OperationRecord},
-        plan::FaultPlan,
-        preflight::{TargetProof, TargetResolvedPodProof},
+        plan::{FaultPlan, FaultPlanOptions, FaultSelection},
+        preflight::{
+            TargetPersistentVolumeClaimProof, TargetPersistentVolumeProof, TargetProof,
+            TargetResolvedPodProof,
+        },
         quorum::{ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape},
         reporting::{
             AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity,
@@ -2135,6 +2259,153 @@ mod tests {
             report.validation_summary_tsv_row(),
             "io-eio\t42\t0\t2\t1\t7\t0\t0\t0\t0\ttrue"
         );
+    }
+
+    #[test]
+    fn fixed_volume_runtime_evidence_binds_plan_proof_status_and_drift() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = "io-eio".to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario_with_options(
+            &scenario,
+            catalog,
+            FaultPlanOptions {
+                rustfs_volume_path: "/data/rustfs0".to_string(),
+                scenario_parameters: Default::default(),
+                volume_selection: Some(FaultSelection::FixedTargets(2)),
+            },
+        )
+        .expect("fixed volume plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let run_spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+        let volume_pod = |index| {
+            TargetResolvedPodProof::new(format!("rustfs-{index}"), format!("uid-{index}"))
+                .with_node(format!("node-{index}"))
+                .with_ready(true)
+                .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
+                    name: format!("data-{index}"),
+                    volume_name: Some(format!("pv-{index}")),
+                    storage_class: Some("fast-csi".to_string()),
+                    persistent_volume: Some(TargetPersistentVolumeProof {
+                        name: format!("pv-{index}"),
+                        node: Some(format!("node-{index}")),
+                        device_or_path: Some(format!("/dev/disk-{index}")),
+                    }),
+                }])
+        };
+        let proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs((0..3).map(volume_pod));
+        let insufficient = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs((0..1).map(volume_pod));
+        assert!(insufficient.require_satisfied().is_err());
+        let options = ArtifactValidationOptions {
+            scenario: scenario.name.clone(),
+            artifact_root: std::path::PathBuf::from("unused"),
+            expected_workload_objects: scenario.object_count,
+            expected_workload_concurrency: config.workload.concurrency,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: config.expected_rustfs_pod_count,
+            expected_stable_window_seconds: config.rustfs_pod_stable_window.as_secs(),
+            expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
+            expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
+        };
+        validate_run_spec(&run_spec, &options).expect("canonical fixed volume run spec");
+        validate_target_proof(&proof, &run_spec, &options).expect("fixed volume target proof");
+
+        let namespace = &run_spec.cluster.namespace;
+        let target = |index| format!("{namespace}/rustfs-{index}/rustfs");
+        let records = vec![
+            json!({"id": target(0), "selectorKey": ".", "phase": "Injected", "injectedCount": 1}),
+            json!({"id": target(1), "selectorKey": ".", "phase": "Injected", "injectedCount": 1}),
+        ];
+        let resource = json!({
+            "apiVersion": "chaos-mesh.org/v1alpha1",
+            "kind": "IOChaos",
+            "metadata": {
+                "name": "fixed-volume",
+                "namespace": run_spec.cluster.chaos_namespace,
+                "labels": {
+                    "rustfs-fault-test/run-id": run_spec.metadata.run_id,
+                    "rustfs-fault-test/scenario": run_spec.scenario.name,
+                    "app.kubernetes.io/managed-by": "s3chaos"
+                }
+            },
+            "spec": {
+                "action": "fault",
+                "errno": 5,
+                "mode": "fixed",
+                "value": "2",
+                "selector": {
+                    "namespaces": [namespace],
+                    "labelSelectors": {"rustfs.tenant": run_spec.cluster.tenant}
+                },
+                "containerNames": ["rustfs"],
+                "volumePath": "/data/rustfs0",
+                "path": "/data/rustfs0/**/*",
+                "methods": ["READ", "WRITE"],
+                "percent": 100,
+                "duration": "60s"
+            },
+            "status": {
+                "conditions": [
+                    {"type": "Selected", "status": "True"},
+                    {"type": "AllInjected", "status": "True"},
+                    {"type": "AllRecovered", "status": "False"}
+                ],
+                "experiment": {"desiredPhase": "Run", "containerRecords": records}
+            }
+        });
+        let snapshot = |stage: &str, resource: serde_json::Value| {
+            json!({
+                "stage": stage,
+                "resource_kind": "iochaos",
+                "resource_name": "fixed-volume",
+                "chaos_status": resource
+            })
+        };
+        let mut evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
+            "injected": true,
+            "active_during_workload": true,
+            "recovered": true,
+            "require_client_disruption": false,
+            "client_disruptions": 0,
+            "pods_before": [],
+            "pods_after": [],
+            "fixed_volume_targets_at_fault_activation": [target(0), target(1)],
+            "fixed_volume_targets_at_workload_snapshot": [target(0), target(1)],
+            "active_snapshots": [snapshot("active", resource.clone())],
+            "workload_snapshots": [snapshot("after-workload", resource.clone())]
+        }))
+        .expect("fault evidence");
+        validate_fixed_volume_runtime_evidence(&evidence, &proof, &run_spec)
+            .expect("fixed volume runtime evidence");
+
+        evidence.fixed_volume_targets_at_workload_snapshot[1] = target(2);
+        assert!(validate_fixed_volume_runtime_evidence(&evidence, &proof, &run_spec).is_err());
+        evidence.fixed_volume_targets_at_workload_snapshot[1] = target(1);
+        evidence.workload_snapshots[0]["chaos_status"]["status"]["experiment"]["containerRecords"]
+            .as_array_mut()
+            .expect("records")
+            .pop();
+        assert!(validate_fixed_volume_runtime_evidence(&evidence, &proof, &run_spec).is_err());
+
+        let mut missing_device = proof;
+        missing_device.resolved_pods[0].persistent_volume_claims[0]
+            .persistent_volume
+            .as_mut()
+            .expect("pv")
+            .device_or_path = None;
+        assert!(validate_target_proof(&missing_device, &run_spec, &options).is_err());
     }
 
     #[test]

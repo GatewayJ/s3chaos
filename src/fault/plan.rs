@@ -587,6 +587,15 @@ impl FaultInjection {
         &self.target
     }
 
+    pub fn target_summary(&self) -> String {
+        match (&self.target, self.selection) {
+            (FaultTarget::RustfsVolume { path }, FaultSelection::FixedTargets(count)) => {
+                format!("{count} RustFS volume target(s) at {path}")
+            }
+            _ => self.target.summary(),
+        }
+    }
+
     pub fn selection(&self) -> FaultSelection {
         self.selection
     }
@@ -660,13 +669,15 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         | FaultKind::RustfsVolumeReadMistake
         | FaultKind::RustfsVolumeEnospc => match selection {
             FaultSelection::Percent(percent) => (1..=100).contains(&percent),
-            FaultSelection::FixedTargets(_) => false,
+            // A single IOChaos resource can select a fixed number of RustFS
+            // volume-bearing Pods. Keep the same safety cap as the other
+            // renderer-backed fixed selector; exact candidate availability is
+            // proved at preflight and actual selection is proved at runtime.
+            FaultSelection::FixedTargets(count) => (1..=8).contains(&count),
         },
-        // NetworkPartition is the only kind whose Chaos Mesh render honors a
-        // multi-target count today (`mode: fixed` + `value`); quorum-loss
-        // scenarios rely on it. The cap is a sanity bound, and the topology
-        // preconditions (which counts actually break quorum) are enforced by
-        // the scenario's runner preflight, not here.
+        // NetworkPartition has its own fixed-count renderer. The cap is a
+        // sanity bound, and the topology preconditions (which counts actually
+        // break quorum) are enforced by the scenario's runner preflight.
         FaultKind::RustfsServerNetworkPartition => match selection {
             FaultSelection::FixedTargets(count) => (1..=8).contains(&count),
             FaultSelection::Percent(_) => false,
@@ -728,6 +739,7 @@ pub struct FaultPlan {
 pub struct FaultPlanOptions {
     pub rustfs_volume_path: String,
     pub scenario_parameters: FaultInjectionParameters,
+    pub volume_selection: Option<FaultSelection>,
 }
 
 impl FaultPlanOptions {
@@ -735,6 +747,7 @@ impl FaultPlanOptions {
         Self {
             rustfs_volume_path: config.rustfs_volume_path.clone(),
             scenario_parameters: config.scenario_parameters.clone(),
+            volume_selection: None,
         }
     }
 }
@@ -744,6 +757,7 @@ impl Default for FaultPlanOptions {
         Self {
             rustfs_volume_path: DEFAULT_RUSTFS_DATA_VOLUME.to_string(),
             scenario_parameters: FaultInjectionParameters::Default,
+            volume_selection: None,
         }
     }
 }
@@ -800,6 +814,7 @@ impl FaultPlan {
                 scenario,
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
+                options.volume_selection,
             )?,
             POD_KILL_ONE_SCENARIO | POD_CRASH_VERSIONED_HOT_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsServerPodKill,
@@ -862,6 +877,7 @@ impl FaultPlan {
                 scenario,
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
+                options.volume_selection,
             )?,
             IO_LATENCY_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeLatency,
@@ -869,6 +885,7 @@ impl FaultPlan {
                 scenario,
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
+                options.volume_selection,
             )?,
             DISK_FULL_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeEnospc,
@@ -876,6 +893,7 @@ impl FaultPlan {
                 scenario,
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
+                options.volume_selection,
             )?,
             STRESS_CPU_SCENARIO => resource_fault(
                 FaultKind::RustfsServerCpuStress,
@@ -909,6 +927,7 @@ impl FaultPlan {
                 scenario,
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
+                options.volume_selection,
             )?,
             other => bail!("scenario {other:?} has no fault plan mapping"),
         };
@@ -956,7 +975,7 @@ impl FaultPlan {
             .map(|fault| {
                 format!(
                     "{} via {}",
-                    fault.target().summary(),
+                    fault.target_summary(),
                     fault.selection().summary()
                 )
             })
@@ -971,6 +990,7 @@ fn volume_fault(
     scenario: &FaultScenario,
     volume_path: &str,
     parameters: &FaultInjectionParameters,
+    selection: Option<FaultSelection>,
 ) -> Result<FaultInjection> {
     FaultInjection::new_with_parameters(
         kind,
@@ -978,7 +998,7 @@ fn volume_fault(
         FaultTarget::RustfsVolume {
             path: volume_path.to_string(),
         },
-        FaultSelection::Percent(scenario.percent),
+        selection.unwrap_or(FaultSelection::Percent(scenario.percent)),
         scenario.duration,
         parameters.resolve_for_kind(kind)?,
     )
@@ -1020,7 +1040,7 @@ fn resource_fault(
 mod tests {
     use super::{
         DEFAULT_RUSTFS_DATA_VOLUME, FaultInjection, FaultInjectionParameters, FaultKind, FaultPlan,
-        FaultSelection, FaultTarget, FaultWorkloadMode,
+        FaultPlanOptions, FaultSelection, FaultTarget, FaultWorkloadMode,
     };
     use crate::fault::{
         config::FaultTestConfig,
@@ -1178,9 +1198,8 @@ mod tests {
     }
 
     #[test]
-    fn multi_target_selection_is_partition_only() {
-        // NetworkPartition is the only kind whose backend render honors a
-        // multi-target count; it accepts 1..=8 and rejects zero/over-cap.
+    fn multi_target_selection_is_limited_to_rendered_fault_families() {
+        // NetworkPartition accepts the same bounded fixed-count selector.
         for (count, ok) in [(1u32, true), (2, true), (8, true), (0, false), (9, false)] {
             let result = FaultInjection::new(
                 FaultKind::RustfsServerNetworkPartition,
@@ -1196,6 +1215,30 @@ mod tests {
             );
         }
 
+        for kind in [
+            FaultKind::RustfsVolumeIoError,
+            FaultKind::RustfsVolumeLatency,
+            FaultKind::RustfsVolumeReadMistake,
+            FaultKind::RustfsVolumeEnospc,
+        ] {
+            for (count, ok) in [(1u32, true), (2, true), (8, true), (0, false), (9, false)] {
+                let result = FaultInjection::new(
+                    kind,
+                    FaultBackend::ChaosMeshIoChaos,
+                    FaultTarget::RustfsVolume {
+                        path: DEFAULT_RUSTFS_DATA_VOLUME.to_string(),
+                    },
+                    FaultSelection::FixedTargets(count),
+                    Duration::from_secs(60),
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    ok,
+                    "volume {kind:?} FixedTargets({count}) acceptance mismatch"
+                );
+            }
+        }
+
         // Every other pod/network kind still renders `mode: one` and ignores
         // the count, so a multi-target selection must be rejected instead of
         // silently narrowing the declared blast radius to a single Pod.
@@ -1209,6 +1252,33 @@ mod tests {
         assert!(
             multi_pod_kill.is_err(),
             "multi-target pod kill must stay rejected until its render honors the count"
+        );
+    }
+
+    #[test]
+    fn volume_plan_option_declares_one_same_kind_fixed_target_fault() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = super::IO_EIO_SCENARIO.to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let spec = scenario_spec(&scenario.name).expect("catalog spec");
+        let plan = FaultPlan::from_scenario_with_options(
+            &scenario,
+            spec,
+            FaultPlanOptions {
+                volume_selection: Some(FaultSelection::FixedTargets(3)),
+                ..FaultPlanOptions::from_config(&config)
+            },
+        )
+        .expect("fixed volume plan");
+
+        let [fault] = plan.faults() else {
+            panic!("fixed volume plan must contain one typed fault")
+        };
+        assert_eq!(fault.kind(), FaultKind::RustfsVolumeIoError);
+        assert_eq!(fault.selection(), FaultSelection::FixedTargets(3));
+        assert_eq!(
+            fault.target_summary(),
+            "3 RustFS volume target(s) at /data/rustfs0"
         );
     }
 

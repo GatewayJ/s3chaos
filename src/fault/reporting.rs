@@ -59,6 +59,10 @@ pub(crate) struct FaultEvidence {
     pub(crate) pods_at_fault_activation: Vec<PodIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) pods_at_workload_snapshot: Vec<PodIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) fixed_volume_targets_at_fault_activation: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) fixed_volume_targets_at_workload_snapshot: Vec<String>,
     pub(crate) pods_after: Vec<PodIdentity>,
     pub(crate) active_snapshots: Vec<FaultStatusSnapshot>,
     pub(crate) workload_snapshots: Vec<FaultStatusSnapshot>,

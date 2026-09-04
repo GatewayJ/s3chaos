@@ -31,12 +31,15 @@ use crate::{
         history::{
             ByteRange, DurabilityCohort, OperationKind, OperationOutcome, OperationRecord, Recorder,
         },
-        plan::{FaultInjection, FaultPlan, FaultPlanOptions, FaultSelection},
+        plan::{FaultInjection, FaultKind, FaultPlan, FaultPlanOptions, FaultSelection},
         pods::{
             rustfs_pod_identities, rustfs_target_inventory, wait_for_rustfs_pod_deletion,
             wait_for_rustfs_pod_replacement,
         },
-        preflight::{PreflightCheck, PreflightPhase, PreflightSummary, TargetProof},
+        preflight::{
+            PreflightCheck, PreflightPhase, PreflightSummary, TargetProof,
+            target_pod_has_bound_volume,
+        },
         quorum::{
             ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape,
             require_fresh_runtime_observation,
@@ -986,6 +989,47 @@ async fn run_fault_case(
         } else {
             (Vec::new(), BTreeSet::new())
         };
+    let active_fixed_volume_targets = if fixed_volume_target_count(plan).is_some() {
+        match require_active_fixed_volume_targets(
+            config,
+            &run_id,
+            plan,
+            &pods_before,
+            &target_proof,
+            &active_snapshots,
+        ) {
+            Ok(targets) => targets,
+            Err(error) => {
+                events
+                    .record(
+                        "fault-snapshot-active",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                collect_fault_artifacts(
+                    collector,
+                    scenario.case_name,
+                    &fault,
+                    "active-volume-target-evidence-failed",
+                )?;
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "fault-snapshot-active",
+                        "environment_or_fault_backend",
+                        error.to_string(),
+                    ),
+                )?;
+                return Err(error);
+            }
+        }
+    } else {
+        BTreeSet::new()
+    };
     events.record(
         "fault-snapshot-active",
         RunEventStatus::Succeeded,
@@ -1338,6 +1382,55 @@ async fn run_fault_case(
     } else {
         Vec::new()
     };
+    let workload_fixed_volume_targets = if fixed_volume_target_count(plan).is_some() {
+        let validation = require_active_fixed_volume_targets(
+            config,
+            &run_id,
+            plan,
+            &pods_before,
+            &target_proof,
+            &workload_snapshots,
+        )
+        .and_then(|targets| {
+            ensure!(
+                targets == active_fixed_volume_targets,
+                "IOChaos selected volume targets changed while the workload was running"
+            );
+            Ok(targets)
+        });
+        match validation {
+            Ok(targets) => targets,
+            Err(error) => {
+                events
+                    .record(
+                        "fault-snapshot-after-workload",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                collect_fault_artifacts(
+                    collector,
+                    scenario.case_name,
+                    &fault,
+                    "workload-volume-target-evidence-failed",
+                )?;
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "fault-snapshot-after-workload",
+                        "environment_or_fault_backend",
+                        error.to_string(),
+                    ),
+                )?;
+                return Err(error);
+            }
+        }
+    } else {
+        BTreeSet::new()
+    };
     events.record(
         "fault-snapshot-after-workload",
         RunEventStatus::Succeeded,
@@ -1626,6 +1719,14 @@ async fn run_fault_case(
         pods_before: pods_before.clone(),
         pods_at_fault_activation: pods_at_fault_activation.clone(),
         pods_at_workload_snapshot: pods_at_workload_snapshot.clone(),
+        fixed_volume_targets_at_fault_activation: active_fixed_volume_targets
+            .iter()
+            .cloned()
+            .collect(),
+        fixed_volume_targets_at_workload_snapshot: workload_fixed_volume_targets
+            .iter()
+            .cloned()
+            .collect(),
         pods_after: pods_after.clone(),
         active_snapshots: active_snapshots.clone(),
         workload_snapshots: workload_snapshots.clone(),
@@ -1916,6 +2017,10 @@ async fn run_fault_case(
         pods_before,
         pods_at_fault_activation,
         pods_at_workload_snapshot,
+        fixed_volume_targets_at_fault_activation: active_fixed_volume_targets.into_iter().collect(),
+        fixed_volume_targets_at_workload_snapshot: workload_fixed_volume_targets
+            .into_iter()
+            .collect(),
         pods_after,
         active_snapshots,
         workload_snapshots,
@@ -2274,6 +2379,96 @@ fn tenant_single_pool_geometry(
         server_count,
         volumes_per_server,
     })
+}
+
+fn fixed_volume_target_count(plan: &FaultPlan) -> Option<u32> {
+    let [fault] = plan.faults() else {
+        return None;
+    };
+    if !matches!(
+        fault.kind(),
+        FaultKind::RustfsVolumeIoError
+            | FaultKind::RustfsVolumeLatency
+            | FaultKind::RustfsVolumeReadMistake
+            | FaultKind::RustfsVolumeEnospc
+    ) {
+        return None;
+    }
+    match fault.selection() {
+        FaultSelection::FixedTargets(count) => Some(count),
+        FaultSelection::Percent(_) => None,
+    }
+}
+
+fn require_active_fixed_volume_targets(
+    config: &FaultTestConfig,
+    run_id: &str,
+    plan: &FaultPlan,
+    pods_before: &[PodIdentity],
+    target_proof: &TargetProof,
+    snapshots: &[FaultStatusSnapshot],
+) -> Result<BTreeSet<String>> {
+    let expected_targets = fixed_volume_target_count(plan)
+        .context("fixed volume runtime proof requires a fixed-target volume fault")?;
+    let [fault] = plan.faults() else {
+        bail!("fixed volume runtime proof requires exactly one planned fault")
+    };
+    ensure!(
+        snapshots.len() == 1,
+        "fixed volume plan requires exactly one runtime fault snapshot"
+    );
+    let pods_active = rustfs_pod_identities(&config.cluster)
+        .context("resolve RustFS Pod identities while fixed-target IOChaos is active")?;
+    let identity_set = |pods: &[PodIdentity]| {
+        pods.iter()
+            .map(|pod| (pod.name.clone(), pod.uid.clone()))
+            .collect::<BTreeSet<_>>()
+    };
+    let proof_identities = target_proof
+        .resolved_pods
+        .iter()
+        .map(|pod| (pod.name.clone(), pod.uid.clone()))
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        identity_set(&pods_active) == identity_set(pods_before)
+            && identity_set(&pods_active) == proof_identities,
+        "RustFS Pod identities changed between target proof and IOChaos activation"
+    );
+    let candidate_pod_ids = target_proof
+        .resolved_pods
+        .iter()
+        .filter(|pod| pod.ready && target_pod_has_bound_volume(pod))
+        .map(|pod| format!("{}/{}", config.cluster.test_namespace, pod.name))
+        .collect::<BTreeSet<_>>();
+    let snapshot = &snapshots[0];
+    ensure!(
+        snapshot.resource_kind.as_deref() == Some("iochaos"),
+        "fixed volume runtime snapshot is not an IOChaos resource"
+    );
+    let resource = snapshot
+        .chaos_status
+        .as_ref()
+        .context("fixed volume runtime snapshot has no IOChaos object")?;
+    ensure!(
+        snapshot.resource_name.as_deref()
+            == resource
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str),
+        "fixed volume runtime snapshot resource name is inconsistent"
+    );
+    chaos_mesh::validate_fixed_volume_snapshot(
+        resource,
+        &chaos_mesh::VolumeTargetEvidenceContract {
+            chaos_namespace: &config.chaos_namespace,
+            target_namespace: &config.cluster.test_namespace,
+            tenant: &config.cluster.tenant_name,
+            run_id,
+            scenario: &plan.scenario,
+            volume_path: fault.rustfs_volume_path()?,
+            expected_targets,
+            candidate_pod_ids: &candidate_pod_ids,
+        },
+    )
 }
 
 fn write_quorum_partition_target_count(plan: &FaultPlan) -> Result<u32> {

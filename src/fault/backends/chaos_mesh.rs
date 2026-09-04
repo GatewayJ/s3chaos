@@ -51,6 +51,122 @@ pub(crate) struct NetworkPartitionEvidenceContract<'a> {
     pub candidate_pod_ids: &'a BTreeSet<String>,
 }
 
+pub(crate) struct VolumeTargetEvidenceContract<'a> {
+    pub chaos_namespace: &'a str,
+    pub target_namespace: &'a str,
+    pub tenant: &'a str,
+    pub run_id: &'a str,
+    pub scenario: &'a str,
+    pub volume_path: &'a str,
+    pub expected_targets: u32,
+    pub candidate_pod_ids: &'a BTreeSet<String>,
+}
+
+/// Validates the submitted fixed-target IOChaos selector and the controller's
+/// per-container records. The CRD selector count alone is only intent; these
+/// records prove which unique RustFS volume-bearing Pods were injected.
+pub(crate) fn validate_fixed_volume_snapshot(
+    resource: &Value,
+    contract: &VolumeTargetEvidenceContract<'_>,
+) -> Result<BTreeSet<String>> {
+    ensure!(
+        resource.get("apiVersion").and_then(Value::as_str) == Some("chaos-mesh.org/v1alpha1")
+            && resource.get("kind").and_then(Value::as_str) == Some("IOChaos"),
+        "runtime fault snapshot is not a Chaos Mesh v1alpha1 IOChaos"
+    );
+    validate_run_metadata(
+        resource,
+        "IOChaos",
+        contract.chaos_namespace,
+        contract.run_id,
+        contract.scenario,
+    )?;
+    ensure!(
+        resource.pointer("/spec/mode").and_then(Value::as_str) == Some("fixed")
+            && resource
+                .pointer("/spec/value")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<u32>().ok())
+                == Some(contract.expected_targets),
+        "runtime IOChaos does not match the fixed volume target count"
+    );
+    validate_pod_selector(
+        resource
+            .pointer("/spec")
+            .context("IOChaos spec is missing")?,
+        contract.target_namespace,
+        contract.tenant,
+    )?;
+    ensure!(
+        resource.pointer("/spec/volumePath").and_then(Value::as_str) == Some(contract.volume_path)
+            && resource.pointer("/spec/path").and_then(Value::as_str)
+                == Some(format!("{}/**/*", contract.volume_path).as_str()),
+        "runtime IOChaos volume path does not match the planned target"
+    );
+    ensure!(
+        resource
+            .pointer("/spec/containerNames")
+            .and_then(Value::as_array)
+            .is_some_and(|containers| {
+                containers.len() == 1 && containers[0].as_str() == Some("rustfs")
+            }),
+        "runtime IOChaos must target only the RustFS container"
+    );
+    ensure!(
+        resource.pointer("/spec/percent").and_then(Value::as_u64) == Some(100),
+        "fixed-target IOChaos must inject all matching I/O on each selected volume"
+    );
+    ensure!(
+        chaos_condition_is_true(resource, "Selected")
+            && chaos_condition_is_true(resource, "AllInjected")
+            && !chaos_condition_is_true(resource, "AllRecovered"),
+        "runtime IOChaos is not selected and fully injected"
+    );
+    ensure!(
+        resource
+            .pointer("/status/experiment/desiredPhase")
+            .and_then(Value::as_str)
+            == Some("Run"),
+        "runtime IOChaos desired phase is not Run"
+    );
+    let records = resource
+        .pointer("/status/experiment/containerRecords")
+        .and_then(Value::as_array)
+        .context("runtime IOChaos has no per-target controller records")?;
+    let record_ids = injected_record_ids(records, ".", "IOChaos")?;
+    ensure!(
+        record_ids.len() == usize::try_from(contract.expected_targets)?,
+        "runtime IOChaos injected {} targets, expected {}",
+        record_ids.len(),
+        contract.expected_targets
+    );
+    let pod_ids = record_ids
+        .iter()
+        .map(|record_id| iochaos_record_pod_id(record_id))
+        .collect::<Result<BTreeSet<_>>>()?;
+    ensure!(
+        pod_ids.len() == record_ids.len(),
+        "runtime IOChaos contains multiple target records for one Pod"
+    );
+    ensure!(
+        pod_ids.is_subset(contract.candidate_pod_ids),
+        "runtime IOChaos selected a target outside the proved Ready Pod set"
+    );
+    Ok(record_ids)
+}
+
+pub(crate) fn iochaos_record_pod_id(record_id: &str) -> Result<String> {
+    let mut parts = record_id.split('/');
+    let namespace = parts.next().unwrap_or_default();
+    let pod = parts.next().unwrap_or_default();
+    let container = parts.next().unwrap_or_default();
+    ensure!(
+        !namespace.is_empty() && !pod.is_empty() && container == "rustfs" && parts.next().is_none(),
+        "runtime IOChaos target id {record_id:?} is not namespace/pod/rustfs"
+    );
+    Ok(format!("{namespace}/{pod}"))
+}
+
 /// Validates both the submitted NetworkChaos contract and the controller's
 /// per-target records. Conditions alone do not prove how many targets were
 /// actually selected and injected.
@@ -134,8 +250,8 @@ pub(crate) fn validate_network_partition_snapshot(
         .pointer("/status/experiment/containerRecords")
         .and_then(Value::as_array)
         .context("runtime NetworkChaos has no per-target controller records")?;
-    let source_ids = injected_record_ids(records, ".")?;
-    let peer_ids = injected_record_ids(records, ".Target")?;
+    let source_ids = injected_record_ids(records, ".", "NetworkChaos")?;
+    let peer_ids = injected_record_ids(records, ".Target", "NetworkChaos")?;
     ensure!(
         source_ids.len() == usize::try_from(contract.expected_source_targets)?,
         "runtime NetworkChaos injected {} source targets, expected {}",
@@ -184,7 +300,49 @@ fn chaos_condition_is_true(resource: &Value, condition_type: &str) -> bool {
         })
 }
 
-fn injected_record_ids(records: &[Value], selector_key: &str) -> Result<BTreeSet<String>> {
+fn validate_run_metadata(
+    resource: &Value,
+    kind: &str,
+    chaos_namespace: &str,
+    run_id: &str,
+    scenario: &str,
+) -> Result<()> {
+    ensure!(
+        resource
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            == Some(chaos_namespace)
+            && resource
+                .pointer(&format!(
+                    "/metadata/labels/{}",
+                    RUN_ID_LABEL.replace('/', "~1")
+                ))
+                .and_then(Value::as_str)
+                == Some(run_id)
+            && resource
+                .pointer(&format!(
+                    "/metadata/labels/{}",
+                    SCENARIO_LABEL.replace('/', "~1")
+                ))
+                .and_then(Value::as_str)
+                == Some(scenario)
+            && resource
+                .pointer(&format!(
+                    "/metadata/labels/{}",
+                    MANAGED_BY_LABEL.replace('/', "~1")
+                ))
+                .and_then(Value::as_str)
+                == Some(MANAGED_BY_VALUE),
+        "runtime {kind} metadata is outside the run scope"
+    );
+    Ok(())
+}
+
+fn injected_record_ids(
+    records: &[Value],
+    selector_key: &str,
+    kind: &str,
+) -> Result<BTreeSet<String>> {
     let matching = records
         .iter()
         .filter(|record| record.get("selectorKey").and_then(Value::as_str) == Some(selector_key))
@@ -197,7 +355,7 @@ fn injected_record_ids(records: &[Value], selector_key: &str) -> Result<BTreeSet
                     .and_then(Value::as_u64)
                     .is_some_and(|count| count > 0)
         }),
-        "runtime NetworkChaos selector {selector_key:?} has a target without successful injection"
+        "runtime {kind} selector {selector_key:?} has a target without successful injection"
     );
     let ids = matching
         .iter()
@@ -207,12 +365,12 @@ fn injected_record_ids(records: &[Value], selector_key: &str) -> Result<BTreeSet
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
                 .map(str::to_string)
-                .context("runtime NetworkChaos record is missing its target id")
+                .with_context(|| format!("runtime {kind} record is missing its target id"))
         })
         .collect::<Result<BTreeSet<_>>>()?;
     ensure!(
         ids.len() == matching.len(),
-        "runtime NetworkChaos selector {selector_key:?} contains duplicate target records"
+        "runtime {kind} selector {selector_key:?} contains duplicate target records"
     );
     Ok(ids)
 }
@@ -314,32 +472,49 @@ fn build_fault_spec(
     resource_name_suffix: &str,
 ) -> Result<FaultSpec> {
     let cluster = &config.cluster;
+    let io_targeting = || -> Result<(u8, Option<u32>)> {
+        match injection.selection() {
+            FaultSelection::Percent(percent) => Ok((percent, None)),
+            // FixedTargets declares the volume blast radius, not an I/O
+            // sampling percentage. Apply the selected volumes fully.
+            FaultSelection::FixedTargets(count) => Ok((100, Some(count))),
+        }
+    };
     match injection.kind() {
-        FaultKind::RustfsVolumeEnospc => Ok(FaultSpec::Io(
-            IoChaosSpec::enospc_on_rustfs_volume(
-                cluster,
-                &config.chaos_namespace,
-                run_id,
-                &scenario.name,
-                injection.rustfs_volume_path()?,
-                injection.percent()?,
-                injection.duration(),
-            )?
-            .with_name_suffix(resource_name_suffix),
-        )),
-        FaultKind::RustfsVolumeReadMistake => Ok(FaultSpec::Io(
-            IoChaosSpec::read_mistake_on_rustfs_volume(
-                cluster,
-                &config.chaos_namespace,
-                run_id,
-                &scenario.name,
-                injection.rustfs_volume_path()?,
-                injection.percent()?,
-                injection.duration(),
-            )?
-            .with_name_suffix(resource_name_suffix),
-        )),
+        FaultKind::RustfsVolumeEnospc => {
+            let (percent, targets) = io_targeting()?;
+            Ok(FaultSpec::Io(
+                IoChaosSpec::enospc_on_rustfs_volume(
+                    cluster,
+                    &config.chaos_namespace,
+                    run_id,
+                    &scenario.name,
+                    injection.rustfs_volume_path()?,
+                    percent,
+                    injection.duration(),
+                )?
+                .with_fixed_targets(targets)?
+                .with_name_suffix(resource_name_suffix),
+            ))
+        }
+        FaultKind::RustfsVolumeReadMistake => {
+            let (percent, targets) = io_targeting()?;
+            Ok(FaultSpec::Io(
+                IoChaosSpec::read_mistake_on_rustfs_volume(
+                    cluster,
+                    &config.chaos_namespace,
+                    run_id,
+                    &scenario.name,
+                    injection.rustfs_volume_path()?,
+                    percent,
+                    injection.duration(),
+                )?
+                .with_fixed_targets(targets)?
+                .with_name_suffix(resource_name_suffix),
+            ))
+        }
         FaultKind::RustfsVolumeLatency => {
+            let (percent, targets) = io_targeting()?;
             let (delay, methods) = injection.parameters().io_latency()?;
             Ok(FaultSpec::Io(
                 IoChaosSpec::latency_on_rustfs_volume(
@@ -351,25 +526,30 @@ fn build_fault_spec(
                     IoLatencyParameters {
                         methods,
                         delay,
-                        percent: injection.percent()?,
+                        percent,
                     },
                     injection.duration(),
                 )?
+                .with_fixed_targets(targets)?
                 .with_name_suffix(resource_name_suffix),
             ))
         }
-        FaultKind::RustfsVolumeIoError => Ok(FaultSpec::Io(
-            IoChaosSpec::eio_on_rustfs_volume(
-                cluster,
-                &config.chaos_namespace,
-                run_id,
-                &scenario.name,
-                injection.rustfs_volume_path()?,
-                injection.percent()?,
-                injection.duration(),
-            )?
-            .with_name_suffix(resource_name_suffix),
-        )),
+        FaultKind::RustfsVolumeIoError => {
+            let (percent, targets) = io_targeting()?;
+            Ok(FaultSpec::Io(
+                IoChaosSpec::eio_on_rustfs_volume(
+                    cluster,
+                    &config.chaos_namespace,
+                    run_id,
+                    &scenario.name,
+                    injection.rustfs_volume_path()?,
+                    percent,
+                    injection.duration(),
+                )?
+                .with_fixed_targets(targets)?
+                .with_name_suffix(resource_name_suffix),
+            ))
+        }
         FaultKind::RustfsServerPodKill => Ok(FaultSpec::PodKill(
             PodChaosSpec::kill_one_rustfs_pod(
                 cluster,
@@ -548,6 +728,7 @@ pub struct IoChaosSpec {
     pub methods: Vec<String>,
     pub action: IoChaosAction,
     pub percent: u8,
+    pub targets: Option<u32>,
     pub duration: Duration,
 }
 
@@ -666,6 +847,7 @@ impl IoChaosSpec {
             methods: vec!["READ".to_string(), "WRITE".to_string()],
             action: IoChaosAction::Fault { errno: 5 },
             percent,
+            targets: None,
             duration,
         })
     }
@@ -708,6 +890,7 @@ impl IoChaosSpec {
                 max_length: 4096,
             },
             percent,
+            targets: None,
             duration,
         })
     }
@@ -753,6 +936,7 @@ impl IoChaosSpec {
                 delay: parameters.delay,
             },
             percent: parameters.percent,
+            targets: None,
             duration,
         })
     }
@@ -791,8 +975,20 @@ impl IoChaosSpec {
             methods: vec!["WRITE".to_string()],
             action: IoChaosAction::Fault { errno: 28 },
             percent,
+            targets: None,
             duration,
         })
+    }
+
+    fn with_fixed_targets(mut self, targets: Option<u32>) -> Result<Self> {
+        if let Some(targets) = targets {
+            ensure!(
+                (1..=8).contains(&targets),
+                "IOChaos fixed targets must be in 1..=8, got {targets}"
+            );
+        }
+        self.targets = targets;
+        Ok(self)
     }
 
     pub fn with_name_suffix(mut self, suffix: &str) -> Self {
@@ -809,6 +1005,10 @@ impl IoChaosSpec {
             .join("\n");
         let seconds = self.duration.as_secs();
         let action = self.action_manifest();
+        let (mode, value) = match self.targets {
+            Some(targets) => ("fixed", format!("  value: \"{targets}\"\n")),
+            None => ("one", String::new()),
+        };
 
         format!(
             r#"apiVersion: chaos-mesh.org/v1alpha1
@@ -822,8 +1022,8 @@ metadata:
     {managed_by_label}: {managed_by_value}
 spec:
 {action}
-  mode: one
-  selector:
+  mode: {mode}
+{value}  selector:
     namespaces:
       - {target_namespace}
     labelSelectors:
@@ -852,6 +1052,8 @@ spec:
             methods = methods,
             percent = self.percent,
             action = action,
+            mode = mode,
+            value = value,
         )
     }
 
@@ -1386,8 +1588,9 @@ mod tests {
     use super::{
         FaultSpec, IoChaosAction, IoChaosSpec, IoLatencyParameters, NetworkChaosAction,
         NetworkChaosSpec, NetworkDelayParameters, NetworkPartitionEvidenceContract, PodChaosAction,
-        PodChaosSpec, StressChaosAction, StressChaosSpec, build_fault_spec,
-        runtime::chaos_experiment_is_active, validate_network_partition_snapshot,
+        PodChaosSpec, StressChaosAction, StressChaosSpec, VolumeTargetEvidenceContract,
+        build_fault_spec, runtime::chaos_experiment_is_active, validate_fixed_volume_snapshot,
+        validate_network_partition_snapshot,
     };
     use crate::fault::config::FaultTestConfig;
     use crate::fault::plan::{
@@ -1430,6 +1633,103 @@ mod tests {
         assert!(manifest.contains("volumePath: /data/rustfs0"));
         assert!(manifest.contains("errno: 5"));
         assert!(manifest.contains("percent: 20"));
+        assert!(manifest.contains("\n  mode: one\n"));
+        assert!(!manifest.contains("\n  value:"));
+    }
+
+    #[test]
+    fn fixed_volume_manifest_and_runtime_records_prove_exact_targets() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let scenario = test_scenario("io-eio");
+        let injection = FaultInjection::new(
+            FaultKind::RustfsVolumeIoError,
+            FaultBackend::ChaosMeshIoChaos,
+            FaultTarget::RustfsVolume {
+                path: "/data/rustfs0".to_string(),
+            },
+            FaultSelection::FixedTargets(2),
+            Duration::from_secs(60),
+        )
+        .expect("fixed volume injection");
+        let spec =
+            build_fault_spec(&config, &scenario, &injection, "run-1", "").expect("fault spec");
+        let FaultSpec::Io(spec) = spec else {
+            panic!("expected IOChaos spec")
+        };
+        let manifest = spec.manifest();
+        assert!(manifest.contains("\n  mode: fixed\n  value: \"2\"\n"));
+        assert!(manifest.contains("\n  percent: 100\n"));
+
+        let candidates = ["faults/rustfs-0", "faults/rustfs-1", "faults/rustfs-2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let contract = VolumeTargetEvidenceContract {
+            chaos_namespace: "chaos-mesh",
+            target_namespace: "faults",
+            tenant: "tenant-1",
+            run_id: "run-1",
+            scenario: "io-eio",
+            volume_path: "/data/rustfs0",
+            expected_targets: 2,
+            candidate_pod_ids: &candidates,
+        };
+        let resource = serde_json::json!({
+            "apiVersion": "chaos-mesh.org/v1alpha1",
+            "kind": "IOChaos",
+            "metadata": {
+                "namespace": "chaos-mesh",
+                "labels": {
+                    "rustfs-fault-test/run-id": "run-1",
+                    "rustfs-fault-test/scenario": "io-eio",
+                    "app.kubernetes.io/managed-by": "s3chaos"
+                }
+            },
+            "spec": {
+                "action": "fault",
+                "errno": 5,
+                "mode": "fixed",
+                "value": "2",
+                "selector": {
+                    "namespaces": ["faults"],
+                    "labelSelectors": {"rustfs.tenant": "tenant-1"}
+                },
+                "containerNames": ["rustfs"],
+                "volumePath": "/data/rustfs0",
+                "path": "/data/rustfs0/**/*",
+                "percent": 100
+            },
+            "status": {
+                "conditions": [
+                    {"type": "Selected", "status": "True"},
+                    {"type": "AllInjected", "status": "True"},
+                    {"type": "AllRecovered", "status": "False"}
+                ],
+                "experiment": {
+                    "desiredPhase": "Run",
+                    "containerRecords": [
+                        {"id": "faults/rustfs-0/rustfs", "selectorKey": ".", "phase": "Injected", "injectedCount": 1},
+                        {"id": "faults/rustfs-1/rustfs", "selectorKey": ".", "phase": "Injected", "injectedCount": 1}
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            validate_fixed_volume_snapshot(&resource, &contract).expect("runtime proof"),
+            ["faults/rustfs-0/rustfs", "faults/rustfs-1/rustfs"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+
+        let mut duplicate_pod = resource.clone();
+        duplicate_pod["status"]["experiment"]["containerRecords"][1]["id"] =
+            serde_json::json!("faults/rustfs-0/rustfs");
+        assert!(validate_fixed_volume_snapshot(&duplicate_pod, &contract).is_err());
+        let mut outside_proof = resource;
+        outside_proof["status"]["experiment"]["containerRecords"][1]["id"] =
+            serde_json::json!("faults/rustfs-9/rustfs");
+        assert!(validate_fixed_volume_snapshot(&outside_proof, &contract).is_err());
     }
 
     #[test]

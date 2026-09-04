@@ -317,7 +317,7 @@ impl TargetProof {
                 kind: fault.kind().as_str().to_string(),
                 backend: fault.backend().as_str().to_string(),
                 target_kind: target_kind(fault.target()).to_string(),
-                target_summary: fault.target().summary(),
+                target_summary: fault.target_summary(),
                 selection: fault.selection().summary(),
                 selection_kind: fault.selection().kind().to_string(),
                 selection_value: fault.selection().value(),
@@ -552,8 +552,8 @@ impl TargetProof {
             });
         }
         if requires_volume_binding {
-            let volume_bindings_resolved =
-                !self.resolved_pods.is_empty() && self.resolved_pods.iter().all(pod_has_bound_pv);
+            let volume_bindings_resolved = !self.resolved_pods.is_empty()
+                && self.resolved_pods.iter().all(target_pod_has_bound_volume);
             self.requirements.push(TargetProofRequirement {
                 name: "target_volume_bindings_resolved".to_string(),
                 status: if volume_bindings_resolved {
@@ -567,6 +567,35 @@ impl TargetProof {
                     "target pod PVC/PV/node/device-or-path binding proof is incomplete".to_string()
                 },
             });
+            if let Some(required_targets) = self
+                .faults
+                .iter()
+                .filter(|fault| {
+                    fault.volume_path.is_some() && fault.selection_kind == "fixed-targets"
+                })
+                .map(|fault| fault.selection_value)
+                .max()
+            {
+                let eligible_candidates = self
+                    .resolved_pods
+                    .iter()
+                    .filter(|pod| pod.ready && target_pod_has_bound_volume(pod))
+                    .count();
+                let enough_candidates = usize::try_from(required_targets)
+                    .is_ok_and(|required| eligible_candidates >= required);
+                self.requirements.push(TargetProofRequirement {
+                    name: "fixed_volume_target_candidates_resolved".to_string(),
+                    status: if enough_candidates {
+                        PreflightStatus::Passed
+                    } else {
+                        PreflightStatus::Failed
+                    },
+                    message: format!(
+                        "resolved {} candidate volume-bearing Pod(s) for {} fixed target(s)",
+                        eligible_candidates, required_targets
+                    ),
+                });
+            }
         }
         self.status = if self
             .requirements
@@ -610,7 +639,7 @@ impl TargetResolvedPodProof {
     }
 }
 
-fn pod_has_bound_pv(pod: &TargetResolvedPodProof) -> bool {
+pub(crate) fn target_pod_has_bound_volume(pod: &TargetResolvedPodProof) -> bool {
     !pod.persistent_volume_claims.is_empty()
         && pod.persistent_volume_claims.iter().all(|claim| {
             claim
@@ -619,6 +648,7 @@ fn pod_has_bound_pv(pod: &TargetResolvedPodProof) -> bool {
                 .is_some_and(|volume| !volume.is_empty())
                 && claim.persistent_volume.as_ref().is_some_and(|pv| {
                     !pv.name.is_empty()
+                        && pv.node.as_deref().is_some_and(|node| !node.is_empty())
                         && pv
                             .device_or_path
                             .as_deref()

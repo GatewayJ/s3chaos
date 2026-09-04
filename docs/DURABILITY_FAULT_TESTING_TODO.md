@@ -278,18 +278,25 @@ guardrails when implementing the ordered TODO below.
 
 ### 5. Implement Volume-Kind Fixed Targeting
 
-- [ ] TODO: Allow `FixedTargets(N)` for RustFS volume fault kinds.
-  Meaning: current plan validation rejects fixed target counts for the volume
-  family. Quorum IO and heal force-read scenarios need same-kind multi-volume
-  targeting without introducing a generic composition DSL.
+- [x] DONE: Allow `FixedTargets(N)` for RustFS volume fault kinds.
+  Meaning: the four Chaos Mesh RustFS volume fault kinds accept bounded fixed
+  target counts while existing percent-based scenarios retain their one-Pod
+  selector and I/O sampling behavior. Composite fault plans remain rejected.
 
-- [ ] TODO: Render Chaos Mesh or host volume faults for `FixedTargets(N)`.
-  Meaning: type-checking a target count is not enough; backend renderers must
-  actually target N volumes/pods/devices and record the selected target set.
+- [x] DONE: Render and prove Chaos Mesh volume faults for `FixedTargets(N)`.
+  Meaning: IOChaos renders `mode: fixed` with the declared count, injects all
+  matching I/O on those selected volumes, and records the controller-selected
+  container targets. Runtime and artifact validation bind that set to the
+  preflight Pod/PVC/PV/node/device proof, require exactly N unique targets, and
+  reject selection drift across the workload. The host DeviceMapper backend
+  remains deliberately single-target because its configuration names one
+  mapper/device; it does not claim unsupported multi-device coverage.
 
-- [ ] TODO: Keep quorum targeting separate from heterogeneous composition.
-  Meaning: quorum P/P+1 is same-kind multi-target IO faulting. It should not
-  require a generic multi-phase workflow abstraction or raw YAML backend steps.
+- [x] DONE: Keep quorum targeting separate from heterogeneous composition.
+  Meaning: `FixedTargets(N)` changes only the selector of one typed volume
+  injection. It does not introduce a generic multi-phase workflow abstraction,
+  heterogeneous faults, or raw YAML backend steps. P/P+1 volume scenarios stay
+  blocked until exact same-erasure-set volume proof exists.
 
 ### 6. Harden Target-Aware Safety Gates
 
