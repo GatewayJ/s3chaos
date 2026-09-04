@@ -255,6 +255,8 @@ pub struct ConsoleFailureSummaryView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub case_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s3_model_classification: Option<String>,
@@ -1453,6 +1455,7 @@ fn failure_summary_view(root: &Path, path: &Path, raw: Value) -> ConsoleFailureS
         classification: json_string(&raw, "classification"),
         schema_version: json_u64(&raw, "schema_version"),
         case_name: json_string(&raw, "case_name"),
+        observed_at_ms: json_u64(&raw, "observed_at_ms"),
         phase: json_string(&raw, "phase"),
         s3_model_classification: json_string(&raw, "s3_model_classification"),
         run_failure_reason: json_string(&raw, "run_failure_reason"),
@@ -2080,10 +2083,7 @@ mod tests {
                     "repetition": 1,
                     "severity": "degraded",
                     "classification": "recovery_tail_read_latency",
-                    "primaryEvidenceArtifacts": [
-                        raw_failure_summary.clone(),
-                        raw_recovery_stability.clone()
-                    ],
+                    "primaryEvidenceArtifacts": [raw_recovery_stability.clone()],
                     "attemptArtifactsDir": raw_attempt_dir.clone(),
                     "failureSummary": raw_failure_summary.clone()
                 }],
@@ -2114,13 +2114,22 @@ mod tests {
         fs::write(
             case_dir.join("failure-summary.json"),
             serde_json::to_string_pretty(&json!({
+                "schema_version": 2,
                 "scenario": "io-eio",
+                "case_name": "fault_io_eio_preserves_committed_objects",
+                "observed_at_ms": 15,
                 "stage": "checker-pre-recommit",
+                "phase": "checker",
                 "verdict": "failed",
                 "severity": "degraded",
                 "classification": "recovery_tail_read_latency",
+                "s3_model_classification": "recovery_tail_read_latency",
+                "responsibility_domain": "product",
                 "data_correctness": "passed",
                 "availability": "recovered_after_tail_latency",
+                "primary_evidence_refs": [
+                    "001-io-eio-r1/fault_io_eio_preserves_committed_objects/recovery-stability-report.json"
+                ],
                 "evidence_classifications": ["recovery_tail_read_latency"],
                 "data_loss": false,
                 "corruption": false,
@@ -2195,10 +2204,7 @@ mod tests {
         );
         assert_eq!(
             suite_summary.failures[0].primary_evidence_artifacts,
-            vec![
-                expected_failure_summary.clone(),
-                expected_recovery_stability.clone()
-            ]
+            vec![expected_recovery_stability.clone()]
         );
         assert_eq!(
             suite_summary.raw["failures"][0]["attemptArtifactsDir"].as_str(),
@@ -2227,6 +2233,12 @@ mod tests {
                 .as_ref()
                 .and_then(|summary| summary.classification.as_deref()),
             Some("recovery_tail_read_latency")
+        );
+        assert_eq!(
+            case.failure_summary
+                .as_ref()
+                .and_then(|summary| summary.observed_at_ms),
+            Some(15)
         );
         assert_eq!(snapshot.runner_failures.len(), 1);
         assert_eq!(

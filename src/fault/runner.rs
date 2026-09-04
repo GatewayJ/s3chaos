@@ -66,6 +66,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use kube::core::DynamicObject;
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep as async_sleep;
 use uuid::Uuid;
@@ -87,7 +88,15 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
     run_scenario_with_config(config).await
 }
 
-pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()> {
+pub async fn run_scenario_with_config(config: FaultTestConfig) -> Result<()> {
+    let reference_root = config.cluster.artifacts_dir.clone();
+    run_scenario_with_config_and_reference_root(config, reference_root).await
+}
+
+pub(crate) async fn run_scenario_with_config_and_reference_root(
+    mut config: FaultTestConfig,
+    reference_root: impl Into<PathBuf>,
+) -> Result<()> {
     scenarios::apply_catalog_defaults(&mut config)?;
     let scenario = FaultScenario::from_config(&config)?;
     let spec = scenarios::scenario_spec(&scenario.name)?;
@@ -104,14 +113,15 @@ pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()>
         scenario.name, config.cluster.context
     );
 
-    let collector = ArtifactCollector::new(&config.cluster.artifacts_dir);
+    let collector =
+        ArtifactCollector::with_reference_root(&config.cluster.artifacts_dir, reference_root)?;
     let result = run_fault_case(&config, &collector, &scenario, &plan).await;
 
     if let Err(error) = &result {
         write_failure_summary_if_absent(
             &collector,
             scenario.case_name,
-            FailureSummary::new(&scenario.name, "scenario", "unknown", error.to_string()),
+            FailureSummary::new(&scenario.name, "scenario", "unknown", error.to_string())?,
         )
         .ok();
         match collector.collect_kubernetes_snapshot_with_diagnosis(
@@ -185,7 +195,7 @@ async fn run_fault_case(
                 "fault-backend-preflight",
                 "environment_or_fault_backend",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -236,7 +246,7 @@ async fn run_fault_case(
                 "fault-backend-pre-cleanup",
                 "environment_or_fault_backend",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -279,7 +289,7 @@ async fn run_fault_case(
                 "fixture-prepare",
                 "test_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -312,7 +322,7 @@ async fn run_fault_case(
                 "tenant-ready-before-fault",
                 "product_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -360,7 +370,7 @@ async fn run_fault_case(
                     "write-quorum-loss-topology-proof",
                     "test_or_environment",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -404,7 +414,7 @@ async fn run_fault_case(
                 "pod-stability-before-fault",
                 "product_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -441,7 +451,7 @@ async fn run_fault_case(
                     "s3-endpoint",
                     "test_or_environment",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -463,7 +473,7 @@ async fn run_fault_case(
                 "initial-s3-access",
                 "product_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -503,7 +513,7 @@ async fn run_fault_case(
                     "s3-client",
                     "test_or_environment",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -539,7 +549,7 @@ async fn run_fault_case(
                     "bucket-create",
                     "test_harness",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -562,7 +572,7 @@ async fn run_fault_case(
                 "bucket-create",
                 "product_or_environment",
                 message.clone(),
-            ),
+            )?,
         )?;
         bail!("{message}");
     }
@@ -598,7 +608,7 @@ async fn run_fault_case(
                     "bucket-create",
                     "product_or_environment",
                     message.clone(),
-                ),
+                )?,
             )?;
             bail!("{message}");
         }
@@ -643,7 +653,7 @@ async fn run_fault_case(
                     "prefill",
                     "product_or_environment",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -691,7 +701,7 @@ async fn run_fault_case(
                         "target-preflight",
                         "test_or_environment",
                         error.to_string(),
-                    ),
+                    )?,
                 )?;
                 return Err(error);
             }
@@ -729,7 +739,7 @@ async fn run_fault_case(
                 "target-preflight",
                 "preflight_failed",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -768,7 +778,7 @@ async fn run_fault_case(
                     "fault-apply",
                     "environment_or_fault_backend",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -804,7 +814,7 @@ async fn run_fault_case(
                 "wait-active",
                 "environment_or_fault_backend",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -846,7 +856,7 @@ async fn run_fault_case(
                     "fault-snapshot-active",
                     "environment_or_fault_backend",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -882,7 +892,7 @@ async fn run_fault_case(
                 "s3-access-under-fault",
                 "environment_or_workload",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -927,7 +937,7 @@ async fn run_fault_case(
                     "warp-workload",
                     "workload_or_product",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -967,7 +977,7 @@ async fn run_fault_case(
                     "post-warp-s3-access",
                     "environment_or_workload",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -1021,7 +1031,7 @@ async fn run_fault_case(
                     "mixed-workload",
                     "workload_or_product",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -1069,7 +1079,7 @@ async fn run_fault_case(
                 "fault-evidence",
                 "test_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -1105,7 +1115,7 @@ async fn run_fault_case(
                 "fault-still-active",
                 "test_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -1140,7 +1150,7 @@ async fn run_fault_case(
                     "fault-snapshot-after-workload",
                     "environment_or_fault_backend",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -1185,7 +1195,7 @@ async fn run_fault_case(
                         "crash-recovery-boundary",
                         "no_signal",
                         error.to_string(),
-                    ),
+                    )?,
                 )?;
                 return Err(error);
             }
@@ -1222,7 +1232,7 @@ async fn run_fault_case(
                     "crash-recovery-boundary",
                     "environment_or_fault_backend",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -1295,7 +1305,7 @@ async fn run_fault_case(
                     "fault-delete",
                     "environment_or_fault_backend",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -1333,7 +1343,7 @@ async fn run_fault_case(
                 "tenant-recovery",
                 "product_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -1375,7 +1385,7 @@ async fn run_fault_case(
                 "pod-stability-after-recovery",
                 "product_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -1409,7 +1419,7 @@ async fn run_fault_case(
                 "s3-access-after-recovery",
                 "product_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -1498,7 +1508,7 @@ async fn run_fault_case(
                     "checker-pre-recommit",
                     recovery_stability_report.classification.as_str(),
                     message,
-                )
+                )?
                 .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds)
                 .with_evidence_classifications(
                     recovery_stability_report.evidence_classifications(),
@@ -1587,7 +1597,7 @@ async fn run_fault_case(
                 "checker-pre-recommit-verdict",
                 recovery_stability_report.classification.as_str(),
                 error.to_string(),
-            )
+            )?
             .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds)
             .with_evidence_classifications(recovery_stability_report.evidence_classifications())
             .with_list_warnings(
@@ -1648,7 +1658,7 @@ async fn run_fault_case(
                 "recommit-unconfirmed",
                 recommit_report.failure_classification(),
                 message.clone(),
-            ),
+            )?,
         )?;
         bail!("{message}");
     }
@@ -1698,7 +1708,7 @@ async fn run_fault_case(
                     "checker-final",
                     "checker_or_environment",
                     message,
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -1759,7 +1769,7 @@ async fn run_fault_case(
                 "checker-verdict",
                 classification.as_str(),
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }

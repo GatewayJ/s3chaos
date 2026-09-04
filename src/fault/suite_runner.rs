@@ -22,7 +22,7 @@ use crate::fault::{
     artifact_validation::{ArtifactValidationOptions, validate_fault_artifacts_and_write_report},
     config::FaultTestConfig,
     reporting::{FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain},
-    runner::run_scenario_with_config,
+    runner::run_scenario_with_config_and_reference_root,
     suite::ResolvedFaultSuite,
     suite_plan::{
         attempt_minimum_required_duration, build_fault_suite_plan_expansion, suite_run_id,
@@ -239,7 +239,9 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
             attempt_dir.display()
         );
 
-        let result = run_scenario_with_config(planned.config.clone()).await;
+        let result =
+            run_scenario_with_config_and_reference_root(planned.config.clone(), suite_root.clone())
+                .await;
         let mut stop_after_attempt_failure = false;
         match result {
             Ok(()) => match validate_attempt_artifacts(&planned.config) {
@@ -469,14 +471,21 @@ fn primary_evidence_artifacts(
     if summary.primary_evidence_refs().is_empty() {
         return None;
     }
-    let base = Path::new(failure_summary_artifact)
+    let legacy_base = Path::new(failure_summary_artifact)
         .parent()
         .unwrap_or_else(|| Path::new(""));
     Some(
         summary
             .primary_evidence_refs()
             .iter()
-            .map(|evidence_ref| base.join(evidence_ref).display().to_string())
+            .map(|evidence_ref| {
+                let path = Path::new(evidence_ref);
+                if path.components().count() == 1 {
+                    legacy_base.join(path).display().to_string()
+                } else {
+                    evidence_ref.clone()
+                }
+            })
             .collect(),
     )
 }
@@ -1012,6 +1021,7 @@ scenarios:
             "recovery_tail_read_latency",
             "tail latency",
         )
+        .expect("known classification")
         .with_recovered_within_seconds(Some(27));
         let mut first_attempt =
             FaultSuiteRunAttempt::running(1, "io-eio", 1, Path::new("attempts/0001"));
@@ -1039,6 +1049,7 @@ scenarios:
             "data_corruption",
             "hash mismatch",
         )
+        .expect("known classification")
         .with_evidence_classifications(["ambiguous_write_materialized", "data_corruption"]);
         let mut second_attempt =
             FaultSuiteRunAttempt::running(2, "network-delay", 1, Path::new("attempts/0002"));
@@ -1088,7 +1099,6 @@ scenarios:
             summary.failures[1].primary_evidence_artifacts.as_deref(),
             Some(
                 &[
-                    "attempts/0002/failure-summary.json".to_string(),
                     "attempts/0002/recovery-stability-report.json".to_string(),
                     "attempts/0002/checker-pre-recommit-report.json".to_string(),
                     "attempts/0002/fault-evidence.json".to_string(),
@@ -1128,7 +1138,6 @@ scenarios:
         assert_eq!(
             value["failures"][1]["primaryEvidenceArtifacts"],
             serde_json::json!([
-                "attempts/0002/failure-summary.json",
                 "attempts/0002/recovery-stability-report.json",
                 "attempts/0002/checker-pre-recommit-report.json",
                 "attempts/0002/fault-evidence.json",

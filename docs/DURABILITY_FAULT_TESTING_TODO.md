@@ -34,12 +34,41 @@ Status legend:
   dm-flakey handle wrappers still live in `runner.rs`. Move them only if more
   backend state makes runner ownership unclear.
 
-- [ ] PARTIAL: Failure summary v2.
+- [x] DONE: Failure summary v2 contract stabilization.
   Meaning: new writers emit `schema_version`, `phase`,
   `s3_model_classification`, `run_failure_reason`, `responsibility_domain`,
   severity, correctness/availability, evidence classifications, and
-  `primary_evidence_refs`. Remaining work is listed below because the review
-  found doc/code drift and missing final-checker classification precision.
+  `primary_evidence_refs`. Additive v2 fields remain optional for readers,
+  writer classifications are allowlisted, and primary evidence uses one
+  root-relative contract. Dedicated final-checker classification precision is
+  still tracked below.
+
+### Failure Summary V2 Compatibility Contract
+
+- Readers must accept v2 summaries that predate additive fields. In particular,
+  `case_name`, `observed_at_ms`, `phase`, `s3_model_classification`,
+  `run_failure_reason`, `responsibility_domain`, and `primary_evidence_refs`
+  are optional through v2. When present, they are validated. A future v3 may
+  make them required.
+- New writers emit `observed_at_ms` and the projection fields. Their
+  classifications come from a closed allowlist; unknown or misspelled values
+  are writer errors instead of falling through to `needs_investigation`.
+- S3-model classifications are `recovery_tail_read_latency`,
+  `committed_object_unavailable`, `list_unavailable_or_unknown`,
+  `data_corruption`, and `ambiguous_write_materialized`.
+- Current run-failure reasons are `harness_error`, `test_harness`,
+  `workload_execution_error`, `artifact_validation_failed`,
+  `checker_execution_error`, `preflight_failed`, `health_guard_failed`,
+  `fault_backend_unavailable`, `fault_not_active`, `fault_not_recovered`,
+  `unknown`, `checker_or_environment`, `test_or_environment`,
+  `environment_or_fault_backend`, `product_or_environment`,
+  `environment_or_workload`, `workload_or_product`, and `no_signal`. Mixed
+  reasons are current writer outputs with unknown responsibility, not merely
+  legacy reader inputs.
+- New `primary_evidence_refs` entries are relative to the suite run artifact
+  root (or the configured artifact root for a standalone scenario), never
+  absolute, escaping, missing, or self-referential. Readers continue to accept
+  the original v2 case-directory-relative leaf form for existing artifacts.
 
 - [x] DONE: `preflight-summary.json`, `target-proof.json`, and
   `artifact-validation-report.json` are part of the success artifact gate.
@@ -173,24 +202,24 @@ guardrails when implementing the ordered TODO below.
   `docs/`. Future status drift should be corrected here instead of maintaining a
   second roadmap.
 
-- [ ] TODO: Make failure-summary v2 additions explicitly optional until v3.
+- [x] DONE: Make failure-summary v2 additions explicitly optional until v3.
   Meaning: `schema_version=2` already exists. New fields that would invalidate
   existing v2 artifacts, especially `observed_at_ms`, must be optional until a
   future v3 contract.
 
-- [ ] TODO: Treat legacy mixed classifications as real run failure reasons while
+- [x] DONE: Treat legacy mixed classifications as real run failure reasons while
   the writer still emits them.
   Meaning: keys such as `checker_or_environment`,
   `environment_or_workload`, `workload_or_product`, and
   `product_or_environment` should be documented and validated as current writer
   outputs, not only as legacy reader inputs, until they are replaced.
 
-- [ ] TODO: Fix the `primary_evidence_refs` contract.
+- [x] DONE: Fix the `primary_evidence_refs` contract.
   Meaning: the design says no self-reference and suite-root relative paths, but
   current writers include `failure-summary.json` and validation is same-dir. Pick
   one contract, update writer, validator, console, and docs together.
 
-- [ ] TODO: Add exhaustive classification allowlist tests for new writers.
+- [x] DONE: Add exhaustive classification allowlist tests for new writers.
   Meaning: unknown or misspelled classification strings must not silently
   degrade to `needs_investigation`/`unknown` when the writer intended a product
   verdict.

@@ -796,10 +796,13 @@
         addPrimaryEvidenceArtifact(links, path, normalizedSummaryPath);
       },
     );
-    const base = dirnameArtifactPath(normalizedSummaryPath);
     asArray(readAny(source, ["primaryEvidenceRefs", "primary_evidence_refs"])).forEach(
       function (path) {
-        addPrimaryEvidenceArtifact(links, joinArtifactPath(base, path), normalizedSummaryPath);
+        const normalized = normalizeArtifactPath(path);
+        const resolved = normalized.includes("/")
+          ? normalized
+          : joinArtifactPath(dirnameArtifactPath(normalizedSummaryPath), normalized);
+        addPrimaryEvidenceArtifact(links, resolved, normalizedSummaryPath);
       },
     );
   }
