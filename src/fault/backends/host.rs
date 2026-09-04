@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -66,6 +67,12 @@ enum DmSuspendMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmTransitionPolicy {
+    Apply,
+    Rollback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DmMountState {
     Mounted,
     Unmounting,
@@ -83,13 +90,17 @@ impl DmMountState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DmVolumeMapping {
     pub node: String,
+    pub node_uid: String,
+    pub node_labels: BTreeMap<String, String>,
     pub pod: String,
     pub pod_uid: String,
     pub volume_name: String,
     pub pvc: String,
     pub pvc_uid: String,
+    pub pvc_phase: String,
     pub pv: String,
     pub pv_uid: String,
+    pub pv_phase: String,
     pub pv_claim_ref: HostStoragePersistentVolumeClaimRef,
     pub node_selector: HostStorageNodeSelector,
     pub container_mount_path: String,
@@ -555,13 +566,17 @@ fn observe_dm_target_read_only(
     }
     Ok(HostStorageTargetObservation {
         node: mapping.node,
+        node_uid: mapping.node_uid,
+        node_labels: mapping.node_labels,
         pod: mapping.pod,
         pod_uid: mapping.pod_uid,
         volume_name: mapping.volume_name,
         persistent_volume_claim: mapping.pvc,
         persistent_volume_claim_uid: mapping.pvc_uid,
+        persistent_volume_claim_phase: mapping.pvc_phase,
         persistent_volume: mapping.pv,
         persistent_volume_uid: mapping.pv_uid,
+        persistent_volume_phase: mapping.pv_phase,
         persistent_volume_claim_ref: mapping.pv_claim_ref,
         node_selector: mapping.node_selector,
         container_mount_path: mapping.container_mount_path,
@@ -691,9 +706,10 @@ fn observer_findmnt_field(
         [
             "/usr/bin/findmnt",
             "-n",
+            "--raw",
             "-o",
             field,
-            "--target",
+            "--mountpoint",
             mapping.mount_path.as_str(),
         ],
     )?
@@ -874,9 +890,17 @@ pub fn apply_dm_flakey(
         DmFaultBehavior::ErrorInjection => DmSuspendMode::Default,
         DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
     };
+    let initial_state = <DmFlakeyGuard as DmTransitionPort>::observe(&mut guard)
+        .context("observe device-mapper state immediately before fault apply")?;
+    require_transition_initial_state(DmTransitionPolicy::Apply, &initial_state)?;
     guard.mutation_lease.set_phase(HostMutationPhase::Active)?;
     guard.fault_applied = true;
-    guard.transition_to_table(&guard.fault_table.clone(), suspend_mode)?;
+    guard.transition_to_table_from_observed(
+        &guard.fault_table.clone(),
+        suspend_mode,
+        DmTransitionPolicy::Apply,
+        initial_state,
+    )?;
     let active = guard.snapshot("active")?;
     ensure!(
         normalize_dm_table(&active.table) == normalize_dm_table(&guard.fault_table),
@@ -1046,7 +1070,7 @@ impl DmFlakeyGuard {
                 "warning: failed to mark device-mapper rollback in progress; retaining the active mutation marker: {error:#}"
             );
         }
-        self.transition_to_table(&recovery_table, suspend_mode)?;
+        self.transition_to_table(&recovery_table, suspend_mode, DmTransitionPolicy::Rollback)?;
         self.ensure_recovery_table_active()?;
         if self.requires_crash_boundary() {
             self.ensure_filesystem_mounted()?;
@@ -1156,9 +1180,10 @@ impl DmFlakeyGuard {
             .host_command([
                 "/usr/bin/findmnt",
                 "-n",
+                "--raw",
                 "-o",
                 field,
-                "--target",
+                "--mountpoint",
                 self.mapping.mount_path.as_str(),
             ])?
             .stdout
@@ -1209,13 +1234,17 @@ impl DmFlakeyGuard {
             .context("device-mapper mount snapshot is missing")?;
         Ok(HostStorageTargetObservation {
             node: self.mapping.node.clone(),
+            node_uid: self.mapping.node_uid.clone(),
+            node_labels: self.mapping.node_labels.clone(),
             pod: self.mapping.pod.clone(),
             pod_uid: self.mapping.pod_uid.clone(),
             volume_name: self.mapping.volume_name.clone(),
             persistent_volume_claim: self.mapping.pvc.clone(),
             persistent_volume_claim_uid: self.mapping.pvc_uid.clone(),
+            persistent_volume_claim_phase: self.mapping.pvc_phase.clone(),
             persistent_volume: self.mapping.pv.clone(),
             persistent_volume_uid: self.mapping.pv_uid.clone(),
+            persistent_volume_phase: self.mapping.pv_phase.clone(),
             persistent_volume_claim_ref: self.mapping.pv_claim_ref.clone(),
             node_selector: self.mapping.node_selector.clone(),
             container_mount_path: self.mapping.container_mount_path.clone(),
@@ -1244,8 +1273,23 @@ impl DmFlakeyGuard {
             .any(|taint| taint.get("key").and_then(Value::as_str) == Some(CRASH_TAINT_KEY)))
     }
 
-    fn transition_to_table(&mut self, table: &str, mode: DmSuspendMode) -> Result<()> {
-        transition_dm_table(self, table, mode)
+    fn transition_to_table(
+        &mut self,
+        table: &str,
+        mode: DmSuspendMode,
+        policy: DmTransitionPolicy,
+    ) -> Result<()> {
+        transition_dm_table(self, table, mode, policy)
+    }
+
+    fn transition_to_table_from_observed(
+        &mut self,
+        table: &str,
+        mode: DmSuspendMode,
+        policy: DmTransitionPolicy,
+        initial: DmObservedState,
+    ) -> Result<()> {
+        transition_dm_table_from_observed(self, table, mode, policy, initial)
     }
 
     fn add_node_taint(&mut self) -> Result<()> {
@@ -1409,23 +1453,20 @@ impl DmFlakeyGuard {
         let output = self.host_command_unchecked([
             "/usr/bin/findmnt",
             "-n",
-            "--target",
+            "--raw",
+            "-o",
+            "TARGET",
+            "--mountpoint",
             self.mapping.mount_path.as_str(),
         ])?;
-        match output.code {
-            Some(1) => Ok(DmMountState::Unmounted),
-            Some(0) => {
+        match classify_exact_mountpoint(&self.mapping.mount_path, &output)? {
+            DmMountState::Unmounted => Ok(DmMountState::Unmounted),
+            DmMountState::Mounted => {
                 let mount = self.capture_mount_snapshot()?;
                 self.verify_mount_source(&mount)?;
                 Ok(DmMountState::Mounted)
             }
-            _ => bail!(
-                "could not determine mount state for {:?}: findmnt exit={:?}, stdout={}, stderr={}",
-                self.mapping.mount_path,
-                output.code,
-                output.stdout,
-                output.stderr
-            ),
+            state => bail!("unexpected exact mountpoint state {state:?}"),
         }
     }
 
@@ -1638,7 +1679,7 @@ impl Drop for DmFlakeyGuard {
                     DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
                 };
                 match self
-                    .transition_to_table(&recovery_table, mode)
+                    .transition_to_table(&recovery_table, mode, DmTransitionPolicy::Rollback)
                     .and_then(|()| self.ensure_recovery_table_active())
                 {
                     Ok(()) => storage_recovered = true,
@@ -1767,12 +1808,75 @@ fn dm_suspend_args(name: &str, mode: DmSuspendMode) -> Vec<&str> {
     }
 }
 
+fn classify_exact_mountpoint(
+    expected_mount_path: &str,
+    output: &CommandOutput,
+) -> Result<DmMountState> {
+    match output.code {
+        Some(1) => Ok(DmMountState::Unmounted),
+        Some(0) => {
+            let targets = output
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|target| !target.is_empty())
+                .collect::<Vec<_>>();
+            ensure!(
+                targets.len() == 1,
+                "findmnt returned {} targets for exact mountpoint {:?}",
+                targets.len(),
+                expected_mount_path
+            );
+            if targets[0] == expected_mount_path {
+                Ok(DmMountState::Mounted)
+            } else {
+                // Some findmnt versions or wrappers may still report the
+                // containing filesystem. It is not evidence that the planned
+                // path remains a mountpoint.
+                Ok(DmMountState::Unmounted)
+            }
+        }
+        _ => bail!(
+            "could not determine exact mount state for {:?}: findmnt exit={:?}, stdout={}, stderr={}",
+            expected_mount_path,
+            output.code,
+            output.stdout,
+            output.stderr
+        ),
+    }
+}
+
+fn require_transition_initial_state(
+    policy: DmTransitionPolicy,
+    initial: &DmObservedState,
+) -> Result<()> {
+    if policy == DmTransitionPolicy::Apply {
+        ensure!(
+            !initial.suspended,
+            "refusing device-mapper fault apply because the target was already suspended"
+        );
+    }
+    Ok(())
+}
+
 fn transition_dm_table(
     port: &mut impl DmTransitionPort,
     requested_table: &str,
     mode: DmSuspendMode,
+    policy: DmTransitionPolicy,
 ) -> Result<()> {
     let initial = port.observe().context("observe device-mapper state")?;
+    transition_dm_table_from_observed(port, requested_table, mode, policy, initial)
+}
+
+fn transition_dm_table_from_observed(
+    port: &mut impl DmTransitionPort,
+    requested_table: &str,
+    mode: DmSuspendMode,
+    policy: DmTransitionPolicy,
+    initial: DmObservedState,
+) -> Result<()> {
+    require_transition_initial_state(policy, &initial)?;
     if !initial.suspended
         && normalize_dm_table(&initial.active_table) == normalize_dm_table(requested_table)
     {
@@ -1844,11 +1948,17 @@ fn verify_dm_volume_mapping(
         .command(["get", "pv", pv, "-o", "json"])
         .run_checked()?;
     let pv_json = serde_json::from_str::<Value>(&pv_json.stdout).context("parse DM target PV")?;
+    let node_json = Kubectl::new(config)
+        .command(["get", "node", binding.node.as_str(), "-o", "json"])
+        .run_checked()?;
+    let node_json =
+        serde_json::from_str::<Value>(&node_json.stdout).context("parse DM target Node")?;
     complete_dm_volume_mapping(
         &config.test_namespace,
         binding,
         &pvc_json,
         &pv_json,
+        &node_json,
         expected_host_mount_path,
     )
 }
@@ -1954,6 +2064,7 @@ fn complete_dm_volume_mapping(
     binding: DmPodVolumeBinding,
     pvc_json: &Value,
     pv_json: &Value,
+    node_json: &Value,
     expected_host_mount_path: &str,
 ) -> Result<DmVolumeMapping> {
     ensure!(
@@ -1969,6 +2080,14 @@ fn complete_dm_volume_mapping(
             .pointer("/metadata/deletionTimestamp")
             .is_none_or(Value::is_null),
         "DM target PVC is terminating"
+    );
+    let pvc_phase = pvc_json
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        .context("DM target PVC is missing status.phase")?;
+    ensure!(
+        pvc_phase == "Bound",
+        "DM target PVC status.phase must be Bound"
     );
     let pvc_uid = pvc_json
         .pointer("/metadata/uid")
@@ -1987,6 +2106,14 @@ fn complete_dm_volume_mapping(
             .pointer("/metadata/deletionTimestamp")
             .is_none_or(Value::is_null),
         "DM target PV is terminating"
+    );
+    let pv_phase = pv_json
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        .context("DM target PV is missing status.phase")?;
+    ensure!(
+        pv_phase == "Bound",
+        "DM target PV status.phase must be Bound"
     );
     let pv_uid = pv_json
         .pointer("/metadata/uid")
@@ -2024,17 +2151,48 @@ fn complete_dm_volume_mapping(
         local_path == expected_host_mount_path,
         "DM target PV {pv:?} uses local path {local_path:?}, expected {expected_host_mount_path:?}"
     );
-    let node_selector = supported_pv_node_selector(pv_json, &binding.node)?;
+    ensure!(
+        node_json.pointer("/metadata/name").and_then(Value::as_str) == Some(binding.node.as_str()),
+        "fetched Node identity does not match the target Pod node"
+    );
+    ensure!(
+        node_json
+            .pointer("/metadata/deletionTimestamp")
+            .is_none_or(Value::is_null),
+        "DM target Node is terminating"
+    );
+    let node_uid = node_json
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .context("DM target Node is missing metadata.uid")?;
+    ensure!(!node_uid.trim().is_empty(), "DM target Node UID is empty");
+    let node_labels = node_json
+        .pointer("/metadata/labels")
+        .and_then(Value::as_object)
+        .context("DM target Node is missing metadata.labels")?
+        .iter()
+        .map(|(key, value)| {
+            let value = value
+                .as_str()
+                .with_context(|| format!("DM target Node label {key:?} is not a string"))?;
+            Ok((key.clone(), value.to_string()))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let node_selector = supported_pv_node_selector(pv_json, &node_labels)?;
 
     Ok(DmVolumeMapping {
         node: binding.node,
+        node_uid: node_uid.to_string(),
+        node_labels,
         pod: binding.pod,
         pod_uid: binding.pod_uid,
         volume_name: binding.volume_name,
         pvc: binding.pvc,
         pvc_uid: pvc_uid.to_string(),
+        pvc_phase: pvc_phase.to_string(),
         pv: pv.to_string(),
         pv_uid: pv_uid.to_string(),
+        pv_phase: pv_phase.to_string(),
         pv_claim_ref: claim_ref,
         node_selector,
         container_mount_path: binding.container_mount_path,
@@ -2042,7 +2200,10 @@ fn complete_dm_volume_mapping(
     })
 }
 
-fn supported_pv_node_selector(pv: &Value, node: &str) -> Result<HostStorageNodeSelector> {
+fn supported_pv_node_selector(
+    pv: &Value,
+    node_labels: &BTreeMap<String, String>,
+) -> Result<HostStorageNodeSelector> {
     let terms = pv
         .pointer("/spec/nodeAffinity/required/nodeSelectorTerms")
         .and_then(Value::as_array)
@@ -2071,17 +2232,24 @@ fn supported_pv_node_selector(pv: &Value, node: &str) -> Result<HostStorageNodeS
         .get("values")
         .and_then(Value::as_array)
         .context("DM target PV hostname selector is missing values")?;
+    let hostname = node_labels
+        .get("kubernetes.io/hostname")
+        .context("DM target Node is missing kubernetes.io/hostname label")?;
+    ensure!(
+        !hostname.trim().is_empty(),
+        "DM target Node kubernetes.io/hostname label is empty"
+    );
     ensure!(
         expression.get("key").and_then(Value::as_str) == Some("kubernetes.io/hostname")
             && expression.get("operator").and_then(Value::as_str) == Some("In")
             && values.len() == 1
-            && values[0].as_str() == Some(node),
-        "DM target PV node selector must be exactly kubernetes.io/hostname In [{node:?}]"
+            && values[0].as_str() == Some(hostname),
+        "DM target PV node selector must exactly match the target Node kubernetes.io/hostname label {hostname:?}"
     );
     Ok(HostStorageNodeSelector {
         key: "kubernetes.io/hostname".to_string(),
         operator: "In".to_string(),
-        values: vec![node.to_string()],
+        values: vec![hostname.to_string()],
     })
 }
 
@@ -2146,14 +2314,17 @@ fn now_ms() -> u64 {
 mod tests {
     use super::{
         DmFaultBehavior, DmFlakeySpec, DmMountState, DmObservedState, DmSuspendMode,
-        DmTransitionPort, HostMutationLease, HostMutationPhase, HostMutationState,
-        complete_dm_volume_mapping, dm_flakey_spec, dm_helper_manifest, dm_resume_args,
-        dm_suspend_args, force_delete_pod_command, helper_pod_name, normalize_dm_table,
-        resolve_dm_pod_volume, supported_pv_node_selector, transition_dm_table, validate_dm_spec,
+        DmTransitionPolicy, DmTransitionPort, HostMutationLease, HostMutationPhase,
+        HostMutationState, classify_exact_mountpoint, complete_dm_volume_mapping, dm_flakey_spec,
+        dm_helper_manifest, dm_resume_args, dm_suspend_args, force_delete_pod_command,
+        helper_pod_name, normalize_dm_table, resolve_dm_pod_volume, supported_pv_node_selector,
+        transition_dm_table, validate_dm_spec,
     };
     use crate::fault::config::FaultTestConfig;
+    use crate::framework::command::CommandOutput;
     use anyhow::{Result, bail};
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
 
     struct FakeDmPort {
         suspended: bool,
@@ -2161,6 +2332,8 @@ mod tests {
         inactive_table: Option<String>,
         fail_next_resume: bool,
         suspend_calls: usize,
+        load_calls: usize,
+        resume_calls: usize,
     }
 
     impl DmTransitionPort for FakeDmPort {
@@ -2181,6 +2354,7 @@ mod tests {
         }
 
         fn load(&mut self, table: &str) -> Result<()> {
+            self.load_calls += 1;
             if !self.suspended {
                 bail!("load requires suspended mapper");
             }
@@ -2189,6 +2363,7 @@ mod tests {
         }
 
         fn resume(&mut self) -> Result<()> {
+            self.resume_calls += 1;
             if self.fail_next_resume {
                 self.fail_next_resume = false;
                 bail!("injected resume failure");
@@ -2232,7 +2407,8 @@ mod tests {
                 "namespace": "rustfs-fault-test",
                 "uid": uid
             },
-            "spec": {"volumeName": "pv-a"}
+            "spec": {"volumeName": "pv-a"},
+            "status": {"phase": "Bound"}
         })
     }
 
@@ -2253,6 +2429,20 @@ mod tests {
                         "values": ["worker-a"]
                     }]
                 }]}}
+            },
+            "status": {"phase": "Bound"}
+        })
+    }
+
+    fn node(name: &str, uid: &str, hostname: &str) -> Value {
+        json!({
+            "metadata": {
+                "name": name,
+                "uid": uid,
+                "labels": {
+                    "disk.example.com/class": "nvme",
+                    "kubernetes.io/hostname": hostname
+                }
             }
         })
     }
@@ -2323,6 +2513,31 @@ mod tests {
         assert!(!DmMountState::Unmounted.proves_expected_mount());
         assert!(!DmMountState::Mounting.proves_expected_mount());
         assert!(!DmMountState::Unknown.proves_expected_mount());
+    }
+
+    #[test]
+    fn exact_mountpoint_does_not_accept_a_parent_filesystem() {
+        let parent = CommandOutput {
+            code: Some(0),
+            stdout: "/\n".to_string(),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            classify_exact_mountpoint("/data/rustfs-fault/dm-volume", &parent)
+                .expect("classify parent mount"),
+            DmMountState::Unmounted
+        );
+
+        let exact = CommandOutput {
+            code: Some(0),
+            stdout: "/data/rustfs-fault/dm-volume\n".to_string(),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            classify_exact_mountpoint("/data/rustfs-fault/dm-volume", &exact)
+                .expect("classify exact mount"),
+            DmMountState::Mounted
+        );
     }
 
     #[test]
@@ -2447,6 +2662,7 @@ mod tests {
             binding,
             &pvc("pvc-uid-a"),
             &pv("pv-uid-a", "pvc-uid-a"),
+            &node("worker-a", "node-uid-a", "worker-a"),
             "/data/rustfs-fault/dm-volume",
         )
         .expect("complete mapping");
@@ -2468,6 +2684,7 @@ mod tests {
             binding.clone(),
             &pvc("pvc-uid-old"),
             &pv("pv-uid-old", "pvc-uid-old"),
+            &node("worker-a", "node-uid-a", "worker-a"),
             "/data/rustfs-fault/dm-volume",
         )
         .expect("original mapping");
@@ -2476,6 +2693,7 @@ mod tests {
             binding,
             &pvc("pvc-uid-new"),
             &pv("pv-uid-new", "pvc-uid-new"),
+            &node("worker-a", "node-uid-a", "worker-a"),
             "/data/rustfs-fault/dm-volume",
         )
         .expect("recreated mapping");
@@ -2493,6 +2711,7 @@ mod tests {
                 binding.clone(),
                 &pvc("pvc-uid-a"),
                 &pv("pv-uid-a", "other-pvc-uid"),
+                &node("worker-a", "node-uid-a", "worker-a"),
                 "/data/rustfs-fault/dm-volume",
             )
             .is_err()
@@ -2503,7 +2722,13 @@ mod tests {
             .as_array_mut()
             .expect("expressions")
             .push(json!({"key": "disk.example.com/class", "operator": "In", "values": ["nvme"]}));
-        assert!(supported_pv_node_selector(&compound, "worker-a").is_err());
+        assert!(
+            supported_pv_node_selector(
+                &compound,
+                &BTreeMap::from([("kubernetes.io/hostname".to_string(), "worker-a".to_string(),)]),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2512,6 +2737,106 @@ mod tests {
         let mut terminating = pod_list(true);
         terminating["items"][0]["metadata"]["deletionTimestamp"] = json!("2026-09-04T00:00:00Z");
         assert!(resolve_dm_pod_volume(&terminating, "worker-a", "/data/rustfs0").is_err());
+    }
+
+    #[test]
+    fn dm_mapping_requires_bound_pvc_and_pv() {
+        let binding = resolve_dm_pod_volume(&pod_list(true), "worker-a", "/data/rustfs0")
+            .expect("resolve data mount");
+        let mut lost_pvc = pvc("pvc-uid-a");
+        lost_pvc["status"]["phase"] = json!("Lost");
+        assert!(
+            complete_dm_volume_mapping(
+                "rustfs-fault-test",
+                binding.clone(),
+                &lost_pvc,
+                &pv("pv-uid-a", "pvc-uid-a"),
+                &node("worker-a", "node-uid-a", "worker-a"),
+                "/data/rustfs-fault/dm-volume",
+            )
+            .is_err()
+        );
+
+        let mut released_pv = pv("pv-uid-a", "pvc-uid-a");
+        released_pv["status"]["phase"] = json!("Released");
+        assert!(
+            complete_dm_volume_mapping(
+                "rustfs-fault-test",
+                binding,
+                &pvc("pvc-uid-a"),
+                &released_pv,
+                &node("worker-a", "node-uid-a", "worker-a"),
+                "/data/rustfs-fault/dm-volume",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn dm_mapping_uses_the_node_hostname_label_and_binds_node_identity() {
+        let binding = resolve_dm_pod_volume(&pod_list(true), "worker-a", "/data/rustfs0")
+            .expect("resolve data mount");
+        let mut matching_pv = pv("pv-uid-a", "pvc-uid-a");
+        matching_pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"][0]["matchExpressions"]
+            [0]["values"] = json!(["storage-host-a"]);
+        let target_node = node("worker-a", "node-uid-a", "storage-host-a");
+        let mapping = complete_dm_volume_mapping(
+            "rustfs-fault-test",
+            binding.clone(),
+            &pvc("pvc-uid-a"),
+            &matching_pv,
+            &target_node,
+            "/data/rustfs-fault/dm-volume",
+        )
+        .expect("hostname selector matches Node label");
+        assert_eq!(mapping.node_uid, "node-uid-a");
+        assert_eq!(
+            mapping.node_labels["kubernetes.io/hostname"],
+            "storage-host-a"
+        );
+
+        assert!(
+            complete_dm_volume_mapping(
+                "rustfs-fault-test",
+                binding,
+                &pvc("pvc-uid-a"),
+                &pv("pv-uid-a", "pvc-uid-a"),
+                &target_node,
+                "/data/rustfs-fault/dm-volume",
+            )
+            .is_err(),
+            "the Pod node name must not stand in for its hostname label"
+        );
+    }
+
+    #[test]
+    fn dm_apply_rejects_an_initially_suspended_mapper_without_commands() {
+        let recovery = "0 1024 linear /dev/loop0 0";
+        let mut port = FakeDmPort {
+            suspended: true,
+            active_table: recovery.to_string(),
+            inactive_table: None,
+            fail_next_resume: false,
+            suspend_calls: 0,
+            load_calls: 0,
+            resume_calls: 0,
+        };
+
+        assert!(
+            transition_dm_table(
+                &mut port,
+                "0 1024 flakey /dev/loop0 0 1 15",
+                DmSuspendMode::Default,
+                DmTransitionPolicy::Apply,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            (port.suspend_calls, port.load_calls, port.resume_calls),
+            (0, 0, 0)
+        );
+        assert!(port.suspended);
+        assert_eq!(port.active_table, recovery);
     }
 
     #[test]
@@ -2524,12 +2849,27 @@ mod tests {
             inactive_table: None,
             fail_next_resume: true,
             suspend_calls: 0,
+            load_calls: 0,
+            resume_calls: 0,
         };
 
-        assert!(transition_dm_table(&mut port, fault, DmSuspendMode::Default).is_err());
+        assert!(
+            transition_dm_table(
+                &mut port,
+                fault,
+                DmSuspendMode::Default,
+                DmTransitionPolicy::Apply,
+            )
+            .is_err()
+        );
         assert!(port.suspended);
-        transition_dm_table(&mut port, recovery, DmSuspendMode::NoFlush)
-            .expect("recover already-suspended mapper");
+        transition_dm_table(
+            &mut port,
+            recovery,
+            DmSuspendMode::NoFlush,
+            DmTransitionPolicy::Rollback,
+        )
+        .expect("recover already-suspended mapper");
 
         assert!(!port.suspended);
         assert_eq!(normalize_dm_table(&port.active_table), recovery);

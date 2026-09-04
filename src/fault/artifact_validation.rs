@@ -1175,6 +1175,12 @@ fn validate_host_storage_artifacts(
         recovery_snapshot.get("stage").and_then(Value::as_str) == Some("recovered")
             && snapshot_mapping.get("node").and_then(Value::as_str)
                 == Some(proof.target.node.as_str())
+            && snapshot_mapping.get("node_uid").and_then(Value::as_str)
+                == Some(proof.target.node_uid.as_str())
+            && snapshot_mapping.get("node_labels")
+                == serde_json::to_value(&proof.target.node_labels)
+                    .ok()
+                    .as_ref()
             && snapshot_mapping.get("pod").and_then(Value::as_str)
                 == Some(proof.target.pod.as_str())
             && snapshot_mapping.get("pod_uid").and_then(Value::as_str)
@@ -1185,10 +1191,14 @@ fn validate_host_storage_artifacts(
                 == Some(proof.target.persistent_volume_claim.as_str())
             && snapshot_mapping.get("pvc_uid").and_then(Value::as_str)
                 == Some(proof.target.persistent_volume_claim_uid.as_str())
+            && snapshot_mapping.get("pvc_phase").and_then(Value::as_str)
+                == Some(proof.target.persistent_volume_claim_phase.as_str())
             && snapshot_mapping.get("pv").and_then(Value::as_str)
                 == Some(proof.target.persistent_volume.as_str())
             && snapshot_mapping.get("pv_uid").and_then(Value::as_str)
                 == Some(proof.target.persistent_volume_uid.as_str())
+            && snapshot_mapping.get("pv_phase").and_then(Value::as_str)
+                == Some(proof.target.persistent_volume_phase.as_str())
             && snapshot_mapping.get("pv_claim_ref")
                 == serde_json::to_value(&proof.target.persistent_volume_claim_ref)
                     .ok()
@@ -2332,7 +2342,7 @@ mod tests {
         workload::WorkloadPlan,
     };
     use serde_json::json;
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
     #[test]
     fn validates_successful_fault_artifacts() {
@@ -2619,13 +2629,20 @@ mod tests {
             },
             HostStorageTargetObservation {
                 node: "worker-a".to_string(),
+                node_uid: "node-uid-a".to_string(),
+                node_labels: BTreeMap::from([(
+                    "kubernetes.io/hostname".to_string(),
+                    "worker-a".to_string(),
+                )]),
                 pod: "rustfs-0".to_string(),
                 pod_uid: "uid-0".to_string(),
                 volume_name: "data".to_string(),
                 persistent_volume_claim: "data-rustfs-0".to_string(),
                 persistent_volume_claim_uid: "pvc-uid-0".to_string(),
+                persistent_volume_claim_phase: "Bound".to_string(),
                 persistent_volume: "pv-a".to_string(),
                 persistent_volume_uid: "pv-uid-a".to_string(),
+                persistent_volume_phase: "Bound".to_string(),
                 persistent_volume_claim_ref: HostStoragePersistentVolumeClaimRef {
                     namespace: "rustfs-fault-test".to_string(),
                     name: "data-rustfs-0".to_string(),
@@ -2684,13 +2701,17 @@ mod tests {
                 "helper_pod": "rustfs-fault-dm-helper-run1",
                 "mapping": {
                     "node": "worker-a",
+                    "node_uid": "node-uid-a",
+                    "node_labels": {"kubernetes.io/hostname": "worker-a"},
                     "pod": "rustfs-0",
                     "pod_uid": "uid-0",
                     "volume_name": "data",
                     "pvc": "data-rustfs-0",
                     "pvc_uid": "pvc-uid-0",
+                    "pvc_phase": "Bound",
                     "pv": "pv-a",
                     "pv_uid": "pv-uid-a",
+                    "pv_phase": "Bound",
                     "pv_claim_ref": {
                         "namespace": "rustfs-fault-test",
                         "name": "data-rustfs-0",
@@ -2776,13 +2797,20 @@ mod tests {
             },
             HostStorageTargetObservation {
                 node: "worker-a".to_string(),
+                node_uid: "node-uid-a".to_string(),
+                node_labels: BTreeMap::from([(
+                    "kubernetes.io/hostname".to_string(),
+                    "worker-a".to_string(),
+                )]),
                 pod: "rustfs-0".to_string(),
                 pod_uid: "uid-0".to_string(),
                 volume_name: "data".to_string(),
                 persistent_volume_claim: "data-rustfs-0".to_string(),
                 persistent_volume_claim_uid: "pvc-uid-0".to_string(),
+                persistent_volume_claim_phase: "Bound".to_string(),
                 persistent_volume: "pv-a".to_string(),
                 persistent_volume_uid: "pv-uid-a".to_string(),
+                persistent_volume_phase: "Bound".to_string(),
                 persistent_volume_claim_ref: HostStoragePersistentVolumeClaimRef {
                     namespace: "rustfs-fault-test".to_string(),
                     name: "data-rustfs-0".to_string(),

@@ -177,6 +177,7 @@ mod tests {
     use anyhow::{Result, anyhow};
     use std::{
         cell::RefCell,
+        collections::BTreeMap,
         rc::Rc,
         time::{Duration, Instant},
     };
@@ -259,13 +260,20 @@ mod tests {
             helper_pod: helper_pod.to_string(),
             mapping: DmVolumeMapping {
                 node: "node-a".to_string(),
+                node_uid: "node-uid-a".to_string(),
+                node_labels: BTreeMap::from([(
+                    "kubernetes.io/hostname".to_string(),
+                    "node-a".to_string(),
+                )]),
                 pod: "rustfs-0".to_string(),
                 pod_uid: "pod-uid-a".to_string(),
                 volume_name: "data".to_string(),
                 pvc: "data-rustfs-0".to_string(),
                 pvc_uid: "pvc-uid-a".to_string(),
+                pvc_phase: "Bound".to_string(),
                 pv: "pv-a".to_string(),
                 pv_uid: "pv-uid-a".to_string(),
+                pv_phase: "Bound".to_string(),
                 pv_claim_ref: HostStoragePersistentVolumeClaimRef {
                     namespace: "rustfs-fault-test".to_string(),
                     name: "data-rustfs-0".to_string(),
