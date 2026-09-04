@@ -19,7 +19,7 @@ use std::{collections::BTreeSet, time::Duration};
 use crate::{
     fault::{
         config::FaultTestConfig,
-        plan::{FaultInjection, FaultKind, FaultSelection},
+        plan::{FaultInjection, FaultKind, FaultSelection, VolumeTargetSelection},
         pods::rustfs_pod_identities,
         reporting::PodIdentity,
         scenarios::FaultScenario,
@@ -51,6 +51,7 @@ pub(crate) struct NetworkPartitionEvidenceContract<'a> {
     pub candidate_pod_ids: &'a BTreeSet<String>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct VolumeTargetEvidenceContract<'a> {
     pub chaos_namespace: &'a str,
     pub target_namespace: &'a str,
@@ -60,6 +61,53 @@ pub(crate) struct VolumeTargetEvidenceContract<'a> {
     pub volume_path: &'a str,
     pub expected_targets: u32,
     pub candidate_pod_ids: &'a BTreeSet<String>,
+    pub runtime: &'a IoChaosRuntimeContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IoChaosRuntimeContract {
+    pub action: IoChaosAction,
+    pub methods: Vec<String>,
+    pub io_sampling_percent: u8,
+    pub duration_seconds: u64,
+}
+
+pub(crate) fn volume_fault_runtime_contract(
+    injection: &FaultInjection,
+) -> Result<IoChaosRuntimeContract> {
+    let targeting = injection.volume_targeting()?;
+    let (action, methods) = match injection.kind() {
+        FaultKind::RustfsVolumeIoError => (
+            IoChaosAction::Fault { errno: 5 },
+            vec!["READ".to_string(), "WRITE".to_string()],
+        ),
+        FaultKind::RustfsVolumeEnospc => (
+            IoChaosAction::Fault { errno: 28 },
+            vec!["WRITE".to_string()],
+        ),
+        FaultKind::RustfsVolumeReadMistake => (
+            IoChaosAction::Mistake {
+                filling: "random".to_string(),
+                max_occurrences: 1,
+                max_length: 4096,
+            },
+            vec!["READ".to_string()],
+        ),
+        FaultKind::RustfsVolumeLatency => {
+            let (delay, methods) = injection.parameters().io_latency()?;
+            (IoChaosAction::Latency { delay }, methods)
+        }
+        other => bail!(
+            "fault kind {} is not a RustFS volume IOChaos fault",
+            other.as_str()
+        ),
+    };
+    Ok(IoChaosRuntimeContract {
+        action,
+        methods,
+        io_sampling_percent: targeting.io_sampling_percent,
+        duration_seconds: injection.duration().as_secs(),
+    })
 }
 
 /// Validates the submitted fixed-target IOChaos selector and the controller's
@@ -113,9 +161,11 @@ pub(crate) fn validate_fixed_volume_snapshot(
         "runtime IOChaos must target only the RustFS container"
     );
     ensure!(
-        resource.pointer("/spec/percent").and_then(Value::as_u64) == Some(100),
-        "fixed-target IOChaos must inject all matching I/O on each selected volume"
+        resource.pointer("/spec/percent").and_then(Value::as_u64)
+            == Some(u64::from(contract.runtime.io_sampling_percent)),
+        "runtime IOChaos I/O sampling percent does not match the planned volume fault"
     );
+    validate_iochaos_behavior(resource, contract.runtime)?;
     ensure!(
         chaos_condition_is_true(resource, "Selected")
             && chaos_condition_is_true(resource, "AllInjected")
@@ -153,6 +203,68 @@ pub(crate) fn validate_fixed_volume_snapshot(
         "runtime IOChaos selected a target outside the proved Ready Pod set"
     );
     Ok(record_ids)
+}
+
+fn validate_iochaos_behavior(resource: &Value, expected: &IoChaosRuntimeContract) -> Result<()> {
+    let spec = resource
+        .pointer("/spec")
+        .context("IOChaos spec is missing")?;
+    let methods = spec
+        .get("methods")
+        .and_then(Value::as_array)
+        .context("runtime IOChaos methods are missing")?
+        .iter()
+        .map(|method| {
+            method
+                .as_str()
+                .map(str::to_string)
+                .context("runtime IOChaos method is not a string")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        methods == expected.methods,
+        "runtime IOChaos methods do not match the planned volume fault"
+    );
+    ensure!(
+        spec.get("duration").and_then(Value::as_str)
+            == Some(format!("{}s", expected.duration_seconds).as_str()),
+        "runtime IOChaos duration does not match the planned volume fault"
+    );
+    match &expected.action {
+        IoChaosAction::Fault { errno } => ensure!(
+            spec.get("action").and_then(Value::as_str) == Some("fault")
+                && spec.get("errno").and_then(Value::as_u64) == Some(u64::from(*errno))
+                && spec.get("delay").is_none()
+                && spec.get("mistake").is_none(),
+            "runtime IOChaos fault action/errno does not match the planned volume fault"
+        ),
+        IoChaosAction::Latency { delay } => ensure!(
+            spec.get("action").and_then(Value::as_str) == Some("latency")
+                && spec.get("delay").and_then(Value::as_str) == Some(delay.as_str())
+                && spec.get("errno").is_none()
+                && spec.get("mistake").is_none(),
+            "runtime IOChaos latency action/delay does not match the planned volume fault"
+        ),
+        IoChaosAction::Mistake {
+            filling,
+            max_occurrences,
+            max_length,
+        } => ensure!(
+            spec.get("action").and_then(Value::as_str) == Some("mistake")
+                && spec.pointer("/mistake/filling").and_then(Value::as_str)
+                    == Some(filling.as_str())
+                && spec
+                    .pointer("/mistake/maxOccurrences")
+                    .and_then(Value::as_u64)
+                    == Some(u64::from(*max_occurrences))
+                && spec.pointer("/mistake/maxLength").and_then(Value::as_u64)
+                    == u64::try_from(*max_length).ok()
+                && spec.get("errno").is_none()
+                && spec.get("delay").is_none(),
+            "runtime IOChaos mistake action does not match the planned volume fault"
+        ),
+    }
+    Ok(())
 }
 
 pub(crate) fn iochaos_record_pod_id(record_id: &str) -> Result<String> {
@@ -473,12 +585,12 @@ fn build_fault_spec(
 ) -> Result<FaultSpec> {
     let cluster = &config.cluster;
     let io_targeting = || -> Result<(u8, Option<u32>)> {
-        match injection.selection() {
-            FaultSelection::Percent(percent) => Ok((percent, None)),
-            // FixedTargets declares the volume blast radius, not an I/O
-            // sampling percentage. Apply the selected volumes fully.
-            FaultSelection::FixedTargets(count) => Ok((100, Some(count))),
-        }
+        let targeting = injection.volume_targeting()?;
+        let targets = match targeting.target_selection {
+            VolumeTargetSelection::One => None,
+            VolumeTargetSelection::FixedTargets(count) => Some(count),
+        };
+        Ok((targeting.io_sampling_percent, targets))
     };
     match injection.kind() {
         FaultKind::RustfsVolumeEnospc => {
@@ -1590,7 +1702,7 @@ mod tests {
         NetworkChaosSpec, NetworkDelayParameters, NetworkPartitionEvidenceContract, PodChaosAction,
         PodChaosSpec, StressChaosAction, StressChaosSpec, VolumeTargetEvidenceContract,
         build_fault_spec, runtime::chaos_experiment_is_active, validate_fixed_volume_snapshot,
-        validate_network_partition_snapshot,
+        validate_network_partition_snapshot, volume_fault_runtime_contract,
     };
     use crate::fault::config::FaultTestConfig;
     use crate::fault::plan::{
@@ -1653,6 +1765,7 @@ mod tests {
         .expect("fixed volume injection");
         let spec =
             build_fault_spec(&config, &scenario, &injection, "run-1", "").expect("fault spec");
+        let runtime_contract = volume_fault_runtime_contract(&injection).expect("runtime contract");
         let FaultSpec::Io(spec) = spec else {
             panic!("expected IOChaos spec")
         };
@@ -1673,6 +1786,7 @@ mod tests {
             volume_path: "/data/rustfs0",
             expected_targets: 2,
             candidate_pod_ids: &candidates,
+            runtime: &runtime_contract,
         };
         let resource = serde_json::json!({
             "apiVersion": "chaos-mesh.org/v1alpha1",
@@ -1697,7 +1811,9 @@ mod tests {
                 "containerNames": ["rustfs"],
                 "volumePath": "/data/rustfs0",
                 "path": "/data/rustfs0/**/*",
-                "percent": 100
+                "methods": ["READ", "WRITE"],
+                "percent": 100,
+                "duration": "60s"
             },
             "status": {
                 "conditions": [
@@ -1721,6 +1837,88 @@ mod tests {
                 .map(str::to_string)
                 .collect()
         );
+
+        for (pointer, value) in [
+            ("/spec/action", serde_json::json!("latency")),
+            ("/spec/errno", serde_json::json!(28)),
+            ("/spec/methods", serde_json::json!(["WRITE"])),
+            ("/spec/duration", serde_json::json!("61s")),
+        ] {
+            let mut tampered = resource.clone();
+            *tampered.pointer_mut(pointer).expect("tamper target") = value;
+            assert!(
+                validate_fixed_volume_snapshot(&tampered, &contract).is_err(),
+                "runtime contract must reject tampered {pointer}"
+            );
+        }
+
+        let latency_injection = FaultInjection::new_with_parameters(
+            FaultKind::RustfsVolumeLatency,
+            FaultBackend::ChaosMeshIoChaos,
+            FaultTarget::RustfsVolume {
+                path: "/data/rustfs0".to_string(),
+            },
+            FaultSelection::FixedTargets(2),
+            Duration::from_secs(60),
+            FaultInjectionParameters::IoLatency {
+                delay: "250ms".to_string(),
+                methods: vec![IoMethod::Read, IoMethod::Write],
+            },
+        )
+        .expect("latency injection");
+        let latency_runtime =
+            volume_fault_runtime_contract(&latency_injection).expect("latency runtime contract");
+        let latency_contract = VolumeTargetEvidenceContract {
+            runtime: &latency_runtime,
+            ..contract
+        };
+        let mut latency_resource = resource.clone();
+        let latency_spec = latency_resource["spec"]
+            .as_object_mut()
+            .expect("latency spec");
+        latency_spec.insert("action".to_string(), serde_json::json!("latency"));
+        latency_spec.insert("delay".to_string(), serde_json::json!("250ms"));
+        latency_spec.remove("errno");
+        validate_fixed_volume_snapshot(&latency_resource, &latency_contract)
+            .expect("latency runtime proof");
+        latency_resource["spec"]["delay"] = serde_json::json!("251ms");
+        assert!(validate_fixed_volume_snapshot(&latency_resource, &latency_contract).is_err());
+
+        let mistake_injection = FaultInjection::new(
+            FaultKind::RustfsVolumeReadMistake,
+            FaultBackend::ChaosMeshIoChaos,
+            FaultTarget::RustfsVolume {
+                path: "/data/rustfs0".to_string(),
+            },
+            FaultSelection::FixedTargets(2),
+            Duration::from_secs(60),
+        )
+        .expect("mistake injection");
+        let mistake_runtime =
+            volume_fault_runtime_contract(&mistake_injection).expect("mistake runtime contract");
+        let mistake_contract = VolumeTargetEvidenceContract {
+            runtime: &mistake_runtime,
+            ..contract
+        };
+        let mut mistake_resource = resource.clone();
+        let mistake_spec = mistake_resource["spec"]
+            .as_object_mut()
+            .expect("mistake spec");
+        mistake_spec.insert("action".to_string(), serde_json::json!("mistake"));
+        mistake_spec.insert("methods".to_string(), serde_json::json!(["READ"]));
+        mistake_spec.insert(
+            "mistake".to_string(),
+            serde_json::json!({
+                "filling": "random",
+                "maxOccurrences": 1,
+                "maxLength": 4096
+            }),
+        );
+        mistake_spec.remove("errno");
+        validate_fixed_volume_snapshot(&mistake_resource, &mistake_contract)
+            .expect("mistake runtime proof");
+        mistake_resource["spec"]["mistake"]["maxOccurrences"] = serde_json::json!(2);
+        assert!(validate_fixed_volume_snapshot(&mistake_resource, &mistake_contract).is_err());
 
         let mut duplicate_pod = resource.clone();
         duplicate_pod["status"]["experiment"]["containerRecords"][1]["id"] =

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -122,6 +122,33 @@ impl FaultTarget {
 pub enum FaultSelection {
     Percent(u8),
     FixedTargets(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeTargetSelection {
+    One,
+    FixedTargets(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeFaultTargeting {
+    pub target_selection: VolumeTargetSelection,
+    pub io_sampling_percent: u8,
+}
+
+impl VolumeFaultTargeting {
+    fn from_legacy_selection(selection: FaultSelection) -> Self {
+        match selection {
+            FaultSelection::Percent(percent) => Self {
+                target_selection: VolumeTargetSelection::One,
+                io_sampling_percent: percent,
+            },
+            FaultSelection::FixedTargets(count) => Self {
+                target_selection: VolumeTargetSelection::FixedTargets(count),
+                io_sampling_percent: 100,
+            },
+        }
+    }
 }
 
 impl FaultSelection {
@@ -513,6 +540,7 @@ pub struct FaultInjection {
     selection: FaultSelection,
     duration: Duration,
     parameters: FaultInjectionParameters,
+    volume_targeting: Option<VolumeFaultTargeting>,
 }
 
 impl FaultInjection {
@@ -564,6 +592,8 @@ impl FaultInjection {
         }
         ensure!(duration > Duration::ZERO, "fault duration must be positive");
         let parameters = parameters.resolve_for_kind(kind)?;
+        let volume_targeting = matches!(target, FaultTarget::RustfsVolume { .. })
+            .then(|| VolumeFaultTargeting::from_legacy_selection(selection));
 
         Ok(Self {
             kind,
@@ -572,6 +602,7 @@ impl FaultInjection {
             selection,
             duration,
             parameters,
+            volume_targeting,
         })
     }
 
@@ -617,6 +648,15 @@ impl FaultInjection {
 
     pub fn parameters(&self) -> &FaultInjectionParameters {
         &self.parameters
+    }
+
+    pub fn volume_targeting(&self) -> Result<VolumeFaultTargeting> {
+        self.volume_targeting.with_context(|| {
+            format!(
+                "fault kind {} does not have RustFS volume targeting",
+                self.kind.as_str()
+            )
+        })
     }
 
     pub fn rustfs_volume_path(&self) -> Result<&str> {
@@ -739,7 +779,6 @@ pub struct FaultPlan {
 pub struct FaultPlanOptions {
     pub rustfs_volume_path: String,
     pub scenario_parameters: FaultInjectionParameters,
-    pub volume_selection: Option<FaultSelection>,
 }
 
 impl FaultPlanOptions {
@@ -747,7 +786,6 @@ impl FaultPlanOptions {
         Self {
             rustfs_volume_path: config.rustfs_volume_path.clone(),
             scenario_parameters: config.scenario_parameters.clone(),
-            volume_selection: None,
         }
     }
 }
@@ -757,7 +795,6 @@ impl Default for FaultPlanOptions {
         Self {
             rustfs_volume_path: DEFAULT_RUSTFS_DATA_VOLUME.to_string(),
             scenario_parameters: FaultInjectionParameters::Default,
-            volume_selection: None,
         }
     }
 }
@@ -814,7 +851,6 @@ impl FaultPlan {
                 scenario,
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
-                options.volume_selection,
             )?,
             POD_KILL_ONE_SCENARIO | POD_CRASH_VERSIONED_HOT_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsServerPodKill,
@@ -877,7 +913,6 @@ impl FaultPlan {
                 scenario,
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
-                options.volume_selection,
             )?,
             IO_LATENCY_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeLatency,
@@ -885,7 +920,6 @@ impl FaultPlan {
                 scenario,
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
-                options.volume_selection,
             )?,
             DISK_FULL_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeEnospc,
@@ -893,7 +927,6 @@ impl FaultPlan {
                 scenario,
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
-                options.volume_selection,
             )?,
             STRESS_CPU_SCENARIO => resource_fault(
                 FaultKind::RustfsServerCpuStress,
@@ -927,7 +960,6 @@ impl FaultPlan {
                 scenario,
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
-                options.volume_selection,
             )?,
             other => bail!("scenario {other:?} has no fault plan mapping"),
         };
@@ -990,7 +1022,6 @@ fn volume_fault(
     scenario: &FaultScenario,
     volume_path: &str,
     parameters: &FaultInjectionParameters,
-    selection: Option<FaultSelection>,
 ) -> Result<FaultInjection> {
     FaultInjection::new_with_parameters(
         kind,
@@ -998,7 +1029,7 @@ fn volume_fault(
         FaultTarget::RustfsVolume {
             path: volume_path.to_string(),
         },
-        selection.unwrap_or(FaultSelection::Percent(scenario.percent)),
+        FaultSelection::Percent(scenario.percent),
         scenario.duration,
         parameters.resolve_for_kind(kind)?,
     )
@@ -1040,7 +1071,7 @@ fn resource_fault(
 mod tests {
     use super::{
         DEFAULT_RUSTFS_DATA_VOLUME, FaultInjection, FaultInjectionParameters, FaultKind, FaultPlan,
-        FaultPlanOptions, FaultSelection, FaultTarget, FaultWorkloadMode,
+        FaultSelection, FaultTarget, FaultWorkloadMode,
     };
     use crate::fault::{
         config::FaultTestConfig,
@@ -1256,18 +1287,22 @@ mod tests {
     }
 
     #[test]
-    fn volume_plan_option_declares_one_same_kind_fixed_target_fault() {
-        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
-        config.scenario = super::IO_EIO_SCENARIO.to_string();
-        let scenario = FaultScenario::from_config(&config).expect("scenario");
-        let spec = scenario_spec(&scenario.name).expect("catalog spec");
-        let plan = FaultPlan::from_scenario_with_options(
-            &scenario,
-            spec,
-            FaultPlanOptions {
-                volume_selection: Some(FaultSelection::FixedTargets(3)),
-                ..FaultPlanOptions::from_config(&config)
+    fn fixed_volume_injection_separates_target_count_from_io_sampling() {
+        let fault = FaultInjection::new(
+            FaultKind::RustfsVolumeIoError,
+            FaultBackend::ChaosMeshIoChaos,
+            FaultTarget::RustfsVolume {
+                path: DEFAULT_RUSTFS_DATA_VOLUME.to_string(),
             },
+            FaultSelection::FixedTargets(3),
+            Duration::from_secs(60),
+        )
+        .expect("fixed volume injection");
+        let plan = FaultPlan::new(
+            "io-eio",
+            "fault_case",
+            FaultWorkloadMode::S3Mixed,
+            vec![fault],
         )
         .expect("fixed volume plan");
 
@@ -1276,6 +1311,13 @@ mod tests {
         };
         assert_eq!(fault.kind(), FaultKind::RustfsVolumeIoError);
         assert_eq!(fault.selection(), FaultSelection::FixedTargets(3));
+        assert_eq!(
+            fault.volume_targeting().expect("volume targeting"),
+            super::VolumeFaultTargeting {
+                target_selection: super::VolumeTargetSelection::FixedTargets(3),
+                io_sampling_percent: 100,
+            }
+        );
         assert_eq!(
             fault.target_summary(),
             "3 RustFS volume target(s) at /data/rustfs0"

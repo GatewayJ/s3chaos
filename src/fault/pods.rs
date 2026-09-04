@@ -22,6 +22,7 @@ use crate::{
     fault::{
         preflight::{
             TargetPersistentVolumeClaimProof, TargetPersistentVolumeProof, TargetResolvedPodProof,
+            TargetVolumeMountProof,
         },
         reporting::PodIdentity,
     },
@@ -159,7 +160,15 @@ fn target_pod_proof(
             .collect(),
         _ => Vec::new(),
     };
-    Some(proof.with_persistent_volume_claims(claims))
+    let volume_mounts = match (pvcs, pvs) {
+        (Some(_), Some(_)) => target_volume_mounts(pod),
+        _ => Vec::new(),
+    };
+    Some(
+        proof
+            .with_persistent_volume_claims(claims)
+            .with_volume_mounts(volume_mounts),
+    )
 }
 
 fn pod_is_ready(pod: &Value) -> bool {
@@ -193,6 +202,59 @@ fn persistent_volume_claim_names(pod: &Value) -> Vec<String> {
     claims
 }
 
+fn target_volume_mounts(pod: &Value) -> Vec<TargetVolumeMountProof> {
+    let volume_claims = pod
+        .pointer("/spec/volumes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|volume| {
+            let name = volume.get("name").and_then(Value::as_str)?;
+            let claim = volume
+                .pointer("/persistentVolumeClaim/claimName")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some((name.to_string(), claim))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut mounts = pod
+        .pointer("/spec/containers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|container| {
+            let container_name = container
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            container
+                .get("volumeMounts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|mount| {
+                    let volume_name = mount.get("name").and_then(Value::as_str)?;
+                    let mount_path = mount.get("mountPath").and_then(Value::as_str)?;
+                    Some(TargetVolumeMountProof {
+                        container_name: container_name.clone(),
+                        mount_path: mount_path.to_string(),
+                        volume_name: volume_name.to_string(),
+                        persistent_volume_claim: volume_claims.get(volume_name).cloned().flatten(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    mounts.sort_by(|left, right| {
+        left.container_name
+            .cmp(&right.container_name)
+            .then_with(|| left.mount_path.cmp(&right.mount_path))
+            .then_with(|| left.volume_name.cmp(&right.volume_name))
+    });
+    mounts
+}
+
 fn target_pvc_proof(
     claim: &str,
     pvcs: &BTreeMap<String, Value>,
@@ -222,8 +284,21 @@ fn target_pvc_proof(
 fn target_pv_proof(name: &str, pv: &Value) -> TargetPersistentVolumeProof {
     TargetPersistentVolumeProof {
         name: name.to_string(),
+        source: pv_source(pv).map(str::to_string),
         node: pv_node_affinity_hostname(pv),
         device_or_path: pv_device_or_path(pv),
+    }
+}
+
+fn pv_source(pv: &Value) -> Option<&'static str> {
+    if pv.pointer("/spec/local/path").is_some() {
+        Some("local")
+    } else if pv.pointer("/spec/hostPath/path").is_some() {
+        Some("host-path")
+    } else if pv.pointer("/spec/csi/volumeHandle").is_some() {
+        Some("csi")
+    } else {
+        None
     }
 }
 
@@ -358,7 +433,7 @@ mod tests {
         items_by_metadata_name, persistent_volume_claim_names, pod_deletion_observed,
         pod_replacement_observed, target_pod_proof,
     };
-    use crate::fault::reporting::PodIdentity;
+    use crate::fault::{preflight::target_pod_has_fixed_volume, reporting::PodIdentity};
     use serde_json::json;
 
     #[test]
@@ -396,6 +471,10 @@ mod tests {
             "metadata": {"name": "rustfs-0", "uid": "uid-a"},
             "spec": {
                 "nodeName": "node-a",
+                "containers": [{
+                    "name": "rustfs",
+                    "volumeMounts": [{"name": "data", "mountPath": "/data/rustfs0"}]
+                }],
                 "volumes": [{
                     "name": "data",
                     "persistentVolumeClaim": {"claimName": "data-rustfs-0"}
@@ -443,8 +522,57 @@ mod tests {
         let claim = &proof.persistent_volume_claims[0];
         assert_eq!(claim.volume_name.as_deref(), Some("pv-a"));
         let pv = claim.persistent_volume.as_ref().expect("pv");
+        assert_eq!(pv.source.as_deref(), Some("local"));
         assert_eq!(pv.node.as_deref(), Some("node-a"));
         assert_eq!(pv.device_or_path.as_deref(), Some("/mnt/rustfs0"));
+        assert!(target_pod_has_fixed_volume(&proof, "/data/rustfs0"));
+    }
+
+    #[test]
+    fn unrelated_pvc_does_not_prove_empty_dir_volume_target() {
+        let pod = json!({
+            "metadata": {"name": "rustfs-0", "uid": "uid-a"},
+            "spec": {
+                "nodeName": "node-a",
+                "containers": [{
+                    "name": "rustfs",
+                    "volumeMounts": [
+                        {"name": "data", "mountPath": "/data/rustfs0"},
+                        {"name": "logs", "mountPath": "/var/log/rustfs"}
+                    ]
+                }],
+                "volumes": [
+                    {"name": "data", "emptyDir": {}},
+                    {"name": "logs", "persistentVolumeClaim": {"claimName": "logs-rustfs-0"}}
+                ]
+            },
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+        });
+        let pvc_list = json!({
+            "items": [{
+                "metadata": {"name": "logs-rustfs-0"},
+                "spec": {"volumeName": "pv-logs", "storageClassName": "fast-csi"}
+            }]
+        });
+        let pv_list = json!({
+            "items": [{
+                "metadata": {"name": "pv-logs"},
+                "spec": {"csi": {"volumeHandle": "logs-handle"}}
+            }]
+        });
+
+        let proof = target_pod_proof(
+            &pod,
+            Some(&items_by_metadata_name(&pvc_list)),
+            Some(&items_by_metadata_name(&pv_list)),
+        )
+        .expect("proof");
+
+        assert_eq!(proof.persistent_volume_claims.len(), 1);
+        assert!(
+            !target_pod_has_fixed_volume(&proof, "/data/rustfs0"),
+            "an unrelated logs PVC must not prove the emptyDir data mount"
+        );
     }
 
     #[test]

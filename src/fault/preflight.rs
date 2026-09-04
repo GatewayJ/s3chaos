@@ -149,6 +149,18 @@ pub struct TargetResolvedPodProof {
     pub node: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub persistent_volume_claims: Vec<TargetPersistentVolumeClaimProof>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_mounts: Vec<TargetVolumeMountProof>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetVolumeMountProof {
+    pub container_name: String,
+    pub mount_path: String,
+    pub volume_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistent_volume_claim: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +179,8 @@ pub struct TargetPersistentVolumeClaimProof {
 #[serde(rename_all = "camelCase")]
 pub struct TargetPersistentVolumeProof {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -576,10 +590,18 @@ impl TargetProof {
                 .map(|fault| fault.selection_value)
                 .max()
             {
+                let volume_path = self
+                    .faults
+                    .iter()
+                    .find(|fault| {
+                        fault.volume_path.is_some() && fault.selection_kind == "fixed-targets"
+                    })
+                    .and_then(|fault| fault.volume_path.as_deref())
+                    .unwrap_or_default();
                 let eligible_candidates = self
                     .resolved_pods
                     .iter()
-                    .filter(|pod| pod.ready && target_pod_has_bound_volume(pod))
+                    .filter(|pod| pod.ready && target_pod_has_fixed_volume(pod, volume_path))
                     .count();
                 let enough_candidates = usize::try_from(required_targets)
                     .is_ok_and(|required| eligible_candidates >= required);
@@ -617,6 +639,7 @@ impl TargetResolvedPodProof {
             ready: false,
             node: None,
             persistent_volume_claims: Vec::new(),
+            volume_mounts: Vec::new(),
         }
     }
 
@@ -637,6 +660,11 @@ impl TargetResolvedPodProof {
         self.persistent_volume_claims = persistent_volume_claims;
         self
     }
+
+    pub fn with_volume_mounts(mut self, volume_mounts: Vec<TargetVolumeMountProof>) -> Self {
+        self.volume_mounts = volume_mounts;
+        self
+    }
 }
 
 pub(crate) fn target_pod_has_bound_volume(pod: &TargetResolvedPodProof) -> bool {
@@ -648,13 +676,56 @@ pub(crate) fn target_pod_has_bound_volume(pod: &TargetResolvedPodProof) -> bool 
                 .is_some_and(|volume| !volume.is_empty())
                 && claim.persistent_volume.as_ref().is_some_and(|pv| {
                     !pv.name.is_empty()
-                        && pv.node.as_deref().is_some_and(|node| !node.is_empty())
                         && pv
                             .device_or_path
                             .as_deref()
                             .is_some_and(|path| !path.is_empty())
                 })
         })
+}
+
+pub(crate) fn target_pod_has_fixed_volume(
+    pod: &TargetResolvedPodProof,
+    expected_mount_path: &str,
+) -> bool {
+    if expected_mount_path.is_empty() {
+        return false;
+    }
+    pod.volume_mounts.iter().any(|mount| {
+        if mount.container_name != "rustfs"
+            || mount.mount_path != expected_mount_path
+            || mount.volume_name.is_empty()
+        {
+            return false;
+        }
+        let Some(claim_name) = mount.persistent_volume_claim.as_deref() else {
+            return false;
+        };
+        pod.persistent_volume_claims.iter().any(|claim| {
+            claim.name == claim_name
+                && claim
+                    .volume_name
+                    .as_deref()
+                    .is_some_and(|volume_name| !volume_name.is_empty())
+                && claim.persistent_volume.as_ref().is_some_and(|pv| {
+                    claim.volume_name.as_deref() == Some(pv.name.as_str())
+                        && pv
+                            .device_or_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty())
+                        && match pv.source.as_deref() {
+                            Some("local") | Some("host-path") => {
+                                pv.node.as_deref() == pod.node.as_deref()
+                            }
+                            Some("csi") => pv
+                                .node
+                                .as_deref()
+                                .is_none_or(|node| Some(node) == pod.node.as_deref()),
+                            _ => false,
+                        }
+                })
+        })
+    })
 }
 
 fn target_requirements(
@@ -788,7 +859,10 @@ fn is_zero_u64(value: &u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreflightStatus, TargetProof, TargetProofStatus, TargetResolvedPodProof};
+    use super::{
+        PreflightStatus, TargetPersistentVolumeClaimProof, TargetPersistentVolumeProof,
+        TargetProof, TargetProofStatus, TargetResolvedPodProof,
+    };
     use crate::fault::{
         config::FaultTestConfig,
         plan::{FaultPlan, FaultPlanOptions},
@@ -848,6 +922,40 @@ mod tests {
 
         assert_eq!(proof.status, TargetProofStatus::Missing);
         assert!(proof.require_satisfied().is_err());
+    }
+
+    #[test]
+    fn percent_volume_proof_accepts_csi_pv_without_hostname_affinity() {
+        let mut config = FaultTestConfig::for_test("k3d-lab", "fast-csi");
+        config.scenario = "io-eio".to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let spec = scenario_spec(&scenario.name).expect("spec");
+        let plan = FaultPlan::from_scenario_with_options(
+            &scenario,
+            spec,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("percent plan");
+        let pod = TargetResolvedPodProof::new("rustfs-0", "uid-0")
+            .with_node("node-a")
+            .with_ready(true)
+            .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
+                name: "data-rustfs-0".to_string(),
+                volume_name: Some("pv-csi".to_string()),
+                storage_class: Some("fast-csi".to_string()),
+                persistent_volume: Some(TargetPersistentVolumeProof {
+                    name: "pv-csi".to_string(),
+                    source: Some("csi".to_string()),
+                    node: None,
+                    device_or_path: Some("csi-volume-handle".to_string()),
+                }),
+            }]);
+
+        let proof = TargetProof::from_plan(&config, &scenario, spec, &plan, "run-1")
+            .with_resolved_pod_proofs([pod]);
+
+        assert_eq!(proof.status, TargetProofStatus::Satisfied);
+        assert!(proof.require_satisfied().is_ok());
     }
 
     #[test]

@@ -278,19 +278,22 @@ guardrails when implementing the ordered TODO below.
 
 ### 5. Implement Volume-Kind Fixed Targeting
 
-- [x] DONE: Allow `FixedTargets(N)` for RustFS volume fault kinds.
-  Meaning: the four Chaos Mesh RustFS volume fault kinds accept bounded fixed
-  target counts while existing percent-based scenarios retain their one-Pod
-  selector and I/O sampling behavior. Composite fault plans remain rejected.
+- [ ] PARTIAL: Allow `FixedTargets(N)` for RustFS volume fault kinds.
+  Meaning: the typed fault and backend layers accept bounded fixed target
+  counts while existing percent-based scenarios retain their one-Pod selector
+  and independent I/O sampling behavior. No executable catalog/config source
+  selects this mode yet, so artifact validation rejects a fixed selection for
+  the current percent-based scenarios. Composite fault plans remain rejected.
 
-- [x] DONE: Render and prove Chaos Mesh volume faults for `FixedTargets(N)`.
+- [ ] PARTIAL: Render and prove Chaos Mesh volume faults for `FixedTargets(N)`.
   Meaning: IOChaos renders `mode: fixed` with the declared count, injects all
   matching I/O on those selected volumes, and records the controller-selected
-  container targets. Runtime and artifact validation bind that set to the
-  preflight Pod/PVC/PV/node/device proof, require exactly N unique targets, and
-  reject selection drift across the workload. The host DeviceMapper backend
-  remains deliberately single-target because its configuration names one
-  mapper/device; it does not claim unsupported multi-device coverage.
+  container targets. Runtime proof binds the exact RustFS container mount path
+  through Pod volume name, PVC, PV, storage source, and applicable local node
+  topology; it also validates action, methods, parameters, sampling, and
+  duration. End-to-end execution remains pending a trusted catalog/config
+  selection source. The host DeviceMapper backend remains deliberately
+  single-target because its configuration names one mapper/device.
 
 - [x] DONE: Keep quorum targeting separate from heterogeneous composition.
   Meaning: `FixedTargets(N)` changes only the selector of one typed volume

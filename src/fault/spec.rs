@@ -113,6 +113,8 @@ pub struct FaultRunFaultSpec {
     #[serde(default = "default_target_proof_spec")]
     pub target_proof: FaultRunTargetProofSpec,
     pub selection: FaultRunSelectionSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_sampling_percent: Option<u8>,
     #[serde(default)]
     pub target_proof_requirements: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -274,6 +276,13 @@ impl FaultRunFaultSpec {
                 artifact: "target-proof.json".to_string(),
             },
             selection: FaultRunSelectionSpec::from_selection(fault.selection()),
+            io_sampling_percent: match fault.selection() {
+                FaultSelection::FixedTargets(_) => fault
+                    .volume_targeting()
+                    .ok()
+                    .map(|targeting| targeting.io_sampling_percent),
+                FaultSelection::Percent(_) => None,
+            },
             target_proof_requirements: scenario_spec
                 .target_proof
                 .iter()

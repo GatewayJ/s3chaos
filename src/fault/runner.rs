@@ -38,7 +38,7 @@ use crate::{
         },
         preflight::{
             PreflightCheck, PreflightPhase, PreflightSummary, TargetProof,
-            target_pod_has_bound_volume,
+            target_pod_has_fixed_volume,
         },
         quorum::{
             ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape,
@@ -2413,6 +2413,7 @@ fn require_active_fixed_volume_targets(
     let [fault] = plan.faults() else {
         bail!("fixed volume runtime proof requires exactly one planned fault")
     };
+    let volume_path = fault.rustfs_volume_path()?;
     ensure!(
         snapshots.len() == 1,
         "fixed volume plan requires exactly one runtime fault snapshot"
@@ -2437,9 +2438,10 @@ fn require_active_fixed_volume_targets(
     let candidate_pod_ids = target_proof
         .resolved_pods
         .iter()
-        .filter(|pod| pod.ready && target_pod_has_bound_volume(pod))
+        .filter(|pod| pod.ready && target_pod_has_fixed_volume(pod, volume_path))
         .map(|pod| format!("{}/{}", config.cluster.test_namespace, pod.name))
         .collect::<BTreeSet<_>>();
+    let runtime_contract = chaos_mesh::volume_fault_runtime_contract(fault)?;
     let snapshot = &snapshots[0];
     ensure!(
         snapshot.resource_kind.as_deref() == Some("iochaos"),
@@ -2464,9 +2466,10 @@ fn require_active_fixed_volume_targets(
             tenant: &config.cluster.tenant_name,
             run_id,
             scenario: &plan.scenario,
-            volume_path: fault.rustfs_volume_path()?,
+            volume_path,
             expected_targets,
             candidate_pod_ids: &candidate_pod_ids,
+            runtime: &runtime_contract,
         },
     )
 }

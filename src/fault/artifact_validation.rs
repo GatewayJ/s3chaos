@@ -36,10 +36,13 @@ use crate::fault::{
     },
     events::{RunEvent, RunEventStatus},
     history::{DurabilityCohort, OperationKind, OperationOutcome, OperationRecord},
-    plan::{FaultPlan, FaultPlanOptions, FaultSelection, FaultWorkloadMode},
+    plan::{
+        FaultInjection, FaultKind, FaultPlan, FaultPlanOptions, FaultSelection, FaultTarget,
+        FaultWorkloadMode,
+    },
     preflight::{
         PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus,
-        target_pod_has_bound_volume,
+        target_pod_has_bound_volume, target_pod_has_fixed_volume,
     },
     quorum::require_fresh_runtime_observation,
     reporting::{
@@ -563,9 +566,6 @@ fn validate_run_spec_catalog_contract(
         FaultPlanOptions {
             rustfs_volume_path: options.expected_rustfs_volume_path.clone(),
             scenario_parameters: artifact_fault.parameters.clone(),
-            volume_selection: (artifact_fault.target.kind == "rustfs-volume"
-                && artifact_fault.selection.kind == "fixed-targets")
-                .then_some(FaultSelection::FixedTargets(artifact_fault.selection.value)),
         },
     )
     .context("rebuild canonical fault plan for artifact validation")?;
@@ -1045,6 +1045,18 @@ fn validate_fixed_volume_runtime_evidence(
 ) -> Result<()> {
     let fault = fixed_volume_fault(spec)
         .context("fixed volume runtime proof requires one fixed-target volume fault")?;
+    let injection = fixed_volume_injection_from_run_spec(fault)?;
+    let runtime_contract =
+        crate::fault::backends::chaos_mesh::volume_fault_runtime_contract(&injection)?;
+    ensure!(
+        fault.io_sampling_percent == Some(runtime_contract.io_sampling_percent),
+        "fixed volume run-spec io_sampling_percent does not match its canonical fault kind"
+    );
+    let volume_path = fault
+        .target
+        .path
+        .as_deref()
+        .context("fixed volume run-spec target has no path")?;
     let expected_count = usize::try_from(fault.selection.value)?;
     let active_targets = evidence
         .fixed_volume_targets_at_fault_activation
@@ -1086,17 +1098,16 @@ fn validate_fixed_volume_runtime_evidence(
             format!("fixed volume target {pod_id:?} is absent from target-proof.json")
         })?;
         ensure!(
-            pod.ready && target_pod_has_bound_volume(pod),
+            pod.ready && target_pod_has_fixed_volume(pod, volume_path),
             "fixed volume target {pod_id:?} lacks Ready Pod/PVC/PV/device proof"
         );
     }
 
-    let candidate_pod_ids = proved_pods.keys().cloned().collect::<BTreeSet<_>>();
-    let volume_path = fault
-        .target
-        .path
-        .as_deref()
-        .context("fixed volume run-spec target has no path")?;
+    let candidate_pod_ids = proved_pods
+        .iter()
+        .filter(|(_, pod)| pod.ready && target_pod_has_fixed_volume(pod, volume_path))
+        .map(|(pod_id, _)| pod_id.clone())
+        .collect::<BTreeSet<_>>();
     for (stage, snapshots, persisted_targets) in [
         ("active", &evidence.active_snapshots, &active_targets),
         (
@@ -1134,6 +1145,7 @@ fn validate_fixed_volume_runtime_evidence(
                 volume_path,
                 expected_targets: fault.selection.value,
                 candidate_pod_ids: &candidate_pod_ids,
+                runtime: &runtime_contract,
             },
         )
         .with_context(|| format!("validate {stage} IOChaos runtime evidence"))?;
@@ -1143,6 +1155,29 @@ fn validate_fixed_volume_runtime_evidence(
         );
     }
     Ok(())
+}
+
+fn fixed_volume_injection_from_run_spec(fault: &FaultRunFaultSpec) -> Result<FaultInjection> {
+    let kind = match fault.kind.as_str() {
+        "rustfs_volume_io_error" => FaultKind::RustfsVolumeIoError,
+        "rustfs_volume_latency" => FaultKind::RustfsVolumeLatency,
+        "rustfs_volume_read_mistake" => FaultKind::RustfsVolumeReadMistake,
+        "rustfs_volume_enospc" => FaultKind::RustfsVolumeEnospc,
+        other => bail!("unsupported fixed volume fault kind {other:?}"),
+    };
+    let volume_path = fault
+        .target
+        .path
+        .clone()
+        .context("fixed volume run-spec target has no path")?;
+    FaultInjection::new_with_parameters(
+        kind,
+        crate::fault::scenarios::FaultBackend::ChaosMeshIoChaos,
+        FaultTarget::RustfsVolume { path: volume_path },
+        FaultSelection::FixedTargets(fault.selection.value),
+        Duration::from_secs(fault.fault_duration_seconds),
+        fault.parameters.clone(),
+    )
 }
 
 fn validate_run_spec_target(
@@ -1956,7 +1991,7 @@ fn default_recovery_stability_reread_seconds() -> u64 {
     DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct FaultEvidenceArtifact {
     injected: bool,
     active_during_workload: bool,
@@ -1991,7 +2026,7 @@ struct FaultEvidenceArtifact {
     recovery_ended_at_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct PodIdentityArtifact {
     name: String,
     uid: String,
@@ -2219,10 +2254,10 @@ mod tests {
     use crate::fault::{
         config::FaultTestConfig,
         history::{OperationOutcome, OperationRecord},
-        plan::{FaultPlan, FaultPlanOptions, FaultSelection},
+        plan::{FaultInjection, FaultKind, FaultPlan, FaultSelection, FaultTarget},
         preflight::{
             TargetPersistentVolumeClaimProof, TargetPersistentVolumeProof, TargetProof,
-            TargetResolvedPodProof,
+            TargetResolvedPodProof, TargetVolumeMountProof,
         },
         quorum::{ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape},
         reporting::{
@@ -2234,7 +2269,7 @@ mod tests {
         workload::WorkloadPlan,
     };
     use serde_json::json;
-    use std::fs;
+    use std::{fs, time::Duration};
 
     #[test]
     fn validates_successful_fault_artifacts() {
@@ -2262,19 +2297,77 @@ mod tests {
     }
 
     #[test]
+    fn percent_volume_artifacts_accept_csi_pv_without_hostname_affinity() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = "io-eio".to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario(&scenario, catalog).expect("percent plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let run_spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+        let proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs([TargetResolvedPodProof::new("rustfs-0", "uid-0")
+                .with_node("node-a")
+                .with_ready(true)
+                .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
+                    name: "data-rustfs-0".to_string(),
+                    volume_name: Some("pv-csi".to_string()),
+                    storage_class: Some("fast-csi".to_string()),
+                    persistent_volume: Some(TargetPersistentVolumeProof {
+                        name: "pv-csi".to_string(),
+                        source: Some("csi".to_string()),
+                        node: None,
+                        device_or_path: Some("csi-volume-handle".to_string()),
+                    }),
+                }])]);
+        let options = ArtifactValidationOptions {
+            scenario: scenario.name.clone(),
+            artifact_root: std::path::PathBuf::from("unused"),
+            expected_workload_objects: scenario.object_count,
+            expected_workload_concurrency: config.workload.concurrency,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: config.expected_rustfs_pod_count,
+            expected_stable_window_seconds: config.rustfs_pod_stable_window.as_secs(),
+            expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
+            expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
+        };
+
+        validate_run_spec(&run_spec, &options).expect("canonical percent run spec");
+        validate_target_proof(&proof, &run_spec, &options)
+            .expect("CSI PV without hostname affinity remains valid for percent mode");
+    }
+
+    #[test]
     fn fixed_volume_runtime_evidence_binds_plan_proof_status_and_drift() {
         let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
         config.scenario = "io-eio".to_string();
         let scenario = FaultScenario::from_config(&config).expect("scenario");
         let catalog = scenario_spec(&scenario.name).expect("catalog");
-        let plan = FaultPlan::from_scenario_with_options(
-            &scenario,
-            catalog,
-            FaultPlanOptions {
-                rustfs_volume_path: "/data/rustfs0".to_string(),
-                scenario_parameters: Default::default(),
-                volume_selection: Some(FaultSelection::FixedTargets(2)),
-            },
+        let plan = FaultPlan::new(
+            scenario.name.clone(),
+            scenario.case_name,
+            crate::fault::plan::FaultWorkloadMode::S3Mixed,
+            vec![
+                FaultInjection::new(
+                    FaultKind::RustfsVolumeIoError,
+                    crate::fault::scenarios::FaultBackend::ChaosMeshIoChaos,
+                    FaultTarget::RustfsVolume {
+                        path: "/data/rustfs0".to_string(),
+                    },
+                    FaultSelection::FixedTargets(2),
+                    Duration::from_secs(60),
+                )
+                .expect("fixed volume injection"),
+            ],
         )
         .expect("fixed volume plan");
         let workload_plan =
@@ -2292,12 +2385,19 @@ mod tests {
             TargetResolvedPodProof::new(format!("rustfs-{index}"), format!("uid-{index}"))
                 .with_node(format!("node-{index}"))
                 .with_ready(true)
+                .with_volume_mounts(vec![TargetVolumeMountProof {
+                    container_name: "rustfs".to_string(),
+                    mount_path: "/data/rustfs0".to_string(),
+                    volume_name: format!("data-{index}"),
+                    persistent_volume_claim: Some(format!("data-{index}")),
+                }])
                 .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
                     name: format!("data-{index}"),
                     volume_name: Some(format!("pv-{index}")),
                     storage_class: Some("fast-csi".to_string()),
                     persistent_volume: Some(TargetPersistentVolumeProof {
                         name: format!("pv-{index}"),
+                        source: Some("local".to_string()),
                         node: Some(format!("node-{index}")),
                         device_or_path: Some(format!("/dev/disk-{index}")),
                     }),
@@ -2319,7 +2419,10 @@ mod tests {
             expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
             expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
         };
-        validate_run_spec(&run_spec, &options).expect("canonical fixed volume run spec");
+        assert!(
+            validate_run_spec(&run_spec, &options).is_err(),
+            "current catalog has no executable fixed-volume selection source"
+        );
         validate_target_proof(&proof, &run_spec, &options).expect("fixed volume target proof");
 
         let namespace = &run_spec.cluster.namespace;
@@ -2389,6 +2492,46 @@ mod tests {
         .expect("fault evidence");
         validate_fixed_volume_runtime_evidence(&evidence, &proof, &run_spec)
             .expect("fixed volume runtime evidence");
+
+        let mut wrong_topology = proof.clone();
+        wrong_topology.resolved_pods[0].persistent_volume_claims[0]
+            .persistent_volume
+            .as_mut()
+            .expect("pv")
+            .node = Some("other-node".to_string());
+        assert!(
+            validate_fixed_volume_runtime_evidence(&evidence, &wrong_topology, &run_spec).is_err(),
+            "local PV topology must match the selected Pod node"
+        );
+
+        let mut wrong_mount = proof.clone();
+        wrong_mount.resolved_pods[0].volume_mounts[0].persistent_volume_claim =
+            Some("unrelated-logs".to_string());
+        assert!(
+            validate_fixed_volume_runtime_evidence(&evidence, &wrong_mount, &run_spec).is_err(),
+            "the configured mount path must link to its own PVC/PV"
+        );
+
+        for (pointer, value) in [
+            ("/spec/action", json!("latency")),
+            ("/spec/errno", json!(28)),
+            ("/spec/methods", json!(["WRITE"])),
+            ("/spec/duration", json!("61s")),
+        ] {
+            let mut tampered = evidence.clone();
+            for snapshots in [
+                &mut tampered.active_snapshots,
+                &mut tampered.workload_snapshots,
+            ] {
+                *snapshots[0]["chaos_status"]
+                    .pointer_mut(pointer)
+                    .expect("tamper target") = value.clone();
+            }
+            assert!(
+                validate_fixed_volume_runtime_evidence(&tampered, &proof, &run_spec).is_err(),
+                "artifact validation must reject tampered {pointer}"
+            );
+        }
 
         evidence.fixed_volume_targets_at_workload_snapshot[1] = target(2);
         assert!(validate_fixed_volume_runtime_evidence(&evidence, &proof, &run_spec).is_err());
