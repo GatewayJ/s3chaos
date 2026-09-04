@@ -285,17 +285,38 @@ validate_runtime_env_contract() {
 
 validate_dm_env_contract() {
   local scenario="$1"
+  local dm_opt_in
   require_nonempty_env RUSTFS_FAULT_TEST_DM_NAME
   require_nonempty_env RUSTFS_FAULT_TEST_DM_NODE
   require_nonempty_env RUSTFS_FAULT_TEST_DM_MOUNT_PATH
+  require_nonempty_env RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE
+  require_nonempty_env RUSTFS_FAULT_TEST_DM_OBSERVER_POD
+  require_nonempty_env RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST
   if [[ "$scenario" == "dm-flakey" ]]; then
     require_nonempty_env RUSTFS_FAULT_TEST_DM_FAULT_TABLE
   fi
 
   require_safe_dm_name RUSTFS_FAULT_TEST_DM_NAME "$RUSTFS_FAULT_TEST_DM_NAME"
   require_safe_node_name RUSTFS_FAULT_TEST_DM_NODE "$RUSTFS_FAULT_TEST_DM_NODE"
+  require_safe_node_name RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE"
+  require_safe_node_name RUSTFS_FAULT_TEST_DM_OBSERVER_POD "$RUSTFS_FAULT_TEST_DM_OBSERVER_POD"
   require_absolute_non_root_path RUSTFS_FAULT_TEST_DM_MOUNT_PATH "$RUSTFS_FAULT_TEST_DM_MOUNT_PATH"
+  require_absolute_non_root_path RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST "$RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST"
+  require_safe_node_name RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST "$RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST"
   require_safe_image_ref RUSTFS_FAULT_TEST_DM_HELPER_IMAGE "${RUSTFS_FAULT_TEST_DM_HELPER_IMAGE:-rancher/mirrored-library-busybox:1.37.0}"
+
+  dm_opt_in="$(printf '%s' "$RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE" | tr '[:upper:]' '[:lower:]')"
+  [[ "$dm_opt_in" == "1" || "$dm_opt_in" == "true" || "$dm_opt_in" == "yes" ]] \
+    || die "RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE must explicitly enable device-mapper mutation"
+  [[ "$RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST" == "$RUSTFS_FAULT_TEST_DM_NODE" ]] \
+    || die "RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST must exactly match RUSTFS_FAULT_TEST_DM_NODE"
+  [[ "$RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST" == "/dev/mapper/$RUSTFS_FAULT_TEST_DM_NAME" ]] \
+    || die "RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST must exactly match /dev/mapper/$RUSTFS_FAULT_TEST_DM_NAME"
+  [[ "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE" != "$FAULT_NAMESPACE" ]] \
+    || die "the read-only DM observer must be outside the disposable fault Tenant namespace"
 }
 
 require_namespace_ownership() {
@@ -513,6 +534,9 @@ preflight() {
   done
   if scenario_requires_static_storage "$scenario"; then
     validate_dm_env_contract "$scenario"
+    kubectl_cluster -n "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE" \
+      get pod "$RUSTFS_FAULT_TEST_DM_OBSERVER_POD" >/dev/null \
+      || die "$scenario requires the configured pre-provisioned host observer Pod"
     kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 || die "$scenario requires a pre-created owned fault namespace with privileged Pod Security"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] || die "$scenario requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
   fi

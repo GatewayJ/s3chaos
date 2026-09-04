@@ -23,6 +23,11 @@ use std::{
 use crate::{
     fault::{
         config::FaultTestConfig,
+        host_storage::{
+            HostStorageAllowlist, HostStorageMutationIntent, HostStorageMutationProof,
+            HostStoragePostCleanupObservation, HostStorageTargetObservation,
+            normalized_dm_table_sha256,
+        },
         plan::{FaultInjection, FaultKind},
         scenarios::FaultScenario,
     },
@@ -142,6 +147,8 @@ pub struct DmFlakeyGuard {
     mount_state: DmMountState,
     crash_boundary_completed: bool,
     recovery_snapshot: Option<DmStatusSnapshot>,
+    preflight_proof: HostStorageMutationProof,
+    fault_applied: bool,
     restored: bool,
 }
 
@@ -163,6 +170,15 @@ pub(crate) struct FaultApplyRequest<'a> {
     pub scenario: &'a FaultScenario,
     pub injection: &'a FaultInjection,
     pub run_id: &'a str,
+    pub host_storage_proof: &'a HostStorageMutationProof,
+}
+
+pub(crate) struct HostStoragePreflightRequest<'a> {
+    pub config: &'a FaultTestConfig,
+    pub scenario: &'a FaultScenario,
+    pub injection: &'a FaultInjection,
+    pub run_id: &'a str,
+    pub fault_name: &'a str,
 }
 
 pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<DmFlakeyGuard> {
@@ -175,6 +191,7 @@ pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<DmFlakeyGua
                 request.collector,
                 request.scenario.case_name,
                 &request.scenario.name,
+                request.host_storage_proof,
             )
         }
         None => bail!(
@@ -187,7 +204,100 @@ pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<DmFlakeyGua
 pub(crate) fn validate_config(config: &FaultTestConfig, kind: FaultKind) -> Result<()> {
     let behavior = dm_behavior(kind)
         .with_context(|| format!("fault kind {} is not a device-mapper fault", kind.as_str()))?;
-    validate_dm_spec(&dm_flakey_spec(config, "preflight", behavior)?)
+    let spec = dm_flakey_spec(config, "preflight", behavior)?;
+    validate_dm_spec(&spec)?;
+    ensure!(
+        config
+            .dm_observer_pod
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty()),
+        "RUSTFS_FAULT_TEST_DM_OBSERVER_POD is required for side-effect-free host observation"
+    );
+    ensure!(
+        config
+            .dm_observer_namespace
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty()),
+        "RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE is required for side-effect-free host observation"
+    );
+    ensure!(
+        config.dm_observer_namespace.as_deref() != Some(config.cluster.test_namespace.as_str()),
+        "host observer must be outside the disposable fault Tenant namespace"
+    );
+    ensure!(
+        config.device_mapper_destructive_enabled,
+        "device-mapper mutation requires RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE=1"
+    );
+    require_exact_config_allowlist(
+        "RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST",
+        &config.host_mutation_allowed_nodes,
+        spec.node,
+    )?;
+    require_exact_config_allowlist(
+        "RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST",
+        &config.host_mutation_allowed_devices,
+        &format!("/dev/mapper/{}", spec.name),
+    )?;
+    ensure!(
+        config.host_mutation_allowed_persistent_volumes.len() == 1
+            && !config.host_mutation_allowed_persistent_volumes[0]
+                .trim()
+                .is_empty(),
+        "RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST must contain exactly one non-empty PV name"
+    );
+    Ok(())
+}
+
+pub(crate) fn preflight_mutation(
+    request: &HostStoragePreflightRequest<'_>,
+) -> Result<HostStorageMutationProof> {
+    let behavior = dm_behavior(request.injection.kind()).with_context(|| {
+        format!(
+            "fault kind {} is not a device-mapper mutation",
+            request.injection.kind().as_str()
+        )
+    })?;
+    validate_config(request.config, request.injection.kind())?;
+    let spec = dm_flakey_spec(request.config, request.run_id, behavior)?;
+    let observer_pod = request
+        .config
+        .dm_observer_pod
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_POD is required")?;
+    let observer_namespace = request
+        .config
+        .dm_observer_namespace
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE is required")?;
+    let observation = observe_dm_target_read_only(
+        &request.config.cluster,
+        &spec,
+        observer_namespace,
+        observer_pod,
+    )?;
+    HostStorageMutationProof::prove_device_mapper(
+        HostStorageMutationIntent {
+            scenario: request.scenario.name.clone(),
+            fault_name: request.fault_name.to_string(),
+            fault_kind: request.injection.kind().as_str().to_string(),
+            run_id: request.run_id.to_string(),
+            context: request.config.cluster.context.clone(),
+            namespace: request.config.cluster.test_namespace.clone(),
+            tenant: request.config.cluster.tenant_name.clone(),
+            observer_namespace: observer_namespace.to_string(),
+            observer_pod: observer_pod.to_string(),
+            backend_specific_destructive_opt_in: request.config.device_mapper_destructive_enabled,
+            allowlist: HostStorageAllowlist {
+                nodes: request.config.host_mutation_allowed_nodes.clone(),
+                devices: request.config.host_mutation_allowed_devices.clone(),
+                persistent_volumes: request
+                    .config
+                    .host_mutation_allowed_persistent_volumes
+                    .clone(),
+            },
+        },
+        observation,
+    )
 }
 
 fn dm_behavior(kind: FaultKind) -> Option<DmFaultBehavior> {
@@ -196,6 +306,246 @@ fn dm_behavior(kind: FaultKind) -> Option<DmFaultBehavior> {
         FaultKind::RustfsBlockDeviceDropWritesCrash => Some(DmFaultBehavior::DropWritesCrash),
         _ => None,
     }
+}
+
+fn require_exact_config_allowlist(label: &str, values: &[String], expected: &str) -> Result<()> {
+    ensure!(
+        values.len() == 1 && values[0].trim() == expected,
+        "{label} must contain exactly {expected:?}"
+    );
+    Ok(())
+}
+
+fn observe_dm_target_read_only(
+    config: &ClusterTestConfig,
+    spec: &DmFlakeySpec<'_>,
+    observer_namespace: &str,
+    observer_pod: &str,
+) -> Result<HostStorageTargetObservation> {
+    let mapping = verify_dm_volume_mapping(config, spec.node, spec.mount_path)?;
+    validate_observer_pod(config, spec, observer_namespace, observer_pod)?;
+    let mount_source =
+        observer_findmnt_field(config, observer_namespace, observer_pod, &mapping, "SOURCE")?;
+    let mount_canonical_source = observer_host_command(
+        config,
+        observer_namespace,
+        observer_pod,
+        ["/usr/bin/readlink", "-f", mount_source.as_str()],
+    )?
+    .stdout
+    .trim()
+    .to_string();
+    let filesystem =
+        observer_findmnt_field(config, observer_namespace, observer_pod, &mapping, "FSTYPE")?;
+    let logical_device = format!("/dev/mapper/{}", spec.name);
+    let canonical_device = observer_host_command(
+        config,
+        observer_namespace,
+        observer_pod,
+        ["/usr/bin/readlink", "-f", logical_device.as_str()],
+    )?
+    .stdout
+    .trim()
+    .to_string();
+    ensure!(
+        !canonical_device.is_empty() && canonical_device == mount_canonical_source,
+        "fault-test PV mount {:?} on node {:?} does not resolve to device-mapper target {:?}",
+        mapping.mount_path,
+        mapping.node,
+        spec.name
+    );
+    let original_table = observer_host_command(
+        config,
+        observer_namespace,
+        observer_pod,
+        ["/usr/sbin/dmsetup", "table", spec.name],
+    )?
+    .stdout;
+    let recovery_table = spec
+        .recovery_table
+        .map(str::to_string)
+        .unwrap_or_else(|| original_table.trim().to_string());
+    ensure!(
+        !recovery_table.trim().is_empty(),
+        "dmsetup returned an empty recovery table for {:?}",
+        spec.name
+    );
+    if spec.recovery_table.is_some() {
+        ensure!(
+            normalize_dm_table(&recovery_table) == normalize_dm_table(&original_table),
+            "configured recovery table must match the active device-mapper table"
+        );
+    }
+    Ok(HostStorageTargetObservation {
+        node: mapping.node,
+        pod: mapping.pod,
+        pod_uid: mapping.pod_uid,
+        persistent_volume_claim: mapping.pvc,
+        persistent_volume: mapping.pv,
+        persistent_volume_path: mapping.mount_path,
+        mapper_name: spec.name.to_string(),
+        logical_device,
+        canonical_device,
+        mount_source,
+        mount_canonical_source,
+        filesystem,
+        recovery_table,
+        observed_at_ms: now_ms(),
+    })
+}
+
+fn validate_observer_pod(
+    config: &ClusterTestConfig,
+    spec: &DmFlakeySpec<'_>,
+    observer_namespace: &str,
+    observer_pod: &str,
+) -> Result<()> {
+    let pod = Kubectl::new(config)
+        .namespaced(observer_namespace)
+        .command(["get", "pod", observer_pod, "-o", "json"])
+        .run_checked()
+        .context("reading pre-provisioned host observer Pod")?;
+    let pod = serde_json::from_str::<Value>(&pod.stdout).context("parse host observer Pod")?;
+    ensure!(
+        pod.pointer("/spec/nodeName").and_then(Value::as_str) == Some(spec.node),
+        "host observer Pod is not pinned to device-mapper target node {:?}",
+        spec.node
+    );
+    ensure!(
+        pod.pointer("/metadata/labels/app.kubernetes.io~1managed-by")
+            .and_then(Value::as_str)
+            == Some(MANAGED_BY_VALUE)
+            && pod
+                .pointer("/metadata/labels/rustfs.com~1fault-host-observer")
+                .and_then(Value::as_str)
+                == Some("true"),
+        "host observer Pod must carry s3chaos ownership and fault-host-observer labels"
+    );
+    ensure!(
+        pod.pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|condition| {
+                condition.get("type").and_then(Value::as_str) == Some("Ready")
+                    && condition.get("status").and_then(Value::as_str) == Some("True")
+            }),
+        "host observer Pod is not Ready"
+    );
+    let containers = pod
+        .pointer("/spec/containers")
+        .and_then(Value::as_array)
+        .context("host observer Pod is missing containers")?;
+    ensure!(
+        containers.len() == 1,
+        "host observer Pod must contain exactly one validated container"
+    );
+    let container = &containers[0];
+    ensure!(
+        container
+            .pointer("/securityContext/privileged")
+            .and_then(Value::as_bool)
+            == Some(true),
+        "host observer container must be privileged"
+    );
+    let host_volume_name = container
+        .pointer("/volumeMounts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|mount| {
+            mount.get("mountPath").and_then(Value::as_str) == Some("/host")
+                && mount.get("readOnly").and_then(Value::as_bool) == Some(true)
+        })
+        .and_then(|mount| mount.get("name").and_then(Value::as_str));
+    let host_volume_name = host_volume_name.context(
+        "host observer Pod must expose /host through a read-only privileged volume mount",
+    )?;
+    ensure!(
+        pod.pointer("/spec/volumes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|volume| {
+                volume.get("name").and_then(Value::as_str) == Some(host_volume_name)
+                    && volume.pointer("/hostPath/path").and_then(Value::as_str) == Some("/")
+                    && volume.pointer("/hostPath/type").and_then(Value::as_str) == Some("Directory")
+            }),
+        "host observer Pod /host mount must reference the read-only host root"
+    );
+    let node = Kubectl::new(config)
+        .command(["get", "node", spec.node, "-o", "json"])
+        .run_checked()
+        .context("reading host observer target node")?;
+    let node = serde_json::from_str::<Value>(&node.stdout).context("parse host observer node")?;
+    ensure!(
+        !node
+            .pointer("/spec/taints")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|taint| taint.get("key").and_then(Value::as_str) == Some(CRASH_TAINT_KEY)),
+        "device-mapper target node already has the crash-containment quarantine taint"
+    );
+    ensure!(
+        pod.pointer("/spec/restartPolicy").and_then(Value::as_str) == Some("Never"),
+        "host observer Pod restartPolicy must be Never"
+    );
+    Ok(())
+}
+
+fn observer_findmnt_field(
+    config: &ClusterTestConfig,
+    observer_namespace: &str,
+    observer_pod: &str,
+    mapping: &DmVolumeMapping,
+    field: &str,
+) -> Result<String> {
+    let value = observer_host_command(
+        config,
+        observer_namespace,
+        observer_pod,
+        [
+            "/usr/bin/findmnt",
+            "-n",
+            "-o",
+            field,
+            "--target",
+            mapping.mount_path.as_str(),
+        ],
+    )?
+    .stdout
+    .trim()
+    .to_string();
+    ensure!(
+        !value.is_empty(),
+        "host observer findmnt returned empty {field}"
+    );
+    Ok(value)
+}
+
+fn observer_host_command<I, S>(
+    config: &ClusterTestConfig,
+    observer_namespace: &str,
+    observer_pod: &str,
+    args: I,
+) -> Result<CommandOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut command = vec![
+        "exec".to_string(),
+        observer_pod.to_string(),
+        "--".to_string(),
+        "chroot".to_string(),
+        "/host".to_string(),
+    ];
+    command.extend(args.into_iter().map(Into::into));
+    Kubectl::new(config)
+        .namespaced(observer_namespace)
+        .command(command)
+        .run_checked()
 }
 
 fn dm_flakey_spec<'a>(
@@ -242,6 +592,7 @@ pub fn apply_dm_flakey(
     collector: &ArtifactCollector,
     case_name: &str,
     scenario: &str,
+    preflight_proof: &HostStorageMutationProof,
 ) -> Result<DmFlakeyGuard> {
     validate_dm_spec(spec)?;
     let mapping = verify_dm_volume_mapping(config, spec.node, spec.mount_path)?;
@@ -278,6 +629,8 @@ pub fn apply_dm_flakey(
         mount_state: DmMountState::Unknown,
         crash_boundary_completed: false,
         recovery_snapshot: None,
+        preflight_proof: preflight_proof.clone(),
+        fault_applied: false,
         restored: false,
     };
     guard.wait_helper_ready()?;
@@ -296,14 +649,21 @@ pub fn apply_dm_flakey(
         "dmsetup returned an empty recovery table for {:?}",
         spec.name
     );
-    if spec.behavior == DmFaultBehavior::DropWritesCrash && spec.recovery_table.is_some() {
+    if spec.recovery_table.is_some() {
         ensure!(
             normalize_dm_table(&guard.recovery_table) == normalize_dm_table(&original_table),
-            "drop_writes crash recovery table must match the device-mapper table that was active before injection; configured {:?}, active {:?}",
+            "configured recovery table must match the device-mapper table that was active before injection; configured {:?}, active {:?}",
             guard.recovery_table,
             original_table
         );
     }
+    let apply_observation = guard.target_observation(&guard.recovery_table)?;
+    guard
+        .preflight_proof
+        .require_fresh_at(apply_observation.observed_at_ms)?;
+    guard
+        .preflight_proof
+        .require_apply_observation(&apply_observation)?;
 
     guard.fault_table = match spec.behavior {
         DmFaultBehavior::ErrorInjection => spec
@@ -316,6 +676,7 @@ pub fn apply_dm_flakey(
         DmFaultBehavior::ErrorInjection => DmSuspendMode::Default,
         DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
     };
+    guard.fault_applied = true;
     guard.load_table(&guard.fault_table.clone(), suspend_mode)?;
     let active = guard.snapshot("active")?;
     ensure!(
@@ -484,6 +845,37 @@ impl DmFlakeyGuard {
             self.remove_node_taint()?;
         }
         self.recovery_snapshot = Some(self.snapshot("recovered")?);
+        let mount = self.capture_mount_snapshot()?;
+        self.verify_mount_source(&mount)?;
+        let cleanup_observation = HostStoragePostCleanupObservation {
+            schema_version: 1,
+            scenario: self.scenario.clone(),
+            fault_name: self.preflight_proof.fault_name.clone(),
+            run_id: self.run_id.clone(),
+            observed_at_ms: now_ms(),
+            node: self.mapping.node.clone(),
+            persistent_volume: self.mapping.pv.clone(),
+            mapper_name: self.dm_name.clone(),
+            logical_device: format!("/dev/mapper/{}", self.dm_name),
+            canonical_device: self.mapper_canonical_device()?,
+            mount_canonical_source: mount.canonical_source.clone(),
+            filesystem_mounted: true,
+            node_quarantined: self.node_has_crash_taint()?,
+            recovery_table_sha256: normalized_dm_table_sha256(
+                &self
+                    .recovery_snapshot
+                    .as_ref()
+                    .context("device-mapper recovery snapshot is missing")?
+                    .table,
+            )?,
+        };
+        self.preflight_proof
+            .validate_post_cleanup(&cleanup_observation)?;
+        self.collector.write_text(
+            &self.case_name,
+            "host-storage-post-cleanup.json",
+            &serde_json::to_string_pretty(&cleanup_observation)?,
+        )?;
         if self.requires_crash_boundary() {
             let snapshot = DmCrashRecoverySnapshot {
                 scenario: self.scenario.clone(),
@@ -570,15 +962,9 @@ impl DmFlakeyGuard {
     }
 
     fn verify_mount_source(&self, mount: &DmMountSnapshot) -> Result<()> {
-        let mapper = self
-            .host_command([
-                "/usr/bin/readlink",
-                "-f",
-                &format!("/dev/mapper/{}", self.dm_name),
-            ])?
-            .stdout;
+        let mapper = self.mapper_canonical_device()?;
         ensure!(
-            mount.canonical_source == mapper.trim(),
+            mount.canonical_source == mapper,
             "fault-test PV mount {:?} on node {:?} is backed by {:?}, not device-mapper target {:?}",
             self.mapping.mount_path,
             self.mapping.node,
@@ -586,6 +972,59 @@ impl DmFlakeyGuard {
             self.dm_name
         );
         Ok(())
+    }
+
+    fn mapper_canonical_device(&self) -> Result<String> {
+        let mapper = self
+            .host_command([
+                "/usr/bin/readlink",
+                "-f",
+                &format!("/dev/mapper/{}", self.dm_name),
+            ])?
+            .stdout
+            .trim()
+            .to_string();
+        ensure!(
+            !mapper.is_empty(),
+            "device-mapper canonical device is empty"
+        );
+        Ok(mapper)
+    }
+
+    fn target_observation(&self, recovery_table: &str) -> Result<HostStorageTargetObservation> {
+        let mount = self
+            .mount_snapshot
+            .as_ref()
+            .context("device-mapper mount snapshot is missing")?;
+        Ok(HostStorageTargetObservation {
+            node: self.mapping.node.clone(),
+            pod: self.mapping.pod.clone(),
+            pod_uid: self.mapping.pod_uid.clone(),
+            persistent_volume_claim: self.mapping.pvc.clone(),
+            persistent_volume: self.mapping.pv.clone(),
+            persistent_volume_path: self.mapping.mount_path.clone(),
+            mapper_name: self.dm_name.clone(),
+            logical_device: format!("/dev/mapper/{}", self.dm_name),
+            canonical_device: self.mapper_canonical_device()?,
+            mount_source: mount.source.clone(),
+            mount_canonical_source: mount.canonical_source.clone(),
+            filesystem: mount.filesystem.clone(),
+            recovery_table: recovery_table.to_string(),
+            observed_at_ms: now_ms(),
+        })
+    }
+
+    fn node_has_crash_taint(&self) -> Result<bool> {
+        let node = Kubectl::new(&self.config)
+            .command(["get", "node", self.mapping.node.as_str(), "-o", "json"])
+            .run_checked()?;
+        let node = serde_json::from_str::<Value>(&node.stdout).context("parse DM target node")?;
+        Ok(node
+            .pointer("/spec/taints")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|taint| taint.get("key").and_then(Value::as_str) == Some(CRASH_TAINT_KEY)))
     }
 
     fn load_table(&self, table: &str, mode: DmSuspendMode) -> Result<()> {
@@ -907,8 +1346,8 @@ impl Drop for DmFlakeyGuard {
     fn drop(&mut self) {
         if !self.restored {
             let recovery_table = self.recovery_table.clone();
-            let mut storage_recovered = recovery_table.is_empty();
-            if !recovery_table.is_empty() {
+            let mut storage_recovered = !self.fault_applied;
+            if self.fault_applied && !recovery_table.is_empty() {
                 let mode = match self.behavior {
                     DmFaultBehavior::ErrorInjection => DmSuspendMode::NoFlush,
                     DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
@@ -953,6 +1392,18 @@ impl Drop for DmFlakeyGuard {
                     "warning: failed to remove crash-containment taint from node {node} during guard cleanup: {error}",
                     node = self.mapping.node,
                 );
+            }
+            if self.fault_applied && !storage_recovered && !self.node_tainted {
+                match self.add_node_taint() {
+                    Ok(()) => eprintln!(
+                        "warning: quarantined node {node} after device-mapper recovery failed",
+                        node = self.mapping.node,
+                    ),
+                    Err(error) => eprintln!(
+                        "warning: failed to quarantine node {node} after device-mapper recovery failed: {error}",
+                        node = self.mapping.node,
+                    ),
+                }
             }
             if storage_recovered {
                 if let Err(error) = self.delete_helper() {

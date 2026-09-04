@@ -298,16 +298,20 @@ guardrails when implementing the ordered TODO below.
   non-target nodes, and non-fault tenants remain hard stops. Existing scenarios
   should keep current behavior.
 
-- [ ] TODO: Add host/storage mutation preflight.
-  Meaning: before PV replacement, bitrot, stale disk, or dm mutation execution,
-  preflight must prove node/device/PV allowlist match, explicit backend-specific
-  destructive opt-in, rollback or quarantine command, and post-cleanup
-  observation.
+- [x] DONE: Add host/storage mutation preflight.
+  Meaning: executable device-mapper scenarios now require exact singleton
+  node/device/PV allowlists, a separate device-mapper destructive opt-in, and a
+  typed rollback/quarantine/post-cleanup contract. Apply re-observes the target
+  against `host-storage-proof.json`; successful recovery must produce a matching
+  `host-storage-post-cleanup.json`. PV replacement, bitrot, and stale-disk flows
+  remain non-executable catalog entries and must use the same domain proof when
+  their backend adapters are implemented.
 
-- [ ] TODO: Make host/storage mutation preflight side-effect free.
-  Meaning: the preflight PR may read Kubernetes/host metadata and write proof
-  artifacts, but it must not mutate disks, PV contents, storage objects, or power
-  state.
+- [x] DONE: Make host/storage mutation preflight side-effect free.
+  Meaning: host preflight reads Kubernetes metadata and fixed read-only host
+  commands through a pre-provisioned observer Pod, then writes only the proof
+  artifact. It does not create the observer or mutate disks, PV/PVC objects,
+  object data, or power state.
 
 ### 7. Wire Precise Final Checker Classifications
 

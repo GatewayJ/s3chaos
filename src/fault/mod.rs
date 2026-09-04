@@ -23,6 +23,7 @@ mod fault_artifacts;
 mod fault_lifecycle;
 pub mod fixture;
 pub mod history;
+pub(crate) mod host_storage;
 pub mod plan;
 pub mod pods;
 pub mod preflight;

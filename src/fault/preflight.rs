@@ -515,8 +515,12 @@ impl TargetProof {
 
     fn record_runtime_target_requirements(&mut self) {
         let requires_selector = self.faults.iter().any(|fault| fault.pod_selector.is_some());
-        let requires_volume_binding = self.faults.iter().any(|fault| fault.volume_path.is_some());
-        if requires_selector {
+        let requires_host_target = self.faults.iter().any(|fault| fault.host_target.is_some());
+        let requires_volume_binding = self
+            .faults
+            .iter()
+            .any(|fault| fault.volume_path.is_some() || fault.host_target.is_some());
+        if requires_selector || requires_host_target {
             self.requirements.push(TargetProofRequirement {
                 name: "target_pods_resolved".to_string(),
                 status: if self.resolved_pods.is_empty() {

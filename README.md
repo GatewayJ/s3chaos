@@ -91,9 +91,11 @@ The two `dm-flakey*` scenarios need host preparation beyond the environment
 variables below: a device-mapper flakey table over a dedicated block device,
 a static local PV/storage class, and scenario-specific variables
 (`RUSTFS_FAULT_TEST_DM_NAME`, `RUSTFS_FAULT_TEST_DM_NODE`,
-`RUSTFS_FAULT_TEST_DM_MOUNT_PATH`, plus a fault table name for legacy
-`dm-flakey`). Follow [`docs/DM_FLAKEY.md`](docs/DM_FLAKEY.md) for the complete
-host device, static Local PV, privileged namespace, run, and teardown process.
+`RUSTFS_FAULT_TEST_DM_MOUNT_PATH`, a separate pre-provisioned read-only host
+observer, backend-specific destructive opt-in, exact node/device/PV allowlists,
+plus a fault table name for legacy `dm-flakey`). Follow
+[`docs/DM_FLAKEY.md`](docs/DM_FLAKEY.md) for the complete host device, static
+Local PV, observer, privileged namespace, run, and teardown process.
 There is no Make target that provisions or removes the host devices.
 
 Required environment for non-static scenarios:

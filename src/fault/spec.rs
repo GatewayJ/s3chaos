@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fault::{
     config::{DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, FaultTestConfig},
+    host_storage::{HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT},
     plan::{
         FaultInjection, FaultInjectionParameters, FaultPlan, FaultSelection, FaultTarget,
         FaultWorkloadMode,
@@ -164,6 +165,12 @@ impl FaultRunSpec {
         run_id: &str,
         bucket: &str,
     ) -> Self {
+        let mut artifacts = FaultRunArtifactSpec::default();
+        if plan.requires_static_storage() {
+            artifacts.required.extend(
+                [HOST_STORAGE_PROOF_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT].map(str::to_string),
+            );
+        }
         Self {
             api_version: FAULT_RUN_API_VERSION.to_string(),
             kind: FAULT_RUN_KIND.to_string(),
@@ -220,7 +227,7 @@ impl FaultRunSpec {
                     FaultRunFaultSpec::from_fault(index, scenario, scenario_spec, fault)
                 })
                 .collect(),
-            artifacts: FaultRunArtifactSpec::default(),
+            artifacts,
         }
     }
 
