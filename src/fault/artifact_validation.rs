@@ -1532,6 +1532,10 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
         report.final_list_warning_count >= report.list_warnings.len(),
         "recovery-stability-report.json final_list_warning_count must cover sampled list_warnings"
     );
+    ensure!(
+        checker::recovery_key_sets_are_consistent(report),
+        "recovery-stability-report.json reread key sets are inconsistent"
+    );
     match report.classification {
         RecoveryStabilityClassification::RecoveryTailReadLatency => {
             ensure!(

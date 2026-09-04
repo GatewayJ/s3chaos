@@ -1860,7 +1860,8 @@ scenarios:
 
         let mut checker = expected_failure_checker_report(&planned.scenario);
         checker["hash_mismatches"] = json!([]);
-        checker["unavailable_committed_objects"] = json!(["k"]);
+        checker["unavailable_committed_objects"] =
+            json!(["k: outcome=Timeout status=200 error=\"get body read timed out\""]);
         fs::write(
             case_dir.join("checker-pre-recommit-report.json"),
             serde_json::to_string(&checker).expect("checker json"),
@@ -1914,6 +1915,27 @@ scenarios:
             100,
         )
         .expect("recovery-tail evidence");
+
+        recovery["reread_attempted_keys"] = json!(["other"]);
+        recovery["reread_recovered_keys"] = json!(["other"]);
+        fs::write(
+            case_dir.join("recovery-stability-report.json"),
+            serde_json::to_string(&recovery).expect("recovery json"),
+        )
+        .expect("write recovery report with mismatched key identity");
+        let error = validate_expected_failure_artifacts(
+            &suite_root,
+            case_dir,
+            &planned.scenario,
+            &planned.case_name,
+            10,
+            100,
+        )
+        .expect_err("same-count recovery evidence for another key must be rejected");
+        assert!(format!("{error:#}").contains("committed_object_unavailable"));
+
+        recovery["reread_attempted_keys"] = json!(["k"]);
+        recovery["reread_recovered_keys"] = json!(["k"]);
 
         let list_warning = "LIST prefix fault-test/ did not complete";
         checker["final_list_warning_count"] = json!(1);

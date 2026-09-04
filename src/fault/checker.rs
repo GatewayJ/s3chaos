@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -457,11 +457,13 @@ pub async fn recovery_stability_reread(
     hash_mismatches.extend(immediate_report.successful_corrupted_reads.iter().cloned());
     let data_corruption_evidence = immediate_data_corruption_evidence(immediate_report);
     let ambiguous_write_evidence = immediate_ambiguous_write_evidence(immediate_report);
+    let still_unavailable_keys =
+        immediate_still_unavailable_keys(immediate_report, &attempted_keys)?;
     let mut report = RecoveryStabilityReport {
         immediate_passed: immediate_report.passed,
         reread_attempted_keys: attempted_keys.clone(),
         reread_recovered_keys: Vec::new(),
-        still_unavailable_keys: immediate_still_unavailable_keys(immediate_report, &attempted_keys),
+        still_unavailable_keys,
         hash_mismatches,
         data_corruption_evidence,
         ambiguous_write_evidence,
@@ -1548,7 +1550,7 @@ fn immediate_ambiguous_write_evidence(report: &CheckerReport) -> Vec<String> {
 fn immediate_still_unavailable_keys(
     report: &CheckerReport,
     reread_attempted_keys: &[String],
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let attempted = reread_attempted_keys
         .iter()
         .map(String::as_str)
@@ -1558,14 +1560,25 @@ fn immediate_still_unavailable_keys(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    ensure!(
+        keys.len() == report.missing_committed_objects.len(),
+        "checker report contains duplicate missing committed-object keys"
+    );
+    let mut observed = keys.clone();
     for failure in report
         .unavailable_committed_objects
         .iter()
         .chain(report.unknown_committed_read_failures.iter())
     {
-        let key = read_failure_key(failure);
-        if !attempted.contains(key.as_str()) {
-            keys.insert(key);
+        let key = read_failure_key(failure).ok_or_else(|| {
+            anyhow!("checker report contains an ambiguous committed-read failure: {failure:?}")
+        })?;
+        ensure!(
+            observed.insert(key.to_string()),
+            "checker report contains duplicate committed-read evidence for key {key:?}"
+        );
+        if !attempted.contains(key) {
+            keys.insert(key.to_string());
         }
     }
     keys.extend(
@@ -1574,15 +1587,128 @@ fn immediate_still_unavailable_keys(
             .iter()
             .map(|item| format!("version:{item}")),
     );
-    keys.into_iter().collect()
+    Ok(keys.into_iter().collect())
 }
 
-fn read_failure_key(message: &str) -> String {
-    message
-        .split_once(':')
-        .map(|(key, _)| key)
-        .unwrap_or(message)
-        .to_string()
+#[derive(Debug, Clone, Copy)]
+struct ReadFailureEvidence<'a> {
+    key: &'a str,
+    outcome: OperationOutcome,
+    http_status: Option<u16>,
+    error: Option<&'a str>,
+}
+
+const READ_FAILURE_MARKER: &str = ": outcome=";
+const UNEXPECTED_BODY_MARKER: &str = ": unexpected body for ";
+
+fn parse_read_failure_message(message: &str) -> Option<ReadFailureEvidence<'_>> {
+    if message.match_indices(READ_FAILURE_MARKER).count() != 1
+        || message.contains(UNEXPECTED_BODY_MARKER)
+    {
+        return None;
+    }
+    let (key, fields) = message.split_once(READ_FAILURE_MARKER)?;
+    if key.is_empty() {
+        return None;
+    }
+    let (outcome, mut remaining) = fields
+        .split_once(' ')
+        .map_or((fields, ""), |(outcome, remaining)| (outcome, remaining));
+    let outcome = match outcome {
+        "Ok" => OperationOutcome::Ok,
+        "NotFound" => OperationOutcome::NotFound,
+        "Failed" => OperationOutcome::Failed,
+        "Timeout" => OperationOutcome::Timeout,
+        "Unknown" => OperationOutcome::Unknown,
+        _ => return None,
+    };
+    let mut http_status = None;
+    if let Some(status_and_remaining) = remaining.strip_prefix("status=") {
+        let (status, rest) = status_and_remaining
+            .split_once(' ')
+            .map_or((status_and_remaining, ""), |(status, rest)| (status, rest));
+        http_status = Some(status.parse().ok()?);
+        remaining = rest;
+    }
+    let error = if remaining.is_empty() {
+        None
+    } else {
+        let error = remaining.strip_prefix("error=")?;
+        (!error.is_empty()).then_some(error)
+    };
+    Some(ReadFailureEvidence {
+        key,
+        outcome,
+        http_status,
+        error,
+    })
+}
+
+fn read_failure_key(message: &str) -> Option<&str> {
+    if let Some(parsed) = parse_read_failure_message(message) {
+        return Some(parsed.key);
+    }
+    if message.match_indices(UNEXPECTED_BODY_MARKER).count() != 1
+        || message.contains(READ_FAILURE_MARKER)
+    {
+        return None;
+    }
+    let (key, detail) = message.split_once(UNEXPECTED_BODY_MARKER)?;
+    (!key.is_empty()
+        && ["Ok", "NotFound", "Failed", "Timeout", "Unknown"]
+            .iter()
+            .any(|outcome| detail.starts_with(outcome))
+        && detail.ends_with(" bytes)"))
+    .then_some(key)
+}
+
+fn immediate_recovery_tail_candidate_keys(report: &CheckerReport) -> Option<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    for (failure, expected_outcome) in report
+        .unavailable_committed_objects
+        .iter()
+        .map(|failure| (failure, OperationOutcome::Timeout))
+        .chain(
+            report
+                .unknown_committed_read_failures
+                .iter()
+                .map(|failure| (failure, OperationOutcome::Unknown)),
+        )
+    {
+        let parsed = parse_read_failure_message(failure)?;
+        if parsed.outcome != expected_outcome
+            || !is_recovery_tail_read_failure(parsed.outcome, parsed.http_status, parsed.error)
+            || !keys.insert(parsed.key.to_string())
+        {
+            return None;
+        }
+    }
+    Some(keys)
+}
+
+pub(crate) fn recovery_key_sets_are_consistent(report: &RecoveryStabilityReport) -> bool {
+    let attempted = report.reread_attempted_keys.iter().collect::<BTreeSet<_>>();
+    let recovered = report.reread_recovered_keys.iter().collect::<BTreeSet<_>>();
+    let still_unavailable = report
+        .still_unavailable_keys
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if attempted.len() != report.reread_attempted_keys.len()
+        || recovered.len() != report.reread_recovered_keys.len()
+        || still_unavailable.len() != report.still_unavailable_keys.len()
+        || !recovered.is_subset(&attempted)
+        || !recovered.is_disjoint(&still_unavailable)
+    {
+        return false;
+    }
+    let has_non_availability_result = !report.hash_mismatches.is_empty()
+        || !report.data_corruption_evidence.is_empty()
+        || !report.ambiguous_write_evidence.is_empty()
+        || !report.harness_errors.is_empty();
+    has_non_availability_result
+        || attempted
+            .difference(&recovered)
+            .all(|key| still_unavailable.contains(key))
 }
 
 fn finish_recovery_stability_report(
@@ -1623,6 +1749,19 @@ fn immediate_failures_are_only_reread_candidates(
     immediate_report: &CheckerReport,
     recovery_report: &RecoveryStabilityReport,
 ) -> bool {
+    let Some(candidate_keys) = immediate_recovery_tail_candidate_keys(immediate_report) else {
+        return false;
+    };
+    let attempted_keys = recovery_report
+        .reread_attempted_keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let recovered_keys = recovery_report
+        .reread_recovered_keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     immediate_report.tenant_recovered
         && immediate_report.missing_committed_objects.is_empty()
         && immediate_report.hash_mismatches.is_empty()
@@ -1639,11 +1778,10 @@ fn immediate_failures_are_only_reread_candidates(
         && immediate_report.version_hash_mismatches.is_empty()
         && immediate_report.missing_committed_delete_markers.is_empty()
         && immediate_report.resurrected_deleted_objects.is_empty()
-        && immediate_report.unavailable_committed_objects.len()
-            + immediate_report.unknown_committed_read_failures.len()
-            == recovery_report.reread_attempted_keys.len()
-        && recovery_report.reread_recovered_keys.len()
-            == recovery_report.reread_attempted_keys.len()
+        && !candidate_keys.is_empty()
+        && recovery_key_sets_are_consistent(recovery_report)
+        && candidate_keys == attempted_keys
+        && attempted_keys == recovered_keys
 }
 
 fn object_model(records: &[OperationRecord]) -> ObjectModel {
@@ -3087,6 +3225,75 @@ mod tests {
     }
 
     #[test]
+    fn recovery_tail_classification_requires_exact_unique_candidate_keys() {
+        let mut immediate = empty_report();
+        immediate
+            .unavailable_committed_objects
+            .push("b: outcome=Timeout status=200 error=\"get body read timed out\"".to_string());
+        immediate
+            .unknown_committed_read_failures
+            .push("a: outcome=Unknown error=\"request timed out before headers\"".to_string());
+        let mut recovery = recovery_report_with_attempted_key("b");
+        recovery.reread_attempted_keys.push("a".to_string());
+        recovery.reread_recovered_keys = vec!["a".to_string(), "b".to_string()];
+
+        finish_recovery_stability_report(&mut recovery, &immediate);
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::RecoveryTailReadLatency,
+            "key-set matching must not depend on vector order"
+        );
+
+        recovery.reread_attempted_keys = vec!["a".to_string(), "other".to_string()];
+        recovery.reread_recovered_keys = recovery.reread_attempted_keys.clone();
+        finish_recovery_stability_report(&mut recovery, &immediate);
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::CommittedObjectUnavailable,
+            "same counts for different keys must not prove tail recovery"
+        );
+
+        recovery.reread_attempted_keys = vec!["a".to_string(), "a".to_string(), "b".to_string()];
+        recovery.reread_recovered_keys = recovery.reread_attempted_keys.clone();
+        finish_recovery_stability_report(&mut recovery, &immediate);
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::CommittedObjectUnavailable,
+            "duplicate recovery keys must fail closed"
+        );
+
+        immediate
+            .unavailable_committed_objects
+            .push(immediate.unavailable_committed_objects[0].clone());
+        recovery.reread_attempted_keys = vec!["a".to_string(), "b".to_string()];
+        recovery.reread_recovered_keys = recovery.reread_attempted_keys.clone();
+        finish_recovery_stability_report(&mut recovery, &immediate);
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::CommittedObjectUnavailable,
+            "duplicate checker evidence must fail closed"
+        );
+    }
+
+    #[test]
+    fn recovery_tail_failure_key_parsing_is_fail_closed_when_ambiguous() {
+        let mut immediate = empty_report();
+        immediate.unavailable_committed_objects.push(
+            "key: outcome=Timeout: outcome=Timeout status=200 error=\"get body read timed out\""
+                .to_string(),
+        );
+        let mut recovery = recovery_report_with_attempted_key("key: outcome=Timeout");
+        recovery.reread_recovered_keys = recovery.reread_attempted_keys.clone();
+
+        finish_recovery_stability_report(&mut recovery, &immediate);
+
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::CommittedObjectUnavailable
+        );
+    }
+
+    #[test]
     fn recovery_evidence_classifications_preserve_tail_latency_with_ambiguous_evidence() {
         let mut recovery = recovery_report_with_attempted_key("k");
         recovery.reread_recovered_keys.push("k".to_string());
@@ -3157,7 +3364,8 @@ mod tests {
         immediate_unavailable
             .unavailable_committed_versions
             .push("k@v1: outcome=Timeout".to_string());
-        let keys = immediate_still_unavailable_keys(&immediate_unavailable, &[]);
+        let keys = immediate_still_unavailable_keys(&immediate_unavailable, &[])
+            .expect("well-formed read failure evidence");
         let mut unavailable = recovery_report_with_attempted_key("k");
         unavailable.ambiguous_write_evidence =
             super::immediate_ambiguous_write_evidence(&immediate_unavailable);
@@ -3226,7 +3434,8 @@ mod tests {
         immediate
             .unavailable_committed_objects
             .push("k: outcome=Timeout error=\"get object timed out\"".to_string());
-        let keys = immediate_still_unavailable_keys(&immediate, &[]);
+        let keys = immediate_still_unavailable_keys(&immediate, &[])
+            .expect("well-formed read failure evidence");
         let mut recovery = RecoveryStabilityReport {
             immediate_passed: false,
             reread_attempted_keys: Vec::new(),
