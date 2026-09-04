@@ -153,6 +153,11 @@ pub struct VerifiedWriteResult {
     pub verified: bool,
 }
 
+struct RecordedDelete {
+    record: OperationRecord,
+    is_delete_marker: Option<bool>,
+}
+
 impl ObjectSpec {
     pub fn key_prefix(run_id: &str) -> String {
         format!("fault-test/{run_id}/")
@@ -1059,6 +1064,33 @@ impl S3WorkloadClient {
     }
 
     pub async fn delete_object(&self, key: &str, recorder: &Recorder) -> Result<OperationOutcome> {
+        Ok(self.delete_object_record(key, recorder).await?.outcome)
+    }
+
+    pub(crate) async fn delete_object_record(
+        &self,
+        key: &str,
+        recorder: &Recorder,
+    ) -> Result<OperationRecord> {
+        Ok(self.delete_object_result(key, recorder).await?.record)
+    }
+
+    /// Returns no trigger candidate when a successful DELETE does not prove it
+    /// created a versioned delete marker. Failed attempts are returned so the
+    /// acknowledgement policy can preserve their exact outcome.
+    pub(crate) async fn delete_marker_record(
+        &self,
+        key: &str,
+        recorder: &Recorder,
+    ) -> Result<Option<OperationRecord>> {
+        let result = self.delete_object_result(key, recorder).await?;
+        if result.record.outcome == OperationOutcome::Ok && result.is_delete_marker != Some(true) {
+            return Ok(None);
+        }
+        Ok(Some(result.record))
+    }
+
+    async fn delete_object_result(&self, key: &str, recorder: &Recorder) -> Result<RecordedDelete> {
         let record = recorder.begin(
             OperationKind::Delete,
             self.bucket.clone(),
@@ -1080,28 +1112,32 @@ impl S3WorkloadClient {
             Ok(Ok(output)) => {
                 let mut record = record;
                 record.version_id = output.version_id().map(str::to_string);
-                recorder.finish(record, OperationOutcome::Ok, Some(204), None)?;
-                Ok(OperationOutcome::Ok)
+                Ok(RecordedDelete {
+                    record: recorder.finish(record, OperationOutcome::Ok, Some(204), None)?,
+                    is_delete_marker: output.delete_marker(),
+                })
             }
             Ok(Err(error)) => {
                 let outcome = classify_sdk_error(&error);
-                recorder.finish(
-                    record,
-                    outcome,
-                    sdk_error_status(&error),
-                    Some(format!("delete object failed: {error}")),
-                )?;
-                Ok(outcome)
+                Ok(RecordedDelete {
+                    record: recorder.finish(
+                        record,
+                        outcome,
+                        sdk_error_status(&error),
+                        Some(format!("delete object failed: {error}")),
+                    )?,
+                    is_delete_marker: None,
+                })
             }
-            Err(_) => {
-                recorder.finish(
+            Err(_) => Ok(RecordedDelete {
+                record: recorder.finish(
                     record,
                     OperationOutcome::Timeout,
                     None,
                     Some("delete object timed out".to_string()),
-                )?;
-                Ok(OperationOutcome::Timeout)
-            }
+                )?,
+                is_delete_marker: None,
+            }),
         }
     }
 
@@ -1123,11 +1159,25 @@ impl S3WorkloadClient {
         object: &PreparedObject,
         recorder: &Recorder,
     ) -> Result<OperationOutcome> {
+        Ok(self
+            .complete_multipart_object_record(object, recorder)
+            .await?
+            .map_or(OperationOutcome::Unknown, |record| record.outcome))
+    }
+
+    /// Completes one multipart object and returns its completion record. A
+    /// missing record means setup failed before CompleteMultipartUpload was
+    /// attempted, so callers must not treat it as an acknowledged mutation.
+    pub(crate) async fn complete_multipart_object_record(
+        &self,
+        object: &PreparedObject,
+        recorder: &Recorder,
+    ) -> Result<Option<OperationRecord>> {
         let Some(upload_id) = self
             .create_multipart_upload(&object.spec.key, recorder)
             .await?
         else {
-            return Ok(OperationOutcome::Unknown);
+            return Ok(None);
         };
         let mut completed_parts = Vec::new();
         for (index, chunk) in object.body.chunks(5 * 1024 * 1024).enumerate() {
@@ -1141,7 +1191,7 @@ impl S3WorkloadClient {
                     let _ = self
                         .abort_multipart_upload(&object.spec.key, &upload_id, recorder)
                         .await;
-                    return Ok(OperationOutcome::Unknown);
+                    return Ok(None);
                 }
             }
         }
@@ -1172,28 +1222,29 @@ impl S3WorkloadClient {
             Ok(Ok(output)) => {
                 let mut record = record;
                 record.version_id = output.version_id().map(str::to_string);
-                recorder.finish(record, OperationOutcome::Ok, Some(200), None)?;
-                Ok(OperationOutcome::Ok)
+                recorder
+                    .finish(record, OperationOutcome::Ok, Some(200), None)
+                    .map(Some)
             }
             Ok(Err(error)) => {
                 let outcome = classify_sdk_error(&error);
-                recorder.finish(
-                    record,
-                    outcome,
-                    sdk_error_status(&error),
-                    Some(format!("complete multipart upload failed: {error}")),
-                )?;
-                Ok(outcome)
+                recorder
+                    .finish(
+                        record,
+                        outcome,
+                        sdk_error_status(&error),
+                        Some(format!("complete multipart upload failed: {error}")),
+                    )
+                    .map(Some)
             }
-            Err(_) => {
-                recorder.finish(
+            Err(_) => recorder
+                .finish(
                     record,
                     OperationOutcome::Timeout,
                     None,
                     Some("complete multipart upload timed out".to_string()),
-                )?;
-                Ok(OperationOutcome::Timeout)
-            }
+                )
+                .map(Some),
         }
     }
 
