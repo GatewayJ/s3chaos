@@ -13,9 +13,12 @@
 // limitations under the License.
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
     thread::sleep,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -25,8 +28,9 @@ use crate::{
         config::FaultTestConfig,
         host_storage::{
             HOST_STORAGE_PROOF_ARTIFACT, HostStorageAllowlist, HostStorageMutationIntent,
-            HostStorageMutationProof, HostStoragePostCleanupObservation,
-            HostStorageTargetObservation, normalized_dm_table_sha256,
+            HostStorageMutationProof, HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
+            HostStoragePostCleanupObservation, HostStorageTargetObservation,
+            normalized_dm_table_sha256,
         },
         plan::{FaultInjection, FaultKind},
         scenarios::FaultScenario,
@@ -81,9 +85,178 @@ pub struct DmVolumeMapping {
     pub node: String,
     pub pod: String,
     pub pod_uid: String,
+    pub volume_name: String,
     pub pvc: String,
+    pub pvc_uid: String,
     pub pv: String,
+    pub pv_uid: String,
+    pub pv_claim_ref: HostStoragePersistentVolumeClaimRef,
+    pub node_selector: HostStorageNodeSelector,
+    pub container_mount_path: String,
     pub mount_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DmPodVolumeBinding {
+    node: String,
+    pod: String,
+    pod_uid: String,
+    volume_name: String,
+    pvc: String,
+    container_mount_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DmObservedState {
+    suspended: bool,
+    active_table: String,
+}
+
+trait DmTransitionPort {
+    fn observe(&mut self) -> Result<DmObservedState>;
+    fn suspend(&mut self, mode: DmSuspendMode) -> Result<()>;
+    fn load(&mut self, table: &str) -> Result<()>;
+    fn resume(&mut self) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum HostMutationPhase {
+    Active,
+    Rollback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HostMutationState {
+    schema_version: u8,
+    token: String,
+    owner_pid: u32,
+    run_id: String,
+    phase: HostMutationPhase,
+}
+
+#[derive(Debug)]
+struct HostMutationLease {
+    path: PathBuf,
+    state: HostMutationState,
+    persisted: bool,
+}
+
+impl HostMutationLease {
+    fn from_config(config: &FaultTestConfig, run_id: &str) -> Result<Self> {
+        let path = config.host_mutation_state_file.clone().context(
+            "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_FILE is required for device-mapper mutation",
+        )?;
+        let token = config.host_mutation_state_token.clone().context(
+            "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_TOKEN is required for device-mapper mutation",
+        )?;
+        ensure!(
+            path.is_absolute() && path.file_name().is_some(),
+            "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_FILE must be an absolute file path"
+        );
+        ensure!(
+            !token.is_empty()
+                && token.len() <= 128
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+            "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_TOKEN contains unsupported characters"
+        );
+        let parent = path
+            .parent()
+            .context("host mutation state path has no parent directory")?;
+        ensure!(
+            parent != Path::new("/")
+                && config.cluster.artifacts_dir.starts_with(parent)
+                && path.file_name().and_then(|value| value.to_str())
+                    == Some(format!(".host-mutation-{token}.json").as_str()),
+            "host mutation state must use its token-specific name within the fault artifact tree"
+        );
+        ensure!(!run_id.trim().is_empty(), "host mutation run id is empty");
+        Ok(Self {
+            path,
+            state: HostMutationState {
+                schema_version: 1,
+                token,
+                owner_pid: std::process::id(),
+                run_id: run_id.to_string(),
+                phase: HostMutationPhase::Active,
+            },
+            persisted: false,
+        })
+    }
+
+    fn set_phase(&mut self, phase: HostMutationPhase) -> Result<()> {
+        if self.persisted {
+            self.require_owned_persisted_state()?;
+        } else {
+            ensure!(
+                !self.path.exists(),
+                "refusing to replace a pre-existing host mutation state file"
+            );
+        }
+        self.state.phase = phase;
+        let parent = self
+            .path
+            .parent()
+            .context("host mutation state path has no parent directory")?;
+        ensure!(
+            parent.is_dir(),
+            "host mutation state parent directory does not exist"
+        );
+        let temporary = temporary_state_path(&self.path, self.state.owner_pid);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("create host mutation state temporary file {temporary:?}"))?;
+        let encoded = serde_json::to_vec(&self.state)?;
+        if let Err(error) = file.write_all(&encoded).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).context("persist host mutation state");
+        }
+        drop(file);
+        if let Err(error) = fs::rename(&temporary, &self.path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).context("publish host mutation state atomically");
+        }
+        self.persisted = true;
+        Ok(())
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        if !self.persisted {
+            return Ok(());
+        }
+        self.require_owned_persisted_state()?;
+        fs::remove_file(&self.path)
+            .with_context(|| format!("remove host mutation state {:?}", self.path))?;
+        self.persisted = false;
+        Ok(())
+    }
+
+    fn require_owned_persisted_state(&self) -> Result<()> {
+        let persisted = fs::read(&self.path)
+            .with_context(|| format!("read host mutation state {:?} before cleanup", self.path))?;
+        let persisted: HostMutationState = serde_json::from_slice(&persisted)
+            .context("parse host mutation state before cleanup")?;
+        ensure!(
+            persisted.token == self.state.token
+                && persisted.owner_pid == self.state.owner_pid
+                && persisted.run_id == self.state.run_id,
+            "host mutation state is owned by another process or run"
+        );
+        Ok(())
+    }
+}
+
+fn temporary_state_path(path: &Path, owner_pid: u32) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("host-mutation-state");
+    path.with_file_name(format!(".{file_name}.{owner_pid}.tmp"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -147,6 +320,7 @@ pub struct DmFlakeyGuard {
     crash_boundary_completed: bool,
     recovery_snapshot: Option<DmStatusSnapshot>,
     preflight_proof: HostStorageMutationProof,
+    mutation_lease: HostMutationLease,
     fault_applied: bool,
     restored: bool,
 }
@@ -185,7 +359,7 @@ pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<DmFlakeyGua
         Some(behavior) => {
             let spec = dm_flakey_spec(request.config, request.run_id, behavior)?;
             apply_dm_flakey(
-                &request.config.cluster,
+                request.config,
                 &spec,
                 request.collector,
                 request.scenario.case_name,
@@ -244,6 +418,7 @@ pub(crate) fn validate_config(config: &FaultTestConfig, kind: FaultKind) -> Resu
                 .is_empty(),
         "RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST must contain exactly one non-empty PV name"
     );
+    HostMutationLease::from_config(config, "preflight")?;
     Ok(())
 }
 
@@ -271,6 +446,7 @@ pub(crate) fn preflight_mutation(
     let observation = observe_dm_target_read_only(
         &request.config.cluster,
         &spec,
+        &request.config.rustfs_volume_path,
         observer_namespace,
         observer_pod,
     )?;
@@ -319,10 +495,11 @@ fn require_exact_config_allowlist(label: &str, values: &[String], expected: &str
 fn observe_dm_target_read_only(
     config: &ClusterTestConfig,
     spec: &DmFlakeySpec<'_>,
+    rustfs_volume_path: &str,
     observer_namespace: &str,
     observer_pod: &str,
 ) -> Result<HostStorageTargetObservation> {
-    let mapping = verify_dm_volume_mapping(config, spec.node, spec.mount_path)?;
+    let mapping = verify_dm_volume_mapping(config, spec.node, rustfs_volume_path, spec.mount_path)?;
     validate_observer_pod(config, spec, observer_namespace, observer_pod)?;
     let mount_source =
         observer_findmnt_field(config, observer_namespace, observer_pod, &mapping, "SOURCE")?;
@@ -380,8 +557,14 @@ fn observe_dm_target_read_only(
         node: mapping.node,
         pod: mapping.pod,
         pod_uid: mapping.pod_uid,
+        volume_name: mapping.volume_name,
         persistent_volume_claim: mapping.pvc,
+        persistent_volume_claim_uid: mapping.pvc_uid,
         persistent_volume: mapping.pv,
+        persistent_volume_uid: mapping.pv_uid,
+        persistent_volume_claim_ref: mapping.pv_claim_ref,
+        node_selector: mapping.node_selector,
+        container_mount_path: mapping.container_mount_path,
         persistent_volume_path: mapping.mount_path,
         mapper_name: spec.name.to_string(),
         logical_device,
@@ -587,15 +770,22 @@ fn dm_flakey_spec<'a>(
 }
 
 pub fn apply_dm_flakey(
-    config: &ClusterTestConfig,
+    fault_config: &FaultTestConfig,
     spec: &DmFlakeySpec<'_>,
     collector: &ArtifactCollector,
     case_name: &str,
     scenario: &str,
     preflight_proof: &HostStorageMutationProof,
 ) -> Result<DmFlakeyGuard> {
+    let config = &fault_config.cluster;
     validate_dm_spec(spec)?;
-    let mapping = verify_dm_volume_mapping(config, spec.node, spec.mount_path)?;
+    let mutation_lease = HostMutationLease::from_config(fault_config, spec.run_id)?;
+    let mapping = verify_dm_volume_mapping(
+        config,
+        spec.node,
+        &fault_config.rustfs_volume_path,
+        spec.mount_path,
+    )?;
     let helper_pod = helper_pod_name(spec.run_id);
     let manifest = dm_helper_manifest(config, &helper_pod, spec.node, spec.helper_image);
     collector.write_text(case_name, "dm-helper-manifest.yaml", &manifest)?;
@@ -630,6 +820,7 @@ pub fn apply_dm_flakey(
         crash_boundary_completed: false,
         recovery_snapshot: None,
         preflight_proof: preflight_proof.clone(),
+        mutation_lease,
         fault_applied: false,
         restored: false,
     };
@@ -637,7 +828,12 @@ pub fn apply_dm_flakey(
     // Re-resolve the complete Kubernetes ownership chain immediately before
     // reading host state so the apply proof cannot splice stale Pod/PVC/PV
     // identity onto a new mount or mapper table.
-    guard.mapping = verify_dm_volume_mapping(config, spec.node, spec.mount_path)?;
+    guard.mapping = verify_dm_volume_mapping(
+        config,
+        spec.node,
+        &fault_config.rustfs_volume_path,
+        spec.mount_path,
+    )?;
     let mount_snapshot = guard.capture_mount_snapshot()?;
     guard.verify_mount_source(&mount_snapshot)?;
     guard.mount_snapshot = Some(mount_snapshot);
@@ -678,8 +874,9 @@ pub fn apply_dm_flakey(
         DmFaultBehavior::ErrorInjection => DmSuspendMode::Default,
         DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
     };
+    guard.mutation_lease.set_phase(HostMutationPhase::Active)?;
     guard.fault_applied = true;
-    guard.load_table(&guard.fault_table.clone(), suspend_mode)?;
+    guard.transition_to_table(&guard.fault_table.clone(), suspend_mode)?;
     let active = guard.snapshot("active")?;
     ensure!(
         normalize_dm_table(&active.table) == normalize_dm_table(&guard.fault_table),
@@ -765,7 +962,13 @@ impl DmFlakeyGuard {
         })
     }
 
-    fn ensure_recovery_table_active(&self) -> Result<()> {
+    fn ensure_recovery_table_active(&mut self) -> Result<()> {
+        let state = <Self as DmTransitionPort>::observe(self)?;
+        ensure!(
+            !state.suspended,
+            "device-mapper target {:?} remains suspended after recovery",
+            self.dm_name
+        );
         let snapshot = self.snapshot("recovery-table-verified")?;
         ensure!(
             normalize_dm_table(&snapshot.table) == normalize_dm_table(&self.recovery_table),
@@ -838,7 +1041,12 @@ impl DmFlakeyGuard {
             DmFaultBehavior::ErrorInjection => DmSuspendMode::NoFlush,
             DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
         };
-        self.load_table(&recovery_table, suspend_mode)?;
+        if let Err(error) = self.mutation_lease.set_phase(HostMutationPhase::Rollback) {
+            eprintln!(
+                "warning: failed to mark device-mapper rollback in progress; retaining the active mutation marker: {error:#}"
+            );
+        }
+        self.transition_to_table(&recovery_table, suspend_mode)?;
         self.ensure_recovery_table_active()?;
         if self.requires_crash_boundary() {
             self.ensure_filesystem_mounted()?;
@@ -898,6 +1106,7 @@ impl DmFlakeyGuard {
             )?;
         }
         self.delete_helper()?;
+        self.mutation_lease.clear()?;
         self.restored = true;
         Ok(())
     }
@@ -1002,8 +1211,14 @@ impl DmFlakeyGuard {
             node: self.mapping.node.clone(),
             pod: self.mapping.pod.clone(),
             pod_uid: self.mapping.pod_uid.clone(),
+            volume_name: self.mapping.volume_name.clone(),
             persistent_volume_claim: self.mapping.pvc.clone(),
+            persistent_volume_claim_uid: self.mapping.pvc_uid.clone(),
             persistent_volume: self.mapping.pv.clone(),
+            persistent_volume_uid: self.mapping.pv_uid.clone(),
+            persistent_volume_claim_ref: self.mapping.pv_claim_ref.clone(),
+            node_selector: self.mapping.node_selector.clone(),
+            container_mount_path: self.mapping.container_mount_path.clone(),
             persistent_volume_path: self.mapping.mount_path.clone(),
             mapper_name: self.dm_name.clone(),
             logical_device: format!("/dev/mapper/{}", self.dm_name),
@@ -1029,13 +1244,8 @@ impl DmFlakeyGuard {
             .any(|taint| taint.get("key").and_then(Value::as_str) == Some(CRASH_TAINT_KEY)))
     }
 
-    fn load_table(&self, table: &str, mode: DmSuspendMode) -> Result<()> {
-        self.dmsetup(dm_suspend_args(&self.dm_name, mode))?;
-        let load = self.dmsetup(["load", self.dm_name.as_str(), "--table", table]);
-        let resume = self.dmsetup(dm_resume_args(&self.dm_name));
-        load?;
-        resume?;
-        Ok(())
+    fn transition_to_table(&mut self, table: &str, mode: DmSuspendMode) -> Result<()> {
+        transition_dm_table(self, table, mode)
     }
 
     fn add_node_taint(&mut self) -> Result<()> {
@@ -1104,8 +1314,12 @@ impl DmFlakeyGuard {
     }
 
     fn force_delete_target_pod(&self, timeout: Duration) -> Result<Option<String>> {
-        let current =
-            verify_dm_volume_mapping(&self.config, &self.mapping.node, &self.mapping.mount_path)?;
+        let current = verify_dm_volume_mapping(
+            &self.config,
+            &self.mapping.node,
+            &self.mapping.container_mount_path,
+            &self.mapping.mount_path,
+        )?;
         ensure!(
             current == self.mapping,
             "refusing to delete a RustFS Pod because its UID/PVC/PV/node mapping changed after device-mapper apply"
@@ -1341,6 +1555,47 @@ impl DmFlakeyGuard {
     }
 }
 
+impl DmTransitionPort for DmFlakeyGuard {
+    fn observe(&mut self) -> Result<DmObservedState> {
+        let suspended = self
+            .dmsetup([
+                "info",
+                "--columns",
+                "--noheadings",
+                "--options",
+                "suspended",
+                self.dm_name.as_str(),
+            ])?
+            .stdout
+            .trim()
+            .to_ascii_lowercase();
+        let suspended = match suspended.as_str() {
+            "suspended" | "yes" | "y" | "1" => true,
+            "active" | "no" | "n" | "0" => false,
+            other => bail!("dmsetup returned unsupported suspended state {other:?}"),
+        };
+        Ok(DmObservedState {
+            suspended,
+            active_table: self.dmsetup(["table", self.dm_name.as_str()])?.stdout,
+        })
+    }
+
+    fn suspend(&mut self, mode: DmSuspendMode) -> Result<()> {
+        self.dmsetup(dm_suspend_args(&self.dm_name, mode))?;
+        Ok(())
+    }
+
+    fn load(&mut self, table: &str) -> Result<()> {
+        self.dmsetup(["load", self.dm_name.as_str(), "--table", table])?;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        self.dmsetup(dm_resume_args(&self.dm_name))?;
+        Ok(())
+    }
+}
+
 fn force_delete_pod_command(
     config: &ClusterTestConfig,
     pod: &str,
@@ -1373,12 +1628,17 @@ impl Drop for DmFlakeyGuard {
             let recovery_table = self.recovery_table.clone();
             let mut storage_recovered = !self.fault_applied;
             if self.fault_applied && !recovery_table.is_empty() {
+                if let Err(error) = self.mutation_lease.set_phase(HostMutationPhase::Rollback) {
+                    eprintln!(
+                        "warning: failed to mark device-mapper rollback in progress; retaining the active mutation marker: {error:#}"
+                    );
+                }
                 let mode = match self.behavior {
                     DmFaultBehavior::ErrorInjection => DmSuspendMode::NoFlush,
                     DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
                 };
                 match self
-                    .load_table(&recovery_table, mode)
+                    .transition_to_table(&recovery_table, mode)
                     .and_then(|()| self.ensure_recovery_table_active())
                 {
                     Ok(()) => storage_recovered = true,
@@ -1429,6 +1689,13 @@ impl Drop for DmFlakeyGuard {
                         node = self.mapping.node,
                     ),
                 }
+            }
+            if (storage_recovered || self.node_tainted)
+                && let Err(error) = self.mutation_lease.clear()
+            {
+                eprintln!(
+                    "warning: failed to clear host mutation state after recovery containment: {error:#}"
+                );
             }
             if storage_recovered {
                 if let Err(error) = self.delete_helper() {
@@ -1500,10 +1767,59 @@ fn dm_suspend_args(name: &str, mode: DmSuspendMode) -> Vec<&str> {
     }
 }
 
+fn transition_dm_table(
+    port: &mut impl DmTransitionPort,
+    requested_table: &str,
+    mode: DmSuspendMode,
+) -> Result<()> {
+    let initial = port.observe().context("observe device-mapper state")?;
+    if !initial.suspended
+        && normalize_dm_table(&initial.active_table) == normalize_dm_table(requested_table)
+    {
+        return Ok(());
+    }
+
+    let mut suspend_error = None;
+    if !initial.suspended {
+        suspend_error = port.suspend(mode).err().map(|error| format!("{error:#}"));
+        let after_suspend = port
+            .observe()
+            .context("re-observe device-mapper state after suspend attempt")?;
+        ensure!(
+            after_suspend.suspended,
+            "device-mapper target remained active after suspend attempt; suspend error={:?}",
+            suspend_error
+        );
+    }
+
+    let load_error = port
+        .load(requested_table)
+        .err()
+        .map(|error| format!("{error:#}"));
+    // Resume is attempted even when load failed. A failed load must not strand
+    // I/O behind a suspended mapper, and final observed state is authoritative.
+    let resume_error = port.resume().err().map(|error| format!("{error:#}"));
+    let final_state = port
+        .observe()
+        .context("observe device-mapper state after load/resume attempts")?;
+    ensure!(
+        !final_state.suspended
+            && normalize_dm_table(&final_state.active_table) == normalize_dm_table(requested_table),
+        "device-mapper transition did not reach active requested table; suspended={}, active_table={:?}, suspend_error={:?}, load_error={:?}, resume_error={:?}",
+        final_state.suspended,
+        final_state.active_table,
+        suspend_error,
+        load_error,
+        resume_error
+    );
+    Ok(())
+}
+
 fn verify_dm_volume_mapping(
     config: &ClusterTestConfig,
     node: &str,
-    expected_mount_path: &str,
+    container_mount_path: &str,
+    expected_host_mount_path: &str,
 ) -> Result<DmVolumeMapping> {
     let selector = format!("rustfs.tenant={}", config.tenant_name);
     let pods = Kubectl::new(config)
@@ -1511,6 +1827,37 @@ fn verify_dm_volume_mapping(
         .command(["get", "pod", "-l", &selector, "-o", "json"])
         .run_checked()?;
     let pods = serde_json::from_str::<Value>(&pods.stdout).context("parse RustFS pod list")?;
+    let binding = resolve_dm_pod_volume(&pods, node, container_mount_path)?;
+
+    let pvc_json = Kubectl::new(config)
+        .namespaced(&config.test_namespace)
+        .command(["get", "pvc", binding.pvc.as_str(), "-o", "json"])
+        .run_checked()?;
+    let pvc_json =
+        serde_json::from_str::<Value>(&pvc_json.stdout).context("parse DM target PVC")?;
+    let pv = pvc_json
+        .pointer("/spec/volumeName")
+        .and_then(Value::as_str)
+        .context("DM target PVC is not bound")?;
+
+    let pv_json = Kubectl::new(config)
+        .command(["get", "pv", pv, "-o", "json"])
+        .run_checked()?;
+    let pv_json = serde_json::from_str::<Value>(&pv_json.stdout).context("parse DM target PV")?;
+    complete_dm_volume_mapping(
+        &config.test_namespace,
+        binding,
+        &pvc_json,
+        &pv_json,
+        expected_host_mount_path,
+    )
+}
+
+fn resolve_dm_pod_volume(
+    pods: &Value,
+    node: &str,
+    container_mount_path: &str,
+) -> Result<DmPodVolumeBinding> {
     let pods_on_node = pods
         .pointer("/items")
         .and_then(Value::as_array)
@@ -1524,6 +1871,22 @@ fn verify_dm_volume_mapping(
         pods_on_node.len()
     );
     let pod = pods_on_node[0];
+    ensure!(
+        pod.pointer("/metadata/deletionTimestamp")
+            .is_none_or(Value::is_null),
+        "DM target Pod is terminating"
+    );
+    ensure!(
+        pod.pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|condition| {
+                condition.get("type").and_then(Value::as_str) == Some("Ready")
+                    && condition.get("status").and_then(Value::as_str) == Some("True")
+            }),
+        "DM target Pod is not Ready"
+    );
     let pod_name = pod
         .pointer("/metadata/name")
         .and_then(Value::as_str)
@@ -1532,71 +1895,194 @@ fn verify_dm_volume_mapping(
         .pointer("/metadata/uid")
         .and_then(Value::as_str)
         .context("DM target Pod is missing metadata.uid")?;
-    let pvc = pod
+    let rustfs_containers = pod
+        .pointer("/spec/containers")
+        .and_then(Value::as_array)
+        .context("DM target Pod is missing spec.containers")?
+        .iter()
+        .filter(|container| container.get("name").and_then(Value::as_str) == Some("rustfs"))
+        .collect::<Vec<_>>();
+    ensure!(
+        rustfs_containers.len() == 1,
+        "DM target Pod must contain exactly one rustfs container"
+    );
+    let matching_mounts = rustfs_containers[0]
+        .get("volumeMounts")
+        .and_then(Value::as_array)
+        .context("RustFS container is missing volumeMounts")?
+        .iter()
+        .filter(|mount| {
+            mount.get("mountPath").and_then(Value::as_str) == Some(container_mount_path)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        matching_mounts.len() == 1,
+        "RustFS container must have exactly one volume mount at {container_mount_path:?}"
+    );
+    let volume_name = matching_mounts[0]
+        .get("name")
+        .and_then(Value::as_str)
+        .context("target RustFS volumeMount is missing name")?;
+    let matching_volumes = pod
         .pointer("/spec/volumes")
         .and_then(Value::as_array)
-        .and_then(|volumes| {
-            volumes.iter().find_map(|volume| {
-                volume
-                    .pointer("/persistentVolumeClaim/claimName")
-                    .and_then(Value::as_str)
-            })
-        })
-        .context("DM target Pod does not mount a PVC")?;
+        .context("DM target Pod is missing spec.volumes")?
+        .iter()
+        .filter(|volume| volume.get("name").and_then(Value::as_str) == Some(volume_name))
+        .collect::<Vec<_>>();
+    ensure!(
+        matching_volumes.len() == 1,
+        "DM target Pod must define exactly one volume named {volume_name:?}"
+    );
+    let pvc = matching_volumes[0]
+        .pointer("/persistentVolumeClaim/claimName")
+        .and_then(Value::as_str)
+        .context("target RustFS volume does not reference a PVC")?;
 
-    let pvc_json = Kubectl::new(config)
-        .namespaced(&config.test_namespace)
-        .command(["get", "pvc", pvc, "-o", "json"])
-        .run_checked()?;
-    let pvc_json =
-        serde_json::from_str::<Value>(&pvc_json.stdout).context("parse DM target PVC")?;
+    Ok(DmPodVolumeBinding {
+        node: node.to_string(),
+        pod: pod_name.to_string(),
+        pod_uid: pod_uid.to_string(),
+        volume_name: volume_name.to_string(),
+        pvc: pvc.to_string(),
+        container_mount_path: container_mount_path.to_string(),
+    })
+}
+
+fn complete_dm_volume_mapping(
+    namespace: &str,
+    binding: DmPodVolumeBinding,
+    pvc_json: &Value,
+    pv_json: &Value,
+    expected_host_mount_path: &str,
+) -> Result<DmVolumeMapping> {
+    ensure!(
+        pvc_json.pointer("/metadata/name").and_then(Value::as_str) == Some(binding.pvc.as_str())
+            && pvc_json
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                == Some(namespace),
+        "fetched PVC identity does not match the Pod volume reference"
+    );
+    ensure!(
+        pvc_json
+            .pointer("/metadata/deletionTimestamp")
+            .is_none_or(Value::is_null),
+        "DM target PVC is terminating"
+    );
+    let pvc_uid = pvc_json
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .context("DM target PVC is missing metadata.uid")?;
     let pv = pvc_json
         .pointer("/spec/volumeName")
         .and_then(Value::as_str)
         .context("DM target PVC is not bound")?;
-
-    let pv_json = Kubectl::new(config)
-        .command(["get", "pv", pv, "-o", "json"])
-        .run_checked()?;
-    let pv_json = serde_json::from_str::<Value>(&pv_json.stdout).context("parse DM target PV")?;
+    ensure!(
+        pv_json.pointer("/metadata/name").and_then(Value::as_str) == Some(pv),
+        "fetched PV identity does not match the bound PVC"
+    );
+    ensure!(
+        pv_json
+            .pointer("/metadata/deletionTimestamp")
+            .is_none_or(Value::is_null),
+        "DM target PV is terminating"
+    );
+    let pv_uid = pv_json
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .context("DM target PV is missing metadata.uid")?;
+    let claim_ref = HostStoragePersistentVolumeClaimRef {
+        namespace: pv_json
+            .pointer("/spec/claimRef/namespace")
+            .and_then(Value::as_str)
+            .context("DM target PV claimRef is missing namespace")?
+            .to_string(),
+        name: pv_json
+            .pointer("/spec/claimRef/name")
+            .and_then(Value::as_str)
+            .context("DM target PV claimRef is missing name")?
+            .to_string(),
+        uid: pv_json
+            .pointer("/spec/claimRef/uid")
+            .and_then(Value::as_str)
+            .context("DM target PV claimRef is missing uid")?
+            .to_string(),
+    };
+    ensure!(
+        claim_ref.namespace == namespace
+            && claim_ref.name == binding.pvc
+            && claim_ref.uid == pvc_uid,
+        "DM target PV claimRef does not exactly match PVC {namespace}/{pvc} uid {pvc_uid}",
+        pvc = binding.pvc
+    );
     let local_path = pv_json
         .pointer("/spec/local/path")
         .and_then(Value::as_str)
         .context("DM target PV is not a local PV")?;
     ensure!(
-        local_path == expected_mount_path,
-        "DM target PV {pv:?} uses local path {local_path:?}, expected {expected_mount_path:?}"
+        local_path == expected_host_mount_path,
+        "DM target PV {pv:?} uses local path {local_path:?}, expected {expected_host_mount_path:?}"
     );
-    ensure!(
-        pv_targets_node(&pv_json, node),
-        "DM target PV {pv:?} node affinity does not target {node:?}"
-    );
+    let node_selector = supported_pv_node_selector(pv_json, &binding.node)?;
 
     Ok(DmVolumeMapping {
-        node: node.to_string(),
-        pod: pod_name.to_string(),
-        pod_uid: pod_uid.to_string(),
-        pvc: pvc.to_string(),
+        node: binding.node,
+        pod: binding.pod,
+        pod_uid: binding.pod_uid,
+        volume_name: binding.volume_name,
+        pvc: binding.pvc,
+        pvc_uid: pvc_uid.to_string(),
         pv: pv.to_string(),
+        pv_uid: pv_uid.to_string(),
+        pv_claim_ref: claim_ref,
+        node_selector,
+        container_mount_path: binding.container_mount_path,
         mount_path: local_path.to_string(),
     })
 }
 
-fn pv_targets_node(pv: &Value, node: &str) -> bool {
-    pv.pointer("/spec/nodeAffinity/required/nodeSelectorTerms")
+fn supported_pv_node_selector(pv: &Value, node: &str) -> Result<HostStorageNodeSelector> {
+    let terms = pv
+        .pointer("/spec/nodeAffinity/required/nodeSelectorTerms")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|term| term.get("matchExpressions").and_then(Value::as_array))
-        .flatten()
-        .any(|expression| {
-            expression.get("key").and_then(Value::as_str) == Some("kubernetes.io/hostname")
-                && expression.get("operator").and_then(Value::as_str) == Some("In")
-                && expression
-                    .get("values")
-                    .and_then(Value::as_array)
-                    .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(node)))
-        })
+        .context("DM target PV is missing required node selector terms")?;
+    ensure!(
+        terms.len() == 1,
+        "DM target PV must use exactly one supported node selector term"
+    );
+    ensure!(
+        terms[0]
+            .get("matchFields")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "DM target PV matchFields are not supported"
+    );
+    let expressions = terms[0]
+        .get("matchExpressions")
+        .and_then(Value::as_array)
+        .context("DM target PV selector term is missing matchExpressions")?;
+    ensure!(
+        expressions.len() == 1,
+        "DM target PV must use exactly one hostname match expression; compound AND selectors are not supported"
+    );
+    let expression = &expressions[0];
+    let values = expression
+        .get("values")
+        .and_then(Value::as_array)
+        .context("DM target PV hostname selector is missing values")?;
+    ensure!(
+        expression.get("key").and_then(Value::as_str) == Some("kubernetes.io/hostname")
+            && expression.get("operator").and_then(Value::as_str) == Some("In")
+            && values.len() == 1
+            && values[0].as_str() == Some(node),
+        "DM target PV node selector must be exactly kubernetes.io/hostname In [{node:?}]"
+    );
+    Ok(HostStorageNodeSelector {
+        key: "kubernetes.io/hostname".to_string(),
+        operator: "In".to_string(),
+        values: vec![node.to_string()],
+    })
 }
 
 fn helper_pod_name(run_id: &str) -> String {
@@ -1659,11 +2145,117 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DmFaultBehavior, DmFlakeySpec, DmMountState, DmSuspendMode, dm_flakey_spec,
-        dm_helper_manifest, dm_resume_args, dm_suspend_args, force_delete_pod_command,
-        helper_pod_name, normalize_dm_table, pv_targets_node, validate_dm_spec,
+        DmFaultBehavior, DmFlakeySpec, DmMountState, DmObservedState, DmSuspendMode,
+        DmTransitionPort, HostMutationLease, HostMutationPhase, HostMutationState,
+        complete_dm_volume_mapping, dm_flakey_spec, dm_helper_manifest, dm_resume_args,
+        dm_suspend_args, force_delete_pod_command, helper_pod_name, normalize_dm_table,
+        resolve_dm_pod_volume, supported_pv_node_selector, transition_dm_table, validate_dm_spec,
     };
     use crate::fault::config::FaultTestConfig;
+    use anyhow::{Result, bail};
+    use serde_json::{Value, json};
+
+    struct FakeDmPort {
+        suspended: bool,
+        active_table: String,
+        inactive_table: Option<String>,
+        fail_next_resume: bool,
+        suspend_calls: usize,
+    }
+
+    impl DmTransitionPort for FakeDmPort {
+        fn observe(&mut self) -> Result<DmObservedState> {
+            Ok(DmObservedState {
+                suspended: self.suspended,
+                active_table: self.active_table.clone(),
+            })
+        }
+
+        fn suspend(&mut self, _mode: DmSuspendMode) -> Result<()> {
+            self.suspend_calls += 1;
+            if self.suspended {
+                bail!("already suspended");
+            }
+            self.suspended = true;
+            Ok(())
+        }
+
+        fn load(&mut self, table: &str) -> Result<()> {
+            if !self.suspended {
+                bail!("load requires suspended mapper");
+            }
+            self.inactive_table = Some(table.to_string());
+            Ok(())
+        }
+
+        fn resume(&mut self) -> Result<()> {
+            if self.fail_next_resume {
+                self.fail_next_resume = false;
+                bail!("injected resume failure");
+            }
+            if !self.suspended {
+                bail!("mapper is not suspended");
+            }
+            if let Some(table) = self.inactive_table.take() {
+                self.active_table = table;
+            }
+            self.suspended = false;
+            Ok(())
+        }
+    }
+
+    fn pod_list(ready: bool) -> Value {
+        json!({"items": [{
+            "metadata": {"name": "rustfs-0", "uid": "pod-uid-a"},
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{
+                    "name": "rustfs",
+                    "volumeMounts": [
+                        {"name": "logs", "mountPath": "/logs"},
+                        {"name": "data", "mountPath": "/data/rustfs0"}
+                    ]
+                }],
+                "volumes": [
+                    {"name": "logs", "persistentVolumeClaim": {"claimName": "logs-rustfs-0"}},
+                    {"name": "data", "persistentVolumeClaim": {"claimName": "data-rustfs-0"}}
+                ]
+            },
+            "status": {"conditions": [{"type": "Ready", "status": if ready { "True" } else { "False" }}]}
+        }]})
+    }
+
+    fn pvc(uid: &str) -> Value {
+        json!({
+            "metadata": {
+                "name": "data-rustfs-0",
+                "namespace": "rustfs-fault-test",
+                "uid": uid
+            },
+            "spec": {"volumeName": "pv-a"}
+        })
+    }
+
+    fn pv(pv_uid: &str, pvc_uid: &str) -> Value {
+        json!({
+            "metadata": {"name": "pv-a", "uid": pv_uid},
+            "spec": {
+                "claimRef": {
+                    "namespace": "rustfs-fault-test",
+                    "name": "data-rustfs-0",
+                    "uid": pvc_uid
+                },
+                "local": {"path": "/data/rustfs-fault/dm-volume"},
+                "nodeAffinity": {"required": {"nodeSelectorTerms": [{
+                    "matchExpressions": [{
+                        "key": "kubernetes.io/hostname",
+                        "operator": "In",
+                        "values": ["worker-a"]
+                    }]
+                }]}}
+            }
+        })
+    }
 
     #[test]
     fn dm_helper_is_pinned_to_one_node_and_host_root() {
@@ -1844,22 +2436,140 @@ mod tests {
     }
 
     #[test]
-    fn dm_pv_affinity_must_match_target_node() {
-        let pv = serde_json::json!({
-            "spec": {"nodeAffinity": {"required": {"nodeSelectorTerms": [{
-                "matchExpressions": [{
-                    "key": "kubernetes.io/hostname",
-                    "operator": "In",
-                    "values": ["worker-a"]
-                }]
-            }]}}}
-        });
+    fn dm_target_follows_the_rustfs_mount_to_the_exact_pvc() {
+        let binding = resolve_dm_pod_volume(&pod_list(true), "worker-a", "/data/rustfs0")
+            .expect("resolve data mount");
+        assert_eq!(binding.volume_name, "data");
+        assert_eq!(binding.pvc, "data-rustfs-0");
 
-        assert!(pv_targets_node(&pv, "worker-a"));
-        assert!(!pv_targets_node(&pv, "worker-b"));
+        let mapping = complete_dm_volume_mapping(
+            "rustfs-fault-test",
+            binding,
+            &pvc("pvc-uid-a"),
+            &pv("pv-uid-a", "pvc-uid-a"),
+            "/data/rustfs-fault/dm-volume",
+        )
+        .expect("complete mapping");
+        assert_eq!(mapping.pvc_uid, "pvc-uid-a");
+        assert_eq!(mapping.pv_uid, "pv-uid-a");
+        assert_eq!(mapping.pv_claim_ref.uid, "pvc-uid-a");
         assert_eq!(
             helper_pod_name("run-ABC-123"),
             "rustfs-fault-dm-helper-runabc123"
         );
+    }
+
+    #[test]
+    fn dm_apply_mapping_detects_same_name_pvc_and_pv_recreation() {
+        let binding = resolve_dm_pod_volume(&pod_list(true), "worker-a", "/data/rustfs0")
+            .expect("resolve data mount");
+        let original = complete_dm_volume_mapping(
+            "rustfs-fault-test",
+            binding.clone(),
+            &pvc("pvc-uid-old"),
+            &pv("pv-uid-old", "pvc-uid-old"),
+            "/data/rustfs-fault/dm-volume",
+        )
+        .expect("original mapping");
+        let recreated = complete_dm_volume_mapping(
+            "rustfs-fault-test",
+            binding,
+            &pvc("pvc-uid-new"),
+            &pv("pv-uid-new", "pvc-uid-new"),
+            "/data/rustfs-fault/dm-volume",
+        )
+        .expect("recreated mapping");
+
+        assert_ne!(original, recreated);
+    }
+
+    #[test]
+    fn dm_mapping_rejects_claim_ref_mismatch_and_compound_topology() {
+        let binding = resolve_dm_pod_volume(&pod_list(true), "worker-a", "/data/rustfs0")
+            .expect("resolve data mount");
+        assert!(
+            complete_dm_volume_mapping(
+                "rustfs-fault-test",
+                binding.clone(),
+                &pvc("pvc-uid-a"),
+                &pv("pv-uid-a", "other-pvc-uid"),
+                "/data/rustfs-fault/dm-volume",
+            )
+            .is_err()
+        );
+
+        let mut compound = pv("pv-uid-a", "pvc-uid-a");
+        compound["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"][0]["matchExpressions"]
+            .as_array_mut()
+            .expect("expressions")
+            .push(json!({"key": "disk.example.com/class", "operator": "In", "values": ["nvme"]}));
+        assert!(supported_pv_node_selector(&compound, "worker-a").is_err());
+    }
+
+    #[test]
+    fn dm_mapping_rejects_unready_or_terminating_pod() {
+        assert!(resolve_dm_pod_volume(&pod_list(false), "worker-a", "/data/rustfs0").is_err());
+        let mut terminating = pod_list(true);
+        terminating["items"][0]["metadata"]["deletionTimestamp"] = json!("2026-09-04T00:00:00Z");
+        assert!(resolve_dm_pod_volume(&terminating, "worker-a", "/data/rustfs0").is_err());
+    }
+
+    #[test]
+    fn dm_resume_failure_recovers_from_the_already_suspended_state() {
+        let recovery = "0 1024 linear /dev/loop0 0";
+        let fault = "0 1024 flakey /dev/loop0 0 1 15";
+        let mut port = FakeDmPort {
+            suspended: false,
+            active_table: recovery.to_string(),
+            inactive_table: None,
+            fail_next_resume: true,
+            suspend_calls: 0,
+        };
+
+        assert!(transition_dm_table(&mut port, fault, DmSuspendMode::Default).is_err());
+        assert!(port.suspended);
+        transition_dm_table(&mut port, recovery, DmSuspendMode::NoFlush)
+            .expect("recover already-suspended mapper");
+
+        assert!(!port.suspended);
+        assert_eq!(normalize_dm_table(&port.active_table), recovery);
+        assert_eq!(
+            port.suspend_calls, 1,
+            "recovery must not issue another suspend"
+        );
+    }
+
+    #[test]
+    fn host_mutation_lease_is_identity_scoped_and_cleaned() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let state_path = temporary.path().join(".host-mutation-token-a.json");
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.cluster.artifacts_dir = temporary.path().to_path_buf();
+        config.host_mutation_state_file = Some(state_path.clone());
+        config.host_mutation_state_token = Some("token-a".to_string());
+        let mut lease = HostMutationLease::from_config(&config, "run-a").expect("lease");
+        lease
+            .set_phase(HostMutationPhase::Active)
+            .expect("persist active state");
+        let state: HostMutationState =
+            serde_json::from_slice(&std::fs::read(&state_path).expect("read state"))
+                .expect("parse state");
+        assert_eq!(state.token, "token-a");
+        assert_eq!(state.owner_pid, std::process::id());
+        lease.clear().expect("clear owned state");
+        assert!(!state_path.exists());
+
+        lease
+            .set_phase(HostMutationPhase::Rollback)
+            .expect("persist rollback state");
+        let mut replaced = state;
+        replaced.token = "token-b".to_string();
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&replaced).expect("serialize replacement"),
+        )
+        .expect("replace state");
+        assert!(lease.clear().is_err());
+        assert!(state_path.exists());
     }
 }

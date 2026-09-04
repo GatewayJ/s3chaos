@@ -17,7 +17,7 @@ use anyhow::Result;
 use std::process::{Command, Output};
 
 #[cfg(unix)]
-fn fault_supervision_output(host_storage_mutation_possible: bool) -> Output {
+fn fault_supervision_output(host_storage_mutation_active: bool) -> Output {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
     Command::new("bash")
         .args([
@@ -28,6 +28,7 @@ probe_count=0
 observed_signals=""
 pgrep() { return 1; }
 sleep() { :; }
+host_storage_mutation_active() { [[ "$2" == "active" ]]; }
 kill() {
   case "$1" in
     -TERM|-KILL)
@@ -43,15 +44,15 @@ kill() {
       ;;
   esac
 }
-terminate_process_tree 4242 "$2" 0
+terminate_process_tree 4242 "$2" token-a 0
 printf '%s\n' "$observed_signals"
 "#,
             "fault-process-supervision-test",
             script,
-            if host_storage_mutation_possible {
-                "true"
+            if host_storage_mutation_active {
+                "active"
             } else {
-                "false"
+                "inactive"
             },
         ])
         .output()
@@ -60,7 +61,7 @@ printf '%s\n' "$observed_signals"
 
 #[cfg(unix)]
 #[test]
-fn dm_termination_past_grace_never_escalates_to_sigkill() {
+fn active_dm_termination_past_grace_never_escalates_to_sigkill() {
     let output = fault_supervision_output(true);
 
     assert!(output.status.success());
@@ -72,12 +73,55 @@ fn dm_termination_past_grace_never_escalates_to_sigkill() {
 
 #[cfg(unix)]
 #[test]
-fn ordinary_termination_past_grace_escalates_to_sigkill() {
+fn mixed_suite_ordinary_attempt_past_grace_escalates_to_sigkill() {
     let output = fault_supervision_output(false);
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "TERM KILL");
     assert!(String::from_utf8_lossy(&output.stderr).contains("escalating to KILL"));
+}
+
+#[cfg(unix)]
+#[test]
+fn host_mutation_marker_rejects_wrong_token_and_cross_process_owner() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let marker = temporary.path().join("marker.json");
+    std::fs::write(&marker, "{}").expect("marker");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+descends=yes
+jq() {
+  case "$2" in
+    '.schemaVersion // empty') printf '1\n' ;;
+    '.token // empty') printf 'token-a\n' ;;
+    '.ownerPid // empty') printf '222\n' ;;
+    '.phase // empty') printf 'rollback\n' ;;
+    *) return 1 ;;
+  esac
+}
+kill() { [[ "$1" == "-0" && "$2" == "222" ]]; }
+process_descends_from() { [[ "$descends" == "yes" && "$1" == "222" && "$2" == "111" ]]; }
+host_storage_mutation_active 111 "$2" token-a && printf 'valid\n'
+host_storage_mutation_active 111 "$2" token-b || printf 'wrong-token-rejected\n'
+descends=no
+host_storage_mutation_active 111 "$2" token-a || printf 'cross-process-rejected\n'
+"#,
+            "fault-mutation-state-test",
+            script,
+            marker.to_str().expect("marker path"),
+        ])
+        .output()
+        .expect("validate host mutation marker");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "valid\nwrong-token-rejected\ncross-process-rejected\n"
+    );
 }
 
 #[tokio::test]

@@ -115,6 +115,8 @@ pub struct FaultTestConfig {
     pub host_mutation_allowed_nodes: Vec<String>,
     pub host_mutation_allowed_devices: Vec<String>,
     pub host_mutation_allowed_persistent_volumes: Vec<String>,
+    pub host_mutation_state_file: Option<PathBuf>,
+    pub host_mutation_state_token: Option<String>,
     pub warp_duration: Duration,
     pub chaos_namespace: String,
 }
@@ -336,6 +338,15 @@ impl FaultTestConfig {
             host_mutation_allowed_persistent_volumes: env_list(
                 &get_env,
                 "RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST",
+            ),
+            host_mutation_state_file: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_FILE",
+            )
+            .map(PathBuf::from),
+            host_mutation_state_token: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_TOKEN",
             ),
             warp_duration: Duration::from_secs(env_u64(
                 &get_env,
@@ -681,6 +692,8 @@ mod tests {
         assert!(config.host_mutation_allowed_nodes.is_empty());
         assert!(config.host_mutation_allowed_devices.is_empty());
         assert!(config.host_mutation_allowed_persistent_volumes.is_empty());
+        assert!(config.host_mutation_state_file.is_none());
+        assert!(config.host_mutation_state_token.is_none());
         assert_eq!(
             config.dm_helper_image,
             "rancher/mirrored-library-busybox:1.37.0"
@@ -772,6 +785,10 @@ mod tests {
                     Some("/dev/mapper/rustfs-test".to_string())
                 }
                 "RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST" => Some("pv-worker-a".to_string()),
+                "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_FILE" => {
+                    Some("/tmp/s3chaos-host-mutation.json".to_string())
+                }
+                "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_TOKEN" => Some("run-token-1".to_string()),
                 _ => None,
             },
             "production-test-cluster".to_string(),
@@ -843,6 +860,14 @@ mod tests {
         assert_eq!(
             config.host_mutation_allowed_persistent_volumes,
             ["pv-worker-a"]
+        );
+        assert_eq!(
+            config.host_mutation_state_file.as_deref(),
+            Some(std::path::Path::new("/tmp/s3chaos-host-mutation.json"))
+        );
+        assert_eq!(
+            config.host_mutation_state_token.as_deref(),
+            Some("run-token-1")
         );
     }
 

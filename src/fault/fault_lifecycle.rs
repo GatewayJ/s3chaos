@@ -170,6 +170,7 @@ mod tests {
     use crate::fault::{
         backends::host::{DmStatusSnapshot, DmVolumeMapping},
         config::FaultTestConfig,
+        host_storage::{HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef},
         reporting::FaultStatusSnapshot,
     };
     use crate::framework::artifacts::ArtifactCollector;
@@ -260,8 +261,22 @@ mod tests {
                 node: "node-a".to_string(),
                 pod: "rustfs-0".to_string(),
                 pod_uid: "pod-uid-a".to_string(),
+                volume_name: "data".to_string(),
                 pvc: "data-rustfs-0".to_string(),
+                pvc_uid: "pvc-uid-a".to_string(),
                 pv: "pv-a".to_string(),
+                pv_uid: "pv-uid-a".to_string(),
+                pv_claim_ref: HostStoragePersistentVolumeClaimRef {
+                    namespace: "rustfs-fault-test".to_string(),
+                    name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-a".to_string(),
+                },
+                node_selector: HostStorageNodeSelector {
+                    key: "kubernetes.io/hostname".to_string(),
+                    operator: "In".to_string(),
+                    values: vec!["node-a".to_string()],
+                },
+                container_mount_path: "/data/rustfs0".to_string(),
                 mount_path: "/data/rustfs0".to_string(),
             },
             table: "0 2048 flakey /dev/sda 0 1 1".to_string(),

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub const HOST_STORAGE_PROOF_SCHEMA_VERSION: u8 = 1;
+pub const HOST_STORAGE_PROOF_SCHEMA_VERSION: u8 = 2;
 pub const HOST_STORAGE_PROOF_ARTIFACT: &str = "host-storage-proof.json";
 pub const HOST_STORAGE_CLEANUP_ARTIFACT: &str = "host-storage-post-cleanup.json";
 pub const HOST_STORAGE_PROOF_MAX_AGE_MS: u64 = 60_000;
@@ -57,13 +57,35 @@ pub struct HostStorageMutationIntent {
     pub fault_table: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStoragePersistentVolumeClaimRef {
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStorageNodeSelector {
+    pub key: String,
+    pub operator: String,
+    pub values: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostStorageTargetObservation {
     pub node: String,
     pub pod: String,
     pub pod_uid: String,
+    pub volume_name: String,
     pub persistent_volume_claim: String,
+    pub persistent_volume_claim_uid: String,
     pub persistent_volume: String,
+    pub persistent_volume_uid: String,
+    pub persistent_volume_claim_ref: HostStoragePersistentVolumeClaimRef,
+    pub node_selector: HostStorageNodeSelector,
+    pub container_mount_path: String,
     pub persistent_volume_path: String,
     pub mapper_name: String,
     pub logical_device: String,
@@ -81,8 +103,14 @@ pub struct HostStorageProvenTarget {
     pub node: String,
     pub pod: String,
     pub pod_uid: String,
+    pub volume_name: String,
     pub persistent_volume_claim: String,
+    pub persistent_volume_claim_uid: String,
     pub persistent_volume: String,
+    pub persistent_volume_uid: String,
+    pub persistent_volume_claim_ref: HostStoragePersistentVolumeClaimRef,
+    pub node_selector: HostStorageNodeSelector,
+    pub container_mount_path: String,
     pub persistent_volume_path: String,
     pub mapper_name: String,
     pub logical_device: String,
@@ -216,6 +244,14 @@ impl HostStorageMutationProof {
             &intent.allowlist.persistent_volumes,
             &observation.persistent_volume,
         )?;
+        ensure!(
+            observation.persistent_volume_claim_ref.namespace == intent.namespace
+                && observation.persistent_volume_claim_ref.name
+                    == observation.persistent_volume_claim
+                && observation.persistent_volume_claim_ref.uid
+                    == observation.persistent_volume_claim_uid,
+            "PersistentVolume claimRef does not bind the observed PVC identity and namespace"
+        );
 
         let tables = canonical_table_contract(
             &intent.fault_kind,
@@ -227,8 +263,14 @@ impl HostStorageMutationProof {
             node: observation.node,
             pod: observation.pod,
             pod_uid: observation.pod_uid,
+            volume_name: observation.volume_name,
             persistent_volume_claim: observation.persistent_volume_claim,
+            persistent_volume_claim_uid: observation.persistent_volume_claim_uid,
             persistent_volume: observation.persistent_volume,
+            persistent_volume_uid: observation.persistent_volume_uid,
+            persistent_volume_claim_ref: observation.persistent_volume_claim_ref,
+            node_selector: observation.node_selector,
+            container_mount_path: observation.container_mount_path,
             persistent_volume_path: observation.persistent_volume_path,
             mapper_name: observation.mapper_name,
             logical_device: observation.logical_device,
@@ -300,6 +342,10 @@ impl HostStorageMutationProof {
         );
         ensure_supported_dm_kind(&self.fault_kind)?;
         validate_proven_target(&self.target)?;
+        ensure!(
+            self.target.persistent_volume_claim_ref.namespace == self.namespace,
+            "proven PersistentVolume claimRef namespace does not match the run namespace"
+        );
         require_exact_singleton("host node", &self.allowlist.nodes, &self.target.node)?;
         require_exact_singleton(
             "host device",
@@ -363,8 +409,16 @@ impl HostStorageMutationProof {
             self.target.node == observation.node
                 && self.target.pod == observation.pod
                 && self.target.pod_uid == observation.pod_uid
+                && self.target.volume_name == observation.volume_name
                 && self.target.persistent_volume_claim == observation.persistent_volume_claim
+                && self.target.persistent_volume_claim_uid
+                    == observation.persistent_volume_claim_uid
                 && self.target.persistent_volume == observation.persistent_volume
+                && self.target.persistent_volume_uid == observation.persistent_volume_uid
+                && self.target.persistent_volume_claim_ref
+                    == observation.persistent_volume_claim_ref
+                && self.target.node_selector == observation.node_selector
+                && self.target.container_mount_path == observation.container_mount_path
                 && self.target.persistent_volume_path == observation.persistent_volume_path
                 && self.target.mapper_name == observation.mapper_name
                 && self.target.logical_device == observation.logical_device
@@ -591,8 +645,27 @@ fn validate_observation(observation: &HostStorageTargetObservation) -> Result<()
         ("node", observation.node.as_str()),
         ("pod", observation.pod.as_str()),
         ("pod UID", observation.pod_uid.as_str()),
+        ("volume name", observation.volume_name.as_str()),
         ("PVC", observation.persistent_volume_claim.as_str()),
+        ("PVC UID", observation.persistent_volume_claim_uid.as_str()),
         ("PV", observation.persistent_volume.as_str()),
+        ("PV UID", observation.persistent_volume_uid.as_str()),
+        (
+            "PV claimRef namespace",
+            observation.persistent_volume_claim_ref.namespace.as_str(),
+        ),
+        (
+            "PV claimRef name",
+            observation.persistent_volume_claim_ref.name.as_str(),
+        ),
+        (
+            "PV claimRef UID",
+            observation.persistent_volume_claim_ref.uid.as_str(),
+        ),
+        (
+            "container mount path",
+            observation.container_mount_path.as_str(),
+        ),
         ("PV path", observation.persistent_volume_path.as_str()),
         ("mapper name", observation.mapper_name.as_str()),
         ("logical device", observation.logical_device.as_str()),
@@ -618,6 +691,7 @@ fn validate_observation(observation: &HostStorageTargetObservation) -> Result<()
         observation.canonical_device == observation.mount_canonical_source,
         "mounted device does not resolve to the selected device-mapper target"
     );
+    validate_node_selector(&observation.node_selector, &observation.node)?;
     ensure!(
         observation.observed_at_ms > 0,
         "host-storage observation timestamp is missing"
@@ -635,8 +709,24 @@ fn validate_proven_target(target: &HostStorageProvenTarget) -> Result<()> {
         ("node", target.node.as_str()),
         ("pod", target.pod.as_str()),
         ("pod UID", target.pod_uid.as_str()),
+        ("volume name", target.volume_name.as_str()),
         ("PVC", target.persistent_volume_claim.as_str()),
+        ("PVC UID", target.persistent_volume_claim_uid.as_str()),
         ("PV", target.persistent_volume.as_str()),
+        ("PV UID", target.persistent_volume_uid.as_str()),
+        (
+            "PV claimRef namespace",
+            target.persistent_volume_claim_ref.namespace.as_str(),
+        ),
+        (
+            "PV claimRef name",
+            target.persistent_volume_claim_ref.name.as_str(),
+        ),
+        (
+            "PV claimRef UID",
+            target.persistent_volume_claim_ref.uid.as_str(),
+        ),
+        ("container mount path", target.container_mount_path.as_str()),
         ("PV path", target.persistent_volume_path.as_str()),
         ("mapper name", target.mapper_name.as_str()),
         ("logical device", target.logical_device.as_str()),
@@ -651,6 +741,22 @@ fn validate_proven_target(target: &HostStorageProvenTarget) -> Result<()> {
         );
     }
     ensure_sha256("proven recovery table", &target.recovery_table_sha256)?;
+    ensure!(
+        target.persistent_volume_claim_ref.name == target.persistent_volume_claim
+            && target.persistent_volume_claim_ref.uid == target.persistent_volume_claim_uid,
+        "proven PersistentVolume claimRef does not match the PVC identity"
+    );
+    validate_node_selector(&target.node_selector, &target.node)?;
+    Ok(())
+}
+
+fn validate_node_selector(selector: &HostStorageNodeSelector, node: &str) -> Result<()> {
+    ensure!(
+        selector.key == "kubernetes.io/hostname"
+            && selector.operator == "In"
+            && selector.values == [node],
+        "host-storage PV node selector must be exactly kubernetes.io/hostname In [{node:?}]"
+    );
     Ok(())
 }
 
@@ -742,6 +848,7 @@ fn require_exact_singleton(label: &str, allowlist: &[String], observed: &str) ->
 mod tests {
     use super::{
         HostStorageAllowlist, HostStorageMutationIntent, HostStorageMutationProof,
+        HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
         HostStoragePostCleanupObservation, HostStorageTargetObservation,
     };
 
@@ -750,8 +857,22 @@ mod tests {
             node: "worker-a".to_string(),
             pod: "rustfs-0".to_string(),
             pod_uid: "uid-0".to_string(),
+            volume_name: "data".to_string(),
             persistent_volume_claim: "data-rustfs-0".to_string(),
+            persistent_volume_claim_uid: "pvc-uid-0".to_string(),
             persistent_volume: "pv-a".to_string(),
+            persistent_volume_uid: "pv-uid-a".to_string(),
+            persistent_volume_claim_ref: HostStoragePersistentVolumeClaimRef {
+                namespace: "rustfs-fault-test".to_string(),
+                name: "data-rustfs-0".to_string(),
+                uid: "pvc-uid-0".to_string(),
+            },
+            node_selector: HostStorageNodeSelector {
+                key: "kubernetes.io/hostname".to_string(),
+                operator: "In".to_string(),
+                values: vec!["worker-a".to_string()],
+            },
+            container_mount_path: "/data/rustfs0".to_string(),
             persistent_volume_path: "/data/rustfs-fault/dm-volume".to_string(),
             mapper_name: "rustfs-fault-dm".to_string(),
             logical_device: "/dev/mapper/rustfs-fault-dm".to_string(),
@@ -927,5 +1048,21 @@ mod tests {
         replaced.observed_at_ms = 2;
 
         assert!(proof.refresh_for_apply(replaced).is_err());
+    }
+
+    #[test]
+    fn apply_refresh_rejects_same_name_pvc_or_pv_recreation() {
+        let proof = HostStorageMutationProof::prove_device_mapper(intent(), observation())
+            .expect("host-storage proof");
+        let mut replaced_pvc = observation();
+        replaced_pvc.persistent_volume_claim_uid = "pvc-uid-new".to_string();
+        replaced_pvc.persistent_volume_claim_ref.uid = "pvc-uid-new".to_string();
+        replaced_pvc.observed_at_ms = 2;
+        assert!(proof.refresh_for_apply(replaced_pvc).is_err());
+
+        let mut replaced_pv = observation();
+        replaced_pv.persistent_volume_uid = "pv-uid-new".to_string();
+        replaced_pv.observed_at_ms = 2;
+        assert!(proof.refresh_for_apply(replaced_pv).is_err());
     }
 }

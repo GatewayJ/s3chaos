@@ -1179,10 +1179,28 @@ fn validate_host_storage_artifacts(
                 == Some(proof.target.pod.as_str())
             && snapshot_mapping.get("pod_uid").and_then(Value::as_str)
                 == Some(proof.target.pod_uid.as_str())
+            && snapshot_mapping.get("volume_name").and_then(Value::as_str)
+                == Some(proof.target.volume_name.as_str())
             && snapshot_mapping.get("pvc").and_then(Value::as_str)
                 == Some(proof.target.persistent_volume_claim.as_str())
+            && snapshot_mapping.get("pvc_uid").and_then(Value::as_str)
+                == Some(proof.target.persistent_volume_claim_uid.as_str())
             && snapshot_mapping.get("pv").and_then(Value::as_str)
                 == Some(proof.target.persistent_volume.as_str())
+            && snapshot_mapping.get("pv_uid").and_then(Value::as_str)
+                == Some(proof.target.persistent_volume_uid.as_str())
+            && snapshot_mapping.get("pv_claim_ref")
+                == serde_json::to_value(&proof.target.persistent_volume_claim_ref)
+                    .ok()
+                    .as_ref()
+            && snapshot_mapping.get("node_selector")
+                == serde_json::to_value(&proof.target.node_selector)
+                    .ok()
+                    .as_ref()
+            && snapshot_mapping
+                .get("container_mount_path")
+                .and_then(Value::as_str)
+                == Some(proof.target.container_mount_path.as_str())
             && snapshot_mapping.get("mount_path").and_then(Value::as_str)
                 == Some(proof.target.persistent_volume_path.as_str()),
         "fault-evidence.json recovery snapshot does not match the proven host-storage target"
@@ -2293,6 +2311,7 @@ mod tests {
         history::{OperationOutcome, OperationRecord},
         host_storage::{
             HostStorageAllowlist, HostStorageMutationIntent, HostStorageMutationProof,
+            HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
             HostStoragePostCleanupObservation, HostStorageTargetObservation,
         },
         plan::FaultPlan,
@@ -2602,8 +2621,22 @@ mod tests {
                 node: "worker-a".to_string(),
                 pod: "rustfs-0".to_string(),
                 pod_uid: "uid-0".to_string(),
+                volume_name: "data".to_string(),
                 persistent_volume_claim: "data-rustfs-0".to_string(),
+                persistent_volume_claim_uid: "pvc-uid-0".to_string(),
                 persistent_volume: "pv-a".to_string(),
+                persistent_volume_uid: "pv-uid-a".to_string(),
+                persistent_volume_claim_ref: HostStoragePersistentVolumeClaimRef {
+                    namespace: "rustfs-fault-test".to_string(),
+                    name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-0".to_string(),
+                },
+                node_selector: HostStorageNodeSelector {
+                    key: "kubernetes.io/hostname".to_string(),
+                    operator: "In".to_string(),
+                    values: vec!["worker-a".to_string()],
+                },
+                container_mount_path: "/data/rustfs0".to_string(),
                 persistent_volume_path: "/data/rustfs-fault/dm-volume".to_string(),
                 mapper_name: "rustfs-fault-dm".to_string(),
                 logical_device: "/dev/mapper/rustfs-fault-dm".to_string(),
@@ -2653,8 +2686,22 @@ mod tests {
                     "node": "worker-a",
                     "pod": "rustfs-0",
                     "pod_uid": "uid-0",
+                    "volume_name": "data",
                     "pvc": "data-rustfs-0",
+                    "pvc_uid": "pvc-uid-0",
                     "pv": "pv-a",
+                    "pv_uid": "pv-uid-a",
+                    "pv_claim_ref": {
+                        "namespace": "rustfs-fault-test",
+                        "name": "data-rustfs-0",
+                        "uid": "pvc-uid-0"
+                    },
+                    "node_selector": {
+                        "key": "kubernetes.io/hostname",
+                        "operator": "In",
+                        "values": ["worker-a"]
+                    },
+                    "container_mount_path": "/data/rustfs0",
                     "mount_path": "/data/rustfs-fault/dm-volume"
                 },
                 "table": "0 1024 linear /dev/loop0 0",
@@ -2678,6 +2725,21 @@ mod tests {
                 &evidence,
             )
             .is_err()
+        );
+
+        let mut recreated_pvc_proof = host_proof.clone();
+        recreated_pvc_proof.target.persistent_volume_claim_uid = "pvc-uid-new".to_string();
+        recreated_pvc_proof.target.persistent_volume_claim_ref.uid = "pvc-uid-new".to_string();
+        assert!(
+            validate_host_storage_artifacts(
+                &recreated_pvc_proof,
+                &cleanup,
+                &target_proof,
+                &run_spec,
+                &evidence,
+            )
+            .is_err(),
+            "recovery evidence must reject a coordinated same-name PVC recreation"
         );
 
         let mut tampered_cleanup = cleanup.clone();
@@ -2716,8 +2778,22 @@ mod tests {
                 node: "worker-a".to_string(),
                 pod: "rustfs-0".to_string(),
                 pod_uid: "uid-0".to_string(),
+                volume_name: "data".to_string(),
                 persistent_volume_claim: "data-rustfs-0".to_string(),
+                persistent_volume_claim_uid: "pvc-uid-0".to_string(),
                 persistent_volume: "pv-a".to_string(),
+                persistent_volume_uid: "pv-uid-a".to_string(),
+                persistent_volume_claim_ref: HostStoragePersistentVolumeClaimRef {
+                    namespace: "rustfs-fault-test".to_string(),
+                    name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-0".to_string(),
+                },
+                node_selector: HostStorageNodeSelector {
+                    key: "kubernetes.io/hostname".to_string(),
+                    operator: "In".to_string(),
+                    values: vec!["worker-a".to_string()],
+                },
+                container_mount_path: "/data/rustfs0".to_string(),
                 persistent_volume_path: "/data/rustfs-fault/dm-volume".to_string(),
                 mapper_name: "rustfs-fault-dm".to_string(),
                 logical_device: "/dev/mapper/rustfs-fault-dm".to_string(),
