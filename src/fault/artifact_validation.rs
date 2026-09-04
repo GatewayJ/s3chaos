@@ -258,14 +258,21 @@ fn bound_case_artifact(case_dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+pub(crate) struct AttemptFailureSummaryReference<'a> {
+    pub observed_attempt_artifacts_dir: &'a str,
+    pub planned_attempt_artifacts_dir: &'a str,
+    pub planned_case_artifacts_dir: &'a str,
+    pub planned_case_name: &'a str,
+    pub failure_summary_ref: &'a str,
+    pub scenario: &'a str,
+    pub run_id: &'a str,
+}
+
 pub(crate) fn validate_attempt_failure_summary_reference(
     suite_root: &Path,
-    attempt_artifacts_dir: &str,
-    failure_summary_ref: &str,
-    scenario: &str,
-    run_id: &str,
+    reference: &AttemptFailureSummaryReference<'_>,
 ) -> Result<()> {
-    let summary_ref = Path::new(failure_summary_ref);
+    let summary_ref = Path::new(reference.failure_summary_ref);
     ensure!(
         !summary_ref.is_absolute()
             && summary_ref.components().all(|component| {
@@ -278,21 +285,34 @@ pub(crate) fn validate_attempt_failure_summary_reference(
     );
     let suite_root = fs::canonicalize(suite_root)
         .with_context(|| format!("canonicalize suite artifact root {}", suite_root.display()))?;
-    let attempt_ref = Path::new(attempt_artifacts_dir);
-    let attempt_path = if attempt_ref.is_absolute() {
-        attempt_ref.to_path_buf()
-    } else {
-        suite_root.join(attempt_ref)
+    let canonical_dir = |reference: &str, label: &str| -> Result<PathBuf> {
+        let reference = Path::new(reference);
+        let path = if reference.is_absolute() {
+            reference.to_path_buf()
+        } else {
+            suite_root.join(reference)
+        };
+        fs::canonicalize(&path).with_context(|| format!("canonicalize {label} {}", path.display()))
     };
-    let attempt_path = fs::canonicalize(&attempt_path).with_context(|| {
-        format!(
-            "canonicalize attempt artifact directory {}",
-            attempt_path.display()
-        )
-    })?;
+    let observed_attempt_path = canonical_dir(
+        reference.observed_attempt_artifacts_dir,
+        "observed attempt artifact directory",
+    )?;
+    let planned_attempt_path = canonical_dir(
+        reference.planned_attempt_artifacts_dir,
+        "planned attempt artifact directory",
+    )?;
+    let planned_case_path = canonical_dir(
+        reference.planned_case_artifacts_dir,
+        "planned case artifact directory",
+    )?;
     ensure!(
-        attempt_path.starts_with(&suite_root),
-        "attempt artifact directory is outside suite artifact root"
+        observed_attempt_path == planned_attempt_path
+            && planned_attempt_path.starts_with(&suite_root)
+            && planned_case_path.parent() == Some(planned_attempt_path.as_path())
+            && planned_case_path.file_name().and_then(|name| name.to_str())
+                == Some(reference.planned_case_name),
+        "suite-summary attempt directories do not match the suite plan"
     );
     let summary_path = fs::canonicalize(suite_root.join(summary_ref)).with_context(|| {
         format!(
@@ -302,15 +322,14 @@ pub(crate) fn validate_attempt_failure_summary_reference(
     })?;
     ensure!(
         summary_path.file_name().and_then(|name| name.to_str()) == Some("failure-summary.json")
-            && summary_path
-                .parent()
-                .and_then(Path::parent)
-                .is_some_and(|parent| parent == attempt_path),
+            && summary_path.parent() == Some(planned_case_path.as_path()),
         "failureSummary does not belong to the current attempt"
     );
-    let summary = read_json::<ArtifactIdentity>(&summary_path)?;
+    let summary = read_json::<FailureSummaryReferenceIdentity>(&summary_path)?;
     ensure!(
-        summary.scenario.as_deref() == Some(scenario) && summary.run_id.as_deref() == Some(run_id),
+        summary.scenario.as_deref() == Some(reference.scenario)
+            && summary.run_id.as_deref() == Some(reference.run_id)
+            && summary.case_name.as_deref() == Some(reference.planned_case_name),
         "failureSummary identity does not match the current attempt"
     );
     Ok(())
@@ -575,6 +594,13 @@ fn validate_fault_artifacts_with_identity(
     let preflight_summary =
         read_json::<PreflightSummary>(required(&artifacts, "preflight-summary.json")?)?;
     validate_preflight_summary(&preflight_summary, options)?;
+    validate_optional_identity_fields(
+        "preflight-summary.json",
+        Some(metadata.scenario.as_str()),
+        preflight_summary.run_id.as_deref(),
+        &metadata,
+        identity,
+    )?;
     let target_proof = read_json::<TargetProof>(required(&artifacts, "target-proof.json")?)?;
     validate_target_proof(&target_proof, &json_spec, options)?;
 
@@ -591,6 +617,20 @@ fn validate_fault_artifacts_with_identity(
             && has_event(&events, "checker-final", RunEventStatus::Succeeded),
         "run-events.jsonl is missing run started, run succeeded, or checker-final succeeded events"
     );
+    let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
+    ensure!(
+        !history.is_empty(),
+        "history.jsonl must contain operation records"
+    );
+    for record in &history {
+        validate_optional_identity_fields(
+            "history.jsonl operation record",
+            Some(record.scenario.as_str()),
+            record.run_id.as_deref(),
+            &metadata,
+            identity,
+        )?;
+    }
 
     let fault_evidence_path = required(&artifacts, "fault-evidence.json")?;
     ensure_json_field_present(
@@ -635,19 +675,14 @@ fn validate_fault_artifacts_with_identity(
 
     let prechecker =
         read_json::<CheckerReport>(required(&artifacts, "checker-pre-recommit-report.json")?)?;
-    validate_checker_identity(
-        "checker-pre-recommit-report.json",
-        &prechecker,
-        &metadata,
-        identity,
-    )?;
+    validate_checker_identity("checker-pre-recommit-report.json", &prechecker, &metadata)?;
     validate_checker_report(
         "checker-pre-recommit-report.json",
         &prechecker,
         options.expected_workload_versioning,
     )?;
     let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
-    validate_checker_identity("checker-report.json", &checker, &metadata, identity)?;
+    validate_checker_identity("checker-report.json", &checker, &metadata)?;
     validate_checker_report(
         "checker-report.json",
         &checker,
@@ -656,6 +691,13 @@ fn validate_fault_artifacts_with_identity(
 
     let recommit =
         read_json::<RecommitReportArtifact>(required(&artifacts, "recommit-report.json")?)?;
+    validate_optional_identity_fields(
+        "recommit-report.json",
+        recommit.scenario.as_deref(),
+        recommit.run_id.as_deref(),
+        &metadata,
+        identity,
+    )?;
     ensure!(
         recommit.attempted == recommit.committed
             && recommit.failed == 0
@@ -1010,14 +1052,11 @@ fn validate_checker_identity(
     name: &str,
     report: &CheckerReport,
     metadata: &RunMetadataArtifact,
-    policy: ArtifactIdentityPolicy<'_>,
 ) -> Result<()> {
-    if matches!(policy, ArtifactIdentityPolicy::PlannedAttempt(_)) {
-        ensure!(
-            report.scenario == metadata.scenario && report.run_id == metadata.run_id,
-            "{name} identity does not match the planned attempt"
-        );
-    }
+    ensure!(
+        report.scenario == metadata.scenario && report.run_id == metadata.run_id,
+        "{name} identity does not match run-metadata.json"
+    );
     Ok(())
 }
 
@@ -2149,6 +2188,16 @@ struct ArtifactIdentity {
     run_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FailureSummaryReferenceIdentity {
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    case_name: Option<String>,
+}
+
 fn default_recovery_stability_reread_seconds() -> u64 {
     DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS
 }
@@ -2262,6 +2311,10 @@ struct DmCrashRecoveryArtifact {
 
 #[derive(Debug, Deserialize)]
 struct RecommitReportArtifact {
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
     attempted: usize,
     committed: usize,
     failed: usize,
@@ -2461,7 +2514,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_success_validation_rejects_a_legacy_checker_from_another_attempt() {
+    fn every_validation_mode_rejects_a_checker_from_another_attempt() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_success_artifacts(dir.path(), "io-eio");
         let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
@@ -2472,13 +2525,136 @@ mod tests {
         write_json(&case_dir, "checker-report.json", &checker);
         let options = success_options(dir.path());
 
-        validate_fault_artifacts(&options).expect("explicit legacy-compatible validation");
+        let legacy_error =
+            validate_fault_artifacts(&options).expect_err("legacy mode must reject a conflict");
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("checker-report.json identity")
+        );
         let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
             &options,
             "run-00000000-0000-4000-8000-000000000001",
         )
         .expect_err("checker from another attempt");
         assert!(error.to_string().contains("checker-report.json identity"));
+    }
+
+    #[test]
+    fn verdict_artifact_identity_conflicts_are_rejected_in_every_mode() {
+        for name in [
+            "preflight-summary.json",
+            "history.jsonl",
+            "recommit-report.json",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_success_artifacts(dir.path(), "io-eio");
+            let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+            let path = case_dir.join(name);
+            if name == "history.jsonl" {
+                let mut record: serde_json::Value =
+                    serde_json::from_str(fs::read_to_string(&path).expect("history").trim())
+                        .expect("record");
+                record["run_id"] = json!("run-old");
+                fs::write(&path, format!("{record}\n")).expect("write history");
+            } else {
+                let mut artifact: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&path).expect("artifact"))
+                        .expect("json");
+                let key = if name == "preflight-summary.json" {
+                    "runId"
+                } else {
+                    "run_id"
+                };
+                artifact[key] = json!("run-old");
+                write_json(&case_dir, name, &artifact);
+            }
+            let options = success_options(dir.path());
+            let legacy = validate_fault_artifacts(&options)
+                .expect_err("legacy-compatible validation must reject an identity conflict");
+            assert!(format!("{legacy:#}").contains(name), "{legacy:#}");
+            let strict = validate_fault_artifacts_for_planned_attempt_and_write_report(
+                &options,
+                "run-00000000-0000-4000-8000-000000000001",
+            )
+            .expect_err("strict validation must reject an identity conflict");
+            assert!(format!("{strict:#}").contains(name), "{strict:#}");
+        }
+    }
+
+    #[test]
+    fn strict_verdict_artifacts_require_additive_identity_fields() {
+        for name in [
+            "preflight-summary.json",
+            "history.jsonl",
+            "recommit-report.json",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_success_artifacts(dir.path(), "io-eio");
+            let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+            let path = case_dir.join(name);
+            if name == "history.jsonl" {
+                let mut record: serde_json::Value =
+                    serde_json::from_str(fs::read_to_string(&path).expect("history").trim())
+                        .expect("record");
+                record.as_object_mut().expect("object").remove("run_id");
+                fs::write(&path, format!("{record}\n")).expect("write history");
+            } else {
+                let mut artifact: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&path).expect("artifact"))
+                        .expect("json");
+                let key = if name == "preflight-summary.json" {
+                    "runId"
+                } else {
+                    "run_id"
+                };
+                artifact.as_object_mut().expect("object").remove(key);
+                write_json(&case_dir, name, &artifact);
+            }
+            let options = success_options(dir.path());
+            validate_fault_artifacts(&options).expect("legacy additive field may be absent");
+            let strict = validate_fault_artifacts_for_planned_attempt_and_write_report(
+                &options,
+                "run-00000000-0000-4000-8000-000000000001",
+            )
+            .expect_err("strict validation requires current identity");
+            assert!(format!("{strict:#}").contains(name), "{strict:#}");
+        }
+    }
+
+    #[test]
+    fn strict_success_validation_rejects_invalid_history_jsonl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        fs::write(case_dir.join("history.jsonl"), "{}\n").expect("invalid history");
+        let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &success_options(dir.path()),
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect_err("invalid operation record must fail closed");
+        assert!(format!("{error:#}").contains("history.jsonl"));
+    }
+
+    #[test]
+    fn strict_success_validation_rejects_mixed_attempt_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("history.jsonl");
+        let current = fs::read_to_string(&path).expect("history");
+        let mut other: serde_json::Value =
+            serde_json::from_str(current.trim()).expect("operation record");
+        other["id"] = json!("op-000002");
+        other["run_id"] = json!("run-old");
+        fs::write(&path, format!("{current}{other}\n")).expect("mixed history");
+
+        let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &success_options(dir.path()),
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect_err("every operation record must match the planned attempt");
+        assert!(format!("{error:#}").contains("history.jsonl"));
     }
 
     #[test]
@@ -3799,6 +3975,7 @@ mod tests {
             "preflight-summary.json",
             &json!({
                 "schemaVersion": 1,
+                "runId": run_id,
                 "status": "passed",
                 "scenarioSet": [scenario],
                 "checkedAtMs": 1,
@@ -3903,7 +4080,28 @@ mod tests {
         workload_plan["scenario"] = json!(scenario);
         workload_plan["run_id"] = json!(run_id);
         write_json(&case_dir, "workload-plan.json", &workload_plan);
-        fs::write(case_dir.join("history.jsonl"), "{}\n").expect("history");
+        fs::write(
+            case_dir.join("history.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "id": "op-000001",
+                    "scenario": scenario,
+                    "run_id": run_id,
+                    "kind": "put",
+                    "bucket": "bucket",
+                    "key": "key",
+                    "value_sha256": "sha",
+                    "size_bytes": 1,
+                    "started_at_ms": 1,
+                    "ended_at_ms": 2,
+                    "outcome": "ok",
+                    "http_status": 200,
+                    "error": null
+                })
+            ),
+        )
+        .expect("history");
         write_json(
             &case_dir,
             "workload-summary.json",
@@ -3927,6 +4125,8 @@ mod tests {
             &case_dir,
             "recommit-report.json",
             &json!({
+                "scenario": scenario,
+                "run_id": run_id,
                 "attempted": 1,
                 "committed": 1,
                 "failed": 0,

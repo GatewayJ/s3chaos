@@ -187,7 +187,7 @@ async fn run_fault_case(
                 crate::fault::reporting::ResponsibilityDomain::FaultBackend,
             )],
         ));
-        write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+        write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases).ok();
         events
             .record(
                 "fault-backend-preflight",
@@ -216,7 +216,7 @@ async fn run_fault_case(
             crate::fault::reporting::ResponsibilityDomain::FaultBackend,
         )],
     ));
-    write_preflight_summary(collector, scenario, config, &preflight_phases)?;
+    write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases)?;
     events.record(
         "fault-backend-preflight",
         RunEventStatus::Succeeded,
@@ -238,7 +238,7 @@ async fn run_fault_case(
                 crate::fault::reporting::ResponsibilityDomain::FaultBackend,
             )],
         ));
-        write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+        write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases).ok();
         events
             .record(
                 "fault-backend-pre-cleanup",
@@ -267,7 +267,7 @@ async fn run_fault_case(
             crate::fault::reporting::ResponsibilityDomain::FaultBackend,
         )],
     ));
-    write_preflight_summary(collector, scenario, config, &preflight_phases)?;
+    write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases)?;
     events.record(
         "fault-backend-pre-cleanup",
         RunEventStatus::Succeeded,
@@ -362,7 +362,7 @@ async fn run_fault_case(
                     crate::fault::reporting::ResponsibilityDomain::Environment,
                 )],
             ));
-            write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+            write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases).ok();
             events
                 .record(
                     "write-quorum-loss-topology-proof",
@@ -693,7 +693,8 @@ async fn run_fault_case(
                         crate::fault::reporting::ResponsibilityDomain::Harness,
                     )],
                 ));
-                write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+                write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases)
+                    .ok();
                 events
                     .record(
                         "target-preflight",
@@ -730,7 +731,7 @@ async fn run_fault_case(
         "target-proof",
         vec![target_proof.preflight_check()],
     ));
-    write_preflight_summary(collector, scenario, config, &preflight_phases)?;
+    write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases)?;
     if let Err(error) = target_proof.require_satisfied() {
         events
             .record(
@@ -1900,9 +1901,10 @@ fn write_preflight_summary(
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
     config: &FaultTestConfig,
+    run_id: &str,
     phases: &[PreflightPhase],
 ) -> Result<()> {
-    let summary = PreflightSummary::single_run(config, &scenario.name, phases.to_vec());
+    let summary = PreflightSummary::single_run(config, &scenario.name, run_id, phases.to_vec());
     collector.write_text(
         scenario.case_name,
         "preflight-summary.json",
@@ -3583,11 +3585,15 @@ async fn recommit_unconfirmed_objects(
         .collect::<Vec<_>>()
         .await;
     attempts.sort_by(|left, right| left.key.cmp(&right.key));
-    RecommitReport::from_attempts(attempts)
+    RecommitReport::from_attempts(attempts).with_identity(&history.scenario(), &history.run_id())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct RecommitReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scenario: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
     attempted: usize,
     committed: usize,
     failed: usize,
@@ -3610,12 +3616,20 @@ impl RecommitReport {
             .filter(|attempt| attempt.is_harness_error())
             .count();
         Self {
+            scenario: None,
+            run_id: None,
             attempted: attempts.len(),
             committed,
             failed,
             harness_errors,
             attempts,
         }
+    }
+
+    fn with_identity(mut self, scenario: &str, run_id: &str) -> Self {
+        self.scenario = Some(scenario.to_string());
+        self.run_id = Some(run_id.to_string());
+        self
     }
 
     fn has_failures(&self) -> bool {

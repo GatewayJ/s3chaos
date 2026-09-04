@@ -21,7 +21,9 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
-use crate::fault::artifact_validation::validate_attempt_failure_summary_reference;
+use crate::fault::artifact_validation::{
+    AttemptFailureSummaryReference, validate_attempt_failure_summary_reference,
+};
 
 const MAX_ARTIFACT_SCAN_DEPTH: usize = 8;
 const MAX_ARTIFACT_SCAN_FILES: usize = 10_000;
@@ -470,9 +472,9 @@ pub fn build_console_snapshot(root: impl AsRef<Path>) -> Result<ConsoleSnapshot>
     }
 
     let exit_codes = read_exit_codes(root, &index.exit_codes, &mut warnings);
-    let expected_failure_proof_missing = suite_summary
-        .as_ref()
-        .is_some_and(|summary| expected_failure_attempt_missing_summary(root, summary));
+    let expected_failure_proof_missing = suite_summary.as_ref().is_some_and(|summary| {
+        expected_failure_attempt_missing_summary(root, suite_plan.as_ref(), summary)
+    });
     if expected_failure_proof_missing {
         push_warning(
             &mut warnings,
@@ -1928,27 +1930,65 @@ fn should_warn_missing_failure_summary(
 
 fn expected_failure_attempt_missing_summary(
     root: &Path,
+    plan: Option<&ConsoleSuitePlanView>,
     summary: &ConsoleSuiteSummaryView,
 ) -> bool {
     summary.attempts.iter().any(|attempt| {
         let matched = attempt.status.as_deref() == Some("expected-failure")
             || attempt.expected_failure_matched == Some(true);
-        matched
-            && attempt
-                .artifacts_dir_reference
-                .as_deref()
-                .zip(attempt.failure_summary_reference.as_deref())
-                .zip(attempt.scenario.as_deref().zip(attempt.run_id.as_deref()))
-                .is_none_or(|((attempt_dir, summary_ref), (scenario, run_id))| {
-                    validate_attempt_failure_summary_reference(
-                        root,
-                        attempt_dir,
-                        summary_ref,
-                        scenario,
-                        run_id,
-                    )
-                    .is_err()
-                })
+        if !matched {
+            return false;
+        }
+        let Some(index) = attempt.index else {
+            return true;
+        };
+        let mut matching_plans = plan
+            .into_iter()
+            .flat_map(|plan| &plan.attempts)
+            .filter(|planned| planned.index == Some(index));
+        let Some(planned) = matching_plans.next() else {
+            return true;
+        };
+        if matching_plans.next().is_some()
+            || attempt.run_id != planned.run_id
+            || attempt.scenario != planned.scenario
+            || attempt.repetition != planned.repetition
+        {
+            return true;
+        }
+        let (
+            Some(observed_attempt),
+            Some(planned_attempt),
+            Some(planned_case),
+            Some(planned_case_name),
+            Some(summary_ref),
+            Some(scenario),
+            Some(run_id),
+        ) = (
+            attempt.artifacts_dir_reference.as_deref(),
+            planned.attempt_artifact_dir.as_deref(),
+            planned.case_artifact_dir.as_deref(),
+            planned.case_name.as_deref(),
+            attempt.failure_summary_reference.as_deref(),
+            planned.scenario.as_deref(),
+            planned.run_id.as_deref(),
+        )
+        else {
+            return true;
+        };
+        validate_attempt_failure_summary_reference(
+            root,
+            &AttemptFailureSummaryReference {
+                observed_attempt_artifacts_dir: observed_attempt,
+                planned_attempt_artifacts_dir: planned_attempt,
+                planned_case_artifacts_dir: planned_case,
+                planned_case_name,
+                failure_summary_ref: summary_ref,
+                scenario,
+                run_id,
+            },
+        )
+        .is_err()
     })
 }
 
@@ -2019,12 +2059,12 @@ fn json_string_array(value: &Value, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactIndex, ArtifactScanLimits, MAX_JSON_ARTIFACT_BYTES, build_console_snapshot,
-        validate_attempt_failure_summary_reference,
+        ArtifactIndex, ArtifactScanLimits, AttemptFailureSummaryReference, MAX_JSON_ARTIFACT_BYTES,
+        build_console_snapshot, validate_attempt_failure_summary_reference,
     };
     use serde_json::json;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn missing_optional_files_emit_warnings() {
@@ -2227,6 +2267,7 @@ mod tests {
                 serde_json::to_string(&json!({
                     "scenario": "io-eio",
                     "run_id": "run-current",
+                    "case_name": "case",
                     "stage": "checker-verdict",
                     "verdict": "failed",
                     "severity": "fail_correctness",
@@ -2239,27 +2280,50 @@ mod tests {
             )
             .expect("write summary");
         }
-        let write_suite = |failure_summary: &str| {
-            fs::write(
-                dir.path().join("suite-summary.json"),
-                serde_json::to_string(&json!({
-                    "suite": "smoke",
-                    "runId": "suite-1",
-                    "status": "succeeded",
-                    "attempts": [{
-                        "index": 1,
-                        "runId": "run-current",
-                        "scenario": "io-eio",
+        fs::write(
+            dir.path().join("suite-plan.json"),
+            serde_json::to_string(&json!({
+                "suite": "smoke",
+                "runId": "suite-1",
+                "attempts": [{
+                    "index": 1,
+                    "runId": "run-current",
+                    "scenario": "io-eio",
+                    "caseName": "case",
+                    "repetition": 1,
+                    "artifacts": {
+                        "attemptDir": attempt_dir,
+                        "caseDir": case_dir,
+                        "eventStream": case_dir.join("run-events.jsonl")
+                    }
+                }]
+            }))
+            .expect("suite plan"),
+        )
+        .expect("write suite plan");
+        let write_suite =
+            |failure_summary: &str, scenario: &str, run_id: &str, artifacts_dir: &Path| {
+                fs::write(
+                    dir.path().join("suite-summary.json"),
+                    serde_json::to_string(&json!({
+                        "suite": "smoke",
+                        "runId": "suite-1",
+                        "status": "succeeded",
+                        "attempts": [{
+                            "index": 1,
+                        "runId": run_id,
+                        "scenario": scenario,
+                        "repetition": 1,
                         "status": "expected-failure",
-                        "artifactsDir": attempt_dir,
-                        "expectedFailureMatched": true,
-                        "failureSummary": failure_summary
-                    }]
-                }))
-                .expect("suite summary"),
-            )
-            .expect("write suite summary");
-        };
+                            "artifactsDir": artifacts_dir,
+                            "expectedFailureMatched": true,
+                            "failureSummary": failure_summary
+                        }]
+                    }))
+                    .expect("suite summary"),
+                )
+                .expect("write suite summary");
+            };
         let warns = || {
             build_console_snapshot(dir.path())
                 .expect("snapshot")
@@ -2273,13 +2337,23 @@ mod tests {
                 })
         };
 
-        write_suite("001-io-eio-r1/case/failure-summary.json");
-        validate_attempt_failure_summary_reference(
-            dir.path(),
-            attempt_dir.to_str().expect("attempt path"),
+        write_suite(
             "001-io-eio-r1/case/failure-summary.json",
             "io-eio",
             "run-current",
+            &attempt_dir,
+        );
+        validate_attempt_failure_summary_reference(
+            dir.path(),
+            &AttemptFailureSummaryReference {
+                observed_attempt_artifacts_dir: attempt_dir.to_str().expect("attempt path"),
+                planned_attempt_artifacts_dir: attempt_dir.to_str().expect("planned attempt path"),
+                planned_case_artifacts_dir: case_dir.to_str().expect("planned case path"),
+                planned_case_name: "case",
+                failure_summary_ref: "001-io-eio-r1/case/failure-summary.json",
+                scenario: "io-eio",
+                run_id: "run-current",
+            },
         )
         .expect("direct bound proof validation");
         assert!(
@@ -2291,7 +2365,7 @@ mod tests {
             "002-io-eio-r1/case/failure-summary.json",
             "001-io-eio-r1/../002-io-eio-r1/case/failure-summary.json",
         ] {
-            write_suite(invalid);
+            write_suite(invalid, "io-eio", "run-current", &attempt_dir);
             assert!(
                 warns(),
                 "unbound proof {invalid:?} must not suppress warning"
@@ -2302,15 +2376,44 @@ mod tests {
                 .join("failure-summary.json")
                 .to_str()
                 .expect("utf8 path"),
+            "io-eio",
+            "run-current",
+            &attempt_dir,
         );
         assert!(warns(), "absolute proof must not suppress warning");
+
+        fs::write(
+            other_case.join("failure-summary.json"),
+            serde_json::to_string(&json!({
+                "scenario": "network-delay",
+                "run_id": "run-old",
+                "case_name": "case"
+            }))
+            .expect("old summary"),
+        )
+        .expect("write old summary");
+        write_suite(
+            "002-io-eio-r1/case/failure-summary.json",
+            "network-delay",
+            "run-old",
+            other_case.parent().expect("old attempt"),
+        );
+        assert!(
+            warns(),
+            "coordinated summary identity and path replacement must not override the suite plan"
+        );
 
         #[cfg(unix)]
         {
             let symlink = case_dir.join("linked-failure-summary.json");
             std::os::unix::fs::symlink(other_case.join("failure-summary.json"), &symlink)
                 .expect("symlink");
-            write_suite("001-io-eio-r1/case/linked-failure-summary.json");
+            write_suite(
+                "001-io-eio-r1/case/linked-failure-summary.json",
+                "io-eio",
+                "run-current",
+                &attempt_dir,
+            );
             assert!(warns(), "symlink proof must not suppress warning");
         }
     }

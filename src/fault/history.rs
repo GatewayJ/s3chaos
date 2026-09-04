@@ -109,6 +109,8 @@ pub struct ByteRange {
 pub struct OperationRecord {
     pub id: String,
     pub scenario: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub kind: OperationKind,
     pub bucket: String,
     pub key: Option<String>,
@@ -201,6 +203,7 @@ impl Recorder {
         OperationRecord {
             id,
             scenario: state.scenario.clone(),
+            run_id: Some(state.run_id.clone()),
             kind,
             bucket: bucket.into(),
             key,

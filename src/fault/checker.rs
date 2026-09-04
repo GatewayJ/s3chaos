@@ -2535,6 +2535,7 @@ mod tests {
         OperationRecord {
             id: id.to_string(),
             scenario: "io-eio".to_string(),
+            run_id: None,
             kind,
             bucket: "bucket".to_string(),
             key: Some(key.to_string()),
@@ -2580,6 +2581,7 @@ mod tests {
         OperationRecord {
             id: id.to_string(),
             scenario: "io-eio".to_string(),
+            run_id: None,
             kind: OperationKind::List,
             bucket: "bucket".to_string(),
             key: Some(prefix.to_string()),
