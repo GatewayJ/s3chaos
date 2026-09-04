@@ -34,7 +34,7 @@ use crate::fault::{
     preflight::{PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus},
     reporting::{
         AvailabilityStatus, DataCorrectnessStatus, FailureClassification, FailurePhase,
-        FailureSeverity, FailureVerdict, ResponsibilityDomain,
+        FailureSeverity, FailureSummary, FailureVerdict, ResponsibilityDomain,
     },
     scenarios::{self, DM_FLAKEY_VERSIONED_HOT_SCENARIO},
     spec::{
@@ -87,6 +87,13 @@ pub struct ArtifactValidationFileReport {
     pub validation: Option<ArtifactValidationReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExpectedFailureArtifactReport {
+    pub failure_summary: String,
+    pub summary: FailureSummary,
+    pub client_disruptions: usize,
 }
 
 impl ArtifactValidationReport {
@@ -396,7 +403,6 @@ pub fn validate_fault_artifacts(
 }
 
 fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -> Result<()> {
-    let catalog_spec = scenarios::scenario_spec(&options.scenario)?;
     ensure!(
         spec.api_version == FAULT_RUN_API_VERSION,
         "run-spec apiVersion {:?} does not match {FAULT_RUN_API_VERSION}",
@@ -413,11 +419,11 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
         spec.scenario.name,
         options.scenario
     );
-    ensure!(
-        spec.scenario.detector == catalog_spec.detector.contract(),
-        "run-spec scenario detector contract does not match the catalog for {:?}",
-        options.scenario
-    );
+    if let Some(detector) = &spec.scenario.detector {
+        detector
+            .validate()
+            .context("run-spec scenario detector contract is invalid")?;
+    }
     ensure!(
         spec.workload.object_count == options.expected_workload_objects,
         "run-spec workload.object_count {} does not match expected {}",
@@ -1008,6 +1014,188 @@ pub(crate) fn validate_written_failure_summary(root: &Path, path: &Path) -> Resu
     validate_failure_summary_v2_fields(&summary, Some(root), Some(path))
 }
 
+pub(crate) fn validate_expected_failure_artifacts(
+    suite_root: &Path,
+    case_dir: &Path,
+    scenario: &str,
+    case_name: &str,
+    attempt_started_at_ms: u64,
+    evaluated_at_ms: u64,
+) -> Result<ExpectedFailureArtifactReport> {
+    let suite_root = fs::canonicalize(suite_root)
+        .with_context(|| format!("canonicalize suite artifact root {}", suite_root.display()))?;
+    let case_dir = fs::canonicalize(case_dir).with_context(|| {
+        format!(
+            "canonicalize case artifact directory {}",
+            case_dir.display()
+        )
+    })?;
+    ensure!(
+        case_dir.starts_with(&suite_root),
+        "case artifact directory {} is outside suite artifact root {}",
+        case_dir.display(),
+        suite_root.display()
+    );
+    ensure!(
+        attempt_started_at_ms <= evaluated_at_ms,
+        "expected-failure evaluation window is invalid"
+    );
+
+    let summary_path = case_dir.join("failure-summary.json");
+    let summary_raw = fs::read_to_string(&summary_path)
+        .with_context(|| format!("reading JSON artifact {}", summary_path.display()))?;
+    let summary = serde_json::from_str::<FailureSummaryArtifact>(&summary_raw)
+        .with_context(|| format!("parsing JSON artifact {}", summary_path.display()))?;
+    let typed_summary = serde_json::from_str::<FailureSummary>(&summary_raw)
+        .with_context(|| format!("parsing typed failure summary {}", summary_path.display()))?;
+    ensure!(
+        summary.schema_version == 2,
+        "expected failure requires failure-summary.json schema_version 2, got {}",
+        summary.schema_version
+    );
+    validate_failure_summary_v2_fields(&summary, Some(&suite_root), Some(&summary_path))?;
+    ensure!(
+        summary.scenario == scenario,
+        "failure-summary.json scenario {:?} does not match current attempt {:?}",
+        summary.scenario,
+        scenario
+    );
+    ensure!(
+        summary.case_name.as_deref() == Some(case_name),
+        "failure-summary.json case_name {:?} does not match current attempt {:?}",
+        summary.case_name,
+        case_name
+    );
+    let observed_at_ms = summary
+        .observed_at_ms
+        .context("expected failure requires failure-summary.json observed_at_ms")?;
+    ensure!(
+        (attempt_started_at_ms..=evaluated_at_ms).contains(&observed_at_ms),
+        "failure-summary.json observed_at_ms {observed_at_ms} is outside current attempt window {attempt_started_at_ms}..={evaluated_at_ms}"
+    );
+    ensure!(
+        summary.phase.is_some(),
+        "expected failure requires failure-summary.json phase"
+    );
+    ensure!(
+        summary.responsibility_domain.is_some(),
+        "expected failure requires failure-summary.json responsibility_domain"
+    );
+    ensure!(
+        summary.s3_model_classification.as_deref() == Some(summary.classification.as_str())
+            && summary.run_failure_reason.is_none(),
+        "expected failure requires a complete product S3-model classification projection"
+    );
+    ensure!(
+        summary.verdict == FailureVerdict::Failed,
+        "expected failure requires failure-summary.json verdict failed"
+    );
+    ensure!(
+        !summary.primary_evidence_refs.is_empty(),
+        "expected failure requires primary evidence refs"
+    );
+
+    let mut referenced = BTreeMap::new();
+    for evidence_ref in &summary.primary_evidence_refs {
+        let relative = Path::new(evidence_ref);
+        ensure!(
+            relative.components().count() > 1,
+            "expected failure requires suite-root-relative evidence refs"
+        );
+        let evidence_path = fs::canonicalize(suite_root.join(relative)).with_context(|| {
+            format!(
+                "canonicalize expected-failure evidence ref {:?}",
+                evidence_ref
+            )
+        })?;
+        ensure!(
+            evidence_path.parent() == Some(case_dir.as_path()),
+            "expected-failure evidence ref {:?} does not belong to current case directory {}",
+            evidence_ref,
+            case_dir.display()
+        );
+        let file_name = evidence_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("expected-failure evidence ref has no UTF-8 file name")?;
+        referenced.insert(file_name.to_string(), evidence_path);
+    }
+
+    let fault_evidence_path = referenced
+        .get("fault-evidence.json")
+        .context("expected failure requires fault-evidence.json as primary evidence")?;
+    let evidence = read_json::<FaultEvidenceArtifact>(fault_evidence_path)?;
+    ensure!(
+        evidence.scenario.as_deref() == Some(scenario),
+        "fault-evidence.json scenario {:?} does not match current attempt {:?}",
+        evidence.scenario,
+        scenario
+    );
+    ensure!(
+        evidence.injected && evidence.active_during_workload && evidence.recovered,
+        "fault-evidence.json must record injected=true, active_during_workload=true, recovered=true"
+    );
+    ensure!(
+        !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
+        "fault-evidence.json must include active and workload fault snapshots"
+    );
+    validate_fault_window_evidence(&evidence)?;
+    let fault_started_at_ms = evidence
+        .fault_apply_started_at_ms
+        .expect("fault window validation requires apply timestamp");
+    let recovery_ended_at_ms = evidence
+        .recovery_ended_at_ms
+        .expect("fault window validation requires recovery timestamp");
+    ensure!(
+        fault_started_at_ms >= attempt_started_at_ms && recovery_ended_at_ms <= evaluated_at_ms,
+        "fault-evidence.json timestamps are outside the current attempt window"
+    );
+
+    let run_spec = read_json::<ExpectedFailureRunSpecIdentity>(&case_dir.join("run-spec.json"))?;
+    ensure!(
+        run_spec.metadata.name == case_name
+            && run_spec.scenario.name == scenario
+            && run_spec.scenario.case_name == case_name
+            && !run_spec.metadata.run_id.trim().is_empty(),
+        "run-spec.json identity does not match the current attempt"
+    );
+
+    let events_path = referenced
+        .get("run-events.jsonl")
+        .context("expected failure requires run-events.jsonl as primary evidence")?;
+    let events = read_jsonl::<RunEvent>(events_path)?;
+    ensure!(!events.is_empty(), "run-events.jsonl must not be empty");
+    ensure!(
+        events.iter().all(|event| {
+            event.scenario == scenario
+                && event.run_id == run_spec.metadata.run_id
+                && (attempt_started_at_ms..=evaluated_at_ms).contains(&event.at_ms)
+        }),
+        "run-events.jsonl identity or timestamps do not match the current attempt"
+    );
+    ensure!(
+        has_event(&events, "run", RunEventStatus::Started)
+            && has_event(&events, "run", RunEventStatus::Failed),
+        "run-events.jsonl is missing current-attempt run started or failed events"
+    );
+
+    for name in ["checker-report.json", "checker-pre-recommit-report.json"] {
+        if let Some(path) = referenced.get(name) {
+            let checker = read_json::<ExpectedFailureCheckerIdentity>(path)?;
+            ensure!(
+                checker.scenario == scenario && checker.run_id == run_spec.metadata.run_id,
+                "{name} identity does not match the current attempt"
+            );
+        }
+    }
+
+    Ok(ExpectedFailureArtifactReport {
+        failure_summary: summary_path.display().to_string(),
+        summary: typed_summary,
+        client_disruptions: evidence.client_disruptions,
+    })
+}
+
 fn validate_failure_summary_v2_fields(
     summary: &FailureSummaryArtifact,
     artifact_root: Option<&Path>,
@@ -1501,6 +1689,8 @@ fn default_recovery_stability_reread_seconds() -> u64 {
 
 #[derive(Debug, Deserialize)]
 struct FaultEvidenceArtifact {
+    #[serde(default)]
+    scenario: Option<String>,
     injected: bool,
     active_during_workload: bool,
     recovered: bool,
@@ -1524,6 +1714,30 @@ struct FaultEvidenceArtifact {
     recovery_started_at_ms: Option<u64>,
     #[serde(default)]
     recovery_ended_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedFailureRunSpecIdentity {
+    metadata: ExpectedFailureRunMetadataIdentity,
+    scenario: ExpectedFailureScenarioIdentity,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedFailureRunMetadataIdentity {
+    name: String,
+    run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedFailureScenarioIdentity {
+    name: String,
+    case_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedFailureCheckerIdentity {
+    scenario: String,
+    run_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1714,13 +1928,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_run_spec_detector_contract_drift() {
+    fn accepts_self_contained_detector_contract_after_catalog_evolution() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_success_artifacts(dir.path(), "io-eio");
         let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
         rewrite_run_spec_detector(
             &case_dir,
             json!({
+                "revision": 1,
                 "qualification": "gate-candidate",
                 "detects": ["commit-metadata-loss"]
             }),
@@ -1737,8 +1952,56 @@ mod tests {
             expected_rustfs_volume_path: "/data/rustfs0".to_string(),
         };
 
-        let error = validate_fault_artifacts(&options).expect_err("detector drift");
+        validate_fault_artifacts(&options).expect("self-contained historical detector contract");
+    }
 
+    #[test]
+    fn accepts_legacy_run_spec_without_detector_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        rewrite_run_spec_without_detector(&case_dir);
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        validate_fault_artifacts(&options).expect("legacy run spec");
+    }
+
+    #[test]
+    fn rejects_unknown_detector_contract_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        rewrite_run_spec_detector(
+            &case_dir,
+            json!({
+                "revision": 2,
+                "qualification": "gate-candidate",
+                "detects": ["data-shard-loss"]
+            }),
+        );
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        let error = validate_fault_artifacts(&options).expect_err("unknown detector revision");
         assert!(error.to_string().contains("detector contract"));
     }
 
@@ -2874,6 +3137,7 @@ mod tests {
                 "boundary": "rustfs-workload/fault-injection",
                 "validation": "clean checker",
                 "detector": {
+                    "revision": 1,
                     "qualification": "gate-candidate",
                     "detects": ["data-shard-loss", "silent-data-corruption"]
                 }
@@ -3148,6 +3412,28 @@ mod tests {
         )
         .expect("parse run spec");
         spec["scenario"]["detector"] = detector;
+        fs::write(
+            &json_path,
+            serde_json::to_string_pretty(&spec).expect("json"),
+        )
+        .expect("write run spec json");
+        fs::write(
+            case_dir.join("run-spec.yaml"),
+            serde_yaml_ng::to_string(&spec).expect("yaml"),
+        )
+        .expect("write run spec yaml");
+    }
+
+    fn rewrite_run_spec_without_detector(case_dir: &std::path::Path) {
+        let json_path = case_dir.join("run-spec.json");
+        let mut spec = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(&json_path).expect("read run spec"),
+        )
+        .expect("parse run spec");
+        spec["scenario"]
+            .as_object_mut()
+            .expect("scenario object")
+            .remove("detector");
         fs::write(
             &json_path,
             serde_json::to_string_pretty(&spec).expect("json"),

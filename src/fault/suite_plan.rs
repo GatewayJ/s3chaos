@@ -815,6 +815,7 @@ mod tests {
                         "expectedBackend": "chaos-mesh-io-chaos",
                         "catalogTarget": "one RustFS container data volume selected by tenant label and configured RustFS volume path",
                         "detector": {
+                            "revision": 1,
                             "qualification": "gate-candidate",
                             "detects": ["data-shard-loss", "silent-data-corruption"]
                         },
@@ -890,8 +891,9 @@ mod tests {
                         "expectedBackend": "chaos-mesh-network-chaos",
                         "catalogTarget": "one RustFS Pod selected by tenant label with delayed peer traffic inside the e2e namespace",
                         "detector": {
+                            "revision": 1,
                             "qualification": "gate-candidate",
-                            "detects": ["recovery-availability-regression", "silent-data-corruption"]
+                            "detects": ["silent-data-corruption", "recovery-availability-regression"]
                         },
                         "faultDurationSeconds": 480,
                         "workload": {

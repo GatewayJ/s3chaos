@@ -20,6 +20,8 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
+use crate::fault::{scenarios::FaultDetectorContract, suite::FaultExpectedFailure};
+
 const MAX_ARTIFACT_SCAN_DEPTH: usize = 8;
 const MAX_ARTIFACT_SCAN_FILES: usize = 10_000;
 const MAX_JSON_ARTIFACT_BYTES: u64 = 1024 * 1024;
@@ -68,6 +70,10 @@ pub struct ConsolePlannedAttemptView {
     pub case_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repetition: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detector: Option<FaultDetectorContract>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_failure: Option<FaultExpectedFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt_artifact_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,6 +160,12 @@ pub struct ConsoleSuiteAttemptView {
     pub ended_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifacts_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_failure: Option<FaultExpectedFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_failure_matched: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1595,6 +1607,8 @@ struct SuitePlanAttemptExtract {
     scenario: Option<String>,
     case_name: Option<String>,
     repetition: Option<usize>,
+    detector: Option<FaultDetectorContract>,
+    expected_failure: Option<FaultExpectedFailure>,
     artifacts: Option<SuitePlanAttemptArtifactsExtract>,
 }
 
@@ -1614,6 +1628,8 @@ impl ConsolePlannedAttemptView {
             scenario: value.scenario,
             case_name: value.case_name,
             repetition: value.repetition,
+            detector: value.detector,
+            expected_failure: value.expected_failure,
             attempt_artifact_dir: view_artifact_path_opt(root, artifacts.attempt_dir),
             case_artifact_dir: view_artifact_path_opt(root, artifacts.case_dir),
             event_stream: view_artifact_path_opt(root, artifacts.event_stream),
@@ -1690,6 +1706,9 @@ struct SuiteAttemptExtract {
     started_at_ms: Option<u64>,
     ended_at_ms: Option<u64>,
     artifacts_dir: Option<String>,
+    expected_failure: Option<FaultExpectedFailure>,
+    expected_failure_matched: Option<bool>,
+    failure_summary: Option<String>,
     seed: Option<u64>,
     client_disruptions: Option<usize>,
     recommitted: Option<usize>,
@@ -1714,6 +1733,9 @@ impl ConsoleSuiteAttemptView {
             started_at_ms: value.started_at_ms,
             ended_at_ms: value.ended_at_ms,
             artifacts_dir: view_artifact_path_opt(root, value.artifacts_dir),
+            expected_failure: value.expected_failure,
+            expected_failure_matched: value.expected_failure_matched,
+            failure_summary: view_artifact_path_opt(root, value.failure_summary),
             seed: value.seed,
             client_disruptions: value.client_disruptions,
             recommitted: value.recommitted,
@@ -2014,6 +2036,83 @@ mod tests {
     }
 
     #[test]
+    fn projects_detector_and_expected_failure_contracts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("suite-plan.json"),
+            serde_json::to_string_pretty(&json!({
+                "suite": "smoke",
+                "runId": "suite-1",
+                "artifactRoot": dir.path(),
+                "attempts": [{
+                    "index": 1,
+                    "scenario": "io-eio",
+                    "caseName": "case",
+                    "repetition": 1,
+                    "detector": {
+                        "revision": 1,
+                        "qualification": "gate-candidate",
+                        "detects": ["silent-data-corruption"]
+                    },
+                    "expectedFailure": {
+                        "classification": "data_corruption",
+                        "severity": "fail_correctness",
+                        "responsibilityDomain": "product",
+                        "evidenceRefs": [
+                            "checker-report.json",
+                            "fault-evidence.json",
+                            "run-events.jsonl"
+                        ]
+                    }
+                }]
+            }))
+            .expect("plan json"),
+        )
+        .expect("plan");
+        fs::write(
+            dir.path().join("suite-summary.json"),
+            serde_json::to_string_pretty(&json!({
+                "suite": "smoke",
+                "runId": "suite-1",
+                "status": "succeeded",
+                "attempts": [{
+                    "index": 1,
+                    "scenario": "io-eio",
+                    "repetition": 1,
+                    "status": "expected-failure",
+                    "artifactsDir": "001-io-eio-r1",
+                    "expectedFailure": {
+                        "classification": "data_corruption",
+                        "severity": "fail_correctness",
+                        "responsibilityDomain": "product",
+                        "evidenceRefs": [
+                            "checker-report.json",
+                            "fault-evidence.json",
+                            "run-events.jsonl"
+                        ]
+                    },
+                    "expectedFailureMatched": true,
+                    "failureSummary": "001-io-eio-r1/case/failure-summary.json"
+                }]
+            }))
+            .expect("summary json"),
+        )
+        .expect("summary");
+
+        let snapshot = build_console_snapshot(dir.path()).expect("snapshot");
+        let planned = &snapshot.suite_plan.as_ref().expect("plan").attempts[0];
+        assert_eq!(planned.detector.as_ref().expect("detector").revision, 1);
+        assert!(planned.expected_failure.is_some());
+        let attempt = &snapshot.suite_summary.as_ref().expect("summary").attempts[0];
+        assert!(attempt.expected_failure.is_some());
+        assert_eq!(attempt.expected_failure_matched, Some(true));
+        assert_eq!(
+            attempt.failure_summary.as_deref(),
+            Some("001-io-eio-r1/case/failure-summary.json")
+        );
+    }
+
+    #[test]
     fn keeps_outer_root_when_multiple_nested_suite_run_roots_exist() {
         let dir = tempfile::tempdir().expect("tempdir");
         for name in ["suite-a", "suite-b"] {
@@ -2190,6 +2289,9 @@ mod tests {
             Some("failed")
         );
         let suite_summary = snapshot.suite_summary.as_ref().expect("suite summary");
+        assert!(suite_summary.attempts[0].expected_failure.is_none());
+        assert_eq!(suite_summary.attempts[0].expected_failure_matched, None);
+        assert!(suite_summary.attempts[0].failure_summary.is_none());
         assert_eq!(
             suite_summary.attempts[0].artifacts_dir.as_deref(),
             Some(expected_attempt_dir.as_str())

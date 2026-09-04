@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::fault::{
     artifact_validation::{
-        ArtifactValidationOptions, validate_fault_artifacts_and_write_report,
-        validate_written_failure_summary,
+        ArtifactValidationOptions, ExpectedFailureArtifactReport,
+        validate_expected_failure_artifacts, validate_fault_artifacts_and_write_report,
     },
     config::FaultTestConfig,
     reporting::{FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain},
@@ -257,7 +257,8 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
         match result {
             Ok(()) => match validate_attempt_artifacts(&planned.config) {
                 Ok(report) => {
-                    summary.total_client_disruptions += report.client_disruptions;
+                    let disruption_budget_failure =
+                        summary.record_client_disruptions(report.client_disruptions);
                     attempt.succeed(
                         report.seed,
                         report.client_disruptions,
@@ -282,19 +283,13 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                             attempt_error,
                             stop_after_attempt_failure,
                         );
-                    } else if let Some(max_disruptions) =
-                        execution_plan.suite.budgets.max_client_disruptions
-                        && summary.total_client_disruptions > max_disruptions
-                    {
-                        summary.record_suite_budget_failure(format!(
-                            "suite maxClientDisruptions budget {max_disruptions} was exceeded with {} disruptions",
-                            summary.total_client_disruptions
-                        ));
-                        replace_last_attempt(&mut summary, attempt);
+                    }
+                    replace_last_attempt(&mut summary, attempt);
+                    if let Some(reason) = disruption_budget_failure {
+                        summary.record_suite_budget_failure(reason);
                         write_summary(&summary_path, &summary)?;
                         break 'suite;
                     }
-                    replace_last_attempt(&mut summary, attempt);
                 }
                 Err(error) => {
                     let (attempt_error, failure_summary_artifact, forced_stop) =
@@ -328,16 +323,24 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                             &planned.plan,
                             expected,
                             failure_summary.as_ref(),
+                            attempt.started_at_ms,
+                            now_ms(),
                         )
                     });
-                if let Some(Ok(failure_summary_artifact)) = expected_failure_result.as_ref() {
+                if let Some(Ok(validation)) = expected_failure_result.as_ref() {
                     attempt.satisfy_expected_failure(
-                        failure_summary
-                            .as_ref()
-                            .expect("validated expected failure has a failure summary"),
-                        failure_summary_artifact.clone(),
+                        &validation.summary,
+                        validation.failure_summary.clone(),
+                        validation.client_disruptions,
                     );
+                    let disruption_budget_failure =
+                        summary.record_client_disruptions(validation.client_disruptions);
                     replace_last_attempt(&mut summary, attempt);
+                    if let Some(reason) = disruption_budget_failure {
+                        summary.record_suite_budget_failure(reason);
+                        write_summary(&summary_path, &summary)?;
+                        break 'suite;
+                    }
                     write_summary(&summary_path, &summary)?;
                     continue 'suite;
                 }
@@ -497,18 +500,26 @@ fn validate_expected_failure(
     plan: &FaultSuitePlanAttempt,
     expected: &FaultExpectedFailure,
     observed: Option<&FailureSummary>,
-) -> Result<String> {
-    let observed = observed.context("failure-summary.json is missing or unreadable")?;
-    let path = Path::new(&plan.artifacts.case_dir).join("failure-summary.json");
-    validate_written_failure_summary(suite_root, &path)
-        .context("failure-summary.json does not satisfy the artifact contract")?;
+    attempt_started_at_ms: u64,
+    evaluated_at_ms: u64,
+) -> Result<ExpectedFailureArtifactReport> {
+    observed.context("failure-summary.json is missing or unreadable")?;
+    let validation = validate_expected_failure_artifacts(
+        suite_root,
+        Path::new(&plan.artifacts.case_dir),
+        &plan.scenario,
+        &plan.case_name,
+        attempt_started_at_ms,
+        evaluated_at_ms,
+    )
+    .context("failure-summary.json does not satisfy the artifact contract")?;
     expected.validate_observed(
-        observed.classification(),
-        observed.severity(),
-        observed.responsibility_domain(),
-        observed.primary_evidence_refs(),
+        validation.summary.classification(),
+        validation.summary.severity(),
+        validation.summary.responsibility_domain(),
+        validation.summary.primary_evidence_refs(),
     )?;
-    Ok(path.display().to_string())
+    Ok(validation)
 }
 
 fn attempt_failure_details(
@@ -610,6 +621,18 @@ impl FaultSuiteRunSummary {
 
     fn succeed(&mut self) {
         self.status = SuiteRunStatus::Succeeded;
+    }
+
+    fn record_client_disruptions(&mut self, disruptions: usize) -> Option<String> {
+        self.total_client_disruptions += disruptions;
+        self.max_client_disruptions
+            .filter(|max| self.total_client_disruptions > *max)
+            .map(|max| {
+                format!(
+                    "suite maxClientDisruptions budget {max} was exceeded with {} disruptions",
+                    self.total_client_disruptions
+                )
+            })
     }
 
     fn record_suite_budget_failure(&mut self, reason: String) {
@@ -755,11 +778,13 @@ impl FaultSuiteRunAttempt {
         &mut self,
         failure_summary: &FailureSummary,
         failure_summary_artifact: String,
+        client_disruptions: usize,
     ) {
         self.status = SuiteAttemptStatus::ExpectedFailure;
         self.ended_at_ms = Some(now_ms());
         self.expected_failure_matched = Some(true);
         self.failure_summary = Some(failure_summary_artifact);
+        self.client_disruptions = Some(client_disruptions);
         self.severity = Some(failure_summary.severity());
         self.classification = Some(failure_summary.classification().to_string());
         self.phase = failure_summary.phase();
@@ -1452,33 +1477,15 @@ scenarios:
         let planned = &execution.plan.attempts[0];
         let case_dir = Path::new(&planned.artifacts.case_dir);
         fs::create_dir_all(case_dir).expect("case dir");
-        for artifact in [
-            "checker-report.json",
-            "fault-evidence.json",
-            "run-events.jsonl",
-        ] {
-            fs::write(case_dir.join(artifact), "{}").expect("evidence");
-        }
-        let observed = FailureSummary::new(
-            "io-eio",
-            "checker-verdict",
-            "data_corruption",
-            "hash mismatch",
-        )
-        .expect("failure summary");
-        write_failure_summary(
-            case_dir,
-            serde_json::to_value(&observed).expect("summary json"),
-        );
+        let suite_root = dir.path().join("rustfs-smoke/suite-fixed");
+        let failure_summary_json = write_expected_failure_artifacts(&suite_root, planned, 1);
+        let observed = serde_json::from_value::<FailureSummary>(failure_summary_json.clone())
+            .expect("failure summary");
         let expected = planned.expected_failure.as_ref().expect("expected failure");
 
-        let summary_artifact = validate_expected_failure(
-            dir.path().join("rustfs-smoke/suite-fixed").as_path(),
-            planned,
-            expected,
-            Some(&observed),
-        )
-        .expect("matched expected failure");
+        let validation =
+            validate_expected_failure(&suite_root, planned, expected, Some(&observed), 10, 100)
+                .expect("matched expected failure");
         let mut attempt = FaultSuiteRunAttempt::running(
             planned.index,
             &planned.scenario,
@@ -1486,42 +1493,125 @@ scenarios:
             Path::new(&planned.artifacts.attempt_dir),
             Some(expected.clone()),
         );
-        attempt.satisfy_expected_failure(&observed, summary_artifact.clone());
+        attempt.satisfy_expected_failure(
+            &observed,
+            validation.failure_summary.clone(),
+            validation.client_disruptions,
+        );
 
         assert_eq!(attempt.status, SuiteAttemptStatus::ExpectedFailure);
         assert_eq!(attempt.expected_failure_matched, Some(true));
+        assert_eq!(attempt.client_disruptions, Some(1));
         assert_eq!(
             attempt.failure_summary.as_deref(),
-            Some(summary_artifact.as_str())
+            Some(validation.failure_summary.as_str())
         );
         let mut run_summary =
             FaultSuiteRunSummary::started(&execution.suite, "suite-fixed".to_string());
+        run_summary.max_client_disruptions = Some(1);
+        assert_eq!(run_summary.record_client_disruptions(1), None);
         run_summary.attempts.push(attempt);
         run_summary.succeed();
         assert_eq!(run_summary.status, SuiteRunStatus::Succeeded);
         assert!(run_summary.failures.is_empty());
-        let summary_json = serde_json::to_value(&run_summary).expect("suite summary json");
-        assert_eq!(summary_json["attempts"][0]["status"], "expected-failure");
-        assert_eq!(summary_json["attempts"][0]["expectedFailureMatched"], true);
+        let suite_summary_json = serde_json::to_value(&run_summary).expect("suite summary json");
+        assert_eq!(
+            suite_summary_json["attempts"][0]["status"],
+            "expected-failure"
+        );
+        assert_eq!(
+            suite_summary_json["attempts"][0]["expectedFailureMatched"],
+            true
+        );
+        assert_eq!(suite_summary_json["totalClientDisruptions"], 1);
 
+        let mut legacy_summary = failure_summary_json.clone();
+        legacy_summary["schema_version"] = json!(1);
+        write_failure_summary(case_dir, legacy_summary.clone());
         fs::remove_file(case_dir.join("fault-evidence.json")).expect("remove evidence");
+        let legacy_observed =
+            serde_json::from_value::<FailureSummary>(legacy_summary).expect("legacy summary");
         let error = validate_expected_failure(
-            dir.path().join("rustfs-smoke/suite-fixed").as_path(),
+            &suite_root,
             planned,
             expected,
-            Some(&observed),
+            Some(&legacy_observed),
+            10,
+            100,
         )
-        .expect_err("missing evidence cannot match");
-        assert!(error.to_string().contains("artifact contract"));
+        .expect_err("legacy summary and missing evidence cannot match");
+        assert!(format!("{error:#}").contains("schema_version 2"));
 
-        let error = validate_expected_failure(
-            dir.path().join("rustfs-smoke/suite-fixed").as_path(),
-            planned,
-            expected,
-            None,
+        let mut wrong_scenario = write_expected_failure_artifacts(&suite_root, planned, 1);
+        wrong_scenario["scenario"] = json!("network-delay");
+        write_failure_summary(case_dir, wrong_scenario);
+        let error =
+            validate_expected_failure(&suite_root, planned, expected, Some(&observed), 10, 100)
+                .expect_err("wrong scenario cannot match");
+        assert!(format!("{error:#}").contains("does not match current attempt"));
+
+        let mut cross_attempt = write_expected_failure_artifacts(&suite_root, planned, 1);
+        let other_case = suite_root.join("002-io-eio-r2").join(&planned.case_name);
+        fs::create_dir_all(&other_case).expect("other case");
+        fs::copy(
+            case_dir.join("fault-evidence.json"),
+            other_case.join("fault-evidence.json"),
         )
-        .expect_err("missing signal cannot match");
+        .expect("copy cross-attempt evidence");
+        cross_attempt["primary_evidence_refs"][1] = json!(
+            other_case
+                .join("fault-evidence.json")
+                .strip_prefix(&suite_root)
+                .expect("relative evidence")
+                .display()
+                .to_string()
+        );
+        write_failure_summary(case_dir, cross_attempt);
+        let error =
+            validate_expected_failure(&suite_root, planned, expected, Some(&observed), 10, 100)
+                .expect_err("cross-attempt evidence cannot match");
+        assert!(format!("{error:#}").contains("current case directory"));
+
+        write_expected_failure_artifacts(&suite_root, planned, 1);
+        let fault_evidence_path = case_dir.join("fault-evidence.json");
+        let mut fault_evidence: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&fault_evidence_path).expect("read fault evidence"),
+        )
+        .expect("fault evidence json");
+        fault_evidence
+            .as_object_mut()
+            .expect("fault evidence object")
+            .remove("client_disruptions");
+        fs::write(
+            &fault_evidence_path,
+            serde_json::to_string(&fault_evidence).expect("fault evidence json"),
+        )
+        .expect("write fault evidence");
+        let error =
+            validate_expected_failure(&suite_root, planned, expected, Some(&observed), 10, 100)
+                .expect_err("missing disruption count cannot match");
+        assert!(format!("{error:#}").contains("client_disruptions"));
+
+        let error = validate_expected_failure(&suite_root, planned, expected, None, 10, 100)
+            .expect_err("missing signal cannot match");
         assert!(error.to_string().contains("missing or unreadable"));
+    }
+
+    #[test]
+    fn client_disruption_budget_is_checked_for_every_accounted_attempt() {
+        let suite = single_scenario_suite();
+        let mut summary = FaultSuiteRunSummary::started(&suite, "suite-fixed".to_string());
+        summary.max_client_disruptions = Some(0);
+        assert_eq!(
+            summary.record_client_disruptions(1).as_deref(),
+            Some("suite maxClientDisruptions budget 0 was exceeded with 1 disruptions")
+        );
+
+        let mut summary = FaultSuiteRunSummary::started(&suite, "suite-fixed".to_string());
+        summary.max_client_disruptions = Some(1);
+        assert_eq!(summary.record_client_disruptions(1), None);
+        assert!(summary.record_client_disruptions(1).is_some());
+        assert_eq!(summary.total_client_disruptions, 2);
     }
 
     fn single_scenario_suite() -> crate::fault::suite::ResolvedFaultSuite {
@@ -1571,5 +1661,88 @@ scenarios:
             serde_json::to_string_pretty(&summary).expect("json"),
         )
         .expect("write failure summary");
+    }
+
+    fn write_expected_failure_artifacts(
+        suite_root: &Path,
+        planned: &crate::fault::suite_plan::FaultSuitePlanAttempt,
+        client_disruptions: usize,
+    ) -> serde_json::Value {
+        let case_dir = Path::new(&planned.artifacts.case_dir);
+        fs::create_dir_all(case_dir).expect("case dir");
+        fs::write(
+            case_dir.join("run-spec.json"),
+            serde_json::to_string(&json!({
+                "metadata": {"name": planned.case_name, "run_id": "run-1"},
+                "scenario": {"name": planned.scenario, "case_name": planned.case_name}
+            }))
+            .expect("run spec json"),
+        )
+        .expect("run spec");
+        fs::write(
+            case_dir.join("checker-report.json"),
+            serde_json::to_string(&json!({"scenario": planned.scenario, "run_id": "run-1"}))
+                .expect("checker json"),
+        )
+        .expect("checker report");
+        fs::write(
+            case_dir.join("fault-evidence.json"),
+            serde_json::to_string(&json!({
+                "scenario": planned.scenario,
+                "injected": true,
+                "active_during_workload": true,
+                "recovered": true,
+                "require_client_disruption": false,
+                "client_disruptions": client_disruptions,
+                "pods_before": [],
+                "pods_after": [],
+                "active_snapshots": [{}],
+                "workload_snapshots": [{}],
+                "fault_apply_started_at_ms": 20,
+                "fault_active_at_ms": 30,
+                "workload_started_at_ms": 40,
+                "workload_ended_at_ms": 50,
+                "fault_delete_started_at_ms": 60,
+                "recovery_started_at_ms": 70,
+                "recovery_ended_at_ms": 80
+            }))
+            .expect("evidence json"),
+        )
+        .expect("fault evidence");
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms": 10, "scenario": planned.scenario, "run_id": "run-1", "stage": "run", "status": "started", "message": "started"}).to_string(),
+                json!({"at_ms": 90, "scenario": planned.scenario, "run_id": "run-1", "stage": "run", "status": "failed", "message": "failed"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("run events");
+        let relative_case = case_dir.strip_prefix(suite_root).expect("relative case");
+        let evidence_ref = |name: &str| relative_case.join(name).display().to_string();
+        let summary = json!({
+            "schema_version": 2,
+            "scenario": planned.scenario,
+            "case_name": planned.case_name,
+            "observed_at_ms": 85,
+            "stage": "checker-verdict",
+            "phase": "checker",
+            "verdict": "failed",
+            "severity": "fail_correctness",
+            "classification": "data_corruption",
+            "s3_model_classification": "data_corruption",
+            "responsibility_domain": "product",
+            "data_correctness": "failed",
+            "availability": "unknown",
+            "primary_evidence_refs": [
+                evidence_ref("checker-report.json"),
+                evidence_ref("fault-evidence.json"),
+                evidence_ref("run-events.jsonl")
+            ],
+            "corruption": true,
+            "message": "hash mismatch"
+        });
+        write_failure_summary(case_dir, summary.clone());
+        summary
     }
 }

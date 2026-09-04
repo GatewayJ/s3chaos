@@ -222,6 +222,8 @@ pub enum DetectorQualification {
     DiagnosticOnly,
 }
 
+pub const FAULT_DETECTOR_CONTRACT_REVISION: u8 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FaultDetectorSpec {
     pub qualification: DetectorQualification,
@@ -230,8 +232,28 @@ pub struct FaultDetectorSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultDetectorContract {
+    pub revision: u8,
     pub qualification: DetectorQualification,
     pub detects: Vec<DurabilityBugFamily>,
+}
+
+impl FaultDetectorContract {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.revision == FAULT_DETECTOR_CONTRACT_REVISION,
+            "fault detector revision {} is unsupported; expected {FAULT_DETECTOR_CONTRACT_REVISION}",
+            self.revision
+        );
+        ensure!(
+            !self.detects.is_empty(),
+            "fault detector must declare at least one durability bug family"
+        );
+        ensure!(
+            self.detects.windows(2).all(|pair| pair[0] < pair[1]),
+            "fault detector bug families must be a sorted unique canonical set"
+        );
+        Ok(())
+    }
 }
 
 impl FaultDetectorSpec {
@@ -265,9 +287,13 @@ impl FaultDetectorSpec {
     }
 
     pub fn contract(self) -> FaultDetectorContract {
+        let mut detects = self.detects.to_vec();
+        detects.sort();
+        detects.dedup();
         FaultDetectorContract {
+            revision: FAULT_DETECTOR_CONTRACT_REVISION,
             qualification: self.qualification,
-            detects: self.detects.to_vec(),
+            detects,
         }
     }
 }
