@@ -21,6 +21,8 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
+use crate::fault::artifact_validation::validate_attempt_failure_summary_reference;
+
 const MAX_ARTIFACT_SCAN_DEPTH: usize = 8;
 const MAX_ARTIFACT_SCAN_FILES: usize = 10_000;
 const MAX_JSON_ARTIFACT_BYTES: u64 = 1024 * 1024;
@@ -217,6 +219,10 @@ pub struct ConsoleSuiteAttemptView {
     pub evidence_classifications: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip)]
+    failure_summary_reference: Option<String>,
+    #[serde(skip)]
+    artifacts_dir_reference: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1779,6 +1785,8 @@ struct SuiteAttemptExtract {
 
 impl ConsoleSuiteAttemptView {
     fn from_extract(root: &Path, value: SuiteAttemptExtract) -> Self {
+        let failure_summary_reference = value.failure_summary.clone();
+        let artifacts_dir_reference = value.artifacts_dir.clone();
         Self {
             index: value.index,
             run_id: value.run_id,
@@ -1803,6 +1811,8 @@ impl ConsoleSuiteAttemptView {
             responsibility_domain: value.responsibility_domain,
             evidence_classifications: value.evidence_classifications,
             error: value.error,
+            failure_summary_reference,
+            artifacts_dir_reference,
         }
     }
 }
@@ -1925,9 +1935,20 @@ fn expected_failure_attempt_missing_summary(
             || attempt.expected_failure_matched == Some(true);
         matched
             && attempt
-                .failure_summary
+                .artifacts_dir_reference
                 .as_deref()
-                .is_none_or(|path| !root.join(path).is_file())
+                .zip(attempt.failure_summary_reference.as_deref())
+                .zip(attempt.scenario.as_deref().zip(attempt.run_id.as_deref()))
+                .is_none_or(|((attempt_dir, summary_ref), (scenario, run_id))| {
+                    validate_attempt_failure_summary_reference(
+                        root,
+                        attempt_dir,
+                        summary_ref,
+                        scenario,
+                        run_id,
+                    )
+                    .is_err()
+                })
     })
 }
 
@@ -1999,6 +2020,7 @@ fn json_string_array(value: &Value, key: &str) -> Vec<String> {
 mod tests {
     use super::{
         ArtifactIndex, ArtifactScanLimits, MAX_JSON_ARTIFACT_BYTES, build_console_snapshot,
+        validate_attempt_failure_summary_reference,
     };
     use serde_json::json;
     use std::fs;
@@ -2189,6 +2211,108 @@ mod tests {
                     .message
                     .contains("expected-failure attempt is matched")
         }));
+    }
+
+    #[test]
+    fn expected_failure_warning_requires_current_attempt_summary_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let attempt_dir = dir.path().join("001-io-eio-r1");
+        let case_dir = attempt_dir.join("case");
+        let other_case = dir.path().join("002-io-eio-r1").join("case");
+        fs::create_dir_all(&case_dir).expect("case dir");
+        fs::create_dir_all(&other_case).expect("other case dir");
+        for dir in [&case_dir, &other_case] {
+            fs::write(
+                dir.join("failure-summary.json"),
+                serde_json::to_string(&json!({
+                    "scenario": "io-eio",
+                    "run_id": "run-current",
+                    "stage": "checker-verdict",
+                    "verdict": "failed",
+                    "severity": "fail_correctness",
+                    "classification": "data_corruption",
+                    "data_correctness": "failed",
+                    "availability": "unknown",
+                    "message": "failure"
+                }))
+                .expect("summary"),
+            )
+            .expect("write summary");
+        }
+        let write_suite = |failure_summary: &str| {
+            fs::write(
+                dir.path().join("suite-summary.json"),
+                serde_json::to_string(&json!({
+                    "suite": "smoke",
+                    "runId": "suite-1",
+                    "status": "succeeded",
+                    "attempts": [{
+                        "index": 1,
+                        "runId": "run-current",
+                        "scenario": "io-eio",
+                        "status": "expected-failure",
+                        "artifactsDir": attempt_dir,
+                        "expectedFailureMatched": true,
+                        "failureSummary": failure_summary
+                    }]
+                }))
+                .expect("suite summary"),
+            )
+            .expect("write suite summary");
+        };
+        let warns = || {
+            build_console_snapshot(dir.path())
+                .expect("snapshot")
+                .warnings
+                .iter()
+                .any(|warning| {
+                    warning.artifact == "failure-summary.json"
+                        && warning
+                            .message
+                            .contains("expected-failure attempt is matched")
+                })
+        };
+
+        write_suite("001-io-eio-r1/case/failure-summary.json");
+        validate_attempt_failure_summary_reference(
+            dir.path(),
+            attempt_dir.to_str().expect("attempt path"),
+            "001-io-eio-r1/case/failure-summary.json",
+            "io-eio",
+            "run-current",
+        )
+        .expect("direct bound proof validation");
+        assert!(
+            !warns(),
+            "a bound current-attempt proof suppresses the warning"
+        );
+
+        for invalid in [
+            "002-io-eio-r1/case/failure-summary.json",
+            "001-io-eio-r1/../002-io-eio-r1/case/failure-summary.json",
+        ] {
+            write_suite(invalid);
+            assert!(
+                warns(),
+                "unbound proof {invalid:?} must not suppress warning"
+            );
+        }
+        write_suite(
+            case_dir
+                .join("failure-summary.json")
+                .to_str()
+                .expect("utf8 path"),
+        );
+        assert!(warns(), "absolute proof must not suppress warning");
+
+        #[cfg(unix)]
+        {
+            let symlink = case_dir.join("linked-failure-summary.json");
+            std::os::unix::fs::symlink(other_case.join("failure-summary.json"), &symlink)
+                .expect("symlink");
+            write_suite("001-io-eio-r1/case/linked-failure-summary.json");
+            assert!(warns(), "symlink proof must not suppress warning");
+        }
     }
 
     #[test]

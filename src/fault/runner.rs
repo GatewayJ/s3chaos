@@ -1012,6 +1012,7 @@ async fn run_fault_case(
     let mut workload = match run_mixed_workload(
         &s3,
         &history,
+        &scenario.name,
         &run_id,
         &workload_plan,
         &prefilled,
@@ -1860,7 +1861,11 @@ fn initialize_fault_run(
     collector.write_text(
         scenario.case_name,
         "workload-plan.json",
-        &serde_json::to_string_pretty(&workload_plan)?,
+        &serde_json::to_string_pretty(&WorkloadPlanArtifact {
+            scenario: &scenario.name,
+            run_id: &run_id,
+            plan: &workload_plan,
+        })?,
     )?;
     events.record(
         "run",
@@ -3391,6 +3396,7 @@ async fn verify_prefill_object(
 async fn run_mixed_workload(
     s3: &S3WorkloadClient,
     history: &Recorder,
+    scenario: &str,
     run_id: &str,
     plan: &WorkloadPlan,
     prefilled: &[ObjectSpec],
@@ -3502,7 +3508,7 @@ async fn run_mixed_workload(
     }
     completed.sort_by_key(|result| result.index);
 
-    let mut summary = WorkloadSummary::new(plan);
+    let mut summary = WorkloadSummary::new(plan, scenario, run_id);
     let mut unconfirmed_puts = Vec::new();
     for result in completed {
         summary.record_all(&result);
@@ -3838,7 +3844,17 @@ fn crash_window_evidence(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct WorkloadPlanArtifact<'a> {
+    scenario: &'a str,
+    run_id: &'a str,
+    #[serde(flatten)]
+    plan: &'a WorkloadPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct WorkloadSummary {
+    scenario: String,
+    run_id: String,
     seed: u64,
     object_count: usize,
     concurrency: usize,
@@ -3853,8 +3869,10 @@ struct WorkloadSummary {
 }
 
 impl WorkloadSummary {
-    fn new(plan: &WorkloadPlan) -> Self {
+    fn new(plan: &WorkloadPlan, scenario: &str, run_id: &str) -> Self {
         Self {
+            scenario: scenario.to_string(),
+            run_id: run_id.to_string(),
             seed: plan.seed,
             object_count: plan.object_count,
             concurrency: plan.concurrency,
@@ -4380,7 +4398,8 @@ mod tests {
 
     #[test]
     fn workload_summary_counts_disrupted_operations() {
-        let mut summary = WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80));
+        let mut summary =
+            WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80), "io-eio", "run-1");
         summary.puts.record(OperationOutcome::Ok);
         summary.gets.record(OperationOutcome::Timeout);
         summary.gets.record(OperationOutcome::NotFound);
@@ -4398,7 +4417,8 @@ mod tests {
 
     #[test]
     fn workload_summary_requires_every_object_operation_family() {
-        let mut summary = WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80));
+        let mut summary =
+            WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80), "io-eio", "run-1");
         summary.puts.record(OperationOutcome::Ok);
         summary.gets.record(OperationOutcome::Ok);
         summary.deletes.record(OperationOutcome::Ok);
@@ -4414,6 +4434,8 @@ mod tests {
     #[test]
     fn workload_summary_can_require_fault_evidence() {
         let summary = WorkloadSummary {
+            scenario: "io-eio".to_string(),
+            run_id: "run-1".to_string(),
             seed: 42,
             object_count: 40000,
             concurrency: 80,

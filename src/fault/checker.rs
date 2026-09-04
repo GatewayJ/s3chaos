@@ -1677,27 +1677,36 @@ fn read_failure_key(message: &str) -> Option<&str> {
 }
 
 fn immediate_recovery_tail_candidate_keys(report: &CheckerReport) -> Option<BTreeSet<String>> {
+    let candidates = immediate_recovery_candidate_keys(report).ok()?;
+    (candidates.len()
+        == report.unavailable_committed_objects.len()
+            + report.unknown_committed_read_failures.len())
+    .then_some(candidates)
+}
+
+fn immediate_recovery_candidate_keys(report: &CheckerReport) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
-    for (failure, expected_outcome) in report
+    let mut observed = BTreeSet::new();
+    for failure in report
         .unavailable_committed_objects
         .iter()
-        .map(|failure| (failure, OperationOutcome::Timeout))
-        .chain(
-            report
-                .unknown_committed_read_failures
-                .iter()
-                .map(|failure| (failure, OperationOutcome::Unknown)),
-        )
+        .chain(report.unknown_committed_read_failures.iter())
     {
-        let parsed = parse_read_failure_message(failure)?;
-        if parsed.outcome != expected_outcome
-            || !is_recovery_tail_read_failure(parsed.outcome, parsed.http_status, parsed.error)
-            || !keys.insert(parsed.key.to_string())
-        {
-            return None;
+        let key = read_failure_key(failure).ok_or_else(|| {
+            anyhow!("checker report contains an ambiguous committed-read failure: {failure:?}")
+        })?;
+        ensure!(
+            observed.insert(key.to_string()),
+            "checker report contains duplicate committed-read evidence for key {key:?}"
+        );
+        let parsed = parse_read_failure_message(failure).ok_or_else(|| {
+            anyhow!("checker report contains an unparseable committed-read failure: {failure:?}")
+        })?;
+        if is_recovery_tail_read_failure(parsed.outcome, parsed.http_status, parsed.error) {
+            keys.insert(parsed.key.to_string());
         }
     }
-    Some(keys)
+    Ok(keys)
 }
 
 pub(crate) fn recovery_key_sets_are_consistent(report: &RecoveryStabilityReport) -> bool {
@@ -1738,6 +1747,11 @@ pub(crate) fn validate_recovery_key_sets(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let candidates = immediate_recovery_candidate_keys(immediate_report)?;
+    ensure!(
+        attempted == candidates,
+        "recovery reread_attempted_keys does not equal checker-derived recovery candidates"
+    );
     let recovered = report
         .reread_recovered_keys
         .iter()
@@ -1748,10 +1762,10 @@ pub(crate) fn validate_recovery_key_sets(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let baseline =
-        immediate_still_unavailable_keys(immediate_report, &report.reread_attempted_keys)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+    let candidate_keys = candidates.iter().cloned().collect::<Vec<_>>();
+    let baseline = immediate_still_unavailable_keys(immediate_report, &candidate_keys)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let allowed = baseline.union(&attempted).cloned().collect::<BTreeSet<_>>();
     ensure!(
         still.is_subset(&allowed),
@@ -3382,6 +3396,33 @@ mod tests {
         assert!(
             validate_recovery_key_sets(&recovery, &immediate).is_err(),
             "duplicate key evidence must fail closed"
+        );
+
+        let mut coordinated = recovery_report_with_attempted_key("a");
+        coordinated.reread_attempted_keys.push("ghost".to_string());
+        coordinated.reread_recovered_keys.push("a".to_string());
+        coordinated.still_unavailable_keys =
+            vec!["ghost".to_string(), "b".to_string(), "z".to_string()];
+        let error = validate_recovery_key_sets(&coordinated, &immediate)
+            .expect_err("attempted and still sets cannot introduce a coordinated ghost key");
+        assert!(
+            error
+                .to_string()
+                .contains("checker-derived recovery candidates")
+        );
+
+        let mut ambiguous_only = empty_report();
+        ambiguous_only
+            .unknown_writes_materialized
+            .push("ambiguous operation became visible".to_string());
+        let mut ghost = recovery_report_with_attempted_key("ghost");
+        ghost.still_unavailable_keys.push("ghost".to_string());
+        let error = validate_recovery_key_sets(&ghost, &ambiguous_only)
+            .expect_err("ambiguous-write evidence cannot authorize a ghost reread key");
+        assert!(
+            error
+                .to_string()
+                .contains("checker-derived recovery candidates")
         );
     }
 

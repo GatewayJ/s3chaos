@@ -101,6 +101,21 @@ struct FailedAttemptDisruptionEvidence {
     run_failed: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ArtifactIdentityPolicy<'a> {
+    LegacyCompatible,
+    PlannedAttempt(&'a str),
+}
+
+impl<'a> ArtifactIdentityPolicy<'a> {
+    fn planned_run_id(self) -> Option<&'a str> {
+        match self {
+            Self::LegacyCompatible => None,
+            Self::PlannedAttempt(run_id) => Some(run_id),
+        }
+    }
+}
+
 pub(crate) fn validate_failed_attempt_disruptions(
     suite_root: &Path,
     case_dir: &Path,
@@ -192,6 +207,18 @@ fn validate_failed_attempt_disruption_evidence(
 
     let workload_path = bound_case_artifact(&case_dir, "workload-summary.json")?;
     let workload = read_json::<WorkloadSummaryArtifact>(&workload_path)?;
+    ensure!(
+        workload.scenario.as_deref() == Some(scenario)
+            && workload.run_id.as_deref() == Some(attempt_run_id),
+        "workload-summary.json identity does not match the planned attempt"
+    );
+    let workload_plan =
+        read_json::<ArtifactIdentity>(&bound_case_artifact(&case_dir, "workload-plan.json")?)?;
+    ensure!(
+        workload_plan.scenario.as_deref() == Some(scenario)
+            && workload_plan.run_id.as_deref() == Some(attempt_run_id),
+        "workload-plan.json identity does not match the planned attempt"
+    );
     let disrupted = workload.disrupted()?;
     ensure!(
         disrupted == evidence.client_disruptions,
@@ -231,6 +258,64 @@ fn bound_case_artifact(case_dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+pub(crate) fn validate_attempt_failure_summary_reference(
+    suite_root: &Path,
+    attempt_artifacts_dir: &str,
+    failure_summary_ref: &str,
+    scenario: &str,
+    run_id: &str,
+) -> Result<()> {
+    let summary_ref = Path::new(failure_summary_ref);
+    ensure!(
+        !summary_ref.is_absolute()
+            && summary_ref.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            }),
+        "failureSummary must be a relative path without parent traversal"
+    );
+    let suite_root = fs::canonicalize(suite_root)
+        .with_context(|| format!("canonicalize suite artifact root {}", suite_root.display()))?;
+    let attempt_ref = Path::new(attempt_artifacts_dir);
+    let attempt_path = if attempt_ref.is_absolute() {
+        attempt_ref.to_path_buf()
+    } else {
+        suite_root.join(attempt_ref)
+    };
+    let attempt_path = fs::canonicalize(&attempt_path).with_context(|| {
+        format!(
+            "canonicalize attempt artifact directory {}",
+            attempt_path.display()
+        )
+    })?;
+    ensure!(
+        attempt_path.starts_with(&suite_root),
+        "attempt artifact directory is outside suite artifact root"
+    );
+    let summary_path = fs::canonicalize(suite_root.join(summary_ref)).with_context(|| {
+        format!(
+            "canonicalize expected-failure proof {}",
+            summary_ref.display()
+        )
+    })?;
+    ensure!(
+        summary_path.file_name().and_then(|name| name.to_str()) == Some("failure-summary.json")
+            && summary_path
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|parent| parent == attempt_path),
+        "failureSummary does not belong to the current attempt"
+    );
+    let summary = read_json::<ArtifactIdentity>(&summary_path)?;
+    ensure!(
+        summary.scenario.as_deref() == Some(scenario) && summary.run_id.as_deref() == Some(run_id),
+        "failureSummary identity does not match the current attempt"
+    );
+    Ok(())
+}
+
 impl ArtifactValidationReport {
     pub fn validation_summary_tsv_row(&self) -> String {
         format!(
@@ -243,7 +328,34 @@ impl ArtifactValidationReport {
 pub fn validate_fault_artifacts_and_write_report(
     options: &ArtifactValidationOptions,
 ) -> Result<ArtifactValidationReport> {
-    match validate_fault_artifacts(options) {
+    validate_fault_artifacts_and_write_report_with_identity(
+        options,
+        ArtifactIdentityPolicy::LegacyCompatible,
+    )
+}
+
+pub(crate) fn validate_fault_artifacts_for_planned_attempt_and_write_report(
+    options: &ArtifactValidationOptions,
+    planned_run_id: &str,
+) -> Result<ArtifactValidationReport> {
+    ensure!(
+        planned_run_id
+            .strip_prefix("run-")
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .is_some(),
+        "success artifact validation requires a valid planned attempt runId"
+    );
+    validate_fault_artifacts_and_write_report_with_identity(
+        options,
+        ArtifactIdentityPolicy::PlannedAttempt(planned_run_id),
+    )
+}
+
+fn validate_fault_artifacts_and_write_report_with_identity(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+) -> Result<ArtifactValidationReport> {
+    match validate_fault_artifacts_with_identity(options, identity) {
         Ok(report) => {
             write_artifact_validation_file_report(
                 options,
@@ -349,10 +461,19 @@ impl ArtifactValidationOptions {
 pub fn validate_fault_artifacts(
     options: &ArtifactValidationOptions,
 ) -> Result<ArtifactValidationReport> {
+    validate_fault_artifacts_with_identity(options, ArtifactIdentityPolicy::LegacyCompatible)
+}
+
+fn validate_fault_artifacts_with_identity(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+) -> Result<ArtifactValidationReport> {
     let scenario_spec = scenarios::scenario_spec(&options.scenario)?;
     validate_conditional_recovery_stability_artifact(
         &options.artifact_root,
         scenario_spec.case_name,
+        &options.scenario,
+        identity.planned_run_id(),
     )?;
     let artifacts = locate_required_artifacts(&options.artifact_root, scenario_spec.case_name)?;
 
@@ -375,6 +496,12 @@ pub fn validate_fault_artifacts(
         options.scenario
     );
     ensure_nonempty(&metadata.run_id, "run-metadata.json run_id")?;
+    if let Some(planned_run_id) = identity.planned_run_id() {
+        ensure!(
+            metadata.run_id == planned_run_id,
+            "run-metadata.json run_id does not match the planned attempt"
+        );
+    }
     ensure_nonempty(&metadata.rustfs_image, "run-metadata.json rustfs_image")?;
     ensure_nonempty(&metadata.storage_class, "run-metadata.json storage_class")?;
     ensure_nonempty(&metadata.context, "run-metadata.json context")?;
@@ -398,7 +525,15 @@ pub fn validate_fault_artifacts(
         options.expected_recovery_stability_reread_seconds
     );
 
-    let workload_plan = read_json::<WorkloadPlan>(required(&artifacts, "workload-plan.json")?)?;
+    let workload_plan_path = required(&artifacts, "workload-plan.json")?;
+    let workload_plan = read_json::<WorkloadPlan>(workload_plan_path)?;
+    let workload_plan_identity = read_json::<ArtifactIdentity>(workload_plan_path)?;
+    validate_optional_artifact_identity(
+        "workload-plan.json",
+        &workload_plan_identity,
+        &metadata,
+        identity,
+    )?;
     ensure!(
         workload_plan.object_count == options.expected_workload_objects,
         "workload-plan.json object_count {} does not match expected {}",
@@ -464,12 +599,13 @@ pub fn validate_fault_artifacts(
         "fault-evidence.json require_client_disruption",
     )?;
     let evidence = read_json::<FaultEvidenceArtifact>(fault_evidence_path)?;
-    if let Some(run_id) = evidence.run_id.as_deref() {
-        ensure!(
-            run_id == metadata.run_id,
-            "fault-evidence.json run_id does not match run-metadata.json"
-        );
-    }
+    validate_optional_identity_fields(
+        "fault-evidence.json",
+        evidence.scenario.as_deref(),
+        evidence.run_id.as_deref(),
+        &metadata,
+        identity,
+    )?;
     ensure!(
         evidence.injected && evidence.active_during_workload && evidence.recovered,
         "fault-evidence.json must record injected=true, active_during_workload=true, recovered=true"
@@ -499,12 +635,19 @@ pub fn validate_fault_artifacts(
 
     let prechecker =
         read_json::<CheckerReport>(required(&artifacts, "checker-pre-recommit-report.json")?)?;
+    validate_checker_identity(
+        "checker-pre-recommit-report.json",
+        &prechecker,
+        &metadata,
+        identity,
+    )?;
     validate_checker_report(
         "checker-pre-recommit-report.json",
         &prechecker,
         options.expected_workload_versioning,
     )?;
     let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
+    validate_checker_identity("checker-report.json", &checker, &metadata, identity)?;
     validate_checker_report(
         "checker-report.json",
         &checker,
@@ -523,6 +666,13 @@ pub fn validate_fault_artifacts(
 
     let summary =
         read_json::<WorkloadSummaryArtifact>(required(&artifacts, "workload-summary.json")?)?;
+    validate_optional_identity_fields(
+        "workload-summary.json",
+        summary.scenario.as_deref(),
+        summary.run_id.as_deref(),
+        &metadata,
+        identity,
+    )?;
     ensure!(
         summary.seed == workload_plan.seed
             && summary.object_count == workload_plan.object_count
@@ -856,6 +1006,66 @@ fn validate_checker_report(
     Ok(())
 }
 
+fn validate_checker_identity(
+    name: &str,
+    report: &CheckerReport,
+    metadata: &RunMetadataArtifact,
+    policy: ArtifactIdentityPolicy<'_>,
+) -> Result<()> {
+    if matches!(policy, ArtifactIdentityPolicy::PlannedAttempt(_)) {
+        ensure!(
+            report.scenario == metadata.scenario && report.run_id == metadata.run_id,
+            "{name} identity does not match the planned attempt"
+        );
+    }
+    Ok(())
+}
+
+fn validate_optional_artifact_identity(
+    name: &str,
+    artifact: &ArtifactIdentity,
+    metadata: &RunMetadataArtifact,
+    policy: ArtifactIdentityPolicy<'_>,
+) -> Result<()> {
+    validate_optional_identity_fields(
+        name,
+        artifact.scenario.as_deref(),
+        artifact.run_id.as_deref(),
+        metadata,
+        policy,
+    )
+}
+
+fn validate_optional_identity_fields(
+    name: &str,
+    scenario: Option<&str>,
+    run_id: Option<&str>,
+    metadata: &RunMetadataArtifact,
+    policy: ArtifactIdentityPolicy<'_>,
+) -> Result<()> {
+    if matches!(policy, ArtifactIdentityPolicy::PlannedAttempt(_)) {
+        ensure!(
+            scenario == Some(metadata.scenario.as_str())
+                && run_id == Some(metadata.run_id.as_str()),
+            "{name} identity is missing or does not match the planned attempt"
+        );
+    } else {
+        if let Some(scenario) = scenario {
+            ensure!(
+                scenario == metadata.scenario,
+                "{name} scenario does not match run-metadata.json"
+            );
+        }
+        if let Some(run_id) = run_id {
+            ensure!(
+                run_id == metadata.run_id,
+                "{name} run_id does not match run-metadata.json"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Result<()> {
     let apply_started = evidence
         .fault_apply_started_at_ms
@@ -1104,7 +1314,12 @@ fn locate_required_artifacts(root: &Path, case_name: &str) -> Result<BTreeMap<St
     Ok(artifacts)
 }
 
-fn validate_conditional_recovery_stability_artifact(root: &Path, case_name: &str) -> Result<()> {
+fn validate_conditional_recovery_stability_artifact(
+    root: &Path,
+    case_name: &str,
+    scenario: &str,
+    planned_run_id: Option<&str>,
+) -> Result<()> {
     let Some(events_path) = optional_artifact(root, case_name, "run-events.jsonl")? else {
         return Ok(());
     };
@@ -1123,7 +1338,24 @@ fn validate_conditional_recovery_stability_artifact(root: &Path, case_name: &str
         .with_context(|| "locate conditional artifact failure-summary.json")?;
     let recovery = read_json::<RecoveryStabilityReport>(&recovery_path)?;
     validate_recovery_stability_report(&recovery)?;
+    if let Some(run_id) = planned_run_id {
+        ensure!(
+            recovery.scenario.as_deref() == Some(scenario)
+                && recovery.run_id.as_deref() == Some(run_id)
+                && events
+                    .iter()
+                    .all(|event| event.scenario == scenario && event.run_id == run_id),
+            "conditional recovery artifacts do not match the planned attempt"
+        );
+    }
     let failure_summary = read_json::<FailureSummaryArtifact>(&failure_summary_path)?;
+    if let Some(run_id) = planned_run_id {
+        ensure!(
+            failure_summary.scenario == scenario
+                && failure_summary.run_id.as_deref() == Some(run_id),
+            "conditional failure-summary.json identity does not match the planned attempt"
+        );
+    }
     ensure!(
         failure_summary.classification == recovery.classification.as_str(),
         "failure-summary.json classification {:?} does not match recovery-stability-report.json classification {:?}",
@@ -1200,7 +1432,7 @@ pub(crate) fn validate_expected_failure_artifacts(
         "expected-failure evaluation window is invalid"
     );
 
-    let summary_path = case_dir.join("failure-summary.json");
+    let summary_path = bound_case_artifact(&case_dir, "failure-summary.json")?;
     let summary_raw = fs::read_to_string(&summary_path)
         .with_context(|| format!("reading JSON artifact {}", summary_path.display()))?;
     let summary = serde_json::from_str::<FailureSummaryArtifact>(&summary_raw)
@@ -1310,7 +1542,11 @@ pub(crate) fn validate_expected_failure_artifacts(
     validate_expected_failure_signal(&summary, &referenced, scenario, attempt_run_id)?;
 
     Ok(ExpectedFailureArtifactReport {
-        failure_summary: summary_path.display().to_string(),
+        failure_summary: summary_path
+            .strip_prefix(&suite_root)
+            .context("failure-summary.json is outside suite artifact root")?
+            .display()
+            .to_string(),
         summary: typed_summary,
         client_disruptions: disruption_evidence.client_disruptions,
     })
@@ -1905,6 +2141,14 @@ struct RunMetadataArtifact {
     recovery_stability_reread_seconds: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct ArtifactIdentity {
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+}
+
 fn default_recovery_stability_reread_seconds() -> u64 {
     DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS
 }
@@ -2067,6 +2311,10 @@ struct FailureSummaryArtifact {
 
 #[derive(Debug, Deserialize)]
 struct WorkloadSummaryArtifact {
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
     seed: u64,
     object_count: usize,
     concurrency: usize,
@@ -2134,6 +2382,7 @@ mod tests {
     use super::{
         ArtifactValidationOptions, FailureSummaryArtifact, recursive_find,
         validate_fault_artifacts, validate_fault_artifacts_and_write_report,
+        validate_fault_artifacts_for_planned_attempt_and_write_report,
     };
     use crate::fault::{
         reporting::{
@@ -2169,6 +2418,67 @@ mod tests {
             report.validation_summary_tsv_row(),
             "io-eio\t42\t0\t2\t1\t7\t0\t0\t0\t0\ttrue"
         );
+    }
+
+    #[test]
+    fn strict_success_validation_rejects_a_copied_attempt_bundle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let options = success_options(dir.path());
+
+        validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &options,
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect("current bundle");
+        let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &options,
+            "run-00000000-0000-4000-8000-000000000002",
+        )
+        .expect_err("copied prior-attempt bundle");
+        assert!(error.to_string().contains("planned attempt"));
+    }
+
+    #[test]
+    fn strict_success_validation_rejects_missing_fault_evidence_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("fault-evidence.json");
+        let mut evidence: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("evidence")).expect("json");
+        evidence.as_object_mut().expect("object").remove("run_id");
+        write_json(&case_dir, "fault-evidence.json", &evidence);
+        let options = success_options(dir.path());
+
+        validate_fault_artifacts(&options).expect("explicit legacy-compatible validation");
+        let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &options,
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect_err("missing current identity");
+        assert!(error.to_string().contains("fault-evidence.json identity"));
+    }
+
+    #[test]
+    fn strict_success_validation_rejects_a_legacy_checker_from_another_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("checker-report.json");
+        let mut checker: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("checker")).expect("json");
+        checker["run_id"] = json!("legacy-run");
+        write_json(&case_dir, "checker-report.json", &checker);
+        let options = success_options(dir.path());
+
+        validate_fault_artifacts(&options).expect("explicit legacy-compatible validation");
+        let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &options,
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect_err("checker from another attempt");
+        assert!(error.to_string().contains("checker-report.json identity"));
     }
 
     #[test]
@@ -2988,8 +3298,13 @@ mod tests {
             }),
         );
 
-        super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect("valid recovery failure fields");
+        super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect("valid recovery failure fields");
     }
 
     #[test]
@@ -3044,8 +3359,13 @@ mod tests {
             }),
         );
 
-        super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect("valid LIST availability failure fields");
+        super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect("valid LIST availability failure fields");
     }
 
     #[test]
@@ -3095,8 +3415,13 @@ mod tests {
             }),
         );
 
-        super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect("valid ambiguous write failure fields");
+        super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect("valid ambiguous write failure fields");
     }
 
     #[test]
@@ -3148,8 +3473,13 @@ mod tests {
             }),
         );
 
-        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect_err("ambiguous summary with loss fields");
+        let error = super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect_err("ambiguous summary with loss fields");
 
         assert!(error.to_string().contains("without proven corruption"));
     }
@@ -3201,8 +3531,13 @@ mod tests {
             }),
         );
 
-        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect_err("ambiguous report with hard evidence");
+        let error = super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect_err("ambiguous report with hard evidence");
 
         assert!(
             error
@@ -3262,8 +3597,13 @@ mod tests {
             }),
         );
 
-        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect_err("tail latency with ambiguous evidence");
+        let error = super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect_err("tail latency with ambiguous evidence");
 
         assert!(error.to_string().contains("without hard failures"));
     }
@@ -3313,8 +3653,13 @@ mod tests {
             }),
         );
 
-        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect_err("availability report with data evidence");
+        let error = super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect_err("availability report with data evidence");
 
         assert!(
             error
@@ -3356,14 +3701,29 @@ mod tests {
         }
     }
 
+    fn success_options(root: &std::path::Path) -> ArtifactValidationOptions {
+        ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: root.to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        }
+    }
+
     fn write_success_artifacts(root: &std::path::Path, scenario: &str) {
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
         let case_dir = root.join("fault_io_eio_preserves_committed_objects");
         fs::create_dir_all(&case_dir).expect("case dir");
         let plan = WorkloadPlan::seeded(42, 12, 4);
         let run_spec = json!({
             "apiVersion": FAULT_RUN_API_VERSION,
             "kind": FAULT_RUN_KIND,
-            "metadata": {"name": "fault_io_eio_preserves_committed_objects", "run_id": "run-1", "bucket": "bucket"},
+            "metadata": {"name": "fault_io_eio_preserves_committed_objects", "run_id": run_id, "bucket": "bucket"},
             "cluster": {
                 "context": "real-cluster",
                 "namespace": "rustfs-fault-test",
@@ -3429,9 +3789,9 @@ mod tests {
         fs::write(
             case_dir.join("run-events.jsonl"),
             [
-                json!({"at_ms":1,"scenario":scenario,"run_id":"run-1","stage":"run","status":"started","message":"started"}).to_string(),
-                json!({"at_ms":2,"scenario":scenario,"run_id":"run-1","stage":"checker-final","status":"succeeded","message":"checked"}).to_string(),
-                json!({"at_ms":3,"scenario":scenario,"run_id":"run-1","stage":"run","status":"succeeded","message":"done"}).to_string(),
+                json!({"at_ms":1,"scenario":scenario,"run_id":run_id,"stage":"run","status":"started","message":"started"}).to_string(),
+                json!({"at_ms":2,"scenario":scenario,"run_id":run_id,"stage":"checker-final","status":"succeeded","message":"checked"}).to_string(),
+                json!({"at_ms":3,"scenario":scenario,"run_id":run_id,"stage":"run","status":"succeeded","message":"done"}).to_string(),
             ].join("\n"),
         ).expect("write events");
         write_json(
@@ -3468,7 +3828,7 @@ mod tests {
                 "generatedAtMs": 1,
                 "scenario": scenario,
                 "caseName": "fault_io_eio_preserves_committed_objects",
-                "runId": "run-1",
+                "runId": run_id,
                 "namespace": "rustfs-fault-test",
                 "tenant": "fault-test-tenant",
                 "resolvedPods": [{
@@ -3516,7 +3876,7 @@ mod tests {
             &json!({
                 "scenario": scenario,
                 "case_name": "fault_io_eio_preserves_committed_objects",
-                "run_id": "run-1",
+                "run_id": run_id,
                 "bucket": "bucket",
                 "backend": "chaos-mesh-io-chaos",
                 "target": "rustfs-volume",
@@ -3539,12 +3899,17 @@ mod tests {
                 "chaos_namespace": "chaos-mesh"
             }),
         );
-        write_json(&case_dir, "workload-plan.json", &json!(plan));
+        let mut workload_plan = json!(plan);
+        workload_plan["scenario"] = json!(scenario);
+        workload_plan["run_id"] = json!(run_id);
+        write_json(&case_dir, "workload-plan.json", &workload_plan);
         fs::write(case_dir.join("history.jsonl"), "{}\n").expect("history");
         write_json(
             &case_dir,
             "workload-summary.json",
             &json!({
+                "scenario": scenario,
+                "run_id": run_id,
                 "seed": 42,
                 "object_count": 12,
                 "concurrency": 4,
@@ -3571,7 +3936,7 @@ mod tests {
         );
         let checker = json!({
             "scenario": scenario,
-            "run_id": "run-1",
+            "run_id": run_id,
             "committed_puts": 7,
             "expected_live_objects": 7,
             "verified_live_objects": 7,
@@ -3599,7 +3964,7 @@ mod tests {
             "fault-evidence.json",
             &json!({
                 "scenario": scenario,
-                "run_id": "run-1",
+                "run_id": run_id,
                 "backend": "chaos-mesh-io-chaos",
                 "target": "rustfs-volume",
                 "injected": true,

@@ -22,7 +22,7 @@ use crate::fault::{
     artifact_validation::{
         ArtifactValidationOptions, ExpectedFailureArtifactReport,
         validate_expected_failure_artifacts, validate_failed_attempt_disruptions,
-        validate_fault_artifacts_and_write_report,
+        validate_fault_artifacts_for_planned_attempt_and_write_report,
     },
     config::FaultTestConfig,
     reporting::{FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain},
@@ -265,7 +265,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
         .await;
         let mut stop_after_attempt_failure = false;
         match result {
-            Ok(()) => match validate_attempt_artifacts(&planned.config) {
+            Ok(()) => match validate_attempt_artifacts(&planned.config, &attempt.run_id) {
                 Ok(report) => {
                     attempt.succeed(
                         report.seed,
@@ -515,6 +515,7 @@ fn suite_duration_budget_failure(
 
 fn validate_attempt_artifacts(
     config: &FaultTestConfig,
+    planned_run_id: &str,
 ) -> Result<crate::fault::artifact_validation::ArtifactValidationReport> {
     let options = ArtifactValidationOptions {
         scenario: config.scenario.clone(),
@@ -527,7 +528,7 @@ fn validate_attempt_artifacts(
         expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
         expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
     };
-    validate_fault_artifacts_and_write_report(&options)
+    validate_fault_artifacts_for_planned_attempt_and_write_report(&options, planned_run_id)
 }
 
 fn write_attempt_started(
@@ -1834,6 +1835,21 @@ scenarios:
                 .expect_err("cross-attempt evidence cannot match");
         assert!(format!("{error:#}").contains("current case directory"));
 
+        #[cfg(unix)]
+        {
+            write_expected_failure_artifacts(&suite_root, planned, 1);
+            let summary_path = case_dir.join("failure-summary.json");
+            let external_summary = other_case.join("failure-summary.json");
+            fs::rename(&summary_path, &external_summary).expect("move summary outside case");
+            std::os::unix::fs::symlink(&external_summary, &summary_path).expect("summary symlink");
+            let error =
+                validate_expected_failure(&suite_root, planned, expected, Some(&observed), 10, 100)
+                    .expect_err("symlinked failure summary cannot match");
+            assert!(format!("{error:#}").contains("planned case directory"));
+            fs::remove_file(&summary_path).expect("remove symlink");
+            fs::rename(&external_summary, &summary_path).expect("restore summary");
+        }
+
         write_expected_failure_artifacts(&suite_root, planned, 1);
         let copied_attempt_dir = suite_root.join("003-io-eio-r3");
         let copied_case_dir = copied_attempt_dir.join(&planned.case_name);
@@ -2073,10 +2089,9 @@ scenarios:
         .expect_err("same-count recovery evidence for another key must be rejected");
         assert!(format!("{error:#}").contains("key evidence"));
 
-        recovery["reread_attempted_keys"] = json!(["k"]);
+        recovery["reread_attempted_keys"] = json!(["k", "zghost"]);
         recovery["reread_recovered_keys"] = json!(["k"]);
-
-        recovery["still_unavailable_keys"] = json!(["ghost"]);
+        recovery["still_unavailable_keys"] = json!(["zghost"]);
         recovery["classification"] = json!("committed_object_unavailable");
         fs::write(
             case_dir.join("recovery-stability-report.json"),
@@ -2102,10 +2117,85 @@ scenarios:
             10,
             100,
         )
+        .expect_err("coordinated attempted/still ghost key must be rejected");
+        assert!(
+            format!("{error:#}").contains("checker-derived recovery candidates"),
+            "{error:#}"
+        );
+
+        recovery["reread_attempted_keys"] = json!(["k"]);
+        recovery["still_unavailable_keys"] = json!(["ghost"]);
+        fs::write(
+            case_dir.join("recovery-stability-report.json"),
+            serde_json::to_string(&recovery).expect("recovery json"),
+        )
+        .expect("write ghost recovery report");
+        let error = validate_expected_failure_artifacts(
+            &suite_root,
+            case_dir,
+            planned.run_id.as_deref().expect("planned run id"),
+            &planned.scenario,
+            &planned.case_name,
+            10,
+            100,
+        )
         .expect_err("recovered checker key plus a ghost unavailable key must be rejected");
         assert!(format!("{error:#}").contains("absent from checker evidence"));
 
+        checker["unavailable_committed_objects"] = json!([]);
+        checker["unknown_writes_materialized"] = json!(["ambiguous write became visible"]);
+        fs::write(
+            case_dir.join("checker-pre-recommit-report.json"),
+            serde_json::to_string(&checker).expect("checker json"),
+        )
+        .expect("write ambiguous checker");
+        recovery["reread_attempted_keys"] = json!(["ghost"]);
+        recovery["reread_recovered_keys"] = json!([]);
+        recovery["still_unavailable_keys"] = json!(["ghost"]);
+        recovery["ambiguous_write_evidence"] = json!(["ambiguous write became visible"]);
+        recovery["classification"] = json!("committed_object_unavailable");
+        fs::write(
+            case_dir.join("recovery-stability-report.json"),
+            serde_json::to_string(&recovery).expect("recovery json"),
+        )
+        .expect("write ambiguous recovery");
+        let mut ambiguous_summary = summary.clone();
+        ambiguous_summary["classification"] = json!("committed_object_unavailable");
+        ambiguous_summary["s3_model_classification"] = json!("committed_object_unavailable");
+        ambiguous_summary["severity"] = json!("fail_availability");
+        ambiguous_summary["data_correctness"] = json!("unknown");
+        ambiguous_summary["availability"] = json!("committed_object_unavailable");
+        ambiguous_summary["data_loss"] = serde_json::Value::Null;
+        ambiguous_summary["corruption"] = json!(false);
+        ambiguous_summary["recovered_within_window"] = json!(false);
+        ambiguous_summary["recovered_within_seconds"] = serde_json::Value::Null;
+        ambiguous_summary["evidence_classifications"] = json!([
+            "ambiguous_write_materialized",
+            "committed_object_unavailable"
+        ]);
+        write_failure_summary(case_dir, ambiguous_summary);
+        let error = validate_expected_failure_artifacts(
+            &suite_root,
+            case_dir,
+            planned.run_id.as_deref().expect("planned run id"),
+            &planned.scenario,
+            &planned.case_name,
+            10,
+            100,
+        )
+        .expect_err("ambiguous-only evidence cannot authorize a ghost reread key");
+        assert!(
+            format!("{error:#}").contains("checker-derived recovery candidates"),
+            "{error:#}"
+        );
+
+        checker["unknown_writes_materialized"] = json!([]);
+        checker["unavailable_committed_objects"] =
+            json!(["k: outcome=Timeout status=200 error=\"get body read timed out\""]);
         recovery["still_unavailable_keys"] = json!([]);
+        recovery["reread_attempted_keys"] = json!(["k"]);
+        recovery["reread_recovered_keys"] = json!(["k"]);
+        recovery["ambiguous_write_evidence"] = json!([]);
         recovery["classification"] = json!("recovery_tail_read_latency");
         write_failure_summary(case_dir, summary);
 
@@ -2363,6 +2453,8 @@ scenarios:
         fs::write(
             case_dir.join("workload-summary.json"),
             serde_json::to_string(&json!({
+                "scenario": planned.scenario,
+                "run_id": run_id,
                 "seed": 1,
                 "object_count": 1,
                 "concurrency": 1,
@@ -2377,6 +2469,15 @@ scenarios:
             .expect("workload summary json"),
         )
         .expect("workload summary");
+        fs::write(
+            case_dir.join("workload-plan.json"),
+            serde_json::to_string(&json!({
+                "scenario": planned.scenario,
+                "run_id": run_id
+            }))
+            .expect("workload plan json"),
+        )
+        .expect("workload plan");
         fs::write(
             case_dir.join("run-events.jsonl"),
             [
