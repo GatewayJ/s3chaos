@@ -38,6 +38,7 @@ FAULT_TENANT="${RUSTFS_FAULT_TEST_TENANT:-fault-test-tenant}"
 CHAOS_NAMESPACE="${RUSTFS_FAULT_TEST_CHAOS_NAMESPACE:-chaos-mesh}"
 ACTIVE_PID=""
 ACTIVE_ARTIFACTS=""
+ACTIVE_HOST_STORAGE_MUTATION_POSSIBLE=false
 FAULT_TEST_BINARY=""
 FAULT_CATALOG_JSON=""
 
@@ -566,7 +567,8 @@ signal_process_tree() {
 }
 
 terminate_process_tree() {
-  local parent="$1" child deadline descendants=false
+  local parent="$1" host_storage_mutation_possible="$2" grace_seconds="${3:-60}"
+  local child deadline descendants=false
   for child in $(pgrep -P "$parent" 2>/dev/null || true); do
     descendants=true
     signal_process_tree "$child" TERM
@@ -575,19 +577,27 @@ terminate_process_tree() {
     kill -TERM "$parent" 2>/dev/null || true
   fi
 
-  deadline=$((SECONDS + 60))
+  deadline=$((SECONDS + grace_seconds))
   while kill -0 "$parent" 2>/dev/null && (( SECONDS < deadline )); do
     sleep 1
   done
   if kill -0 "$parent" 2>/dev/null; then
-    echo "warning: fault process did not finish graceful recovery within 60s; escalating to KILL" >&2
-    signal_process_tree "$parent" KILL
+    if [[ "$host_storage_mutation_possible" == "true" ]]; then
+      echo "warning: device-mapper host-storage mutation may still be active after ${grace_seconds}s; refusing to send SIGKILL because it could interrupt rollback" >&2
+      echo "warning: waiting for the fault process to restore or quarantine the target; preserve its proof artifacts for scoped manual recovery if it cannot finish" >&2
+      while kill -0 "$parent" 2>/dev/null; do
+        sleep 1
+      done
+    else
+      echo "warning: fault process did not finish graceful recovery within ${grace_seconds}s; escalating to KILL" >&2
+      signal_process_tree "$parent" KILL
+    fi
   fi
 }
 
 handle_signal() {
   if [[ -n "$ACTIVE_PID" ]]; then
-    terminate_process_tree "$ACTIVE_PID"
+    terminate_process_tree "$ACTIVE_PID" "$ACTIVE_HOST_STORAGE_MUTATION_POSSIBLE"
   fi
   cleanup_managed_chaos
   if [[ -n "$ACTIVE_ARTIFACTS" ]]; then
@@ -853,8 +863,10 @@ run_scenario() {
   list_non_fault_tenants >"$baseline_tenants"
   if scenario_requires_static_storage "$scenario"; then
     require_chaos=false
+    ACTIVE_HOST_STORAGE_MUTATION_POSSIBLE=true
   else
     require_chaos=true
+    ACTIVE_HOST_STORAGE_MUTATION_POSSIBLE=false
   fi
   capture_cluster_snapshot "$artifacts" before
 
@@ -906,7 +918,7 @@ run_scenario() {
         || warn_artifact_write_failed "health-watch.jsonl" "$artifacts/health-watch.jsonl"
       if [[ "$will_abort" == "true" ]]; then
         touch "$artifacts/health-guard-failed"
-        terminate_process_tree "$test_pid"
+        terminate_process_tree "$test_pid" "$ACTIVE_HOST_STORAGE_MUTATION_POSSIBLE"
         cleanup_managed_chaos
         break
       fi
@@ -917,6 +929,7 @@ run_scenario() {
   wait "$test_pid" 2>/dev/null || true
   ACTIVE_PID=""
   ACTIVE_ARTIFACTS=""
+  ACTIVE_HOST_STORAGE_MUTATION_POSSIBLE=false
   rc=125
   [[ -f "$artifacts/test-exit-code.tmp" ]] && rc="$(cat "$artifacts/test-exit-code.tmp")"
   [[ ! -f "$artifacts/health-guard-failed" ]] || rc=90
@@ -978,6 +991,11 @@ suite_requires_chaos() {
   jq -e '.requiresChaosMesh == true' "$plan_path" >/dev/null
 }
 
+suite_requires_static_storage() {
+  local plan_path="$1"
+  jq -e '.requiresStaticStorage == true' "$plan_path" >/dev/null
+}
+
 suite_max_duration_seconds() {
   local plan_path="$1"
   jq -r '.budgets.maxDurationSeconds // empty' "$plan_path"
@@ -1006,6 +1024,11 @@ run_suite() {
   else
     require_chaos=false
   fi
+  if suite_requires_static_storage "$suite_plan"; then
+    ACTIVE_HOST_STORAGE_MUTATION_POSSIBLE=true
+  else
+    ACTIVE_HOST_STORAGE_MUTATION_POSSIBLE=false
+  fi
   max_duration_seconds="$(suite_max_duration_seconds "$suite_plan")"
   capture_cluster_snapshot "$run_root" before
 
@@ -1033,7 +1056,7 @@ run_suite() {
       write_suite_budget_watch_event "$run_root/health-watch.jsonl" "$current_time" "$suite_name" "$health_checks" "$elapsed" "$max_duration_seconds" \
         || warn_artifact_write_failed "health-watch.jsonl" "$run_root/health-watch.jsonl"
       touch "$run_root/suite-budget-failed"
-      terminate_process_tree "$ACTIVE_PID"
+      terminate_process_tree "$ACTIVE_PID" "$ACTIVE_HOST_STORAGE_MUTATION_POSSIBLE"
       cleanup_managed_chaos
       break
     fi
@@ -1062,7 +1085,7 @@ run_suite() {
         || warn_artifact_write_failed "health-watch.jsonl" "$run_root/health-watch.jsonl"
       if [[ "$will_abort" == "true" ]]; then
         touch "$run_root/health-guard-failed"
-        terminate_process_tree "$ACTIVE_PID"
+        terminate_process_tree "$ACTIVE_PID" "$ACTIVE_HOST_STORAGE_MUTATION_POSSIBLE"
         cleanup_managed_chaos
         break
       fi
@@ -1073,6 +1096,7 @@ run_suite() {
   wait "$ACTIVE_PID" 2>/dev/null || true
   ACTIVE_PID=""
   ACTIVE_ARTIFACTS=""
+  ACTIVE_HOST_STORAGE_MUTATION_POSSIBLE=false
   rc=125
   [[ -f "$run_root/suite-exit-code.tmp" ]] && rc="$(cat "$run_root/suite-exit-code.tmp")"
   [[ ! -f "$run_root/health-guard-failed" ]] || rc=90
@@ -1106,6 +1130,10 @@ cleanup() {
   fi
   echo "managed fault-test resources cleaned; external StorageClasses, PVs, and host devices were not changed"
 }
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
 
 trap handle_signal INT TERM HUP
 
