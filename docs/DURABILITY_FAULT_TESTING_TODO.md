@@ -289,11 +289,14 @@ guardrails when implementing the ordered TODO below.
   Meaning: IOChaos renders `mode: fixed` with the declared count, injects all
   matching I/O on those selected volumes, and records the controller-selected
   container targets. Runtime proof binds the exact RustFS container mount path
-  through Pod volume name, PVC, PV, storage source, and applicable local node
-  topology; it also validates action, methods, parameters, sampling, and
-  duration. End-to-end execution remains pending a trusted catalog/config
-  selection source. The host DeviceMapper backend remains deliberately
-  single-target because its configuration names one mapper/device.
+  through Pod volume name, PVC, PV, storage source, and supported required Node
+  label constraints; unsupported affinity forms fail closed. Activation and
+  workload evidence preserve the selected Pod names and UIDs and reject
+  controller record or Pod-identity drift. The proof also validates action,
+  methods, parameters, sampling, and duration. End-to-end execution remains
+  pending a trusted catalog/config selection source. The host DeviceMapper
+  backend remains deliberately single-target because its configuration names
+  one mapper/device.
 
 - [x] DONE: Keep quorum targeting separate from heterogeneous composition.
   Meaning: `FixedTargets(N)` changes only the selector of one typed volume

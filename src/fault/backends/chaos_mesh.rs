@@ -183,10 +183,40 @@ pub(crate) fn validate_fixed_volume_snapshot(
         .pointer("/status/experiment/containerRecords")
         .and_then(Value::as_array)
         .context("runtime IOChaos has no per-target controller records")?;
-    let record_ids = injected_record_ids(records, ".", "IOChaos")?;
+    ensure!(
+        records.len() == usize::try_from(contract.expected_targets)?,
+        "runtime IOChaos contains {} controller records, expected exactly {}",
+        records.len(),
+        contract.expected_targets
+    );
+    ensure!(
+        records.iter().all(|record| {
+            record.get("selectorKey").and_then(Value::as_str) == Some(".")
+                && record.get("phase").and_then(Value::as_str) == Some("Injected")
+                && record
+                    .get("injectedCount")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|count| count > 0)
+        }),
+        "runtime IOChaos contains an unknown selector or a controller record without successful injection"
+    );
+    let record_ids = records
+        .iter()
+        .map(|record| {
+            record
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .context("runtime IOChaos controller record has no target id")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    ensure!(
+        record_ids.len() == records.len(),
+        "runtime IOChaos contains duplicate controller target records"
+    );
     ensure!(
         record_ids.len() == usize::try_from(contract.expected_targets)?,
-        "runtime IOChaos injected {} targets, expected {}",
+        "runtime IOChaos injected {} unique targets, expected {}",
         record_ids.len(),
         contract.expected_targets
     );
@@ -1924,6 +1954,22 @@ mod tests {
         duplicate_pod["status"]["experiment"]["containerRecords"][1]["id"] =
             serde_json::json!("faults/rustfs-0/rustfs");
         assert!(validate_fixed_volume_snapshot(&duplicate_pod, &contract).is_err());
+        for selector_key in [".Target", "unknown"] {
+            let mut extra_record = resource.clone();
+            extra_record["status"]["experiment"]["containerRecords"]
+                .as_array_mut()
+                .expect("container records")
+                .push(serde_json::json!({
+                    "id": "faults/rustfs-2/rustfs",
+                    "selectorKey": selector_key,
+                    "phase": "Injected",
+                    "injectedCount": 1
+                }));
+            assert!(
+                validate_fixed_volume_snapshot(&extra_record, &contract).is_err(),
+                "extra {selector_key} record must fail closed"
+            );
+        }
         let mut outside_proof = resource;
         outside_proof["status"]["experiment"]["containerRecords"][1]["id"] =
             serde_json::json!("faults/rustfs-9/rustfs");

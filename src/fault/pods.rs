@@ -21,8 +21,9 @@ use std::time::{Duration, Instant};
 use crate::{
     fault::{
         preflight::{
-            TargetPersistentVolumeClaimProof, TargetPersistentVolumeProof, TargetResolvedPodProof,
-            TargetVolumeMountProof,
+            TargetNodeAffinityProof, TargetNodeSelectorRequirementProof,
+            TargetNodeSelectorTermProof, TargetPersistentVolumeClaimProof,
+            TargetPersistentVolumeProof, TargetResolvedPodProof, TargetVolumeMountProof,
         },
         reporting::PodIdentity,
     },
@@ -44,6 +45,7 @@ pub(crate) fn rustfs_pod_identities(config: &ClusterTestConfig) -> Result<Vec<Po
 pub(crate) fn rustfs_target_inventory(
     config: &ClusterTestConfig,
     include_volume_bindings: bool,
+    include_node_labels: bool,
 ) -> Result<RustfsTargetInventory> {
     let pods = rustfs_pods_json(config)?;
     let selector = rustfs_tenant_selector(config);
@@ -54,11 +56,18 @@ pub(crate) fn rustfs_target_inventory(
     } else {
         None
     };
+    let node_labels = if include_node_labels {
+        Some(node_label_map(config)?)
+    } else {
+        None
+    };
     let pod_proofs = items
         .iter()
         .filter_map(|item| match &volume_maps {
-            Some((pvcs, pvs)) => target_pod_proof(item, Some(pvcs), Some(pvs)),
-            None => target_pod_proof(item, None, None),
+            Some((pvcs, pvs)) => {
+                target_pod_proof(item, Some(pvcs), Some(pvs), node_labels.as_ref())
+            }
+            None => target_pod_proof(item, None, None, node_labels.as_ref()),
         })
         .collect();
 
@@ -128,6 +137,31 @@ fn pv_map(config: &ClusterTestConfig) -> Result<BTreeMap<String, Value>> {
     Ok(items_by_metadata_name(&value))
 }
 
+fn node_label_map(
+    config: &ClusterTestConfig,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+    let output = Kubectl::new(config)
+        .command(["get", "node", "-o", "json"])
+        .run_checked()?;
+    let value = serde_json::from_str::<Value>(&output.stdout).context("parse Node list json")?;
+    Ok(value
+        .pointer("/items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            let name = node.pointer("/metadata/name").and_then(Value::as_str)?;
+            let labels = node
+                .pointer("/metadata/labels")
+                .and_then(Value::as_object)?
+                .iter()
+                .map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
+                .collect::<Option<BTreeMap<_, _>>>()?;
+            Some((name.to_string(), labels))
+        })
+        .collect())
+}
+
 fn items_by_metadata_name(value: &Value) -> BTreeMap<String, Value> {
     value
         .pointer("/items")
@@ -145,6 +179,7 @@ fn target_pod_proof(
     pod: &Value,
     pvcs: Option<&BTreeMap<String, Value>>,
     pvs: Option<&BTreeMap<String, Value>>,
+    node_labels: Option<&BTreeMap<String, BTreeMap<String, String>>>,
 ) -> Option<TargetResolvedPodProof> {
     let metadata = pod.get("metadata")?;
     let name = metadata.get("name")?.as_str()?.to_string();
@@ -152,6 +187,9 @@ fn target_pod_proof(
     let mut proof = TargetResolvedPodProof::new(name, uid).with_ready(pod_is_ready(pod));
     if let Some(node) = pod.pointer("/spec/nodeName").and_then(Value::as_str) {
         proof = proof.with_node(node);
+        if let Some(labels) = node_labels.and_then(|nodes| nodes.get(node)) {
+            proof = proof.with_node_labels(labels.clone());
+        }
     }
     let claims = match (pvcs, pvs) {
         (Some(pvcs), Some(pvs)) => persistent_volume_claim_names(pod)
@@ -282,10 +320,14 @@ fn target_pvc_proof(
 }
 
 fn target_pv_proof(name: &str, pv: &Value) -> TargetPersistentVolumeProof {
+    let required_node_affinity = pv_required_node_affinity(pv);
     TargetPersistentVolumeProof {
         name: name.to_string(),
         source: pv_source(pv).map(str::to_string),
-        node: pv_node_affinity_hostname(pv),
+        node: required_node_affinity
+            .as_ref()
+            .and_then(unique_hostname_affinity),
+        required_node_affinity,
         device_or_path: pv_device_or_path(pv),
     }
 }
@@ -302,25 +344,81 @@ fn pv_source(pv: &Value) -> Option<&'static str> {
     }
 }
 
-fn pv_node_affinity_hostname(pv: &Value) -> Option<String> {
-    pv.pointer("/spec/nodeAffinity/required/nodeSelectorTerms")
-        .and_then(Value::as_array)
+fn pv_required_node_affinity(pv: &Value) -> Option<TargetNodeAffinityProof> {
+    let required = pv.pointer("/spec/nodeAffinity/required")?;
+    let terms = required.get("nodeSelectorTerms").and_then(Value::as_array);
+    let mut well_formed = terms.is_some();
+    let terms = terms
         .into_iter()
         .flatten()
-        .filter_map(|term| term.get("matchExpressions").and_then(Value::as_array))
-        .flatten()
-        .find_map(|expression| {
-            if expression.get("key").and_then(Value::as_str) != Some("kubernetes.io/hostname")
-                || expression.get("operator").and_then(Value::as_str) != Some("In")
-            {
-                return None;
-            }
-            expression
-                .get("values")
-                .and_then(Value::as_array)?
-                .iter()
-                .find_map(|value| value.as_str().map(str::to_string))
+        .map(|term| TargetNodeSelectorTermProof {
+            match_expressions: node_selector_requirements(
+                term.get("matchExpressions"),
+                &mut well_formed,
+            ),
+            match_fields: node_selector_requirements(term.get("matchFields"), &mut well_formed),
         })
+        .collect();
+    Some(TargetNodeAffinityProof { well_formed, terms })
+}
+
+fn node_selector_requirements(
+    value: Option<&Value>,
+    well_formed: &mut bool,
+) -> Vec<TargetNodeSelectorRequirementProof> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let Some(requirements) = value.as_array() else {
+        *well_formed = false;
+        return Vec::new();
+    };
+    requirements
+        .iter()
+        .map(|requirement| {
+            let key = requirement.get("key").and_then(Value::as_str);
+            let operator = requirement.get("operator").and_then(Value::as_str);
+            let values = requirement.get("values").and_then(Value::as_array);
+            let parsed_values = values.map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            });
+            if key.is_none()
+                || operator.is_none()
+                || values.is_some_and(|items| {
+                    parsed_values
+                        .as_ref()
+                        .is_none_or(|parsed| parsed.len() != items.len())
+                })
+            {
+                *well_formed = false;
+            }
+            TargetNodeSelectorRequirementProof {
+                key: key.unwrap_or_default().to_string(),
+                operator: operator.unwrap_or_default().to_string(),
+                values: parsed_values.unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+fn unique_hostname_affinity(affinity: &TargetNodeAffinityProof) -> Option<String> {
+    if !affinity.well_formed || affinity.terms.len() != 1 {
+        return None;
+    }
+    let matches = affinity.terms[0]
+        .match_expressions
+        .iter()
+        .filter(|requirement| {
+            requirement.key == "kubernetes.io/hostname"
+                && requirement.operator == "In"
+                && requirement.values.len() == 1
+        })
+        .collect::<Vec<_>>();
+    (matches.len() == 1).then(|| matches[0].values[0].clone())
 }
 
 fn pv_device_or_path(pv: &Value) -> Option<String> {
@@ -435,6 +533,7 @@ mod tests {
     };
     use crate::fault::{preflight::target_pod_has_fixed_volume, reporting::PodIdentity};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn pod_replacement_requires_old_uid_removed_and_new_uid_added() {
@@ -502,7 +601,7 @@ mod tests {
                                 "matchExpressions": [{
                                     "key": "kubernetes.io/hostname",
                                     "operator": "In",
-                                    "values": ["node-a"]
+                                    "values": ["node-b", "node-a"]
                                 }]
                             }]
                         }
@@ -512,8 +611,13 @@ mod tests {
         });
         let pvcs = items_by_metadata_name(&pvc_list);
         let pvs = items_by_metadata_name(&pv_list);
+        let node_labels = BTreeMap::from([(
+            "node-a".to_string(),
+            BTreeMap::from([("kubernetes.io/hostname".to_string(), "node-a".to_string())]),
+        )]);
 
-        let proof = target_pod_proof(&pod, Some(&pvcs), Some(&pvs)).expect("proof");
+        let proof =
+            target_pod_proof(&pod, Some(&pvcs), Some(&pvs), Some(&node_labels)).expect("proof");
 
         assert_eq!(persistent_volume_claim_names(&pod), vec!["data-rustfs-0"]);
         assert!(proof.ready);
@@ -523,7 +627,16 @@ mod tests {
         assert_eq!(claim.volume_name.as_deref(), Some("pv-a"));
         let pv = claim.persistent_volume.as_ref().expect("pv");
         assert_eq!(pv.source.as_deref(), Some("local"));
-        assert_eq!(pv.node.as_deref(), Some("node-a"));
+        assert_eq!(pv.node, None, "multi-value affinity has no singleton node");
+        assert_eq!(
+            pv.required_node_affinity
+                .as_ref()
+                .expect("node affinity")
+                .terms[0]
+                .match_expressions[0]
+                .values,
+            ["node-b", "node-a"]
+        );
         assert_eq!(pv.device_or_path.as_deref(), Some("/mnt/rustfs0"));
         assert!(target_pod_has_fixed_volume(&proof, "/data/rustfs0"));
     }
@@ -565,6 +678,7 @@ mod tests {
             &pod,
             Some(&items_by_metadata_name(&pvc_list)),
             Some(&items_by_metadata_name(&pv_list)),
+            None,
         )
         .expect("proof");
 
@@ -588,7 +702,7 @@ mod tests {
             }
         });
 
-        let proof = target_pod_proof(&pod, None, None).expect("proof");
+        let proof = target_pod_proof(&pod, None, None, None).expect("proof");
 
         assert_eq!(proof.name, "rustfs-0");
         assert_eq!(proof.node.as_deref(), Some("node-a"));

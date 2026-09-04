@@ -1058,6 +1058,44 @@ fn validate_fixed_volume_runtime_evidence(
         .as_deref()
         .context("fixed volume run-spec target has no path")?;
     let expected_count = usize::try_from(fault.selection.value)?;
+    let before_identities = unique_pod_identities(
+        "fault-evidence.json pods_before",
+        evidence
+            .pods_before
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    let proof_identities = unique_pod_identities(
+        "target-proof.json resolved_pods",
+        proof
+            .resolved_pods
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    ensure!(
+        !before_identities.is_empty() && before_identities == proof_identities,
+        "fault-evidence.json pods_before must exactly match target-proof.json Pod identities"
+    );
+    let active_identities = unique_pod_identities(
+        "fault-evidence.json pods_at_fault_activation",
+        evidence
+            .pods_at_fault_activation
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    let workload_identities = unique_pod_identities(
+        "fault-evidence.json pods_at_workload_snapshot",
+        evidence
+            .pods_at_workload_snapshot
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    ensure!(
+        active_identities.len() == expected_count
+            && workload_identities == active_identities
+            && active_identities.is_subset(&proof_identities),
+        "fixed volume selected Pod identities must be exactly N unchanged identities from pods_before and target-proof.json"
+    );
     let active_targets = evidence
         .fixed_volume_targets_at_fault_activation
         .iter()
@@ -1092,6 +1130,14 @@ fn validate_fixed_volume_runtime_evidence(
     ensure!(
         selected_pods.len() == active_targets.len(),
         "fault-evidence.json contains multiple fixed volume target records for one Pod"
+    );
+    let active_identity_pods = active_identities
+        .iter()
+        .map(|(name, _)| format!("{}/{name}", spec.cluster.namespace))
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        active_identity_pods == selected_pods,
+        "fault-evidence.json selected Pod identities do not match controller target names"
     );
     for pod_id in &selected_pods {
         let pod = proved_pods.get(pod_id).with_context(|| {
@@ -2256,8 +2302,10 @@ mod tests {
         history::{OperationOutcome, OperationRecord},
         plan::{FaultInjection, FaultKind, FaultPlan, FaultSelection, FaultTarget},
         preflight::{
-            TargetPersistentVolumeClaimProof, TargetPersistentVolumeProof, TargetProof,
-            TargetResolvedPodProof, TargetVolumeMountProof,
+            TargetNodeAffinityProof, TargetNodeSelectorRequirementProof,
+            TargetNodeSelectorTermProof, TargetPersistentVolumeClaimProof,
+            TargetPersistentVolumeProof, TargetProof, TargetResolvedPodProof,
+            TargetVolumeMountProof,
         },
         quorum::{ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape},
         reporting::{
@@ -2269,7 +2317,7 @@ mod tests {
         workload::WorkloadPlan,
     };
     use serde_json::json;
-    use std::{fs, time::Duration};
+    use std::{collections::BTreeMap, fs, time::Duration};
 
     #[test]
     fn validates_successful_fault_artifacts() {
@@ -2325,6 +2373,7 @@ mod tests {
                     persistent_volume: Some(TargetPersistentVolumeProof {
                         name: "pv-csi".to_string(),
                         source: Some("csi".to_string()),
+                        required_node_affinity: None,
                         node: None,
                         device_or_path: Some("csi-volume-handle".to_string()),
                     }),
@@ -2384,6 +2433,10 @@ mod tests {
         let volume_pod = |index| {
             TargetResolvedPodProof::new(format!("rustfs-{index}"), format!("uid-{index}"))
                 .with_node(format!("node-{index}"))
+                .with_node_labels(BTreeMap::from([(
+                    "kubernetes.io/hostname".to_string(),
+                    format!("node-{index}"),
+                )]))
                 .with_ready(true)
                 .with_volume_mounts(vec![TargetVolumeMountProof {
                     container_name: "rustfs".to_string(),
@@ -2398,6 +2451,17 @@ mod tests {
                     persistent_volume: Some(TargetPersistentVolumeProof {
                         name: format!("pv-{index}"),
                         source: Some("local".to_string()),
+                        required_node_affinity: Some(TargetNodeAffinityProof {
+                            well_formed: true,
+                            terms: vec![TargetNodeSelectorTermProof {
+                                match_expressions: vec![TargetNodeSelectorRequirementProof {
+                                    key: "kubernetes.io/hostname".to_string(),
+                                    operator: "In".to_string(),
+                                    values: vec![format!("node-{index}")],
+                                }],
+                                match_fields: Vec::new(),
+                            }],
+                        }),
                         node: Some(format!("node-{index}")),
                         device_or_path: Some(format!("/dev/disk-{index}")),
                     }),
@@ -2482,7 +2546,18 @@ mod tests {
             "recovered": true,
             "require_client_disruption": false,
             "client_disruptions": 0,
-            "pods_before": [],
+            "pods_before": (0..3).map(|index| json!({
+                "name": format!("rustfs-{index}"),
+                "uid": format!("uid-{index}")
+            })).collect::<Vec<_>>(),
+            "pods_at_fault_activation": (0..2).map(|index| json!({
+                "name": format!("rustfs-{index}"),
+                "uid": format!("uid-{index}")
+            })).collect::<Vec<_>>(),
+            "pods_at_workload_snapshot": (0..2).map(|index| json!({
+                "name": format!("rustfs-{index}"),
+                "uid": format!("uid-{index}")
+            })).collect::<Vec<_>>(),
             "pods_after": [],
             "fixed_volume_targets_at_fault_activation": [target(0), target(1)],
             "fixed_volume_targets_at_workload_snapshot": [target(0), target(1)],
@@ -2493,12 +2568,42 @@ mod tests {
         validate_fixed_volume_runtime_evidence(&evidence, &proof, &run_spec)
             .expect("fixed volume runtime evidence");
 
+        let mut missing_uid = evidence.clone();
+        missing_uid.pods_at_fault_activation[0].uid.clear();
+        assert!(
+            validate_fixed_volume_runtime_evidence(&missing_uid, &proof, &run_spec).is_err(),
+            "selected Pod identities require a non-empty UID"
+        );
+        let mut missing_identities = evidence.clone();
+        missing_identities.pods_at_fault_activation.clear();
+        assert!(
+            validate_fixed_volume_runtime_evidence(&missing_identities, &proof, &run_spec).is_err(),
+            "selected Pod identity evidence must not be empty"
+        );
+        let mut duplicate_name = evidence.clone();
+        duplicate_name.pods_at_fault_activation[1].name = "rustfs-0".to_string();
+        assert!(
+            validate_fixed_volume_runtime_evidence(&duplicate_name, &proof, &run_spec).is_err(),
+            "selected Pod identity names must be unique"
+        );
+        let mut tampered_uid = evidence.clone();
+        tampered_uid.pods_at_fault_activation[0].uid = "uid-tampered".to_string();
+        assert!(
+            validate_fixed_volume_runtime_evidence(&tampered_uid, &proof, &run_spec).is_err(),
+            "selected Pod UID must match target-proof and pods_before"
+        );
+        let mut replacement = evidence.clone();
+        replacement.pods_at_workload_snapshot[0].uid = "uid-replacement".to_string();
+        assert!(
+            validate_fixed_volume_runtime_evidence(&replacement, &proof, &run_spec).is_err(),
+            "same-name Pod replacement across snapshots must fail closed"
+        );
+
         let mut wrong_topology = proof.clone();
-        wrong_topology.resolved_pods[0].persistent_volume_claims[0]
-            .persistent_volume
-            .as_mut()
-            .expect("pv")
-            .node = Some("other-node".to_string());
+        wrong_topology.resolved_pods[0].node_labels.insert(
+            "kubernetes.io/hostname".to_string(),
+            "other-node".to_string(),
+        );
         assert!(
             validate_fixed_volume_runtime_evidence(&evidence, &wrong_topology, &run_spec).is_err(),
             "local PV topology must match the selected Pod node"
