@@ -1589,33 +1589,34 @@ fn finish_recovery_stability_report(
     report: &mut RecoveryStabilityReport,
     immediate_report: &CheckerReport,
 ) {
+    report.classification = classify_recovery_stability(report, immediate_report);
+}
+
+pub(crate) fn classify_recovery_stability(
+    report: &RecoveryStabilityReport,
+    immediate_report: &CheckerReport,
+) -> RecoveryStabilityClassification {
     if !report.hash_mismatches.is_empty() || !report.data_corruption_evidence.is_empty() {
-        report.classification = RecoveryStabilityClassification::DataCorruption;
-        return;
+        return RecoveryStabilityClassification::DataCorruption;
     }
     if !report.harness_errors.is_empty() {
-        report.classification = RecoveryStabilityClassification::HarnessError;
-        return;
+        return RecoveryStabilityClassification::HarnessError;
     }
     if !report.still_unavailable_keys.is_empty() {
-        report.classification = RecoveryStabilityClassification::CommittedObjectUnavailable;
-        return;
+        return RecoveryStabilityClassification::CommittedObjectUnavailable;
     }
     if !report.ambiguous_write_evidence.is_empty() {
-        report.classification = RecoveryStabilityClassification::AmbiguousWriteMaterialized;
-        return;
+        return RecoveryStabilityClassification::AmbiguousWriteMaterialized;
     }
     if has_list_unavailable_or_unknown_signal(immediate_report) {
-        report.classification = RecoveryStabilityClassification::ListUnavailableOrUnknown;
-        return;
+        return RecoveryStabilityClassification::ListUnavailableOrUnknown;
     }
     if !report.reread_attempted_keys.is_empty()
         && immediate_failures_are_only_reread_candidates(immediate_report, report)
     {
-        report.classification = RecoveryStabilityClassification::RecoveryTailReadLatency;
-        return;
+        return RecoveryStabilityClassification::RecoveryTailReadLatency;
     }
-    report.classification = classify_without_reread(immediate_report);
+    classify_without_reread(immediate_report)
 }
 
 fn immediate_failures_are_only_reread_candidates(

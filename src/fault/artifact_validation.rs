@@ -1234,6 +1234,18 @@ fn validate_expected_failure_signal(
                 "recovery-stability-report.json immediate_passed does not match checker-pre-recommit-report.json"
             );
             ensure!(
+                recovery.final_list_warning_count == checker.final_list_warning_count
+                    && recovery.list_warnings == checker.list_warnings,
+                "recovery-stability-report.json LIST evidence does not match checker-pre-recommit-report.json"
+            );
+            let observed = checker::classify_recovery_stability(&recovery, &checker);
+            ensure!(
+                recovery.classification == observed,
+                "recovery-stability-report.json claims classification {:?}, but its checker/recovery evidence classifies as {:?}",
+                recovery.classification.as_str(),
+                observed.as_str()
+            );
+            ensure!(
                 recovery.classification.as_str() == summary.classification,
                 "recovery-stability-report.json supports classification {:?}, not {:?}",
                 recovery.classification.as_str(),

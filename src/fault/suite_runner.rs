@@ -324,27 +324,21 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                         now_ms(),
                     )
                 });
-                let disruption_budget_failure = expected_failure_artifacts
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok())
-                    .and_then(|validation| {
-                        account_validated_failure_disruptions(
-                            &mut summary,
-                            &mut attempt,
-                            validation,
-                        )
-                    });
-                let expected_failure_mismatch = match (
+                let (expected_failure_mismatch, disruption_budget_failure) = match (
                     planned.plan.expected_failure.as_ref(),
                     expected_failure_artifacts.as_ref(),
                 ) {
                     (Some(expected), Some(Ok(validation))) => {
-                        validate_expected_failure_match(expected, validation)
-                            .err()
-                            .map(|error| format!("{error:#}"))
+                        let evaluation = evaluate_validated_expected_failure(
+                            &mut summary,
+                            &mut attempt,
+                            expected,
+                            validation,
+                        );
+                        (evaluation.mismatch, evaluation.disruption_budget_failure)
                     }
-                    (Some(_), Some(Err(error))) => Some(format!("{error:#}")),
-                    _ => None,
+                    (Some(_), Some(Err(error))) => (Some(format!("{error:#}")), None),
+                    _ => (None, None),
                 };
                 if planned.plan.expected_failure.is_some() && expected_failure_mismatch.is_none() {
                     let validation = expected_failure_artifacts
@@ -357,8 +351,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                         validation.client_disruptions,
                     );
                     replace_last_attempt(&mut summary, attempt);
-                    if let Some(reason) = disruption_budget_failure {
-                        summary.record_suite_budget_failure(reason);
+                    if enforce_disruption_budget(&mut summary, disruption_budget_failure) {
                         write_summary(&summary_path, &summary)?;
                         break 'suite;
                     }
@@ -548,6 +541,30 @@ fn validate_expected_failure_match(
         validation.summary.responsibility_domain(),
         validation.summary.primary_evidence_refs(),
     )
+}
+
+struct ValidatedExpectedFailureEvaluation {
+    mismatch: Option<String>,
+    disruption_budget_failure: Option<String>,
+}
+
+fn evaluate_validated_expected_failure(
+    summary: &mut FaultSuiteRunSummary,
+    attempt: &mut FaultSuiteRunAttempt,
+    expected: &FaultExpectedFailure,
+    validation: &ExpectedFailureArtifactReport,
+) -> ValidatedExpectedFailureEvaluation {
+    // Once the artifact contract is trusted, its safety signal is authoritative
+    // even when the diagnostic expectation itself is wrong.
+    let disruption_budget_failure =
+        account_validated_failure_disruptions(summary, attempt, validation);
+    let mismatch = validate_expected_failure_match(expected, validation)
+        .err()
+        .map(|error| format!("{error:#}"));
+    ValidatedExpectedFailureEvaluation {
+        mismatch,
+        disruption_budget_failure,
+    }
 }
 
 #[cfg(test)]
@@ -882,12 +899,11 @@ fn now_ms() -> u64 {
 mod tests {
     use super::{
         FaultSuiteRunAttempt, FaultSuiteRunFailureKind, FaultSuiteRunSummary, FaultSuiteStopReason,
-        SuiteAttemptStatus, SuiteRunStatus, account_validated_failure_disruptions,
-        artifact_validation_failure_details, attempt_failure_details,
-        build_fault_suite_execution_plan, enforce_disruption_budget,
-        should_stop_after_attempt_failure, suite_duration_budget_failure,
-        validate_expected_failure, validate_expected_failure_artifact_contract,
-        validate_expected_failure_match,
+        SuiteAttemptStatus, SuiteRunStatus, artifact_validation_failure_details,
+        attempt_failure_details, build_fault_suite_execution_plan, enforce_disruption_budget,
+        evaluate_validated_expected_failure, should_stop_after_attempt_failure,
+        suite_duration_budget_failure, validate_expected_failure,
+        validate_expected_failure_artifact_contract, write_summary,
     };
     use crate::fault::artifact_validation::validate_expected_failure_artifacts;
     use crate::fault::{
@@ -1611,7 +1627,6 @@ scenarios:
             100,
         )
         .expect("strict artifact validation remains independent of typed matching");
-        assert!(validate_expected_failure_match(&mismatched_expected, &validation).is_err());
         let mut budget_summary =
             FaultSuiteRunSummary::started(&execution.suite, "suite-budget".to_string());
         budget_summary.max_client_disruptions = Some(0);
@@ -1620,18 +1635,25 @@ scenarios:
             &planned.scenario,
             planned.repetition,
             Path::new(&planned.artifacts.attempt_dir),
-            Some(mismatched_expected),
+            Some(mismatched_expected.clone()),
         );
-        let budget_failure = account_validated_failure_disruptions(
+        let evaluation = evaluate_validated_expected_failure(
             &mut budget_summary,
             &mut mismatched_attempt,
+            &mismatched_expected,
             &validation,
         );
-        assert!(budget_failure.is_some(), "mismatch cannot bypass max=0");
+        assert!(evaluation.mismatch.is_some(), "fixture must mismatch");
+        assert!(
+            evaluation.disruption_budget_failure.is_some(),
+            "mismatch cannot bypass max=0"
+        );
         assert_eq!(budget_summary.total_client_disruptions, 1);
         assert_eq!(mismatched_attempt.client_disruptions, Some(1));
+        let must_stop =
+            enforce_disruption_budget(&mut budget_summary, evaluation.disruption_budget_failure);
         assert!(
-            enforce_disruption_budget(&mut budget_summary, budget_failure),
+            must_stop,
             "the runner must stop before scheduling another destructive attempt"
         );
         assert_eq!(budget_summary.status, SuiteRunStatus::Failed);
@@ -1639,6 +1661,14 @@ scenarios:
             budget_summary.stop_reason,
             Some(FaultSuiteStopReason::Failure { .. })
         ));
+        let mismatch_summary_path = dir.path().join("mismatch-suite-summary.json");
+        write_summary(&mismatch_summary_path, &budget_summary).expect("write suite summary");
+        let persisted = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(mismatch_summary_path).expect("read suite summary"),
+        )
+        .expect("suite summary json");
+        assert_eq!(persisted["totalClientDisruptions"], 1);
+        assert_eq!(persisted["status"], "failed");
 
         let checker_path = case_dir.join("checker-report.json");
         let mut clean_checker = expected_failure_checker_report(&planned.scenario);
@@ -1836,24 +1866,24 @@ scenarios:
             serde_json::to_string(&checker).expect("checker json"),
         )
         .expect("write checker report");
+        let mut recovery = json!({
+            "immediate_passed": false,
+            "reread_attempted_keys": ["k"],
+            "reread_recovered_keys": ["k"],
+            "still_unavailable_keys": [],
+            "hash_mismatches": [],
+            "data_corruption_evidence": [],
+            "ambiguous_write_evidence": [],
+            "final_list_warning_count": 0,
+            "list_warnings": [],
+            "harness_errors": [],
+            "max_recovery_seconds": 60,
+            "recovered_within_seconds": 27,
+            "classification": "recovery_tail_read_latency"
+        });
         fs::write(
             case_dir.join("recovery-stability-report.json"),
-            serde_json::to_string(&json!({
-                "immediate_passed": false,
-                "reread_attempted_keys": ["k"],
-                "reread_recovered_keys": ["k"],
-                "still_unavailable_keys": [],
-                "hash_mismatches": [],
-                "data_corruption_evidence": [],
-                "ambiguous_write_evidence": [],
-                "final_list_warning_count": 0,
-                "list_warnings": [],
-                "harness_errors": [],
-                "max_recovery_seconds": 60,
-                "recovered_within_seconds": 27,
-                "classification": "recovery_tail_read_latency"
-            }))
-            .expect("recovery json"),
+            serde_json::to_string(&recovery).expect("recovery json"),
         )
         .expect("write recovery report");
         summary["stage"] = json!("checker-pre-recommit-verdict");
@@ -1884,6 +1914,32 @@ scenarios:
             100,
         )
         .expect("recovery-tail evidence");
+
+        let list_warning = "LIST prefix fault-test/ did not complete";
+        checker["final_list_warning_count"] = json!(1);
+        checker["list_warnings"] = json!([list_warning]);
+        fs::write(
+            case_dir.join("checker-pre-recommit-report.json"),
+            serde_json::to_string(&checker).expect("checker json"),
+        )
+        .expect("write checker report with LIST warning");
+        recovery["final_list_warning_count"] = json!(1);
+        recovery["list_warnings"] = json!([list_warning]);
+        fs::write(
+            case_dir.join("recovery-stability-report.json"),
+            serde_json::to_string(&recovery).expect("recovery json"),
+        )
+        .expect("write forged tail recovery report");
+        let error = validate_expected_failure_artifacts(
+            &suite_root,
+            case_dir,
+            &planned.scenario,
+            &planned.case_name,
+            10,
+            100,
+        )
+        .expect_err("LIST warning must outrank recovered read-tail evidence");
+        assert!(format!("{error:#}").contains("list_unavailable_or_unknown"));
     }
 
     #[test]
