@@ -14,17 +14,21 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeSet,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::fault::{
     config::FaultTestConfig,
     plan::{FaultPlan, FaultTarget},
+    quorum::{ErasureSetHealth, ErasureSetMembership, ErasureSetShape},
     reporting::ResponsibilityDomain,
     scenarios::{FaultScenario, FaultScenarioSpec},
 };
 
 const PREFLIGHT_SUMMARY_SCHEMA_VERSION: u8 = 1;
-const TARGET_PROOF_SCHEMA_VERSION: u8 = 1;
+const TARGET_PROOF_SCHEMA_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +113,10 @@ pub struct TargetProofFault {
     pub target_kind: String,
     pub target_summary: String,
     pub selection: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub selection_kind: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub selection_value: u32,
     pub conflict_domain: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pod_selector: Option<TargetPodSelectorProof>,
@@ -135,6 +143,8 @@ pub struct TargetPodSelectorProof {
 pub struct TargetResolvedPodProof {
     pub name: String,
     pub uid: String,
+    #[serde(default)]
+    pub ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -178,6 +188,18 @@ pub struct TargetHostProof {
 pub struct TargetErasureSetProof {
     pub required: bool,
     pub resolved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shape: Option<ErasureSetShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<ErasureSetHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub membership: Option<ErasureSetMembership>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub observed_at_ms: u64,
     pub note: String,
 }
 
@@ -297,6 +319,8 @@ impl TargetProof {
                 target_kind: target_kind(fault.target()).to_string(),
                 target_summary: fault.target().summary(),
                 selection: fault.selection().summary(),
+                selection_kind: fault.selection().kind().to_string(),
+                selection_value: fault.selection().value(),
                 conflict_domain: spec.conflict_domain.to_string(),
                 pod_selector: pod_selector_proof(config, fault.target()),
                 volume_path: volume_path(fault.target()),
@@ -309,7 +333,7 @@ impl TargetProof {
             requirements.push(TargetProofRequirement {
                 name: ERASURE_SET_PROOF_REQUIREMENT.to_string(),
                 status: PreflightStatus::Failed,
-                message: "same-erasure-set proof is not implemented".to_string(),
+                message: "same-erasure-set runtime observation is pending".to_string(),
             });
         }
         let status = if requirements
@@ -380,10 +404,70 @@ impl TargetProof {
     /// cannot see); this only records its outcome so the fail-closed
     /// requirement reflects evidence instead of rejecting the scenario
     /// unconditionally.
-    pub fn with_erasure_set_topology_proven(mut self) -> Self {
+    pub fn with_erasure_set_topology_proven(
+        mut self,
+        shape: ErasureSetShape,
+        health: ErasureSetHealth,
+        membership: ErasureSetMembership,
+        deployment_id: impl Into<String>,
+        observed_at_ms: u64,
+    ) -> Result<Self> {
+        shape.validate()?;
+        health.require_all_online(shape.total_shards)?;
+        membership.validate(&shape)?;
+        let deployment_id = deployment_id.into();
+        anyhow::ensure!(
+            !deployment_id.trim().is_empty(),
+            "deployment id must not be empty"
+        );
+        anyhow::ensure!(observed_at_ms > 0, "observation timestamp must be positive");
+        anyhow::ensure!(
+            self.faults.iter().any(|fault| fault.erasure_set.is_some()),
+            "target proof does not require erasure-set evidence"
+        );
+        anyhow::ensure!(
+            self.resolved_pods.len() == usize::try_from(shape.server_count)?,
+            "resolved pod count does not match runtime erasure-set server count"
+        );
+        let pod_names = self
+            .resolved_pods
+            .iter()
+            .map(|pod| pod.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let pod_uids = self
+            .resolved_pods
+            .iter()
+            .map(|pod| pod.uid.as_str())
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            pod_names.len() == self.resolved_pods.len()
+                && pod_uids.len() == self.resolved_pods.len()
+                && pod_names.iter().all(|name| !name.trim().is_empty())
+                && pod_uids.iter().all(|uid| !uid.trim().is_empty()),
+            "runtime erasure-set proof requires unique non-empty Pod names and UIDs"
+        );
+        anyhow::ensure!(
+            self.resolved_pods.iter().all(|pod| pod.ready),
+            "runtime erasure-set proof requires every resolved pod to be Ready"
+        );
+        let membership_pods = membership
+            .members
+            .iter()
+            .map(|member| member.pod_name.as_str())
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            membership_pods == pod_names,
+            "runtime erasure-set membership does not match the resolved RustFS Pods"
+        );
         for fault in &mut self.faults {
             if let Some(proof) = &mut fault.erasure_set {
                 proof.resolved = true;
+                proof.source = Some("rustfs-admin-server-info".to_string());
+                proof.deployment_id = Some(deployment_id.clone());
+                proof.shape = Some(shape.clone());
+                proof.health = Some(health);
+                proof.membership = Some(membership.clone());
+                proof.observed_at_ms = observed_at_ms;
                 proof.note = ERASURE_SET_PROOF_RESOLVED_NOTE.to_string();
             }
         }
@@ -393,6 +477,7 @@ impl TargetProof {
                 requirement.message = ERASURE_SET_PROOF_RESOLVED_NOTE.to_string();
             }
         }
+        self.generated_at_ms = now_ms();
         self.status = if self
             .requirements
             .iter()
@@ -402,7 +487,7 @@ impl TargetProof {
         } else {
             TargetProofStatus::Satisfied
         };
-        self
+        Ok(self)
     }
 
     pub fn preflight_check(&self) -> PreflightCheck {
@@ -500,6 +585,7 @@ impl TargetResolvedPodProof {
         Self {
             name: name.into(),
             uid: uid.into(),
+            ready: false,
             node: None,
             persistent_volume_claims: Vec::new(),
         }
@@ -507,6 +593,11 @@ impl TargetResolvedPodProof {
 
     pub fn with_node(mut self, node: impl Into<String>) -> Self {
         self.node = Some(node.into());
+        self
+    }
+
+    pub fn with_ready(mut self, ready: bool) -> Self {
+        self.ready = ready;
         self
     }
 
@@ -630,18 +721,24 @@ fn host_target_proof(config: &FaultTestConfig, target: &FaultTarget) -> Option<T
 }
 
 fn erasure_set_proof(spec: &FaultScenarioSpec) -> Option<TargetErasureSetProof> {
-    let requires = spec.target.contains("erasure set") || spec.conflict_domain.contains("erasure");
-    requires.then(|| TargetErasureSetProof {
-        required: true,
-        resolved: false,
-        note: ERASURE_SET_PROOF_PENDING_NOTE.to_string(),
-    })
+    spec.requires_erasure_set_proof()
+        .then(|| TargetErasureSetProof {
+            required: true,
+            resolved: false,
+            source: None,
+            deployment_id: None,
+            shape: None,
+            health: None,
+            membership: None,
+            observed_at_ms: 0,
+            note: ERASURE_SET_PROOF_PENDING_NOTE.to_string(),
+        })
 }
 
 const ERASURE_SET_PROOF_PENDING_NOTE: &str =
-    "same-erasure-set target proof is not implemented for this scenario";
+    "same-erasure-set runtime observation is pending for this scenario";
 const ERASURE_SET_PROOF_RESOLVED_NOTE: &str =
-    "same-erasure-set topology proven from the live tenant pool geometry before fault apply";
+    "same-erasure-set topology proven from RustFS admin runtime geometry before fault apply";
 pub const ERASURE_SET_PROOF_REQUIREMENT: &str = "same_erasure_set_target_proof";
 
 fn now_ms() -> u64 {
@@ -651,12 +748,21 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PreflightStatus, TargetProof, TargetProofStatus, TargetResolvedPodProof};
     use crate::fault::{
         config::FaultTestConfig,
         plan::{FaultPlan, FaultPlanOptions},
+        quorum::{ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape},
         scenarios::{FaultScenario, scenario_spec},
     };
 
@@ -740,10 +846,31 @@ mod tests {
         // Once the runner records the passed proof, the same evidence set is
         // satisfied — the requirement flips instead of staying unconditional.
         let proven = TargetProof::from_plan(&config, &scenario, spec, &plan, "run-1")
-            .with_resolved_pod_proofs([
-                TargetResolvedPodProof::new("rustfs-0", "uid-0").with_node("node-a")
-            ])
-            .with_erasure_set_topology_proven();
+            .with_resolved_pod_proofs((0..4).map(|index| {
+                TargetResolvedPodProof::new(format!("rustfs-{index}"), format!("uid-{index}"))
+                    .with_node(format!("node-{index}"))
+                    .with_ready(true)
+            }))
+            .with_erasure_set_topology_proven(
+                ErasureSetShape::from_runtime_single_set(4, 2, &[1], &[8], 4)
+                    .expect("runtime shape"),
+                ErasureSetHealth::from_runtime(8, 8, 0, 0).expect("runtime health"),
+                ErasureSetMembership::from_runtime(
+                    &ErasureSetShape::from_runtime_single_set(4, 2, &[1], &[8], 4)
+                        .expect("runtime shape"),
+                    (0..4)
+                        .map(|index| ErasureSetMember {
+                            pod_name: format!("rustfs-{index}"),
+                            server_endpoint: format!("http://rustfs-{index}.rustfs:9000"),
+                            shard_ids: vec![format!("drive-{index}-a"), format!("drive-{index}-b")],
+                        })
+                        .collect(),
+                )
+                .expect("runtime membership"),
+                "deployment-1",
+                1,
+            )
+            .expect("valid runtime proof");
         assert_eq!(proven.status, TargetProofStatus::Satisfied);
         assert!(proven.require_satisfied().is_ok());
         let requirement = proven
@@ -756,7 +883,12 @@ mod tests {
             proven
                 .faults
                 .iter()
-                .all(|fault| fault.erasure_set.as_ref().is_some_and(|p| p.resolved))
+                .all(|fault| fault.erasure_set.as_ref().is_some_and(|p| {
+                    p.resolved
+                        && p.shape
+                            .as_ref()
+                            .is_some_and(|shape| shape.total_shards == 8)
+                }))
         );
     }
 }

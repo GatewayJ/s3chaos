@@ -42,10 +42,17 @@ pub struct ObjectSpec {
     index: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreparedObject {
     pub spec: ObjectSpec,
     body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StagedMultipartUpload {
+    object: PreparedObject,
+    upload_id: String,
+    completed_parts: Vec<CompletedPart>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1123,11 +1130,36 @@ impl S3WorkloadClient {
         object: &PreparedObject,
         recorder: &Recorder,
     ) -> Result<OperationOutcome> {
+        let Some(staged) = self
+            .try_stage_multipart_object(object.clone(), recorder)
+            .await?
+        else {
+            return Ok(OperationOutcome::Unknown);
+        };
+        self.complete_staged_multipart_object(staged, recorder)
+            .await
+    }
+
+    pub(crate) async fn stage_multipart_object(
+        &self,
+        object: PreparedObject,
+        recorder: &Recorder,
+    ) -> Result<StagedMultipartUpload> {
+        self.try_stage_multipart_object(object, recorder)
+            .await?
+            .context("multipart upload could not be staged before fault activation")
+    }
+
+    async fn try_stage_multipart_object(
+        &self,
+        object: PreparedObject,
+        recorder: &Recorder,
+    ) -> Result<Option<StagedMultipartUpload>> {
         let Some(upload_id) = self
             .create_multipart_upload(&object.spec.key, recorder)
             .await?
         else {
-            return Ok(OperationOutcome::Unknown);
+            return Ok(None);
         };
         let mut completed_parts = Vec::new();
         for (index, chunk) in object.body.chunks(5 * 1024 * 1024).enumerate() {
@@ -1141,11 +1173,27 @@ impl S3WorkloadClient {
                     let _ = self
                         .abort_multipart_upload(&object.spec.key, &upload_id, recorder)
                         .await;
-                    return Ok(OperationOutcome::Unknown);
+                    return Ok(None);
                 }
             }
         }
+        Ok(Some(StagedMultipartUpload {
+            object,
+            upload_id,
+            completed_parts,
+        }))
+    }
 
+    pub(crate) async fn complete_staged_multipart_object(
+        &self,
+        staged: StagedMultipartUpload,
+        recorder: &Recorder,
+    ) -> Result<OperationOutcome> {
+        let StagedMultipartUpload {
+            object,
+            upload_id,
+            completed_parts,
+        } = staged;
         let record = recorder.begin(
             OperationKind::CompleteMultipartUpload,
             self.bucket.clone(),

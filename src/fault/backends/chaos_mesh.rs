@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, bail, ensure};
-use std::time::Duration;
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::Value;
+use std::{collections::BTreeSet, time::Duration};
 
 use crate::{
     fault::{
@@ -39,6 +40,182 @@ pub(crate) const RUN_ID_LABEL: &str = "rustfs-fault-test/run-id";
 const SCENARIO_LABEL: &str = "rustfs-fault-test/scenario";
 pub(crate) const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 pub(crate) const MANAGED_BY_VALUE: &str = "s3chaos";
+
+pub(crate) struct NetworkPartitionEvidenceContract<'a> {
+    pub chaos_namespace: &'a str,
+    pub target_namespace: &'a str,
+    pub tenant: &'a str,
+    pub run_id: &'a str,
+    pub scenario: &'a str,
+    pub expected_source_targets: u32,
+    pub candidate_pod_ids: &'a BTreeSet<String>,
+}
+
+/// Validates both the submitted NetworkChaos contract and the controller's
+/// per-target records. Conditions alone do not prove how many targets were
+/// actually selected and injected.
+pub(crate) fn validate_network_partition_snapshot(
+    resource: &Value,
+    contract: &NetworkPartitionEvidenceContract<'_>,
+) -> Result<BTreeSet<String>> {
+    ensure!(
+        resource.get("apiVersion").and_then(Value::as_str) == Some("chaos-mesh.org/v1alpha1")
+            && resource.get("kind").and_then(Value::as_str) == Some("NetworkChaos"),
+        "runtime fault snapshot is not a Chaos Mesh v1alpha1 NetworkChaos"
+    );
+    ensure!(
+        resource
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            == Some(contract.chaos_namespace)
+            && resource
+                .pointer(&format!(
+                    "/metadata/labels/{}",
+                    RUN_ID_LABEL.replace('/', "~1")
+                ))
+                .and_then(Value::as_str)
+                == Some(contract.run_id)
+            && resource
+                .pointer(&format!(
+                    "/metadata/labels/{}",
+                    SCENARIO_LABEL.replace('/', "~1")
+                ))
+                .and_then(Value::as_str)
+                == Some(contract.scenario)
+            && resource
+                .pointer(&format!(
+                    "/metadata/labels/{}",
+                    MANAGED_BY_LABEL.replace('/', "~1")
+                ))
+                .and_then(Value::as_str)
+                == Some(MANAGED_BY_VALUE),
+        "runtime NetworkChaos metadata is outside the run scope"
+    );
+    ensure!(
+        resource.pointer("/spec/action").and_then(Value::as_str) == Some("partition")
+            && resource.pointer("/spec/direction").and_then(Value::as_str) == Some("both")
+            && resource.pointer("/spec/mode").and_then(Value::as_str) == Some("fixed")
+            && resource
+                .pointer("/spec/value")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<u32>().ok())
+                == Some(contract.expected_source_targets),
+        "runtime NetworkChaos does not match the fixed bidirectional partition plan"
+    );
+    validate_pod_selector(
+        resource
+            .pointer("/spec")
+            .context("NetworkChaos spec is missing")?,
+        contract.target_namespace,
+        contract.tenant,
+    )?;
+    let target = resource
+        .pointer("/spec/target")
+        .context("NetworkChaos target selector is missing")?;
+    ensure!(
+        target.get("mode").and_then(Value::as_str) == Some("all"),
+        "runtime NetworkChaos peer selector must use mode all"
+    );
+    validate_pod_selector(target, contract.target_namespace, contract.tenant)?;
+    ensure!(
+        chaos_condition_is_true(resource, "Selected")
+            && chaos_condition_is_true(resource, "AllInjected")
+            && !chaos_condition_is_true(resource, "AllRecovered"),
+        "runtime NetworkChaos is not selected and fully injected"
+    );
+    ensure!(
+        resource
+            .pointer("/status/experiment/desiredPhase")
+            .and_then(Value::as_str)
+            == Some("Run"),
+        "runtime NetworkChaos desired phase is not Run"
+    );
+    let records = resource
+        .pointer("/status/experiment/containerRecords")
+        .and_then(Value::as_array)
+        .context("runtime NetworkChaos has no per-target controller records")?;
+    let source_ids = injected_record_ids(records, ".")?;
+    let peer_ids = injected_record_ids(records, ".Target")?;
+    ensure!(
+        source_ids.len() == usize::try_from(contract.expected_source_targets)?,
+        "runtime NetworkChaos injected {} source targets, expected {}",
+        source_ids.len(),
+        contract.expected_source_targets
+    );
+    ensure!(
+        source_ids.is_subset(contract.candidate_pod_ids),
+        "runtime NetworkChaos selected a source target outside the proved Ready Pod set"
+    );
+    ensure!(
+        peer_ids == *contract.candidate_pod_ids,
+        "runtime NetworkChaos peer records do not cover the proved Ready Pod set"
+    );
+    Ok(source_ids)
+}
+
+fn validate_pod_selector(selector: &Value, namespace: &str, tenant: &str) -> Result<()> {
+    let namespaces = selector
+        .pointer("/selector/namespaces")
+        .and_then(Value::as_array)
+        .context("NetworkChaos selector.namespaces is missing")?;
+    ensure!(
+        namespaces.len() == 1 && namespaces[0].as_str() == Some(namespace),
+        "runtime NetworkChaos selector namespace does not match the target namespace"
+    );
+    ensure!(
+        selector
+            .pointer("/selector/labelSelectors/rustfs.tenant")
+            .and_then(Value::as_str)
+            == Some(tenant),
+        "runtime NetworkChaos selector tenant does not match the target tenant"
+    );
+    Ok(())
+}
+
+fn chaos_condition_is_true(resource: &Value, condition_type: &str) -> bool {
+    resource
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .is_some_and(|conditions| {
+            conditions.iter().any(|condition| {
+                condition.get("type").and_then(Value::as_str) == Some(condition_type)
+                    && condition.get("status").and_then(Value::as_str) == Some("True")
+            })
+        })
+}
+
+fn injected_record_ids(records: &[Value], selector_key: &str) -> Result<BTreeSet<String>> {
+    let matching = records
+        .iter()
+        .filter(|record| record.get("selectorKey").and_then(Value::as_str) == Some(selector_key))
+        .collect::<Vec<_>>();
+    ensure!(
+        matching.iter().all(|record| {
+            record.get("phase").and_then(Value::as_str) == Some("Injected")
+                && record
+                    .get("injectedCount")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|count| count > 0)
+        }),
+        "runtime NetworkChaos selector {selector_key:?} has a target without successful injection"
+    );
+    let ids = matching
+        .iter()
+        .map(|record| {
+            record
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .context("runtime NetworkChaos record is missing its target id")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    ensure!(
+        ids.len() == matching.len(),
+        "runtime NetworkChaos selector {selector_key:?} contains duplicate target records"
+    );
+    Ok(ids)
+}
 
 pub(crate) struct FaultApplyRequest<'a> {
     pub config: &'a FaultTestConfig,
@@ -1208,15 +1385,16 @@ spec:
 mod tests {
     use super::{
         FaultSpec, IoChaosAction, IoChaosSpec, IoLatencyParameters, NetworkChaosAction,
-        NetworkChaosSpec, NetworkDelayParameters, PodChaosAction, PodChaosSpec, StressChaosAction,
-        StressChaosSpec, build_fault_spec, runtime::chaos_experiment_is_active,
+        NetworkChaosSpec, NetworkDelayParameters, NetworkPartitionEvidenceContract, PodChaosAction,
+        PodChaosSpec, StressChaosAction, StressChaosSpec, build_fault_spec,
+        runtime::chaos_experiment_is_active, validate_network_partition_snapshot,
     };
     use crate::fault::config::FaultTestConfig;
     use crate::fault::plan::{
         FaultInjection, FaultInjectionParameters, FaultKind, FaultSelection, FaultTarget, IoMethod,
     };
     use crate::fault::scenarios::{FaultBackend, FaultScenario};
-    use std::time::Duration;
+    use std::{collections::BTreeSet, time::Duration};
 
     fn test_scenario(name: &str) -> FaultScenario {
         FaultScenario {
@@ -1408,6 +1586,89 @@ mod tests {
             .is_err(),
             "zero targets must be rejected"
         );
+    }
+
+    #[test]
+    fn network_partition_runtime_evidence_binds_injected_records() {
+        let candidates = [
+            "faults/rustfs-0",
+            "faults/rustfs-1",
+            "faults/rustfs-2",
+            "faults/rustfs-3",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+        let contract = NetworkPartitionEvidenceContract {
+            chaos_namespace: "chaos-mesh",
+            target_namespace: "faults",
+            tenant: "tenant-1",
+            run_id: "run-1",
+            scenario: "network-partition-write-quorum-loss",
+            expected_source_targets: 2,
+            candidate_pod_ids: &candidates,
+        };
+        let resource = serde_json::json!({
+            "apiVersion": "chaos-mesh.org/v1alpha1",
+            "kind": "NetworkChaos",
+            "metadata": {
+                "namespace": "chaos-mesh",
+                "labels": {
+                    "rustfs-fault-test/run-id": "run-1",
+                    "rustfs-fault-test/scenario": "network-partition-write-quorum-loss",
+                    "app.kubernetes.io/managed-by": "s3chaos"
+                }
+            },
+            "spec": {
+                "action": "partition",
+                "mode": "fixed",
+                "value": "2",
+                "selector": {
+                    "namespaces": ["faults"],
+                    "labelSelectors": {"rustfs.tenant": "tenant-1"}
+                },
+                "direction": "both",
+                "target": {
+                    "mode": "all",
+                    "selector": {
+                        "namespaces": ["faults"],
+                        "labelSelectors": {"rustfs.tenant": "tenant-1"}
+                    }
+                }
+            },
+            "status": {
+                "conditions": [
+                    {"type": "Selected", "status": "True"},
+                    {"type": "AllInjected", "status": "True"},
+                    {"type": "AllRecovered", "status": "False"}
+                ],
+                "experiment": {
+                    "desiredPhase": "Run",
+                    "containerRecords": [
+                        {"id": "faults/rustfs-0", "selectorKey": ".", "phase": "Injected", "injectedCount": 1},
+                        {"id": "faults/rustfs-1", "selectorKey": ".", "phase": "Injected", "injectedCount": 1},
+                        {"id": "faults/rustfs-0", "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1},
+                        {"id": "faults/rustfs-1", "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1},
+                        {"id": "faults/rustfs-2", "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1},
+                        {"id": "faults/rustfs-3", "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1}
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            validate_network_partition_snapshot(&resource, &contract).expect("runtime proof"),
+            ["faults/rustfs-0", "faults/rustfs-1"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        let mut missing_injection = resource.clone();
+        missing_injection["status"]["experiment"]["containerRecords"]
+            .as_array_mut()
+            .expect("records")
+            .remove(1);
+        assert!(validate_network_partition_snapshot(&missing_injection, &contract).is_err());
     }
 
     #[test]

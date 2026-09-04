@@ -31,12 +31,16 @@ use crate::{
         history::{
             ByteRange, DurabilityCohort, OperationKind, OperationOutcome, OperationRecord, Recorder,
         },
-        plan::{FaultInjection, FaultPlan, FaultPlanOptions, WRITE_QUORUM_LOSS_PARTITION_TARGETS},
+        plan::{FaultInjection, FaultPlan, FaultPlanOptions, FaultSelection},
         pods::{
             rustfs_pod_identities, rustfs_target_inventory, wait_for_rustfs_pod_deletion,
             wait_for_rustfs_pod_replacement,
         },
         preflight::{PreflightCheck, PreflightPhase, PreflightSummary, TargetProof},
+        quorum::{
+            ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape,
+            require_fresh_runtime_observation,
+        },
         reporting::{
             FailureSummary, FaultEvidence, FaultStatusSnapshot, PodIdentity, RunMetadata,
             write_checker_error, write_failure_summary, write_failure_summary_if_absent,
@@ -47,8 +51,8 @@ use crate::{
         },
         spec::FaultRunSpec,
         workload::{
-            ObjectSpec, S3WorkloadClient, WorkloadOperation, WorkloadPlan, sha256_hex,
-            wait_for_s3_endpoint,
+            ObjectSpec, S3WorkloadClient, StagedMultipartUpload, WorkloadOperation, WorkloadPlan,
+            sha256_hex, wait_for_s3_endpoint,
         },
     },
     framework::{
@@ -60,12 +64,13 @@ use crate::{
         port_forward::{PortForwardGuard, PortForwardSpec},
         resources, wait,
     },
+    rustfs::read_erasure_layout,
 };
 use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
 use kube::core::DynamicObject;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep as async_sleep;
 use uuid::Uuid;
@@ -322,56 +327,6 @@ async fn run_fault_case(
         "Tenant is Ready before fault injection",
         None,
     )?;
-    // Topology-conservation proof runs here, after the harness has created and
-    // readied its own Tenant, not in the pre-fixture backend preflight: the
-    // proof reads the live Tenant's pool geometry, which does not exist yet on
-    // a fresh/standalone run before prepare_fault_fixture.
-    let mut erasure_set_topology_proven = false;
-    if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
-        events.record(
-            "write-quorum-loss-topology-proof",
-            RunEventStatus::Started,
-            "proving the tenant matches a reference single-erasure-set topology",
-            None,
-        )?;
-        if let Err(error) = require_write_quorum_loss_topology(config) {
-            preflight_phases.push(PreflightPhase::new(
-                "write-quorum-loss-topology-proof",
-                vec![PreflightCheck::failed(
-                    "write_quorum_loss_topology",
-                    error.to_string(),
-                    crate::fault::reporting::ResponsibilityDomain::Environment,
-                )],
-            ));
-            write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
-            events
-                .record(
-                    "write-quorum-loss-topology-proof",
-                    RunEventStatus::Failed,
-                    error.to_string(),
-                    None,
-                )
-                .ok();
-            write_failure_summary(
-                collector,
-                scenario.case_name,
-                FailureSummary::new(
-                    &scenario.name,
-                    "write-quorum-loss-topology-proof",
-                    "test_or_environment",
-                    error.to_string(),
-                ),
-            )?;
-            return Err(error);
-        }
-        erasure_set_topology_proven = true;
-        events.record(
-            "write-quorum-loss-topology-proof",
-            RunEventStatus::Succeeded,
-            "tenant topology provably makes a two-server partition break write quorum",
-            None,
-        )?;
-    }
     events.record(
         "pod-stability-before-fault",
         RunEventStatus::Started,
@@ -654,6 +609,57 @@ async fn run_fault_case(
         "pre-fault objects were written and verified",
         Some(serde_json::json!({ "objects": prefilled.len() })),
     )?;
+    let staged_multipart_uploads = if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+    {
+        events.record(
+            "multipart-stage",
+            RunEventStatus::Started,
+            "creating multipart uploads and uploading parts before quorum loss",
+            None,
+        )?;
+        let staged = match stage_write_quorum_multipart_uploads(
+            &s3,
+            &history,
+            &run_id,
+            &workload_plan,
+            scenario.prefill_count(),
+            scenario.mixed_workload_count(),
+        )
+        .await
+        {
+            Ok(staged) => staged,
+            Err(error) => {
+                events
+                    .record(
+                        "multipart-stage",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "multipart-stage",
+                        "product_or_environment",
+                        error.to_string(),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
+        events.record(
+            "multipart-stage",
+            RunEventStatus::Succeeded,
+            "multipart uploads are ready for completion during quorum loss",
+            Some(serde_json::json!({ "uploads": staged.len() })),
+        )?;
+        Some(staged)
+    } else {
+        None
+    };
     events.record(
         "target-preflight",
         RunEventStatus::Started,
@@ -699,8 +705,71 @@ async fn run_fault_case(
     let pods_before = target_inventory.identities;
     let mut target_proof = TargetProof::from_plan(config, scenario, spec, plan, &run_id)
         .with_resolved_pod_proofs(target_inventory.pod_proofs);
-    if erasure_set_topology_proven {
-        target_proof = target_proof.with_erasure_set_topology_proven();
+    let mut topology_observed_at_ms = None;
+    if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+        events.record(
+            "write-quorum-loss-topology-proof",
+            RunEventStatus::Started,
+            "reading RustFS runtime erasure geometry immediately before fault activation",
+            None,
+        )?;
+        let target_servers = write_quorum_partition_target_count(plan)?;
+        let observation = match require_write_quorum_loss_topology(
+            config,
+            &endpoint,
+            access_key,
+            secret_key,
+            target_servers,
+            &pods_before,
+        )
+        .await
+        {
+            Ok(observation) => observation,
+            Err(error) => {
+                preflight_phases.push(PreflightPhase::new(
+                    "write-quorum-loss-topology-proof",
+                    vec![PreflightCheck::failed(
+                        "write_quorum_loss_topology",
+                        error.to_string(),
+                        crate::fault::reporting::ResponsibilityDomain::Environment,
+                    )],
+                ));
+                write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+                events
+                    .record(
+                        "write-quorum-loss-topology-proof",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "write-quorum-loss-topology-proof",
+                        "test_or_environment",
+                        error.to_string(),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
+        events.record(
+            "write-quorum-loss-topology-proof",
+            RunEventStatus::Succeeded,
+            "fresh, fully-online RustFS runtime geometry establishes the declared quorum boundary",
+            Some(serde_json::to_value(&observation)?),
+        )?;
+        topology_observed_at_ms = Some(observation.observed_at_ms);
+        target_proof = target_proof.with_erasure_set_topology_proven(
+            observation.shape,
+            observation.health,
+            observation.membership,
+            observation.deployment_id,
+            observation.observed_at_ms,
+        )?;
     }
     collector.write_text(
         scenario.case_name,
@@ -749,6 +818,30 @@ async fn run_fault_case(
         })),
     )?;
     let fault_apply_started_at_ms = now_ms();
+    if let Some(observed_at_ms) = topology_observed_at_ms
+        && let Err(error) =
+            require_fresh_runtime_observation(observed_at_ms, fault_apply_started_at_ms)
+    {
+        events
+            .record(
+                "fault-apply",
+                RunEventStatus::Failed,
+                error.to_string(),
+                None,
+            )
+            .ok();
+        write_failure_summary(
+            collector,
+            scenario.case_name,
+            FailureSummary::new(
+                &scenario.name,
+                "fault-apply",
+                "test_or_environment",
+                error.to_string(),
+            ),
+        )?;
+        return Err(error);
+    }
     let mut fault = match AppliedFaults::apply(config, collector, scenario, plan, &run_id) {
         Ok(fault) => fault,
         Err(error) => {
@@ -851,6 +944,48 @@ async fn run_fault_case(
             return Err(error);
         }
     };
+    let (pods_at_fault_activation, active_partition_targets) =
+        if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+            match require_active_write_quorum_partition(
+                config,
+                &run_id,
+                plan,
+                &pods_before,
+                &target_proof,
+                &active_snapshots,
+            ) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    events
+                        .record(
+                            "fault-snapshot-active",
+                            RunEventStatus::Failed,
+                            error.to_string(),
+                            None,
+                        )
+                        .ok();
+                    collect_fault_artifacts(
+                        collector,
+                        scenario.case_name,
+                        &fault,
+                        "active-target-evidence-failed",
+                    )?;
+                    write_failure_summary(
+                        collector,
+                        scenario.case_name,
+                        FailureSummary::new(
+                            &scenario.name,
+                            "fault-snapshot-active",
+                            "environment_or_fault_backend",
+                            error.to_string(),
+                        ),
+                    )?;
+                    return Err(error);
+                }
+            }
+        } else {
+            (Vec::new(), BTreeSet::new())
+        };
     events.record(
         "fault-snapshot-active",
         RunEventStatus::Succeeded,
@@ -999,6 +1134,7 @@ async fn run_fault_case(
         scenario.prefill_count(),
         scenario.mixed_workload_count(),
         config.workload_ranged_get_percent,
+        staged_multipart_uploads.as_ref(),
     )
     .await
     {
@@ -1040,10 +1176,17 @@ async fn run_fault_case(
     )?;
     let require_client_disruption =
         config.require_client_disruption || spec.impact_policy.requires_client_disruption();
-    if let Err(error) = workload
+    let fault_evidence_result = workload
         .summary
         .require_fault_evidence(require_client_disruption)
-    {
+        .and_then(|()| {
+            if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+                workload.summary.require_write_quorum_loss_effect()
+            } else {
+                Ok(())
+            }
+        });
+    if let Err(error) = fault_evidence_result {
         events
             .record(
                 "fault-evidence",
@@ -1144,6 +1287,56 @@ async fn run_fault_case(
             )?;
             return Err(error);
         }
+    };
+    let pods_at_workload_snapshot = if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+    {
+        let validation = require_active_write_quorum_partition(
+            config,
+            &run_id,
+            plan,
+            &pods_before,
+            &target_proof,
+            &workload_snapshots,
+        )
+        .and_then(|(pods, workload_partition_targets)| {
+            ensure!(
+                workload_partition_targets == active_partition_targets,
+                "NetworkChaos source targets changed while the quorum workload was running"
+            );
+            Ok(pods)
+        });
+        match validation {
+            Ok(pods) => pods,
+            Err(error) => {
+                events
+                    .record(
+                        "fault-snapshot-after-workload",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                collect_fault_artifacts(
+                    collector,
+                    scenario.case_name,
+                    &fault,
+                    "workload-target-evidence-failed",
+                )?;
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "fault-snapshot-after-workload",
+                        "environment_or_fault_backend",
+                        error.to_string(),
+                    ),
+                )?;
+                return Err(error);
+            }
+        }
+    } else {
+        Vec::new()
     };
     events.record(
         "fault-snapshot-after-workload",
@@ -1431,6 +1624,8 @@ async fn run_fault_case(
         client_disruptions: workload.summary.disrupted(),
         workload_plan: workload_plan.clone(),
         pods_before: pods_before.clone(),
+        pods_at_fault_activation: pods_at_fault_activation.clone(),
+        pods_at_workload_snapshot: pods_at_workload_snapshot.clone(),
         pods_after: pods_after.clone(),
         active_snapshots: active_snapshots.clone(),
         workload_snapshots: workload_snapshots.clone(),
@@ -1719,6 +1914,8 @@ async fn run_fault_case(
         client_disruptions: workload.summary.disrupted(),
         workload_plan,
         pods_before,
+        pods_at_fault_activation,
+        pods_at_workload_snapshot,
         pods_after,
         active_snapshots,
         workload_snapshots,
@@ -1902,77 +2099,276 @@ fn require_fault_backends(config: &FaultTestConfig, plan: &FaultPlan) -> Result<
     {
         host::validate_config(config, fault.kind())?;
     }
-    // The write-quorum-loss topology proof deliberately does NOT run here: this
-    // preflight runs before prepare_fault_fixture creates the Tenant, so
-    // reading the Tenant's pool geometry would NotFound on a fresh run. The
-    // proof runs right after tenant readiness instead (see run_fault_case).
+    // Runtime erasure geometry is read after the fixture and S3 access path are
+    // ready; neither exists yet during this static backend preflight.
     Ok(())
 }
 
-/// Topology-conservation proof for the write-quorum-loss partition.
-///
-/// The scenario's FixedTargets(2) only means "write quorum breaks, read quorum
-/// survives" on the reference tenant shapes: a single pool of 4 servers with
-/// 1 or 2 volumes per server (4 or 8 drives). RustFS lays both out as a single
-/// erasure set with data == parity (4 drives -> EC 2+2, 8 drives -> EC 4+4),
-/// where write quorum is data+1 and read quorum is data. Isolating 2 of 4
-/// servers then provably removes exactly half the drives of that one set:
-/// write quorum becomes unreachable while read quorum can still be met by the
-/// surviving half — and every pod is in the same set, so no same-erasure-set
-/// resolution is needed. On any other shape the same count could be a no-op
-/// (more servers) or a full outage (fewer), so we fail closed instead of
-/// running a scenario whose oracle no longer matches its name. Replacing this
-/// with a real erasure-set proof (admin cluster snapshot) generalizes it later.
-fn require_write_quorum_loss_topology(config: &FaultTestConfig) -> Result<()> {
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservedErasureSet {
+    source: &'static str,
+    deployment_id: String,
+    shape: ErasureSetShape,
+    health: ErasureSetHealth,
+    membership: ErasureSetMembership,
+    observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TenantPoolGeometry {
+    server_count: usize,
+    volumes_per_server: u64,
+}
+
+async fn require_write_quorum_loss_topology(
+    config: &FaultTestConfig,
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    target_servers: u32,
+    pods: &[PodIdentity],
+) -> Result<ObservedErasureSet> {
+    // Age the combined proof from its oldest input: Tenant geometry is read
+    // before the admin layout, so a slow second read must not refresh the
+    // apparent age of the first observation.
+    let observed_at_ms = now_ms();
     let cluster = &config.cluster;
     let output = Kubectl::new(cluster)
         .namespaced(&cluster.test_namespace)
-        .command([
-            "get",
-            "tenant",
-            cluster.tenant_name.as_str(),
-            "-o",
-            "jsonpath={.spec.pools[*].persistence.volumesPerServer}",
-        ])
+        .command(["get", "tenant", cluster.tenant_name.as_str(), "-o", "json"])
         .run_checked()
-        .context("reading tenant volumesPerServer for the write-quorum-loss topology proof")?;
-    let raw = output.stdout.trim().to_string();
-    let volumes: Vec<u64> = raw
-        .split_whitespace()
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .with_context(|| format!("tenant volumesPerServer must be numeric, got {value:?}"))
-        })
-        .collect::<Result<_>>()?;
-    write_quorum_loss_topology_shape(config.expected_rustfs_pod_count, &volumes, &raw)
+        .context("reading tenant pool geometry for the write-quorum-loss topology proof")?;
+    let tenant: serde_json::Value =
+        serde_json::from_str(&output.stdout).context("decoding tenant topology JSON")?;
+    let tenant = tenant_single_pool_geometry(&tenant, config.expected_rustfs_pod_count)?;
+    let runtime = read_erasure_layout(endpoint, "us-east-1", access_key, secret_key)
+        .await
+        .context("reading RustFS admin erasure layout")?;
+    let shape = ErasureSetShape::from_runtime_single_set(
+        tenant.server_count,
+        tenant.volumes_per_server,
+        &runtime.total_sets,
+        &runtime.drives_per_set,
+        runtime.standard_parity,
+    )
+    .context("RustFS runtime does not report a single erasure set matching the Tenant")?;
+    let health = ErasureSetHealth::from_runtime(
+        shape.total_shards,
+        runtime.online_drives,
+        runtime.offline_drives,
+        runtime.unknown_drives,
+    )
+    .context("RustFS runtime erasure set is not fully online before fault injection")?;
+    let membership = runtime_single_set_membership(&runtime, &shape, pods)?;
+    shape.require_server_partition_boundary(target_servers)?;
+    Ok(ObservedErasureSet {
+        source: "rustfs-admin-server-info",
+        deployment_id: runtime.deployment_id,
+        shape,
+        health,
+        membership,
+        observed_at_ms,
+    })
 }
 
-/// Pure shape predicate behind the write-quorum-loss topology proof: accepts
-/// only the reference single-pool 4-server tenant with 1 or 2 volumes per
-/// server. Kept free of kubectl I/O so the acceptance matrix is unit-testable.
-fn write_quorum_loss_topology_shape(pod_count: usize, volumes: &[u64], raw: &str) -> Result<()> {
-    const EXPECTED_SERVERS: usize = 4;
-    const ACCEPTED_VOLUMES_PER_SERVER: [u64; 2] = [1, 2];
+fn runtime_single_set_membership(
+    runtime: &crate::rustfs::RustfsErasureLayout,
+    shape: &ErasureSetShape,
+    pods: &[PodIdentity],
+) -> Result<ErasureSetMembership> {
+    let candidate_pods = pods
+        .iter()
+        .map(|pod| pod.name.as_str())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        candidate_pods.len() == pods.len()
+            && candidate_pods.iter().all(|name| !name.trim().is_empty()),
+        "runtime topology proof requires unique non-empty candidate Pod names"
+    );
 
+    let members = runtime
+        .servers
+        .iter()
+        .map(|server| {
+            let pod_name = runtime_server_pod_name(&server.endpoint, &candidate_pods)?;
+            let shard_ids = server
+                .drives
+                .iter()
+                .map(|drive| {
+                    ensure!(
+                        drive.pool_index == i32::try_from(shape.pool_index)?
+                            && drive.set_index == i32::try_from(shape.set_index)?,
+                        "RustFS runtime drive {:?} for Pod {pod_name:?} is outside the proven pool/set",
+                        drive.uuid
+                    );
+                    ensure!(
+                        !drive.uuid.trim().is_empty(),
+                        "RustFS runtime drive for Pod {pod_name:?} has an empty UUID"
+                    );
+                    Ok(drive.uuid.clone())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ErasureSetMember {
+                pod_name,
+                server_endpoint: server.endpoint.clone(),
+                shard_ids,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ErasureSetMembership::from_runtime(shape, members)
+        .context("RustFS server/drive membership does not match the proven erasure-set shape")
+}
+
+fn runtime_server_pod_name(endpoint: &str, candidate_pods: &BTreeSet<&str>) -> Result<String> {
+    let endpoint_with_scheme = if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+    let url = reqwest::Url::parse(&endpoint_with_scheme)
+        .with_context(|| format!("parse RustFS server endpoint {endpoint:?}"))?;
+    let host = url
+        .host_str()
+        .with_context(|| format!("RustFS server endpoint {endpoint:?} has no host"))?;
+    let matching_pods = candidate_pods
+        .iter()
+        .filter(|pod| host == **pod || host.starts_with(&format!("{}.", pod)))
+        .copied()
+        .collect::<Vec<_>>();
     ensure!(
-        pod_count == EXPECTED_SERVERS,
-        "network-partition-write-quorum-loss requires the reference 4-server tenant \
-         (RUSTFS_POD_COUNT={}); partitioning {} of {} servers does not provably break \
-         write quorum on other shapes",
-        EXPECTED_SERVERS,
-        WRITE_QUORUM_LOSS_PARTITION_TARGETS,
-        pod_count,
+        matching_pods.len() == 1,
+        "RustFS server endpoint {endpoint:?} does not identify exactly one resolved Pod"
     );
+    Ok(matching_pods[0].to_string())
+}
+
+fn tenant_single_pool_geometry(
+    tenant: &serde_json::Value,
+    expected_server_count: usize,
+) -> Result<TenantPoolGeometry> {
+    let pools = tenant
+        .pointer("/spec/pools")
+        .and_then(serde_json::Value::as_array)
+        .context("tenant spec.pools must be an array")?;
     ensure!(
-        volumes.len() == 1 && ACCEPTED_VOLUMES_PER_SERVER.contains(&volumes[0]),
-        "network-partition-write-quorum-loss requires the reference single-pool tenant with \
-         volumesPerServer of 1 or 2 (4 or 8 drives; both lay out as one erasure set with \
-         data == parity, so isolating 2 of 4 servers removes exactly half the drives); \
-         found volumesPerServer={raw:?} — on that shape a 2-of-4 partition does not provably \
-         break write quorum, so the run is rejected instead of producing a misleading verdict",
+        pools.len() == 1,
+        "quorum topology proof requires exactly one tenant pool, found {}",
+        pools.len()
     );
-    Ok(())
+    let pool = &pools[0];
+    let server_count = pool
+        .get("servers")
+        .and_then(serde_json::Value::as_u64)
+        .context("tenant spec.pools[0].servers must be a positive integer")?;
+    let server_count = usize::try_from(server_count)?;
+    ensure!(
+        server_count == expected_server_count,
+        "tenant pool server count {server_count} does not match configured expected RustFS pod count {expected_server_count}"
+    );
+    let volumes_per_server = pool
+        .pointer("/persistence/volumesPerServer")
+        .and_then(serde_json::Value::as_u64)
+        .context("tenant spec.pools[0].persistence.volumesPerServer must be a positive integer")?;
+    Ok(TenantPoolGeometry {
+        server_count,
+        volumes_per_server,
+    })
+}
+
+fn write_quorum_partition_target_count(plan: &FaultPlan) -> Result<u32> {
+    let [fault] = plan.faults() else {
+        bail!("write-quorum-loss topology proof requires exactly one planned fault")
+    };
+    match fault.selection() {
+        FaultSelection::FixedTargets(count) => Ok(count),
+        FaultSelection::Percent(_) => {
+            bail!("write-quorum-loss topology proof requires a fixed target count")
+        }
+    }
+}
+
+fn require_active_write_quorum_partition(
+    config: &FaultTestConfig,
+    run_id: &str,
+    plan: &FaultPlan,
+    pods_before: &[PodIdentity],
+    target_proof: &TargetProof,
+    snapshots: &[FaultStatusSnapshot],
+) -> Result<(Vec<PodIdentity>, BTreeSet<String>)> {
+    ensure!(
+        snapshots.len() == 1,
+        "write-quorum-loss plan requires exactly one runtime fault snapshot"
+    );
+    let pods_active = rustfs_pod_identities(&config.cluster)
+        .context("resolve RustFS Pod identities while NetworkChaos is active")?;
+    let identity_set = |pods: &[PodIdentity]| {
+        pods.iter()
+            .map(|pod| (pod.name.clone(), pod.uid.clone()))
+            .collect::<BTreeSet<_>>()
+    };
+    ensure!(
+        identity_set(&pods_active) == identity_set(pods_before),
+        "RustFS Pod identities changed between target proof and NetworkChaos activation"
+    );
+    let candidate_pod_ids = pods_active
+        .iter()
+        .map(|pod| format!("{}/{}", config.cluster.test_namespace, pod.name))
+        .collect::<BTreeSet<_>>();
+    let snapshot = &snapshots[0];
+    ensure!(
+        snapshot.resource_kind.as_deref() == Some("networkchaos"),
+        "write-quorum-loss runtime snapshot is not a NetworkChaos resource"
+    );
+    let resource = snapshot
+        .chaos_status
+        .as_ref()
+        .context("write-quorum-loss runtime snapshot has no NetworkChaos object")?;
+    ensure!(
+        snapshot.resource_name.as_deref()
+            == resource
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str),
+        "write-quorum-loss runtime snapshot resource name is inconsistent"
+    );
+    let targets = chaos_mesh::validate_network_partition_snapshot(
+        resource,
+        &chaos_mesh::NetworkPartitionEvidenceContract {
+            chaos_namespace: &config.chaos_namespace,
+            target_namespace: &config.cluster.test_namespace,
+            tenant: &config.cluster.tenant_name,
+            run_id,
+            scenario: &plan.scenario,
+            expected_source_targets: write_quorum_partition_target_count(plan)?,
+            candidate_pod_ids: &candidate_pod_ids,
+        },
+    )?;
+    let erasure_set = target_proof
+        .faults
+        .iter()
+        .find_map(|fault| fault.erasure_set.as_ref())
+        .context("target proof has no runtime erasure-set evidence")?;
+    let shape = erasure_set
+        .shape
+        .as_ref()
+        .context("target proof runtime erasure-set evidence has no shape")?;
+    let membership = erasure_set
+        .membership
+        .as_ref()
+        .context("target proof runtime erasure-set evidence has no server/drive membership")?;
+    let namespace_prefix = format!("{}/", config.cluster.test_namespace);
+    let selected_pods = targets
+        .iter()
+        .map(|target| {
+            target.strip_prefix(&namespace_prefix).with_context(|| {
+                format!("NetworkChaos selected target {target:?} is outside the test namespace")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    membership
+        .require_selected_boundary(shape, selected_pods)
+        .context("actual NetworkChaos source targets do not cross the write-quorum boundary")?;
+    Ok((pods_active, targets))
 }
 
 fn require_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Result<()> {
@@ -3363,6 +3759,47 @@ async fn verify_prefill_object(
     )
 }
 
+async fn stage_write_quorum_multipart_uploads(
+    s3: &S3WorkloadClient,
+    history: &Recorder,
+    run_id: &str,
+    plan: &WorkloadPlan,
+    start_index: usize,
+    count: usize,
+) -> Result<BTreeMap<usize, StagedMultipartUpload>> {
+    let tasks = multipart_workload_indices(plan, start_index, count)
+        .into_iter()
+        .map(|index| {
+            let s3 = s3.clone();
+            let history = history.clone();
+            let run_id = run_id.to_string();
+            let object = ObjectSpec::prepare_seeded(&run_id, index, plan.size_at(index), plan.seed);
+            async move {
+                let staged = s3
+                    .stage_multipart_object(object, &history)
+                    .await
+                    .with_context(|| format!("stage multipart workload object at index {index}"))?;
+                Ok::<_, anyhow::Error>((index, staged))
+            }
+        });
+    let staged = stream::iter(tasks)
+        .buffer_unordered(plan.concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    ensure!(
+        !staged.is_empty(),
+        "write-quorum-loss workload contains no multipart completion operation"
+    );
+    Ok(staged.into_iter().collect())
+}
+
+fn multipart_workload_indices(plan: &WorkloadPlan, start_index: usize, count: usize) -> Vec<usize> {
+    (0..count)
+        .filter(|offset| plan.operation_mix.operation_at(*offset) == WorkloadOperation::Multipart)
+        .map(|offset| start_index + offset)
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_mixed_workload(
     s3: &S3WorkloadClient,
@@ -3373,6 +3810,7 @@ async fn run_mixed_workload(
     start_index: usize,
     count: usize,
     ranged_get_percent: u8,
+    staged_multipart_uploads: Option<&BTreeMap<usize, StagedMultipartUpload>>,
 ) -> Result<MixedWorkloadResult> {
     let tasks = (0..count).map(|offset| {
         let s3 = s3.clone();
@@ -3382,9 +3820,22 @@ async fn run_mixed_workload(
         let size_bytes = plan.size_at(index);
         let seed = plan.seed;
         let existing = prefilled[plan.existing_object_offset(offset, prefilled.len())].clone();
+        let operation = plan.operation_mix.operation_at(offset);
+        let staged_multipart = if operation == WorkloadOperation::Multipart {
+            staged_multipart_uploads.map(|uploads| {
+                uploads
+                    .get(&index)
+                    .cloned()
+                    .with_context(|| format!("missing staged multipart upload for index {index}"))
+            })
+        } else {
+            None
+        }
+        .transpose();
         async move {
+            let staged_multipart = staged_multipart?;
             let mut result = MixedTaskResult::new(index);
-            match plan.operation_mix.operation_at(offset) {
+            match operation {
                 WorkloadOperation::Put => {
                     let object = ObjectSpec::prepare_seeded(&run_id, index, size_bytes, seed);
                     let spec = object.spec.clone();
@@ -3445,7 +3896,13 @@ async fn run_mixed_workload(
                 WorkloadOperation::Multipart => {
                     let object = ObjectSpec::prepare_seeded(&run_id, index, size_bytes, seed);
                     let spec = object.spec.clone();
-                    let complete_outcome = s3.complete_multipart_object(&object, &history).await?;
+                    let complete_outcome = match staged_multipart {
+                        Some(staged) => {
+                            s3.complete_staged_multipart_object(staged, &history)
+                                .await?
+                        }
+                        None => s3.complete_multipart_object(&object, &history).await?,
+                    };
                     result.multipart_completes.push(complete_outcome);
                     if complete_outcome == OperationOutcome::Ok {
                         result
@@ -3893,6 +4350,27 @@ impl WorkloadSummary {
         Ok(())
     }
 
+    fn require_write_quorum_loss_effect(&self) -> Result<()> {
+        ensure!(
+            self.puts.total() > 0
+                && self.deletes.total() > 0
+                && self.multipart_completes.total() > 0,
+            "write-quorum-loss workload did not exercise PUT, DELETE, and multipart completion"
+        );
+        let acknowledged_mutations = self.puts.ok + self.deletes.ok + self.multipart_completes.ok;
+        ensure!(
+            acknowledged_mutations == 0,
+            "write-quorum-loss workload observed {acknowledged_mutations} successfully acknowledged PUT, DELETE, or multipart completion operations"
+        );
+        let disrupted_mutations =
+            self.puts.disrupted() + self.deletes.disrupted() + self.multipart_completes.disrupted();
+        ensure!(
+            disrupted_mutations > 0,
+            "write-quorum-loss workload observed no disrupted mutation operation"
+        );
+        Ok(())
+    }
+
     fn disrupted(&self) -> usize {
         self.puts.disrupted()
             + self.gets.disrupted()
@@ -3968,11 +4446,16 @@ mod tests {
         RecommitAttempt, RecommitReport, TargetPodRecoveryEvidence, WorkloadSummary, bucket_name,
         chaos_artifact_name, chaos_daemon_pods_from_json, chaos_manifest_artifact_name,
         chaos_resource_name_suffix, finalizers_from_resource, iochaos_finalizer_patch_allowed,
-        podiochaos_recovery_evidence, resource_has_deletion_timestamp, resource_label_matches,
-        stable_pod_fingerprint, target_pods_from_json, unmount_success_log_lines, warp_bucket_name,
-        write_quorum_loss_topology_shape,
+        multipart_workload_indices, podiochaos_recovery_evidence, resource_has_deletion_timestamp,
+        resource_label_matches, runtime_server_pod_name, runtime_single_set_membership,
+        stable_pod_fingerprint, target_pods_from_json, tenant_single_pool_geometry,
+        unmount_success_log_lines, warp_bucket_name,
     };
     use crate::fault::history::{ByteRange, OperationOutcome, OperationRecord};
+    use crate::{
+        fault::{quorum::ErasureSetShape, reporting::PodIdentity},
+        rustfs::{RustfsDriveLayout, RustfsErasureLayout, RustfsServerLayout},
+    };
 
     /// The ranged-GET sampler must be a pure function of (seed, index): zero
     /// percent and tiny objects never sample, derived ranges always stay in
@@ -4414,6 +4897,42 @@ mod tests {
     }
 
     #[test]
+    fn write_quorum_loss_rejects_any_acknowledged_mutation() {
+        let mut summary = WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80));
+        summary.puts.record(OperationOutcome::Failed);
+        summary.deletes.record(OperationOutcome::Timeout);
+        summary
+            .multipart_completes
+            .record(OperationOutcome::Unknown);
+        assert!(summary.require_write_quorum_loss_effect().is_ok());
+
+        summary.puts.record(OperationOutcome::Ok);
+        assert!(summary.require_write_quorum_loss_effect().is_err());
+
+        let mut read_only_disruption = WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80));
+        read_only_disruption.puts.record(OperationOutcome::NotFound);
+        read_only_disruption
+            .deletes
+            .record(OperationOutcome::NotFound);
+        read_only_disruption
+            .multipart_completes
+            .record(OperationOutcome::NotFound);
+        read_only_disruption.gets.record(OperationOutcome::Timeout);
+        assert_eq!(read_only_disruption.disrupted(), 1);
+        assert!(
+            read_only_disruption
+                .require_write_quorum_loss_effect()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn quorum_workload_stages_every_planned_multipart_completion() {
+        let plan = WorkloadPlan::seeded(42, 24, 4);
+        assert_eq!(multipart_workload_indices(&plan, 12, 12), vec![17, 23]);
+    }
+
+    #[test]
     fn crash_window_evidence_selects_the_latest_versioned_mutation_ack() {
         let records = [
             serde_json::from_value::<OperationRecord>(json!({
@@ -4568,19 +5087,95 @@ mod tests {
     }
 
     #[test]
-    fn write_quorum_loss_topology_shape_accepts_only_reference_shapes() {
-        assert!(write_quorum_loss_topology_shape(4, &[1], "1").is_ok());
-        assert!(write_quorum_loss_topology_shape(4, &[2], "2").is_ok());
+    fn tenant_geometry_requires_one_pool_and_matches_configured_server_count() {
+        let tenant = |servers, volumes_per_server| {
+            serde_json::json!({
+                "spec": {
+                    "pools": [{
+                        "servers": servers,
+                        "persistence": { "volumesPerServer": volumes_per_server }
+                    }]
+                }
+            })
+        };
 
-        // Wrong server count: partitioning 2 of N != 4 proves nothing.
-        assert!(write_quorum_loss_topology_shape(5, &[1], "1").is_err());
-        assert!(write_quorum_loss_topology_shape(3, &[1], "1").is_err());
-        // Multi-pool tenants are not the reference single-erasure-set layout.
-        assert!(write_quorum_loss_topology_shape(4, &[1, 2], "1 2").is_err());
-        // Absent volumesPerServer must fail closed, not default.
-        assert!(write_quorum_loss_topology_shape(4, &[], "").is_err());
-        // 16 drives resolve to EC 12+4, where a 2-server partition does not
-        // break write quorum.
-        assert!(write_quorum_loss_topology_shape(4, &[4], "4").is_err());
+        assert_eq!(
+            tenant_single_pool_geometry(&tenant(4, 1), 4).expect("tenant geometry"),
+            super::TenantPoolGeometry {
+                server_count: 4,
+                volumes_per_server: 1,
+            }
+        );
+        assert_eq!(
+            tenant_single_pool_geometry(&tenant(4, 2), 4).expect("tenant geometry"),
+            super::TenantPoolGeometry {
+                server_count: 4,
+                volumes_per_server: 2,
+            }
+        );
+
+        // Config/live disagreement cannot be treated as proof.
+        assert!(tenant_single_pool_geometry(&tenant(4, 1), 5).is_err());
+        // Multi-pool and incomplete Tenant resources fail closed.
+        let multi_pool = serde_json::json!({
+            "spec": {
+                "pools": [
+                    {"servers": 4, "persistence": {"volumesPerServer": 1}},
+                    {"servers": 4, "persistence": {"volumesPerServer": 1}}
+                ]
+            }
+        });
+        assert!(tenant_single_pool_geometry(&multi_pool, 4).is_err());
+        assert!(tenant_single_pool_geometry(&serde_json::json!({"spec": {}}), 4).is_err());
+    }
+
+    #[test]
+    fn runtime_membership_resolves_server_endpoints_to_pods_and_drives() {
+        let shape = ErasureSetShape::from_runtime_single_set(4, 2, &[1], &[8], 4).expect("shape");
+        let pods = (0..4)
+            .map(|index| PodIdentity {
+                name: format!("rustfs-{index}"),
+                uid: format!("uid-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let servers = (0..4)
+            .map(|index| RustfsServerLayout {
+                endpoint: format!("http://rustfs-{index}.rustfs.test.svc:9000"),
+                drives: (0..2)
+                    .map(|drive| RustfsDriveLayout {
+                        uuid: format!("drive-{index}-{drive}"),
+                        state: "ok".to_string(),
+                        pool_index: 0,
+                        set_index: 0,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let runtime = RustfsErasureLayout {
+            deployment_id: "deployment-1".to_string(),
+            standard_parity: 4,
+            total_sets: vec![1],
+            drives_per_set: vec![8],
+            online_drives: 8,
+            offline_drives: 0,
+            unknown_drives: 0,
+            servers,
+        };
+
+        let membership =
+            runtime_single_set_membership(&runtime, &shape, &pods).expect("membership");
+        assert_eq!(membership.members.len(), 4);
+        assert!(
+            membership
+                .require_selected_boundary(&shape, ["rustfs-0", "rustfs-1"])
+                .is_ok()
+        );
+
+        let candidates = pods.iter().map(|pod| pod.name.as_str()).collect();
+        assert_eq!(
+            runtime_server_pod_name("rustfs-0.rustfs.test.svc:9000", &candidates)
+                .expect("pod name"),
+            "rustfs-0"
+        );
     }
 }
