@@ -67,8 +67,8 @@ enum DmSuspendMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DmTransitionPolicy {
-    Apply,
+enum DmTransitionPolicy<'a> {
+    Apply { recovery_table: &'a str },
     Rollback,
 }
 
@@ -892,13 +892,21 @@ pub fn apply_dm_flakey(
     };
     let initial_state = <DmFlakeyGuard as DmTransitionPort>::observe(&mut guard)
         .context("observe device-mapper state immediately before fault apply")?;
-    require_transition_initial_state(DmTransitionPolicy::Apply, &initial_state)?;
+    let proven_recovery_table = guard.recovery_table.clone();
+    require_transition_initial_state(
+        DmTransitionPolicy::Apply {
+            recovery_table: &proven_recovery_table,
+        },
+        &initial_state,
+    )?;
     guard.mutation_lease.set_phase(HostMutationPhase::Active)?;
     guard.fault_applied = true;
     guard.transition_to_table_from_observed(
         &guard.fault_table.clone(),
         suspend_mode,
-        DmTransitionPolicy::Apply,
+        DmTransitionPolicy::Apply {
+            recovery_table: &proven_recovery_table,
+        },
         initial_state,
     )?;
     let active = guard.snapshot("active")?;
@@ -1277,7 +1285,7 @@ impl DmFlakeyGuard {
         &mut self,
         table: &str,
         mode: DmSuspendMode,
-        policy: DmTransitionPolicy,
+        policy: DmTransitionPolicy<'_>,
     ) -> Result<()> {
         transition_dm_table(self, table, mode, policy)
     }
@@ -1286,7 +1294,7 @@ impl DmFlakeyGuard {
         &mut self,
         table: &str,
         mode: DmSuspendMode,
-        policy: DmTransitionPolicy,
+        policy: DmTransitionPolicy<'_>,
         initial: DmObservedState,
     ) -> Result<()> {
         transition_dm_table_from_observed(self, table, mode, policy, initial)
@@ -1813,7 +1821,15 @@ fn classify_exact_mountpoint(
     output: &CommandOutput,
 ) -> Result<DmMountState> {
     match output.code {
-        Some(1) => Ok(DmMountState::Unmounted),
+        Some(1) if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() => {
+            Ok(DmMountState::Unmounted)
+        }
+        Some(1) => bail!(
+            "findmnt did not provide clean no-match evidence for exact mountpoint {:?}: stdout={}, stderr={}",
+            expected_mount_path,
+            output.stdout,
+            output.stderr
+        ),
         Some(0) => {
             let targets = output
                 .stdout
@@ -1847,13 +1863,19 @@ fn classify_exact_mountpoint(
 }
 
 fn require_transition_initial_state(
-    policy: DmTransitionPolicy,
+    policy: DmTransitionPolicy<'_>,
     initial: &DmObservedState,
 ) -> Result<()> {
-    if policy == DmTransitionPolicy::Apply {
+    if let DmTransitionPolicy::Apply { recovery_table } = policy {
         ensure!(
             !initial.suspended,
             "refusing device-mapper fault apply because the target was already suspended"
+        );
+        ensure!(
+            normalize_dm_table(&initial.active_table) == normalize_dm_table(recovery_table),
+            "refusing device-mapper fault apply because the active table drifted from the proven recovery table; active={:?}, recovery={:?}",
+            initial.active_table,
+            recovery_table
         );
     }
     Ok(())
@@ -1863,7 +1885,7 @@ fn transition_dm_table(
     port: &mut impl DmTransitionPort,
     requested_table: &str,
     mode: DmSuspendMode,
-    policy: DmTransitionPolicy,
+    policy: DmTransitionPolicy<'_>,
 ) -> Result<()> {
     let initial = port.observe().context("observe device-mapper state")?;
     transition_dm_table_from_observed(port, requested_table, mode, policy, initial)
@@ -1873,7 +1895,7 @@ fn transition_dm_table_from_observed(
     port: &mut impl DmTransitionPort,
     requested_table: &str,
     mode: DmSuspendMode,
-    policy: DmTransitionPolicy,
+    policy: DmTransitionPolicy<'_>,
     initial: DmObservedState,
 ) -> Result<()> {
     require_transition_initial_state(policy, &initial)?;
@@ -1889,6 +1911,26 @@ fn transition_dm_table_from_observed(
         let after_suspend = port
             .observe()
             .context("re-observe device-mapper state after suspend attempt")?;
+        if let DmTransitionPolicy::Apply { recovery_table } = policy {
+            let table_matches_recovery = normalize_dm_table(&after_suspend.active_table)
+                == normalize_dm_table(recovery_table);
+            if suspend_error.is_some() || !after_suspend.suspended || !table_matches_recovery {
+                let recovery_result = transition_dm_table_from_observed(
+                    port,
+                    recovery_table,
+                    mode,
+                    DmTransitionPolicy::Rollback,
+                    after_suspend.clone(),
+                );
+                bail!(
+                    "device-mapper fault apply lost its proven pre-load state; suspended={}, active_table={:?}, suspend_error={:?}, recovery_result={:?}",
+                    after_suspend.suspended,
+                    after_suspend.active_table,
+                    suspend_error,
+                    recovery_result.map_err(|error| format!("{error:#}"))
+                );
+            }
+        }
         ensure!(
             after_suspend.suspended,
             "device-mapper target remained active after suspend attempt; suspend error={:?}",
@@ -2330,9 +2372,12 @@ mod tests {
         suspended: bool,
         active_table: String,
         inactive_table: Option<String>,
+        active_table_after_suspend: Option<String>,
+        fail_next_suspend_after_suspending: bool,
         fail_next_resume: bool,
         suspend_calls: usize,
         load_calls: usize,
+        loaded_tables: Vec<String>,
         resume_calls: usize,
     }
 
@@ -2350,11 +2395,19 @@ mod tests {
                 bail!("already suspended");
             }
             self.suspended = true;
+            if let Some(table) = self.active_table_after_suspend.take() {
+                self.active_table = table;
+            }
+            if self.fail_next_suspend_after_suspending {
+                self.fail_next_suspend_after_suspending = false;
+                bail!("injected suspend failure after state change");
+            }
             Ok(())
         }
 
         fn load(&mut self, table: &str) -> Result<()> {
             self.load_calls += 1;
+            self.loaded_tables.push(table.to_string());
             if !self.suspended {
                 bail!("load requires suspended mapper");
             }
@@ -2538,6 +2591,38 @@ mod tests {
                 .expect("classify exact mount"),
             DmMountState::Mounted
         );
+
+        let no_match = CommandOutput {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            classify_exact_mountpoint("/data/rustfs-fault/dm-volume", &no_match)
+                .expect("classify clean no-match"),
+            DmMountState::Unmounted
+        );
+    }
+
+    #[test]
+    fn exact_mountpoint_rejects_exit_one_with_command_diagnostics() {
+        for output in [
+            CommandOutput {
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "error: unable to upgrade connection: container not found".to_string(),
+            },
+            CommandOutput {
+                code: Some(1),
+                stdout: "unexpected chroot output".to_string(),
+                stderr: String::new(),
+            },
+        ] {
+            assert!(
+                classify_exact_mountpoint("/data/rustfs-fault/dm-volume", &output).is_err(),
+                "kubectl/chroot/findmnt diagnostics must not prove an unmount"
+            );
+        }
     }
 
     #[test]
@@ -2816,9 +2901,12 @@ mod tests {
             suspended: true,
             active_table: recovery.to_string(),
             inactive_table: None,
+            active_table_after_suspend: None,
+            fail_next_suspend_after_suspending: false,
             fail_next_resume: false,
             suspend_calls: 0,
             load_calls: 0,
+            loaded_tables: Vec::new(),
             resume_calls: 0,
         };
 
@@ -2827,7 +2915,9 @@ mod tests {
                 &mut port,
                 "0 1024 flakey /dev/loop0 0 1 15",
                 DmSuspendMode::Default,
-                DmTransitionPolicy::Apply,
+                DmTransitionPolicy::Apply {
+                    recovery_table: recovery,
+                },
             )
             .is_err()
         );
@@ -2840,16 +2930,19 @@ mod tests {
     }
 
     #[test]
-    fn dm_resume_failure_recovers_from_the_already_suspended_state() {
+    fn dm_apply_rejects_recovery_table_drift_before_suspending() {
         let recovery = "0 1024 linear /dev/loop0 0";
         let fault = "0 1024 flakey /dev/loop0 0 1 15";
         let mut port = FakeDmPort {
             suspended: false,
-            active_table: recovery.to_string(),
+            active_table: "0 1024 linear /dev/loop1 0".to_string(),
             inactive_table: None,
-            fail_next_resume: true,
+            active_table_after_suspend: None,
+            fail_next_suspend_after_suspending: false,
+            fail_next_resume: false,
             suspend_calls: 0,
             load_calls: 0,
+            loaded_tables: Vec::new(),
             resume_calls: 0,
         };
 
@@ -2858,7 +2951,111 @@ mod tests {
                 &mut port,
                 fault,
                 DmSuspendMode::Default,
-                DmTransitionPolicy::Apply,
+                DmTransitionPolicy::Apply {
+                    recovery_table: recovery,
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(
+            (port.suspend_calls, port.load_calls, port.resume_calls),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn dm_apply_suspend_error_recovers_without_loading_the_fault_table() {
+        let recovery = "0 1024 linear /dev/loop0 0";
+        let fault = "0 1024 flakey /dev/loop0 0 1 15";
+        let mut port = FakeDmPort {
+            suspended: false,
+            active_table: recovery.to_string(),
+            inactive_table: None,
+            active_table_after_suspend: None,
+            fail_next_suspend_after_suspending: true,
+            fail_next_resume: false,
+            suspend_calls: 0,
+            load_calls: 0,
+            loaded_tables: Vec::new(),
+            resume_calls: 0,
+        };
+
+        assert!(
+            transition_dm_table(
+                &mut port,
+                fault,
+                DmSuspendMode::Default,
+                DmTransitionPolicy::Apply {
+                    recovery_table: recovery,
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(port.loaded_tables, [recovery]);
+        assert!(!port.loaded_tables.iter().any(|table| table == fault));
+        assert!(!port.suspended);
+        assert_eq!(normalize_dm_table(&port.active_table), recovery);
+    }
+
+    #[test]
+    fn dm_apply_recovers_if_the_table_drifts_during_suspend() {
+        let recovery = "0 1024 linear /dev/loop0 0";
+        let fault = "0 1024 flakey /dev/loop0 0 1 15";
+        let mut port = FakeDmPort {
+            suspended: false,
+            active_table: recovery.to_string(),
+            inactive_table: None,
+            active_table_after_suspend: Some("0 1024 linear /dev/loop1 0".to_string()),
+            fail_next_suspend_after_suspending: false,
+            fail_next_resume: false,
+            suspend_calls: 0,
+            load_calls: 0,
+            loaded_tables: Vec::new(),
+            resume_calls: 0,
+        };
+
+        assert!(
+            transition_dm_table(
+                &mut port,
+                fault,
+                DmSuspendMode::Default,
+                DmTransitionPolicy::Apply {
+                    recovery_table: recovery,
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(port.loaded_tables, [recovery]);
+        assert!(!port.loaded_tables.iter().any(|table| table == fault));
+        assert!(!port.suspended);
+        assert_eq!(normalize_dm_table(&port.active_table), recovery);
+    }
+
+    #[test]
+    fn dm_resume_failure_recovers_from_the_already_suspended_state() {
+        let recovery = "0 1024 linear /dev/loop0 0";
+        let fault = "0 1024 flakey /dev/loop0 0 1 15";
+        let mut port = FakeDmPort {
+            suspended: false,
+            active_table: recovery.to_string(),
+            inactive_table: None,
+            active_table_after_suspend: None,
+            fail_next_suspend_after_suspending: false,
+            fail_next_resume: true,
+            suspend_calls: 0,
+            load_calls: 0,
+            loaded_tables: Vec::new(),
+            resume_calls: 0,
+        };
+
+        assert!(
+            transition_dm_table(
+                &mut port,
+                fault,
+                DmSuspendMode::Default,
+                DmTransitionPolicy::Apply {
+                    recovery_table: recovery,
+                },
             )
             .is_err()
         );
@@ -2873,6 +3070,7 @@ mod tests {
 
         assert!(!port.suspended);
         assert_eq!(normalize_dm_table(&port.active_table), recovery);
+        assert_eq!(port.loaded_tables, [fault, recovery]);
         assert_eq!(
             port.suspend_calls, 1,
             "recovery must not issue another suspend"

@@ -1126,13 +1126,18 @@ fn validate_host_storage_artifacts(
         pod.node.as_deref() == Some(proof.target.node.as_str()),
         "host-storage target Pod node does not match target-proof.json"
     );
+    let proven_hostname = proof
+        .target
+        .node_labels
+        .get("kubernetes.io/hostname")
+        .context("host-storage proof lacks the proven Node hostname label")?;
     ensure!(
         pod.persistent_volume_claims.iter().any(|claim| {
             claim.name == proof.target.persistent_volume_claim
                 && claim.volume_name.as_deref() == Some(proof.target.persistent_volume.as_str())
                 && claim.persistent_volume.as_ref().is_some_and(|pv| {
                     pv.name == proof.target.persistent_volume
-                        && pv.node.as_deref() == Some(proof.target.node.as_str())
+                        && pv.node.as_deref() == Some(proven_hostname.as_str())
                         && pv.device_or_path.as_deref()
                             == Some(proof.target.persistent_volume_path.as_str())
                 })
@@ -2604,7 +2609,7 @@ mod tests {
                     storage_class: Some("rustfs-fault-dm".to_string()),
                     persistent_volume: Some(TargetPersistentVolumeProof {
                         name: "pv-a".to_string(),
-                        node: Some("worker-a".to_string()),
+                        node: Some("storage-host-a".to_string()),
                         device_or_path: Some("/data/rustfs-fault/dm-volume".to_string()),
                     }),
                 }])]);
@@ -2632,7 +2637,7 @@ mod tests {
                 node_uid: "node-uid-a".to_string(),
                 node_labels: BTreeMap::from([(
                     "kubernetes.io/hostname".to_string(),
-                    "worker-a".to_string(),
+                    "storage-host-a".to_string(),
                 )]),
                 pod: "rustfs-0".to_string(),
                 pod_uid: "uid-0".to_string(),
@@ -2651,7 +2656,7 @@ mod tests {
                 node_selector: HostStorageNodeSelector {
                     key: "kubernetes.io/hostname".to_string(),
                     operator: "In".to_string(),
-                    values: vec!["worker-a".to_string()],
+                    values: vec!["storage-host-a".to_string()],
                 },
                 container_mount_path: "/data/rustfs0".to_string(),
                 persistent_volume_path: "/data/rustfs-fault/dm-volume".to_string(),
@@ -2702,7 +2707,7 @@ mod tests {
                 "mapping": {
                     "node": "worker-a",
                     "node_uid": "node-uid-a",
-                    "node_labels": {"kubernetes.io/hostname": "worker-a"},
+                    "node_labels": {"kubernetes.io/hostname": "storage-host-a"},
                     "pod": "rustfs-0",
                     "pod_uid": "uid-0",
                     "volume_name": "data",
@@ -2720,7 +2725,7 @@ mod tests {
                     "node_selector": {
                         "key": "kubernetes.io/hostname",
                         "operator": "In",
-                        "values": ["worker-a"]
+                        "values": ["storage-host-a"]
                     },
                     "container_mount_path": "/data/rustfs0",
                     "mount_path": "/data/rustfs-fault/dm-volume"
@@ -2734,6 +2739,24 @@ mod tests {
 
         validate_host_storage_artifacts(&host_proof, &cleanup, &target_proof, &run_spec, &evidence)
             .expect("valid host-storage artifacts");
+
+        let mut tampered_topology = target_proof.clone();
+        tampered_topology.resolved_pods[0].persistent_volume_claims[0]
+            .persistent_volume
+            .as_mut()
+            .expect("target PV")
+            .node = Some("worker-a".to_string());
+        assert!(
+            validate_host_storage_artifacts(
+                &host_proof,
+                &cleanup,
+                &tampered_topology,
+                &run_spec,
+                &evidence,
+            )
+            .is_err(),
+            "target-proof PV topology must match the proven hostname label, not Node metadata.name"
+        );
 
         let mut tampered_proof = host_proof.clone();
         tampered_proof.allowlist.persistent_volumes = vec!["pv-b".to_string()];
@@ -2800,7 +2823,7 @@ mod tests {
                 node_uid: "node-uid-a".to_string(),
                 node_labels: BTreeMap::from([(
                     "kubernetes.io/hostname".to_string(),
-                    "worker-a".to_string(),
+                    "storage-host-a".to_string(),
                 )]),
                 pod: "rustfs-0".to_string(),
                 pod_uid: "uid-0".to_string(),
@@ -2819,7 +2842,7 @@ mod tests {
                 node_selector: HostStorageNodeSelector {
                     key: "kubernetes.io/hostname".to_string(),
                     operator: "In".to_string(),
-                    values: vec!["worker-a".to_string()],
+                    values: vec!["storage-host-a".to_string()],
                 },
                 container_mount_path: "/data/rustfs0".to_string(),
                 persistent_volume_path: "/data/rustfs-fault/dm-volume".to_string(),
