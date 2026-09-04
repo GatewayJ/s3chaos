@@ -111,6 +111,10 @@ impl RecoveryStabilityClassification {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryStabilityReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub immediate_passed: bool,
     pub reread_attempted_keys: Vec<String>,
     pub reread_recovered_keys: Vec<String>,
@@ -134,6 +138,8 @@ pub struct RecoveryStabilityReport {
 impl RecoveryStabilityReport {
     pub(crate) fn harness_error(message: impl Into<String>, max_recovery: Duration) -> Self {
         Self {
+            scenario: None,
+            run_id: None,
             immediate_passed: false,
             reread_attempted_keys: Vec::new(),
             reread_recovered_keys: Vec::new(),
@@ -148,6 +154,12 @@ impl RecoveryStabilityReport {
             recovered_within_seconds: None,
             classification: RecoveryStabilityClassification::HarnessError,
         }
+    }
+
+    pub(crate) fn with_identity(mut self, scenario: &str, run_id: &str) -> Self {
+        self.scenario = Some(scenario.to_string());
+        self.run_id = Some(run_id.to_string());
+        self
     }
 
     pub(crate) fn evidence_classifications(&self) -> Vec<String> {
@@ -460,6 +472,8 @@ pub async fn recovery_stability_reread(
     let still_unavailable_keys =
         immediate_still_unavailable_keys(immediate_report, &attempted_keys)?;
     let mut report = RecoveryStabilityReport {
+        scenario: Some(immediate_report.scenario.clone()),
+        run_id: Some(immediate_report.run_id.clone()),
         immediate_passed: immediate_report.passed,
         reread_attempted_keys: attempted_keys.clone(),
         reread_recovered_keys: Vec::new(),
@@ -1711,6 +1725,54 @@ pub(crate) fn recovery_key_sets_are_consistent(report: &RecoveryStabilityReport)
             .all(|key| still_unavailable.contains(key))
 }
 
+pub(crate) fn validate_recovery_key_sets(
+    report: &RecoveryStabilityReport,
+    immediate_report: &CheckerReport,
+) -> Result<()> {
+    ensure!(
+        recovery_key_sets_are_consistent(report),
+        "recovery reread key sets are internally inconsistent"
+    );
+    let attempted = report
+        .reread_attempted_keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let recovered = report
+        .reread_recovered_keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let still = report
+        .still_unavailable_keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let baseline =
+        immediate_still_unavailable_keys(immediate_report, &report.reread_attempted_keys)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+    let allowed = baseline.union(&attempted).cloned().collect::<BTreeSet<_>>();
+    ensure!(
+        still.is_subset(&allowed),
+        "recovery still_unavailable_keys contains keys absent from checker evidence and reread candidates"
+    );
+
+    let has_non_availability_result = !report.hash_mismatches.is_empty()
+        || !report.data_corruption_evidence.is_empty()
+        || !report.ambiguous_write_evidence.is_empty()
+        || !report.harness_errors.is_empty();
+    if !has_non_availability_result {
+        let mut expected = baseline;
+        expected.extend(attempted.difference(&recovered).cloned());
+        ensure!(
+            still == expected,
+            "recovery still_unavailable_keys does not equal checker-derived unavailable keys plus attempted-but-not-recovered keys"
+        );
+    }
+    Ok(())
+}
+
 fn finish_recovery_stability_report(
     report: &mut RecoveryStabilityReport,
     immediate_report: &CheckerReport,
@@ -2440,6 +2502,7 @@ mod tests {
         evaluate_recovery_reread_get, finish_recovery_stability_report,
         immediate_still_unavailable_keys, is_recovery_tail_read_failure, list_history_warnings,
         object_model, recovery_tail_candidate_keys, successful_read_anomalies,
+        validate_recovery_key_sets,
     };
     use crate::fault::history::{
         ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
@@ -3294,6 +3357,35 @@ mod tests {
     }
 
     #[test]
+    fn recovery_key_sets_reject_ghosts_and_derive_exact_unavailable_set() {
+        let mut immediate = empty_report();
+        immediate.missing_committed_objects.push("z".to_string());
+        immediate.unavailable_committed_objects.extend([
+            "a: outcome=Timeout status=200 error=\"get body read timed out\"".to_string(),
+            "b: outcome=Timeout status=200 error=\"get body read timed out\"".to_string(),
+        ]);
+        let mut recovery = recovery_report_with_attempted_key("a");
+        recovery.reread_attempted_keys.push("b".to_string());
+        recovery.reread_recovered_keys.push("a".to_string());
+        recovery.still_unavailable_keys = vec!["b".to_string(), "z".to_string()];
+
+        validate_recovery_key_sets(&recovery, &immediate)
+            .expect("checker evidence derives the exact multi-key unavailable set");
+
+        recovery.reread_recovered_keys.push("b".to_string());
+        recovery.still_unavailable_keys = vec!["ghost".to_string(), "z".to_string()];
+        let error = validate_recovery_key_sets(&recovery, &immediate)
+            .expect_err("an unrelated still-unavailable key must fail closed");
+        assert!(error.to_string().contains("absent from checker evidence"));
+
+        recovery.still_unavailable_keys = vec!["z".to_string(), "z".to_string()];
+        assert!(
+            validate_recovery_key_sets(&recovery, &immediate).is_err(),
+            "duplicate key evidence must fail closed"
+        );
+    }
+
+    #[test]
     fn recovery_evidence_classifications_preserve_tail_latency_with_ambiguous_evidence() {
         let mut recovery = recovery_report_with_attempted_key("k");
         recovery.reread_recovered_keys.push("k".to_string());
@@ -3437,6 +3529,8 @@ mod tests {
         let keys = immediate_still_unavailable_keys(&immediate, &[])
             .expect("well-formed read failure evidence");
         let mut recovery = RecoveryStabilityReport {
+            scenario: None,
+            run_id: None,
             immediate_passed: false,
             reread_attempted_keys: Vec::new(),
             reread_recovered_keys: Vec::new(),
@@ -4452,6 +4546,8 @@ mod tests {
 
     fn recovery_report_with_attempted_key(key: &str) -> RecoveryStabilityReport {
         RecoveryStabilityReport {
+            scenario: None,
+            run_id: None,
             immediate_passed: false,
             reread_attempted_keys: vec![key.to_string()],
             reread_recovered_keys: Vec::new(),

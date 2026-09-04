@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 use crate::fault::{
     checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
@@ -93,6 +94,141 @@ pub(crate) struct ExpectedFailureArtifactReport {
     pub failure_summary: String,
     pub summary: FailureSummary,
     pub client_disruptions: usize,
+}
+
+struct FailedAttemptDisruptionEvidence {
+    client_disruptions: usize,
+    run_failed: bool,
+}
+
+pub(crate) fn validate_failed_attempt_disruptions(
+    suite_root: &Path,
+    case_dir: &Path,
+    attempt_run_id: &str,
+    scenario: &str,
+    case_name: &str,
+    attempt_started_at_ms: u64,
+    evaluated_at_ms: u64,
+) -> Result<usize> {
+    Ok(validate_failed_attempt_disruption_evidence(
+        suite_root,
+        case_dir,
+        attempt_run_id,
+        scenario,
+        case_name,
+        attempt_started_at_ms,
+        evaluated_at_ms,
+    )?
+    .client_disruptions)
+}
+
+fn validate_failed_attempt_disruption_evidence(
+    suite_root: &Path,
+    case_dir: &Path,
+    attempt_run_id: &str,
+    scenario: &str,
+    case_name: &str,
+    attempt_started_at_ms: u64,
+    evaluated_at_ms: u64,
+) -> Result<FailedAttemptDisruptionEvidence> {
+    ensure!(
+        attempt_run_id
+            .strip_prefix("run-")
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .is_some(),
+        "failed-attempt safety requires a valid planned attempt runId"
+    );
+    let suite_root = fs::canonicalize(suite_root)
+        .with_context(|| format!("canonicalize suite artifact root {}", suite_root.display()))?;
+    let case_dir = fs::canonicalize(case_dir).with_context(|| {
+        format!(
+            "canonicalize case artifact directory {}",
+            case_dir.display()
+        )
+    })?;
+    ensure!(
+        case_dir.starts_with(&suite_root),
+        "case artifact directory is outside suite artifact root"
+    );
+    ensure!(
+        attempt_started_at_ms <= evaluated_at_ms,
+        "failed-attempt evaluation window is invalid"
+    );
+
+    let run_spec_path = bound_case_artifact(&case_dir, "run-spec.json")?;
+    let run_spec = read_json::<ExpectedFailureRunSpecIdentity>(&run_spec_path)?;
+    ensure!(
+        run_spec.metadata.name == case_name
+            && run_spec.metadata.run_id == attempt_run_id
+            && run_spec.scenario.name == scenario
+            && run_spec.scenario.case_name == case_name,
+        "run-spec.json identity does not match the planned attempt"
+    );
+    let evidence_path = bound_case_artifact(&case_dir, "fault-evidence.json")?;
+    let evidence = read_json::<FaultEvidenceArtifact>(&evidence_path)?;
+    ensure!(
+        evidence.scenario.as_deref() == Some(scenario)
+            && evidence.run_id.as_deref() == Some(attempt_run_id),
+        "fault-evidence.json identity does not match the planned attempt"
+    );
+    ensure!(
+        evidence.injected && evidence.active_during_workload && evidence.recovered,
+        "fault-evidence.json does not prove a completed fault lifecycle"
+    );
+    ensure!(
+        !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
+        "fault-evidence.json does not prove fault activity during the workload"
+    );
+    validate_fault_window_evidence(&evidence)?;
+    ensure!(
+        evidence
+            .fault_apply_started_at_ms
+            .is_some_and(|at| at >= attempt_started_at_ms)
+            && evidence
+                .recovery_ended_at_ms
+                .is_some_and(|at| at <= evaluated_at_ms),
+        "fault-evidence.json timestamps are outside the current attempt window"
+    );
+
+    let workload_path = bound_case_artifact(&case_dir, "workload-summary.json")?;
+    let workload = read_json::<WorkloadSummaryArtifact>(&workload_path)?;
+    let disrupted = workload.disrupted()?;
+    ensure!(
+        disrupted == evidence.client_disruptions,
+        "fault-evidence.json client_disruptions does not match workload-summary.json"
+    );
+
+    let events_path = bound_case_artifact(&case_dir, "run-events.jsonl")?;
+    let events = read_jsonl::<RunEvent>(&events_path)?;
+    ensure!(
+        !events.is_empty()
+            && events.iter().all(|event| {
+                event.scenario == scenario
+                    && event.run_id == attempt_run_id
+                    && (attempt_started_at_ms..=evaluated_at_ms).contains(&event.at_ms)
+            }),
+        "run-events.jsonl identity or timestamps do not match the planned attempt"
+    );
+    ensure!(
+        has_event(&events, "run", RunEventStatus::Started)
+            && (has_event(&events, "run", RunEventStatus::Failed)
+                || has_event(&events, "run", RunEventStatus::Succeeded)),
+        "run-events.jsonl is missing current-attempt run start or terminal event"
+    );
+    Ok(FailedAttemptDisruptionEvidence {
+        client_disruptions: disrupted,
+        run_failed: has_event(&events, "run", RunEventStatus::Failed),
+    })
+}
+
+fn bound_case_artifact(case_dir: &Path, name: &str) -> Result<PathBuf> {
+    let path = fs::canonicalize(case_dir.join(name))
+        .with_context(|| format!("canonicalize current-attempt artifact {name}"))?;
+    ensure!(
+        path.parent() == Some(case_dir),
+        "current-attempt artifact {name} does not belong to its planned case directory"
+    );
+    Ok(path)
 }
 
 impl ArtifactValidationReport {
@@ -309,6 +445,12 @@ pub fn validate_fault_artifacts(
 
     let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
     ensure!(
+        events
+            .iter()
+            .all(|event| { event.scenario == options.scenario && event.run_id == metadata.run_id }),
+        "run-events.jsonl identity does not match run-metadata.json"
+    );
+    ensure!(
         has_event(&events, "run", RunEventStatus::Started)
             && has_event(&events, "run", RunEventStatus::Succeeded)
             && has_event(&events, "checker-final", RunEventStatus::Succeeded),
@@ -322,6 +464,12 @@ pub fn validate_fault_artifacts(
         "fault-evidence.json require_client_disruption",
     )?;
     let evidence = read_json::<FaultEvidenceArtifact>(fault_evidence_path)?;
+    if let Some(run_id) = evidence.run_id.as_deref() {
+        ensure!(
+            run_id == metadata.run_id,
+            "fault-evidence.json run_id does not match run-metadata.json"
+        );
+    }
     ensure!(
         evidence.injected && evidence.active_during_workload && evidence.recovered,
         "fault-evidence.json must record injected=true, active_during_workload=true, recovered=true"
@@ -388,6 +536,10 @@ pub fn validate_fault_artifacts(
     ensure!(
         summary.exercised_all_operation_families(),
         "workload-summary.json did not exercise every required S3 operation family"
+    );
+    ensure!(
+        summary.disrupted()? == evidence.client_disruptions,
+        "fault-evidence.json client_disruptions does not match workload-summary.json"
     );
 
     Ok(ArtifactValidationReport {
@@ -1016,11 +1168,19 @@ pub(crate) fn validate_written_failure_summary(root: &Path, path: &Path) -> Resu
 pub(crate) fn validate_expected_failure_artifacts(
     suite_root: &Path,
     case_dir: &Path,
+    attempt_run_id: &str,
     scenario: &str,
     case_name: &str,
     attempt_started_at_ms: u64,
     evaluated_at_ms: u64,
 ) -> Result<ExpectedFailureArtifactReport> {
+    ensure!(
+        attempt_run_id
+            .strip_prefix("run-")
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .is_some(),
+        "expected failure requires a valid planned attempt runId"
+    );
     let suite_root = fs::canonicalize(suite_root)
         .with_context(|| format!("canonicalize suite artifact root {}", suite_root.display()))?;
     let case_dir = fs::canonicalize(case_dir).with_context(|| {
@@ -1058,6 +1218,12 @@ pub(crate) fn validate_expected_failure_artifacts(
         "failure-summary.json scenario {:?} does not match current attempt {:?}",
         summary.scenario,
         scenario
+    );
+    ensure!(
+        summary.run_id.as_deref() == Some(attempt_run_id),
+        "failure-summary.json run_id {:?} does not match planned attempt {:?}",
+        summary.run_id,
+        attempt_run_id
     );
     ensure!(
         summary.case_name.as_deref() == Some(case_name),
@@ -1120,70 +1286,33 @@ pub(crate) fn validate_expected_failure_artifacts(
         referenced.insert(file_name.to_string(), evidence_path);
     }
 
-    let fault_evidence_path = referenced
+    referenced
         .get("fault-evidence.json")
         .context("expected failure requires fault-evidence.json as primary evidence")?;
-    let evidence = read_json::<FaultEvidenceArtifact>(fault_evidence_path)?;
-    ensure!(
-        evidence.scenario.as_deref() == Some(scenario),
-        "fault-evidence.json scenario {:?} does not match current attempt {:?}",
-        evidence.scenario,
-        scenario
-    );
-    ensure!(
-        evidence.injected && evidence.active_during_workload && evidence.recovered,
-        "fault-evidence.json must record injected=true, active_during_workload=true, recovered=true"
-    );
-    ensure!(
-        !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
-        "fault-evidence.json must include active and workload fault snapshots"
-    );
-    validate_fault_window_evidence(&evidence)?;
-    let fault_started_at_ms = evidence
-        .fault_apply_started_at_ms
-        .expect("fault window validation requires apply timestamp");
-    let recovery_ended_at_ms = evidence
-        .recovery_ended_at_ms
-        .expect("fault window validation requires recovery timestamp");
-    ensure!(
-        fault_started_at_ms >= attempt_started_at_ms && recovery_ended_at_ms <= evaluated_at_ms,
-        "fault-evidence.json timestamps are outside the current attempt window"
-    );
-
-    let run_spec = read_json::<ExpectedFailureRunSpecIdentity>(&case_dir.join("run-spec.json"))?;
-    ensure!(
-        run_spec.metadata.name == case_name
-            && run_spec.scenario.name == scenario
-            && run_spec.scenario.case_name == case_name
-            && !run_spec.metadata.run_id.trim().is_empty(),
-        "run-spec.json identity does not match the current attempt"
-    );
-
-    let events_path = referenced
+    referenced
         .get("run-events.jsonl")
         .context("expected failure requires run-events.jsonl as primary evidence")?;
-    let events = read_jsonl::<RunEvent>(events_path)?;
-    ensure!(!events.is_empty(), "run-events.jsonl must not be empty");
+
+    let disruption_evidence = validate_failed_attempt_disruption_evidence(
+        &suite_root,
+        &case_dir,
+        attempt_run_id,
+        scenario,
+        case_name,
+        attempt_started_at_ms,
+        evaluated_at_ms,
+    )?;
     ensure!(
-        events.iter().all(|event| {
-            event.scenario == scenario
-                && event.run_id == run_spec.metadata.run_id
-                && (attempt_started_at_ms..=evaluated_at_ms).contains(&event.at_ms)
-        }),
-        "run-events.jsonl identity or timestamps do not match the current attempt"
-    );
-    ensure!(
-        has_event(&events, "run", RunEventStatus::Started)
-            && has_event(&events, "run", RunEventStatus::Failed),
-        "run-events.jsonl is missing current-attempt run started or failed events"
+        disruption_evidence.run_failed,
+        "run-events.jsonl does not prove the current attempt failed"
     );
 
-    validate_expected_failure_signal(&summary, &referenced, scenario, &run_spec.metadata.run_id)?;
+    validate_expected_failure_signal(&summary, &referenced, scenario, attempt_run_id)?;
 
     Ok(ExpectedFailureArtifactReport {
         failure_summary: summary_path.display().to_string(),
         summary: typed_summary,
-        client_disruptions: evidence.client_disruptions,
+        client_disruptions: disruption_evidence.client_disruptions,
     })
 }
 
@@ -1230,6 +1359,11 @@ fn validate_expected_failure_signal(
             let recovery = read_json::<RecoveryStabilityReport>(recovery_path)?;
             validate_recovery_stability_report(&recovery)?;
             ensure!(
+                recovery.scenario.as_deref() == Some(scenario)
+                    && recovery.run_id.as_deref() == Some(run_id),
+                "recovery-stability-report.json identity does not match the planned attempt"
+            );
+            ensure!(
                 recovery.immediate_passed == checker.passed,
                 "recovery-stability-report.json immediate_passed does not match checker-pre-recommit-report.json"
             );
@@ -1238,6 +1372,9 @@ fn validate_expected_failure_signal(
                     && recovery.list_warnings == checker.list_warnings,
                 "recovery-stability-report.json LIST evidence does not match checker-pre-recommit-report.json"
             );
+            checker::validate_recovery_key_sets(&recovery, &checker).context(
+                "recovery-stability-report.json key evidence is not bound to checker evidence",
+            )?;
             let observed = checker::classify_recovery_stability(&recovery, &checker);
             ensure!(
                 recovery.classification == observed,
@@ -1776,6 +1913,8 @@ fn default_recovery_stability_reread_seconds() -> u64 {
 struct FaultEvidenceArtifact {
     #[serde(default)]
     scenario: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
     injected: bool,
     active_during_workload: bool,
     recovered: bool,
@@ -1892,6 +2031,8 @@ struct FailureSummaryArtifact {
     schema_version: u8,
     scenario: String,
     #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
     case_name: Option<String>,
     #[serde(default)]
     observed_at_ms: Option<u64>,
@@ -1947,6 +2088,23 @@ impl WorkloadSummaryArtifact {
             && self.multipart_completes.total() > 0
             && self.multipart_aborts.total() > 0
     }
+
+    fn disrupted(&self) -> Result<usize> {
+        [
+            &self.puts,
+            &self.gets,
+            &self.deletes,
+            &self.lists,
+            &self.multipart_completes,
+            &self.multipart_aborts,
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, counts| {
+            total
+                .checked_add(counts.disrupted()?)
+                .context("workload-summary.json disrupted count overflowed")
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1961,6 +2119,13 @@ struct OutcomeCountsArtifact {
 impl OutcomeCountsArtifact {
     fn total(&self) -> usize {
         self.ok + self.not_found + self.failed + self.timeout + self.unknown
+    }
+
+    fn disrupted(&self) -> Result<usize> {
+        self.failed
+            .checked_add(self.timeout)
+            .and_then(|value| value.checked_add(self.unknown))
+            .context("workload-summary.json outcome disrupted count overflowed")
     }
 }
 
@@ -3162,6 +3327,7 @@ mod tests {
         FailureSummaryArtifact {
             schema_version: 2,
             scenario: "io-eio".to_string(),
+            run_id: None,
             case_name: Some("fault_io_eio_preserves_committed_objects".to_string()),
             observed_at_ms: None,
             stage: "checker-pre-recommit-verdict".to_string(),
@@ -3383,8 +3549,8 @@ mod tests {
                 "object_count": 12,
                 "concurrency": 4,
                 "total_payload_bytes": 12582912,
-                "puts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
-                "gets": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "puts": {"ok": 1, "not_found": 0, "failed": 1, "timeout": 0, "unknown": 0},
+                "gets": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
                 "deletes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
                 "lists": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
                 "multipart_completes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
@@ -3433,6 +3599,7 @@ mod tests {
             "fault-evidence.json",
             &json!({
                 "scenario": scenario,
+                "run_id": "run-1",
                 "backend": "chaos-mesh-io-chaos",
                 "target": "rustfs-volume",
                 "injected": true,

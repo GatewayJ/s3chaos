@@ -92,6 +92,8 @@ pub struct FaultSuitePlanBudgets {
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanAttempt {
     pub index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub scenario: String,
     pub case_name: String,
     pub repetition: usize,
@@ -219,6 +221,7 @@ pub(crate) struct FaultSuiteExpandedAttempt {
 
 struct FaultSuitePlanAttemptInput<'a> {
     index: usize,
+    run_id: String,
     scenario: &'a ResolvedFaultSuiteScenario,
     repetition: usize,
     config: &'a FaultTestConfig,
@@ -312,6 +315,7 @@ pub(crate) fn build_fault_suite_plan_expansion(
             };
             let plan = FaultSuitePlanAttempt::from_attempt(FaultSuitePlanAttemptInput {
                 index: attempt_index,
+                run_id: fault_run_id(),
                 scenario,
                 repetition,
                 config: &config,
@@ -371,7 +375,26 @@ impl FaultSuitePlan {
             self.api_version == FAULT_SUITE_PLAN_API_VERSION && self.kind == FAULT_SUITE_PLAN_KIND,
             "fault suite plan apiVersion/kind is unsupported"
         );
+        let mut run_ids = BTreeSet::new();
         for attempt in &self.attempts {
+            let run_id = attempt.run_id.as_deref().with_context(|| {
+                format!(
+                    "current fault suite plan attempt {} ({}) is missing runId",
+                    attempt.index, attempt.scenario
+                )
+            })?;
+            ensure!(
+                parse_fault_run_id(run_id).is_some(),
+                "current fault suite plan attempt {} ({}) has invalid runId {:?}",
+                attempt.index,
+                attempt.scenario,
+                run_id
+            );
+            ensure!(
+                run_ids.insert(run_id),
+                "current fault suite plan contains duplicate attempt runId {:?}",
+                run_id
+            );
             attempt
                 .detector
                 .as_ref()
@@ -442,6 +465,7 @@ impl FaultSuitePlanAttempt {
 
         Ok(Self {
             index: input.index,
+            run_id: Some(input.run_id),
             scenario: input.scenario.name.clone(),
             case_name: input.spec.case_name.to_string(),
             repetition: input.repetition,
@@ -703,6 +727,14 @@ pub(crate) fn suite_run_id() -> String {
     format!("suite-{}", Uuid::new_v4())
 }
 
+pub(crate) fn fault_run_id() -> String {
+    format!("run-{}", Uuid::new_v4())
+}
+
+fn parse_fault_run_id(value: &str) -> Option<Uuid> {
+    Uuid::parse_str(value.strip_prefix("run-")?).ok()
+}
+
 fn generated_suite_seed() -> u64 {
     let bytes = *Uuid::new_v4().as_bytes();
     u64::from_le_bytes(
@@ -746,7 +778,13 @@ mod tests {
 
         let expansion = build_fault_suite_plan_expansion(suite, base, "suite-fixed".to_string())
             .expect("suite plan expansion");
-        let plan = serde_json::to_value(&expansion.plan).expect("plan json");
+        let mut plan = serde_json::to_value(&expansion.plan).expect("plan json");
+        for attempt in plan["attempts"].as_array_mut().expect("plan attempts") {
+            attempt
+                .as_object_mut()
+                .expect("plan attempt")
+                .remove("runId");
+        }
         let required_artifacts = json!([
             "run-spec.yaml",
             "run-spec.json",
@@ -795,7 +833,6 @@ mod tests {
         let target_proof = json!([
             "run artifacts must include the selected Kubernetes object or host device identity before the fault is activated"
         ]);
-
         assert_eq!(
             plan,
             json!({
@@ -1031,6 +1068,18 @@ scenarios:
             .expect("suite plan expansion");
         let attempt = &expansion.plan.attempts[0];
 
+        assert!(
+            attempt
+                .run_id
+                .as_deref()
+                .and_then(super::parse_fault_run_id)
+                .is_some()
+        );
+        assert!(
+            expansion.plan.attempts[1..]
+                .iter()
+                .all(|other| other.run_id != attempt.run_id)
+        );
         assert_eq!(
             attempt.detector.as_ref(),
             Some(&expansion.suite.scenarios[0].detector)
@@ -1040,6 +1089,7 @@ scenarios:
             expansion.suite.scenarios[0].expected_failure
         );
         let json = serde_json::to_value(attempt).expect("attempt json");
+        assert_eq!(json["runId"], attempt.run_id.as_deref().expect("run id"));
         assert_eq!(json["expectedFailure"]["classification"], "data_corruption");
         assert_eq!(
             json["expectedFailure"]["evidenceRefs"],
@@ -1063,6 +1113,10 @@ scenarios:
                 .as_object_mut()
                 .expect("legacy plan attempt")
                 .remove("detector");
+            attempt
+                .as_object_mut()
+                .expect("legacy plan attempt")
+                .remove("runId");
         }
         let legacy = serde_json::from_value::<super::FaultSuitePlan>(legacy)
             .expect("legacy v1alpha1 plan without detector must remain readable");
@@ -1071,6 +1125,12 @@ scenarios:
                 .attempts
                 .iter()
                 .all(|attempt| attempt.detector.is_none())
+        );
+        assert!(
+            legacy
+                .attempts
+                .iter()
+                .all(|attempt| attempt.run_id.is_none())
         );
         assert!(
             legacy.validate_current_contract().is_err(),

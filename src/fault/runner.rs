@@ -39,13 +39,15 @@ use crate::{
         preflight::{PreflightCheck, PreflightPhase, PreflightSummary, TargetProof},
         reporting::{
             FailureSummary, FaultEvidence, FaultStatusSnapshot, PodIdentity, RunMetadata,
-            write_checker_error, write_failure_summary, write_failure_summary_if_absent,
+            write_checker_error, write_failure_summary as persist_failure_summary,
+            write_failure_summary_if_absent,
         },
         scenarios::{
             self, FaultBackend, FaultIsolation, FaultScenario, FaultScenarioSpec,
             NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
         },
         spec::FaultRunSpec,
+        suite_plan::fault_run_id,
         workload::{
             ObjectSpec, S3WorkloadClient, WorkloadOperation, WorkloadPlan, sha256_hex,
             wait_for_s3_endpoint,
@@ -90,12 +92,13 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
 
 pub async fn run_scenario_with_config(config: FaultTestConfig) -> Result<()> {
     let reference_root = config.cluster.artifacts_dir.clone();
-    run_scenario_with_config_and_reference_root(config, reference_root).await
+    run_scenario_with_config_and_reference_root(config, reference_root, fault_run_id()).await
 }
 
 pub(crate) async fn run_scenario_with_config_and_reference_root(
     mut config: FaultTestConfig,
     reference_root: impl Into<PathBuf>,
+    run_id: String,
 ) -> Result<()> {
     scenarios::apply_catalog_defaults(&mut config)?;
     let scenario = FaultScenario::from_config(&config)?;
@@ -115,13 +118,14 @@ pub(crate) async fn run_scenario_with_config_and_reference_root(
 
     let collector =
         ArtifactCollector::with_reference_root(&config.cluster.artifacts_dir, reference_root)?;
-    let result = run_fault_case(&config, &collector, &scenario, &plan).await;
+    let result = run_fault_case(&config, &collector, &scenario, &plan, &run_id).await;
 
     if let Err(error) = &result {
         write_failure_summary_if_absent(
             &collector,
             scenario.case_name,
-            FailureSummary::new(&scenario.name, "scenario", "unknown", error.to_string())?,
+            FailureSummary::new(&scenario.name, "scenario", "unknown", error.to_string())?
+                .with_run_id(&run_id),
         )
         .ok();
         match collector.collect_kubernetes_snapshot_with_diagnosis(
@@ -150,6 +154,7 @@ async fn run_fault_case(
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
     plan: &FaultPlan,
+    planned_run_id: &str,
 ) -> Result<()> {
     let FaultRunContext {
         spec,
@@ -158,7 +163,11 @@ async fn run_fault_case(
         bucket,
         events,
         history,
-    } = initialize_fault_run(config, collector, scenario, plan)?;
+    } = initialize_fault_run(config, collector, scenario, plan, planned_run_id)?;
+    let write_failure_summary =
+        |collector: &ArtifactCollector, case_name: &str, summary: FailureSummary| {
+            persist_failure_summary(collector, case_name, summary.with_run_id(&run_id))
+        };
     let mut run_completion =
         events.completion_guard("run", "fault run failed before successful completion");
     let mut preflight_phases = Vec::new();
@@ -1432,6 +1441,7 @@ async fn run_fault_case(
     let recovery_ended_at_ms = now_ms();
     let recovered_evidence = FaultEvidence {
         scenario: scenario.name.clone(),
+        run_id: run_id.clone(),
         backend: plan.backend_summary(),
         target: plan.target_summary(),
         injected: true,
@@ -1494,7 +1504,8 @@ async fn run_fault_case(
             let recovery_stability_report = checker::RecoveryStabilityReport::harness_error(
                 message.clone(),
                 config.recovery_stability_reread,
-            );
+            )
+            .with_identity(&scenario.name, &run_id);
             collector.write_text(
                 scenario.case_name,
                 "recovery-stability-report.json",
@@ -1582,6 +1593,7 @@ async fn run_fault_case(
                     message,
                     config.recovery_stability_reread,
                 )
+                .with_identity(&scenario.name, &run_id)
             }
         };
         collector.write_text(
@@ -1720,6 +1732,7 @@ async fn run_fault_case(
     )?;
     let evidence = FaultEvidence {
         scenario: scenario.name.clone(),
+        run_id: run_id.clone(),
         backend: plan.backend_summary(),
         target: plan.target_summary(),
         injected: true,
@@ -1799,9 +1812,10 @@ fn initialize_fault_run(
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
     plan: &FaultPlan,
+    run_id: &str,
 ) -> Result<FaultRunContext> {
     let spec = scenarios::scenario_spec(&scenario.name)?;
-    let run_id = format!("run-{}", Uuid::new_v4());
+    let run_id = run_id.to_string();
     let workload_seed = config.workload_seed.unwrap_or_else(generated_seed);
     let workload_plan = WorkloadPlan::seeded_with_profile(
         workload_seed,

@@ -21,7 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::fault::{
     artifact_validation::{
         ArtifactValidationOptions, ExpectedFailureArtifactReport,
-        validate_expected_failure_artifacts, validate_fault_artifacts_and_write_report,
+        validate_expected_failure_artifacts, validate_failed_attempt_disruptions,
+        validate_fault_artifacts_and_write_report,
     },
     config::FaultTestConfig,
     reporting::{FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain},
@@ -155,6 +156,7 @@ pub enum FaultSuiteStopReason {
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuiteRunAttempt {
     pub index: usize,
+    pub run_id: String,
     pub scenario: String,
     pub repetition: usize,
     pub status: SuiteAttemptStatus,
@@ -235,6 +237,11 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
         let attempt_dir = Path::new(&planned.plan.artifacts.attempt_dir);
         let mut attempt = FaultSuiteRunAttempt::running(
             planned.plan.index,
+            planned
+                .plan
+                .run_id
+                .as_deref()
+                .expect("validated current suite plan has attempt runId"),
             &planned.plan.scenario,
             planned.plan.repetition,
             attempt_dir,
@@ -250,15 +257,16 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
             attempt_dir.display()
         );
 
-        let result =
-            run_scenario_with_config_and_reference_root(planned.config.clone(), suite_root.clone())
-                .await;
+        let result = run_scenario_with_config_and_reference_root(
+            planned.config.clone(),
+            suite_root.clone(),
+            attempt.run_id.clone(),
+        )
+        .await;
         let mut stop_after_attempt_failure = false;
         match result {
             Ok(()) => match validate_attempt_artifacts(&planned.config) {
                 Ok(report) => {
-                    let disruption_budget_failure =
-                        summary.record_client_disruptions(report.client_disruptions);
                     attempt.succeed(
                         report.seed,
                         report.client_disruptions,
@@ -271,11 +279,20 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                             planned.plan.scenario, planned.plan.repetition
                         );
                         attempt.fail(attempt_error.clone(), None);
-                        stop_after_attempt_failure = should_stop_after_attempt_failure(
-                            &execution_plan.suite.budgets.continue_on_severities,
-                            execution_plan.suite.budgets.stop_on_first_failure,
-                            None,
+                        let safety_failure = evaluate_failed_attempt_safety(
+                            &mut summary,
+                            &mut attempt,
+                            &suite_root,
+                            &planned.plan,
+                            now_ms(),
+                            Some(report.client_disruptions),
                         );
+                        stop_after_attempt_failure = safety_failure.is_some()
+                            || should_stop_after_attempt_failure(
+                                &execution_plan.suite.budgets.continue_on_severities,
+                                execution_plan.suite.budgets.stop_on_first_failure,
+                                None,
+                            );
                         summary.record_attempt_failure(
                             &attempt,
                             None,
@@ -283,11 +300,19 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                             attempt_error,
                             stop_after_attempt_failure,
                         );
-                    }
-                    replace_last_attempt(&mut summary, attempt);
-                    if enforce_disruption_budget(&mut summary, disruption_budget_failure) {
-                        write_summary(&summary_path, &summary)?;
-                        break 'suite;
+                        replace_last_attempt(&mut summary, attempt);
+                        if enforce_disruption_budget(&mut summary, safety_failure) {
+                            write_summary(&summary_path, &summary)?;
+                            break 'suite;
+                        }
+                    } else {
+                        let disruption_budget_failure =
+                            summary.record_client_disruptions(report.client_disruptions)?;
+                        replace_last_attempt(&mut summary, attempt);
+                        if enforce_disruption_budget(&mut summary, disruption_budget_failure) {
+                            write_summary(&summary_path, &summary)?;
+                            break 'suite;
+                        }
                     }
                 }
                 Err(error) => {
@@ -297,11 +322,19 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                             format!("artifact validation failed: {error}"),
                         );
                     attempt.fail(attempt_error.clone(), None);
+                    let safety_failure = evaluate_failed_attempt_safety(
+                        &mut summary,
+                        &mut attempt,
+                        &suite_root,
+                        &planned.plan,
+                        now_ms(),
+                        None,
+                    );
                     let failure_message = format!(
                         "scenario {} repetition {} failed: {attempt_error}",
                         planned.plan.scenario, planned.plan.repetition
                     );
-                    stop_after_attempt_failure = forced_stop;
+                    stop_after_attempt_failure = forced_stop || safety_failure.is_some();
                     summary.record_attempt_failure(
                         &attempt,
                         None,
@@ -310,9 +343,14 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                         stop_after_attempt_failure,
                     );
                     replace_last_attempt(&mut summary, attempt);
+                    if enforce_disruption_budget(&mut summary, safety_failure) {
+                        write_summary(&summary_path, &summary)?;
+                        break 'suite;
+                    }
                 }
             },
             Err(error) => {
+                let evaluated_at_ms = now_ms();
                 let (attempt_error, failure_summary, failure_severity) =
                     attempt_failure_details(&planned.plan, error.to_string());
                 let expected_failure_artifacts = planned.plan.expected_failure.as_ref().map(|_| {
@@ -321,25 +359,31 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                         &planned.plan,
                         failure_summary.as_ref(),
                         attempt.started_at_ms,
-                        now_ms(),
+                        evaluated_at_ms,
                     )
                 });
-                let (expected_failure_mismatch, disruption_budget_failure) = match (
+                let expected_failure_mismatch = match (
                     planned.plan.expected_failure.as_ref(),
                     expected_failure_artifacts.as_ref(),
                 ) {
                     (Some(expected), Some(Ok(validation))) => {
-                        let evaluation = evaluate_validated_expected_failure(
-                            &mut summary,
-                            &mut attempt,
-                            expected,
-                            validation,
-                        );
-                        (evaluation.mismatch, evaluation.disruption_budget_failure)
+                        evaluate_validated_expected_failure(expected, validation).mismatch
                     }
-                    (Some(_), Some(Err(error))) => (Some(format!("{error:#}")), None),
-                    _ => (None, None),
+                    (Some(_), Some(Err(error))) => Some(format!("{error:#}")),
+                    _ => None,
                 };
+                let trusted_disruptions = expected_failure_artifacts
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .map(|validation| validation.client_disruptions);
+                let safety_failure = evaluate_failed_attempt_safety(
+                    &mut summary,
+                    &mut attempt,
+                    &suite_root,
+                    &planned.plan,
+                    evaluated_at_ms,
+                    trusted_disruptions,
+                );
                 if planned.plan.expected_failure.is_some() && expected_failure_mismatch.is_none() {
                     let validation = expected_failure_artifacts
                         .as_ref()
@@ -351,7 +395,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                         validation.client_disruptions,
                     );
                     replace_last_attempt(&mut summary, attempt);
-                    if enforce_disruption_budget(&mut summary, disruption_budget_failure) {
+                    if enforce_disruption_budget(&mut summary, safety_failure) {
                         write_summary(&summary_path, &summary)?;
                         break 'suite;
                     }
@@ -370,11 +414,12 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                     "scenario {} repetition {} failed: {attempt_error}",
                     planned.plan.scenario, planned.plan.repetition
                 );
-                stop_after_attempt_failure = should_stop_after_attempt_failure(
-                    &execution_plan.suite.budgets.continue_on_severities,
-                    execution_plan.suite.budgets.stop_on_first_failure,
-                    failure_severity,
-                );
+                stop_after_attempt_failure = safety_failure.is_some()
+                    || should_stop_after_attempt_failure(
+                        &execution_plan.suite.budgets.continue_on_severities,
+                        execution_plan.suite.budgets.stop_on_first_failure,
+                        failure_severity,
+                    );
                 summary.record_attempt_failure(
                     &attempt,
                     failure_summary.as_ref(),
@@ -383,7 +428,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                     stop_after_attempt_failure,
                 );
                 replace_last_attempt(&mut summary, attempt);
-                if enforce_disruption_budget(&mut summary, disruption_budget_failure) {
+                if enforce_disruption_budget(&mut summary, safety_failure) {
                     write_summary(&summary_path, &summary)?;
                     break 'suite;
                 }
@@ -523,6 +568,9 @@ fn validate_expected_failure_artifact_contract(
     validate_expected_failure_artifacts(
         suite_root,
         Path::new(&plan.artifacts.case_dir),
+        plan.run_id
+            .as_deref()
+            .context("current suite plan attempt is missing runId")?,
         &plan.scenario,
         &plan.case_name,
         attempt_started_at_ms,
@@ -545,26 +593,16 @@ fn validate_expected_failure_match(
 
 struct ValidatedExpectedFailureEvaluation {
     mismatch: Option<String>,
-    disruption_budget_failure: Option<String>,
 }
 
 fn evaluate_validated_expected_failure(
-    summary: &mut FaultSuiteRunSummary,
-    attempt: &mut FaultSuiteRunAttempt,
     expected: &FaultExpectedFailure,
     validation: &ExpectedFailureArtifactReport,
 ) -> ValidatedExpectedFailureEvaluation {
-    // Once the artifact contract is trusted, its safety signal is authoritative
-    // even when the diagnostic expectation itself is wrong.
-    let disruption_budget_failure =
-        account_validated_failure_disruptions(summary, attempt, validation);
     let mismatch = validate_expected_failure_match(expected, validation)
         .err()
         .map(|error| format!("{error:#}"));
-    ValidatedExpectedFailureEvaluation {
-        mismatch,
-        disruption_budget_failure,
-    }
+    ValidatedExpectedFailureEvaluation { mismatch }
 }
 
 #[cfg(test)]
@@ -587,13 +625,46 @@ fn validate_expected_failure(
     Ok(validation)
 }
 
-fn account_validated_failure_disruptions(
+fn evaluate_failed_attempt_safety(
     summary: &mut FaultSuiteRunSummary,
     attempt: &mut FaultSuiteRunAttempt,
-    validation: &ExpectedFailureArtifactReport,
+    suite_root: &Path,
+    plan: &FaultSuitePlanAttempt,
+    evaluated_at_ms: u64,
+    trusted_disruptions: Option<usize>,
 ) -> Option<String> {
-    attempt.client_disruptions = Some(validation.client_disruptions);
-    summary.record_client_disruptions(validation.client_disruptions)
+    let disruptions = match trusted_disruptions {
+        Some(disruptions) => disruptions,
+        None => match plan
+            .run_id
+            .as_deref()
+            .context("planned attempt is missing runId")
+            .and_then(|run_id| {
+                validate_failed_attempt_disruptions(
+                    suite_root,
+                    Path::new(&plan.artifacts.case_dir),
+                    run_id,
+                    &plan.scenario,
+                    &plan.case_name,
+                    attempt.started_at_ms,
+                    evaluated_at_ms,
+                )
+            }) {
+            Ok(disruptions) => disruptions,
+            Err(error) => {
+                return Some(format!(
+                    "refusing to continue destructive suite because current-attempt client disruptions could not be verified: {error:#}"
+                ));
+            }
+        },
+    };
+    attempt.client_disruptions = Some(disruptions);
+    match summary.record_client_disruptions(disruptions) {
+        Ok(budget_failure) => budget_failure,
+        Err(error) => Some(format!(
+            "refusing to continue destructive suite because client disruption accounting failed: {error:#}"
+        )),
+    }
 }
 
 fn enforce_disruption_budget(
@@ -709,16 +780,20 @@ impl FaultSuiteRunSummary {
         self.status = SuiteRunStatus::Succeeded;
     }
 
-    fn record_client_disruptions(&mut self, disruptions: usize) -> Option<String> {
-        self.total_client_disruptions += disruptions;
-        self.max_client_disruptions
+    fn record_client_disruptions(&mut self, disruptions: usize) -> Result<Option<String>> {
+        self.total_client_disruptions = self
+            .total_client_disruptions
+            .checked_add(disruptions)
+            .context("suite client disruption count overflowed")?;
+        Ok(self
+            .max_client_disruptions
             .filter(|max| self.total_client_disruptions > *max)
             .map(|max| {
                 format!(
                     "suite maxClientDisruptions budget {max} was exceeded with {} disruptions",
                     self.total_client_disruptions
                 )
-            })
+            }))
     }
 
     fn record_suite_budget_failure(&mut self, reason: String) {
@@ -799,6 +874,7 @@ impl FaultSuiteRunSummary {
 impl FaultSuiteRunAttempt {
     fn running(
         index: usize,
+        run_id: &str,
         scenario: &str,
         repetition: usize,
         artifacts_dir: &Path,
@@ -806,6 +882,7 @@ impl FaultSuiteRunAttempt {
     ) -> Self {
         Self {
             index,
+            run_id: run_id.to_string(),
             scenario: scenario.to_string(),
             repetition,
             status: SuiteAttemptStatus::Running,
@@ -901,9 +978,9 @@ mod tests {
         FaultSuiteRunAttempt, FaultSuiteRunFailureKind, FaultSuiteRunSummary, FaultSuiteStopReason,
         SuiteAttemptStatus, SuiteRunStatus, artifact_validation_failure_details,
         attempt_failure_details, build_fault_suite_execution_plan, enforce_disruption_budget,
-        evaluate_validated_expected_failure, should_stop_after_attempt_failure,
-        suite_duration_budget_failure, validate_expected_failure,
-        validate_expected_failure_artifact_contract, write_summary,
+        evaluate_failed_attempt_safety, evaluate_validated_expected_failure,
+        should_stop_after_attempt_failure, suite_duration_budget_failure,
+        validate_expected_failure, validate_expected_failure_artifact_contract, write_summary,
     };
     use crate::fault::artifact_validation::validate_expected_failure_artifacts;
     use crate::fault::{
@@ -1254,8 +1331,14 @@ scenarios:
         )
         .expect("known classification")
         .with_recovered_within_seconds(Some(27));
-        let mut first_attempt =
-            FaultSuiteRunAttempt::running(1, "io-eio", 1, Path::new("attempts/0001"), None);
+        let mut first_attempt = FaultSuiteRunAttempt::running(
+            1,
+            "run-first",
+            "io-eio",
+            1,
+            Path::new("attempts/0001"),
+            None,
+        );
         first_attempt.fail("tail latency".to_string(), Some(&degraded));
         summary.record_attempt_failure(
             &first_attempt,
@@ -1282,8 +1365,14 @@ scenarios:
         )
         .expect("known classification")
         .with_evidence_classifications(["ambiguous_write_materialized", "data_corruption"]);
-        let mut second_attempt =
-            FaultSuiteRunAttempt::running(2, "network-delay", 1, Path::new("attempts/0002"), None);
+        let mut second_attempt = FaultSuiteRunAttempt::running(
+            2,
+            "run-second",
+            "network-delay",
+            1,
+            Path::new("attempts/0002"),
+            None,
+        );
         second_attempt.fail("hash mismatch".to_string(), Some(&hard_failure));
         assert_eq!(
             second_attempt.evidence_classifications.as_deref(),
@@ -1419,6 +1508,7 @@ scenarios:
         ));
         let mut attempt = FaultSuiteRunAttempt::running(
             planned.index,
+            planned.run_id.as_deref().expect("planned run id"),
             &planned.scenario,
             planned.repetition,
             Path::new(&planned.artifacts.attempt_dir),
@@ -1493,6 +1583,7 @@ scenarios:
         let artifact = failure_summary_artifact.clone();
         let mut attempt = FaultSuiteRunAttempt::running(
             planned.index,
+            planned.run_id.as_deref().expect("planned run id"),
             &planned.scenario,
             planned.repetition,
             Path::new(&planned.artifacts.attempt_dir),
@@ -1579,6 +1670,7 @@ scenarios:
                 .expect("matched expected failure");
         let mut attempt = FaultSuiteRunAttempt::running(
             planned.index,
+            planned.run_id.as_deref().expect("planned run id"),
             &planned.scenario,
             planned.repetition,
             Path::new(&planned.artifacts.attempt_dir),
@@ -1600,7 +1692,12 @@ scenarios:
         let mut run_summary =
             FaultSuiteRunSummary::started(&execution.suite, "suite-fixed".to_string());
         run_summary.max_client_disruptions = Some(1);
-        assert_eq!(run_summary.record_client_disruptions(1), None);
+        assert_eq!(
+            run_summary
+                .record_client_disruptions(1)
+                .expect("disruption accounting"),
+            None
+        );
         run_summary.attempts.push(attempt);
         run_summary.succeed();
         assert_eq!(run_summary.status, SuiteRunStatus::Succeeded);
@@ -1632,26 +1729,29 @@ scenarios:
         budget_summary.max_client_disruptions = Some(0);
         let mut mismatched_attempt = FaultSuiteRunAttempt::running(
             planned.index,
+            planned.run_id.as_deref().expect("planned run id"),
             &planned.scenario,
             planned.repetition,
             Path::new(&planned.artifacts.attempt_dir),
             Some(mismatched_expected.clone()),
         );
-        let evaluation = evaluate_validated_expected_failure(
+        let evaluation = evaluate_validated_expected_failure(&mismatched_expected, &validation);
+        assert!(evaluation.mismatch.is_some(), "fixture must mismatch");
+        let disruption_budget_failure = evaluate_failed_attempt_safety(
             &mut budget_summary,
             &mut mismatched_attempt,
-            &mismatched_expected,
-            &validation,
+            &suite_root,
+            planned,
+            100,
+            Some(validation.client_disruptions),
         );
-        assert!(evaluation.mismatch.is_some(), "fixture must mismatch");
         assert!(
-            evaluation.disruption_budget_failure.is_some(),
+            disruption_budget_failure.is_some(),
             "mismatch cannot bypass max=0"
         );
         assert_eq!(budget_summary.total_client_disruptions, 1);
         assert_eq!(mismatched_attempt.client_disruptions, Some(1));
-        let must_stop =
-            enforce_disruption_budget(&mut budget_summary, evaluation.disruption_budget_failure);
+        let must_stop = enforce_disruption_budget(&mut budget_summary, disruption_budget_failure);
         assert!(
             must_stop,
             "the runner must stop before scheduling another destructive attempt"
@@ -1671,7 +1771,10 @@ scenarios:
         assert_eq!(persisted["status"], "failed");
 
         let checker_path = case_dir.join("checker-report.json");
-        let mut clean_checker = expected_failure_checker_report(&planned.scenario);
+        let mut clean_checker = expected_failure_checker_report(
+            &planned.scenario,
+            planned.run_id.as_deref().expect("planned run id"),
+        );
         clean_checker["hash_mismatches"] = json!([]);
         clean_checker["passed"] = json!(true);
         fs::write(
@@ -1732,6 +1835,31 @@ scenarios:
         assert!(format!("{error:#}").contains("current case directory"));
 
         write_expected_failure_artifacts(&suite_root, planned, 1);
+        let copied_attempt_dir = suite_root.join("003-io-eio-r3");
+        let copied_case_dir = copied_attempt_dir.join(&planned.case_name);
+        fs::create_dir_all(&copied_case_dir).expect("copied case dir");
+        for entry in fs::read_dir(case_dir).expect("read source case") {
+            let entry = entry.expect("source artifact");
+            if entry.file_type().expect("artifact type").is_file() {
+                fs::copy(entry.path(), copied_case_dir.join(entry.file_name()))
+                    .expect("copy complete attempt bundle");
+            }
+        }
+        let mut copied_plan = planned.clone();
+        copied_plan.index = 3;
+        copied_plan.run_id = Some(crate::fault::suite_plan::fault_run_id());
+        copied_plan.artifacts.attempt_dir = copied_attempt_dir.display().to_string();
+        copied_plan.artifacts.case_dir = copied_case_dir.display().to_string();
+        let error = validate_expected_failure_artifact_contract(
+            &suite_root,
+            &copied_plan,
+            Some(&observed),
+            10,
+            100,
+        )
+        .expect_err("a self-consistent bundle copied to another planned attempt must be rejected");
+        assert!(format!("{error:#}").contains("does not match planned attempt"));
+
         let fault_evidence_path = case_dir.join("fault-evidence.json");
         let mut fault_evidence: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(&fault_evidence_path).expect("read fault evidence"),
@@ -1818,7 +1946,10 @@ scenarios:
             }
             write_failure_summary(case_dir, summary);
 
-            let mut checker = expected_failure_checker_report(&planned.scenario);
+            let mut checker = expected_failure_checker_report(
+                &planned.scenario,
+                planned.run_id.as_deref().expect("planned run id"),
+            );
             checker["hash_mismatches"] = json!([]);
             checker[signal] = value;
             if classification == "list_unavailable_or_unknown" {
@@ -1833,6 +1964,7 @@ scenarios:
             validate_expected_failure_artifacts(
                 &suite_root,
                 case_dir,
+                planned.run_id.as_deref().expect("planned run id"),
                 &planned.scenario,
                 &planned.case_name,
                 10,
@@ -1858,7 +1990,10 @@ scenarios:
         let relative_case = case_dir.strip_prefix(&suite_root).expect("relative case");
         let evidence_ref = |name: &str| relative_case.join(name).display().to_string();
 
-        let mut checker = expected_failure_checker_report(&planned.scenario);
+        let mut checker = expected_failure_checker_report(
+            &planned.scenario,
+            planned.run_id.as_deref().expect("planned run id"),
+        );
         checker["hash_mismatches"] = json!([]);
         checker["unavailable_committed_objects"] =
             json!(["k: outcome=Timeout status=200 error=\"get body read timed out\""]);
@@ -1868,6 +2003,8 @@ scenarios:
         )
         .expect("write checker report");
         let mut recovery = json!({
+            "scenario": planned.scenario,
+            "run_id": planned.run_id.as_deref().expect("planned run id"),
             "immediate_passed": false,
             "reread_attempted_keys": ["k"],
             "reread_recovered_keys": ["k"],
@@ -1904,11 +2041,12 @@ scenarios:
             evidence_ref("fault-evidence.json"),
             evidence_ref("run-events.jsonl")
         ]);
-        write_failure_summary(case_dir, summary);
+        write_failure_summary(case_dir, summary.clone());
 
         validate_expected_failure_artifacts(
             &suite_root,
             case_dir,
+            planned.run_id.as_deref().expect("planned run id"),
             &planned.scenario,
             &planned.case_name,
             10,
@@ -1926,16 +2064,50 @@ scenarios:
         let error = validate_expected_failure_artifacts(
             &suite_root,
             case_dir,
+            planned.run_id.as_deref().expect("planned run id"),
             &planned.scenario,
             &planned.case_name,
             10,
             100,
         )
         .expect_err("same-count recovery evidence for another key must be rejected");
-        assert!(format!("{error:#}").contains("committed_object_unavailable"));
+        assert!(format!("{error:#}").contains("key evidence"));
 
         recovery["reread_attempted_keys"] = json!(["k"]);
         recovery["reread_recovered_keys"] = json!(["k"]);
+
+        recovery["still_unavailable_keys"] = json!(["ghost"]);
+        recovery["classification"] = json!("committed_object_unavailable");
+        fs::write(
+            case_dir.join("recovery-stability-report.json"),
+            serde_json::to_string(&recovery).expect("recovery json"),
+        )
+        .expect("write ghost recovery report");
+        let mut ghost_summary = summary.clone();
+        ghost_summary["classification"] = json!("committed_object_unavailable");
+        ghost_summary["s3_model_classification"] = json!("committed_object_unavailable");
+        ghost_summary["severity"] = json!("fail_availability");
+        ghost_summary["data_correctness"] = json!("unknown");
+        ghost_summary["availability"] = json!("committed_object_unavailable");
+        ghost_summary["recovered_within_window"] = json!(false);
+        ghost_summary["recovered_within_seconds"] = serde_json::Value::Null;
+        ghost_summary["evidence_classifications"] = json!(["committed_object_unavailable"]);
+        write_failure_summary(case_dir, ghost_summary);
+        let error = validate_expected_failure_artifacts(
+            &suite_root,
+            case_dir,
+            planned.run_id.as_deref().expect("planned run id"),
+            &planned.scenario,
+            &planned.case_name,
+            10,
+            100,
+        )
+        .expect_err("recovered checker key plus a ghost unavailable key must be rejected");
+        assert!(format!("{error:#}").contains("absent from checker evidence"));
+
+        recovery["still_unavailable_keys"] = json!([]);
+        recovery["classification"] = json!("recovery_tail_read_latency");
+        write_failure_summary(case_dir, summary);
 
         let list_warning = "LIST prefix fault-test/ did not complete";
         checker["final_list_warning_count"] = json!(1);
@@ -1955,6 +2127,7 @@ scenarios:
         let error = validate_expected_failure_artifacts(
             &suite_root,
             case_dir,
+            planned.run_id.as_deref().expect("planned run id"),
             &planned.scenario,
             &planned.case_name,
             10,
@@ -1970,15 +2143,115 @@ scenarios:
         let mut summary = FaultSuiteRunSummary::started(&suite, "suite-fixed".to_string());
         summary.max_client_disruptions = Some(0);
         assert_eq!(
-            summary.record_client_disruptions(1).as_deref(),
+            summary
+                .record_client_disruptions(1)
+                .expect("disruption accounting")
+                .as_deref(),
             Some("suite maxClientDisruptions budget 0 was exceeded with 1 disruptions")
         );
 
         let mut summary = FaultSuiteRunSummary::started(&suite, "suite-fixed".to_string());
         summary.max_client_disruptions = Some(1);
-        assert_eq!(summary.record_client_disruptions(1), None);
-        assert!(summary.record_client_disruptions(1).is_some());
+        assert_eq!(
+            summary
+                .record_client_disruptions(1)
+                .expect("disruption accounting"),
+            None
+        );
+        assert!(
+            summary
+                .record_client_disruptions(1)
+                .expect("disruption accounting")
+                .is_some()
+        );
         assert_eq!(summary.total_client_disruptions, 2);
+    }
+
+    #[test]
+    fn failed_attempt_safety_stops_orchestration_before_the_next_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite = expected_failure_suite();
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+        base.cluster.artifacts_dir = dir.path().to_path_buf();
+        let execution = build_fault_suite_execution_plan(suite, base, "suite-fixed".to_string())
+            .expect("suite execution plan");
+        let planned = &execution.plan.attempts[0];
+        let suite_root = dir.path().join("rustfs-smoke/suite-fixed");
+        write_expected_failure_artifacts(&suite_root, planned, 1);
+
+        let mut summary =
+            FaultSuiteRunSummary::started(&execution.suite, "suite-fixed".to_string());
+        summary.stop_on_first_failure = false;
+        summary.max_client_disruptions = Some(0);
+        let mut visited = 0;
+        for _ in 0..2 {
+            visited += 1;
+            let mut attempt = FaultSuiteRunAttempt::running(
+                planned.index,
+                planned.run_id.as_deref().expect("planned run id"),
+                &planned.scenario,
+                planned.repetition,
+                Path::new(&planned.artifacts.attempt_dir),
+                None,
+            );
+            attempt.started_at_ms = 10;
+            let safety_failure = evaluate_failed_attempt_safety(
+                &mut summary,
+                &mut attempt,
+                &suite_root,
+                planned,
+                100,
+                None,
+            );
+            if enforce_disruption_budget(&mut summary, safety_failure) {
+                break;
+            }
+        }
+        assert_eq!(visited, 1, "max=0 must stop before a second attempt");
+        assert_eq!(summary.total_client_disruptions, 1);
+
+        write_expected_failure_artifacts(&suite_root, planned, 1);
+        fs::remove_file(Path::new(&planned.artifacts.case_dir).join("fault-evidence.json"))
+            .expect("remove evidence");
+        let mut summary =
+            FaultSuiteRunSummary::started(&execution.suite, "suite-invalid".to_string());
+        summary.stop_on_first_failure = false;
+        summary.max_client_disruptions = Some(0);
+        let mut visited = 0;
+        for _ in 0..2 {
+            visited += 1;
+            let mut attempt = FaultSuiteRunAttempt::running(
+                planned.index,
+                planned.run_id.as_deref().expect("planned run id"),
+                &planned.scenario,
+                planned.repetition,
+                Path::new(&planned.artifacts.attempt_dir),
+                None,
+            );
+            attempt.started_at_ms = 10;
+            let safety_failure = evaluate_failed_attempt_safety(
+                &mut summary,
+                &mut attempt,
+                &suite_root,
+                planned,
+                100,
+                None,
+            );
+            assert!(
+                safety_failure
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("could not be verified"))
+            );
+            if enforce_disruption_budget(&mut summary, safety_failure) {
+                break;
+            }
+        }
+        assert_eq!(
+            visited, 1,
+            "invalid evidence must fail closed before a second attempt"
+        );
+        assert_eq!(summary.total_client_disruptions, 0);
     }
 
     fn single_scenario_suite() -> crate::fault::suite::ResolvedFaultSuite {
@@ -2036,11 +2309,12 @@ scenarios:
         client_disruptions: usize,
     ) -> serde_json::Value {
         let case_dir = Path::new(&planned.artifacts.case_dir);
+        let run_id = planned.run_id.as_deref().expect("planned run id");
         fs::create_dir_all(case_dir).expect("case dir");
         fs::write(
             case_dir.join("run-spec.json"),
             serde_json::to_string(&json!({
-                "metadata": {"name": planned.case_name, "run_id": "run-1"},
+                "metadata": {"name": planned.case_name, "run_id": run_id},
                 "scenario": {"name": planned.scenario, "case_name": planned.case_name}
             }))
             .expect("run spec json"),
@@ -2048,7 +2322,7 @@ scenarios:
         .expect("run spec");
         fs::write(
             case_dir.join("checker-report.json"),
-            serde_json::to_string(&expected_failure_checker_report(&planned.scenario))
+            serde_json::to_string(&expected_failure_checker_report(&planned.scenario, run_id))
                 .expect("checker json"),
         )
         .expect("checker report");
@@ -2056,6 +2330,7 @@ scenarios:
             case_dir.join("fault-evidence.json"),
             serde_json::to_string(&json!({
                 "scenario": planned.scenario,
+                "run_id": run_id,
                 "injected": true,
                 "active_during_workload": true,
                 "recovered": true,
@@ -2076,11 +2351,37 @@ scenarios:
             .expect("evidence json"),
         )
         .expect("fault evidence");
+        let counts = |failed: usize| {
+            json!({
+                "ok": 0,
+                "not_found": 0,
+                "failed": failed,
+                "timeout": 0,
+                "unknown": 0
+            })
+        };
+        fs::write(
+            case_dir.join("workload-summary.json"),
+            serde_json::to_string(&json!({
+                "seed": 1,
+                "object_count": 1,
+                "concurrency": 1,
+                "recommitted_after_recovery": 0,
+                "puts": counts(client_disruptions),
+                "gets": counts(0),
+                "deletes": counts(0),
+                "lists": counts(0),
+                "multipart_completes": counts(0),
+                "multipart_aborts": counts(0)
+            }))
+            .expect("workload summary json"),
+        )
+        .expect("workload summary");
         fs::write(
             case_dir.join("run-events.jsonl"),
             [
-                json!({"at_ms": 10, "scenario": planned.scenario, "run_id": "run-1", "stage": "run", "status": "started", "message": "started"}).to_string(),
-                json!({"at_ms": 90, "scenario": planned.scenario, "run_id": "run-1", "stage": "run", "status": "failed", "message": "failed"}).to_string(),
+                json!({"at_ms": 10, "scenario": planned.scenario, "run_id": run_id, "stage": "run", "status": "started", "message": "started"}).to_string(),
+                json!({"at_ms": 90, "scenario": planned.scenario, "run_id": run_id, "stage": "run", "status": "failed", "message": "failed"}).to_string(),
             ]
             .join("\n"),
         )
@@ -2090,6 +2391,7 @@ scenarios:
         let summary = json!({
             "schema_version": 2,
             "scenario": planned.scenario,
+            "run_id": run_id,
             "case_name": planned.case_name,
             "observed_at_ms": 85,
             "stage": "checker-verdict",
@@ -2113,10 +2415,10 @@ scenarios:
         summary
     }
 
-    fn expected_failure_checker_report(scenario: &str) -> serde_json::Value {
+    fn expected_failure_checker_report(scenario: &str, run_id: &str) -> serde_json::Value {
         json!({
             "scenario": scenario,
-            "run_id": "run-1",
+            "run_id": run_id,
             "committed_puts": 1,
             "expected_live_objects": 1,
             "verified_live_objects": 1,

@@ -47,6 +47,7 @@ pub(crate) struct PodIdentity {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct FaultEvidence {
     pub(crate) scenario: String,
+    pub(crate) run_id: String,
     pub(crate) backend: String,
     pub(crate) target: String,
     pub(crate) injected: bool,
@@ -391,6 +392,8 @@ pub(crate) struct FailureSummary {
     #[serde(default = "legacy_failure_summary_schema_version")]
     schema_version: u8,
     scenario: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     case_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -448,6 +451,7 @@ impl FailureSummary {
         let projection = FailureV2Projection::from_classification(classification);
         Ok(Self {
             schema_version: FAILURE_SUMMARY_SCHEMA_VERSION,
+            run_id: None,
             scenario: scenario.into(),
             case_name: None,
             observed_at_ms: Some(now_ms()),
@@ -471,6 +475,11 @@ impl FailureSummary {
             recovered_within_seconds: None,
             message: message.into(),
         })
+    }
+
+    pub(crate) fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
     }
 
     fn with_case_name(mut self, case_name: &str) -> Self {

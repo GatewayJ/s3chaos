@@ -64,6 +64,8 @@ pub struct ConsolePlannedAttemptView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scenario: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub case_name: Option<String>,
@@ -171,6 +173,8 @@ pub struct ConsoleSuiteFailureView {
 pub struct ConsoleSuiteAttemptView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scenario: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -460,7 +464,17 @@ pub fn build_console_snapshot(root: impl AsRef<Path>) -> Result<ConsoleSnapshot>
     }
 
     let exit_codes = read_exit_codes(root, &index.exit_codes, &mut warnings);
-    if index.failure_summaries.is_empty()
+    let expected_failure_proof_missing = suite_summary
+        .as_ref()
+        .is_some_and(|summary| expected_failure_attempt_missing_summary(root, summary));
+    if expected_failure_proof_missing {
+        push_warning(
+            &mut warnings,
+            "failure-summary.json",
+            &artifact_root,
+            "expected-failure attempt is matched but its failure-summary.json proof is missing",
+        );
+    } else if index.failure_summaries.is_empty()
         && should_warn_missing_failure_summary(suite_summary.as_ref(), &attempts)
     {
         push_warning(
@@ -1638,6 +1652,7 @@ struct SuitePlanExtract {
 #[serde(default, rename_all = "camelCase")]
 struct SuitePlanAttemptExtract {
     index: Option<usize>,
+    run_id: Option<String>,
     scenario: Option<String>,
     case_name: Option<String>,
     repetition: Option<usize>,
@@ -1661,6 +1676,7 @@ impl ConsolePlannedAttemptView {
         let artifacts = value.artifacts.unwrap_or_default();
         Self {
             index: value.index,
+            run_id: value.run_id,
             scenario: value.scenario,
             case_name: value.case_name,
             repetition: value.repetition,
@@ -1736,6 +1752,7 @@ impl ConsoleSuiteFailureView {
 #[serde(default, rename_all = "camelCase")]
 struct SuiteAttemptExtract {
     index: Option<usize>,
+    run_id: Option<String>,
     scenario: Option<String>,
     repetition: Option<usize>,
     status: Option<String>,
@@ -1764,6 +1781,7 @@ impl ConsoleSuiteAttemptView {
     fn from_extract(root: &Path, value: SuiteAttemptExtract) -> Self {
         Self {
             index: value.index,
+            run_id: value.run_id,
             scenario: value.scenario,
             repetition: value.repetition,
             status: value.status,
@@ -1896,6 +1914,21 @@ fn should_warn_missing_failure_summary(
     }) || attempts
         .iter()
         .any(|attempt| attempt.status.as_deref() == Some("failed"))
+}
+
+fn expected_failure_attempt_missing_summary(
+    root: &Path,
+    summary: &ConsoleSuiteSummaryView,
+) -> bool {
+    summary.attempts.iter().any(|attempt| {
+        let matched = attempt.status.as_deref() == Some("expected-failure")
+            || attempt.expected_failure_matched == Some(true);
+        matched
+            && attempt
+                .failure_summary
+                .as_deref()
+                .is_none_or(|path| !root.join(path).is_file())
+    })
 }
 
 fn should_warn_missing_runner_failure_summary(exit_codes: &[ConsoleExitCodeView]) -> bool {
@@ -2150,6 +2183,12 @@ mod tests {
             attempt.failure_summary.as_deref(),
             Some("001-io-eio-r1/case/failure-summary.json")
         );
+        assert!(snapshot.warnings.iter().any(|warning| {
+            warning.artifact == "failure-summary.json"
+                && warning
+                    .message
+                    .contains("expected-failure attempt is matched")
+        }));
     }
 
     #[test]
