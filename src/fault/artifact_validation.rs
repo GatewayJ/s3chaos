@@ -22,8 +22,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::fault::{
-    checker::RecoveryStabilityReport,
-    checker::{CheckerReport, RecoveryStabilityClassification},
+    checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
     config::{
         DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, DEFAULT_RUSTFS_POD_COUNT,
         DEFAULT_RUSTFS_POD_STABLE_WINDOW_SECONDS, DEFAULT_RUSTFS_VOLUME_PATH,
@@ -1179,21 +1178,91 @@ pub(crate) fn validate_expected_failure_artifacts(
         "run-events.jsonl is missing current-attempt run started or failed events"
     );
 
-    for name in ["checker-report.json", "checker-pre-recommit-report.json"] {
-        if let Some(path) = referenced.get(name) {
-            let checker = read_json::<ExpectedFailureCheckerIdentity>(path)?;
-            ensure!(
-                checker.scenario == scenario && checker.run_id == run_spec.metadata.run_id,
-                "{name} identity does not match the current attempt"
-            );
-        }
-    }
+    validate_expected_failure_signal(&summary, &referenced, scenario, &run_spec.metadata.run_id)?;
 
     Ok(ExpectedFailureArtifactReport {
         failure_summary: summary_path.display().to_string(),
         summary: typed_summary,
         client_disruptions: evidence.client_disruptions,
     })
+}
+
+fn validate_expected_failure_signal(
+    summary: &FailureSummaryArtifact,
+    referenced: &BTreeMap<String, PathBuf>,
+    scenario: &str,
+    run_id: &str,
+) -> Result<()> {
+    ensure!(
+        summary.phase == Some(FailurePhase::Checker),
+        "expected product failure must be emitted by the checker phase"
+    );
+    match summary.stage.as_str() {
+        "checker-verdict" => {
+            let report =
+                read_expected_failure_checker(referenced, "checker-report.json", scenario, run_id)?;
+            ensure!(
+                !report.passed,
+                "checker-report.json passed and cannot support an expected failure"
+            );
+            let observed = checker::classify_without_reread(&report);
+            ensure!(
+                observed.as_str() == summary.classification,
+                "checker-report.json supports classification {:?}, not {:?}",
+                observed.as_str(),
+                summary.classification
+            );
+        }
+        "checker-pre-recommit-verdict" => {
+            let checker = read_expected_failure_checker(
+                referenced,
+                "checker-pre-recommit-report.json",
+                scenario,
+                run_id,
+            )?;
+            ensure!(
+                !checker.passed,
+                "checker-pre-recommit-report.json passed and cannot support an expected failure"
+            );
+            let recovery_path = referenced
+                .get("recovery-stability-report.json")
+                .context("pre-recommit expected failure requires recovery-stability-report.json")?;
+            let recovery = read_json::<RecoveryStabilityReport>(recovery_path)?;
+            validate_recovery_stability_report(&recovery)?;
+            ensure!(
+                recovery.immediate_passed == checker.passed,
+                "recovery-stability-report.json immediate_passed does not match checker-pre-recommit-report.json"
+            );
+            ensure!(
+                recovery.classification.as_str() == summary.classification,
+                "recovery-stability-report.json supports classification {:?}, not {:?}",
+                recovery.classification.as_str(),
+                summary.classification
+            );
+            validate_recovery_failure_summary_fields(summary, &recovery)?;
+        }
+        stage => bail!(
+            "expected product failure stage {stage:?} has no supported checker evidence contract"
+        ),
+    }
+    Ok(())
+}
+
+fn read_expected_failure_checker(
+    referenced: &BTreeMap<String, PathBuf>,
+    name: &str,
+    scenario: &str,
+    run_id: &str,
+) -> Result<CheckerReport> {
+    let path = referenced
+        .get(name)
+        .with_context(|| format!("expected failure requires {name}"))?;
+    let report = read_json::<CheckerReport>(path)?;
+    ensure!(
+        report.scenario == scenario && report.run_id == run_id,
+        "{name} identity does not match the current attempt"
+    );
+    Ok(report)
 }
 
 fn validate_failure_summary_v2_fields(
@@ -1732,12 +1801,6 @@ struct ExpectedFailureRunMetadataIdentity {
 struct ExpectedFailureScenarioIdentity {
     name: String,
     case_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExpectedFailureCheckerIdentity {
-    scenario: String,
-    run_id: String,
 }
 
 #[derive(Debug, Deserialize)]

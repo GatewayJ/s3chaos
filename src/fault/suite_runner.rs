@@ -285,8 +285,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                         );
                     }
                     replace_last_attempt(&mut summary, attempt);
-                    if let Some(reason) = disruption_budget_failure {
-                        summary.record_suite_budget_failure(reason);
+                    if enforce_disruption_budget(&mut summary, disruption_budget_failure) {
                         write_summary(&summary_path, &summary)?;
                         break 'suite;
                     }
@@ -316,25 +315,47 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
             Err(error) => {
                 let (attempt_error, failure_summary, failure_severity) =
                     attempt_failure_details(&planned.plan, error.to_string());
-                let expected_failure_result =
-                    planned.plan.expected_failure.as_ref().map(|expected| {
-                        validate_expected_failure(
-                            &suite_root,
-                            &planned.plan,
-                            expected,
-                            failure_summary.as_ref(),
-                            attempt.started_at_ms,
-                            now_ms(),
+                let expected_failure_artifacts = planned.plan.expected_failure.as_ref().map(|_| {
+                    validate_expected_failure_artifact_contract(
+                        &suite_root,
+                        &planned.plan,
+                        failure_summary.as_ref(),
+                        attempt.started_at_ms,
+                        now_ms(),
+                    )
+                });
+                let disruption_budget_failure = expected_failure_artifacts
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .and_then(|validation| {
+                        account_validated_failure_disruptions(
+                            &mut summary,
+                            &mut attempt,
+                            validation,
                         )
                     });
-                if let Some(Ok(validation)) = expected_failure_result.as_ref() {
+                let expected_failure_mismatch = match (
+                    planned.plan.expected_failure.as_ref(),
+                    expected_failure_artifacts.as_ref(),
+                ) {
+                    (Some(expected), Some(Ok(validation))) => {
+                        validate_expected_failure_match(expected, validation)
+                            .err()
+                            .map(|error| format!("{error:#}"))
+                    }
+                    (Some(_), Some(Err(error))) => Some(format!("{error:#}")),
+                    _ => None,
+                };
+                if planned.plan.expected_failure.is_some() && expected_failure_mismatch.is_none() {
+                    let validation = expected_failure_artifacts
+                        .as_ref()
+                        .and_then(|result| result.as_ref().ok())
+                        .expect("a matched expected failure has validated artifacts");
                     attempt.satisfy_expected_failure(
                         &validation.summary,
                         validation.failure_summary.clone(),
                         validation.client_disruptions,
                     );
-                    let disruption_budget_failure =
-                        summary.record_client_disruptions(validation.client_disruptions);
                     replace_last_attempt(&mut summary, attempt);
                     if let Some(reason) = disruption_budget_failure {
                         summary.record_suite_budget_failure(reason);
@@ -345,11 +366,10 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                     continue 'suite;
                 }
 
-                let attempt_error = match expected_failure_result {
-                    Some(Err(mismatch)) => {
+                let attempt_error = match expected_failure_mismatch {
+                    Some(mismatch) => {
                         format!("{attempt_error}; expected failure did not match: {mismatch}")
                     }
-                    Some(Ok(_)) => unreachable!("matched expected failure returned above"),
                     None => attempt_error,
                 };
                 attempt.fail(attempt_error.clone(), failure_summary.as_ref());
@@ -370,6 +390,10 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
                     stop_after_attempt_failure,
                 );
                 replace_last_attempt(&mut summary, attempt);
+                if enforce_disruption_budget(&mut summary, disruption_budget_failure) {
+                    write_summary(&summary_path, &summary)?;
+                    break 'suite;
+                }
             }
         }
 
@@ -495,6 +519,38 @@ fn read_attempt_failure_summary(plan: &FaultSuitePlanAttempt) -> Result<Option<F
     Ok(Some(summary))
 }
 
+fn validate_expected_failure_artifact_contract(
+    suite_root: &Path,
+    plan: &FaultSuitePlanAttempt,
+    observed: Option<&FailureSummary>,
+    attempt_started_at_ms: u64,
+    evaluated_at_ms: u64,
+) -> Result<ExpectedFailureArtifactReport> {
+    observed.context("failure-summary.json is missing or unreadable")?;
+    validate_expected_failure_artifacts(
+        suite_root,
+        Path::new(&plan.artifacts.case_dir),
+        &plan.scenario,
+        &plan.case_name,
+        attempt_started_at_ms,
+        evaluated_at_ms,
+    )
+    .context("failure-summary.json does not satisfy the artifact contract")
+}
+
+fn validate_expected_failure_match(
+    expected: &FaultExpectedFailure,
+    validation: &ExpectedFailureArtifactReport,
+) -> Result<()> {
+    expected.validate_observed(
+        validation.summary.classification(),
+        validation.summary.severity(),
+        validation.summary.responsibility_domain(),
+        validation.summary.primary_evidence_refs(),
+    )
+}
+
+#[cfg(test)]
 fn validate_expected_failure(
     suite_root: &Path,
     plan: &FaultSuitePlanAttempt,
@@ -503,23 +559,36 @@ fn validate_expected_failure(
     attempt_started_at_ms: u64,
     evaluated_at_ms: u64,
 ) -> Result<ExpectedFailureArtifactReport> {
-    observed.context("failure-summary.json is missing or unreadable")?;
-    let validation = validate_expected_failure_artifacts(
+    let validation = validate_expected_failure_artifact_contract(
         suite_root,
-        Path::new(&plan.artifacts.case_dir),
-        &plan.scenario,
-        &plan.case_name,
+        plan,
+        observed,
         attempt_started_at_ms,
         evaluated_at_ms,
-    )
-    .context("failure-summary.json does not satisfy the artifact contract")?;
-    expected.validate_observed(
-        validation.summary.classification(),
-        validation.summary.severity(),
-        validation.summary.responsibility_domain(),
-        validation.summary.primary_evidence_refs(),
     )?;
+    validate_expected_failure_match(expected, &validation)?;
     Ok(validation)
+}
+
+fn account_validated_failure_disruptions(
+    summary: &mut FaultSuiteRunSummary,
+    attempt: &mut FaultSuiteRunAttempt,
+    validation: &ExpectedFailureArtifactReport,
+) -> Option<String> {
+    attempt.client_disruptions = Some(validation.client_disruptions);
+    summary.record_client_disruptions(validation.client_disruptions)
+}
+
+fn enforce_disruption_budget(
+    summary: &mut FaultSuiteRunSummary,
+    budget_failure: Option<String>,
+) -> bool {
+    if let Some(reason) = budget_failure {
+        summary.record_suite_budget_failure(reason);
+        true
+    } else {
+        false
+    }
 }
 
 fn attempt_failure_details(
@@ -813,15 +882,21 @@ fn now_ms() -> u64 {
 mod tests {
     use super::{
         FaultSuiteRunAttempt, FaultSuiteRunFailureKind, FaultSuiteRunSummary, FaultSuiteStopReason,
-        SuiteAttemptStatus, SuiteRunStatus, artifact_validation_failure_details,
-        attempt_failure_details, build_fault_suite_execution_plan,
+        SuiteAttemptStatus, SuiteRunStatus, account_validated_failure_disruptions,
+        artifact_validation_failure_details, attempt_failure_details,
+        build_fault_suite_execution_plan, enforce_disruption_budget,
         should_stop_after_attempt_failure, suite_duration_budget_failure,
-        validate_expected_failure,
+        validate_expected_failure, validate_expected_failure_artifact_contract,
+        validate_expected_failure_match,
     };
+    use crate::fault::artifact_validation::validate_expected_failure_artifacts;
     use crate::fault::{
         config::FaultTestConfig,
         plan::FaultInjectionParameters,
-        reporting::{FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain},
+        reporting::{
+            FailureClassification, FailurePhase, FailureSeverity, FailureSummary,
+            ResponsibilityDomain,
+        },
         suite::FaultSuite,
     };
     use serde_json::json;
@@ -1525,6 +1600,60 @@ scenarios:
         );
         assert_eq!(suite_summary_json["totalClientDisruptions"], 1);
 
+        let mut mismatched_expected = expected.clone();
+        mismatched_expected.classification = FailureClassification::CommittedObjectUnavailable;
+        mismatched_expected.severity = FailureSeverity::FailAvailability;
+        let validation = validate_expected_failure_artifact_contract(
+            &suite_root,
+            planned,
+            Some(&observed),
+            10,
+            100,
+        )
+        .expect("strict artifact validation remains independent of typed matching");
+        assert!(validate_expected_failure_match(&mismatched_expected, &validation).is_err());
+        let mut budget_summary =
+            FaultSuiteRunSummary::started(&execution.suite, "suite-budget".to_string());
+        budget_summary.max_client_disruptions = Some(0);
+        let mut mismatched_attempt = FaultSuiteRunAttempt::running(
+            planned.index,
+            &planned.scenario,
+            planned.repetition,
+            Path::new(&planned.artifacts.attempt_dir),
+            Some(mismatched_expected),
+        );
+        let budget_failure = account_validated_failure_disruptions(
+            &mut budget_summary,
+            &mut mismatched_attempt,
+            &validation,
+        );
+        assert!(budget_failure.is_some(), "mismatch cannot bypass max=0");
+        assert_eq!(budget_summary.total_client_disruptions, 1);
+        assert_eq!(mismatched_attempt.client_disruptions, Some(1));
+        assert!(
+            enforce_disruption_budget(&mut budget_summary, budget_failure),
+            "the runner must stop before scheduling another destructive attempt"
+        );
+        assert_eq!(budget_summary.status, SuiteRunStatus::Failed);
+        assert!(matches!(
+            budget_summary.stop_reason,
+            Some(FaultSuiteStopReason::Failure { .. })
+        ));
+
+        let checker_path = case_dir.join("checker-report.json");
+        let mut clean_checker = expected_failure_checker_report(&planned.scenario);
+        clean_checker["hash_mismatches"] = json!([]);
+        clean_checker["passed"] = json!(true);
+        fs::write(
+            &checker_path,
+            serde_json::to_string(&clean_checker).expect("checker json"),
+        )
+        .expect("write clean checker");
+        let error =
+            validate_expected_failure(&suite_root, planned, expected, Some(&observed), 10, 100)
+                .expect_err("a passing checker without corruption cannot prove data corruption");
+        assert!(format!("{error:#}").contains("passed"));
+
         let mut legacy_summary = failure_summary_json.clone();
         legacy_summary["schema_version"] = json!(1);
         write_failure_summary(case_dir, legacy_summary.clone());
@@ -1595,6 +1724,166 @@ scenarios:
         let error = validate_expected_failure(&suite_root, planned, expected, None, 10, 100)
             .expect_err("missing signal cannot match");
         assert!(error.to_string().contains("missing or unreadable"));
+    }
+
+    #[test]
+    fn expected_failure_signal_accepts_each_supported_checker_classification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite = expected_failure_suite();
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+        base.cluster.artifacts_dir = dir.path().to_path_buf();
+        let execution = build_fault_suite_execution_plan(suite, base, "suite-fixed".to_string())
+            .expect("suite execution plan");
+        let planned = &execution.plan.attempts[0];
+        let suite_root = dir.path().join("rustfs-smoke/suite-fixed");
+        let case_dir = Path::new(&planned.artifacts.case_dir);
+
+        for (classification, severity, correctness, availability, signal, value) in [
+            (
+                "data_corruption",
+                "fail_correctness",
+                "failed",
+                "unknown",
+                "hash_mismatches",
+                json!(["k: hash mismatch"]),
+            ),
+            (
+                "ambiguous_write_materialized",
+                "needs_investigation",
+                "unknown",
+                "unknown",
+                "unknown_writes_materialized",
+                json!(["k: ambiguous write materialized"]),
+            ),
+            (
+                "committed_object_unavailable",
+                "fail_availability",
+                "unknown",
+                "committed_object_unavailable",
+                "unavailable_committed_objects",
+                json!(["k"]),
+            ),
+            (
+                "list_unavailable_or_unknown",
+                "fail_availability",
+                "unknown",
+                "list_unavailable_or_unknown",
+                "list_warnings",
+                json!(["LIST prefix fault-test/ did not complete"]),
+            ),
+        ] {
+            let mut summary = write_expected_failure_artifacts(&suite_root, planned, 1);
+            summary["classification"] = json!(classification);
+            summary["s3_model_classification"] = json!(classification);
+            summary["severity"] = json!(severity);
+            summary["data_correctness"] = json!(correctness);
+            summary["availability"] = json!(availability);
+            summary["corruption"] = json!(classification == "data_corruption");
+            if matches!(
+                classification,
+                "committed_object_unavailable" | "list_unavailable_or_unknown"
+            ) {
+                summary["recovered_within_window"] = json!(false);
+            }
+            write_failure_summary(case_dir, summary);
+
+            let mut checker = expected_failure_checker_report(&planned.scenario);
+            checker["hash_mismatches"] = json!([]);
+            checker[signal] = value;
+            if classification == "list_unavailable_or_unknown" {
+                checker["final_list_warning_count"] = json!(1);
+            }
+            fs::write(
+                case_dir.join("checker-report.json"),
+                serde_json::to_string(&checker).expect("checker json"),
+            )
+            .expect("write checker report");
+
+            validate_expected_failure_artifacts(
+                &suite_root,
+                case_dir,
+                &planned.scenario,
+                &planned.case_name,
+                10,
+                100,
+            )
+            .unwrap_or_else(|error| panic!("{classification} evidence rejected: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn expected_failure_signal_accepts_recovery_tail_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite = expected_failure_suite();
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+        base.cluster.artifacts_dir = dir.path().to_path_buf();
+        let execution = build_fault_suite_execution_plan(suite, base, "suite-fixed".to_string())
+            .expect("suite execution plan");
+        let planned = &execution.plan.attempts[0];
+        let suite_root = dir.path().join("rustfs-smoke/suite-fixed");
+        let case_dir = Path::new(&planned.artifacts.case_dir);
+        let mut summary = write_expected_failure_artifacts(&suite_root, planned, 1);
+        let relative_case = case_dir.strip_prefix(&suite_root).expect("relative case");
+        let evidence_ref = |name: &str| relative_case.join(name).display().to_string();
+
+        let mut checker = expected_failure_checker_report(&planned.scenario);
+        checker["hash_mismatches"] = json!([]);
+        checker["unavailable_committed_objects"] = json!(["k"]);
+        fs::write(
+            case_dir.join("checker-pre-recommit-report.json"),
+            serde_json::to_string(&checker).expect("checker json"),
+        )
+        .expect("write checker report");
+        fs::write(
+            case_dir.join("recovery-stability-report.json"),
+            serde_json::to_string(&json!({
+                "immediate_passed": false,
+                "reread_attempted_keys": ["k"],
+                "reread_recovered_keys": ["k"],
+                "still_unavailable_keys": [],
+                "hash_mismatches": [],
+                "data_corruption_evidence": [],
+                "ambiguous_write_evidence": [],
+                "final_list_warning_count": 0,
+                "list_warnings": [],
+                "harness_errors": [],
+                "max_recovery_seconds": 60,
+                "recovered_within_seconds": 27,
+                "classification": "recovery_tail_read_latency"
+            }))
+            .expect("recovery json"),
+        )
+        .expect("write recovery report");
+        summary["stage"] = json!("checker-pre-recommit-verdict");
+        summary["classification"] = json!("recovery_tail_read_latency");
+        summary["s3_model_classification"] = json!("recovery_tail_read_latency");
+        summary["severity"] = json!("degraded");
+        summary["data_correctness"] = json!("passed");
+        summary["availability"] = json!("recovered_after_tail_latency");
+        summary["data_loss"] = json!(false);
+        summary["corruption"] = json!(false);
+        summary["recovered_within_window"] = json!(true);
+        summary["recovered_within_seconds"] = json!(27);
+        summary["evidence_classifications"] = json!(["recovery_tail_read_latency"]);
+        summary["primary_evidence_refs"] = json!([
+            evidence_ref("recovery-stability-report.json"),
+            evidence_ref("checker-pre-recommit-report.json"),
+            evidence_ref("fault-evidence.json"),
+            evidence_ref("run-events.jsonl")
+        ]);
+        write_failure_summary(case_dir, summary);
+
+        validate_expected_failure_artifacts(
+            &suite_root,
+            case_dir,
+            &planned.scenario,
+            &planned.case_name,
+            10,
+            100,
+        )
+        .expect("recovery-tail evidence");
     }
 
     #[test]
@@ -1681,7 +1970,7 @@ scenarios:
         .expect("run spec");
         fs::write(
             case_dir.join("checker-report.json"),
-            serde_json::to_string(&json!({"scenario": planned.scenario, "run_id": "run-1"}))
+            serde_json::to_string(&expected_failure_checker_report(&planned.scenario))
                 .expect("checker json"),
         )
         .expect("checker report");
@@ -1744,5 +2033,28 @@ scenarios:
         });
         write_failure_summary(case_dir, summary.clone());
         summary
+    }
+
+    fn expected_failure_checker_report(scenario: &str) -> serde_json::Value {
+        json!({
+            "scenario": scenario,
+            "run_id": "run-1",
+            "committed_puts": 1,
+            "expected_live_objects": 1,
+            "verified_live_objects": 1,
+            "missing_committed_objects": [],
+            "unavailable_committed_objects": [],
+            "unknown_committed_read_failures": [],
+            "hash_mismatches": ["k: hash mismatch"],
+            "successful_corrupted_reads": [],
+            "unexpected_visible_deleted_objects": [],
+            "list_history_warning_count": 0,
+            "final_list_warning_count": 0,
+            "list_history_warnings": [],
+            "list_warnings": [],
+            "final_listed_objects": 1,
+            "tenant_recovered": true,
+            "passed": false
+        })
     }
 }

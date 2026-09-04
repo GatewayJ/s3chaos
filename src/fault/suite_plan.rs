@@ -100,7 +100,8 @@ pub struct FaultSuitePlanAttempt {
     pub impact_policy: String,
     pub expected_backend: String,
     pub catalog_target: String,
-    pub detector: FaultDetectorContract,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector: Option<FaultDetectorContract>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_failure: Option<FaultExpectedFailure>,
     pub fault_duration_seconds: u64,
@@ -361,7 +362,34 @@ pub(crate) fn build_fault_suite_plan_expansion(
 
 impl FaultSuitePlan {
     pub fn to_json(&self) -> Result<String> {
+        self.validate_current_contract()?;
         Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    fn validate_current_contract(&self) -> Result<()> {
+        ensure!(
+            self.api_version == FAULT_SUITE_PLAN_API_VERSION && self.kind == FAULT_SUITE_PLAN_KIND,
+            "fault suite plan apiVersion/kind is unsupported"
+        );
+        for attempt in &self.attempts {
+            attempt
+                .detector
+                .as_ref()
+                .with_context(|| {
+                    format!(
+                        "current fault suite plan attempt {} ({}) is missing detector contract",
+                        attempt.index, attempt.scenario
+                    )
+                })?
+                .validate()
+                .with_context(|| {
+                    format!(
+                        "current fault suite plan attempt {} ({}) has invalid detector contract",
+                        attempt.index, attempt.scenario
+                    )
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -422,7 +450,7 @@ impl FaultSuitePlanAttempt {
             impact_policy: input.spec.impact_policy.as_str().to_string(),
             expected_backend: input.spec.backend.as_str().to_string(),
             catalog_target: input.spec.target.to_string(),
-            detector: input.spec.detector.contract(),
+            detector: Some(input.spec.detector.contract()),
             expected_failure: input.scenario.expected_failure.clone(),
             fault_duration_seconds: input.config.duration.as_secs(),
             workload: FaultSuitePlanWorkload {
@@ -1003,7 +1031,10 @@ scenarios:
             .expect("suite plan expansion");
         let attempt = &expansion.plan.attempts[0];
 
-        assert_eq!(attempt.detector, expansion.suite.scenarios[0].detector);
+        assert_eq!(
+            attempt.detector.as_ref(),
+            Some(&expansion.suite.scenarios[0].detector)
+        );
         assert_eq!(
             attempt.expected_failure,
             expansion.suite.scenarios[0].expected_failure
@@ -1022,6 +1053,33 @@ scenarios:
         let encoded = expansion.plan.to_json().expect("plan json");
         let decoded = serde_json::from_str::<super::FaultSuitePlan>(&encoded).expect("plan decode");
         assert_eq!(decoded, expansion.plan);
+
+        let mut legacy = serde_json::to_value(&decoded).expect("legacy plan json");
+        for attempt in legacy["attempts"]
+            .as_array_mut()
+            .expect("legacy plan attempts")
+        {
+            attempt
+                .as_object_mut()
+                .expect("legacy plan attempt")
+                .remove("detector");
+        }
+        let legacy = serde_json::from_value::<super::FaultSuitePlan>(legacy)
+            .expect("legacy v1alpha1 plan without detector must remain readable");
+        assert!(
+            legacy
+                .attempts
+                .iter()
+                .all(|attempt| attempt.detector.is_none())
+        );
+        assert!(
+            legacy.validate_current_contract().is_err(),
+            "new plan validation must still require detector contracts"
+        );
+        assert!(
+            legacy.to_json().is_err(),
+            "new plan writer must not emit a detector-less plan"
+        );
     }
 
     #[test]
