@@ -13,14 +13,13 @@
 // limitations under the License.
 
 use anyhow::{Context, Result, bail};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-
-use crate::fault::{scenarios::FaultDetectorContract, suite::FaultExpectedFailure};
 
 const MAX_ARTIFACT_SCAN_DEPTH: usize = 8;
 const MAX_ARTIFACT_SCAN_FILES: usize = 10_000;
@@ -71,15 +70,39 @@ pub struct ConsolePlannedAttemptView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repetition: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detector: Option<FaultDetectorContract>,
+    pub detector: Option<ConsoleDetectorView>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_failure: Option<FaultExpectedFailure>,
+    pub expected_failure: Option<ConsoleExpectedFailureView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt_artifact_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub case_artifact_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_stream: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ConsoleDetectorView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualification: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub detects: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ConsoleExpectedFailureView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responsibility_domain: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,7 +184,7 @@ pub struct ConsoleSuiteAttemptView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifacts_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_failure: Option<FaultExpectedFailure>,
+    pub expected_failure: Option<ConsoleExpectedFailureView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_failure_matched: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1591,6 +1614,17 @@ fn parse_suite_summary_extract(
     }
 }
 
+fn deserialize_optional_projection<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct SuitePlanExtract {
@@ -1607,8 +1641,10 @@ struct SuitePlanAttemptExtract {
     scenario: Option<String>,
     case_name: Option<String>,
     repetition: Option<usize>,
-    detector: Option<FaultDetectorContract>,
-    expected_failure: Option<FaultExpectedFailure>,
+    #[serde(default, deserialize_with = "deserialize_optional_projection")]
+    detector: Option<ConsoleDetectorView>,
+    #[serde(default, deserialize_with = "deserialize_optional_projection")]
+    expected_failure: Option<ConsoleExpectedFailureView>,
     artifacts: Option<SuitePlanAttemptArtifactsExtract>,
 }
 
@@ -1706,7 +1742,8 @@ struct SuiteAttemptExtract {
     started_at_ms: Option<u64>,
     ended_at_ms: Option<u64>,
     artifacts_dir: Option<String>,
-    expected_failure: Option<FaultExpectedFailure>,
+    #[serde(default, deserialize_with = "deserialize_optional_projection")]
+    expected_failure: Option<ConsoleExpectedFailureView>,
     expected_failure_matched: Option<bool>,
     failure_summary: Option<String>,
     seed: Option<u64>,
@@ -2101,7 +2138,10 @@ mod tests {
 
         let snapshot = build_console_snapshot(dir.path()).expect("snapshot");
         let planned = &snapshot.suite_plan.as_ref().expect("plan").attempts[0];
-        assert_eq!(planned.detector.as_ref().expect("detector").revision, 1);
+        assert_eq!(
+            planned.detector.as_ref().expect("detector").revision,
+            Some(1)
+        );
         assert!(planned.expected_failure.is_some());
         let attempt = &snapshot.suite_summary.as_ref().expect("summary").attempts[0];
         assert!(attempt.expected_failure.is_some());
@@ -2110,6 +2150,88 @@ mod tests {
             attempt.failure_summary.as_deref(),
             Some("001-io-eio-r1/case/failure-summary.json")
         );
+    }
+
+    #[test]
+    fn future_contract_fields_do_not_hide_console_attempts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("suite-plan.json"),
+            serde_json::to_string_pretty(&json!({
+                "suite": "future-smoke",
+                "runId": "suite-2",
+                "attempts": [{
+                    "index": 1,
+                    "scenario": "future-scenario",
+                    "detector": {
+                        "revision": 2,
+                        "qualification": "future-qualification",
+                        "detects": ["future-bug-family"],
+                        "futureDetectorField": {"mode": "strict"}
+                    },
+                    "expectedFailure": {
+                        "classification": "future_classification",
+                        "severity": "future_severity",
+                        "responsibilityDomain": "future_owner",
+                        "evidenceRefs": ["future-evidence.json"],
+                        "futureExpectedField": true
+                    }
+                }]
+            }))
+            .expect("plan json"),
+        )
+        .expect("plan");
+        fs::write(
+            dir.path().join("suite-summary.json"),
+            serde_json::to_string_pretty(&json!({
+                "suite": "future-smoke",
+                "runId": "suite-2",
+                "status": "succeeded",
+                "attempts": [{
+                    "index": 1,
+                    "scenario": "future-scenario",
+                    "status": "expected-failure",
+                    "expectedFailure": {
+                        "classification": "future_classification",
+                        "futureExpectedField": true
+                    },
+                    "expectedFailureMatched": true,
+                    "failureSummary": "001-future-r1/case/failure-summary.json"
+                }]
+            }))
+            .expect("summary json"),
+        )
+        .expect("summary");
+
+        let snapshot = build_console_snapshot(dir.path()).expect("snapshot");
+        let plan = snapshot.suite_plan.as_ref().expect("suite plan");
+        assert_eq!(plan.suite.as_deref(), Some("future-smoke"));
+        assert_eq!(plan.run_id.as_deref(), Some("suite-2"));
+        assert_eq!(plan.attempts.len(), 1);
+        let planned = &plan.attempts[0];
+        assert_eq!(planned.scenario.as_deref(), Some("future-scenario"));
+        assert_eq!(
+            planned.detector.as_ref().expect("detector").detects,
+            vec!["future-bug-family"]
+        );
+        assert_eq!(
+            planned
+                .expected_failure
+                .as_ref()
+                .and_then(|expected| expected.classification.as_deref()),
+            Some("future_classification")
+        );
+        let summary = snapshot.suite_summary.as_ref().expect("suite summary");
+        assert_eq!(summary.suite.as_deref(), Some("future-smoke"));
+        assert_eq!(summary.attempts.len(), 1);
+        assert_eq!(
+            summary.attempts[0]
+                .expected_failure
+                .as_ref()
+                .and_then(|expected| expected.classification.as_deref()),
+            Some("future_classification")
+        );
+        assert_eq!(summary.attempts[0].expected_failure_matched, Some(true));
     }
 
     #[test]

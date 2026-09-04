@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -239,11 +239,15 @@ pub struct FaultDetectorContract {
 
 impl FaultDetectorContract {
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.revision == FAULT_DETECTOR_CONTRACT_REVISION,
-            "fault detector revision {} is unsupported; expected {FAULT_DETECTOR_CONTRACT_REVISION}",
-            self.revision
-        );
+        match self.revision {
+            1 => self.validate_revision_1(),
+            revision => {
+                bail!("fault detector revision {revision} is unsupported; supported revisions: 1")
+            }
+        }
+    }
+
+    fn validate_revision_1(&self) -> Result<()> {
         ensure!(
             !self.detects.is_empty(),
             "fault detector must declare at least one durability bug family"
@@ -1212,8 +1216,8 @@ pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
 mod tests {
     use super::{
         DM_FLAKEY_VERSIONED_HOT_SCENARIO, DetectorQualification, DurabilityBugFamily,
-        FaultParameterSchema, FaultScenario, FaultScenarioStatus, FaultScenarioWorkloadProfile,
-        IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO,
+        FaultDetectorContract, FaultParameterSchema, FaultScenario, FaultScenarioStatus,
+        FaultScenarioWorkloadProfile, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO,
         POD_CRASH_VERSIONED_HOT_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
         WARP_UNDER_CHAOS_SCENARIO, apply_catalog_defaults, executable_scenario_catalog,
         expected_workload_versioning_for_scenario, scenario_catalog, scenario_catalog_json,
@@ -1461,6 +1465,25 @@ mod tests {
                 .detects
                 .contains(&DurabilityBugFamily::CommitMetadataLoss)
         );
+    }
+
+    #[test]
+    fn detector_contract_keeps_revision_one_and_rejects_unknown_revisions() {
+        let revision_one = FaultDetectorContract {
+            revision: 1,
+            qualification: DetectorQualification::GateCandidate,
+            detects: vec![DurabilityBugFamily::SilentDataCorruption],
+        };
+        revision_one
+            .validate()
+            .expect("revision 1 remains supported");
+
+        let unknown = FaultDetectorContract {
+            revision: 2,
+            ..revision_one
+        };
+        let error = unknown.validate().expect_err("unknown revision");
+        assert!(error.to_string().contains("supported revisions: 1"));
     }
 
     #[test]
