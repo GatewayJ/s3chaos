@@ -556,20 +556,40 @@ cleanup_managed_chaos() {
     -l "$MANAGER_SELECTOR" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
 }
 
-terminate_process_tree() {
-  local parent="$1"
+signal_process_tree() {
+  local parent="$1" signal="$2"
   local child
   for child in $(pgrep -P "$parent" 2>/dev/null || true); do
-    terminate_process_tree "$child"
+    signal_process_tree "$child" "$signal"
   done
-  kill -TERM "$parent" 2>/dev/null || true
+  kill -"$signal" "$parent" 2>/dev/null || true
+}
+
+terminate_process_tree() {
+  local parent="$1" child deadline descendants=false
+  for child in $(pgrep -P "$parent" 2>/dev/null || true); do
+    descendants=true
+    signal_process_tree "$child" TERM
+  done
+  if [[ "$descendants" == "false" ]]; then
+    kill -TERM "$parent" 2>/dev/null || true
+  fi
+
+  deadline=$((SECONDS + 60))
+  while kill -0 "$parent" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 1
+  done
+  if kill -0 "$parent" 2>/dev/null; then
+    echo "warning: fault process did not finish graceful recovery within 60s; escalating to KILL" >&2
+    signal_process_tree "$parent" KILL
+  fi
 }
 
 handle_signal() {
-  cleanup_managed_chaos
   if [[ -n "$ACTIVE_PID" ]]; then
     terminate_process_tree "$ACTIVE_PID"
   fi
+  cleanup_managed_chaos
   if [[ -n "$ACTIVE_ARTIFACTS" ]]; then
     touch "$ACTIVE_ARTIFACTS/interrupted"
     echo 130 >"$ACTIVE_ARTIFACTS/exit-code"
@@ -886,8 +906,8 @@ run_scenario() {
         || warn_artifact_write_failed "health-watch.jsonl" "$artifacts/health-watch.jsonl"
       if [[ "$will_abort" == "true" ]]; then
         touch "$artifacts/health-guard-failed"
-        cleanup_managed_chaos
         terminate_process_tree "$test_pid"
+        cleanup_managed_chaos
         break
       fi
     fi
@@ -1013,8 +1033,8 @@ run_suite() {
       write_suite_budget_watch_event "$run_root/health-watch.jsonl" "$current_time" "$suite_name" "$health_checks" "$elapsed" "$max_duration_seconds" \
         || warn_artifact_write_failed "health-watch.jsonl" "$run_root/health-watch.jsonl"
       touch "$run_root/suite-budget-failed"
-      cleanup_managed_chaos
       terminate_process_tree "$ACTIVE_PID"
+      cleanup_managed_chaos
       break
     fi
 
@@ -1042,8 +1062,8 @@ run_suite() {
         || warn_artifact_write_failed "health-watch.jsonl" "$run_root/health-watch.jsonl"
       if [[ "$will_abort" == "true" ]]; then
         touch "$run_root/health-guard-failed"
-        cleanup_managed_chaos
         terminate_process_tree "$ACTIVE_PID"
+        cleanup_managed_chaos
         break
       fi
     fi

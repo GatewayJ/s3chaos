@@ -54,6 +54,7 @@ pub struct HostStorageMutationIntent {
     pub observer_pod: String,
     pub backend_specific_destructive_opt_in: bool,
     pub allowlist: HostStorageAllowlist,
+    pub fault_table: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,8 +98,31 @@ pub struct HostStorageProvenTarget {
 pub struct DeviceMapperRollbackContract {
     pub mapper_name: String,
     pub suspend_mode: String,
+    pub recovery_table: String,
     pub recovery_table_sha256: String,
     pub resume_without_udev_sync: bool,
+    pub commands: DeviceMapperRollbackCommands,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceMapperRollbackCommands {
+    pub suspend: Vec<String>,
+    pub load: Vec<String>,
+    pub resume: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceMapperTableContract {
+    pub start_sector: u64,
+    pub length_sectors: u64,
+    pub backing_device: String,
+    pub backing_offset_sector: u64,
+    pub recovery_table: String,
+    pub recovery_table_sha256: String,
+    pub fault_table: String,
+    pub fault_table_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +171,7 @@ pub struct HostStorageMutationProof {
     pub preflight_side_effects: String,
     pub allowlist: HostStorageAllowlist,
     pub target: HostStorageProvenTarget,
+    pub tables: DeviceMapperTableContract,
     pub recovery: HostStorageRecoveryContract,
 }
 
@@ -192,7 +217,12 @@ impl HostStorageMutationProof {
             &observation.persistent_volume,
         )?;
 
-        let recovery_table_sha256 = normalized_dm_table_sha256(&observation.recovery_table)?;
+        let tables = canonical_table_contract(
+            &intent.fault_kind,
+            &observation.recovery_table,
+            intent.fault_table.as_deref(),
+        )?;
+        let recovery_table_sha256 = tables.recovery_table_sha256.clone();
         let target = HostStorageProvenTarget {
             node: observation.node,
             pod: observation.pod,
@@ -208,8 +238,7 @@ impl HostStorageMutationProof {
             filesystem: observation.filesystem,
             recovery_table_sha256: recovery_table_sha256.clone(),
         };
-        let recovery =
-            canonical_recovery_contract(&intent.fault_kind, &target, recovery_table_sha256)?;
+        let recovery = canonical_recovery_contract(&intent.fault_kind, &target, &tables)?;
         let proof = Self {
             schema_version: HOST_STORAGE_PROOF_SCHEMA_VERSION,
             status: HostStorageProofStatus::Satisfied,
@@ -228,6 +257,7 @@ impl HostStorageMutationProof {
             preflight_side_effects: READ_ONLY_PREFLIGHT_SCOPE.to_string(),
             allowlist: intent.allowlist,
             target,
+            tables,
             recovery,
         };
         proof.validate()?;
@@ -281,13 +311,19 @@ impl HostStorageMutationProof {
             &self.allowlist.persistent_volumes,
             &self.target.persistent_volume,
         )?;
+        let canonical_tables = canonical_table_contract(
+            &self.fault_kind,
+            &self.tables.recovery_table,
+            Some(&self.tables.fault_table),
+        )?;
+        ensure!(
+            self.tables == canonical_tables
+                && self.target.recovery_table_sha256 == self.tables.recovery_table_sha256,
+            "host-storage device-mapper table contract is not canonical"
+        );
         ensure!(
             self.recovery
-                == canonical_recovery_contract(
-                    &self.fault_kind,
-                    &self.target,
-                    self.target.recovery_table_sha256.clone(),
-                )?,
+                == canonical_recovery_contract(&self.fault_kind, &self.target, &self.tables)?,
             "host-storage recovery/quarantine/cleanup contract is not canonical"
         );
         Ok(())
@@ -304,6 +340,18 @@ impl HostStorageMutationProof {
             HOST_STORAGE_PROOF_MAX_AGE_MS
         );
         Ok(())
+    }
+
+    pub fn require_generated_during_apply(
+        &self,
+        fault_apply_started_at_ms: u64,
+        fault_active_at_ms: u64,
+    ) -> Result<()> {
+        ensure!(
+            self.generated_at_ms >= fault_apply_started_at_ms,
+            "final host-storage proof predates the apply-time re-observation"
+        );
+        self.require_fresh_at(fault_active_at_ms)
     }
 
     pub fn require_apply_observation(
@@ -329,6 +377,36 @@ impl HostStorageMutationProof {
             "device-mapper target changed between host-storage preflight and fault apply"
         );
         Ok(())
+    }
+
+    pub fn refresh_for_apply(&self, observation: HostStorageTargetObservation) -> Result<Self> {
+        self.validate()?;
+        self.require_apply_observation(&observation)?;
+        let refreshed = Self::prove_device_mapper(
+            HostStorageMutationIntent {
+                scenario: self.scenario.clone(),
+                fault_name: self.fault_name.clone(),
+                fault_kind: self.fault_kind.clone(),
+                run_id: self.run_id.clone(),
+                context: self.context.clone(),
+                namespace: self.namespace.clone(),
+                tenant: self.tenant.clone(),
+                observer_namespace: self.observer_namespace.clone(),
+                observer_pod: self.observer_pod.clone(),
+                backend_specific_destructive_opt_in: self.backend_specific_destructive_opt_in,
+                allowlist: self.allowlist.clone(),
+                fault_table: (self.fault_kind == DM_FLAKEY_KIND)
+                    .then(|| self.tables.fault_table.clone()),
+            },
+            observation,
+        )?;
+        ensure!(
+            refreshed.target == self.target
+                && refreshed.tables == self.tables
+                && refreshed.recovery == self.recovery,
+            "host-storage authorization changed while refreshing the apply observation"
+        );
+        Ok(refreshed)
     }
 
     pub fn validate_post_cleanup(
@@ -365,12 +443,147 @@ impl HostStorageMutationProof {
 }
 
 pub fn normalized_dm_table_sha256(table: &str) -> Result<String> {
-    let normalized = table.split_whitespace().collect::<Vec<_>>().join(" ");
+    let recovery = parse_linear_table(table)?;
+    Ok(table_sha256(&recovery.canonical))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedDmTable {
+    start_sector: u64,
+    length_sectors: u64,
+    backing_device: String,
+    backing_offset_sector: u64,
+    canonical: String,
+}
+
+fn canonical_table_contract(
+    fault_kind: &str,
+    recovery_table: &str,
+    configured_fault_table: Option<&str>,
+) -> Result<DeviceMapperTableContract> {
+    let recovery = parse_linear_table(recovery_table)?;
+    let fault_table = match fault_kind {
+        DM_FLAKEY_KIND => parse_error_flakey_table(
+            configured_fault_table
+                .ok_or_else(|| anyhow::anyhow!("dm-flakey requires an explicit fault table"))?,
+            &recovery,
+        )?,
+        DM_DROP_WRITES_KIND => {
+            let expected = drop_writes_table(&recovery);
+            if let Some(configured) = configured_fault_table {
+                ensure!(
+                    normalize_table(configured) == expected,
+                    "drop_writes fault table is not the canonical table derived from recovery state"
+                );
+            }
+            expected
+        }
+        other => bail!("fault kind {other:?} is not a supported device-mapper mutation"),
+    };
+    Ok(DeviceMapperTableContract {
+        start_sector: recovery.start_sector,
+        length_sectors: recovery.length_sectors,
+        backing_device: recovery.backing_device,
+        backing_offset_sector: recovery.backing_offset_sector,
+        recovery_table_sha256: table_sha256(&recovery.canonical),
+        recovery_table: recovery.canonical,
+        fault_table_sha256: table_sha256(&fault_table),
+        fault_table,
+    })
+}
+
+fn parse_linear_table(table: &str) -> Result<ParsedDmTable> {
+    let fields = table.split_whitespace().collect::<Vec<_>>();
     ensure!(
-        !normalized.is_empty(),
-        "device-mapper recovery table is empty"
+        fields.len() == 5 && fields[2] == "linear",
+        "device-mapper recovery table must be one linear segment in '<start> <length> linear <backing> <offset>' form"
     );
-    Ok(format!("{:x}", Sha256::digest(normalized.as_bytes())))
+    let start_sector = parse_sector(fields[0], "start")?;
+    let length_sectors = parse_sector(fields[1], "length")?;
+    ensure!(
+        length_sectors > 0,
+        "device-mapper table length must be positive"
+    );
+    let backing_device = parse_backing_device(fields[3])?;
+    let backing_offset_sector = parse_sector(fields[4], "backing offset")?;
+    let canonical =
+        format!("{start_sector} {length_sectors} linear {backing_device} {backing_offset_sector}");
+    Ok(ParsedDmTable {
+        start_sector,
+        length_sectors,
+        backing_device,
+        backing_offset_sector,
+        canonical,
+    })
+}
+
+fn parse_error_flakey_table(table: &str, recovery: &ParsedDmTable) -> Result<String> {
+    let fields = table.split_whitespace().collect::<Vec<_>>();
+    ensure!(
+        fields.len() == 7 && fields[2] == "flakey" && fields[5] == "1" && fields[6] == "15",
+        "dm-flakey table must use exactly '<start> <length> flakey <backing> <offset> 1 15'"
+    );
+    require_matching_geometry(fields.as_slice(), recovery)?;
+    Ok(format!(
+        "{} {} flakey {} {} 1 15",
+        recovery.start_sector,
+        recovery.length_sectors,
+        recovery.backing_device,
+        recovery.backing_offset_sector
+    ))
+}
+
+fn require_matching_geometry(fields: &[&str], recovery: &ParsedDmTable) -> Result<()> {
+    let start_sector = parse_sector(fields[0], "fault start")?;
+    let length_sectors = parse_sector(fields[1], "fault length")?;
+    let backing_device = parse_backing_device(fields[3])?;
+    let backing_offset_sector = parse_sector(fields[4], "fault backing offset")?;
+    ensure!(
+        start_sector == recovery.start_sector
+            && length_sectors == recovery.length_sectors
+            && backing_device == recovery.backing_device
+            && backing_offset_sector == recovery.backing_offset_sector,
+        "fault table geometry/backing device must exactly match the active recovery table"
+    );
+    Ok(())
+}
+
+fn parse_sector(value: &str, label: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("device-mapper {label} sector is not an unsigned integer"))
+}
+
+fn parse_backing_device(value: &str) -> Result<String> {
+    let device_number = value.split_once(':').is_some_and(|(major, minor)| {
+        !major.is_empty()
+            && !minor.is_empty()
+            && major.chars().all(|ch| ch.is_ascii_digit())
+            && minor.chars().all(|ch| ch.is_ascii_digit())
+    });
+    ensure!(
+        (value.starts_with("/dev/") && value.len() > "/dev/".len()) || device_number,
+        "device-mapper backing device must be an absolute /dev path or major:minor number"
+    );
+    Ok(value.to_string())
+}
+
+fn normalize_table(table: &str) -> String {
+    table.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn table_sha256(table: &str) -> String {
+    format!("{:x}", Sha256::digest(table.as_bytes()))
+}
+
+fn drop_writes_table(recovery: &ParsedDmTable) -> String {
+    format!(
+        "{} {} flakey {} {} 0 86400 1 drop_writes",
+        recovery.start_sector,
+        recovery.length_sectors,
+        recovery.backing_device,
+        recovery.backing_offset_sector
+    )
 }
 
 fn validate_observation(observation: &HostStorageTargetObservation) -> Result<()> {
@@ -437,13 +650,14 @@ fn validate_proven_target(target: &HostStorageProvenTarget) -> Result<()> {
             "proven host-storage {label} is empty"
         );
     }
+    ensure_sha256("proven recovery table", &target.recovery_table_sha256)?;
     Ok(())
 }
 
 fn canonical_recovery_contract(
     fault_kind: &str,
     target: &HostStorageProvenTarget,
-    recovery_table_sha256: String,
+    tables: &DeviceMapperTableContract,
 ) -> Result<HostStorageRecoveryContract> {
     let suspend_mode = match fault_kind {
         DM_FLAKEY_KIND => "noflush",
@@ -454,8 +668,30 @@ fn canonical_recovery_contract(
         rollback: DeviceMapperRollbackContract {
             mapper_name: target.mapper_name.clone(),
             suspend_mode: suspend_mode.to_string(),
-            recovery_table_sha256,
+            recovery_table: tables.recovery_table.clone(),
+            recovery_table_sha256: tables.recovery_table_sha256.clone(),
             resume_without_udev_sync: true,
+            commands: DeviceMapperRollbackCommands {
+                suspend: vec![
+                    "/usr/sbin/dmsetup".to_string(),
+                    "suspend".to_string(),
+                    format!("--{suspend_mode}"),
+                    target.mapper_name.clone(),
+                ],
+                load: vec![
+                    "/usr/sbin/dmsetup".to_string(),
+                    "load".to_string(),
+                    target.mapper_name.clone(),
+                    "--table".to_string(),
+                    tables.recovery_table.clone(),
+                ],
+                resume: vec![
+                    "/usr/sbin/dmsetup".to_string(),
+                    "resume".to_string(),
+                    "--noudevsync".to_string(),
+                    target.mapper_name.clone(),
+                ],
+            },
         },
         quarantine: HostStorageQuarantineContract {
             node: target.node.clone(),
@@ -470,6 +706,17 @@ fn canonical_recovery_contract(
             require_quarantine_absent: true,
         },
     })
+}
+
+fn ensure_sha256(label: &str, value: &str) -> Result<()> {
+    ensure!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{label} SHA-256 must be 64 lowercase hexadecimal characters"
+    );
+    Ok(())
 }
 
 fn ensure_supported_dm_kind(fault_kind: &str) -> Result<()> {
@@ -534,6 +781,7 @@ mod tests {
                 devices: vec!["/dev/mapper/rustfs-fault-dm".to_string()],
                 persistent_volumes: vec!["pv-a".to_string()],
             },
+            fault_table: Some("0 1024 flakey /dev/loop0 0 1 15".to_string()),
         }
     }
 
@@ -579,6 +827,13 @@ mod tests {
         assert!(
             HostStorageMutationProof::prove_device_mapper(wrong_device, observation()).is_err()
         );
+
+        let mut redirected = intent();
+        redirected.fault_table = Some("0 1024 flakey /dev/sda 0 1 15".to_string());
+        assert!(
+            HostStorageMutationProof::prove_device_mapper(redirected, observation()).is_err(),
+            "fault table must not redirect the authorized mapper to another backing device"
+        );
     }
 
     #[test]
@@ -588,6 +843,16 @@ mod tests {
         let mut tampered = proof.clone();
         tampered.recovery.rollback.mapper_name = "other".to_string();
         assert!(tampered.validate().is_err());
+
+        let mut invalid_hash = proof.clone();
+        invalid_hash.target.recovery_table_sha256 = "g".repeat(64);
+        assert!(
+            invalid_hash
+                .validate()
+                .expect_err("non-hex recovery hash must fail")
+                .to_string()
+                .contains("64 lowercase hexadecimal")
+        );
 
         let mut changed = observation();
         changed.persistent_volume = "pv-b".to_string();
@@ -610,5 +875,57 @@ mod tests {
             recovery_table_sha256: proof.target.recovery_table_sha256.clone(),
         };
         assert!(proof.validate_post_cleanup(&cleanup).is_err());
+    }
+
+    #[test]
+    fn proof_persists_canonical_fault_and_executable_rollback_state() {
+        let mut observed = observation();
+        observed.recovery_table = " 0  1024 linear  /dev/loop0  0\n".to_string();
+        let proof = HostStorageMutationProof::prove_device_mapper(intent(), observed)
+            .expect("host-storage proof");
+
+        assert_eq!(proof.tables.recovery_table, "0 1024 linear /dev/loop0 0");
+        assert_eq!(proof.tables.fault_table, "0 1024 flakey /dev/loop0 0 1 15");
+        assert_eq!(
+            proof.recovery.rollback.commands.load,
+            [
+                "/usr/sbin/dmsetup",
+                "load",
+                "rustfs-fault-dm",
+                "--table",
+                "0 1024 linear /dev/loop0 0",
+            ]
+        );
+        assert_eq!(
+            proof.recovery.rollback.recovery_table,
+            "0 1024 linear /dev/loop0 0"
+        );
+        assert_eq!(proof.recovery.rollback.recovery_table_sha256.len(), 64);
+    }
+
+    #[test]
+    fn drop_writes_table_is_derived_from_the_live_linear_geometry() {
+        let mut drop_intent = intent();
+        drop_intent.fault_kind = "rustfs_block_device_drop_writes_crash".to_string();
+        drop_intent.fault_table = None;
+        let proof = HostStorageMutationProof::prove_device_mapper(drop_intent, observation())
+            .expect("drop-writes proof");
+
+        assert_eq!(
+            proof.tables.fault_table,
+            "0 1024 flakey /dev/loop0 0 0 86400 1 drop_writes"
+        );
+        assert_eq!(proof.recovery.rollback.suspend_mode, "nolockfs");
+    }
+
+    #[test]
+    fn apply_refresh_rejects_a_replaced_pod_identity() {
+        let proof = HostStorageMutationProof::prove_device_mapper(intent(), observation())
+            .expect("host-storage proof");
+        let mut replaced = observation();
+        replaced.pod_uid = "uid-replacement".to_string();
+        replaced.observed_at_ms = 2;
+
+        assert!(proof.refresh_for_apply(replaced).is_err());
     }
 }

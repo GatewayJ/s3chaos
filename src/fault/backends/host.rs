@@ -24,9 +24,9 @@ use crate::{
     fault::{
         config::FaultTestConfig,
         host_storage::{
-            HostStorageAllowlist, HostStorageMutationIntent, HostStorageMutationProof,
-            HostStoragePostCleanupObservation, HostStorageTargetObservation,
-            normalized_dm_table_sha256,
+            HOST_STORAGE_PROOF_ARTIFACT, HostStorageAllowlist, HostStorageMutationIntent,
+            HostStorageMutationProof, HostStoragePostCleanupObservation,
+            HostStorageTargetObservation, normalized_dm_table_sha256,
         },
         plan::{FaultInjection, FaultKind},
         scenarios::FaultScenario,
@@ -40,7 +40,6 @@ use crate::{
 const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 const MANAGED_BY_VALUE: &str = "s3chaos";
 const CRASH_TAINT_KEY: &str = "s3chaos.rustfs.com/dm-crash";
-const DROP_WRITES_DOWN_INTERVAL_SECONDS: u64 = 86_400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -295,6 +294,7 @@ pub(crate) fn preflight_mutation(
                     .host_mutation_allowed_persistent_volumes
                     .clone(),
             },
+            fault_table: spec.fault_table.map(str::to_string),
         },
         observation,
     )
@@ -634,6 +634,10 @@ pub fn apply_dm_flakey(
         restored: false,
     };
     guard.wait_helper_ready()?;
+    // Re-resolve the complete Kubernetes ownership chain immediately before
+    // reading host state so the apply proof cannot splice stale Pod/PVC/PV
+    // identity onto a new mount or mapper table.
+    guard.mapping = verify_dm_volume_mapping(config, spec.node, spec.mount_path)?;
     let mount_snapshot = guard.capture_mount_snapshot()?;
     guard.verify_mount_source(&mount_snapshot)?;
     guard.mount_snapshot = Some(mount_snapshot);
@@ -661,17 +665,15 @@ pub fn apply_dm_flakey(
     guard
         .preflight_proof
         .require_fresh_at(apply_observation.observed_at_ms)?;
-    guard
-        .preflight_proof
-        .require_apply_observation(&apply_observation)?;
+    guard.preflight_proof = guard.preflight_proof.refresh_for_apply(apply_observation)?;
+    collector.write_text(
+        case_name,
+        HOST_STORAGE_PROOF_ARTIFACT,
+        &serde_json::to_string_pretty(&guard.preflight_proof)?,
+    )?;
 
-    guard.fault_table = match spec.behavior {
-        DmFaultBehavior::ErrorInjection => spec
-            .fault_table
-            .context("dm-flakey fault table disappeared after validation")?
-            .to_string(),
-        DmFaultBehavior::DropWritesCrash => drop_writes_table(&guard.recovery_table)?,
-    };
+    guard.recovery_table = guard.preflight_proof.tables.recovery_table.clone();
+    guard.fault_table = guard.preflight_proof.tables.fault_table.clone();
     let suspend_mode = match spec.behavior {
         DmFaultBehavior::ErrorInjection => DmSuspendMode::Default,
         DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
@@ -1102,16 +1104,13 @@ impl DmFlakeyGuard {
     }
 
     fn force_delete_target_pod(&self, timeout: Duration) -> Result<Option<String>> {
-        Kubectl::new(&self.config)
-            .namespaced(&self.config.test_namespace)
-            .command([
-                "delete",
-                "pod",
-                self.mapping.pod.as_str(),
-                "--grace-period=0",
-                "--force",
-                "--wait=false",
-            ])
+        let current =
+            verify_dm_volume_mapping(&self.config, &self.mapping.node, &self.mapping.mount_path)?;
+        ensure!(
+            current == self.mapping,
+            "refusing to delete a RustFS Pod because its UID/PVC/PV/node mapping changed after device-mapper apply"
+        );
+        force_delete_pod_command(&self.config, &self.mapping.pod, &self.mapping.pod_uid)?
             .run_checked()?;
 
         let deadline = Instant::now() + timeout;
@@ -1342,6 +1341,32 @@ impl DmFlakeyGuard {
     }
 }
 
+fn force_delete_pod_command(
+    config: &ClusterTestConfig,
+    pod: &str,
+    pod_uid: &str,
+) -> Result<CommandSpec> {
+    ensure!(
+        !pod.is_empty()
+            && pod.chars().all(|ch| ch.is_ascii_lowercase()
+                || ch.is_ascii_digit()
+                || matches!(ch, '.' | '-')),
+        "target Pod name is not safe for the Kubernetes API path"
+    );
+    ensure!(!pod_uid.trim().is_empty(), "target Pod UID is empty");
+    let uri = format!("/api/v1/namespaces/{}/pods/{pod}", config.test_namespace);
+    let delete_options = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "DeleteOptions",
+        "gracePeriodSeconds": 0,
+        "propagationPolicy": "Background",
+        "preconditions": {"uid": pod_uid},
+    });
+    Ok(Kubectl::new(config)
+        .command(["delete", "--raw", uri.as_str(), "-f", "-"])
+        .stdin(serde_json::to_string(&delete_options)?))
+}
+
 impl Drop for DmFlakeyGuard {
     fn drop(&mut self) {
         if !self.restored {
@@ -1473,28 +1498,6 @@ fn dm_suspend_args(name: &str, mode: DmSuspendMode) -> Vec<&str> {
         DmSuspendMode::NoFlush => vec!["suspend", "--noflush", name],
         DmSuspendMode::NoLockFs => vec!["suspend", "--nolockfs", name],
     }
-}
-
-fn drop_writes_table(recovery_table: &str) -> Result<String> {
-    let fields = recovery_table.split_whitespace().collect::<Vec<_>>();
-    ensure!(
-        fields.len() == 5 && fields[2] == "linear",
-        "drop_writes crash injection requires one linear recovery-table segment in '<start> <sectors> linear <backing> <offset>' form, got {recovery_table:?}"
-    );
-    let start = fields[0]
-        .parse::<u64>()
-        .context("parse recovery-table start sector")?;
-    let sectors = fields[1]
-        .parse::<u64>()
-        .context("parse recovery-table sector count")?;
-    let offset = fields[4]
-        .parse::<u64>()
-        .context("parse recovery-table backing offset")?;
-    ensure!(sectors > 0, "recovery-table sector count must be positive");
-    Ok(format!(
-        "{start} {sectors} flakey {} {offset} 0 {DROP_WRITES_DOWN_INTERVAL_SECONDS} 1 drop_writes",
-        fields[3]
-    ))
 }
 
 fn verify_dm_volume_mapping(
@@ -1657,8 +1660,8 @@ fn now_ms() -> u64 {
 mod tests {
     use super::{
         DmFaultBehavior, DmFlakeySpec, DmMountState, DmSuspendMode, dm_flakey_spec,
-        dm_helper_manifest, dm_resume_args, dm_suspend_args, drop_writes_table, helper_pod_name,
-        normalize_dm_table, pv_targets_node, validate_dm_spec,
+        dm_helper_manifest, dm_resume_args, dm_suspend_args, force_delete_pod_command,
+        helper_pod_name, normalize_dm_table, pv_targets_node, validate_dm_spec,
     };
     use crate::fault::config::FaultTestConfig;
 
@@ -1731,16 +1734,6 @@ mod tests {
     }
 
     #[test]
-    fn crash_table_is_always_down_and_silently_drops_writes() {
-        assert_eq!(
-            drop_writes_table("0 1024 linear 7:1 0").expect("drop-writes table"),
-            "0 1024 flakey 7:1 0 0 86400 1 drop_writes"
-        );
-        assert!(drop_writes_table("0 1024 flakey 7:1 0 1 15").is_err());
-        assert!(drop_writes_table("0 0 linear 7:1 0").is_err());
-    }
-
-    #[test]
     fn dm_table_comparison_uses_the_full_normalized_table() {
         assert_eq!(
             normalize_dm_table("0 1024  flakey   /dev/loop0 0 1 15\n"),
@@ -1771,6 +1764,33 @@ mod tests {
             ..valid
         };
         assert!(validate_dm_spec(&root).is_err());
+    }
+
+    #[test]
+    fn forced_pod_delete_is_uid_preconditioned() {
+        let config = FaultTestConfig::for_test("real-cluster", "rustfs-fault-dm");
+        let command = force_delete_pod_command(&config.cluster, "rustfs-0", "uid-old")
+            .expect("delete command");
+        let body = serde_json::from_str::<serde_json::Value>(
+            command.stdin.as_deref().expect("delete options body"),
+        )
+        .expect("delete options JSON");
+
+        assert!(command.args.windows(2).any(|args| args
+            == [
+                "--raw",
+                "/api/v1/namespaces/rustfs-fault-test/pods/rustfs-0"
+            ]));
+        assert_eq!(
+            body.pointer("/preconditions/uid")
+                .and_then(|value| value.as_str()),
+            Some("uid-old")
+        );
+        assert_eq!(
+            body.get("gracePeriodSeconds")
+                .and_then(|value| value.as_u64()),
+            Some(0)
+        );
     }
 
     #[test]

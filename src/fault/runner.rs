@@ -1535,6 +1535,9 @@ async fn run_fault_case(
         None,
     )?;
     let fault_delete_started_at_ms = history.mark_fault_ended_now();
+    // Recovery begins with fault removal. Host-storage cleanup observations are
+    // emitted by `delete`, so this timestamp must precede that call.
+    let recovery_started_at_ms = now_ms();
     let fault_delete_started_at = Instant::now();
     if let Err(error) = fault.delete(cluster.timeout) {
         let finalizer_recovery = match fault.recover_delete_timeout(
@@ -1605,7 +1608,6 @@ async fn run_fault_case(
         "waiting for Tenant readiness after fault removal",
         None,
     )?;
-    let recovery_started_at_ms = now_ms();
     history.set_durability_cohort(DurabilityCohort::PostRecovery);
     if let Err(error) = wait_for_ready_tenant(cluster).await {
         events

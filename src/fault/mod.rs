@@ -31,6 +31,7 @@ pub mod quorum;
 pub mod reporting;
 pub mod runner;
 pub mod scenarios;
+pub mod shutdown;
 pub mod spec;
 pub mod suite;
 pub mod suite_plan;

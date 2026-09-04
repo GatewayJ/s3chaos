@@ -35,7 +35,7 @@ use crate::fault::{
     history::{DurabilityCohort, OperationKind, OperationOutcome, OperationRecord},
     host_storage::{
         HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT, HostStorageMutationProof,
-        HostStoragePostCleanupObservation,
+        HostStoragePostCleanupObservation, normalized_dm_table_sha256,
     },
     plan::{FaultPlan, FaultPlanOptions, FaultWorkloadMode},
     preflight::{PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus},
@@ -1142,12 +1142,51 @@ fn validate_host_storage_artifacts(
     let fault_apply_started_at_ms = evidence
         .fault_apply_started_at_ms
         .context("fault-evidence.json lacks fault_apply_started_at_ms")?;
+    let fault_active_at_ms = evidence
+        .fault_active_at_ms
+        .context("fault-evidence.json lacks fault_active_at_ms")?;
     proof
-        .require_fresh_at(fault_apply_started_at_ms)
-        .context("host-storage proof was stale at fault apply")?;
+        .require_generated_during_apply(fault_apply_started_at_ms, fault_active_at_ms)
+        .context("host-storage proof was not freshly regenerated during fault apply")?;
     proof
         .validate_post_cleanup(cleanup)
         .context("validate host-storage-post-cleanup.json")?;
+    let recovery_snapshot = evidence
+        .dm_recovery_snapshot
+        .as_ref()
+        .context("fault-evidence.json lacks dm_recovery_snapshot")?;
+    let recovery_table = recovery_snapshot
+        .get("table")
+        .and_then(Value::as_str)
+        .context("fault-evidence.json dm_recovery_snapshot lacks table")?;
+    let recovery_table_sha256 = normalized_dm_table_sha256(recovery_table)
+        .context("validate fault-evidence.json dm_recovery_snapshot table")?;
+    ensure!(
+        recovery_table_sha256 == proof.tables.recovery_table_sha256
+            && recovery_table_sha256 == proof.recovery.rollback.recovery_table_sha256
+            && recovery_table_sha256 == cleanup.recovery_table_sha256
+            && proof.tables.recovery_table == proof.recovery.rollback.recovery_table,
+        "device-mapper recovery table/hash is not cross-bound across proof, rollback, cleanup, and fault evidence"
+    );
+    let snapshot_mapping = recovery_snapshot
+        .get("mapping")
+        .context("fault-evidence.json dm_recovery_snapshot lacks mapping")?;
+    ensure!(
+        recovery_snapshot.get("stage").and_then(Value::as_str) == Some("recovered")
+            && snapshot_mapping.get("node").and_then(Value::as_str)
+                == Some(proof.target.node.as_str())
+            && snapshot_mapping.get("pod").and_then(Value::as_str)
+                == Some(proof.target.pod.as_str())
+            && snapshot_mapping.get("pod_uid").and_then(Value::as_str)
+                == Some(proof.target.pod_uid.as_str())
+            && snapshot_mapping.get("pvc").and_then(Value::as_str)
+                == Some(proof.target.persistent_volume_claim.as_str())
+            && snapshot_mapping.get("pv").and_then(Value::as_str)
+                == Some(proof.target.persistent_volume.as_str())
+            && snapshot_mapping.get("mount_path").and_then(Value::as_str)
+                == Some(proof.target.persistent_volume_path.as_str()),
+        "fault-evidence.json recovery snapshot does not match the proven host-storage target"
+    );
     let recovery_started_at_ms = evidence
         .recovery_started_at_ms
         .context("fault-evidence.json lacks recovery_started_at_ms")?;
@@ -2007,6 +2046,8 @@ struct FaultEvidenceArtifact {
     active_snapshots: Vec<Value>,
     workload_snapshots: Vec<Value>,
     #[serde(default)]
+    dm_recovery_snapshot: Option<Value>,
+    #[serde(default)]
     fault_apply_started_at_ms: Option<u64>,
     #[serde(default)]
     fault_active_at_ms: Option<u64>,
@@ -2555,6 +2596,7 @@ mod tests {
                     devices: vec!["/dev/mapper/rustfs-fault-dm".to_string()],
                     persistent_volumes: vec!["pv-a".to_string()],
                 },
+                fault_table: Some("0 1024 flakey /dev/loop0 0 1 15".to_string()),
             },
             HostStorageTargetObservation {
                 node: "worker-a".to_string(),
@@ -2570,7 +2612,7 @@ mod tests {
                 mount_canonical_source: "/dev/dm-0".to_string(),
                 filesystem: "ext4".to_string(),
                 recovery_table: "0 1024 linear /dev/loop0 0".to_string(),
-                observed_at_ms: 100,
+                observed_at_ms: 151,
             },
         )
         .expect("host proof");
@@ -2601,7 +2643,23 @@ mod tests {
             "active_snapshots": [{}],
             "workload_snapshots": [{}],
             "fault_apply_started_at_ms": 150,
-            "recovery_started_at_ms": 200,
+            "fault_active_at_ms": 160,
+            "fault_delete_started_at_ms": 200,
+            "recovery_started_at_ms": 201,
+            "dm_recovery_snapshot": {
+                "stage": "recovered",
+                "helper_pod": "rustfs-fault-dm-helper-run1",
+                "mapping": {
+                    "node": "worker-a",
+                    "pod": "rustfs-0",
+                    "pod_uid": "uid-0",
+                    "pvc": "data-rustfs-0",
+                    "pv": "pv-a",
+                    "mount_path": "/data/rustfs-fault/dm-volume"
+                },
+                "table": "0 1024 linear /dev/loop0 0",
+                "status": "0 1024 linear"
+            },
             "recovery_ended_at_ms": 400
         }))
         .expect("evidence");
@@ -2622,7 +2680,7 @@ mod tests {
             .is_err()
         );
 
-        let mut tampered_cleanup = cleanup;
+        let mut tampered_cleanup = cleanup.clone();
         tampered_cleanup.recovery_table_sha256 = "0".repeat(64);
         assert!(
             validate_host_storage_artifacts(
@@ -2633,6 +2691,58 @@ mod tests {
                 &evidence,
             )
             .is_err()
+        );
+
+        let redirected_proof = HostStorageMutationProof::prove_device_mapper(
+            HostStorageMutationIntent {
+                scenario: scenario.name.clone(),
+                fault_name: run_spec.faults[0].name.clone(),
+                fault_kind: run_spec.faults[0].kind.clone(),
+                run_id: "run-1".to_string(),
+                context: config.cluster.context.clone(),
+                namespace: config.cluster.test_namespace.clone(),
+                tenant: config.cluster.tenant_name.clone(),
+                observer_namespace: "rustfs-fault-observers".to_string(),
+                observer_pod: "observer-worker-a".to_string(),
+                backend_specific_destructive_opt_in: true,
+                allowlist: HostStorageAllowlist {
+                    nodes: vec!["worker-a".to_string()],
+                    devices: vec!["/dev/mapper/rustfs-fault-dm".to_string()],
+                    persistent_volumes: vec!["pv-a".to_string()],
+                },
+                fault_table: Some("0 1024 flakey /dev/sda 0 1 15".to_string()),
+            },
+            HostStorageTargetObservation {
+                node: "worker-a".to_string(),
+                pod: "rustfs-0".to_string(),
+                pod_uid: "uid-0".to_string(),
+                persistent_volume_claim: "data-rustfs-0".to_string(),
+                persistent_volume: "pv-a".to_string(),
+                persistent_volume_path: "/data/rustfs-fault/dm-volume".to_string(),
+                mapper_name: "rustfs-fault-dm".to_string(),
+                logical_device: "/dev/mapper/rustfs-fault-dm".to_string(),
+                canonical_device: "/dev/dm-0".to_string(),
+                mount_source: "/dev/mapper/rustfs-fault-dm".to_string(),
+                mount_canonical_source: "/dev/dm-0".to_string(),
+                filesystem: "ext4".to_string(),
+                recovery_table: "0 1024 linear /dev/sda 0".to_string(),
+                observed_at_ms: 151,
+            },
+        )
+        .expect("internally consistent redirected proof");
+        let mut coordinated_cleanup = cleanup;
+        coordinated_cleanup.recovery_table_sha256 =
+            redirected_proof.target.recovery_table_sha256.clone();
+        assert!(
+            validate_host_storage_artifacts(
+                &redirected_proof,
+                &coordinated_cleanup,
+                &target_proof,
+                &run_spec,
+                &evidence,
+            )
+            .is_err(),
+            "independent recovery snapshot must reject coordinated proof/cleanup tampering"
         );
     }
 

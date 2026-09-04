@@ -301,11 +301,13 @@ guardrails when implementing the ordered TODO below.
 - [x] DONE: Add host/storage mutation preflight.
   Meaning: executable device-mapper scenarios now require exact singleton
   node/device/PV allowlists, a separate device-mapper destructive opt-in, and a
-  typed rollback/quarantine/post-cleanup contract. Apply re-observes the target
-  against `host-storage-proof.json`; successful recovery must produce a matching
-  `host-storage-post-cleanup.json`. PV replacement, bitrot, and stale-disk flows
-  remain non-executable catalog entries and must use the same domain proof when
-  their backend adapters are implemented.
+  typed rollback/quarantine/post-cleanup contract. The proof persists canonical
+  fault/recovery tables and executable rollback commands; apply re-observes the
+  full Pod UID/PVC/PV/node/mount/table chain before loading the proven table.
+  Signal cancellation unwinds the guard, and successful recovery must bind an
+  independent recovery snapshot to `host-storage-post-cleanup.json`. PV
+  replacement, bitrot, and stale-disk flows remain non-executable catalog
+  entries and must use the same domain proof when their adapters are implemented.
 
 - [x] DONE: Make host/storage mutation preflight side-effect free.
   Meaning: host preflight reads Kubernetes metadata and fixed read-only host
