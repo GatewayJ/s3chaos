@@ -18,10 +18,17 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::fault::scenarios::{ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO};
+use crate::fault::{
+    scenarios::{ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO},
+    workload::WorkloadPlan,
+};
+use crate::framework::port_forward::{
+    KubernetesRawGetSnapshot, PortForwardGuard, PortForwardTargetSnapshot,
+};
 use crate::rustfs::{RustfsAdminResponse, RustfsAdminTransport};
 
 pub const ADMIN_PREFIX: &str = "/rustfs/admin/v3";
@@ -99,28 +106,49 @@ impl AdminAttemptWindow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminTopologyBuildContext {
-    pub run_id: String,
-    pub case_name: String,
-    pub cluster_domain: String,
-    /// Upper bound on net-new bytes admitted while the admin operation runs.
-    pub workload_max_bytes: u64,
-    pub runtime: AdminRuntimeBinding,
+    run_id: String,
+    case_name: String,
+    cluster_domain: String,
+    /// Fail-closed storage reserve for the finite workload.
+    workload_max_bytes: u64,
+    runtime: AdminRuntimeBinding,
 }
 
 impl AdminTopologyBuildContext {
     pub fn new(
         run_id: impl Into<String>,
         case_name: impl Into<String>,
-        workload_max_bytes: u64,
+        workload: &WorkloadPlan,
         runtime: AdminRuntimeBinding,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let prefilled_count = workload.object_count / 2;
+        let mixed_count = workload.object_count - prefilled_count;
+        ensure!(
+            mixed_count as u64 >= workload.operation_mix.total_weight(),
+            "admin workload must execute at least one complete operation-mix cycle"
+        );
+        let context = Self {
             run_id: run_id.into(),
             case_name: case_name.into(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
-            workload_max_bytes,
+            workload_max_bytes: workload.mixed_write_upper_bound(prefilled_count, mixed_count)?,
             runtime,
-        }
+        };
+        ensure!(
+            context.workload_max_bytes > 0,
+            "admin workload storage budget must be positive"
+        );
+        Ok(context)
+    }
+
+    pub fn with_cluster_domain(mut self, cluster_domain: impl Into<String>) -> Result<Self> {
+        let cluster_domain = cluster_domain.into();
+        ensure!(
+            !cluster_domain.trim().is_empty(),
+            "admin topology cluster domain must not be empty"
+        );
+        self.cluster_domain = cluster_domain;
+        Ok(self)
     }
 }
 
@@ -277,61 +305,198 @@ pub struct AdminRequestEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminEndpointIdentity {
-    pub kubernetes_context: String,
-    pub cluster_uid: String,
-    pub namespace: String,
-    pub service_name: String,
-    pub service_uid: String,
-    pub service_resource_version: String,
-    pub service_response_sha256: String,
-    pub service_response_body: String,
-    pub local_endpoint: String,
-    pub remote_port: u16,
+    kubernetes_context: String,
+    cluster_uid: String,
+    port_forward_command: String,
+    port_forward_started_at_ms: u64,
+    cluster_started_at_ms: u64,
+    cluster_observed_at_ms: u64,
+    cluster_response_sha256: String,
+    cluster_response_body: String,
+    namespace: String,
+    service_name: String,
+    service_uid: String,
+    service_resource_version: String,
+    service_started_at_ms: u64,
+    service_observed_at_ms: u64,
+    service_response_sha256: String,
+    service_response_body: String,
+    tenant_name: String,
+    tenant_uid: String,
+    tenant_resource_version: String,
+    tenant_started_at_ms: u64,
+    tenant_observed_at_ms: u64,
+    tenant_response_sha256: String,
+    tenant_response_body: String,
+    local_endpoint: String,
+    remote_port: u16,
 }
 
 impl AdminEndpointIdentity {
+    fn from_live_port_forward(port_forward: &mut PortForwardGuard) -> Result<Self> {
+        let snapshot = port_forward.capture_target()?;
+        let service: Value = serde_json::from_str(snapshot.service_response_body())
+            .context("decode captured Kubernetes Service GET response")?;
+        let tenant_name = required_string(&service, "/spec/selector/rustfs.tenant")?;
+        let tenant = port_forward.capture_namespaced_resource("tenant", &tenant_name)?;
+        Self::from_port_forward_snapshot(&snapshot, &tenant)
+    }
+
+    fn from_port_forward_snapshot(
+        snapshot: &PortForwardTargetSnapshot,
+        tenant_snapshot: &KubernetesRawGetSnapshot,
+    ) -> Result<Self> {
+        let cluster_response_body = snapshot.cluster_response_body().to_string();
+        let cluster: Value = serde_json::from_str(&cluster_response_body)
+            .context("decode captured Kubernetes cluster identity response")?;
+        let service_response_body = snapshot.service_response_body().to_string();
+        let service: Value = serde_json::from_str(&service_response_body)
+            .context("decode captured Kubernetes Service GET response")?;
+        let service_name = snapshot
+            .spec()
+            .service
+            .strip_prefix("svc/")
+            .filter(|name| !name.is_empty())
+            .context("admin port-forward target is not a named Service")?;
+        let tenant_response_body = tenant_snapshot.response_body().to_string();
+        let tenant: Value = serde_json::from_str(&tenant_response_body)
+            .context("decode captured Kubernetes Tenant GET response")?;
+        let (cluster_started_at_ms, cluster_observed_at_ms) = snapshot.cluster_interval_ms();
+        let (service_started_at_ms, service_observed_at_ms) = snapshot.service_interval_ms();
+        let (tenant_started_at_ms, tenant_observed_at_ms) = tenant_snapshot.interval_ms();
+        let identity = Self {
+            kubernetes_context: snapshot.kubernetes_context().to_string(),
+            cluster_uid: required_string(&cluster, "/metadata/uid")?,
+            port_forward_command: snapshot.command_display().to_string(),
+            port_forward_started_at_ms: snapshot.port_forward_started_at_ms(),
+            cluster_started_at_ms,
+            cluster_observed_at_ms,
+            cluster_response_sha256: sha256_hex(cluster_response_body.as_bytes()),
+            cluster_response_body,
+            namespace: snapshot.spec().namespace.clone(),
+            service_name: service_name.to_string(),
+            service_uid: required_string(&service, "/metadata/uid")?,
+            service_resource_version: required_string(&service, "/metadata/resourceVersion")?,
+            service_started_at_ms,
+            service_observed_at_ms,
+            service_response_sha256: sha256_hex(service_response_body.as_bytes()),
+            service_response_body,
+            tenant_name: required_string(&tenant, "/metadata/name")?,
+            tenant_uid: required_string(&tenant, "/metadata/uid")?,
+            tenant_resource_version: required_string(&tenant, "/metadata/resourceVersion")?,
+            tenant_started_at_ms,
+            tenant_observed_at_ms,
+            tenant_response_sha256: sha256_hex(tenant_response_body.as_bytes()),
+            tenant_response_body,
+            local_endpoint: snapshot.spec().local_base_url(),
+            remote_port: snapshot.spec().remote_port,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
     fn validate(&self) -> Result<()> {
         let endpoint = reqwest::Url::parse(&self.local_endpoint)
             .context("parse admin port-forward endpoint identity")?;
+        let local_port = endpoint
+            .port()
+            .context("admin port-forward endpoint has no explicit local port")?;
+        let expected_command = format!(
+            "kubectl --context {} -n {} port-forward svc/{} {}:{}",
+            self.kubernetes_context,
+            self.namespace,
+            self.service_name,
+            local_port,
+            self.remote_port
+        );
         ensure!(
             !self.kubernetes_context.trim().is_empty()
                 && !self.cluster_uid.trim().is_empty()
+                && self.port_forward_command == expected_command
+                && self.port_forward_started_at_ms > 0
+                && self.port_forward_started_at_ms <= self.cluster_started_at_ms
+                && self.cluster_started_at_ms <= self.cluster_observed_at_ms
+                && self.cluster_observed_at_ms <= self.service_started_at_ms
+                && self.service_started_at_ms <= self.service_observed_at_ms
+                && self.service_observed_at_ms <= self.tenant_started_at_ms
+                && self.tenant_started_at_ms <= self.tenant_observed_at_ms
+                && self.cluster_response_sha256
+                    == sha256_hex(self.cluster_response_body.as_bytes())
                 && !self.namespace.trim().is_empty()
                 && !self.service_name.trim().is_empty()
                 && !self.service_uid.trim().is_empty()
                 && !self.service_resource_version.trim().is_empty()
                 && self.service_response_sha256
                     == sha256_hex(self.service_response_body.as_bytes())
-                && matches!(endpoint.scheme(), "http" | "https")
-                && endpoint
-                    .host_str()
-                    .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-                    .is_some_and(|host| host.is_loopback())
-                && endpoint.port().is_some()
+                && endpoint.scheme() == "http"
+                && endpoint.host_str() == Some("127.0.0.1")
+                && endpoint.username().is_empty()
+                && endpoint.password().is_none()
                 && endpoint.path() == "/"
                 && endpoint.query().is_none()
                 && endpoint.fragment().is_none()
+                && self.local_endpoint == format!("http://127.0.0.1:{local_port}")
                 && self.remote_port == 9000,
             "admin endpoint is not an exact loopback port-forward to the current Tenant I/O service"
+        );
+        let cluster: Value = serde_json::from_str(&self.cluster_response_body)
+            .context("decode captured Kubernetes cluster identity response")?;
+        ensure!(
+            required_string(&cluster, "/apiVersion")? == "v1"
+                && required_string(&cluster, "/kind")? == "Namespace"
+                && required_string(&cluster, "/metadata/name")? == "kube-system"
+                && required_string(&cluster, "/metadata/uid")? == self.cluster_uid,
+            "Kubernetes cluster UID does not match the captured kube-system Namespace GET response"
         );
         let service: Value = serde_json::from_str(&self.service_response_body)
             .context("decode captured Kubernetes Service GET response")?;
         ensure!(
-            required_string(&service, "/metadata/namespace")? == self.namespace
+            required_string(&service, "/apiVersion")? == "v1"
+                && required_string(&service, "/kind")? == "Service"
+                && required_string(&service, "/metadata/namespace")? == self.namespace
                 && required_string(&service, "/metadata/name")? == self.service_name
                 && required_string(&service, "/metadata/uid")? == self.service_uid
                 && required_string(&service, "/metadata/resourceVersion")?
-                    == self.service_resource_version,
+                    == self.service_resource_version
+                && service
+                    .pointer("/spec/ports")
+                    .and_then(Value::as_array)
+                    .is_some_and(|ports| {
+                        ports.iter().any(|port| {
+                            port.get("port").and_then(Value::as_u64)
+                                == Some(u64::from(self.remote_port))
+                        })
+                    }),
             "admin port-forward Service identity fields do not match its captured Kubernetes response"
+        );
+        let tenant: Value = serde_json::from_str(&self.tenant_response_body)
+            .context("decode captured Kubernetes Tenant GET response")?;
+        ensure!(
+            !self.tenant_name.trim().is_empty()
+                && !self.tenant_uid.trim().is_empty()
+                && !self.tenant_resource_version.trim().is_empty()
+                && self.tenant_response_sha256 == sha256_hex(self.tenant_response_body.as_bytes())
+                && required_string(&tenant, "/metadata/namespace")? == self.namespace
+                && required_string(&tenant, "/metadata/name")? == self.tenant_name
+                && required_string(&tenant, "/metadata/uid")? == self.tenant_uid
+                && required_string(&tenant, "/metadata/resourceVersion")?
+                    == self.tenant_resource_version
+                && service
+                    .pointer("/spec/selector/rustfs.tenant")
+                    .and_then(Value::as_str)
+                    == Some(self.tenant_name.as_str()),
+            "admin endpoint Tenant identity does not match its live port-forward Service or captured Tenant GET"
         );
         Ok(())
     }
 
-    fn validate_for_tenant(&self, namespace: &str, tenant: &str) -> Result<()> {
+    fn validate_for_tenant(&self, namespace: &str, tenant: &str, tenant_uid: &str) -> Result<()> {
         self.validate()?;
         ensure!(
             self.namespace == namespace
                 && self.service_name == format!("{tenant}-io")
+                && self.tenant_name == tenant
+                && self.tenant_uid == tenant_uid
                 && serde_json::from_str::<Value>(&self.service_response_body)
                     .ok()
                     .and_then(|service| {
@@ -343,6 +508,25 @@ impl AdminEndpointIdentity {
                     .as_deref()
                     == Some(tenant),
             "admin port-forward service does not belong to the proven Tenant"
+        );
+        Ok(())
+    }
+
+    fn require_same_live_target(&self, current: &Self) -> Result<()> {
+        self.validate()?;
+        current.validate()?;
+        ensure!(
+            self.kubernetes_context == current.kubernetes_context
+                && self.cluster_uid == current.cluster_uid
+                && self.port_forward_command == current.port_forward_command
+                && self.namespace == current.namespace
+                && self.service_name == current.service_name
+                && self.service_uid == current.service_uid
+                && self.tenant_name == current.tenant_name
+                && self.tenant_uid == current.tenant_uid
+                && self.local_endpoint == current.local_endpoint
+                && self.remote_port == current.remote_port,
+            "admin port-forward live Kubernetes target drifted after endpoint binding"
         );
         Ok(())
     }
@@ -399,6 +583,7 @@ impl AdminRuntimeBinding {
         self.target.endpoint.validate()?;
         ensure!(
             (200..300).contains(&self.status)
+                && self.target.endpoint.tenant_observed_at_ms <= self.started_at_ms
                 && self.started_at_ms > 0
                 && self.started_at_ms <= self.observed_at_ms
                 && !self.target.deployment_id.trim().is_empty()
@@ -538,10 +723,11 @@ impl AdminPoolSnapshot {
         validate_attempt_identity(&self.attempt)?;
         self.tenant_get.validate()?;
         self.runtime.validate()?;
-        self.runtime
-            .target
-            .endpoint
-            .validate_for_tenant(&self.tenant_get.namespace, &self.tenant_get.name)?;
+        self.runtime.target.endpoint.validate_for_tenant(
+            &self.tenant_get.namespace,
+            &self.tenant_get.name,
+            &self.tenant_get.uid,
+        )?;
         ensure!(
             self.tenant_get.uid == self.attempt.tenant_uid
                 && self.observed_at_ms == self.request.observed_at_ms
@@ -590,18 +776,30 @@ pub trait AdminTopologyPort: Send + Sync {
     async fn stop_rebalance(&self) -> Result<AdminCall<()>>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RustfsAdminTopologyAdapter {
     transport: RustfsAdminTransport,
     runtime: AdminRuntimeBinding,
+    port_forward: Option<Mutex<PortForwardGuard>>,
 }
 
 impl RustfsAdminTopologyAdapter {
     pub async fn connect(
+        mut port_forward: PortForwardGuard,
+        region: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<Self> {
+        let endpoint = AdminEndpointIdentity::from_live_port_forward(&mut port_forward)?;
+        Self::connect_bound(endpoint, region, access_key, secret_key, Some(port_forward)).await
+    }
+
+    async fn connect_bound(
         endpoint: AdminEndpointIdentity,
         region: &str,
         access_key: &str,
         secret_key: &str,
+        port_forward: Option<PortForwardGuard>,
     ) -> Result<Self> {
         let transport = RustfsAdminTransport::new(
             &endpoint.local_endpoint,
@@ -612,7 +810,35 @@ impl RustfsAdminTopologyAdapter {
             "s3chaos-fault-admin-topology",
         )?;
         let runtime = probe_runtime_binding(&transport, endpoint).await?;
-        Ok(Self { transport, runtime })
+        Ok(Self {
+            transport,
+            runtime,
+            port_forward: port_forward.map(Mutex::new),
+        })
+    }
+
+    #[cfg(test)]
+    async fn connect_for_test(
+        endpoint: AdminEndpointIdentity,
+        region: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<Self> {
+        Self::connect_bound(endpoint, region, access_key, secret_key, None).await
+    }
+
+    fn ensure_port_forward_target(&self) -> Result<()> {
+        let Some(port_forward) = &self.port_forward else {
+            return Ok(());
+        };
+        let mut port_forward = port_forward
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admin port-forward guard lock is poisoned"))?;
+        let current = AdminEndpointIdentity::from_live_port_forward(&mut port_forward)?;
+        self.runtime
+            .target
+            .endpoint
+            .require_same_live_target(&current)
     }
 
     pub fn runtime_binding(&self) -> &AdminRuntimeBinding {
@@ -620,6 +846,7 @@ impl RustfsAdminTopologyAdapter {
     }
 
     pub async fn probe_runtime_binding(&self) -> Result<AdminRuntimeBinding> {
+        self.ensure_port_forward_target()?;
         probe_runtime_binding(&self.transport, self.runtime.target.endpoint.clone()).await
     }
 
@@ -629,6 +856,7 @@ impl RustfsAdminTopologyAdapter {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<AdminCall<T>> {
+        self.ensure_port_forward_target()?;
         let started_at_ms = now_ms();
         let response = self
             .transport
@@ -656,6 +884,7 @@ impl RustfsAdminTopologyAdapter {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<AdminCall<()>> {
+        self.ensure_port_forward_target()?;
         let started_at_ms = now_ms();
         let response = self
             .transport
@@ -887,11 +1116,11 @@ impl AdminTopologyProof {
         let tenant_uid = required_string(tenant, "/metadata/uid")?;
         let namespace = required_string(tenant, "/metadata/namespace")?;
         validate_build_context(scenario, context)?;
-        context
-            .runtime
-            .target
-            .endpoint
-            .validate_for_tenant(&namespace, &tenant_name)?;
+        context.runtime.target.endpoint.validate_for_tenant(
+            &namespace,
+            &tenant_name,
+            &tenant_uid,
+        )?;
         let tenant_pools = tenant
             .pointer("/spec/pools")
             .and_then(Value::as_array)
@@ -963,10 +1192,11 @@ impl AdminTopologyProof {
         );
         validate_attempt_identity(&self.attempt)?;
         self.runtime.validate()?;
-        self.runtime
-            .target
-            .endpoint
-            .validate_for_tenant(&self.namespace, &self.tenant)?;
+        self.runtime.target.endpoint.validate_for_tenant(
+            &self.namespace,
+            &self.tenant,
+            &self.attempt.tenant_uid,
+        )?;
         for pool in &self.tenant_pools {
             ensure!(
                 pool.tenant_uid == self.attempt.tenant_uid,
@@ -2733,25 +2963,52 @@ mod tests {
     }
 
     fn endpoint_identity() -> AdminEndpointIdentity {
+        let cluster_response_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "kube-system", "uid": "cluster-uid"}
+        })
+        .to_string();
         let service_response_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
             "metadata": {
                 "namespace": "fault-ns",
                 "name": "fault-tenant-io",
                 "uid": "service-uid",
                 "resourceVersion": "service-rv-1"
             },
-            "spec": {"selector": {"rustfs.tenant": "fault-tenant"}}
+            "spec": {
+                "ports": [{"port": 9000}],
+                "selector": {"rustfs.tenant": "fault-tenant"}
+            }
         })
         .to_string();
+        let tenant_response_body = serde_json::to_string(&tenant()).expect("serialize Tenant");
         AdminEndpointIdentity {
             kubernetes_context: "kind-admin-test".to_string(),
             cluster_uid: "cluster-uid".to_string(),
+            port_forward_command: "kubectl --context kind-admin-test -n fault-ns port-forward svc/fault-tenant-io 19000:9000".to_string(),
+            port_forward_started_at_ms: 10,
+            cluster_started_at_ms: 20,
+            cluster_observed_at_ms: 21,
+            cluster_response_sha256: sha256_hex(cluster_response_body.as_bytes()),
+            cluster_response_body,
             namespace: "fault-ns".to_string(),
             service_name: "fault-tenant-io".to_string(),
             service_uid: "service-uid".to_string(),
             service_resource_version: "service-rv-1".to_string(),
+            service_started_at_ms: 22,
+            service_observed_at_ms: 23,
             service_response_sha256: sha256_hex(service_response_body.as_bytes()),
             service_response_body,
+            tenant_name: "fault-tenant".to_string(),
+            tenant_uid: "tenant-uid".to_string(),
+            tenant_resource_version: "tenant-rv-1".to_string(),
+            tenant_started_at_ms: 24,
+            tenant_observed_at_ms: 25,
+            tenant_response_sha256: sha256_hex(tenant_response_body.as_bytes()),
+            tenant_response_body,
             local_endpoint: "http://127.0.0.1:19000".to_string(),
             remote_port: 9000,
         }
@@ -2762,6 +3019,72 @@ mod tests {
             endpoint: endpoint_identity(),
             deployment_id: "deployment-1".to_string(),
         }
+    }
+
+    #[test]
+    fn endpoint_identity_rejects_self_consistent_cross_cluster_tenant_substitution() {
+        let mut endpoint = endpoint_identity();
+        let cluster_response_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "kube-system", "uid": "cluster-b-uid"}
+        })
+        .to_string();
+        let service_response_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "namespace": "fault-ns",
+                "name": "fault-tenant-io",
+                "uid": "service-b-uid",
+                "resourceVersion": "service-b-rv"
+            },
+            "spec": {
+                "ports": [{"port": 9000}],
+                "selector": {"rustfs.tenant": "fault-tenant"}
+            }
+        })
+        .to_string();
+        let tenant_response_body = serde_json::json!({
+            "metadata": {
+                "namespace": "fault-ns",
+                "name": "fault-tenant",
+                "uid": "tenant-b-uid",
+                "resourceVersion": "tenant-b-rv"
+            }
+        })
+        .to_string();
+        endpoint.kubernetes_context = "kind-cluster-b".to_string();
+        endpoint.cluster_uid = "cluster-b-uid".to_string();
+        endpoint.port_forward_command = "kubectl --context kind-cluster-b -n fault-ns port-forward svc/fault-tenant-io 19000:9000".to_string();
+        endpoint.cluster_response_sha256 = sha256_hex(cluster_response_body.as_bytes());
+        endpoint.cluster_response_body = cluster_response_body;
+        endpoint.service_uid = "service-b-uid".to_string();
+        endpoint.service_resource_version = "service-b-rv".to_string();
+        endpoint.service_response_sha256 = sha256_hex(service_response_body.as_bytes());
+        endpoint.service_response_body = service_response_body;
+        endpoint.tenant_uid = "tenant-b-uid".to_string();
+        endpoint.tenant_resource_version = "tenant-b-rv".to_string();
+        endpoint.tenant_response_sha256 = sha256_hex(tenant_response_body.as_bytes());
+        endpoint.tenant_response_body = tenant_response_body;
+
+        endpoint
+            .validate()
+            .expect("self-consistent cluster B identity");
+        assert!(
+            endpoint
+                .validate_for_tenant("fault-ns", "fault-tenant", "tenant-uid")
+                .is_err(),
+            "a live endpoint from cluster B must not bind to cluster A's original Tenant UID"
+        );
+    }
+
+    #[test]
+    fn endpoint_identity_rejects_loopback_port_not_owned_by_its_guard_command() {
+        let mut endpoint = endpoint_identity();
+        endpoint.local_endpoint = "http://127.0.0.1:19001".to_string();
+
+        assert!(endpoint.validate().is_err());
     }
 
     fn runtime_binding(started_at_ms: u64, observed_at_ms: u64) -> AdminRuntimeBinding {
@@ -2778,12 +3101,42 @@ mod tests {
     }
 
     fn context(scenario: &str) -> AdminTopologyBuildContext {
-        AdminTopologyBuildContext::new(
+        AdminTopologyBuildContext {
+            run_id: TEST_RUN_ID.to_string(),
+            case_name: case_name(scenario).to_string(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            workload_max_bytes: TEST_WORKLOAD_MAX_BYTES,
+            runtime: runtime_binding(60, 70),
+        }
+    }
+
+    #[test]
+    fn build_context_derives_capacity_only_from_a_complete_workload_plan() {
+        let complete = WorkloadPlan::seeded(42, 12, 1);
+        let context = AdminTopologyBuildContext::new(
             TEST_RUN_ID,
-            case_name(scenario),
-            TEST_WORKLOAD_MAX_BYTES,
+            case_name(ADMIN_DECOMMISSION_SCENARIO),
+            &complete,
             runtime_binding(60, 70),
         )
+        .expect("complete workload context");
+        assert_eq!(
+            context.workload_max_bytes,
+            complete
+                .mixed_write_upper_bound(6, 6)
+                .expect("derived workload bound")
+        );
+
+        let incomplete = WorkloadPlan::seeded(42, 2, 1);
+        assert!(
+            AdminTopologyBuildContext::new(
+                TEST_RUN_ID,
+                case_name(ADMIN_DECOMMISSION_SCENARIO),
+                &incomplete,
+                runtime_binding(60, 70),
+            )
+            .is_err()
+        );
     }
 
     fn attempt(scenario: &str) -> AdminAttemptIdentity {
@@ -3187,11 +3540,22 @@ mod tests {
             axum::serve(listener, app).await.expect("mock server");
         });
         let mut endpoint_identity = endpoint_identity();
+        let local_port = reqwest::Url::parse(&endpoint)
+            .expect("mock endpoint")
+            .port()
+            .expect("mock port");
+        endpoint_identity.port_forward_command = format!(
+            "kubectl --context kind-admin-test -n fault-ns port-forward svc/fault-tenant-io {local_port}:9000"
+        );
         endpoint_identity.local_endpoint = endpoint;
-        let adapter =
-            RustfsAdminTopologyAdapter::connect(endpoint_identity, "us-east-1", "access", "secret")
-                .await
-                .expect("adapter");
+        let adapter = RustfsAdminTopologyAdapter::connect_for_test(
+            endpoint_identity,
+            "us-east-1",
+            "access",
+            "secret",
+        )
+        .await
+        .expect("adapter");
 
         let response = adapter.list_pools().await.expect("pool list");
         assert_eq!(
@@ -3209,7 +3573,6 @@ mod tests {
     #[test]
     fn pool_snapshot_derives_tenant_uid_from_fresh_kubernetes_get() {
         let mut current_tenant = tenant();
-        current_tenant["metadata"]["uid"] = Value::String("fresh-tenant-uid".to_string());
         current_tenant["metadata"]["resourceVersion"] = Value::String("tenant-rv-2".to_string());
         let current_pools = pools();
         let snapshot = AdminPoolSnapshot::from_list(
@@ -3242,9 +3605,44 @@ mod tests {
         )
         .expect("snapshot derives Tenant identity from the Kubernetes resource");
 
-        assert_eq!(snapshot.attempt.tenant_uid, "fresh-tenant-uid");
+        assert_eq!(snapshot.attempt.tenant_uid, "tenant-uid");
         assert_eq!(snapshot.tenant_get.resource_version, "tenant-rv-2");
         assert_eq!(snapshot.tenant_get.observed_at_ms, 80);
+
+        let mut recreated_tenant = current_tenant.clone();
+        recreated_tenant["metadata"]["uid"] = Value::String("replacement-tenant-uid".to_string());
+        assert!(
+            AdminPoolSnapshot::from_list(
+                TEST_RUN_ID,
+                case_name(ADMIN_REBALANCE_SCENARIO),
+                serde_json::to_string(&recreated_tenant)
+                    .expect("Tenant JSON")
+                    .as_bytes(),
+                runtime_binding(60, 70),
+                75,
+                80,
+                AdminCall {
+                    value: current_pools.clone(),
+                    request: with_json_response(
+                        AdminRequestEvidence {
+                            target: request_target(),
+                            method: "GET".to_string(),
+                            path: format!("{ADMIN_PREFIX}/pools/list"),
+                            query: BTreeMap::new(),
+                            status: 200,
+                            started_at_ms: 85,
+                            observed_at_ms: 90,
+                            request_id: None,
+                            response_sha256: None,
+                            response_body: None,
+                        },
+                        &current_pools,
+                    ),
+                },
+            )
+            .is_err(),
+            "a recreated Tenant UID must not replace the guard-bound original Tenant"
+        );
 
         assert!(
             AdminPoolSnapshot::from_list(

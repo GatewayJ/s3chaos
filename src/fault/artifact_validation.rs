@@ -96,6 +96,10 @@ pub fn validate_admin_topology_artifact_files(
     )?)?;
     let prefilled_count = workload.plan.object_count / 2;
     let mixed_count = workload.plan.object_count - prefilled_count;
+    ensure!(
+        mixed_count as u64 >= workload.plan.operation_mix.total_weight(),
+        "admin workload plan must execute at least one complete operation-mix cycle"
+    );
     let workload_max_bytes = workload
         .plan
         .mixed_write_upper_bound(prefilled_count, mixed_count)?;
@@ -3313,6 +3317,7 @@ mod tests {
     fn admin_topology_files_require_successful_terminal_progress() {
         let dir = tempfile::tempdir().expect("tempdir");
         let case_name = "fault_admin_decommission_preserves_object_model";
+        let workload_max_bytes = 50_358_024_u64;
         let primary = "http://fault-tenant-primary-{0...3}.fault-tenant-hl.fault-ns.svc.cluster.local:9000/data/rustfs{0...0}";
         let target = "http://fault-tenant-decommission-target-{0...3}.fault-tenant-hl.fault-ns.svc.cluster.local:9000/data/rustfs{0...0}";
         let attempt = AdminAttemptIdentity {
@@ -3331,10 +3336,10 @@ mod tests {
                 "status": "active",
                 "decommissionStatus": "none",
                 "rebalanceStatus": "none",
-                "totalSize": 2000,
-                "currentSize": 1500,
-                "usedSize": 500,
-                "used": 0.25
+                "totalSize": 100000000,
+                "currentSize": 90000000,
+                "usedSize": 10000000,
+                "used": 0.1
             },
             {
                 "id": 1,
@@ -3355,10 +3360,10 @@ mod tests {
                 "status": "active",
                 "decommissionStatus": "none",
                 "rebalanceStatus": "none",
-                "totalSize": 2000,
-                "currentSize": 1300,
-                "usedSize": 700,
-                "used": 0.35
+                "totalSize": 100000000,
+                "currentSize": 89999800,
+                "usedSize": 10000200,
+                "used": 0.100002
             }
         ]);
         let pools_body = serde_json::to_string(&pools).expect("pools/list response body");
@@ -3380,26 +3385,63 @@ mod tests {
         }))
         .expect("terminal status body");
         let terminal_status_sha256 = hex::encode(Sha256::digest(terminal_status_body.as_bytes()));
+        let cluster_body = serde_json::to_string(&json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "kube-system", "uid": "cluster-uid"}
+        }))
+        .expect("cluster identity GET body");
+        let cluster_sha256 = hex::encode(Sha256::digest(cluster_body.as_bytes()));
         let service_body = serde_json::to_string(&json!({
+            "apiVersion": "v1",
+            "kind": "Service",
             "metadata": {
                 "namespace": "fault-ns",
                 "name": "fault-tenant-io",
                 "uid": "service-uid",
                 "resourceVersion": "service-rv-1"
             },
-            "spec": {"selector": {"rustfs.tenant": "fault-tenant"}}
+            "spec": {
+                "ports": [{"port": 9000}],
+                "selector": {"rustfs.tenant": "fault-tenant"}
+            }
         }))
         .expect("Service GET body");
         let service_sha256 = hex::encode(Sha256::digest(service_body.as_bytes()));
+        let endpoint_tenant_body = serde_json::to_string(&json!({
+            "metadata": {
+                "namespace": "fault-ns",
+                "name": "fault-tenant",
+                "uid": "tenant-uid",
+                "resourceVersion": "tenant-rv-1"
+            }
+        }))
+        .expect("endpoint Tenant GET body");
+        let endpoint_tenant_sha256 = hex::encode(Sha256::digest(endpoint_tenant_body.as_bytes()));
         let endpoint_identity = json!({
             "kubernetesContext": "kind-admin-test",
             "clusterUid": "cluster-uid",
+            "portForwardCommand": "kubectl --context kind-admin-test -n fault-ns port-forward svc/fault-tenant-io 19000:9000",
+            "portForwardStartedAtMs": 10,
+            "clusterStartedAtMs": 20,
+            "clusterObservedAtMs": 21,
+            "clusterResponseSha256": cluster_sha256,
+            "clusterResponseBody": cluster_body,
             "namespace": "fault-ns",
             "serviceName": "fault-tenant-io",
             "serviceUid": "service-uid",
             "serviceResourceVersion": "service-rv-1",
+            "serviceStartedAtMs": 22,
+            "serviceObservedAtMs": 23,
             "serviceResponseSha256": service_sha256,
             "serviceResponseBody": service_body,
+            "tenantName": "fault-tenant",
+            "tenantUid": "tenant-uid",
+            "tenantResourceVersion": "tenant-rv-1",
+            "tenantStartedAtMs": 24,
+            "tenantObservedAtMs": 25,
+            "tenantResponseSha256": endpoint_tenant_sha256,
+            "tenantResponseBody": endpoint_tenant_body,
             "localEndpoint": "http://127.0.0.1:19000",
             "remotePort": 9000
         });
@@ -3460,11 +3502,11 @@ mod tests {
                 "runtimePools": pools,
                 "targetPoolId": 1,
                 "targetPoolExpression": target,
-                "remainingFreeBytes": 1500,
+                "remainingFreeBytes": 90000000,
                 "targetUsedBytes": 200,
-                "workloadMaxBytes": 100,
+                "workloadMaxBytes": workload_max_bytes,
                 "capacityGuardPercent": 130,
-                "requiredRemainingFreeBytes": 360,
+                "requiredRemainingFreeBytes": workload_max_bytes + 260,
                 "mutuallyExclusive": true,
                 "satisfied": true
             }),
@@ -3575,21 +3617,18 @@ mod tests {
                 }
             }),
         );
-        write_json(
-            dir.path(),
-            "workload-plan.json",
-            &json!({
-                "scenario": "admin-decommission",
-                "run_id": "run-admin-1",
-                "seed": 1,
-                "generator": "splitmix64-v1",
-                "object_count": 2,
-                "concurrency": 1,
-                "operation_mix": {"put": 1, "overwrite": 1, "get": 1, "list": 1, "delete": 1, "multipart": 1},
-                "total_payload_bytes": 200,
-                "size_distribution": [{"size_bytes": 100, "object_count": 2}]
-            }),
-        );
+        let valid_workload_plan = json!({
+            "scenario": "admin-decommission",
+            "run_id": "run-admin-1",
+            "seed": 1,
+            "generator": "splitmix64-v1",
+            "object_count": 12,
+            "concurrency": 1,
+            "operation_mix": {"put": 1, "overwrite": 1, "get": 1, "list": 1, "delete": 1, "multipart": 1},
+            "total_payload_bytes": 1200,
+            "size_distribution": [{"size_bytes": 100, "object_count": 12}]
+        });
+        write_json(dir.path(), "workload-plan.json", &valid_workload_plan);
         let progress_path = dir.path().join("admin-operation-progress.jsonl");
         fs::write(
             &progress_path,
@@ -3611,6 +3650,29 @@ mod tests {
             dir.path(),
         )
         .expect("valid admin evidence");
+        let mut incomplete_operation_cycle = valid_workload_plan.clone();
+        incomplete_operation_cycle["object_count"] = json!(2);
+        incomplete_operation_cycle["total_payload_bytes"] = json!(200);
+        incomplete_operation_cycle["size_distribution"] =
+            json!([{"size_bytes": 100, "object_count": 2}]);
+        write_json(
+            dir.path(),
+            "workload-plan.json",
+            &incomplete_operation_cycle,
+        );
+        let incomplete_error = validate_admin_topology_artifact_files(
+            "admin-decommission",
+            &attempt,
+            attempt_window,
+            dir.path(),
+        )
+        .expect_err("incomplete operation cycle must fail closed");
+        assert!(
+            incomplete_error
+                .to_string()
+                .contains("complete operation-mix cycle")
+        );
+        write_json(dir.path(), "workload-plan.json", &valid_workload_plan);
         let valid_operation = serde_json::from_slice::<Value>(
             &fs::read(dir.path().join("admin-operation.json")).expect("operation artifact"),
         )
@@ -3791,21 +3853,7 @@ mod tests {
             )
             .is_err()
         );
-        write_json(
-            dir.path(),
-            "workload-plan.json",
-            &json!({
-                "scenario": "admin-decommission",
-                "run_id": "run-admin-1",
-                "seed": 1,
-                "generator": "splitmix64-v1",
-                "object_count": 2,
-                "concurrency": 1,
-                "operation_mix": {"put": 1, "overwrite": 1, "get": 1, "list": 1, "delete": 1, "multipart": 1},
-                "total_payload_bytes": 200,
-                "size_distribution": [{"size_bytes": 100, "object_count": 2}]
-            }),
-        );
+        write_json(dir.path(), "workload-plan.json", &valid_workload_plan);
 
         fs::write(
             progress_path,
