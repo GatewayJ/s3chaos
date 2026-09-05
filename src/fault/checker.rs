@@ -290,7 +290,15 @@ impl CheckerReport {
     }
 
     fn success_predicate(&self) -> bool {
+        let tolerated = self
+            .tolerated_ambiguous_deletes
+            .iter()
+            .collect::<BTreeSet<_>>();
         self.tenant_recovered
+            && tolerated.len() == self.tolerated_ambiguous_deletes.len()
+            && self.verified_live_objects.checked_add(tolerated.len())
+                == Some(self.expected_live_objects)
+            && self.tolerated_ambiguous_deletes_have_audit_proof()
             && self.missing_committed_objects.is_empty()
             && self.unavailable_committed_objects.is_empty()
             && self.unknown_committed_read_failures.is_empty()
@@ -311,6 +319,48 @@ impl CheckerReport {
             && self.resurrected_deleted_objects.is_empty()
             && self.delete_marker_lineage_incomplete.is_empty()
             && self.multipart_upload_lineage_incomplete.is_empty()
+    }
+
+    fn tolerated_ambiguous_deletes_have_audit_proof(&self) -> bool {
+        if self.tolerated_ambiguous_deletes.is_empty() {
+            return true;
+        }
+        let Some(audit) = &self.audit else {
+            return false;
+        };
+        let prefix = ObjectSpec::key_prefix(&self.run_id);
+        self.tolerated_ambiguous_deletes.iter().all(|key| {
+            let get_proves_absence = audit.suffix_operations.iter().any(|operation| {
+                operation.kind == OperationKind::Get
+                    && operation.key.as_deref() == Some(key)
+                    && operation.version_id.is_none()
+                    && operation.outcome == OperationOutcome::NotFound
+                    && operation.http_status == Some(404)
+            });
+            let list_proves_absence = audit.suffix_operations.iter().any(|operation| {
+                operation.kind == OperationKind::List
+                    && operation.key.as_deref() == Some(prefix.as_str())
+                    && operation.outcome == OperationOutcome::Ok
+                    && operation.http_status == Some(200)
+                    && operation
+                        .listed_keys
+                        .as_ref()
+                        .is_some_and(|keys| !keys.contains(key))
+            });
+            let version_proves_delete = !self.versioning_expected
+                || audit.suffix_operations.iter().any(|operation| {
+                    operation.kind == OperationKind::ListVersions
+                        && operation.key.as_deref() == Some(prefix.as_str())
+                        && operation.outcome == OperationOutcome::Ok
+                        && operation.http_status == Some(200)
+                        && operation.listed_versions.as_ref().is_some_and(|versions| {
+                            versions.iter().any(|version| {
+                                version.key == *key && version.is_latest && version.is_delete_marker
+                            })
+                        })
+                });
+            get_proves_absence && list_proves_absence && version_proves_delete
+        })
     }
 
     pub(crate) fn failure_classification(&self) -> RecoveryStabilityClassification {
@@ -467,6 +517,16 @@ pub async fn check_s3_history(
     let mut data_version_checks = Vec::new();
     let mut delete_marker_checks = Vec::new();
     let mut list_object_versions_completed = None;
+    let mut ambiguous_delete_absent = BTreeSet::new();
+    let mut ambiguous_delete_present = BTreeSet::new();
+    let mut version_latest_by_key = None;
+    let expected_latest_versions = expect_versioning.then(|| {
+        checker_expected_version_listing(&initial_records)
+            .into_iter()
+            .filter(|entry| entry.is_latest)
+            .map(|entry| (entry.key.clone(), entry))
+            .collect::<BTreeMap<_, _>>()
+    });
 
     let final_keys = model
         .live
@@ -495,8 +555,19 @@ pub async fn check_s3_history(
             // The committed object had a later ambiguous (timeout/unknown)
             // delete; a 404 means that delete took effect, which is a
             // legitimate outcome, not a lost committed object.
-            report.tolerated_ambiguous_deletes.push(key);
+            ambiguous_delete_absent.insert(key);
             continue;
+        }
+        if expected.as_ref().is_some_and(|expected| {
+            get.outcome == OperationOutcome::Ok
+                && get
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| object_matches(expected, body))
+        }) && unknown_writes.is_empty()
+            && model.ambiguous_delete_pending.contains(&key)
+        {
+            ambiguous_delete_present.insert(key.clone());
         }
         evaluate_final_get(&mut report, key, expected.as_ref(), &unknown_writes, get);
     }
@@ -532,6 +603,7 @@ pub async fn check_s3_history(
     let prefix = ObjectSpec::key_prefix(&run_id);
 
     let mut final_list_warnings = WarningSummary::default();
+    let mut final_listed_keys = None;
     if let Some(lineage) = version_lineage {
         report.expected_committed_versions = lineage.versions.len();
         report.committed_writes_missing_version_id_count = lineage.missing_version_id_count;
@@ -563,6 +635,7 @@ pub async fn check_s3_history(
         match s3.list_object_versions(&prefix, recorder).await? {
             Some(entries) => {
                 list_object_versions_completed = Some(true);
+                version_latest_by_key = Some(latest_version_entries(&entries));
                 delete_marker_checks =
                     checker_delete_marker_audits(&lineage.delete_markers, Some(entries.as_slice()));
                 let (missing_versions, multipart_lineage) =
@@ -576,7 +649,9 @@ pub async fn check_s3_history(
                 evaluate_deleted_latest_versions(
                     &mut report,
                     &model.deleted,
-                    &latest_version_entries(&entries),
+                    version_latest_by_key
+                        .as_ref()
+                        .expect("latest version map was just captured"),
                 );
                 let (materialized, conflicts) = materialized_ambiguous_versions(
                     s3,
@@ -602,24 +677,32 @@ pub async fn check_s3_history(
         Some(keys) => {
             report.final_listed_objects = Some(keys.len());
             let listed = keys.into_iter().collect::<BTreeSet<_>>();
-            for key in model.live.keys() {
-                if !listed.contains(key) && !model.ambiguous_delete_pending.contains(key) {
-                    final_list_warnings.push(format!(
-                        "LIST prefix {prefix} did not include expected live key {key}"
-                    ));
-                }
-            }
-            for key in model.deleted {
-                if listed.contains(&key) {
-                    final_list_warnings
-                        .push(format!("LIST prefix {prefix} included deleted key {key}"));
-                }
-            }
+            evaluate_final_list_keys(
+                &model,
+                &ambiguous_delete_absent,
+                &listed,
+                &prefix,
+                &mut final_list_warnings,
+            );
+            final_listed_keys = Some(listed);
         }
         None => final_list_warnings.push(format!("LIST prefix {prefix} did not complete")),
     }
     report.final_list_warning_count = final_list_warnings.total_count;
     report.list_warnings = final_list_warnings.samples;
+
+    finalize_ambiguous_delete_observations(
+        &mut report,
+        &model,
+        AmbiguousDeleteFinalObservations {
+            absent_on_get: &ambiguous_delete_absent,
+            present_on_get: &ambiguous_delete_present,
+            listed_keys: final_listed_keys.as_ref(),
+            actual_latest: version_latest_by_key.as_ref(),
+            expected_latest: expected_latest_versions.as_ref(),
+            expect_versioning,
+        },
+    );
 
     report.missing_committed_objects.sort();
     report
@@ -648,7 +731,6 @@ pub async fn check_s3_history(
         .sort_by(|left, right| (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id)));
     delete_marker_checks
         .sort_by(|left, right| (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id)));
-    report.passed = report.success_predicate();
     let checker_records = recorder.records();
     let checker_suffix = checker_records
         .get(initial_records.len()..)
@@ -666,6 +748,7 @@ pub async fn check_s3_history(
         delete_marker_checks,
         list_object_versions_completed,
     });
+    report.passed = report.success_predicate();
 
     Ok(report)
 }
@@ -1078,6 +1161,79 @@ fn evaluate_deleted_latest_versions(
     }
 }
 
+struct AmbiguousDeleteFinalObservations<'a> {
+    absent_on_get: &'a BTreeSet<String>,
+    present_on_get: &'a BTreeSet<String>,
+    listed_keys: Option<&'a BTreeSet<String>>,
+    actual_latest: Option<&'a BTreeMap<String, ObjectVersionEntry>>,
+    expected_latest: Option<&'a BTreeMap<String, ListedVersionEntry>>,
+    expect_versioning: bool,
+}
+
+fn finalize_ambiguous_delete_observations(
+    report: &mut CheckerReport,
+    model: &ObjectModel,
+    observations: AmbiguousDeleteFinalObservations<'_>,
+) {
+    let AmbiguousDeleteFinalObservations {
+        absent_on_get,
+        present_on_get,
+        listed_keys,
+        actual_latest,
+        expected_latest,
+        expect_versioning,
+    } = observations;
+    for key in &model.ambiguous_delete_pending {
+        if absent_on_get.contains(key) {
+            let list_proves_absence = listed_keys.is_some_and(|listed| !listed.contains(key));
+            let version_proves_delete = !expect_versioning
+                || actual_latest
+                    .and_then(|latest| latest.get(key))
+                    .is_some_and(|entry| entry.is_delete_marker);
+            if list_proves_absence && version_proves_delete {
+                report.tolerated_ambiguous_deletes.push(key.clone());
+            } else if expect_versioning {
+                match actual_latest.and_then(|latest| latest.get(key)) {
+                    Some(entry) if !entry.is_delete_marker => {
+                        report.missing_committed_objects.push(key.clone());
+                    }
+                    None => report.delete_marker_lineage_incomplete.push(format!(
+                        "{key}: GET returned 404 after ambiguous delete but ListObjectVersions has no latest entry"
+                    )),
+                    Some(_) => {}
+                }
+            }
+            continue;
+        }
+
+        if !present_on_get.contains(key) || !expect_versioning {
+            continue;
+        }
+        match actual_latest.and_then(|latest| latest.get(key)) {
+            Some(entry) if entry.is_delete_marker => {
+                report.unexpected_visible_deleted_objects.push(format!(
+                    "{key}: GET returned the committed body after ambiguous delete but ListObjectVersions reports a delete marker latest"
+                ));
+            }
+            Some(entry)
+                if expected_latest
+                    .and_then(|latest| latest.get(key))
+                    .is_none_or(|expected| {
+                        entry.version_id != expected.version_id || expected.is_delete_marker
+                    }) =>
+            {
+                report.delete_marker_lineage_incomplete.push(format!(
+                    "{key}: ambiguous delete did not materialize but latest data version identity drifted"
+                ));
+            }
+            None => report.delete_marker_lineage_incomplete.push(format!(
+                "{key}: ambiguous delete did not materialize but ListObjectVersions has no latest data entry"
+            )),
+            Some(_) => {}
+        }
+    }
+}
+
 fn missing_committed_delete_markers(
     committed: &[CommittedDeleteMarker],
     entries: &[ObjectVersionEntry],
@@ -1203,6 +1359,34 @@ impl WarningSummary {
         self.total_count += 1;
         if self.samples.len() < MAX_WARNING_SAMPLES {
             self.samples.push(warning);
+        }
+    }
+}
+
+fn evaluate_final_list_keys(
+    model: &ObjectModel,
+    ambiguous_delete_absent: &BTreeSet<String>,
+    listed: &BTreeSet<String>,
+    prefix: &str,
+    warnings: &mut WarningSummary,
+) {
+    for key in model.live.keys() {
+        if !listed.contains(key) && !ambiguous_delete_absent.contains(key) {
+            warnings.push(format!(
+                "LIST prefix {prefix} did not include expected live key {key}"
+            ));
+        }
+    }
+    for key in ambiguous_delete_absent {
+        if listed.contains(key) {
+            warnings.push(format!(
+                "GET reported ambiguous-delete key {key} absent but LIST prefix {prefix} still included it"
+            ));
+        }
+    }
+    for key in &model.deleted {
+        if listed.contains(key) {
+            warnings.push(format!("LIST prefix {prefix} included deleted key {key}"));
         }
     }
 }
@@ -1790,6 +1974,8 @@ fn final_list_content_corruption_warning(report: &CheckerReport, warning: &str) 
             .any(|missing| missing == key);
     }
     warning.contains("included deleted key")
+        || (warning.contains("GET reported ambiguous-delete key")
+            && warning.contains("still included it"))
 }
 
 fn has_committed_unavailable_signal(report: &CheckerReport) -> bool {
@@ -2837,17 +3023,19 @@ fn record_object(record: &OperationRecord) -> Option<(String, ExpectedObject)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AmbiguousWriteAttempt, CheckerReport, CommittedDeleteMarker, CommittedVersion,
-        ExpectedObject, RecoveryStabilityClassification, RecoveryStabilityReport, WarningSummary,
-        checker_data_version_audit, checker_delete_marker_audits,
+        AmbiguousDeleteFinalObservations, AmbiguousWriteAttempt, CheckerAudit,
+        CheckerOperationAudit, CheckerReport, CommittedDeleteMarker, CommittedVersion,
+        ExpectedObject, ObjectModel, RecoveryStabilityClassification, RecoveryStabilityReport,
+        WarningSummary, checker_data_version_audit, checker_delete_marker_audits,
         checker_expected_current_get_keys, checker_history_records_sha256, evaluate_committed_get,
-        evaluate_final_get, evaluate_recovery_reread_get, finish_recovery_stability_report,
+        evaluate_final_get, evaluate_final_list_keys, evaluate_recovery_reread_get,
+        finalize_ambiguous_delete_observations, finish_recovery_stability_report,
         immediate_still_unavailable_keys, is_recovery_tail_read_failure, list_history_warnings,
         object_model, recovery_tail_candidate_keys, successful_read_anomalies,
         validate_recovery_key_sets,
     };
     use crate::fault::history::{
-        ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
+        ByteRange, ListedVersionEntry, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
     };
     use crate::fault::workload::seeded_bytes;
     use crate::fault::workload::{GetObjectResult, ObjectVersionEntry, sha256_hex};
@@ -5502,6 +5690,99 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_delete_requires_get_list_and_latest_version_agreement() {
+        let key = "key".to_string();
+        let mut model = ObjectModel::default();
+        model.live.insert(
+            key.clone(),
+            ExpectedObject {
+                sha256: "hash".to_string(),
+                size_bytes: 4,
+            },
+        );
+        model.ambiguous_delete_pending.insert(key.clone());
+        let absent = BTreeSet::from([key.clone()]);
+        let present = BTreeSet::new();
+        let listed = BTreeSet::new();
+        let expected_latest = BTreeMap::from([(
+            key.clone(),
+            ListedVersionEntry {
+                key: key.clone(),
+                version_id: Some("version-1".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        )]);
+        let marker_latest = BTreeMap::from([(
+            key.clone(),
+            ObjectVersionEntry {
+                key: key.clone(),
+                version_id: Some("delete-unknown".to_string()),
+                is_latest: true,
+                is_delete_marker: true,
+            },
+        )]);
+        let observations = |actual_latest| AmbiguousDeleteFinalObservations {
+            absent_on_get: &absent,
+            present_on_get: &present,
+            listed_keys: Some(&listed),
+            actual_latest,
+            expected_latest: Some(&expected_latest),
+            expect_versioning: true,
+        };
+
+        let mut clean = empty_report();
+        clean.expected_live_objects = 1;
+        finalize_ambiguous_delete_observations(
+            &mut clean,
+            &model,
+            observations(Some(&marker_latest)),
+        );
+        assert_eq!(clean.tolerated_ambiguous_deletes.len(), 1);
+        assert_eq!(clean.tolerated_ambiguous_deletes[0], key);
+        assert!(clean.missing_committed_objects.is_empty());
+
+        let old_data_latest = BTreeMap::from([(
+            key.clone(),
+            ObjectVersionEntry {
+                key: key.clone(),
+                version_id: Some("version-1".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        )]);
+        let mut lost = empty_report();
+        lost.expected_live_objects = 1;
+        finalize_ambiguous_delete_observations(
+            &mut lost,
+            &model,
+            observations(Some(&old_data_latest)),
+        );
+        assert!(lost.tolerated_ambiguous_deletes.is_empty());
+        assert_eq!(lost.missing_committed_objects.len(), 1);
+        assert!(!lost.success_predicate());
+
+        let mut contradiction = WarningSummary::default();
+        evaluate_final_list_keys(
+            &model,
+            &absent,
+            &BTreeSet::from([key]),
+            "fault-test/run/",
+            &mut contradiction,
+        );
+        assert_eq!(contradiction.total_count, 1);
+        let mut present_omission = WarningSummary::default();
+        evaluate_final_list_keys(
+            &model,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            "fault-test/run/",
+            &mut present_omission,
+        );
+        assert_eq!(present_omission.total_count, 1);
+    }
+
+    #[test]
     fn checker_audit_binds_exact_history_prefix_serialization() {
         let records = vec![record(
             "op-1",
@@ -5653,8 +5934,70 @@ mod tests {
             .tolerated_ambiguous_deletes
             .push("key".to_string());
         assert!(
+            tolerated_delete.require_success().is_err(),
+            "a tolerated delete without checker wire evidence must fail closed"
+        );
+        tolerated_delete.audit = Some(CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            history_prefix_record_count: 0,
+            history_prefix_sha256: "prefix".to_string(),
+            history_suffix_record_count: 2,
+            history_suffix_sha256: "suffix".to_string(),
+            suffix_operations: vec![
+                CheckerOperationAudit {
+                    operation_id: "get-key".to_string(),
+                    kind: OperationKind::Get,
+                    key: Some("key".to_string()),
+                    version_id: None,
+                    observed_sha256: None,
+                    size_bytes: None,
+                    listed_keys: None,
+                    listed_versions: None,
+                    started_sequence: Some(1),
+                    ended_sequence: Some(2),
+                    outcome: OperationOutcome::NotFound,
+                    http_status: Some(404),
+                    error: None,
+                },
+                CheckerOperationAudit {
+                    operation_id: "list-prefix".to_string(),
+                    kind: OperationKind::List,
+                    key: Some("fault-test/run-1/".to_string()),
+                    version_id: None,
+                    observed_sha256: None,
+                    size_bytes: None,
+                    listed_keys: Some(Vec::new()),
+                    listed_versions: None,
+                    started_sequence: Some(3),
+                    ended_sequence: Some(4),
+                    outcome: OperationOutcome::Ok,
+                    http_status: Some(200),
+                    error: None,
+                },
+            ],
+            data_version_checks: Vec::new(),
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: None,
+        });
+        assert!(
             tolerated_delete.require_success().is_ok(),
             "a materialized ambiguous delete is clean when GET and LIST agree on absence"
+        );
+
+        let mut forged_count_gap = tolerated_delete.clone();
+        forged_count_gap.expected_live_objects = 2;
+        assert!(
+            forged_count_gap.require_success().is_err(),
+            "tolerated keys must exactly account for the live-object verification gap"
+        );
+        tolerated_delete
+            .tolerated_ambiguous_deletes
+            .push("key".to_string());
+        assert!(
+            tolerated_delete.require_success().is_err(),
+            "duplicate tolerated keys cannot inflate the live-object balance"
         );
     }
 

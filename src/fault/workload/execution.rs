@@ -314,13 +314,18 @@ pub(in crate::fault) async fn run_mixed_workload(
     for result in results {
         completed.push(result?);
     }
+    // Preserve completion order for recovery retries. Same-key mutations are
+    // serialized above, so this is their observed real-time order; sorting by
+    // plan index first could replay two ambiguous hot-key overwrites backwards.
+    let unconfirmed_puts = completed
+        .iter()
+        .flat_map(|result| result.unconfirmed_puts.iter().cloned())
+        .collect();
     completed.sort_by_key(|result| result.index);
 
     let mut summary = WorkloadSummary::new(plan, scenario, run_id);
-    let mut unconfirmed_puts = Vec::new();
     for result in completed {
         summary.record_all(&result);
-        unconfirmed_puts.extend(result.unconfirmed_puts);
     }
 
     summary.require_exercised()?;
@@ -496,35 +501,57 @@ pub(in crate::fault) async fn recommit_unconfirmed_objects(
     objects: &[ObjectSpec],
     concurrency: usize,
 ) -> RecommitReport {
-    let tasks = objects.iter().cloned().map(|object| {
-        let s3 = s3.clone();
-        let history = history.clone();
-        async move {
-            let prepared = object.prepare();
-            match s3.put_object_record(&prepared, &history).await {
-                Ok(record) => {
-                    let verify_get_outcome = if record.outcome == OperationOutcome::Ok {
-                        match s3.get_object_result(&object.key, &history).await {
-                            Ok(get) => Some(get.outcome),
-                            Err(_) => Some(OperationOutcome::Unknown),
+    let tasks = unconfirmed_objects_by_key(objects)
+        .into_iter()
+        .map(|objects| {
+            let s3 = s3.clone();
+            let history = history.clone();
+            async move {
+                let mut attempts = Vec::with_capacity(objects.len());
+                for object in objects {
+                    let prepared = object.prepare();
+                    let attempt = match s3.put_object_record(&prepared, &history).await {
+                        Ok(record) => {
+                            let verify_get_outcome = if record.outcome == OperationOutcome::Ok {
+                                match s3.get_object_result(&object.key, &history).await {
+                                    Ok(get) => Some(get.outcome),
+                                    Err(_) => Some(OperationOutcome::Unknown),
+                                }
+                            } else {
+                                None
+                            };
+                            RecommitAttempt::from_record(object, record, verify_get_outcome)
                         }
-                    } else {
-                        None
+                        Err(error) => RecommitAttempt::from_harness_error(
+                            object,
+                            format!("record PUT: {error}"),
+                        ),
                     };
-                    RecommitAttempt::from_record(object, record, verify_get_outcome)
+                    attempts.push(attempt);
                 }
-                Err(error) => {
-                    RecommitAttempt::from_harness_error(object, format!("record PUT: {error}"))
-                }
+                attempts
             }
-        }
-    });
+        });
     let mut attempts = stream::iter(tasks)
         .buffer_unordered(concurrency)
         .collect::<Vec<_>>()
-        .await;
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     attempts.sort_by(|left, right| left.key.cmp(&right.key));
     RecommitReport::from_attempts(attempts).with_identity(&history.scenario(), &history.run_id())
+}
+
+fn unconfirmed_objects_by_key(objects: &[ObjectSpec]) -> Vec<Vec<ObjectSpec>> {
+    let mut by_key = BTreeMap::<String, Vec<ObjectSpec>>::new();
+    for object in objects {
+        by_key
+            .entry(object.key.clone())
+            .or_default()
+            .push(object.clone());
+    }
+    by_key.into_values().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1146,6 +1173,101 @@ mod tests {
     fn quorum_workload_stages_every_planned_multipart_completion() {
         let plan = WorkloadPlan::seeded(42, 24, 4);
         assert_eq!(multipart_workload_indices(&plan, 12, 12), vec![17, 23]);
+    }
+    #[test]
+    fn recommit_groups_same_key_attempts_in_original_order() {
+        let first = ObjectSpec::prepare_seeded("run", 1, 1024, 42).spec;
+        let second = first.prepare_overwrite(1).spec;
+        let other = ObjectSpec::prepare_seeded("run", 2, 1024, 42).spec;
+
+        let grouped = unconfirmed_objects_by_key(&[first.clone(), other.clone(), second.clone()]);
+        assert_eq!(grouped.len(), 2);
+        let same_key = grouped
+            .iter()
+            .find(|objects| objects[0].key == first.key)
+            .expect("same-key retry group");
+        assert_eq!(same_key, &[first, second]);
+        assert_eq!(
+            grouped
+                .iter()
+                .filter(|objects| objects[0].key == other.key)
+                .count(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn recommit_never_overlaps_requests_for_the_same_key() {
+        use axum::{
+            Router,
+            body::{Body, Bytes},
+            http::{Method, Response},
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let active_puts = Arc::new(AtomicUsize::new(0));
+        let max_active_puts = Arc::new(AtomicUsize::new(0));
+        let stored = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().fallback({
+            let active_puts = active_puts.clone();
+            let max_active_puts = max_active_puts.clone();
+            let stored = stored.clone();
+            move |method: Method, body: Bytes| {
+                let active_puts = active_puts.clone();
+                let max_active_puts = max_active_puts.clone();
+                let stored = stored.clone();
+                async move {
+                    match method {
+                        Method::PUT => {
+                            let active = active_puts.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_active_puts.fetch_max(active, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            *stored.lock().expect("stored body") = body.to_vec();
+                            active_puts.fetch_sub(1, Ordering::SeqCst);
+                            Response::builder()
+                                .status(200)
+                                .header("x-amz-version-id", "version")
+                                .body(Body::empty())
+                                .expect("PUT response")
+                        }
+                        Method::GET => Response::builder()
+                            .status(200)
+                            .body(Body::from(stored.lock().expect("stored body").clone()))
+                            .expect("GET response"),
+                        _ => panic!("unexpected S3 method {method}"),
+                    }
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock S3");
+        });
+        let client = S3WorkloadClient::new(
+            endpoint,
+            "bucket",
+            "test-access",
+            "test-secret",
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history =
+            Recorder::create(dir.path().join("history.jsonl"), "storage", "run").expect("history");
+        let first = ObjectSpec::prepare_seeded("run", 1, 1024, 42).spec;
+        let second = first.prepare_overwrite(1).spec;
+
+        let report = recommit_unconfirmed_objects(&client, &history, &[first, second], 2).await;
+        assert_eq!(report.attempted, 2);
+        assert_eq!(report.committed, 2);
+        assert_eq!(max_active_puts.load(Ordering::SeqCst), 1);
+        server.abort();
     }
     #[tokio::test]
     async fn multipart_staging_and_cleanup_drain_siblings_after_errors() {
