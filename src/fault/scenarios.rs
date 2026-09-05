@@ -930,6 +930,21 @@ impl FaultScenario {
             config.duration > Duration::ZERO,
             "RUSTFS_FAULT_TEST_DURATION_SECONDS must be greater than zero"
         );
+        if spec.backend == FaultBackend::MinioWarpWithChaos {
+            // Warp is followed by an S3 access wait and the correctness workload.
+            // Reserve headroom here; the runtime active-state check remains the
+            // authority because setup and workload time depend on the target.
+            ensure!(
+                config.warp_duration > Duration::ZERO
+                    && config
+                        .duration
+                        .checked_sub(config.cluster.timeout)
+                        .is_some_and(|remaining| config.warp_duration < remaining),
+                "RUSTFS_FAULT_TEST_WARP_DURATION_SECONDS must be positive and leave more than RUSTFS_FAULT_TEST_TIMEOUT_SECONDS ({}s) inside the fault duration ({}s) for post-Warp operations; shorten Warp or increase faultDuration",
+                config.cluster.timeout.as_secs(),
+                config.duration.as_secs()
+            );
+        }
         config.workload.validate()?;
         config.workload_operation_mix.validate()?;
         if let Some(payload_distribution) = &config.workload_payload_distribution {
@@ -1041,6 +1056,14 @@ mod tests {
         assert_eq!(scenario.percent, 20);
         assert_eq!(scenario.prefill_count(), 20000);
         assert_eq!(scenario.mixed_workload_count(), 20000);
+    }
+
+    #[test]
+    fn non_warp_scenario_ignores_ambient_warp_duration() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.duration = Duration::from_secs(60);
+        config.warp_duration = Duration::MAX;
+        assert!(FaultScenario::from_config(&config).is_ok());
     }
 
     #[test]

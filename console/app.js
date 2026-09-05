@@ -791,11 +791,13 @@
 
   function addPrimaryEvidenceArtifacts(links, source, summaryPath) {
     const normalizedSummaryPath = normalizeArtifactPath(summaryPath || artifactPathFrom(source));
-    asArray(readAny(source, ["primaryEvidenceArtifacts", "primary_evidence_artifacts"])).forEach(
-      function (path) {
+    const resolvedArtifacts = readAny(source, ["primaryEvidenceArtifacts", "primary_evidence_artifacts"]);
+    if (resolvedArtifacts !== undefined) {
+      asArray(resolvedArtifacts).forEach(function (path) {
         addPrimaryEvidenceArtifact(links, path, normalizedSummaryPath);
-      },
-    );
+      });
+      return;
+    }
     asArray(readAny(source, ["primaryEvidenceRefs", "primary_evidence_refs"])).forEach(
       function (path) {
         const normalized = normalizeArtifactPath(path);

@@ -1,0 +1,25 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-fault-dm-lab
+budgets:
+  maxDuration: 3h
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 2000
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: disabled
+artifacts:
+  required: strict
+workloadProfiles:
+  dm-lab:
+    objects: 2400
+    concurrency: 60
+scenarios:
+  - name: dm-flakey
+    faultDuration: 15m
+    workloadProfile: dm-lab
+  - name: dm-flakey-versioned-hot
+    faultDuration: 15m
+    workloadProfile: dm-lab
