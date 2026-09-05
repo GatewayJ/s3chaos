@@ -104,6 +104,7 @@ pub struct AdminTopologyBuildContext {
     pub cluster_domain: String,
     /// Upper bound on net-new bytes admitted while the admin operation runs.
     pub workload_max_bytes: u64,
+    pub runtime: AdminRuntimeBinding,
 }
 
 impl AdminTopologyBuildContext {
@@ -111,12 +112,14 @@ impl AdminTopologyBuildContext {
         run_id: impl Into<String>,
         case_name: impl Into<String>,
         workload_max_bytes: u64,
+        runtime: AdminRuntimeBinding,
     ) -> Self {
         Self {
             run_id: run_id.into(),
             case_name: case_name.into(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             workload_max_bytes,
+            runtime,
         }
     }
 }
@@ -255,6 +258,7 @@ pub struct RebalanceStopPropagationStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminRequestEvidence {
+    pub target: AdminRequestTarget,
     pub method: String,
     pub path: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -270,6 +274,142 @@ pub struct AdminRequestEvidence {
     pub response_body: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminEndpointIdentity {
+    pub kubernetes_context: String,
+    pub cluster_uid: String,
+    pub namespace: String,
+    pub service_name: String,
+    pub service_uid: String,
+    pub service_resource_version: String,
+    pub service_response_sha256: String,
+    pub service_response_body: String,
+    pub local_endpoint: String,
+    pub remote_port: u16,
+}
+
+impl AdminEndpointIdentity {
+    fn validate(&self) -> Result<()> {
+        let endpoint = reqwest::Url::parse(&self.local_endpoint)
+            .context("parse admin port-forward endpoint identity")?;
+        ensure!(
+            !self.kubernetes_context.trim().is_empty()
+                && !self.cluster_uid.trim().is_empty()
+                && !self.namespace.trim().is_empty()
+                && !self.service_name.trim().is_empty()
+                && !self.service_uid.trim().is_empty()
+                && !self.service_resource_version.trim().is_empty()
+                && self.service_response_sha256
+                    == sha256_hex(self.service_response_body.as_bytes())
+                && matches!(endpoint.scheme(), "http" | "https")
+                && endpoint
+                    .host_str()
+                    .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                    .is_some_and(|host| host.is_loopback())
+                && endpoint.port().is_some()
+                && endpoint.path() == "/"
+                && endpoint.query().is_none()
+                && endpoint.fragment().is_none()
+                && self.remote_port == 9000,
+            "admin endpoint is not an exact loopback port-forward to the current Tenant I/O service"
+        );
+        let service: Value = serde_json::from_str(&self.service_response_body)
+            .context("decode captured Kubernetes Service GET response")?;
+        ensure!(
+            required_string(&service, "/metadata/namespace")? == self.namespace
+                && required_string(&service, "/metadata/name")? == self.service_name
+                && required_string(&service, "/metadata/uid")? == self.service_uid
+                && required_string(&service, "/metadata/resourceVersion")?
+                    == self.service_resource_version,
+            "admin port-forward Service identity fields do not match its captured Kubernetes response"
+        );
+        Ok(())
+    }
+
+    fn validate_for_tenant(&self, namespace: &str, tenant: &str) -> Result<()> {
+        self.validate()?;
+        ensure!(
+            self.namespace == namespace
+                && self.service_name == format!("{tenant}-io")
+                && serde_json::from_str::<Value>(&self.service_response_body)
+                    .ok()
+                    .and_then(|service| {
+                        service
+                            .pointer("/spec/selector/rustfs.tenant")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some(tenant),
+            "admin port-forward service does not belong to the proven Tenant"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminRequestTarget {
+    pub endpoint: AdminEndpointIdentity,
+    pub deployment_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminRuntimeBinding {
+    pub target: AdminRequestTarget,
+    pub status: u16,
+    pub started_at_ms: u64,
+    pub observed_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub response_sha256: String,
+    pub response_body: String,
+}
+
+impl AdminRuntimeBinding {
+    fn from_response(
+        endpoint: AdminEndpointIdentity,
+        response: &RustfsAdminResponse,
+        started_at_ms: u64,
+        observed_at_ms: u64,
+    ) -> Result<Self> {
+        require_success(response, &format!("{ADMIN_PREFIX}/info"))?;
+        let response_body = String::from_utf8(response.body.clone())
+            .context("RustFS admin info response is not UTF-8 JSON")?;
+        let deployment_id = deployment_id_from_info(&response_body)?;
+        let binding = Self {
+            target: AdminRequestTarget {
+                endpoint,
+                deployment_id,
+            },
+            status: response.status,
+            started_at_ms,
+            observed_at_ms,
+            request_id: response.request_id.clone(),
+            response_sha256: sha256_hex(response_body.as_bytes()),
+            response_body,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.target.endpoint.validate()?;
+        ensure!(
+            (200..300).contains(&self.status)
+                && self.started_at_ms > 0
+                && self.started_at_ms <= self.observed_at_ms
+                && !self.target.deployment_id.trim().is_empty()
+                && self.response_sha256 == sha256_hex(self.response_body.as_bytes())
+                && deployment_id_from_info(&self.response_body)? == self.target.deployment_id,
+            "RustFS deployment binding is incomplete or inconsistent with its captured admin info response"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminCall<T> {
@@ -280,23 +420,41 @@ pub struct AdminCall<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KubernetesTenantGetEvidence {
+    pub kubernetes_context: String,
+    pub cluster_uid: String,
     pub namespace: String,
     pub name: String,
     pub uid: String,
     pub resource_version: String,
     pub started_at_ms: u64,
     pub observed_at_ms: u64,
+    pub response_sha256: String,
+    pub response_body: String,
 }
 
 impl KubernetesTenantGetEvidence {
-    pub fn from_resource(tenant: &Value, started_at_ms: u64, observed_at_ms: u64) -> Result<Self> {
+    pub fn from_response(
+        kubernetes_context: &str,
+        cluster_uid: &str,
+        response_body: &[u8],
+        started_at_ms: u64,
+        observed_at_ms: u64,
+    ) -> Result<Self> {
+        let response_body = String::from_utf8(response_body.to_vec())
+            .context("Kubernetes Tenant GET response is not UTF-8 JSON")?;
+        let tenant: Value = serde_json::from_str(&response_body)
+            .context("decode Kubernetes Tenant GET response")?;
         let evidence = Self {
-            namespace: required_string(tenant, "/metadata/namespace")?,
-            name: required_string(tenant, "/metadata/name")?,
-            uid: required_string(tenant, "/metadata/uid")?,
-            resource_version: required_string(tenant, "/metadata/resourceVersion")?,
+            kubernetes_context: kubernetes_context.to_string(),
+            cluster_uid: cluster_uid.to_string(),
+            namespace: required_string(&tenant, "/metadata/namespace")?,
+            name: required_string(&tenant, "/metadata/name")?,
+            uid: required_string(&tenant, "/metadata/uid")?,
+            resource_version: required_string(&tenant, "/metadata/resourceVersion")?,
             started_at_ms,
             observed_at_ms,
+            response_sha256: sha256_hex(response_body.as_bytes()),
+            response_body,
         };
         evidence.validate()?;
         Ok(evidence)
@@ -305,12 +463,27 @@ impl KubernetesTenantGetEvidence {
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.namespace.trim().is_empty()
+                && !self.kubernetes_context.trim().is_empty()
+                && !self.cluster_uid.trim().is_empty()
                 && !self.name.trim().is_empty()
                 && !self.uid.trim().is_empty()
                 && !self.resource_version.trim().is_empty()
                 && self.started_at_ms > 0
                 && self.started_at_ms <= self.observed_at_ms,
             "Kubernetes Tenant GET evidence lacks namespace/name/UID/resourceVersion or an ordered startedAt/observedAt interval"
+        );
+        ensure!(
+            self.response_sha256 == sha256_hex(self.response_body.as_bytes()),
+            "Kubernetes Tenant GET response digest does not match its captured body"
+        );
+        let tenant: Value = serde_json::from_str(&self.response_body)
+            .context("decode captured Kubernetes Tenant GET response")?;
+        ensure!(
+            required_string(&tenant, "/metadata/namespace")? == self.namespace
+                && required_string(&tenant, "/metadata/name")? == self.name
+                && required_string(&tenant, "/metadata/uid")? == self.uid
+                && required_string(&tenant, "/metadata/resourceVersion")? == self.resource_version,
+            "Kubernetes Tenant GET identity fields do not match its captured response"
         );
         Ok(())
     }
@@ -322,6 +495,7 @@ pub struct AdminPoolSnapshot {
     #[serde(flatten)]
     pub attempt: AdminAttemptIdentity,
     pub tenant_get: KubernetesTenantGetEvidence,
+    pub runtime: AdminRuntimeBinding,
     pub observed_at_ms: u64,
     pub request: AdminRequestEvidence,
     pub pools: Vec<AdminPool>,
@@ -331,13 +505,16 @@ impl AdminPoolSnapshot {
     pub fn from_list(
         run_id: impl Into<String>,
         case_name: impl Into<String>,
-        tenant: &Value,
+        tenant_response_body: &[u8],
+        runtime: AdminRuntimeBinding,
         tenant_started_at_ms: u64,
         tenant_observed_at_ms: u64,
         call: AdminCall<Vec<AdminPool>>,
     ) -> Result<Self> {
-        let tenant_get = KubernetesTenantGetEvidence::from_resource(
-            tenant,
+        let tenant_get = KubernetesTenantGetEvidence::from_response(
+            &runtime.target.endpoint.kubernetes_context,
+            &runtime.target.endpoint.cluster_uid,
+            tenant_response_body,
             tenant_started_at_ms,
             tenant_observed_at_ms,
         )?;
@@ -348,6 +525,7 @@ impl AdminPoolSnapshot {
                 tenant_uid: tenant_get.uid.clone(),
             },
             tenant_get,
+            runtime,
             observed_at_ms: call.request.observed_at_ms,
             request: call.request,
             pools: call.value,
@@ -359,6 +537,11 @@ impl AdminPoolSnapshot {
     fn validate_list_request(&self) -> Result<()> {
         validate_attempt_identity(&self.attempt)?;
         self.tenant_get.validate()?;
+        self.runtime.validate()?;
+        self.runtime
+            .target
+            .endpoint
+            .validate_for_tenant(&self.tenant_get.namespace, &self.tenant_get.name)?;
         ensure!(
             self.tenant_get.uid == self.attempt.tenant_uid
                 && self.observed_at_ms == self.request.observed_at_ms
@@ -370,6 +553,14 @@ impl AdminPoolSnapshot {
                 && self.request.query.is_empty()
                 && (200..300).contains(&self.request.status),
             "pool snapshot is not bound to one Kubernetes Tenant GET and one successful pools/list observation"
+        );
+        ensure!(
+            self.request.target == self.runtime.target
+                && self.tenant_get.kubernetes_context
+                    == self.runtime.target.endpoint.kubernetes_context
+                && self.tenant_get.cluster_uid == self.runtime.target.endpoint.cluster_uid
+                && self.tenant_get.namespace == self.runtime.target.endpoint.namespace,
+            "pool snapshot Tenant GET, port-forward endpoint, deployment, and pools/list request are not one runtime identity"
         );
         let wire_pools = parse_captured_json_response::<Vec<AdminPool>>(
             &self.request,
@@ -402,20 +593,34 @@ pub trait AdminTopologyPort: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct RustfsAdminTopologyAdapter {
     transport: RustfsAdminTransport,
+    runtime: AdminRuntimeBinding,
 }
 
 impl RustfsAdminTopologyAdapter {
-    pub fn new(endpoint: &str, region: &str, access_key: &str, secret_key: &str) -> Result<Self> {
-        Ok(Self {
-            transport: RustfsAdminTransport::new(
-                endpoint,
-                region,
-                access_key,
-                secret_key,
-                None,
-                "s3chaos-fault-admin-topology",
-            )?,
-        })
+    pub async fn connect(
+        endpoint: AdminEndpointIdentity,
+        region: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<Self> {
+        let transport = RustfsAdminTransport::new(
+            &endpoint.local_endpoint,
+            region,
+            access_key,
+            secret_key,
+            None,
+            "s3chaos-fault-admin-topology",
+        )?;
+        let runtime = probe_runtime_binding(&transport, endpoint).await?;
+        Ok(Self { transport, runtime })
+    }
+
+    pub fn runtime_binding(&self) -> &AdminRuntimeBinding {
+        &self.runtime
+    }
+
+    pub async fn probe_runtime_binding(&self) -> Result<AdminRuntimeBinding> {
+        probe_runtime_binding(&self.transport, self.runtime.target.endpoint.clone()).await
     }
 
     async fn json<T: for<'de> Deserialize<'de>>(
@@ -432,12 +637,12 @@ impl RustfsAdminTopologyAdapter {
         let observed_at_ms = now_ms();
         require_success(&response, path)?;
         let request = request_evidence(
+            self.runtime.target.clone(),
             method,
             path,
             query,
             &response,
-            started_at_ms,
-            observed_at_ms,
+            (started_at_ms, observed_at_ms),
             Some(&response.body),
         );
         let value = serde_json::from_slice(&response.body)
@@ -461,12 +666,12 @@ impl RustfsAdminTopologyAdapter {
         Ok(AdminCall {
             value: (),
             request: request_evidence(
+                self.runtime.target.clone(),
                 method,
                 path,
                 query,
                 &response,
-                started_at_ms,
-                observed_at_ms,
+                (started_at_ms, observed_at_ms),
                 None,
             ),
         })
@@ -474,15 +679,16 @@ impl RustfsAdminTopologyAdapter {
 }
 
 fn request_evidence(
+    target: AdminRequestTarget,
     method: Method,
     path: &str,
     query: &[(&str, &str)],
     response: &RustfsAdminResponse,
-    started_at_ms: u64,
-    observed_at_ms: u64,
+    observed_interval_ms: (u64, u64),
     response_body: Option<&[u8]>,
 ) -> AdminRequestEvidence {
     AdminRequestEvidence {
+        target,
         method: method.to_string(),
         path: path.to_string(),
         query: query
@@ -490,12 +696,40 @@ fn request_evidence(
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect(),
         status: response.status,
-        started_at_ms,
-        observed_at_ms,
+        started_at_ms: observed_interval_ms.0,
+        observed_at_ms: observed_interval_ms.1,
         request_id: response.request_id.clone(),
         response_sha256: response_body.map(sha256_hex),
         response_body: response_body.map(|body| String::from_utf8_lossy(body).into_owned()),
     }
+}
+
+async fn probe_runtime_binding(
+    transport: &RustfsAdminTransport,
+    endpoint: AdminEndpointIdentity,
+) -> Result<AdminRuntimeBinding> {
+    let started_at_ms = now_ms();
+    let response = transport
+        .request(
+            Method::GET,
+            &format!("{ADMIN_PREFIX}/info"),
+            &[],
+            Vec::new(),
+            None,
+        )
+        .await?;
+    let observed_at_ms = now_ms();
+    AdminRuntimeBinding::from_response(endpoint, &response, started_at_ms, observed_at_ms)
+}
+
+fn deployment_id_from_info(response_body: &str) -> Result<String> {
+    serde_json::from_str::<Value>(response_body)
+        .context("decode captured RustFS admin info response")?
+        .pointer("/info/deploymentID")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .context("RustFS admin info response is missing deploymentID")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -621,6 +855,7 @@ pub struct AdminTopologyProof {
     pub scenario: String,
     pub tenant: String,
     pub namespace: String,
+    pub runtime: AdminRuntimeBinding,
     pub tenant_pools: Vec<TenantPoolProof>,
     pub runtime_pools: Vec<AdminPool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -652,6 +887,11 @@ impl AdminTopologyProof {
         let tenant_uid = required_string(tenant, "/metadata/uid")?;
         let namespace = required_string(tenant, "/metadata/namespace")?;
         validate_build_context(scenario, context)?;
+        context
+            .runtime
+            .target
+            .endpoint
+            .validate_for_tenant(&namespace, &tenant_name)?;
         let tenant_pools = tenant
             .pointer("/spec/pools")
             .and_then(Value::as_array)
@@ -693,6 +933,7 @@ impl AdminTopologyProof {
             scenario: scenario.to_string(),
             tenant: tenant_name,
             namespace,
+            runtime: context.runtime.clone(),
             tenant_pools,
             runtime_pools,
             target_pool_id,
@@ -721,6 +962,11 @@ impl AdminTopologyProof {
             "admin topology proof lacks Tenant identity"
         );
         validate_attempt_identity(&self.attempt)?;
+        self.runtime.validate()?;
+        self.runtime
+            .target
+            .endpoint
+            .validate_for_tenant(&self.namespace, &self.tenant)?;
         for pool in &self.tenant_pools {
             ensure!(
                 pool.tenant_uid == self.attempt.tenant_uid,
@@ -795,6 +1041,7 @@ fn validate_build_context(scenario: &str, context: &AdminTopologyBuildContext) -
         context.workload_max_bytes > 0,
         "admin topology workload must have a positive bounded byte budget"
     );
+    context.runtime.validate()?;
     Ok(())
 }
 
@@ -1101,6 +1348,13 @@ fn validate_pre_start_snapshot(
         "pre-start pool snapshot does not belong to the current run/case/Tenant attempt"
     );
     ensure!(
+        snapshot.runtime == proof.runtime
+            && operation_requests
+                .iter()
+                .all(|request| request.target == proof.runtime.target),
+        "pre-start topology and destructive request transcript are not bound to the proven RustFS endpoint and deployment"
+    );
+    ensure!(
         snapshot.tenant_get.namespace == proof.namespace
             && snapshot.tenant_get.name == proof.tenant
             && snapshot.tenant_get.uid == proof.attempt.tenant_uid,
@@ -1119,7 +1373,8 @@ fn validate_pre_start_snapshot(
     let (start_started_at_ms, _, _) =
         validate_start_before_status(operation_requests, &proof.scenario, proof.target_pool_id)?;
     ensure!(
-        snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
+        snapshot.runtime.observed_at_ms < snapshot.tenant_get.started_at_ms
+            && snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
             && snapshot.request.observed_at_ms < start_started_at_ms
             && snapshot.tenant_get.observed_at_ms < start_started_at_ms
             && start_started_at_ms - snapshot.tenant_get.observed_at_ms
@@ -1141,6 +1396,13 @@ fn validate_post_operation_snapshot(
         "post-operation pool snapshot does not belong to the current run/case/Tenant attempt"
     );
     ensure!(
+        snapshot.runtime.target == proof.runtime.target
+            && operation_requests
+                .iter()
+                .all(|request| request.target == proof.runtime.target),
+        "post-operation topology and request transcript changed RustFS endpoint or deployment"
+    );
+    ensure!(
         snapshot.tenant_get.namespace == proof.namespace
             && snapshot.tenant_get.name == proof.tenant
             && snapshot.tenant_get.uid == proof.attempt.tenant_uid,
@@ -1150,7 +1412,8 @@ fn validate_post_operation_snapshot(
     let (_, _, terminal_status_observed_at_ms) =
         validate_start_before_status(operation_requests, &proof.scenario, proof.target_pool_id)?;
     ensure!(
-        terminal_status_observed_at_ms < snapshot.tenant_get.started_at_ms
+        terminal_status_observed_at_ms < snapshot.runtime.started_at_ms
+            && snapshot.runtime.observed_at_ms < snapshot.tenant_get.started_at_ms
             && snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
             && snapshot.observed_at_ms >= snapshot.request.started_at_ms,
         "post-operation Tenant GET and pools/list were not observed in order after terminal status"
@@ -1460,6 +1723,13 @@ impl AdminOperationEvidence {
                 .all(|request| (200..300).contains(&request.status)),
             "admin operation evidence contains a failed HTTP request"
         );
+        ensure!(
+            self.requests
+                .iter()
+                .all(|request| request.target == self.pools_before.runtime.target)
+                && self.pools_after.runtime.target == self.pools_before.runtime.target,
+            "admin operation requests and topology snapshots do not share one endpoint/deployment identity"
+        );
         validate_request_timing(&self.requests, attempt_window)?;
         let (start_started_at_ms, _, terminal_status_observed_at_ms) =
             validate_start_before_status(&self.requests, &self.scenario, self.target_pool_id)?;
@@ -1467,10 +1737,14 @@ impl AdminOperationEvidence {
         self.pools_before.validate_list_request()?;
         ensure!(
             self.pools_before.attempt == self.attempt
+                && attempt_window.contains(self.pools_before.runtime.started_at_ms)
+                && attempt_window.contains(self.pools_before.runtime.observed_at_ms)
                 && attempt_window.contains(self.pools_before.tenant_get.started_at_ms)
                 && attempt_window.contains(self.pools_before.tenant_get.observed_at_ms)
                 && attempt_window.contains(self.pools_before.request.started_at_ms)
                 && attempt_window.contains(self.pools_before.request.observed_at_ms)
+                && self.pools_before.runtime.observed_at_ms
+                    < self.pools_before.tenant_get.started_at_ms
                 && self.pools_before.tenant_get.observed_at_ms
                     < self.pools_before.request.started_at_ms
                 && self.pools_before.request.observed_at_ms < start_started_at_ms
@@ -1485,12 +1759,16 @@ impl AdminOperationEvidence {
         self.pools_after.validate_list_request()?;
         ensure!(
             self.pools_after.attempt == self.attempt
+                && attempt_window.contains(self.pools_after.runtime.started_at_ms)
+                && attempt_window.contains(self.pools_after.runtime.observed_at_ms)
                 && attempt_window.contains(self.pools_after.tenant_get.started_at_ms)
                 && attempt_window.contains(self.pools_after.tenant_get.observed_at_ms)
                 && attempt_window.contains(self.pools_after.request.started_at_ms)
                 && attempt_window.contains(self.pools_after.request.observed_at_ms)
                 && attempt_window.contains(self.pools_after.observed_at_ms)
-                && terminal_status_observed_at_ms < self.pools_after.tenant_get.started_at_ms
+                && terminal_status_observed_at_ms < self.pools_after.runtime.started_at_ms
+                && self.pools_after.runtime.observed_at_ms
+                    < self.pools_after.tenant_get.started_at_ms
                 && self.pools_after.tenant_get.observed_at_ms
                     < self.pools_after.request.started_at_ms,
             "post-operation pool snapshot identity or observation time is invalid"
@@ -2408,6 +2686,15 @@ pub fn validate_admin_topology_artifacts(
         proof.attempt == *expected_attempt && operation.attempt == *expected_attempt,
         "admin topology artifacts do not belong to the current run/case/Tenant attempt"
     );
+    ensure!(
+        proof.runtime == operation.pools_before.runtime
+            && proof.runtime.target == operation.pools_after.runtime.target
+            && operation
+                .requests
+                .iter()
+                .all(|request| request.target == proof.runtime.target),
+        "admin topology artifacts mix Kubernetes endpoint or RustFS deployment identities"
+    );
     proof.require_satisfied()?;
     operation.require_success(attempt_window)?;
     validate_pre_start_snapshot(proof, &operation.pools_before, &operation.requests)?;
@@ -2445,8 +2732,58 @@ mod tests {
         expected_case_name(scenario).unwrap()
     }
 
+    fn endpoint_identity() -> AdminEndpointIdentity {
+        let service_response_body = serde_json::json!({
+            "metadata": {
+                "namespace": "fault-ns",
+                "name": "fault-tenant-io",
+                "uid": "service-uid",
+                "resourceVersion": "service-rv-1"
+            },
+            "spec": {"selector": {"rustfs.tenant": "fault-tenant"}}
+        })
+        .to_string();
+        AdminEndpointIdentity {
+            kubernetes_context: "kind-admin-test".to_string(),
+            cluster_uid: "cluster-uid".to_string(),
+            namespace: "fault-ns".to_string(),
+            service_name: "fault-tenant-io".to_string(),
+            service_uid: "service-uid".to_string(),
+            service_resource_version: "service-rv-1".to_string(),
+            service_response_sha256: sha256_hex(service_response_body.as_bytes()),
+            service_response_body,
+            local_endpoint: "http://127.0.0.1:19000".to_string(),
+            remote_port: 9000,
+        }
+    }
+
+    fn request_target() -> AdminRequestTarget {
+        AdminRequestTarget {
+            endpoint: endpoint_identity(),
+            deployment_id: "deployment-1".to_string(),
+        }
+    }
+
+    fn runtime_binding(started_at_ms: u64, observed_at_ms: u64) -> AdminRuntimeBinding {
+        let response_body = r#"{"info":{"deploymentID":"deployment-1"}}"#.to_string();
+        AdminRuntimeBinding {
+            target: request_target(),
+            status: 200,
+            started_at_ms,
+            observed_at_ms,
+            request_id: Some("admin-info-request".to_string()),
+            response_sha256: sha256_hex(response_body.as_bytes()),
+            response_body,
+        }
+    }
+
     fn context(scenario: &str) -> AdminTopologyBuildContext {
-        AdminTopologyBuildContext::new(TEST_RUN_ID, case_name(scenario), TEST_WORKLOAD_MAX_BYTES)
+        AdminTopologyBuildContext::new(
+            TEST_RUN_ID,
+            case_name(scenario),
+            TEST_WORKLOAD_MAX_BYTES,
+            runtime_binding(60, 70),
+        )
     }
 
     fn attempt(scenario: &str) -> AdminAttemptIdentity {
@@ -2480,6 +2817,7 @@ mod tests {
     fn rebalance_requests() -> Vec<AdminRequestEvidence> {
         let mut requests = vec![
             AdminRequestEvidence {
+                target: request_target(),
                 method: "POST".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/start"),
                 query: BTreeMap::new(),
@@ -2491,6 +2829,7 @@ mod tests {
                 response_body: None,
             },
             AdminRequestEvidence {
+                target: request_target(),
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/status"),
                 query: BTreeMap::new(),
@@ -2527,6 +2866,7 @@ mod tests {
         requests.insert(
             1,
             AdminRequestEvidence {
+                target: request_target(),
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/status"),
                 query: BTreeMap::new(),
@@ -2562,6 +2902,7 @@ mod tests {
         let pool_id = pool_id.to_string();
         let mut requests = vec![
             AdminRequestEvidence {
+                target: request_target(),
                 method: "POST".to_string(),
                 path: format!("{ADMIN_PREFIX}/pools/decommission"),
                 query: BTreeMap::from([
@@ -2576,6 +2917,7 @@ mod tests {
                 response_body: None,
             },
             AdminRequestEvidence {
+                target: request_target(),
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/decommission/status"),
                 query: BTreeMap::from([
@@ -2617,6 +2959,7 @@ mod tests {
             requests.insert(
                 1,
                 AdminRequestEvidence {
+                    target: request_target(),
                     method: "GET".to_string(),
                     path: format!("{ADMIN_PREFIX}/decommission/status"),
                     query: BTreeMap::from([
@@ -2705,6 +3048,7 @@ mod tests {
             };
         let request = with_json_response(
             AdminRequestEvidence {
+                target: request_target(),
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/pools/list"),
                 query: BTreeMap::new(),
@@ -2717,16 +3061,27 @@ mod tests {
             },
             &pools,
         );
+        let tenant_response_body = serde_json::to_string(&tenant()).expect("serialize Tenant");
+        let runtime = if observed_at_ms < 200 {
+            runtime_binding(60, 70)
+        } else {
+            runtime_binding(201, 204)
+        };
         AdminPoolSnapshot {
             attempt: attempt(scenario),
             tenant_get: KubernetesTenantGetEvidence {
+                kubernetes_context: "kind-admin-test".to_string(),
+                cluster_uid: "cluster-uid".to_string(),
                 namespace: "fault-ns".to_string(),
                 name: "fault-tenant".to_string(),
                 uid: "tenant-uid".to_string(),
                 resource_version: "tenant-rv-1".to_string(),
                 started_at_ms: tenant_started_at_ms,
                 observed_at_ms: tenant_observed_at_ms,
+                response_sha256: sha256_hex(tenant_response_body.as_bytes()),
+                response_body: tenant_response_body,
             },
+            runtime,
             observed_at_ms,
             request,
             pools,
@@ -2810,10 +3165,20 @@ mod tests {
 
     #[tokio::test]
     async fn adapter_captures_rustfs_admin_x_request_id() {
-        let app = Router::new().route(
-            "/rustfs/admin/v3/pools/list",
-            get(|| async { ([("x-request-id", "rustfs-admin-request-1")], "[]") }),
-        );
+        let app = Router::new()
+            .route(
+                "/rustfs/admin/v3/info",
+                get(|| async {
+                    (
+                        [("x-request-id", "rustfs-admin-info-request-1")],
+                        r#"{"info":{"deploymentID":"deployment-1"}}"#,
+                    )
+                }),
+            )
+            .route(
+                "/rustfs/admin/v3/pools/list",
+                get(|| async { ([("x-request-id", "rustfs-admin-request-1")], "[]") }),
+            );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("mock listener");
@@ -2821,10 +3186,18 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("mock server");
         });
-        let adapter = RustfsAdminTopologyAdapter::new(&endpoint, "us-east-1", "access", "secret")
-            .expect("adapter");
+        let mut endpoint_identity = endpoint_identity();
+        endpoint_identity.local_endpoint = endpoint;
+        let adapter =
+            RustfsAdminTopologyAdapter::connect(endpoint_identity, "us-east-1", "access", "secret")
+                .await
+                .expect("adapter");
 
         let response = adapter.list_pools().await.expect("pool list");
+        assert_eq!(
+            adapter.runtime_binding().target.deployment_id,
+            "deployment-1"
+        );
         assert_eq!(
             response.request.request_id.as_deref(),
             Some("rustfs-admin-request-1")
@@ -2842,13 +3215,17 @@ mod tests {
         let snapshot = AdminPoolSnapshot::from_list(
             TEST_RUN_ID,
             case_name(ADMIN_REBALANCE_SCENARIO),
-            &current_tenant,
+            serde_json::to_string(&current_tenant)
+                .expect("Tenant JSON")
+                .as_bytes(),
+            runtime_binding(60, 70),
             75,
             80,
             AdminCall {
                 value: current_pools.clone(),
                 request: with_json_response(
                     AdminRequestEvidence {
+                        target: request_target(),
                         method: "GET".to_string(),
                         path: format!("{ADMIN_PREFIX}/pools/list"),
                         query: BTreeMap::new(),
@@ -2873,13 +3250,17 @@ mod tests {
             AdminPoolSnapshot::from_list(
                 TEST_RUN_ID,
                 case_name(ADMIN_REBALANCE_SCENARIO),
-                &current_tenant,
+                serde_json::to_string(&current_tenant)
+                    .expect("Tenant JSON")
+                    .as_bytes(),
+                runtime_binding(60, 70),
                 80,
                 85,
                 AdminCall {
                     value: current_pools.clone(),
                     request: with_json_response(
                         AdminRequestEvidence {
+                            target: request_target(),
                             method: "GET".to_string(),
                             path: format!("{ADMIN_PREFIX}/pools/list"),
                             query: BTreeMap::new(),
@@ -3562,6 +3943,7 @@ mod tests {
         );
         operation.canceled_or_stopped = false;
         operation.requests.push(AdminRequestEvidence {
+            target: request_target(),
             method: "POST".to_string(),
             path: format!("{ADMIN_PREFIX}/pools/cancel"),
             query: BTreeMap::from([
@@ -3598,6 +3980,7 @@ mod tests {
         ] {
             let mut injected_mutation = operation.clone();
             injected_mutation.requests.push(AdminRequestEvidence {
+                target: request_target(),
                 method: "POST".to_string(),
                 path,
                 query,
@@ -3714,6 +4097,7 @@ mod tests {
         repeated_terminal_operation
             .requests
             .push(AdminRequestEvidence {
+                target: request_target(),
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/status"),
                 query: BTreeMap::new(),
@@ -3871,6 +4255,7 @@ mod tests {
 
         let mut wrong_terminal_request = operation.clone();
         wrong_terminal_request.requests.push(AdminRequestEvidence {
+            target: request_target(),
             method: "GET".to_string(),
             path: format!("{ADMIN_PREFIX}/decommission/status"),
             query: BTreeMap::from([
@@ -3929,6 +4314,7 @@ mod tests {
             bytes_moved: Some(20),
             requests: vec![
                 AdminRequestEvidence {
+                    target: request_target(),
                     method: "POST".to_string(),
                     path: format!("{ADMIN_PREFIX}/rebalance/start"),
                     query: BTreeMap::new(),
@@ -3940,6 +4326,7 @@ mod tests {
                     response_body: None,
                 },
                 AdminRequestEvidence {
+                    target: request_target(),
                     method: "GET".to_string(),
                     path: format!("{ADMIN_PREFIX}/rebalance/status"),
                     query: BTreeMap::new(),

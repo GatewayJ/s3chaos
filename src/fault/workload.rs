@@ -353,6 +353,51 @@ impl WorkloadPlan {
         }
     }
 
+    /// Conservative payload-byte upper bound for one finite mixed workload.
+    ///
+    /// Every logical data mutation is charged independently, including
+    /// overwrites of the same hot key (which create additional versions when
+    /// versioning is enabled) and the staged body of each deliberately aborted
+    /// multipart upload. Prefill bytes are excluded because the admin topology
+    /// snapshot is taken after prefill completes.
+    pub(crate) fn mixed_write_upper_bound(
+        &self,
+        prefilled_count: usize,
+        mixed_count: usize,
+    ) -> Result<u64> {
+        ensure!(
+            prefilled_count
+                .checked_add(mixed_count)
+                .is_some_and(|count| count <= self.object_count),
+            "finite mixed workload range exceeds workload object_count"
+        );
+        let mut bytes = 0_u64;
+        for offset in 0..mixed_count {
+            let index = prefilled_count + offset;
+            let mutation_bytes = match self.operation_mix.operation_at(offset) {
+                WorkloadOperation::Put | WorkloadOperation::Multipart => self.size_at(index) as u64,
+                WorkloadOperation::Overwrite => {
+                    ensure!(
+                        prefilled_count > 0,
+                        "finite mixed workload cannot overwrite without prefilled objects"
+                    );
+                    let existing = self.existing_object_offset(offset, prefilled_count);
+                    self.size_at(existing) as u64
+                }
+                WorkloadOperation::Get | WorkloadOperation::List | WorkloadOperation::Delete => 0,
+            };
+            bytes = bytes
+                .checked_add(mutation_bytes)
+                .context("finite mixed workload write-byte bound overflowed")?;
+            if self.operation_mix.operation_at(offset) == WorkloadOperation::Multipart {
+                bytes = bytes
+                    .checked_add(4 * 1024)
+                    .context("finite mixed workload multipart-abort byte bound overflowed")?;
+            }
+        }
+        Ok(bytes)
+    }
+
     fn from_serialized(raw: SerializedWorkloadPlan) -> std::result::Result<Self, String> {
         if raw.generator != Self::GENERATOR {
             return Err(format!("unsupported workload generator {}", raw.generator));
@@ -2036,6 +2081,37 @@ mod tests {
                 "100% hotspot operations should stay inside the hot set"
             );
         }
+    }
+
+    #[test]
+    fn finite_write_bound_charges_hot_overwrite_versions_and_multipart_abort_bodies() {
+        let plan = WorkloadPlan::seeded_with_profile(
+            42,
+            24,
+            4,
+            WorkloadOperationMix::default(),
+            Some(WorkloadPayloadDistribution {
+                classes: vec![WorkloadPayloadClass {
+                    size_bytes: 1024,
+                    weight: 1,
+                }],
+            }),
+            Some(WorkloadHotspot {
+                object_percent: 1,
+                operation_percent: 100,
+            }),
+        )
+        .expect("finite workload plan");
+
+        // Twelve mixed operations contain two full operation-mix cycles:
+        // two PUTs, two overwrites of the same hot prefilled key, and two
+        // multipart completions plus their 4 KiB abort fixtures.
+        assert_eq!(
+            plan.mixed_write_upper_bound(12, 12)
+                .expect("finite write bound"),
+            6 * 1024 + 2 * 4096
+        );
+        assert!(plan.mixed_write_upper_bound(12, 13).is_err());
     }
 
     #[test]
