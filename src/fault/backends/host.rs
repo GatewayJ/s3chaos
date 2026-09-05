@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub use crate::fault::host_storage::{DmStatusSnapshot, DmVolumeMapping};
+use crate::fault::host_storage::{helper_pod_name, normalize_dm_table};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -86,26 +88,6 @@ impl DmMountState {
     fn proves_expected_mount(self) -> bool {
         matches!(self, Self::Mounted)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DmVolumeMapping {
-    pub node: String,
-    pub node_uid: String,
-    pub node_labels: BTreeMap<String, String>,
-    pub pod: String,
-    pub pod_uid: String,
-    pub volume_name: String,
-    pub pvc: String,
-    pub pvc_uid: String,
-    pub pvc_phase: String,
-    pub pv: String,
-    pub pv_uid: String,
-    pub pv_phase: String,
-    pub pv_claim_ref: HostStoragePersistentVolumeClaimRef,
-    pub node_selector: HostStorageNodeSelector,
-    pub container_mount_path: String,
-    pub mount_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,61 +252,6 @@ fn temporary_state_path(path: &Path, owner_pid: u32) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("host-mutation-state");
     path.with_file_name(format!(".{file_name}.{owner_pid}.tmp"))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DmStatusSnapshot {
-    pub stage: String,
-    pub mapper_name: String,
-    pub canonical_device: String,
-    pub suspended: bool,
-    pub observed_at_ms: u64,
-    pub helper_pod: String,
-    pub mapping: DmVolumeMapping,
-    pub table: String,
-    pub status: String,
-}
-
-impl DmStatusSnapshot {
-    pub(crate) fn validate_proof(
-        &self,
-        proof: &HostStorageMutationProof,
-        stage: &str,
-        expected_table: &str,
-    ) -> Result<()> {
-        let target = &proof.target;
-        let mapping = &self.mapping;
-        ensure!(
-            self.stage == stage
-                && self.helper_pod == helper_pod_name(&proof.run_id)
-                && self.mapper_name == target.mapper_name
-                && self.canonical_device == target.canonical_device
-                && !self.suspended
-                && self.observed_at_ms >= proof.generated_at_ms
-                && normalize_dm_table(&self.table) == normalize_dm_table(expected_table),
-            "device-mapper {stage} snapshot does not match the proven device, table, or active state"
-        );
-        ensure!(
-            mapping.node == target.node
-                && mapping.node_uid == target.node_uid
-                && mapping.node_labels == target.node_labels
-                && mapping.pod == target.pod
-                && mapping.pod_uid == target.pod_uid
-                && mapping.volume_name == target.volume_name
-                && mapping.pvc == target.persistent_volume_claim
-                && mapping.pvc_uid == target.persistent_volume_claim_uid
-                && mapping.pvc_phase == target.persistent_volume_claim_phase
-                && mapping.pv == target.persistent_volume
-                && mapping.pv_uid == target.persistent_volume_uid
-                && mapping.pv_phase == target.persistent_volume_phase
-                && mapping.pv_claim_ref == target.persistent_volume_claim_ref
-                && mapping.node_selector == target.node_selector
-                && mapping.container_mount_path == target.container_mount_path
-                && mapping.mount_path == target.persistent_volume_path,
-            "device-mapper {stage} snapshot does not match the proven Pod/PVC/PV/node mapping"
-        );
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -971,52 +898,6 @@ pub fn apply_dm_flakey(
     )?;
 
     Ok(guard)
-}
-
-pub fn run_warp_mixed(
-    duration: Duration,
-    collector: &ArtifactCollector,
-    case_name: &str,
-    endpoint: &str,
-    bucket: &str,
-    access_key: &str,
-    secret_key: &str,
-) -> Result<()> {
-    let host = endpoint
-        .strip_prefix("http://")
-        .or_else(|| endpoint.strip_prefix("https://"))
-        .unwrap_or(endpoint);
-    let duration = format!("{}s", duration.as_secs());
-    let command = CommandSpec::new("warp").args([
-        "mixed".to_string(),
-        format!("--host={host}"),
-        format!("--access-key={access_key}"),
-        format!("--secret-key={secret_key}"),
-        format!("--bucket={bucket}"),
-        format!("--duration={duration}"),
-        "--obj.size=4KiB".to_string(),
-        "--tls=false".to_string(),
-        "--autoterm".to_string(),
-    ]);
-    let output = command.run()?;
-    let display = command.display().replace(
-        &format!("--secret-key={secret_key}"),
-        "--secret-key=<redacted>",
-    );
-    collector.write_text(
-        case_name,
-        "warp-mixed.txt",
-        &format!(
-            "$ {}\nexit: {:?}\nstdout:\n{}\nstderr:\n{}",
-            display, output.code, output.stdout, output.stderr
-        ),
-    )?;
-    ensure!(
-        output.code == Some(0),
-        "warp mixed command failed with exit {:?}",
-        output.code
-    );
-    Ok(())
 }
 
 impl DmFlakeyGuard {
@@ -2373,16 +2254,6 @@ fn supported_pv_node_selector(
     })
 }
 
-fn helper_pod_name(run_id: &str) -> String {
-    let suffix = run_id
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .take(12)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    format!("rustfs-fault-dm-helper-{suffix}")
-}
-
 fn dm_helper_manifest(config: &ClusterTestConfig, name: &str, node: &str, image: &str) -> String {
     format!(
         r#"apiVersion: v1
@@ -2417,10 +2288,6 @@ spec:
         managed_by_label = MANAGED_BY_LABEL,
         managed_by_value = MANAGED_BY_VALUE,
     )
-}
-
-fn normalize_dm_table(table: &str) -> String {
-    table.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn now_ms() -> u64 {

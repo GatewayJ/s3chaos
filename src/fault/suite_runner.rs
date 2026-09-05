@@ -27,6 +27,7 @@ use crate::fault::{
     config::FaultTestConfig,
     reporting::{FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain},
     runner::run_scenario_with_config_and_reference_root,
+    shutdown::{RunDeadline, SuiteDeadlineExceeded},
     suite::{FaultExpectedFailure, ResolvedFaultSuite},
     suite_plan::{
         attempt_minimum_required_duration, build_fault_suite_plan_expansion, suite_run_id,
@@ -40,6 +41,8 @@ pub use crate::fault::suite_plan::{
     FaultSuitePlanSelection, FaultSuitePlanTarget, FaultSuitePlanWorkload,
     plan_fault_suite_from_yaml,
 };
+
+mod attempt;
 
 pub const FAULT_SUITE_RUN_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
 pub const FAULT_SUITE_RUN_KIND: &str = "FaultSuiteRun";
@@ -208,6 +211,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
     let summary_path = suite_root.join("suite-summary.json");
     let plan_path = suite_root.join("suite-plan.json");
     let started = Instant::now();
+    let deadline = RunDeadline::new(execution_plan.suite.budgets.max_duration_seconds)?;
     let mut summary =
         FaultSuiteRunSummary::started(&execution_plan.suite, execution_plan.plan.run_id.clone());
     fs::write(&plan_path, execution_plan.plan.to_json()?)
@@ -261,189 +265,33 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
             planned.config.clone(),
             suite_root.clone(),
             attempt.run_id.clone(),
+            deadline,
         )
         .await;
-        let mut stop_after_attempt_failure = false;
-        match result {
-            Ok(()) => match validate_attempt_artifacts(&planned.config, &attempt.run_id) {
-                Ok(report) => {
-                    attempt.succeed(
-                        report.seed,
-                        report.client_disruptions,
-                        report.recommitted,
-                        report.committed,
-                    );
-                    if planned.plan.expected_failure.is_some() {
-                        let attempt_error = format!(
-                            "scenario {} repetition {} succeeded, but the suite required the typed expected failure signal",
-                            planned.plan.scenario, planned.plan.repetition
-                        );
-                        attempt.fail(attempt_error.clone(), None);
-                        let safety_failure = evaluate_failed_attempt_safety(
-                            &mut summary,
-                            &mut attempt,
-                            &suite_root,
-                            &planned.plan,
-                            now_ms(),
-                            Some(report.client_disruptions),
-                        );
-                        stop_after_attempt_failure = safety_failure.is_some()
-                            || should_stop_after_attempt_failure(
-                                &execution_plan.suite.budgets.continue_on_severities,
-                                execution_plan.suite.budgets.stop_on_first_failure,
-                                None,
-                            );
-                        summary.record_attempt_failure(
-                            &attempt,
-                            None,
-                            None,
-                            attempt_error,
-                            stop_after_attempt_failure,
-                        );
-                        replace_last_attempt(&mut summary, attempt);
-                        if enforce_disruption_budget(&mut summary, safety_failure) {
-                            write_summary(&summary_path, &summary)?;
-                            break 'suite;
-                        }
-                    } else {
-                        let disruption_budget_failure =
-                            summary.record_client_disruptions(report.client_disruptions)?;
-                        replace_last_attempt(&mut summary, attempt);
-                        if enforce_disruption_budget(&mut summary, disruption_budget_failure) {
-                            write_summary(&summary_path, &summary)?;
-                            break 'suite;
-                        }
-                    }
-                }
-                Err(error) => {
-                    let (attempt_error, failure_summary_artifact, forced_stop) =
-                        artifact_validation_failure_details(
-                            &planned.plan,
-                            format!("artifact validation failed: {error}"),
-                        );
-                    attempt.fail(attempt_error.clone(), None);
-                    let safety_failure = evaluate_failed_attempt_safety(
-                        &mut summary,
-                        &mut attempt,
-                        &suite_root,
-                        &planned.plan,
-                        now_ms(),
-                        None,
-                    );
-                    let failure_message = format!(
-                        "scenario {} repetition {} failed: {attempt_error}",
-                        planned.plan.scenario, planned.plan.repetition
-                    );
-                    stop_after_attempt_failure = forced_stop || safety_failure.is_some();
-                    summary.record_attempt_failure(
-                        &attempt,
-                        None,
-                        failure_summary_artifact,
-                        failure_message,
-                        stop_after_attempt_failure,
-                    );
-                    replace_last_attempt(&mut summary, attempt);
-                    if enforce_disruption_budget(&mut summary, safety_failure) {
-                        write_summary(&summary_path, &summary)?;
-                        break 'suite;
-                    }
-                }
-            },
-            Err(error) => {
-                let evaluated_at_ms = now_ms();
-                let (attempt_error, failure_summary, failure_severity) =
-                    attempt_failure_details(&planned.plan, error.to_string());
-                let expected_failure_artifacts = planned.plan.expected_failure.as_ref().map(|_| {
-                    validate_expected_failure_artifact_contract(
-                        &suite_root,
-                        &planned.plan,
-                        failure_summary.as_ref(),
-                        attempt.started_at_ms,
-                        evaluated_at_ms,
-                    )
-                });
-                let expected_failure_mismatch = match (
-                    planned.plan.expected_failure.as_ref(),
-                    expected_failure_artifacts.as_ref(),
-                ) {
-                    (Some(expected), Some(Ok(validation))) => {
-                        evaluate_validated_expected_failure(expected, validation).mismatch
-                    }
-                    (Some(_), Some(Err(error))) => Some(format!("{error:#}")),
-                    _ => None,
-                };
-                let trusted_disruptions = expected_failure_artifacts
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok())
-                    .map(|validation| validation.client_disruptions);
-                let safety_failure = evaluate_failed_attempt_safety(
-                    &mut summary,
-                    &mut attempt,
-                    &suite_root,
-                    &planned.plan,
-                    evaluated_at_ms,
-                    trusted_disruptions,
-                );
-                if planned.plan.expected_failure.is_some() && expected_failure_mismatch.is_none() {
-                    let validation = expected_failure_artifacts
-                        .as_ref()
-                        .and_then(|result| result.as_ref().ok())
-                        .expect("a matched expected failure has validated artifacts");
-                    attempt.satisfy_expected_failure(
-                        &validation.summary,
-                        validation.failure_summary.clone(),
-                        validation.client_disruptions,
-                    );
-                    replace_last_attempt(&mut summary, attempt);
-                    if enforce_disruption_budget(&mut summary, safety_failure) {
-                        write_summary(&summary_path, &summary)?;
-                        break 'suite;
-                    }
-                    write_summary(&summary_path, &summary)?;
-                    continue 'suite;
-                }
-
-                let attempt_error = match expected_failure_mismatch {
-                    Some(mismatch) => {
-                        format!("{attempt_error}; expected failure did not match: {mismatch}")
-                    }
-                    None => attempt_error,
-                };
-                attempt.fail(attempt_error.clone(), failure_summary.as_ref());
-                let failure_message = format!(
-                    "scenario {} repetition {} failed: {attempt_error}",
-                    planned.plan.scenario, planned.plan.repetition
-                );
-                stop_after_attempt_failure = safety_failure.is_some()
-                    || should_stop_after_attempt_failure(
-                        &execution_plan.suite.budgets.continue_on_severities,
-                        execution_plan.suite.budgets.stop_on_first_failure,
-                        failure_severity,
-                    );
-                summary.record_attempt_failure(
-                    &attempt,
-                    failure_summary.as_ref(),
-                    attempt_failure_summary_artifact(&planned.plan),
-                    failure_message,
-                    stop_after_attempt_failure,
-                );
-                replace_last_attempt(&mut summary, attempt);
-                if enforce_disruption_budget(&mut summary, safety_failure) {
-                    write_summary(&summary_path, &summary)?;
-                    break 'suite;
-                }
-            }
+        if let Err(error) = &result
+            && error.is::<SuiteDeadlineExceeded>()
+        {
+            attempt.fail(error.to_string(), None);
+            replace_last_attempt(&mut summary, attempt);
+            summary.record_suite_budget_failure(error.to_string());
+            write_summary(&summary_path, &summary)?;
+            break 'suite;
         }
-
+        let stop_after_attempt_failure = attempt::evaluate_attempt_result(
+            planned,
+            &execution_plan.suite,
+            &mut summary,
+            &suite_root,
+            attempt,
+            result,
+        )?;
         write_summary(&summary_path, &summary)?;
         if stop_after_attempt_failure {
             break 'suite;
         }
     }
 
-    if summary.status == SuiteRunStatus::Running {
-        summary.succeed();
-    }
+    finalize_suite_status(&mut summary, deadline);
     summary.ended_at_ms = Some(now_ms());
     summary.elapsed_seconds = Some(started.elapsed().as_secs());
     write_summary(&summary_path, &summary)?;
@@ -480,6 +328,20 @@ fn build_fault_suite_execution_plan(
         plan: expansion.plan,
         attempts,
     })
+}
+
+fn finalize_suite_status(summary: &mut FaultSuiteRunSummary, deadline: RunDeadline) {
+    if let Err(error) = deadline.check() {
+        if !summary
+            .failures
+            .iter()
+            .any(|failure| matches!(failure.kind, FaultSuiteRunFailureKind::SuiteBudget))
+        {
+            summary.record_suite_budget_failure(error.to_string());
+        }
+    } else if summary.status == SuiteRunStatus::Running {
+        summary.succeed();
+    }
 }
 
 fn suite_duration_budget_failure(
@@ -1263,6 +1125,49 @@ scenarios:
             .expect_err("budget should fail before execution");
 
         assert!(error.to_string().contains("cannot cover planned scenario"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_attempt_overrun_fails_suite_without_a_following_attempt() {
+        let suite = single_scenario_suite();
+        let mut summary = FaultSuiteRunSummary::started(&suite, "suite-deadline".to_string());
+        let mut last = FaultSuiteRunAttempt::running(
+            1,
+            "final-run",
+            "io-eio",
+            1,
+            Path::new("artifacts/final"),
+            None,
+        );
+        last.succeed(42, 1, 0, 12);
+        summary.attempts.push(last);
+        let deadline = super::RunDeadline::new(Some(2)).expect("deadline");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        super::finalize_suite_status(&mut summary, deadline);
+        assert_eq!(summary.status, SuiteRunStatus::Failed);
+        assert_eq!(summary.failures.len(), 1);
+        assert!(matches!(
+            summary.failures[0].kind,
+            FaultSuiteRunFailureKind::SuiteBudget
+        ));
+        assert!(summary.failures[0].reason.contains("maxDuration budget 2s"));
+        super::finalize_suite_status(&mut summary, deadline);
+        assert_eq!(
+            summary.failures.len(),
+            1,
+            "timeout finalization must not duplicate a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn suite_finalization_preserves_failures_and_accepts_on_time_completion() {
+        let suite = single_scenario_suite();
+        let mut summary = FaultSuiteRunSummary::started(&suite, "suite-on-time".to_string());
+        super::finalize_suite_status(&mut summary, super::RunDeadline::default());
+        assert_eq!(summary.status, SuiteRunStatus::Succeeded);
+        summary.record_suite_budget_failure("existing failure".to_string());
+        super::finalize_suite_status(&mut summary, super::RunDeadline::default());
+        assert_eq!(summary.status, SuiteRunStatus::Failed);
     }
 
     #[test]

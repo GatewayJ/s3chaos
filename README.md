@@ -101,6 +101,13 @@ execution environments and verdicts separate:
 | `dm-lab.yaml` | `dm-flakey` and the versioned hot-key soft-power-loss proxy | Prepared dedicated block device and static local PV from `docs/DM_FLAKEY.md` |
 | `warp-performance.yaml` | Performance-only Warp-under-chaos campaign; correctness still comes from the normal checker | `warp` on `PATH`; Warp defaults to 60 seconds |
 
+The Rust runner owns `budgets.maxDuration` for both `make fault-suite-run`
+and direct `s3chaos fault-suite-run` invocations. Expiration fails the suite,
+including its final attempt, and stops admitting workload operations. In-flight
+multipart operations and cleanup are drained before returning; device recovery
+and synchronous external commands may finish after the budget. The shell wrapper
+continues to supervise cluster health independently.
+
 Warp planning requires a positive `RUSTFS_FAULT_TEST_WARP_DURATION_SECONDS`
 strictly below `faultDuration - RUSTFS_FAULT_TEST_TIMEOUT_SECONDS` to leave
 headroom for post-Warp operations. With this suite's 15-minute fault window and

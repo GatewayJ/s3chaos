@@ -798,28 +798,6 @@ write_health_watch_event() {
     }' >>"$jsonl"
 }
 
-write_suite_budget_watch_event() {
-  local jsonl="$1" at="$2" suite="$3" health_checks="$4" elapsed="$5" max_duration="$6"
-  jq -cn \
-    --arg at "$at" \
-    --arg suite "$suite" \
-    --argjson health_checks "$health_checks" \
-    --argjson elapsed_seconds "$elapsed" \
-    --argjson max_duration_seconds "$max_duration" \
-    '{
-      at: $at,
-      scope: "suite",
-      safe: false,
-      health_checks: $health_checks,
-      suite: $suite,
-      message: "suite maxDuration budget exceeded",
-      reason: "maxDurationSeconds exceeded",
-      budget: false,
-      elapsedSeconds: $elapsed_seconds,
-      maxDurationSeconds: $max_duration_seconds
-    }' >>"$jsonl"
-}
-
 append_health_watch_log() {
   local path="$1" at="$2" safe="$3" health_checks="$4" reason="$5" message="$6" consecutive_failures="$7" failure_threshold="$8" will_abort="$9"
   printf '%s safe=%s checks=%s reason=%s consecutiveFailures=%s/%s willAbort=%s message=%s\n' \
@@ -1040,17 +1018,11 @@ suite_requires_chaos() {
   jq -e '.requiresChaosMesh == true' "$plan_path" >/dev/null
 }
 
-suite_max_duration_seconds() {
-  local plan_path="$1"
-  jq -r '.budgets.maxDurationSeconds // empty' "$plan_path"
-}
-
 run_suite() {
   local suite="$1" run_root rc suite_plan suite_name
   local baseline_ready_nodes baseline_tenants current_time health_checks require_chaos
   local health_status health_safe health_message health_reason
   local consecutive_health_failures will_abort
-  local started_at now max_duration_seconds elapsed
   [[ -f "$suite" ]] || die "suite yaml file not found: $suite"
   run_root="$(new_run_root)"
   mkdir -p "$run_root"
@@ -1069,7 +1041,6 @@ run_suite() {
   else
     require_chaos=false
   fi
-  max_duration_seconds="$(suite_max_duration_seconds "$suite_plan")"
   capture_cluster_snapshot "$run_root" before
   prepare_host_mutation_state "$run_root"
 
@@ -1086,24 +1057,11 @@ run_suite() {
     echo "$?" >"$run_root/suite-exit-code.tmp"
   ) &
   ACTIVE_PID="$!"
-  started_at="$(date +%s)"
   health_checks=0
   consecutive_health_failures=0
 
   while kill -0 "$ACTIVE_PID" 2>/dev/null; do
     current_time="$(date -u +%FT%TZ)"
-    now="$(date +%s)"
-    elapsed=$((now - started_at))
-    if [[ -n "$max_duration_seconds" && "$elapsed" -ge "$max_duration_seconds" ]]; then
-      echo "$current_time budget=false maxDurationSeconds=$max_duration_seconds elapsedSeconds=$elapsed" >>"$run_root/health-watch.log"
-      write_suite_budget_watch_event "$run_root/health-watch.jsonl" "$current_time" "$suite_name" "$health_checks" "$elapsed" "$max_duration_seconds" \
-        || warn_artifact_write_failed "health-watch.jsonl" "$run_root/health-watch.jsonl"
-      touch "$run_root/suite-budget-failed"
-      terminate_process_tree "$ACTIVE_PID" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN"
-      cleanup_managed_chaos
-      break
-    fi
-
     health_checks=$((health_checks + 1))
     health_status="$(health_status_json "$baseline_ready_nodes" "$baseline_tenants" "$require_chaos")"
     health_safe="$(jq -r '.safe' <<<"$health_status")"
@@ -1143,7 +1101,6 @@ run_suite() {
   rc=125
   [[ -f "$run_root/suite-exit-code.tmp" ]] && rc="$(cat "$run_root/suite-exit-code.tmp")"
   [[ ! -f "$run_root/health-guard-failed" ]] || rc=90
-  [[ ! -f "$run_root/suite-budget-failed" ]] || rc=91
   echo "$rc" >"$run_root/suite-exit-code"
   capture_cluster_snapshot "$run_root" after
   capture_fault_logs "$run_root"

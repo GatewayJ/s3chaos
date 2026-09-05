@@ -334,16 +334,6 @@ impl PreflightCheck {
             message: message.into(),
         }
     }
-
-    pub fn with_expected_actual(
-        mut self,
-        expected: impl Into<String>,
-        actual: impl Into<String>,
-    ) -> Self {
-        self.expected = Some(expected.into());
-        self.actual = Some(actual.into());
-        self
-    }
 }
 
 impl TargetProof {
