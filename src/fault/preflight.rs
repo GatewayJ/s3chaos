@@ -143,6 +143,8 @@ pub struct TargetPodSelectorProof {
 pub struct TargetResolvedPodProof {
     pub name: String,
     pub uid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustfs_container_id: Option<String>,
     #[serde(default)]
     pub ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -629,8 +631,10 @@ impl TargetProof {
                     .iter()
                     .filter(|pod| pod.ready && target_pod_has_fixed_volume(pod, volume_path))
                     .count();
-                let enough_candidates = usize::try_from(required_targets)
-                    .is_ok_and(|required| eligible_candidates >= required);
+                // The IOChaos tenant selector may choose any resolved Pod.
+                let enough_candidates = eligible_candidates == self.resolved_pods.len()
+                    && usize::try_from(required_targets)
+                        .is_ok_and(|required| required > 0 && eligible_candidates >= required);
                 self.requirements.push(TargetProofRequirement {
                     name: "fixed_volume_target_candidates_resolved".to_string(),
                     status: if enough_candidates {
@@ -639,8 +643,10 @@ impl TargetProof {
                         PreflightStatus::Failed
                     },
                     message: format!(
-                        "resolved {} candidate volume-bearing Pod(s) for {} fixed target(s)",
-                        eligible_candidates, required_targets
+                        "proved {} of {} selector Pod(s) for {} fixed volume target(s)",
+                        eligible_candidates,
+                        self.resolved_pods.len(),
+                        required_targets
                     ),
                 });
             }
@@ -662,6 +668,7 @@ impl TargetResolvedPodProof {
         Self {
             name: name.into(),
             uid: uid.into(),
+            rustfs_container_id: None,
             ready: false,
             node: None,
             node_labels: BTreeMap::new(),
@@ -720,7 +727,12 @@ pub(crate) fn target_pod_has_fixed_volume(
     pod: &TargetResolvedPodProof,
     expected_mount_path: &str,
 ) -> bool {
-    if expected_mount_path.is_empty() {
+    if expected_mount_path.is_empty()
+        || pod
+            .rustfs_container_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+    {
         return false;
     }
     if pod.node.as_deref().is_none_or(str::is_empty) || pod.node_labels.is_empty() {
@@ -1022,7 +1034,7 @@ mod tests {
         affinity: Option<TargetNodeAffinityProof>,
         node_labels: BTreeMap<String, String>,
     ) -> TargetResolvedPodProof {
-        TargetResolvedPodProof::new("rustfs-0", "uid-0")
+        let mut pod = TargetResolvedPodProof::new("rustfs-0", "uid-0")
             .with_node("node-a")
             .with_node_labels(node_labels)
             .with_ready(true)
@@ -1043,7 +1055,9 @@ mod tests {
                     node: None,
                     device_or_path: Some("volume-handle".to_string()),
                 }),
-            }])
+            }]);
+        pod.rustfs_container_id = Some("containerd://rustfs-0".to_string());
+        pod
     }
 
     fn affinity(terms: Vec<Vec<(&str, &str, Vec<&str>)>>) -> TargetNodeAffinityProof {

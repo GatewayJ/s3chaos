@@ -185,6 +185,21 @@ fn target_pod_proof(
     let name = metadata.get("name")?.as_str()?.to_string();
     let uid = metadata.get("uid")?.as_str()?.to_string();
     let mut proof = TargetResolvedPodProof::new(name, uid).with_ready(pod_is_ready(pod));
+    proof.rustfs_container_id = pod
+        .pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+        .and_then(|statuses| {
+            let mut rustfs = statuses
+                .iter()
+                .filter(|status| status.get("name").and_then(Value::as_str) == Some("rustfs"));
+            let status = rustfs.next()?;
+            if rustfs.next().is_some() || !status.pointer("/state/running")?.is_object() {
+                return None;
+            }
+            status.get("containerID")?.as_str()
+        })
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string);
     if let Some(node) = pod.pointer("/spec/nodeName").and_then(Value::as_str) {
         proof = proof.with_node(node);
         if let Some(labels) = node_labels.and_then(|nodes| nodes.get(node)) {
@@ -207,6 +222,40 @@ fn target_pod_proof(
             .with_persistent_volume_claims(claims)
             .with_volume_mounts(volume_mounts),
     )
+}
+
+pub(crate) fn fixed_volume_container_ids(
+    pods: &[TargetResolvedPodProof],
+    selected_pod_names: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut containers = BTreeMap::new();
+    for pod in pods
+        .iter()
+        .filter(|pod| selected_pod_names.contains(&pod.name))
+    {
+        let id = pod
+            .rustfs_container_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .with_context(|| {
+                format!(
+                    "fixed volume target {} has no running RustFS container ID",
+                    pod.name
+                )
+            })?;
+        ensure!(
+            containers
+                .insert(pod.name.clone(), id.to_string())
+                .is_none(),
+            "fixed volume target {} has duplicate Pod records",
+            pod.name
+        );
+    }
+    ensure!(
+        containers.len() == selected_pod_names.len(),
+        "fixed volume container identities do not cover the selected Pods"
+    );
+    Ok(containers)
 }
 
 fn pod_is_ready(pod: &Value) -> bool {
@@ -528,12 +577,51 @@ pub(crate) fn pod_replacement_observed(before: &[PodIdentity], current: &[PodIde
 #[cfg(test)]
 mod tests {
     use super::{
-        items_by_metadata_name, persistent_volume_claim_names, pod_deletion_observed,
-        pod_replacement_observed, target_pod_proof,
+        fixed_volume_container_ids, items_by_metadata_name, persistent_volume_claim_names,
+        pod_deletion_observed, pod_replacement_observed, target_pod_proof,
     };
     use crate::fault::{preflight::target_pod_has_fixed_volume, reporting::PodIdentity};
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn fixed_volume_identity_tracks_the_running_rustfs_container() {
+        let mut pod = json!({
+            "metadata": {"name": "rustfs-0", "uid": "uid-0"},
+            "status": {"containerStatuses": [
+                {"name": "sidecar", "containerID": "containerd://sidecar", "state": {"running": {}}},
+                {"name": "rustfs", "containerID": "containerd://original", "state": {"running": {}}}
+            ]}
+        });
+        let selected = BTreeSet::from(["rustfs-0".to_string()]);
+        let original = target_pod_proof(&pod, None, None, None).expect("Pod proof");
+        let expected = fixed_volume_container_ids(std::slice::from_ref(&original), &selected)
+            .expect("running container identity does not require readiness during IOChaos");
+        assert_eq!(expected["rustfs-0"], "containerd://original");
+
+        pod["status"]["containerStatuses"][1]["containerID"] = json!("containerd://replacement");
+        let restarted = target_pod_proof(&pod, None, None, None).expect("restarted Pod");
+        assert_eq!(restarted.uid, original.uid);
+        assert_ne!(
+            fixed_volume_container_ids(&[restarted], &selected).unwrap(),
+            expected
+        );
+
+        for state in [json!({"waiting": {}}), json!({"terminated": {}}), json!({})] {
+            pod["status"]["containerStatuses"][1]["state"] = state;
+            let stopped = target_pod_proof(&pod, None, None, None).expect("stopped Pod");
+            assert!(fixed_volume_container_ids(&[stopped], &selected).is_err());
+        }
+        pod["status"]["containerStatuses"][1]["state"] = json!({"running": {}});
+        for id in [json!(null), json!(""), json!(" ")] {
+            pod["status"]["containerStatuses"][1]["containerID"] = id;
+            let missing =
+                target_pod_proof(&pod, None, None, None).expect("Pod without container ID");
+            assert!(fixed_volume_container_ids(&[missing], &selected).is_err());
+        }
+        assert!(fixed_volume_container_ids(&[], &selected).is_err());
+        assert!(fixed_volume_container_ids(&[original.clone(), original], &selected).is_err());
+    }
 
     #[test]
     fn pod_replacement_requires_old_uid_removed_and_new_uid_added() {
@@ -579,7 +667,10 @@ mod tests {
                     "persistentVolumeClaim": {"claimName": "data-rustfs-0"}
                 }]
             },
-            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{"name": "rustfs", "containerID": "containerd://original", "state": {"running": {}}}]
+            }
         });
         let pvc_list = json!({
             "items": [{
@@ -659,7 +750,10 @@ mod tests {
                     {"name": "logs", "persistentVolumeClaim": {"claimName": "logs-rustfs-0"}}
                 ]
             },
-            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{"name": "rustfs", "containerID": "containerd://original", "state": {"running": {}}}]
+            }
         });
         let pvc_list = json!({
             "items": [{

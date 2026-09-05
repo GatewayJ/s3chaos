@@ -1183,6 +1183,53 @@ scenarios:
     }
 
     #[test]
+    fn warp_example_rejects_duration_without_post_warp_headroom() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+            "../../fault/examples/warp-performance.yaml"
+        ))
+        .expect("Warp example")
+        .resolve()
+        .expect("resolved Warp example");
+        for (warp_seconds, timeout_seconds, accepted) in [
+            (60, 300, true),
+            (599, 300, true),
+            (600, 300, false),
+            (900, 300, false),
+            (1200, 300, false),
+            (0, 300, false),
+            (60, 900, false),
+            (60, 901, false),
+        ] {
+            let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+            base.warp_duration = Duration::from_secs(warp_seconds);
+            base.cluster.timeout = Duration::from_secs(timeout_seconds);
+            let result = build_fault_suite_plan_expansion(
+                suite.clone(),
+                base,
+                "warp-duration-test".to_string(),
+            );
+            if accepted {
+                assert!(result.is_ok(), "Warp {warp_seconds}s: {result:?}");
+            } else {
+                let error = result.expect_err("invalid Warp duration must fail before execution");
+                assert!(error.to_string().contains("WARP_DURATION_SECONDS"));
+            }
+        }
+        let mut extended_suite = suite;
+        extended_suite.scenarios[0].fault_duration_seconds = Some(1800);
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.warp_duration = Duration::from_secs(1200);
+        assert!(
+            build_fault_suite_plan_expansion(
+                extended_suite,
+                base,
+                "extended-warp-window".to_string()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn suite_runtime_contract_rejects_stable_window_that_matches_timeout_before_run_starts() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
             r#"
