@@ -50,7 +50,7 @@ use crate::fault::{
         PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus,
         target_pod_has_bound_volume, target_pod_has_fixed_volume,
     },
-    quorum::require_fresh_runtime_observation,
+    quorum::{QuorumCaseClass, require_fresh_runtime_observation},
     reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
     scenarios::{self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario},
     spec::{
@@ -815,6 +815,20 @@ fn validate_fault_artifacts_with_identity(
             .context("fault-evidence.json workload_ended_at_ms is required")?;
         if options.scenario == scenarios::QUORUM_P_IO_FAULT_SCENARIO {
             require_typed_quorum_read_survival(
+                &history,
+                &metadata.scenario,
+                &json_spec.metadata.bucket,
+                json_spec
+                    .faults
+                    .first()
+                    .context("runtime quorum run-spec has no fault")?
+                    .parameters
+                    .quorum_case()?,
+                workload_started_at_ms,
+                workload_ended_at_ms,
+            )?;
+        } else if options.scenario == scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO {
+            summary.require_typed_write_quorum_loss_effect(
                 &history,
                 &metadata.scenario,
                 &json_spec.metadata.bucket,
@@ -3229,22 +3243,72 @@ impl WorkloadSummaryArtifact {
         workload_started_at_ms: u64,
         workload_ended_at_ms: u64,
     ) -> Result<()> {
-        ensure!(
-            self.puts.total() > 0
-                && self.deletes.total() > 0
-                && self.multipart_completes.total() > 0,
-            "workload-summary.json did not exercise every committing mutation family"
-        );
-        for (kind, counts) in [
+        self.require_rejected_write_mutations(&[
             ("PUT", &self.puts),
             ("DELETE", &self.deletes),
             ("CompleteMultipartUpload", &self.multipart_completes),
-        ] {
+        ])?;
+        self.require_write_mutation_history_matches(
+            history,
+            scenario,
+            bucket,
+            workload_started_at_ms,
+            workload_ended_at_ms,
+        )
+    }
+
+    fn require_typed_write_quorum_loss_effect(
+        &self,
+        history: &[OperationRecord],
+        scenario: &str,
+        bucket: &str,
+        class: QuorumCaseClass,
+        workload_started_at_ms: u64,
+        workload_ended_at_ms: u64,
+    ) -> Result<()> {
+        match class {
+            QuorumCaseClass::Payload => self.require_rejected_write_mutations(&[
+                ("PUT", &self.puts),
+                ("CompleteMultipartUpload", &self.multipart_completes),
+            ])?,
+            QuorumCaseClass::Metadata => {
+                self.require_rejected_write_mutations(&[("DELETE", &self.deletes)])?
+            }
+        }
+        self.require_write_mutation_history_matches(
+            history,
+            scenario,
+            bucket,
+            workload_started_at_ms,
+            workload_ended_at_ms,
+        )
+    }
+
+    fn require_rejected_write_mutations(
+        &self,
+        mutations: &[(&str, &OutcomeCountsArtifact)],
+    ) -> Result<()> {
+        ensure!(
+            mutations.iter().all(|(_, counts)| counts.total() > 0),
+            "workload-summary.json did not exercise every mutation selected by the quorum case"
+        );
+        for (kind, counts) in mutations {
             ensure!(
                 counts.ok == 0 && counts.not_found == 0 && counts.disrupted()? > 0,
                 "write-quorum-loss {kind} outcomes must all be failed, timed out, or unknown: {counts:?}"
             );
         }
+        Ok(())
+    }
+
+    fn require_write_mutation_history_matches(
+        &self,
+        history: &[OperationRecord],
+        scenario: &str,
+        bucket: &str,
+        workload_started_at_ms: u64,
+        workload_ended_at_ms: u64,
+    ) -> Result<()> {
         for (kind, summary_counts) in [
             (OperationKind::Put, &self.puts),
             (OperationKind::Delete, &self.deletes),
@@ -3357,7 +3421,7 @@ mod tests {
         spec::{FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec},
         workload::WorkloadPlan,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::{collections::BTreeMap, fs, time::Duration};
 
     #[test]
@@ -4896,6 +4960,125 @@ mod tests {
                     11,
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn typed_write_quorum_loss_artifacts_follow_the_selected_quorum_class() {
+        let summary = |puts: Value, deletes: Value, multipart_completes: Value| {
+            serde_json::from_value::<WorkloadSummaryArtifact>(json!({
+                "seed": 42,
+                "object_count": 3,
+                "concurrency": 1,
+                "recommitted_after_recovery": 0,
+                "puts": puts,
+                "gets": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "deletes": deletes,
+                "lists": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "multipart_completes": multipart_completes,
+                "multipart_aborts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}
+            }))
+            .expect("summary")
+        };
+        let record = |id: &str, kind: &str, outcome: &str| {
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": id,
+                "scenario": QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                "kind": kind,
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": null,
+                "size_bytes": null,
+                "started_at_ms": 10,
+                "ended_at_ms": 11,
+                "outcome": outcome,
+                "http_status": null,
+                "error": null,
+                "durability_cohort": "fault_active"
+            }))
+            .expect("history record")
+        };
+
+        let payload = summary(
+            json!({"ok": 0, "not_found": 0, "failed": 1, "timeout": 0, "unknown": 0}),
+            json!({"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}),
+            json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0}),
+        );
+        let payload_history = vec![
+            record("put-1", "put", "failed"),
+            record("delete-1", "delete", "ok"),
+            record("mpu-1", "complete_multipart_upload", "timeout"),
+        ];
+        payload
+            .require_typed_write_quorum_loss_effect(
+                &payload_history,
+                QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                "bucket",
+                QuorumCaseClass::Payload,
+                10,
+                11,
+            )
+            .expect("payload quorum loss may retain metadata write quorum");
+        assert!(
+            payload
+                .require_typed_write_quorum_loss_effect(
+                    &payload_history,
+                    QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                    "bucket",
+                    QuorumCaseClass::Metadata,
+                    10,
+                    11,
+                )
+                .is_err()
+        );
+
+        let metadata = summary(
+            json!({"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}),
+            json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 1}),
+            json!({"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}),
+        );
+        let metadata_history = vec![
+            record("put-2", "put", "ok"),
+            record("delete-2", "delete", "unknown"),
+            record("mpu-2", "complete_multipart_upload", "ok"),
+        ];
+        metadata
+            .require_typed_write_quorum_loss_effect(
+                &metadata_history,
+                QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                "bucket",
+                QuorumCaseClass::Metadata,
+                10,
+                11,
+            )
+            .expect("metadata quorum loss may retain payload write quorum");
+        assert!(
+            metadata
+                .require_typed_write_quorum_loss_effect(
+                    &metadata_history,
+                    QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                    "bucket",
+                    QuorumCaseClass::Payload,
+                    10,
+                    11,
+                )
+                .is_err()
+        );
+
+        let mut tampered_history = payload_history;
+        tampered_history[1].outcome = OperationOutcome::Failed;
+        assert!(
+            payload
+                .require_typed_write_quorum_loss_effect(
+                    &tampered_history,
+                    QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                    "bucket",
+                    QuorumCaseClass::Payload,
+                    10,
+                    11,
+                )
+                .is_err(),
+            "unselected mutation history must still match the signed summary"
         );
     }
 

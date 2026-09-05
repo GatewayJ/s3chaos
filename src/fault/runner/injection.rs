@@ -604,12 +604,12 @@ impl FaultRun<'_> {
             .summary
             .require_fault_evidence(require_client_disruption)
             .and_then(|()| {
-                if matches!(
-                    plan.scenario.as_str(),
-                    NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
-                        | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
-                ) {
+                if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
                     workload.summary.require_write_quorum_loss_effect()
+                } else if plan.scenario == QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO {
+                    workload.summary.require_typed_write_quorum_loss_effect(
+                        plan.fault().parameters().quorum_case()?,
+                    )
                 } else if plan.scenario == QUORUM_P_IO_FAULT_SCENARIO {
                     require_typed_quorum_read_survival(
                         &self.context.history.records(),

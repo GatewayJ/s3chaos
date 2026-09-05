@@ -906,17 +906,34 @@ impl WorkloadSummary {
     }
 
     pub(in crate::fault) fn require_write_quorum_loss_effect(&self) -> Result<()> {
-        ensure!(
-            self.puts.total() > 0
-                && self.deletes.total() > 0
-                && self.multipart_completes.total() > 0,
-            "write-quorum-loss workload did not exercise PUT, DELETE, and multipart completion"
-        );
-        for (kind, counts) in [
+        self.require_rejected_write_mutations(&[
             ("PUT", &self.puts),
             ("DELETE", &self.deletes),
             ("CompleteMultipartUpload", &self.multipart_completes),
-        ] {
+        ])
+    }
+
+    pub(in crate::fault) fn require_typed_write_quorum_loss_effect(
+        &self,
+        class: QuorumCaseClass,
+    ) -> Result<()> {
+        match class {
+            QuorumCaseClass::Payload => self.require_rejected_write_mutations(&[
+                ("PUT", &self.puts),
+                ("CompleteMultipartUpload", &self.multipart_completes),
+            ]),
+            QuorumCaseClass::Metadata => {
+                self.require_rejected_write_mutations(&[("DELETE", &self.deletes)])
+            }
+        }
+    }
+
+    fn require_rejected_write_mutations(&self, mutations: &[(&str, &OutcomeCounts)]) -> Result<()> {
+        ensure!(
+            mutations.iter().all(|(_, counts)| counts.total() > 0),
+            "write-quorum-loss workload did not exercise every mutation selected by the quorum case"
+        );
+        for (kind, counts) in mutations {
             ensure!(
                 counts.ok == 0 && counts.not_found == 0 && counts.disrupted() > 0,
                 "write-quorum-loss {kind} outcomes must all be failed, timed out, or unknown: {counts:?}"
@@ -1155,6 +1172,41 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn typed_write_quorum_loss_checks_only_the_selected_quorum_class() {
+        let mut payload = WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2), "io-eio", "run-1");
+        payload.puts.record(OperationOutcome::Failed);
+        payload.deletes.record(OperationOutcome::Ok);
+        payload
+            .multipart_completes
+            .record(OperationOutcome::Timeout);
+        assert!(
+            payload
+                .require_typed_write_quorum_loss_effect(QuorumCaseClass::Payload)
+                .is_ok()
+        );
+        assert!(
+            payload
+                .require_typed_write_quorum_loss_effect(QuorumCaseClass::Metadata)
+                .is_err()
+        );
+
+        let mut metadata =
+            WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2), "io-eio", "run-1");
+        metadata.puts.record(OperationOutcome::Ok);
+        metadata.deletes.record(OperationOutcome::Unknown);
+        metadata.multipart_completes.record(OperationOutcome::Ok);
+        assert!(
+            metadata
+                .require_typed_write_quorum_loss_effect(QuorumCaseClass::Metadata)
+                .is_ok()
+        );
+        assert!(
+            metadata
+                .require_typed_write_quorum_loss_effect(QuorumCaseClass::Payload)
+                .is_err()
+        );
     }
     #[test]
     fn quorum_workload_stages_every_planned_multipart_completion() {
