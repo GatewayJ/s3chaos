@@ -38,6 +38,7 @@ use crate::fault::{
     history::{
         DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome, OperationRecord,
         validate_history_phase_boundary, validate_history_scope_and_order,
+        validate_successful_version_identity_uniqueness,
     },
     preflight::{PreflightStatus, TARGET_PROOF_SCHEMA_VERSION, TargetProof, TargetProofStatus},
     quorum::{ErasureSetMembership, ErasureSetShape, PersistedVersionClass, QuorumRequirements},
@@ -4428,7 +4429,11 @@ fn validate_immutable_version_history(
     history: &[OperationRecord],
     identity: &StorageRecoveryArtifactIdentity,
 ) -> Result<()> {
-    let mut versions = BTreeMap::<(String, String), Option<String>>::new();
+    validate_successful_version_identity_uniqueness(
+        history
+            .iter()
+            .filter(|record| record_matches_identity(record, identity)),
+    )?;
     for record in history.iter().filter(|record| {
         record_matches_identity(record, identity)
             && (is_object_commit(record.kind) || record.kind == OperationKind::Delete)
@@ -4437,7 +4442,7 @@ fn validate_immutable_version_history(
                 .http_status
                 .is_some_and(|status| (200..300).contains(&status))
     }) {
-        let Some(version_id) = record
+        let Some(_version_id) = record
             .version_id
             .as_deref()
             .filter(|version_id| *version_id != "null")
@@ -4448,28 +4453,17 @@ fn validate_immutable_version_history(
             valid_operation_interval(record),
             "successful versioned write has an invalid operation interval"
         );
-        let key = record
+        let _key = record
             .key
             .as_deref()
             .filter(|key| !key.is_empty())
             .context("successful versioned write lacks an object key")?;
-        let value = if is_object_commit(record.kind) {
+        if is_object_commit(record.kind) {
             let hash = record
                 .value_sha256
                 .as_deref()
                 .context("successful versioned write lacks a content hash")?;
             validate_sha256("successful versioned write", hash)?;
-            Some(hash.to_string())
-        } else {
-            None
-        };
-        if let Some(previous) =
-            versions.insert((key.to_string(), version_id.to_string()), value.clone())
-        {
-            ensure!(
-                previous == value,
-                "one immutable object version identity has conflicting data/delete-marker type or content"
-            );
         }
     }
     Ok(())
@@ -5639,6 +5633,67 @@ mod tests {
         )
         .expect("valid stale return fixture");
         (proof, history)
+    }
+
+    fn duplicate_stale_mutation(
+        proof: &mut StaleDiskReturnProof,
+        history: &mut Vec<OperationRecord>,
+        source_index: usize,
+        duplicate_id: &str,
+    ) {
+        history.truncate(checker_prefix_record_count(&proof.post_return_checker));
+        let mut duplicate_record = history[source_index].clone();
+        duplicate_record.id = duplicate_id.to_string();
+        history.push(duplicate_record);
+
+        let mut duplicate_evidence = proof.committed_mutations[source_index].clone();
+        duplicate_evidence.operation_id = duplicate_id.to_string();
+        proof.committed_mutations.push(duplicate_evidence);
+
+        append_post_return_checker_suffix(history);
+        proof.post_return_checker = post_return_checker(history);
+    }
+
+    #[test]
+    fn post_return_checker_rejects_duplicate_put_version_identity() {
+        let (mut proof, mut history) = stale_return_fixture();
+        duplicate_stale_mutation(&mut proof, &mut history, 0, "stale-put-duplicate");
+
+        let error = proof
+            .post_return_checker
+            .validate(
+                &proof.identity,
+                proof.returned_generation.observed_at_ms,
+                &proof.committed_mutations,
+                &history,
+            )
+            .expect_err("duplicate successful PUT version identity must be rejected");
+
+        assert!(
+            format!("{error:#}").contains("reuses successful immutable S3 version identity"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn post_return_checker_rejects_duplicate_delete_marker_version_identity() {
+        let (mut proof, mut history) = stale_return_fixture();
+        duplicate_stale_mutation(&mut proof, &mut history, 1, "stale-delete-duplicate");
+
+        let error = proof
+            .post_return_checker
+            .validate(
+                &proof.identity,
+                proof.returned_generation.observed_at_ms,
+                &proof.committed_mutations,
+                &history,
+            )
+            .expect_err("duplicate successful delete-marker version identity must be rejected");
+
+        assert!(
+            format!("{error:#}").contains("reuses successful immutable S3 version identity"),
+            "{error:#}"
+        );
     }
 
     #[test]

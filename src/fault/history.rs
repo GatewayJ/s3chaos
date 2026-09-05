@@ -156,6 +156,37 @@ pub struct OperationRecord {
     pub fault_window_relation: Option<FaultWindowRelation>,
 }
 
+pub(crate) fn validate_successful_version_identity_uniqueness<'a>(
+    records: impl IntoIterator<Item = &'a OperationRecord>,
+) -> Result<()> {
+    let mut version_identities = HashSet::new();
+    for record in records.into_iter().filter(|record| {
+        record.outcome == OperationOutcome::Ok
+            && matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+            )
+    }) {
+        let Some(version_id) = record
+            .version_id
+            .as_deref()
+            .filter(|version_id| !version_id.is_empty() && *version_id != "null")
+        else {
+            continue;
+        };
+        let key = record
+            .key
+            .as_deref()
+            .context("successful versioned mutation history record has no key")?;
+        ensure!(
+            version_identities.insert((record.bucket.as_str(), key, version_id)),
+            "history reuses successful immutable S3 version identity {}/{key}@{version_id}",
+            record.bucket
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_history_scope_and_order(
     records: &[OperationRecord],
     scenario: &str,
@@ -170,6 +201,7 @@ pub(crate) fn validate_history_scope_and_order(
         }),
         "history contains an operation outside the checker run scenario, run id, or bucket"
     );
+    validate_successful_version_identity_uniqueness(records)?;
 
     let expected_event_count = records
         .len()
