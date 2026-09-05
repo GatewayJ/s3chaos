@@ -288,26 +288,10 @@ impl QuorumRequirements {
     }
 
     pub fn validate(self) -> Result<()> {
-        ensure!(self.total_shards > 0, "total_shards must be positive");
+        let expected = Self::payload(self.total_shards, self.parity_shards)?;
         ensure!(
-            self.data_shards + self.parity_shards == self.total_shards,
-            "data_shards + parity_shards must equal total_shards"
-        );
-        ensure!(
-            self.read_quorum > 0 && self.read_quorum <= self.total_shards,
-            "read_quorum must be within the erasure set"
-        );
-        ensure!(
-            self.write_quorum > 0 && self.write_quorum <= self.total_shards,
-            "write_quorum must be within the erasure set"
-        );
-        ensure!(
-            self.read_tolerance == self.total_shards - self.read_quorum,
-            "read_tolerance does not match read_quorum"
-        );
-        ensure!(
-            self.write_tolerance == self.total_shards - self.write_quorum,
-            "write_tolerance does not match write_quorum"
+            self == expected,
+            "quorum requirements do not match the shard geometry"
         );
         Ok(())
     }
@@ -472,6 +456,23 @@ mod tests {
             assert_eq!(metadata.read_tolerance, 6);
             assert_eq!(metadata.write_tolerance, 5);
         }
+    }
+
+    #[test]
+    fn quorum_validation_rejects_inconsistent_geometry_without_overflow() {
+        let valid =
+            QuorumRequirements::for_mutation(8, 4, QuorumMutationClass::PutObject).expect("quorum");
+        valid.validate().expect("valid geometry");
+        let mut wrong_quorum = valid;
+        wrong_quorum.write_quorum = 1;
+        wrong_quorum.write_tolerance = 7;
+        assert!(wrong_quorum.validate().is_err());
+        let mut overflowing = valid;
+        overflowing.data_shards = u32::MAX;
+        assert!(overflowing.validate().is_err());
+        let mut too_wide = valid;
+        too_wide.total_shards = u32::MAX;
+        assert!(too_wide.validate().is_err());
     }
 
     #[test]

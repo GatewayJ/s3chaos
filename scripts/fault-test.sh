@@ -634,8 +634,8 @@ prepare_host_mutation_state() {
 }
 
 cleanup_host_mutation_state() {
-  if [[ -n "$ACTIVE_HOST_MUTATION_STATE_FILE" ]]; then
-    rm -f "$ACTIVE_HOST_MUTATION_STATE_FILE"
+  if [[ -n "$ACTIVE_HOST_MUTATION_STATE_FILE" && -e "$ACTIVE_HOST_MUTATION_STATE_FILE" ]]; then
+    echo "warning: preserving unresolved host mutation state at $ACTIVE_HOST_MUTATION_STATE_FILE; verify device recovery before removing it" >&2
   fi
   ACTIVE_HOST_MUTATION_STATE_FILE=""
   ACTIVE_HOST_MUTATION_STATE_TOKEN=""

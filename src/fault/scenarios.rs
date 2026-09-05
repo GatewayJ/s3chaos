@@ -386,7 +386,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             "live target proof must bind Tenant geometry and unique Ready Pod identities to bounded-age RustFS admin runtime set/parity and server/drive data before fault activation",
             "the selected target set must contain exactly two RustFS Pods",
         ],
-        validation: "the runner stages multipart uploads before the fault, binds Tenant server/volume width and unique Ready Pod identities to a signed RustFS admin runtime set/parity and drive-membership snapshot no more than five seconds before fault apply, then proves the actual two-Pod partition leaves read quorum but not write quorum at activation and after workload; every PUT, DELETE, and staged multipart completion during the outage is recorded in history and none may be acknowledged; successful reads never return wrong hashes; after heal every committed object and version is re-readable with intact content (post-return zero-loss), and Tenant recovers Ready",
+        validation: "the runner stages multipart uploads before the fault, binds Tenant server/volume width and unique Ready Pod identities to RustFS admin runtime set/parity and drive-membership data fetched by a signed request no more than five seconds before fault apply, then proves the actual two-Pod partition leaves read quorum but not write quorum at activation and after workload; every PUT, DELETE, and staged multipart completion during the outage is recorded in history and must fail, time out, or remain unknown; 404 is not quorum-loss evidence; successful reads never return wrong hashes; after heal every committed object and version is re-readable with intact content (post-return zero-loss), and Tenant recovers Ready",
         observability: "history.jsonl, workload-summary.json, checker-report.json, checker-pre-recommit-report.json, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
         conflict_domain: "run-scoped NetworkChaos resource; must not overlap with PodChaos or IOChaos in the same Tenant",
     },
@@ -943,6 +943,21 @@ impl FaultScenario {
             config.duration > Duration::ZERO,
             "RUSTFS_FAULT_TEST_DURATION_SECONDS must be greater than zero"
         );
+        if spec.backend == FaultBackend::MinioWarpWithChaos {
+            // Warp is followed by an S3 access wait and the correctness workload.
+            // Reserve headroom here; the runtime active-state check remains the
+            // authority because setup and workload time depend on the target.
+            ensure!(
+                config.warp_duration > Duration::ZERO
+                    && config
+                        .duration
+                        .checked_sub(config.cluster.timeout)
+                        .is_some_and(|remaining| config.warp_duration < remaining),
+                "RUSTFS_FAULT_TEST_WARP_DURATION_SECONDS must be positive and leave more than RUSTFS_FAULT_TEST_TIMEOUT_SECONDS ({}s) inside the fault duration ({}s) for post-Warp operations; shorten Warp or increase faultDuration",
+                config.cluster.timeout.as_secs(),
+                config.duration.as_secs()
+            );
+        }
         config.workload.validate()?;
         config.workload_operation_mix.validate()?;
         if let Some(payload_distribution) = &config.workload_payload_distribution {
@@ -1055,6 +1070,14 @@ mod tests {
         assert_eq!(scenario.percent, 20);
         assert_eq!(scenario.prefill_count(), 20000);
         assert_eq!(scenario.mixed_workload_count(), 20000);
+    }
+
+    #[test]
+    fn non_warp_scenario_ignores_ambient_warp_duration() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.duration = Duration::from_secs(60);
+        config.warp_duration = Duration::MAX;
+        assert!(FaultScenario::from_config(&config).is_ok());
     }
 
     #[test]

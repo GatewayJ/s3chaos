@@ -64,6 +64,7 @@ enum DmSuspendMode {
     Default,
     NoFlush,
     NoLockFs,
+    NoFlushNoLockFs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +88,7 @@ impl DmMountState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DmVolumeMapping {
     pub node: String,
     pub node_uid: String,
@@ -135,6 +136,7 @@ trait DmTransitionPort {
 enum HostMutationPhase {
     Active,
     Rollback,
+    RecoveryRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,13 +272,59 @@ fn temporary_state_path(path: &Path, owner_pid: u32) -> PathBuf {
     path.with_file_name(format!(".{file_name}.{owner_pid}.tmp"))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DmStatusSnapshot {
     pub stage: String,
+    pub mapper_name: String,
+    pub canonical_device: String,
+    pub suspended: bool,
+    pub observed_at_ms: u64,
     pub helper_pod: String,
     pub mapping: DmVolumeMapping,
     pub table: String,
     pub status: String,
+}
+
+impl DmStatusSnapshot {
+    pub(crate) fn validate_proof(
+        &self,
+        proof: &HostStorageMutationProof,
+        stage: &str,
+        expected_table: &str,
+    ) -> Result<()> {
+        let target = &proof.target;
+        let mapping = &self.mapping;
+        ensure!(
+            self.stage == stage
+                && self.helper_pod == helper_pod_name(&proof.run_id)
+                && self.mapper_name == target.mapper_name
+                && self.canonical_device == target.canonical_device
+                && !self.suspended
+                && self.observed_at_ms >= proof.generated_at_ms
+                && normalize_dm_table(&self.table) == normalize_dm_table(expected_table),
+            "device-mapper {stage} snapshot does not match the proven device, table, or active state"
+        );
+        ensure!(
+            mapping.node == target.node
+                && mapping.node_uid == target.node_uid
+                && mapping.node_labels == target.node_labels
+                && mapping.pod == target.pod
+                && mapping.pod_uid == target.pod_uid
+                && mapping.volume_name == target.volume_name
+                && mapping.pvc == target.persistent_volume_claim
+                && mapping.pvc_uid == target.persistent_volume_claim_uid
+                && mapping.pvc_phase == target.persistent_volume_claim_phase
+                && mapping.pv == target.persistent_volume
+                && mapping.pv_uid == target.persistent_volume_uid
+                && mapping.pv_phase == target.persistent_volume_phase
+                && mapping.pv_claim_ref == target.persistent_volume_claim_ref
+                && mapping.node_selector == target.node_selector
+                && mapping.container_mount_path == target.container_mount_path
+                && mapping.mount_path == target.persistent_volume_path,
+            "device-mapper {stage} snapshot does not match the proven Pod/PVC/PV/node mapping"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -974,22 +1022,49 @@ pub fn run_warp_mixed(
 impl DmFlakeyGuard {
     pub fn ensure_active(&self, stage: &str) -> Result<DmStatusSnapshot> {
         let snapshot = self.snapshot(stage)?;
-        ensure!(
-            normalize_dm_table(&snapshot.table) == normalize_dm_table(&self.fault_table),
-            "device-mapper target {:?} is no longer using the requested fault table at {stage}; expected {:?}, active {:?}",
-            self.dm_name,
-            self.fault_table,
-            snapshot.table
-        );
+        snapshot.validate_proof(&self.preflight_proof, stage, &self.fault_table)?;
         Ok(snapshot)
     }
 
+    fn observe_dm_state(&self) -> Result<DmObservedState> {
+        ensure!(
+            self.mapper_canonical_device()? == self.preflight_proof.target.canonical_device,
+            "refusing to use a mapper whose canonical device changed after preflight"
+        );
+        let suspended = self
+            .dmsetup([
+                "info",
+                "--columns",
+                "--noheadings",
+                "--options",
+                "suspended",
+                self.dm_name.as_str(),
+            ])?
+            .stdout
+            .trim()
+            .to_ascii_lowercase();
+        let suspended = match suspended.as_str() {
+            "suspended" | "yes" | "y" | "1" => true,
+            "active" | "no" | "n" | "0" => false,
+            other => bail!("dmsetup returned unsupported suspended state {other:?}"),
+        };
+        Ok(DmObservedState {
+            suspended,
+            active_table: self.dmsetup(["table", self.dm_name.as_str()])?.stdout,
+        })
+    }
+
     pub fn snapshot(&self, stage: &str) -> Result<DmStatusSnapshot> {
+        let state = self.observe_dm_state()?;
         Ok(DmStatusSnapshot {
             stage: stage.to_string(),
+            mapper_name: self.dm_name.clone(),
+            canonical_device: self.mapper_canonical_device()?,
+            suspended: state.suspended,
+            observed_at_ms: now_ms(),
             helper_pod: self.helper_pod.clone(),
             mapping: self.mapping.clone(),
-            table: self.dmsetup(["table", self.dm_name.as_str()])?.stdout,
+            table: state.active_table,
             status: self.dmsetup(["status", self.dm_name.as_str()])?.stdout,
         })
     }
@@ -1002,13 +1077,11 @@ impl DmFlakeyGuard {
             self.dm_name
         );
         let snapshot = self.snapshot("recovery-table-verified")?;
-        ensure!(
-            normalize_dm_table(&snapshot.table) == normalize_dm_table(&self.recovery_table),
-            "device-mapper target {:?} did not restore the exact pre-injection table; expected {:?}, active {:?}",
-            self.dm_name,
-            self.recovery_table,
-            snapshot.table
-        );
+        snapshot.validate_proof(
+            &self.preflight_proof,
+            "recovery-table-verified",
+            &self.recovery_table,
+        )?;
         Ok(())
     }
 
@@ -1606,27 +1679,7 @@ impl DmFlakeyGuard {
 
 impl DmTransitionPort for DmFlakeyGuard {
     fn observe(&mut self) -> Result<DmObservedState> {
-        let suspended = self
-            .dmsetup([
-                "info",
-                "--columns",
-                "--noheadings",
-                "--options",
-                "suspended",
-                self.dm_name.as_str(),
-            ])?
-            .stdout
-            .trim()
-            .to_ascii_lowercase();
-        let suspended = match suspended.as_str() {
-            "suspended" | "yes" | "y" | "1" => true,
-            "active" | "no" | "n" | "0" => false,
-            other => bail!("dmsetup returned unsupported suspended state {other:?}"),
-        };
-        Ok(DmObservedState {
-            suspended,
-            active_table: self.dmsetup(["table", self.dm_name.as_str()])?.stdout,
-        })
+        self.observe_dm_state()
     }
 
     fn suspend(&mut self, mode: DmSuspendMode) -> Result<()> {
@@ -1703,7 +1756,7 @@ impl Drop for DmFlakeyGuard {
                     }
                 }
             }
-            if storage_recovered && self.requires_crash_boundary() {
+            if self.fault_applied && storage_recovered {
                 match self.ensure_filesystem_mounted() {
                     Ok(()) => {}
                     Err(error) => {
@@ -1730,7 +1783,7 @@ impl Drop for DmFlakeyGuard {
             if self.fault_applied && !storage_recovered && !self.node_tainted {
                 match self.add_node_taint() {
                     Ok(()) => eprintln!(
-                        "warning: quarantined node {node} after device-mapper recovery failed",
+                        "warning: applied NoSchedule to node {node} after device-mapper recovery failed",
                         node = self.mapping.node,
                     ),
                     Err(error) => eprintln!(
@@ -1739,14 +1792,12 @@ impl Drop for DmFlakeyGuard {
                     ),
                 }
             }
-            if (storage_recovered || self.node_tainted)
-                && let Err(error) = self.mutation_lease.clear()
-            {
-                eprintln!(
-                    "warning: failed to clear host mutation state after recovery containment: {error:#}"
-                );
-            }
             if storage_recovered {
+                if let Err(error) = self.mutation_lease.clear() {
+                    eprintln!(
+                        "warning: failed to clear host mutation state after verified recovery: {error:#}"
+                    );
+                }
                 if let Err(error) = self.delete_helper() {
                     eprintln!(
                         "warning: failed to delete dm-flakey helper pod {pod} during guard cleanup: {error}",
@@ -1754,6 +1805,20 @@ impl Drop for DmFlakeyGuard {
                     );
                 }
             } else {
+                // NoSchedule cannot stop a Pod already using the failed mapper.
+                if let Err(error) = suspend_failed_mapper(self) {
+                    eprintln!(
+                        "warning: could not verify suspension of the unrecovered mapper; existing Pod I/O may continue: {error:#}"
+                    );
+                }
+                if let Err(error) = self
+                    .mutation_lease
+                    .set_phase(HostMutationPhase::RecoveryRequired)
+                {
+                    eprintln!(
+                        "warning: failed to mark manual recovery required; retaining prior mutation state: {error:#}"
+                    );
+                }
                 eprintln!(
                     "warning: leaving dm helper pod {pod} on node {node} for manual recovery because storage cleanup did not complete",
                     pod = self.helper_pod,
@@ -1808,10 +1873,23 @@ fn dm_resume_args(name: &str) -> [&str; 3] {
     ["resume", "--noudevsync", name]
 }
 
+fn suspend_failed_mapper(port: &mut impl DmTransitionPort) -> Result<()> {
+    if port.observe()?.suspended {
+        return Ok(());
+    }
+    let suspended = port.suspend(DmSuspendMode::NoFlushNoLockFs);
+    ensure!(
+        port.observe()?.suspended,
+        "failed mapper remains active after containment suspend: {suspended:?}"
+    );
+    Ok(())
+}
+
 fn dm_suspend_args(name: &str, mode: DmSuspendMode) -> Vec<&str> {
     match mode {
         DmSuspendMode::Default => vec!["suspend", name],
         DmSuspendMode::NoFlush => vec!["suspend", "--noflush", name],
+        DmSuspendMode::NoFlushNoLockFs => vec!["suspend", "--noflush", "--nolockfs", name],
         DmSuspendMode::NoLockFs => vec!["suspend", "--nolockfs", name],
     }
 }
@@ -3100,6 +3178,12 @@ mod tests {
         lease
             .set_phase(HostMutationPhase::Rollback)
             .expect("persist rollback state");
+        lease
+            .set_phase(HostMutationPhase::RecoveryRequired)
+            .expect("retain failed recovery state");
+        let unresolved: HostMutationState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(unresolved.phase, HostMutationPhase::RecoveryRequired);
         let mut replaced = state;
         replaced.token = "token-b".to_string();
         std::fs::write(
@@ -3109,5 +3193,56 @@ mod tests {
         .expect("replace state");
         assert!(lease.clear().is_err());
         assert!(state_path.exists());
+    }
+
+    #[test]
+    fn failed_mapper_containment_suspends_without_loading_or_resuming() {
+        for (already_suspended, transport_error) in [(false, false), (true, false), (false, true)] {
+            let mut port = FakeDmPort {
+                suspended: already_suspended,
+                active_table: "0 1024 flakey /dev/loop0 0 1 15".to_string(),
+                inactive_table: None,
+                active_table_after_suspend: None,
+                fail_next_suspend_after_suspending: transport_error,
+                fail_next_resume: false,
+                suspend_calls: 0,
+                load_calls: 0,
+                loaded_tables: Vec::new(),
+                resume_calls: 0,
+            };
+            super::suspend_failed_mapper(&mut port)
+                .expect("suspension must be observed despite a lost command response");
+            assert!(port.suspended);
+            assert_eq!(port.suspend_calls, usize::from(!already_suspended));
+            assert_eq!(port.load_calls, 0);
+            assert_eq!(port.resume_calls, 0);
+        }
+        assert_eq!(
+            dm_suspend_args("mapper", DmSuspendMode::NoFlushNoLockFs),
+            ["suspend", "--noflush", "--nolockfs", "mapper"]
+        );
+    }
+
+    #[test]
+    fn containment_rejects_a_successful_suspend_without_suspended_state() {
+        struct UnchangedMapper;
+        impl DmTransitionPort for UnchangedMapper {
+            fn observe(&mut self) -> anyhow::Result<DmObservedState> {
+                Ok(DmObservedState {
+                    suspended: false,
+                    active_table: String::new(),
+                })
+            }
+            fn suspend(&mut self, _mode: DmSuspendMode) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn load(&mut self, _table: &str) -> anyhow::Result<()> {
+                panic!("containment must not load a table")
+            }
+            fn resume(&mut self) -> anyhow::Result<()> {
+                panic!("containment must not resume IO")
+            }
+        }
+        assert!(super::suspend_failed_mapper(&mut UnchangedMapper).is_err());
     }
 }

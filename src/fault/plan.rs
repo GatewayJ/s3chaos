@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -122,6 +122,33 @@ impl FaultTarget {
 pub enum FaultSelection {
     Percent(u8),
     FixedTargets(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeTargetSelection {
+    One,
+    FixedTargets(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeFaultTargeting {
+    pub target_selection: VolumeTargetSelection,
+    pub io_sampling_percent: u8,
+}
+
+impl VolumeFaultTargeting {
+    fn from_legacy_selection(selection: FaultSelection) -> Self {
+        match selection {
+            FaultSelection::Percent(percent) => Self {
+                target_selection: VolumeTargetSelection::One,
+                io_sampling_percent: percent,
+            },
+            FaultSelection::FixedTargets(count) => Self {
+                target_selection: VolumeTargetSelection::FixedTargets(count),
+                io_sampling_percent: 100,
+            },
+        }
+    }
 }
 
 impl FaultSelection {
@@ -513,6 +540,7 @@ pub struct FaultInjection {
     selection: FaultSelection,
     duration: Duration,
     parameters: FaultInjectionParameters,
+    volume_targeting: Option<VolumeFaultTargeting>,
 }
 
 impl FaultInjection {
@@ -564,6 +592,8 @@ impl FaultInjection {
         }
         ensure!(duration > Duration::ZERO, "fault duration must be positive");
         let parameters = parameters.resolve_for_kind(kind)?;
+        let volume_targeting = matches!(target, FaultTarget::RustfsVolume { .. })
+            .then(|| VolumeFaultTargeting::from_legacy_selection(selection));
 
         Ok(Self {
             kind,
@@ -572,6 +602,7 @@ impl FaultInjection {
             selection,
             duration,
             parameters,
+            volume_targeting,
         })
     }
 
@@ -585,6 +616,15 @@ impl FaultInjection {
 
     pub fn target(&self) -> &FaultTarget {
         &self.target
+    }
+
+    pub fn target_summary(&self) -> String {
+        match (&self.target, self.selection) {
+            (FaultTarget::RustfsVolume { path }, FaultSelection::FixedTargets(count)) => {
+                format!("{count} RustFS volume target(s) at {path}")
+            }
+            _ => self.target.summary(),
+        }
     }
 
     pub fn selection(&self) -> FaultSelection {
@@ -608,6 +648,15 @@ impl FaultInjection {
 
     pub fn parameters(&self) -> &FaultInjectionParameters {
         &self.parameters
+    }
+
+    pub fn volume_targeting(&self) -> Result<VolumeFaultTargeting> {
+        self.volume_targeting.with_context(|| {
+            format!(
+                "fault kind {} does not have RustFS volume targeting",
+                self.kind.as_str()
+            )
+        })
     }
 
     pub fn rustfs_volume_path(&self) -> Result<&str> {
@@ -660,13 +709,15 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         | FaultKind::RustfsVolumeReadMistake
         | FaultKind::RustfsVolumeEnospc => match selection {
             FaultSelection::Percent(percent) => (1..=100).contains(&percent),
-            FaultSelection::FixedTargets(_) => false,
+            // A single IOChaos resource can select a fixed number of RustFS
+            // volume-bearing Pods. Keep the same safety cap as the other
+            // renderer-backed fixed selector; exact candidate availability is
+            // proved at preflight and actual selection is proved at runtime.
+            FaultSelection::FixedTargets(count) => (1..=8).contains(&count),
         },
-        // NetworkPartition is the only kind whose Chaos Mesh render honors a
-        // multi-target count today (`mode: fixed` + `value`); quorum-loss
-        // scenarios rely on it. The cap is a sanity bound, and the topology
-        // preconditions (which counts actually break quorum) are enforced by
-        // the scenario's runner preflight, not here.
+        // NetworkPartition has its own fixed-count renderer. The cap is a
+        // sanity bound, and the topology preconditions (which counts actually
+        // break quorum) are enforced by the scenario's runner preflight.
         FaultKind::RustfsServerNetworkPartition => match selection {
             FaultSelection::FixedTargets(count) => (1..=8).contains(&count),
             FaultSelection::Percent(_) => false,
@@ -956,7 +1007,7 @@ impl FaultPlan {
             .map(|fault| {
                 format!(
                     "{} via {}",
-                    fault.target().summary(),
+                    fault.target_summary(),
                     fault.selection().summary()
                 )
             })
@@ -1178,9 +1229,8 @@ mod tests {
     }
 
     #[test]
-    fn multi_target_selection_is_partition_only() {
-        // NetworkPartition is the only kind whose backend render honors a
-        // multi-target count; it accepts 1..=8 and rejects zero/over-cap.
+    fn multi_target_selection_is_limited_to_rendered_fault_families() {
+        // NetworkPartition accepts the same bounded fixed-count selector.
         for (count, ok) in [(1u32, true), (2, true), (8, true), (0, false), (9, false)] {
             let result = FaultInjection::new(
                 FaultKind::RustfsServerNetworkPartition,
@@ -1196,6 +1246,30 @@ mod tests {
             );
         }
 
+        for kind in [
+            FaultKind::RustfsVolumeIoError,
+            FaultKind::RustfsVolumeLatency,
+            FaultKind::RustfsVolumeReadMistake,
+            FaultKind::RustfsVolumeEnospc,
+        ] {
+            for (count, ok) in [(1u32, true), (2, true), (8, true), (0, false), (9, false)] {
+                let result = FaultInjection::new(
+                    kind,
+                    FaultBackend::ChaosMeshIoChaos,
+                    FaultTarget::RustfsVolume {
+                        path: DEFAULT_RUSTFS_DATA_VOLUME.to_string(),
+                    },
+                    FaultSelection::FixedTargets(count),
+                    Duration::from_secs(60),
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    ok,
+                    "volume {kind:?} FixedTargets({count}) acceptance mismatch"
+                );
+            }
+        }
+
         // Every other pod/network kind still renders `mode: one` and ignores
         // the count, so a multi-target selection must be rejected instead of
         // silently narrowing the declared blast radius to a single Pod.
@@ -1209,6 +1283,44 @@ mod tests {
         assert!(
             multi_pod_kill.is_err(),
             "multi-target pod kill must stay rejected until its render honors the count"
+        );
+    }
+
+    #[test]
+    fn fixed_volume_injection_separates_target_count_from_io_sampling() {
+        let fault = FaultInjection::new(
+            FaultKind::RustfsVolumeIoError,
+            FaultBackend::ChaosMeshIoChaos,
+            FaultTarget::RustfsVolume {
+                path: DEFAULT_RUSTFS_DATA_VOLUME.to_string(),
+            },
+            FaultSelection::FixedTargets(3),
+            Duration::from_secs(60),
+        )
+        .expect("fixed volume injection");
+        let plan = FaultPlan::new(
+            "io-eio",
+            "fault_case",
+            FaultWorkloadMode::S3Mixed,
+            vec![fault],
+        )
+        .expect("fixed volume plan");
+
+        let [fault] = plan.faults() else {
+            panic!("fixed volume plan must contain one typed fault")
+        };
+        assert_eq!(fault.kind(), FaultKind::RustfsVolumeIoError);
+        assert_eq!(fault.selection(), FaultSelection::FixedTargets(3));
+        assert_eq!(
+            fault.volume_targeting().expect("volume targeting"),
+            super::VolumeFaultTargeting {
+                target_selection: super::VolumeTargetSelection::FixedTargets(3),
+                io_sampling_percent: 100,
+            }
+        );
+        assert_eq!(
+            fault.target_summary(),
+            "3 RustFS volume target(s) at /data/rustfs0"
         );
     }
 

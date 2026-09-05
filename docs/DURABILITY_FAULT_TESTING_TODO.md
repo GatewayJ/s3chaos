@@ -34,12 +34,46 @@ Status legend:
   dm-flakey handle wrappers still live in `runner.rs`. Move them only if more
   backend state makes runner ownership unclear.
 
-- [ ] PARTIAL: Failure summary v2.
+- [x] DONE: Failure summary v2 contract stabilization.
   Meaning: new writers emit `schema_version`, `phase`,
   `s3_model_classification`, `run_failure_reason`, `responsibility_domain`,
   severity, correctness/availability, evidence classifications, and
-  `primary_evidence_refs`. Remaining work is listed below because the review
-  found doc/code drift and missing final-checker classification precision.
+  `primary_evidence_refs`. Additive v2 fields remain optional for readers,
+  writer classifications are allowlisted, and primary evidence uses one
+  root-relative contract. Dedicated final-checker classification precision is
+  still tracked below.
+
+### Failure Summary V2 Compatibility Contract
+
+- Readers must accept v2 summaries that predate additive fields. In particular,
+  `case_name`, `observed_at_ms`, `phase`, `s3_model_classification`,
+  `run_failure_reason`, `responsibility_domain`, and `primary_evidence_refs`
+  are optional through v2. When present, they are validated. A future v3 may
+  make them required.
+- New writers emit `observed_at_ms` and the projection fields. Their
+  classifications come from a closed allowlist; unknown or misspelled values
+  are writer errors instead of falling through to `needs_investigation`.
+- S3-model classifications are `recovery_tail_read_latency`,
+  `committed_object_unavailable`, `committed_version_missing`,
+  `committed_version_unavailable`, `version_hash_mismatch`,
+  `delete_marker_missing`, `deleted_object_resurrected`,
+  `delete_marker_lineage_incomplete`,
+  `version_id_missing_on_committed_write`,
+  `multipart_upload_lineage_incomplete`, `list_unavailable_or_unknown`,
+  `data_corruption`, and `ambiguous_write_materialized`.
+- Current run-failure reasons are `harness_error`, `test_harness`,
+  `workload_execution_error`, `artifact_validation_failed`,
+  `checker_execution_error`, `preflight_failed`, `health_guard_failed`,
+  `fault_backend_unavailable`, `fault_not_active`, `fault_not_recovered`,
+  `unknown`, `checker_or_environment`, `test_or_environment`,
+  `environment_or_fault_backend`, `product_or_environment`,
+  `environment_or_workload`, `workload_or_product`, and `no_signal`. Mixed
+  reasons are current writer outputs with unknown responsibility, not merely
+  legacy reader inputs.
+- New `primary_evidence_refs` entries are relative to the suite run artifact
+  root (or the configured artifact root for a standalone scenario), never
+  absolute, escaping, missing, or self-referential. Readers continue to accept
+  the original v2 case-directory-relative leaf form for existing artifacts.
 
 - [x] DONE: `preflight-summary.json`, `target-proof.json`, and
   `artifact-validation-report.json` are part of the success artifact gate.
@@ -62,11 +96,10 @@ Status legend:
   evidence, while a completed LIST with wrong content remains correctness
   evidence.
 
-- [ ] PARTIAL: Versioned checker semantics.
+- [x] DONE: Versioned checker semantics.
   Meaning: committed version reads, delete marker checks, resurrection checks,
-  ambiguous writes, and recovery-tail classification exist. Dedicated primary
-  classifications such as `committed_version_missing` and
-  `delete_marker_missing` are not fully wired as final failure-summary outputs.
+  ambiguous writes, recovery-tail classification, and dedicated final
+  classifications are wired through failure-summary output.
 
 - [x] DONE: Read-only artifact console exists.
   Meaning: `fault-console-json` and `fault-console-serve` inspect artifact
@@ -173,24 +206,24 @@ guardrails when implementing the ordered TODO below.
   `docs/`. Future status drift should be corrected here instead of maintaining a
   second roadmap.
 
-- [ ] TODO: Make failure-summary v2 additions explicitly optional until v3.
+- [x] DONE: Make failure-summary v2 additions explicitly optional until v3.
   Meaning: `schema_version=2` already exists. New fields that would invalidate
   existing v2 artifacts, especially `observed_at_ms`, must be optional until a
   future v3 contract.
 
-- [ ] TODO: Treat legacy mixed classifications as real run failure reasons while
+- [x] DONE: Treat legacy mixed classifications as real run failure reasons while
   the writer still emits them.
   Meaning: keys such as `checker_or_environment`,
   `environment_or_workload`, `workload_or_product`, and
   `product_or_environment` should be documented and validated as current writer
   outputs, not only as legacy reader inputs, until they are replaced.
 
-- [ ] TODO: Fix the `primary_evidence_refs` contract.
+- [x] DONE: Fix the `primary_evidence_refs` contract.
   Meaning: the design says no self-reference and suite-root relative paths, but
   current writers include `failure-summary.json` and validation is same-dir. Pick
   one contract, update writer, validator, console, and docs together.
 
-- [ ] TODO: Add exhaustive classification allowlist tests for new writers.
+- [x] DONE: Add exhaustive classification allowlist tests for new writers.
   Meaning: unknown or misspelled classification strings must not silently
   degrade to `needs_investigation`/`unknown` when the writer intended a product
   verdict.
@@ -278,18 +311,34 @@ guardrails when implementing the ordered TODO below.
 
 ### 5. Implement Volume-Kind Fixed Targeting
 
-- [ ] TODO: Allow `FixedTargets(N)` for RustFS volume fault kinds.
-  Meaning: current plan validation rejects fixed target counts for the volume
-  family. Quorum IO and heal force-read scenarios need same-kind multi-volume
-  targeting without introducing a generic composition DSL.
+- [ ] PARTIAL: Allow `FixedTargets(N)` for RustFS volume fault kinds.
+  Meaning: the typed fault and backend layers accept bounded fixed target
+  counts while existing percent-based scenarios retain their one-Pod selector
+  and independent I/O sampling behavior. No executable catalog/config source
+  selects this mode yet, so artifact validation rejects a fixed selection for
+  the current percent-based scenarios. Composite fault plans remain rejected.
 
-- [ ] TODO: Render Chaos Mesh or host volume faults for `FixedTargets(N)`.
-  Meaning: type-checking a target count is not enough; backend renderers must
-  actually target N volumes/pods/devices and record the selected target set.
+- [ ] PARTIAL: Render and prove Chaos Mesh volume faults for `FixedTargets(N)`.
+  Meaning: IOChaos renders `mode: fixed` with the declared count, injects all
+  matching I/O on those selected volumes, and records the controller-selected
+  container targets. Runtime proof binds the exact RustFS container mount path
+  through Pod volume name, PVC, PV, storage source, and supported required Node
+  label constraints; unsupported affinity forms fail closed. Every Pod in the
+  tenant selector must pass preflight before a fixed count can be injected.
+  Activation and workload evidence preserve the selected Pod names, UIDs, and
+  running RustFS container IDs and reject controller record drift. Replacing a
+  container invalidates its mount-namespace proof even when the Pod UID stays
+  unchanged. The proof also validates action,
+  methods, parameters, sampling, and duration. End-to-end execution remains
+  pending a trusted catalog/config selection source. The host DeviceMapper
+  backend remains deliberately single-target because its configuration names
+  one mapper/device.
 
-- [ ] TODO: Keep quorum targeting separate from heterogeneous composition.
-  Meaning: quorum P/P+1 is same-kind multi-target IO faulting. It should not
-  require a generic multi-phase workflow abstraction or raw YAML backend steps.
+- [x] DONE: Keep quorum targeting separate from heterogeneous composition.
+  Meaning: `FixedTargets(N)` changes only the selector of one typed volume
+  injection. It does not introduce a generic multi-phase workflow abstraction,
+  heterogeneous faults, or raw YAML backend steps. P/P+1 volume scenarios stay
+  blocked until exact same-erasure-set volume proof exists.
 
 ### 6. Harden Target-Aware Safety Gates
 
@@ -304,8 +353,11 @@ guardrails when implementing the ordered TODO below.
   typed rollback/quarantine/post-cleanup contract. The proof persists canonical
   fault/recovery tables and executable rollback commands; apply re-observes the
   full Pod UID/PVC/PV/node/mount/table chain before loading the proven table.
-  Signal cancellation unwinds the guard, and successful recovery must bind an
-  independent recovery snapshot to `host-storage-post-cleanup.json`. PV
+  Signal cancellation unwinds the guard. Activation and workload snapshots
+  prove the same active mapper and fault table; successful recovery binds its
+  snapshot to `host-storage-post-cleanup.json`. Failed rollback attempts to
+  suspend the mapper and retains the helper and mutation marker for manual
+  recovery; a scheduling taint alone cannot prove storage containment. PV
   replacement, bitrot, and stale-disk flows remain non-executable catalog
   entries and must use the same domain proof when their adapters are implemented.
 
@@ -317,21 +369,31 @@ guardrails when implementing the ordered TODO below.
 
 ### 7. Wire Precise Final Checker Classifications
 
-- [ ] TODO: Project final checker evidence to product classifications.
+- [x] DONE: Project final checker evidence to product classifications.
   Meaning: final checker failures must map to S3-visible product classes such
   as `committed_version_missing`, `committed_object_unavailable`,
   `delete_marker_missing`, or `version_hash_mismatch`, not generic
   `product_or_environment`.
 
-- [ ] TODO: Split committed version/delete marker/MPU primary classifications.
+- [x] DONE: Split committed version/delete marker/MPU primary classifications.
   Meaning: checker already records many facts; reporting must expose the
   highest-signal one as the primary `s3_model_classification` so #4221-style
   ACK-then-loss is routed to product correctness/availability, not unknown.
 
-- [ ] TODO: Add durability checker goldens.
+- [x] DONE: Add durability checker goldens.
   Meaning: synthetic histories should cover PUT 200 loss, DELETE 204
   resurrection, committed MPU complete loss, missing version id, ambiguous
   materialization, LIST timeout, and completed LIST wrong content.
+
+The checker owns classification precedence. Exact committed-version 404 or
+complete-version-list omission is `committed_version_missing`; exact-version
+timeouts remain `committed_version_unavailable`; version body mismatch is
+`version_hash_mismatch`; missing committed delete markers and visible deleted
+objects are `delete_marker_missing` and `deleted_object_resurrected`. A 2xx
+write response without a version id is incomplete lineage, not proven loss;
+DELETE uses `delete_marker_lineage_incomplete`, while MPU completion uses the
+more specific `multipart_upload_lineage_incomplete`.
+Reporting only projects this typed checker result into failure-summary fields.
 
 ### 8. Add The First Calibrated Destructive Smoke Scenarios
 

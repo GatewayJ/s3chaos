@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -33,11 +33,34 @@ struct SnapshotCommand {
 #[derive(Debug, Clone)]
 pub struct ArtifactCollector {
     root: PathBuf,
+    reference_root: PathBuf,
 }
 
 impl ArtifactCollector {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        Self {
+            reference_root: root.clone(),
+            root,
+        }
+    }
+
+    pub(crate) fn with_reference_root(
+        root: impl Into<PathBuf>,
+        reference_root: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let root = root.into();
+        let reference_root = reference_root.into();
+        ensure!(
+            root.starts_with(&reference_root),
+            "artifact write root {} must be inside reference root {}",
+            root.display(),
+            reference_root.display()
+        );
+        Ok(Self {
+            root,
+            reference_root,
+        })
     }
 
     pub fn case_dir(&self, case_name: &str) -> PathBuf {
@@ -54,6 +77,22 @@ impl ArtifactCollector {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn reference_path(&self, path: &Path) -> Result<PathBuf> {
+        path.strip_prefix(&self.reference_root)
+            .map(Path::to_path_buf)
+            .with_context(|| {
+                format!(
+                    "artifact {} is outside reference root {}",
+                    path.display(),
+                    self.reference_root.display()
+                )
+            })
+    }
+
+    pub(crate) fn reference_root(&self) -> &Path {
+        &self.reference_root
     }
 
     pub fn collect_kubernetes_snapshot(

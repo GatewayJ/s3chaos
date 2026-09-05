@@ -23,7 +23,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::fault::{
-    backends::chaos_mesh::{NetworkPartitionEvidenceContract, validate_network_partition_snapshot},
+    backends::chaos_mesh::{
+        NetworkPartitionEvidenceContract, VolumeTargetEvidenceContract, iochaos_record_pod_id,
+        validate_fixed_volume_snapshot, validate_network_partition_snapshot,
+    },
+    backends::host::DmStatusSnapshot,
     checker::RecoveryStabilityReport,
     checker::{CheckerReport, RecoveryStabilityClassification},
     config::{
@@ -37,12 +41,19 @@ use crate::fault::{
         HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT, HostStorageMutationProof,
         HostStoragePostCleanupObservation, normalized_dm_table_sha256,
     },
-    plan::{FaultPlan, FaultPlanOptions, FaultWorkloadMode},
-    preflight::{PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus},
+    plan::{
+        FaultInjection, FaultKind, FaultPlan, FaultPlanOptions, FaultSelection, FaultTarget,
+        FaultWorkloadMode,
+    },
+    pods::fixed_volume_container_ids,
+    preflight::{
+        PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus,
+        target_pod_has_bound_volume, target_pod_has_fixed_volume,
+    },
     quorum::require_fresh_runtime_observation,
     reporting::{
-        AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity, FailureVerdict,
-        ResponsibilityDomain, is_s3_model_classification,
+        AvailabilityStatus, DataCorrectnessStatus, FailureClassification, FailurePhase,
+        FailureSeverity, FailureVerdict, ResponsibilityDomain,
     },
     scenarios::{self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario},
     spec::{
@@ -380,6 +391,9 @@ pub fn validate_fault_artifacts(
             ),
             "run-events.jsonl lacks a successful host-storage mutation preflight"
         );
+    }
+    if fixed_volume_fault(&json_spec).is_some() {
+        validate_fixed_volume_runtime_evidence(&evidence, &target_proof, &json_spec)?;
     }
     validate_fault_window_evidence(&evidence)?;
     if options.scenario == DM_FLAKEY_VERSIONED_HOT_SCENARIO {
@@ -816,6 +830,22 @@ fn validate_target_proof(
             "target-proof.json volume targets must include pod PVC/PV/node/device-or-path bindings"
         );
     }
+    if let Some(fault) = fixed_volume_fault(spec) {
+        let volume_path = fault
+            .target
+            .path
+            .as_deref()
+            .context("fixed volume path is missing")?;
+        ensure!(
+            fault.selection.value > 0
+                && proof.resolved_pods.len() >= usize::try_from(fault.selection.value)?
+                && proof
+                    .resolved_pods
+                    .iter()
+                    .all(|pod| pod.ready && target_pod_has_fixed_volume(pod, volume_path)),
+            "target-proof.json must prove every fixed volume selector Pod before injection"
+        );
+    }
     for (fault, spec_fault) in proof.faults.iter().zip(&spec.faults) {
         let Some(erasure_set) = &fault.erasure_set else {
             continue;
@@ -1173,53 +1203,9 @@ fn validate_host_storage_artifacts(
             && proof.tables.recovery_table == proof.recovery.rollback.recovery_table,
         "device-mapper recovery table/hash is not cross-bound across proof, rollback, cleanup, and fault evidence"
     );
-    let snapshot_mapping = recovery_snapshot
-        .get("mapping")
-        .context("fault-evidence.json dm_recovery_snapshot lacks mapping")?;
-    ensure!(
-        recovery_snapshot.get("stage").and_then(Value::as_str) == Some("recovered")
-            && snapshot_mapping.get("node").and_then(Value::as_str)
-                == Some(proof.target.node.as_str())
-            && snapshot_mapping.get("node_uid").and_then(Value::as_str)
-                == Some(proof.target.node_uid.as_str())
-            && snapshot_mapping.get("node_labels")
-                == serde_json::to_value(&proof.target.node_labels)
-                    .ok()
-                    .as_ref()
-            && snapshot_mapping.get("pod").and_then(Value::as_str)
-                == Some(proof.target.pod.as_str())
-            && snapshot_mapping.get("pod_uid").and_then(Value::as_str)
-                == Some(proof.target.pod_uid.as_str())
-            && snapshot_mapping.get("volume_name").and_then(Value::as_str)
-                == Some(proof.target.volume_name.as_str())
-            && snapshot_mapping.get("pvc").and_then(Value::as_str)
-                == Some(proof.target.persistent_volume_claim.as_str())
-            && snapshot_mapping.get("pvc_uid").and_then(Value::as_str)
-                == Some(proof.target.persistent_volume_claim_uid.as_str())
-            && snapshot_mapping.get("pvc_phase").and_then(Value::as_str)
-                == Some(proof.target.persistent_volume_claim_phase.as_str())
-            && snapshot_mapping.get("pv").and_then(Value::as_str)
-                == Some(proof.target.persistent_volume.as_str())
-            && snapshot_mapping.get("pv_uid").and_then(Value::as_str)
-                == Some(proof.target.persistent_volume_uid.as_str())
-            && snapshot_mapping.get("pv_phase").and_then(Value::as_str)
-                == Some(proof.target.persistent_volume_phase.as_str())
-            && snapshot_mapping.get("pv_claim_ref")
-                == serde_json::to_value(&proof.target.persistent_volume_claim_ref)
-                    .ok()
-                    .as_ref()
-            && snapshot_mapping.get("node_selector")
-                == serde_json::to_value(&proof.target.node_selector)
-                    .ok()
-                    .as_ref()
-            && snapshot_mapping
-                .get("container_mount_path")
-                .and_then(Value::as_str)
-                == Some(proof.target.container_mount_path.as_str())
-            && snapshot_mapping.get("mount_path").and_then(Value::as_str)
-                == Some(proof.target.persistent_volume_path.as_str()),
-        "fault-evidence.json recovery snapshot does not match the proven host-storage target"
-    );
+    let recovery_snapshot: DmStatusSnapshot = serde_json::from_value(recovery_snapshot.clone())
+        .context("parse device-mapper recovery snapshot")?;
+    recovery_snapshot.validate_proof(proof, "recovered", &proof.tables.recovery_table)?;
     let recovery_started_at_ms = evidence
         .recovery_started_at_ms
         .context("fault-evidence.json lacks recovery_started_at_ms")?;
@@ -1228,28 +1214,275 @@ fn validate_host_storage_artifacts(
         .context("fault-evidence.json lacks recovery_ended_at_ms")?;
     ensure!(
         cleanup.observed_at_ms >= recovery_started_at_ms
-            && cleanup.observed_at_ms <= recovery_ended_at_ms,
+            && cleanup.observed_at_ms <= recovery_ended_at_ms
+            && recovery_snapshot.observed_at_ms >= recovery_started_at_ms
+            && recovery_snapshot.observed_at_ms <= recovery_ended_at_ms,
         "host-storage post-cleanup observation is outside the recorded recovery window"
     );
+    let workload_started = evidence
+        .workload_started_at_ms
+        .context("missing workload start")?;
+    let workload_ended = evidence
+        .workload_ended_at_ms
+        .context("missing workload end")?;
+    let fault_delete_started = evidence
+        .fault_delete_started_at_ms
+        .context("missing fault delete start")?;
+    for (stage, snapshots, start, end) in [
+        (
+            "active",
+            &evidence.active_snapshots,
+            fault_active_at_ms,
+            workload_started,
+        ),
+        (
+            "after-workload",
+            &evidence.workload_snapshots,
+            workload_ended,
+            fault_delete_started,
+        ),
+    ] {
+        let [snapshot] = snapshots.as_slice() else {
+            bail!("device-mapper {stage} evidence requires exactly one fault snapshot");
+        };
+        ensure!(
+            snapshot.get("stage").and_then(Value::as_str) == Some(stage)
+                && snapshot.get("resource_kind").and_then(Value::as_str) == Some("device-mapper"),
+            "device-mapper {stage} snapshot metadata is inconsistent"
+        );
+        let dm_snapshot: DmStatusSnapshot = serde_json::from_value(
+            snapshot
+                .get("dm_status")
+                .context("device-mapper snapshot lacks dm_status")?
+                .clone(),
+        )
+        .with_context(|| format!("parse {stage} device-mapper snapshot"))?;
+        dm_snapshot.validate_proof(proof, stage, &proof.tables.fault_table)?;
+        ensure!(
+            dm_snapshot.observed_at_ms >= start && dm_snapshot.observed_at_ms <= end,
+            "device-mapper {stage} observation is outside its recorded fault window"
+        );
+    }
     Ok(())
 }
 
-fn target_pod_has_bound_volume(pod: &crate::fault::preflight::TargetResolvedPodProof) -> bool {
-    !pod.persistent_volume_claims.is_empty()
-        && pod.persistent_volume_claims.iter().all(|claim| {
-            claim
-                .volume_name
-                .as_deref()
-                .is_some_and(|volume| !volume.is_empty())
-                && claim.persistent_volume.as_ref().is_some_and(|pv| {
-                    !pv.name.is_empty()
-                        && pv.node.as_deref().is_some_and(|node| !node.is_empty())
-                        && pv
-                            .device_or_path
-                            .as_deref()
-                            .is_some_and(|path| !path.is_empty())
-                })
-        })
+fn fixed_volume_fault(spec: &FaultRunSpec) -> Option<&FaultRunFaultSpec> {
+    let [fault] = spec.faults.as_slice() else {
+        return None;
+    };
+    (fault.target.kind == "rustfs-volume"
+        && fault.selection.kind == "fixed-targets"
+        && matches!(
+            fault.kind.as_str(),
+            "rustfs_volume_io_error"
+                | "rustfs_volume_latency"
+                | "rustfs_volume_read_mistake"
+                | "rustfs_volume_enospc"
+        ))
+    .then_some(fault)
+}
+
+fn validate_fixed_volume_runtime_evidence(
+    evidence: &FaultEvidenceArtifact,
+    proof: &TargetProof,
+    spec: &FaultRunSpec,
+) -> Result<()> {
+    let fault = fixed_volume_fault(spec)
+        .context("fixed volume runtime proof requires one fixed-target volume fault")?;
+    let injection = fixed_volume_injection_from_run_spec(fault)?;
+    let runtime_contract =
+        crate::fault::backends::chaos_mesh::volume_fault_runtime_contract(&injection)?;
+    ensure!(
+        fault.io_sampling_percent == Some(runtime_contract.io_sampling_percent),
+        "fixed volume run-spec io_sampling_percent does not match its canonical fault kind"
+    );
+    let volume_path = fault
+        .target
+        .path
+        .as_deref()
+        .context("fixed volume run-spec target has no path")?;
+    let expected_count = usize::try_from(fault.selection.value)?;
+    let before_identities = unique_pod_identities(
+        "fault-evidence.json pods_before",
+        evidence
+            .pods_before
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    let proof_identities = unique_pod_identities(
+        "target-proof.json resolved_pods",
+        proof
+            .resolved_pods
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    ensure!(
+        !before_identities.is_empty() && before_identities == proof_identities,
+        "fault-evidence.json pods_before must exactly match target-proof.json Pod identities"
+    );
+    let active_identities = unique_pod_identities(
+        "fault-evidence.json pods_at_fault_activation",
+        evidence
+            .pods_at_fault_activation
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    let workload_identities = unique_pod_identities(
+        "fault-evidence.json pods_at_workload_snapshot",
+        evidence
+            .pods_at_workload_snapshot
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    ensure!(
+        active_identities.len() == expected_count
+            && workload_identities == active_identities
+            && active_identities.is_subset(&proof_identities),
+        "fixed volume selected Pod identities must be exactly N unchanged identities from pods_before and target-proof.json"
+    );
+    let active_targets = evidence
+        .fixed_volume_targets_at_fault_activation
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let workload_targets = evidence
+        .fixed_volume_targets_at_workload_snapshot
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        active_targets.len() == expected_count
+            && active_targets.len() == evidence.fixed_volume_targets_at_fault_activation.len(),
+        "fault-evidence.json must persist exactly {} unique active fixed volume targets",
+        fault.selection.value
+    );
+    ensure!(
+        workload_targets == active_targets
+            && workload_targets.len() == evidence.fixed_volume_targets_at_workload_snapshot.len(),
+        "fault-evidence.json fixed volume target set changed across workload snapshots"
+    );
+
+    let proved_pods = proof
+        .resolved_pods
+        .iter()
+        .map(|pod| (format!("{}/{}", proof.namespace, pod.name), pod))
+        .collect::<BTreeMap<_, _>>();
+    let selected_pods = active_targets
+        .iter()
+        .map(|target| iochaos_record_pod_id(target))
+        .collect::<Result<BTreeSet<_>>>()?;
+    ensure!(
+        selected_pods.len() == active_targets.len(),
+        "fault-evidence.json contains multiple fixed volume target records for one Pod"
+    );
+    let active_identity_pods = active_identities
+        .iter()
+        .map(|(name, _)| format!("{}/{name}", spec.cluster.namespace))
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        active_identity_pods == selected_pods,
+        "fault-evidence.json selected Pod identities do not match controller target names"
+    );
+    let selected_pod_names = active_identities
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let expected_containers =
+        fixed_volume_container_ids(&proof.resolved_pods, &selected_pod_names)?;
+    ensure!(
+        evidence.fixed_volume_containers_at_fault_activation == expected_containers
+            && evidence.fixed_volume_containers_at_workload_snapshot == expected_containers,
+        "fixed volume RustFS container identities must remain unchanged from target proof through workload completion"
+    );
+    for pod_id in &selected_pods {
+        let pod = proved_pods.get(pod_id).with_context(|| {
+            format!("fixed volume target {pod_id:?} is absent from target-proof.json")
+        })?;
+        ensure!(
+            pod.ready && target_pod_has_fixed_volume(pod, volume_path),
+            "fixed volume target {pod_id:?} lacks Ready Pod/PVC/PV/device proof"
+        );
+    }
+
+    let candidate_pod_ids = proved_pods
+        .iter()
+        .filter(|(_, pod)| pod.ready && target_pod_has_fixed_volume(pod, volume_path))
+        .map(|(pod_id, _)| pod_id.clone())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        candidate_pod_ids.len() == proof.resolved_pods.len(),
+        "fixed volume target proof must cover every selector Pod"
+    );
+    for (stage, snapshots, persisted_targets) in [
+        ("active", &evidence.active_snapshots, &active_targets),
+        (
+            "after-workload",
+            &evidence.workload_snapshots,
+            &workload_targets,
+        ),
+    ] {
+        ensure!(
+            snapshots.len() == 1,
+            "fault-evidence.json {stage} stage must contain exactly one IOChaos snapshot"
+        );
+        let snapshot = &snapshots[0];
+        ensure!(
+            snapshot.get("stage").and_then(Value::as_str) == Some(stage)
+                && snapshot.get("resource_kind").and_then(Value::as_str) == Some("iochaos"),
+            "fault-evidence.json {stage} fixed volume snapshot metadata is invalid"
+        );
+        let resource = snapshot
+            .get("chaos_status")
+            .context("fault-evidence.json fixed volume snapshot has no IOChaos object")?;
+        ensure!(
+            snapshot.get("resource_name").and_then(Value::as_str)
+                == resource.pointer("/metadata/name").and_then(Value::as_str),
+            "fault-evidence.json fixed volume snapshot resource name is inconsistent"
+        );
+        let snapshot_targets = validate_fixed_volume_snapshot(
+            resource,
+            &VolumeTargetEvidenceContract {
+                chaos_namespace: &spec.cluster.chaos_namespace,
+                target_namespace: &spec.cluster.namespace,
+                tenant: &spec.cluster.tenant,
+                run_id: &spec.metadata.run_id,
+                scenario: &spec.scenario.name,
+                volume_path,
+                expected_targets: fault.selection.value,
+                candidate_pod_ids: &candidate_pod_ids,
+                runtime: &runtime_contract,
+            },
+        )
+        .with_context(|| format!("validate {stage} IOChaos runtime evidence"))?;
+        ensure!(
+            &snapshot_targets == persisted_targets,
+            "fault-evidence.json persisted fixed volume targets do not match the {stage} IOChaos snapshot"
+        );
+    }
+    Ok(())
+}
+
+fn fixed_volume_injection_from_run_spec(fault: &FaultRunFaultSpec) -> Result<FaultInjection> {
+    let kind = match fault.kind.as_str() {
+        "rustfs_volume_io_error" => FaultKind::RustfsVolumeIoError,
+        "rustfs_volume_latency" => FaultKind::RustfsVolumeLatency,
+        "rustfs_volume_read_mistake" => FaultKind::RustfsVolumeReadMistake,
+        "rustfs_volume_enospc" => FaultKind::RustfsVolumeEnospc,
+        other => bail!("unsupported fixed volume fault kind {other:?}"),
+    };
+    let volume_path = fault
+        .target
+        .path
+        .clone()
+        .context("fixed volume run-spec target has no path")?;
+    FaultInjection::new_with_parameters(
+        kind,
+        crate::fault::scenarios::FaultBackend::ChaosMeshIoChaos,
+        FaultTarget::RustfsVolume { path: volume_path },
+        FaultSelection::FixedTargets(fault.selection.value),
+        Duration::from_secs(fault.fault_duration_seconds),
+        fault.parameters.clone(),
+    )
 }
 
 fn validate_run_spec_target(
@@ -1308,6 +1541,8 @@ fn validate_checker_report(
             && report.version_hash_mismatches.is_empty()
             && report.missing_committed_delete_markers.is_empty()
             && report.resurrected_deleted_objects.is_empty()
+            && report.delete_marker_lineage_incomplete.is_empty()
+            && report.multipart_upload_lineage_incomplete.is_empty()
             && report.tenant_recovered,
         "{name} contains a non-clean checker verdict"
     );
@@ -1598,7 +1833,11 @@ fn validate_conditional_recovery_stability_artifact(root: &Path, case_name: &str
         !failure_summary.scenario.trim().is_empty() && !failure_summary.message.trim().is_empty(),
         "failure-summary.json must include non-empty scenario and message"
     );
-    validate_failure_summary_v2_fields(&failure_summary, Some(&failure_summary_path))?;
+    validate_failure_summary_v2_fields(
+        &failure_summary,
+        Some(failure_summary_reference_root(root)),
+        Some(&failure_summary_path),
+    )?;
     validate_recovery_failure_summary_fields(&failure_summary, &recovery)?;
     Ok(())
 }
@@ -1611,28 +1850,31 @@ fn validate_conditional_recovery_stability_artifact(root: &Path, case_name: &str
 /// undetected exactly where it matters most. Called from
 /// `reporting::write_failure_summary` right after the write; violations are
 /// surfaced as warnings there so they never mask the run's original failure.
-pub(crate) fn validate_written_failure_summary(path: &Path) -> Result<()> {
+pub(crate) fn validate_written_failure_summary(root: &Path, path: &Path) -> Result<()> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading just-written failure summary {}", path.display()))?;
     let summary: FailureSummaryArtifact = serde_json::from_str(&raw)
         .with_context(|| format!("parsing just-written failure summary {}", path.display()))?;
-    validate_failure_summary_v2_fields(&summary, Some(path))
+    validate_failure_summary_v2_fields(&summary, Some(root), Some(path))
 }
 
 fn validate_failure_summary_v2_fields(
     summary: &FailureSummaryArtifact,
+    artifact_root: Option<&Path>,
     artifact_path: Option<&Path>,
 ) -> Result<()> {
     if summary.schema_version < 2 {
         return Ok(());
     }
 
-    ensure!(
-        summary.phase == Some(FailurePhase::from_stage(&summary.stage)),
-        "failure-summary.json phase {:?} does not match stage {:?}",
-        summary.phase,
-        summary.stage
-    );
+    if let Some(phase) = summary.phase {
+        ensure!(
+            phase == FailurePhase::from_stage(&summary.stage),
+            "failure-summary.json phase {:?} does not match stage {:?}",
+            summary.phase,
+            summary.stage
+        );
+    }
     ensure!(
         summary
             .case_name
@@ -1640,50 +1882,82 @@ fn validate_failure_summary_v2_fields(
             .is_none_or(|value| !value.trim().is_empty()),
         "failure-summary.json case_name must be null or a non-empty string"
     );
+    ensure!(
+        summary.observed_at_ms.is_none_or(|value| value > 0),
+        "failure-summary.json observed_at_ms must be greater than zero when present"
+    );
 
     validate_failure_summary_v2_classification(summary)?;
+    if summary.primary_evidence_refs.is_empty() {
+        return Ok(());
+    }
     ensure!(
-        !summary.primary_evidence_refs.is_empty() && summary.primary_evidence_refs.len() <= 5,
-        "failure-summary.json primary_evidence_refs must contain 1 to 5 entries for schema_version >= 2"
+        summary.primary_evidence_refs.len() <= 5,
+        "failure-summary.json primary_evidence_refs must contain at most 5 entries"
     );
     ensure_unique(
         &summary.primary_evidence_refs,
         "failure-summary.json primary_evidence_refs",
     )?;
     for evidence_ref in &summary.primary_evidence_refs {
-        validate_primary_evidence_ref(evidence_ref, artifact_path)?;
+        validate_primary_evidence_ref(evidence_ref, artifact_root, artifact_path)?;
     }
     Ok(())
 }
 
+fn failure_summary_reference_root(validation_root: &Path) -> &Path {
+    validation_root
+        .parent()
+        .filter(|parent| {
+            parent.join("suite-plan.json").is_file() && parent.join("suite-summary.json").is_file()
+        })
+        .unwrap_or(validation_root)
+}
+
 fn validate_failure_summary_v2_classification(summary: &FailureSummaryArtifact) -> Result<()> {
-    if is_s3_model_classification(&summary.classification) {
+    let classification =
+        FailureClassification::from_name(&summary.classification).with_context(|| {
+            format!(
+                "failure-summary.json classification {:?} is not in the writer allowlist",
+                summary.classification
+            )
+        })?;
+    if classification.is_s3_model() {
         ensure!(
-            summary.s3_model_classification.as_deref() == Some(summary.classification.as_str())
-                && summary.run_failure_reason.is_none()
-                && summary.responsibility_domain == Some(ResponsibilityDomain::Product),
-            "failure-summary.json S3 model classification must set s3_model_classification, omit run_failure_reason, and use product responsibility"
+            summary
+                .s3_model_classification
+                .as_deref()
+                .is_none_or(|value| value == summary.classification)
+                && summary.run_failure_reason.is_none(),
+            "failure-summary.json S3 model classification must match s3_model_classification when present and omit run_failure_reason"
         );
     } else {
         ensure!(
             summary.s3_model_classification.is_none()
-                && summary.run_failure_reason.as_deref() == Some(summary.classification.as_str()),
-            "failure-summary.json non-S3-model classification must set run_failure_reason and omit s3_model_classification"
+                && summary
+                    .run_failure_reason
+                    .as_deref()
+                    .is_none_or(|value| value == summary.classification),
+            "failure-summary.json non-S3-model classification must match run_failure_reason when present and omit s3_model_classification"
         );
     }
-    ensure!(
-        summary.responsibility_domain
-            == Some(ResponsibilityDomain::from_classification(
-                &summary.classification
-            )),
-        "failure-summary.json responsibility_domain {:?} does not match classification {:?}",
-        summary.responsibility_domain,
-        summary.classification
-    );
+    if let Some(responsibility_domain) = summary.responsibility_domain {
+        ensure!(
+            responsibility_domain
+                == ResponsibilityDomain::from_classification(&summary.classification),
+            "failure-summary.json responsibility_domain {:?} does not match classification {:?}",
+            summary.responsibility_domain,
+            summary.classification
+        );
+    }
     Ok(())
 }
 
-fn validate_primary_evidence_ref(evidence_ref: &str, artifact_path: Option<&Path>) -> Result<()> {
+fn validate_primary_evidence_ref(
+    evidence_ref: &str,
+    artifact_root: Option<&Path>,
+    artifact_path: Option<&Path>,
+) -> Result<()> {
     let path = Path::new(evidence_ref);
     ensure!(
         !evidence_ref.trim().is_empty() && path.is_relative(),
@@ -1692,18 +1966,30 @@ fn validate_primary_evidence_ref(evidence_ref: &str, artifact_path: Option<&Path
     ensure!(
         path.components()
             .all(|component| matches!(component, std::path::Component::Normal(_))),
-        "failure-summary.json primary_evidence_refs must stay inside the artifact root"
+        "failure-summary.json primary_evidence_refs must stay inside the suite artifact root"
     );
-    if let Some(artifact_path) = artifact_path
-        && evidence_ref != "failure-summary.json"
-    {
-        let sibling = artifact_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(evidence_ref);
+    if let Some(artifact_root) = artifact_root {
+        // v2 was originally emitted with case-directory-relative leaf names.
+        // Keep those artifacts readable while all new writers use the stable
+        // suite-root-relative form, which necessarily includes the case path.
+        let legacy_case_relative = path.components().count() == 1;
+        let evidence_path = if legacy_case_relative {
+            artifact_path
+                .and_then(Path::parent)
+                .unwrap_or(artifact_root)
+                .join(path)
+        } else {
+            artifact_root.join(path)
+        };
+        if let Some(artifact_path) = artifact_path {
+            ensure!(
+                legacy_case_relative || evidence_path != artifact_path,
+                "failure-summary.json primary_evidence_refs must not reference the summary itself"
+            );
+        }
         ensure!(
-            sibling.is_file(),
-            "failure-summary.json primary evidence ref {:?} does not exist next to the summary",
+            evidence_path.is_file(),
+            "failure-summary.json primary evidence ref {:?} does not exist under its compatible artifact root",
             evidence_ref
         );
     }
@@ -1751,9 +2037,57 @@ fn validate_recovery_failure_summary_fields(
                 summary.severity == FailureSeverity::FailAvailability
                     && summary.data_correctness == DataCorrectnessStatus::Unknown
                     && summary.availability == AvailabilityStatus::CommittedObjectUnavailable
+                    && summary.data_loss.is_none()
                     && summary.corruption == Some(false)
                     && summary.recovered_within_window == Some(false),
-                "committed_object_unavailable failure-summary.json must describe an availability failure with unverified data correctness"
+                "committed_object_unavailable failure-summary.json must describe an availability failure without claiming data loss"
+            );
+        }
+        RecoveryStabilityClassification::CommittedVersionMissing => {
+            ensure!(
+                summary.severity == FailureSeverity::FailCorrectness
+                    && summary.data_correctness == DataCorrectnessStatus::Failed
+                    && summary.availability == AvailabilityStatus::Unknown
+                    && summary.data_loss == Some(true)
+                    && summary.corruption == Some(false)
+                    && summary.recovered_within_window == Some(false),
+                "committed_version_missing failure-summary.json must describe proven committed-version loss"
+            );
+        }
+        RecoveryStabilityClassification::CommittedVersionUnavailable => {
+            ensure!(
+                summary.severity == FailureSeverity::FailAvailability
+                    && summary.data_correctness == DataCorrectnessStatus::Unknown
+                    && summary.availability == AvailabilityStatus::CommittedVersionUnavailable
+                    && summary.data_loss.is_none()
+                    && summary.corruption == Some(false)
+                    && summary.recovered_within_window == Some(false),
+                "committed_version_unavailable failure-summary.json must preserve an availability verdict without claiming data loss"
+            );
+        }
+        RecoveryStabilityClassification::VersionHashMismatch
+        | RecoveryStabilityClassification::DeleteMarkerMissing
+        | RecoveryStabilityClassification::DeletedObjectResurrected => {
+            ensure!(
+                summary.severity == FailureSeverity::FailCorrectness
+                    && summary.data_correctness == DataCorrectnessStatus::Failed
+                    && summary.availability == AvailabilityStatus::Unknown
+                    && summary.data_loss == Some(false)
+                    && summary.corruption == Some(true),
+                "precise checker correctness failure-summary.json must describe proven semantic or content corruption"
+            );
+        }
+        RecoveryStabilityClassification::DeleteMarkerLineageIncomplete
+        | RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite
+        | RecoveryStabilityClassification::MultipartUploadLineageIncomplete => {
+            ensure!(
+                summary.severity == FailureSeverity::NeedsInvestigation
+                    && summary.data_correctness == DataCorrectnessStatus::Unknown
+                    && summary.availability == AvailabilityStatus::Unknown
+                    && summary.data_loss.is_none()
+                    && summary.corruption == Some(false)
+                    && summary.recovered_within_window.is_none(),
+                "incomplete version-lineage failure-summary.json must not claim data loss or corruption"
             );
         }
         RecoveryStabilityClassification::ListUnavailableOrUnknown => {
@@ -1761,9 +2095,10 @@ fn validate_recovery_failure_summary_fields(
                 summary.severity == FailureSeverity::FailAvailability
                     && summary.data_correctness == DataCorrectnessStatus::Unknown
                     && summary.availability == AvailabilityStatus::ListUnavailableOrUnknown
+                    && summary.data_loss.is_none()
                     && summary.corruption == Some(false)
                     && summary.recovered_within_window == Some(false),
-                "list_unavailable_or_unknown failure-summary.json must describe a LIST availability/unknown failure without proven corruption"
+                "list_unavailable_or_unknown failure-summary.json must describe a LIST availability/unknown failure without claiming data loss or corruption"
             );
         }
         RecoveryStabilityClassification::DataCorruption => {
@@ -1790,8 +2125,11 @@ fn validate_recovery_failure_summary_fields(
             ensure!(
                 summary.severity == FailureSeverity::Infra
                     && summary.data_correctness == DataCorrectnessStatus::Unknown
-                    && summary.availability == AvailabilityStatus::Unknown,
-                "harness_error failure-summary.json must describe an infra/harness failure"
+                    && summary.availability == AvailabilityStatus::Unknown
+                    && summary.data_loss.is_none()
+                    && summary.corruption.is_none()
+                    && summary.recovered_within_window.is_none(),
+                "harness_error failure-summary.json must describe an infra/harness failure without data loss or product verdict fields"
             );
         }
     }
@@ -1814,6 +2152,10 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
     ensure_sorted_unique(
         &report.data_corruption_evidence,
         "recovery-stability-report.json data_corruption_evidence",
+    )?;
+    ensure_sorted_unique(
+        &report.classification_evidence,
+        "recovery-stability-report.json classification_evidence",
     )?;
     ensure_sorted_unique(
         &report.ambiguous_write_evidence,
@@ -1847,6 +2189,45 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
                     && report.data_corruption_evidence.is_empty()
                     && report.harness_errors.is_empty(),
                 "committed_object_unavailable requires still_unavailable_keys without higher-priority recovery failures"
+            );
+        }
+        classification @ (RecoveryStabilityClassification::CommittedVersionMissing
+        | RecoveryStabilityClassification::VersionHashMismatch
+        | RecoveryStabilityClassification::DeleteMarkerMissing
+        | RecoveryStabilityClassification::DeletedObjectResurrected) => {
+            ensure!(
+                report
+                    .classification_evidence
+                    .iter()
+                    .any(|item| classification.matches_classification_evidence(item)),
+                "precise checker correctness classification {:?} requires matching classification_evidence",
+                classification
+            );
+        }
+        RecoveryStabilityClassification::CommittedVersionUnavailable => {
+            ensure!(
+                report
+                    .classification_evidence
+                    .iter()
+                    .any(|item| report.classification.matches_classification_evidence(item))
+                    && !report.still_unavailable_keys.is_empty()
+                    && report.hash_mismatches.is_empty()
+                    && report.data_corruption_evidence.is_empty(),
+                "committed_version_unavailable requires exact-version availability evidence without proven data loss"
+            );
+        }
+        classification @ (RecoveryStabilityClassification::DeleteMarkerLineageIncomplete
+        | RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite
+        | RecoveryStabilityClassification::MultipartUploadLineageIncomplete) => {
+            ensure!(
+                report
+                    .classification_evidence
+                    .iter()
+                    .any(|item| classification.matches_classification_evidence(item))
+                    && report.hash_mismatches.is_empty()
+                    && report.data_corruption_evidence.is_empty()
+                    && report.still_unavailable_keys.is_empty(),
+                "incomplete version-lineage classification requires classification_evidence without loss, corruption, or availability evidence"
             );
         }
         RecoveryStabilityClassification::ListUnavailableOrUnknown => {
@@ -2063,7 +2444,7 @@ fn default_recovery_stability_reread_seconds() -> u64 {
     DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct FaultEvidenceArtifact {
     injected: bool,
     active_during_workload: bool,
@@ -2075,6 +2456,14 @@ struct FaultEvidenceArtifact {
     pods_at_fault_activation: Vec<PodIdentityArtifact>,
     #[serde(default)]
     pods_at_workload_snapshot: Vec<PodIdentityArtifact>,
+    #[serde(default)]
+    fixed_volume_targets_at_fault_activation: Vec<String>,
+    #[serde(default)]
+    fixed_volume_targets_at_workload_snapshot: Vec<String>,
+    #[serde(default)]
+    fixed_volume_containers_at_fault_activation: BTreeMap<String, String>,
+    #[serde(default)]
+    fixed_volume_containers_at_workload_snapshot: BTreeMap<String, String>,
     pods_after: Vec<PodIdentityArtifact>,
     active_snapshots: Vec<Value>,
     workload_snapshots: Vec<Value>,
@@ -2096,7 +2485,7 @@ struct FaultEvidenceArtifact {
     recovery_ended_at_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct PodIdentityArtifact {
     name: String,
     uid: String,
@@ -2170,6 +2559,8 @@ struct FailureSummaryArtifact {
     scenario: String,
     #[serde(default)]
     case_name: Option<String>,
+    #[serde(default)]
+    observed_at_ms: Option<u64>,
     stage: String,
     #[serde(default)]
     phase: Option<FailurePhase>,
@@ -2237,17 +2628,16 @@ impl WorkloadSummaryArtifact {
                 && self.multipart_completes.total() > 0,
             "workload-summary.json did not exercise every committing mutation family"
         );
-        let acknowledged_mutations = self.puts.ok + self.deletes.ok + self.multipart_completes.ok;
-        ensure!(
-            acknowledged_mutations == 0,
-            "workload-summary.json records {acknowledged_mutations} successfully acknowledged PUT, DELETE, or multipart completion operations during write-quorum loss"
-        );
-        let disrupted_mutations =
-            self.puts.disrupted() + self.deletes.disrupted() + self.multipart_completes.disrupted();
-        ensure!(
-            disrupted_mutations > 0,
-            "workload-summary.json records no disrupted mutation during write-quorum loss"
-        );
+        for (kind, counts) in [
+            ("PUT", &self.puts),
+            ("DELETE", &self.deletes),
+            ("CompleteMultipartUpload", &self.multipart_completes),
+        ] {
+            ensure!(
+                counts.ok == 0 && counts.not_found == 0 && counts.disrupted() > 0,
+                "write-quorum-loss {kind} outcomes must all be failed, timed out, or unknown: {counts:?}"
+            );
+        }
         for (kind, summary_counts) in [
             (OperationKind::Put, &self.puts),
             (OperationKind::Delete, &self.deletes),
@@ -2317,11 +2707,13 @@ impl OutcomeCountsArtifact {
 mod tests {
     use super::{
         ArtifactValidationOptions, FailureSummaryArtifact, FaultEvidenceArtifact,
-        WorkloadSummaryArtifact, recursive_find, validate_fault_artifacts,
-        validate_fault_artifacts_and_write_report, validate_host_storage_artifacts,
-        validate_run_spec, validate_target_proof, validate_write_quorum_runtime_evidence,
+        OutcomeCountsArtifact, WorkloadSummaryArtifact, recursive_find, validate_fault_artifacts,
+        validate_fault_artifacts_and_write_report, validate_fixed_volume_runtime_evidence,
+        validate_host_storage_artifacts, validate_run_spec, validate_target_proof,
+        validate_write_quorum_runtime_evidence,
     };
     use crate::fault::{
+        checker::{RecoveryStabilityClassification, RecoveryStabilityReport},
         config::FaultTestConfig,
         history::{OperationOutcome, OperationRecord},
         host_storage::{
@@ -2329,10 +2721,12 @@ mod tests {
             HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
             HostStoragePostCleanupObservation, HostStorageTargetObservation,
         },
-        plan::FaultPlan,
+        plan::{FaultInjection, FaultKind, FaultPlan, FaultSelection, FaultTarget},
         preflight::{
-            TargetPersistentVolumeClaimProof, TargetPersistentVolumeProof, TargetProof,
-            TargetResolvedPodProof,
+            TargetNodeAffinityProof, TargetNodeSelectorRequirementProof,
+            TargetNodeSelectorTermProof, TargetPersistentVolumeClaimProof,
+            TargetPersistentVolumeProof, TargetProof, TargetResolvedPodProof,
+            TargetVolumeMountProof,
         },
         quorum::{ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape},
         reporting::{
@@ -2347,7 +2741,7 @@ mod tests {
         workload::WorkloadPlan,
     };
     use serde_json::json;
-    use std::{collections::BTreeMap, fs};
+    use std::{collections::BTreeMap, fs, time::Duration};
 
     #[test]
     fn validates_successful_fault_artifacts() {
@@ -2372,6 +2766,386 @@ mod tests {
             report.validation_summary_tsv_row(),
             "io-eio\t42\t0\t2\t1\t7\t0\t0\t0\t0\ttrue"
         );
+    }
+
+    #[test]
+    fn percent_volume_artifacts_accept_csi_pv_without_hostname_affinity() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = "io-eio".to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario(&scenario, catalog).expect("percent plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let run_spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+        let proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs([TargetResolvedPodProof::new("rustfs-0", "uid-0")
+                .with_node("node-a")
+                .with_ready(true)
+                .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
+                    name: "data-rustfs-0".to_string(),
+                    volume_name: Some("pv-csi".to_string()),
+                    storage_class: Some("fast-csi".to_string()),
+                    persistent_volume: Some(TargetPersistentVolumeProof {
+                        name: "pv-csi".to_string(),
+                        source: Some("csi".to_string()),
+                        required_node_affinity: None,
+                        node: None,
+                        device_or_path: Some("csi-volume-handle".to_string()),
+                    }),
+                }])]);
+        let options = ArtifactValidationOptions {
+            scenario: scenario.name.clone(),
+            artifact_root: std::path::PathBuf::from("unused"),
+            expected_workload_objects: scenario.object_count,
+            expected_workload_concurrency: config.workload.concurrency,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: config.expected_rustfs_pod_count,
+            expected_stable_window_seconds: config.rustfs_pod_stable_window.as_secs(),
+            expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
+            expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
+        };
+
+        validate_run_spec(&run_spec, &options).expect("canonical percent run spec");
+        validate_target_proof(&proof, &run_spec, &options)
+            .expect("CSI PV without hostname affinity remains valid for percent mode");
+    }
+
+    #[test]
+    fn fixed_volume_runtime_evidence_binds_plan_proof_status_and_drift() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = "io-eio".to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::new(
+            scenario.name.clone(),
+            scenario.case_name,
+            crate::fault::plan::FaultWorkloadMode::S3Mixed,
+            vec![
+                FaultInjection::new(
+                    FaultKind::RustfsVolumeIoError,
+                    crate::fault::scenarios::FaultBackend::ChaosMeshIoChaos,
+                    FaultTarget::RustfsVolume {
+                        path: "/data/rustfs0".to_string(),
+                    },
+                    FaultSelection::FixedTargets(2),
+                    Duration::from_secs(60),
+                )
+                .expect("fixed volume injection"),
+            ],
+        )
+        .expect("fixed volume plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let run_spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+        let volume_pod = |index| {
+            let mut pod =
+                TargetResolvedPodProof::new(format!("rustfs-{index}"), format!("uid-{index}"))
+                    .with_node(format!("node-{index}"))
+                    .with_node_labels(BTreeMap::from([(
+                        "kubernetes.io/hostname".to_string(),
+                        format!("node-{index}"),
+                    )]))
+                    .with_ready(true)
+                    .with_volume_mounts(vec![TargetVolumeMountProof {
+                        container_name: "rustfs".to_string(),
+                        mount_path: "/data/rustfs0".to_string(),
+                        volume_name: format!("data-{index}"),
+                        persistent_volume_claim: Some(format!("data-{index}")),
+                    }])
+                    .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
+                        name: format!("data-{index}"),
+                        volume_name: Some(format!("pv-{index}")),
+                        storage_class: Some("fast-csi".to_string()),
+                        persistent_volume: Some(TargetPersistentVolumeProof {
+                            name: format!("pv-{index}"),
+                            source: Some("local".to_string()),
+                            required_node_affinity: Some(TargetNodeAffinityProof {
+                                well_formed: true,
+                                terms: vec![TargetNodeSelectorTermProof {
+                                    match_expressions: vec![TargetNodeSelectorRequirementProof {
+                                        key: "kubernetes.io/hostname".to_string(),
+                                        operator: "In".to_string(),
+                                        values: vec![format!("node-{index}")],
+                                    }],
+                                    match_fields: Vec::new(),
+                                }],
+                            }),
+                            node: Some(format!("node-{index}")),
+                            device_or_path: Some(format!("/dev/disk-{index}")),
+                        }),
+                    }]);
+            pod.rustfs_container_id = Some(format!("containerd://rustfs-{index}"));
+            pod
+        };
+        let proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs((0..3).map(volume_pod));
+        let insufficient = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs((0..1).map(volume_pod));
+        assert!(insufficient.require_satisfied().is_err());
+        let options = ArtifactValidationOptions {
+            scenario: scenario.name.clone(),
+            artifact_root: std::path::PathBuf::from("unused"),
+            expected_workload_objects: scenario.object_count,
+            expected_workload_concurrency: config.workload.concurrency,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: config.expected_rustfs_pod_count,
+            expected_stable_window_seconds: config.rustfs_pod_stable_window.as_secs(),
+            expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
+            expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
+        };
+        assert!(
+            validate_run_spec(&run_spec, &options).is_err(),
+            "current catalog has no executable fixed-volume selection source"
+        );
+        validate_target_proof(&proof, &run_spec, &options).expect("fixed volume target proof");
+
+        let mut unproved_candidate = volume_pod(2);
+        unproved_candidate.volume_mounts[0].mount_path = "/unrelated-logs".to_string();
+        let mixed_candidates = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs([volume_pod(0), volume_pod(1), unproved_candidate.clone()]);
+        assert!(
+            mixed_candidates.require_satisfied().is_err(),
+            "two eligible Pods must not permit injection when the selector can also choose an unproved third Pod"
+        );
+        let mut stale_proof = proof.clone();
+        stale_proof.resolved_pods[2] = unproved_candidate;
+        assert!(
+            validate_target_proof(&stale_proof, &run_spec, &options).is_err(),
+            "artifact validation must recheck all candidates even when saved preflight flags passed"
+        );
+
+        let namespace = &run_spec.cluster.namespace;
+        let target = |index| format!("{namespace}/rustfs-{index}/rustfs");
+        let records = vec![
+            json!({"id": target(0), "selectorKey": ".", "phase": "Injected", "injectedCount": 1}),
+            json!({"id": target(1), "selectorKey": ".", "phase": "Injected", "injectedCount": 1}),
+        ];
+        let resource = json!({
+            "apiVersion": "chaos-mesh.org/v1alpha1",
+            "kind": "IOChaos",
+            "metadata": {
+                "name": "fixed-volume",
+                "namespace": run_spec.cluster.chaos_namespace,
+                "labels": {
+                    "rustfs-fault-test/run-id": run_spec.metadata.run_id,
+                    "rustfs-fault-test/scenario": run_spec.scenario.name,
+                    "app.kubernetes.io/managed-by": "s3chaos"
+                }
+            },
+            "spec": {
+                "action": "fault",
+                "errno": 5,
+                "mode": "fixed",
+                "value": "2",
+                "selector": {
+                    "namespaces": [namespace],
+                    "labelSelectors": {"rustfs.tenant": run_spec.cluster.tenant}
+                },
+                "containerNames": ["rustfs"],
+                "volumePath": "/data/rustfs0",
+                "path": "/data/rustfs0/**/*",
+                "methods": ["READ", "WRITE"],
+                "percent": 100,
+                "duration": "60s"
+            },
+            "status": {
+                "conditions": [
+                    {"type": "Selected", "status": "True"},
+                    {"type": "AllInjected", "status": "True"},
+                    {"type": "AllRecovered", "status": "False"}
+                ],
+                "experiment": {"desiredPhase": "Run", "containerRecords": records}
+            }
+        });
+        let snapshot = |stage: &str, resource: serde_json::Value| {
+            json!({
+                "stage": stage,
+                "resource_kind": "iochaos",
+                "resource_name": "fixed-volume",
+                "chaos_status": resource
+            })
+        };
+        let mut evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
+            "injected": true,
+            "active_during_workload": true,
+            "recovered": true,
+            "require_client_disruption": false,
+            "client_disruptions": 0,
+            "pods_before": (0..3).map(|index| json!({
+                "name": format!("rustfs-{index}"),
+                "uid": format!("uid-{index}")
+            })).collect::<Vec<_>>(),
+            "pods_at_fault_activation": (0..2).map(|index| json!({
+                "name": format!("rustfs-{index}"),
+                "uid": format!("uid-{index}")
+            })).collect::<Vec<_>>(),
+            "pods_at_workload_snapshot": (0..2).map(|index| json!({
+                "name": format!("rustfs-{index}"),
+                "uid": format!("uid-{index}")
+            })).collect::<Vec<_>>(),
+            "pods_after": [],
+            "fixed_volume_targets_at_fault_activation": [target(0), target(1)],
+            "fixed_volume_targets_at_workload_snapshot": [target(0), target(1)],
+            "fixed_volume_containers_at_fault_activation": {
+                "rustfs-0": "containerd://rustfs-0", "rustfs-1": "containerd://rustfs-1"
+            },
+            "fixed_volume_containers_at_workload_snapshot": {
+                "rustfs-0": "containerd://rustfs-0", "rustfs-1": "containerd://rustfs-1"
+            },
+            "active_snapshots": [snapshot("active", resource.clone())],
+            "workload_snapshots": [snapshot("after-workload", resource.clone())]
+        }))
+        .expect("fault evidence");
+        validate_fixed_volume_runtime_evidence(&evidence, &proof, &run_spec)
+            .expect("fixed volume runtime evidence");
+        assert!(
+            validate_fixed_volume_runtime_evidence(&evidence, &stale_proof, &run_spec).is_err(),
+            "selecting only proved Pods does not repair an unproved preflight candidate"
+        );
+
+        for stage in ["activation", "workload", "both"] {
+            let mut restarted = evidence.clone();
+            if stage != "workload" {
+                restarted
+                    .fixed_volume_containers_at_fault_activation
+                    .insert(
+                        "rustfs-0".to_string(),
+                        "containerd://replacement".to_string(),
+                    );
+            }
+            if stage != "activation" {
+                restarted
+                    .fixed_volume_containers_at_workload_snapshot
+                    .insert(
+                        "rustfs-0".to_string(),
+                        "containerd://replacement".to_string(),
+                    );
+            }
+            assert!(
+                validate_fixed_volume_runtime_evidence(&restarted, &proof, &run_spec).is_err(),
+                "same-UID Pod with a replaced container at {stage} must invalidate IOChaos evidence"
+            );
+        }
+        for stage in ["activation", "workload"] {
+            let mut missing = evidence.clone();
+            let containers = if stage == "activation" {
+                &mut missing.fixed_volume_containers_at_fault_activation
+            } else {
+                &mut missing.fixed_volume_containers_at_workload_snapshot
+            };
+            containers.remove("rustfs-0");
+            assert!(validate_fixed_volume_runtime_evidence(&missing, &proof, &run_spec).is_err());
+        }
+        let mut missing_container = proof.clone();
+        missing_container.resolved_pods[0].rustfs_container_id = None;
+        assert!(
+            validate_fixed_volume_runtime_evidence(&evidence, &missing_container, &run_spec)
+                .is_err()
+        );
+
+        let mut missing_uid = evidence.clone();
+        missing_uid.pods_at_fault_activation[0].uid.clear();
+        assert!(
+            validate_fixed_volume_runtime_evidence(&missing_uid, &proof, &run_spec).is_err(),
+            "selected Pod identities require a non-empty UID"
+        );
+        let mut missing_identities = evidence.clone();
+        missing_identities.pods_at_fault_activation.clear();
+        assert!(
+            validate_fixed_volume_runtime_evidence(&missing_identities, &proof, &run_spec).is_err(),
+            "selected Pod identity evidence must not be empty"
+        );
+        let mut duplicate_name = evidence.clone();
+        duplicate_name.pods_at_fault_activation[1].name = "rustfs-0".to_string();
+        assert!(
+            validate_fixed_volume_runtime_evidence(&duplicate_name, &proof, &run_spec).is_err(),
+            "selected Pod identity names must be unique"
+        );
+        let mut tampered_uid = evidence.clone();
+        tampered_uid.pods_at_fault_activation[0].uid = "uid-tampered".to_string();
+        assert!(
+            validate_fixed_volume_runtime_evidence(&tampered_uid, &proof, &run_spec).is_err(),
+            "selected Pod UID must match target-proof and pods_before"
+        );
+        let mut replacement = evidence.clone();
+        replacement.pods_at_workload_snapshot[0].uid = "uid-replacement".to_string();
+        assert!(
+            validate_fixed_volume_runtime_evidence(&replacement, &proof, &run_spec).is_err(),
+            "same-name Pod replacement across snapshots must fail closed"
+        );
+
+        let mut wrong_topology = proof.clone();
+        wrong_topology.resolved_pods[0].node_labels.insert(
+            "kubernetes.io/hostname".to_string(),
+            "other-node".to_string(),
+        );
+        assert!(
+            validate_fixed_volume_runtime_evidence(&evidence, &wrong_topology, &run_spec).is_err(),
+            "local PV topology must match the selected Pod node"
+        );
+
+        let mut wrong_mount = proof.clone();
+        wrong_mount.resolved_pods[0].volume_mounts[0].persistent_volume_claim =
+            Some("unrelated-logs".to_string());
+        assert!(
+            validate_fixed_volume_runtime_evidence(&evidence, &wrong_mount, &run_spec).is_err(),
+            "the configured mount path must link to its own PVC/PV"
+        );
+
+        for (pointer, value) in [
+            ("/spec/action", json!("latency")),
+            ("/spec/errno", json!(28)),
+            ("/spec/methods", json!(["WRITE"])),
+            ("/spec/duration", json!("61s")),
+        ] {
+            let mut tampered = evidence.clone();
+            for snapshots in [
+                &mut tampered.active_snapshots,
+                &mut tampered.workload_snapshots,
+            ] {
+                *snapshots[0]["chaos_status"]
+                    .pointer_mut(pointer)
+                    .expect("tamper target") = value.clone();
+            }
+            assert!(
+                validate_fixed_volume_runtime_evidence(&tampered, &proof, &run_spec).is_err(),
+                "artifact validation must reject tampered {pointer}"
+            );
+        }
+
+        evidence.fixed_volume_targets_at_workload_snapshot[1] = target(2);
+        assert!(validate_fixed_volume_runtime_evidence(&evidence, &proof, &run_spec).is_err());
+        evidence.fixed_volume_targets_at_workload_snapshot[1] = target(1);
+        evidence.workload_snapshots[0]["chaos_status"]["status"]["experiment"]["containerRecords"]
+            .as_array_mut()
+            .expect("records")
+            .pop();
+        assert!(validate_fixed_volume_runtime_evidence(&evidence, &proof, &run_spec).is_err());
+
+        let mut missing_device = proof;
+        missing_device.resolved_pods[0].persistent_volume_claims[0]
+            .persistent_volume
+            .as_mut()
+            .expect("pv")
+            .device_or_path = None;
+        assert!(validate_target_proof(&missing_device, &run_spec, &options).is_err());
     }
 
     #[test]
@@ -2609,6 +3383,8 @@ mod tests {
                     storage_class: Some("rustfs-fault-dm".to_string()),
                     persistent_volume: Some(TargetPersistentVolumeProof {
                         name: "pv-a".to_string(),
+                        source: Some("local".to_string()),
+                        required_node_affinity: None,
                         node: Some("storage-host-a".to_string()),
                         device_or_path: Some("/data/rustfs-fault/dm-volume".to_string()),
                     }),
@@ -2687,7 +3463,43 @@ mod tests {
             node_quarantined: false,
             recovery_table_sha256: host_proof.target.recovery_table_sha256.clone(),
         };
-        let evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
+        let recovery_snapshot = json!({
+            "stage": "recovered",
+            "mapper_name": "rustfs-fault-dm",
+            "canonical_device": "/dev/dm-0",
+            "suspended": false,
+            "observed_at_ms": 299,
+            "helper_pod": "rustfs-fault-dm-helper-run1",
+            "mapping": {
+                "node": "worker-a",
+                "node_uid": "node-uid-a",
+                "node_labels": {"kubernetes.io/hostname": "storage-host-a"},
+                "pod": "rustfs-0",
+                "pod_uid": "uid-0",
+                "volume_name": "data",
+                "pvc": "data-rustfs-0",
+                "pvc_uid": "pvc-uid-0",
+                "pvc_phase": "Bound",
+                "pv": "pv-a",
+                "pv_uid": "pv-uid-a",
+                "pv_phase": "Bound",
+                "pv_claim_ref": {
+                    "namespace": "rustfs-fault-test",
+                    "name": "data-rustfs-0",
+                    "uid": "pvc-uid-0"
+                },
+                "node_selector": {
+                    "key": "kubernetes.io/hostname",
+                    "operator": "In",
+                    "values": ["storage-host-a"]
+                },
+                "container_mount_path": "/data/rustfs0",
+                "mount_path": "/data/rustfs-fault/dm-volume"
+            },
+            "table": "0 1024 linear /dev/loop0 0",
+            "status": "0 1024 linear"
+        });
+        let mut evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
             "injected": true,
             "active_during_workload": true,
             "recovered": true,
@@ -2699,46 +3511,85 @@ mod tests {
             "workload_snapshots": [{}],
             "fault_apply_started_at_ms": 150,
             "fault_active_at_ms": 160,
+            "workload_started_at_ms": 170,
+            "workload_ended_at_ms": 190,
             "fault_delete_started_at_ms": 200,
             "recovery_started_at_ms": 201,
-            "dm_recovery_snapshot": {
-                "stage": "recovered",
-                "helper_pod": "rustfs-fault-dm-helper-run1",
-                "mapping": {
-                    "node": "worker-a",
-                    "node_uid": "node-uid-a",
-                    "node_labels": {"kubernetes.io/hostname": "storage-host-a"},
-                    "pod": "rustfs-0",
-                    "pod_uid": "uid-0",
-                    "volume_name": "data",
-                    "pvc": "data-rustfs-0",
-                    "pvc_uid": "pvc-uid-0",
-                    "pvc_phase": "Bound",
-                    "pv": "pv-a",
-                    "pv_uid": "pv-uid-a",
-                    "pv_phase": "Bound",
-                    "pv_claim_ref": {
-                        "namespace": "rustfs-fault-test",
-                        "name": "data-rustfs-0",
-                        "uid": "pvc-uid-0"
-                    },
-                    "node_selector": {
-                        "key": "kubernetes.io/hostname",
-                        "operator": "In",
-                        "values": ["storage-host-a"]
-                    },
-                    "container_mount_path": "/data/rustfs0",
-                    "mount_path": "/data/rustfs-fault/dm-volume"
-                },
-                "table": "0 1024 linear /dev/loop0 0",
-                "status": "0 1024 linear"
-            },
+            "dm_recovery_snapshot": recovery_snapshot,
             "recovery_ended_at_ms": 400
         }))
         .expect("evidence");
 
+        let active_snapshot = |stage, timestamp| {
+            let mut dm = evidence
+                .dm_recovery_snapshot
+                .clone()
+                .expect("recovery snapshot");
+            dm["stage"] = json!(stage);
+            dm["table"] = json!(host_proof.tables.fault_table);
+            dm["observed_at_ms"] = json!(timestamp);
+            json!({"stage": stage, "resource_kind": "device-mapper", "dm_status": dm})
+        };
+        evidence.active_snapshots = vec![active_snapshot("active", 161)];
+        evidence.workload_snapshots = vec![active_snapshot("after-workload", 195)];
         validate_host_storage_artifacts(&host_proof, &cleanup, &target_proof, &run_spec, &evidence)
             .expect("valid host-storage artifacts");
+
+        for workload in [false, true] {
+            for replacement in [vec![], vec![json!({})], vec![json!({}), json!({})]] {
+                let mut broken = evidence.clone();
+                if workload {
+                    broken.workload_snapshots = replacement;
+                } else {
+                    broken.active_snapshots = replacement;
+                }
+                assert!(
+                    validate_host_storage_artifacts(
+                        &host_proof,
+                        &cleanup,
+                        &target_proof,
+                        &run_spec,
+                        &broken
+                    )
+                    .is_err()
+                );
+            }
+            for (pointer, value) in [
+                ("/stage", json!("recovered")),
+                ("/resource_kind", json!("iochaos")),
+                ("/dm_status/stage", json!("recovered")),
+                ("/dm_status/helper_pod", json!("other-run-helper")),
+                ("/dm_status/mapper_name", json!("other-mapper")),
+                ("/dm_status/canonical_device", json!("/dev/dm-9")),
+                ("/dm_status/suspended", json!(true)),
+                ("/dm_status/table", json!(host_proof.tables.recovery_table)),
+                ("/dm_status/mapping/node_uid", json!("replaced-node")),
+                ("/dm_status/mapping/pv_uid", json!("replaced-pv")),
+                ("/dm_status/mapping/pvc_uid", json!("replaced-pvc")),
+                ("/dm_status/mapping/pod_uid", json!("replaced-pod")),
+                ("/dm_status/observed_at_ms", json!(159)),
+                ("/dm_status/observed_at_ms", json!(201)),
+            ] {
+                let mut broken = evidence.clone();
+                let snapshots = if workload {
+                    &mut broken.workload_snapshots
+                } else {
+                    &mut broken.active_snapshots
+                };
+                *snapshots[0].pointer_mut(pointer).expect("tampered field") = value;
+                assert!(
+                    validate_host_storage_artifacts(
+                        &host_proof,
+                        &cleanup,
+                        &target_proof,
+                        &run_spec,
+                        &broken
+                    )
+                    .is_err(),
+                    "must reject {pointer} drift at workload={workload}"
+                );
+            }
+        }
 
         let mut tampered_topology = target_proof.clone();
         tampered_topology.resolved_pods[0].persistent_volume_claims[0]
@@ -2920,6 +3771,55 @@ mod tests {
                 11,
             )
             .expect("rejected mutations prove write-quorum loss");
+        for family in 0..3 {
+            for replace in [true, false] {
+                let mut invalid_history = history.clone();
+                let mut counts = [
+                    OutcomeCountsArtifact::default(),
+                    OutcomeCountsArtifact::default(),
+                    OutcomeCountsArtifact::default(),
+                ];
+                if replace {
+                    invalid_history[family].outcome = OperationOutcome::NotFound;
+                } else {
+                    let mut extra = invalid_history[family].clone();
+                    extra.id = "extra-404".to_string();
+                    extra.outcome = OperationOutcome::NotFound;
+                    invalid_history.push(extra);
+                }
+                for record in &invalid_history {
+                    let index = match record.kind {
+                        crate::fault::history::OperationKind::Put => 0,
+                        crate::fault::history::OperationKind::Delete => 1,
+                        _ => 2,
+                    };
+                    counts[index].record(record.outcome);
+                }
+                let [puts, deletes, multipart_completes] = counts;
+                let invalid = WorkloadSummaryArtifact {
+                    puts,
+                    deletes,
+                    multipart_completes,
+                    gets: OutcomeCountsArtifact::default(),
+                    lists: OutcomeCountsArtifact::default(),
+                    multipart_aborts: OutcomeCountsArtifact::default(),
+                    seed: 42,
+                    object_count: 3,
+                    concurrency: 1,
+                    recommitted_after_recovery: 0,
+                };
+                let error = invalid
+                    .require_write_quorum_loss_effect(
+                        &invalid_history,
+                        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+                        "bucket",
+                        10,
+                        11,
+                    )
+                    .expect_err("404 is not quorum-loss evidence even when history matches");
+                assert!(error.to_string().contains("outcomes must all"), "{error}");
+            }
+        }
         history[0].bucket = "foreign-bucket".to_string();
         assert!(
             summary
@@ -3189,11 +4089,11 @@ mod tests {
     fn validates_failure_summary_v2_checker_projection() {
         let summary = failure_summary_v2_for_test();
 
-        super::validate_failure_summary_v2_fields(&summary, None).expect("valid v2 summary");
+        super::validate_failure_summary_v2_fields(&summary, None, None).expect("valid v2 summary");
     }
 
     #[test]
-    fn validates_failure_summary_v2_evidence_refs_next_to_summary() {
+    fn accepts_legacy_v2_case_relative_evidence_refs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let summary_path = dir.path().join("failure-summary.json");
         fs::write(&summary_path, "{}").expect("summary");
@@ -3201,8 +4101,56 @@ mod tests {
         fs::write(dir.path().join("run-events.jsonl"), "").expect("events");
         let summary = failure_summary_v2_for_test();
 
-        super::validate_failure_summary_v2_fields(&summary, Some(&summary_path))
+        super::validate_failure_summary_v2_fields(&summary, Some(dir.path()), Some(&summary_path))
             .expect("existing evidence refs");
+    }
+
+    #[test]
+    fn validates_suite_root_relative_evidence_refs_from_attempt_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("suite-plan.json"), "{}").expect("suite plan");
+        fs::write(dir.path().join("suite-summary.json"), "{}").expect("suite summary");
+        let attempt_root = dir.path().join("001-io-eio-r1");
+        let case_dir = attempt_root.join("case");
+        fs::create_dir_all(&case_dir).expect("case dir");
+        let summary_path = case_dir.join("failure-summary.json");
+        fs::write(&summary_path, "{}").expect("summary");
+        fs::write(case_dir.join("checker-report.json"), "{}").expect("checker");
+        fs::write(case_dir.join("run-events.jsonl"), "").expect("events");
+        let mut summary = failure_summary_v2_for_test();
+        summary.primary_evidence_refs = vec![
+            "001-io-eio-r1/case/checker-report.json".to_string(),
+            "001-io-eio-r1/case/run-events.jsonl".to_string(),
+        ];
+
+        let reference_root = super::failure_summary_reference_root(&attempt_root);
+        assert_eq!(reference_root, dir.path());
+        super::validate_failure_summary_v2_fields(
+            &summary,
+            Some(reference_root),
+            Some(&summary_path),
+        )
+        .expect("suite-root-relative evidence refs");
+    }
+
+    #[test]
+    fn rejects_failure_summary_v2_suite_root_relative_self_reference() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_dir = dir.path().join("001-io-eio-r1").join("case");
+        fs::create_dir_all(&case_dir).expect("case dir");
+        let summary_path = case_dir.join("failure-summary.json");
+        fs::write(&summary_path, "{}").expect("summary");
+        let mut summary = failure_summary_v2_for_test();
+        summary.primary_evidence_refs = vec!["001-io-eio-r1/case/failure-summary.json".to_string()];
+
+        let error = super::validate_failure_summary_v2_fields(
+            &summary,
+            Some(dir.path()),
+            Some(&summary_path),
+        )
+        .expect_err("self reference");
+
+        assert!(error.to_string().contains("must not reference"));
     }
 
     #[test]
@@ -3212,8 +4160,12 @@ mod tests {
         fs::write(&summary_path, "{}").expect("summary");
         let summary = failure_summary_v2_for_test();
 
-        let error = super::validate_failure_summary_v2_fields(&summary, Some(&summary_path))
-            .expect_err("missing evidence ref");
+        let error = super::validate_failure_summary_v2_fields(
+            &summary,
+            Some(dir.path()),
+            Some(&summary_path),
+        )
+        .expect_err("missing evidence ref");
 
         assert!(error.to_string().contains("does not exist"));
     }
@@ -3227,14 +4179,354 @@ mod tests {
         summary.responsibility_domain = None;
         summary.primary_evidence_refs.clear();
 
-        super::validate_failure_summary_v2_fields(&summary, None).expect("legacy summary");
+        super::validate_failure_summary_v2_fields(&summary, None, None).expect("legacy summary");
+    }
+
+    #[test]
+    fn allows_existing_v2_summary_without_additive_fields() {
+        let mut summary = failure_summary_v2_for_test();
+        summary.schema_version = 2;
+        summary.case_name = None;
+        summary.observed_at_ms = None;
+        summary.phase = None;
+        summary.s3_model_classification = None;
+        summary.run_failure_reason = None;
+        summary.responsibility_domain = None;
+        summary.primary_evidence_refs.clear();
+
+        super::validate_failure_summary_v2_fields(&summary, None, None)
+            .expect("existing v2 additive fields remain optional");
+    }
+
+    #[test]
+    fn rejects_failure_summary_v2_unknown_classification() {
+        let mut summary = failure_summary_v2_for_test();
+        summary.classification = "data_corrupton".to_string();
+
+        let error = super::validate_failure_summary_v2_fields(&summary, None, None)
+            .expect_err("unknown classification");
+
+        assert!(error.to_string().contains("writer allowlist"));
+    }
+
+    #[test]
+    fn rejects_failure_summary_v2_zero_observed_timestamp() {
+        let mut summary = failure_summary_v2_for_test();
+        summary.observed_at_ms = Some(0);
+
+        let error = super::validate_failure_summary_v2_fields(&summary, None, None)
+            .expect_err("zero timestamp");
+
+        assert!(error.to_string().contains("observed_at_ms"));
+    }
+
+    #[test]
+    fn validates_precise_checker_recovery_summary_contracts() {
+        let cases = [
+            (
+                RecoveryStabilityClassification::CommittedVersionMissing,
+                FailureSeverity::FailCorrectness,
+                DataCorrectnessStatus::Failed,
+                AvailabilityStatus::Unknown,
+                Some(true),
+                Some(false),
+                Some(false),
+                false,
+                "missing_committed_version: k@v1",
+            ),
+            (
+                RecoveryStabilityClassification::CommittedVersionUnavailable,
+                FailureSeverity::FailAvailability,
+                DataCorrectnessStatus::Unknown,
+                AvailabilityStatus::CommittedVersionUnavailable,
+                None,
+                Some(false),
+                Some(false),
+                true,
+                "unavailable_committed_version: k@v1 timeout",
+            ),
+            (
+                RecoveryStabilityClassification::VersionHashMismatch,
+                FailureSeverity::FailCorrectness,
+                DataCorrectnessStatus::Failed,
+                AvailabilityStatus::Unknown,
+                Some(false),
+                Some(true),
+                None,
+                false,
+                "version_hash_mismatch: k@v1",
+            ),
+            (
+                RecoveryStabilityClassification::DeleteMarkerMissing,
+                FailureSeverity::FailCorrectness,
+                DataCorrectnessStatus::Failed,
+                AvailabilityStatus::Unknown,
+                Some(false),
+                Some(true),
+                None,
+                false,
+                "missing_committed_delete_marker: k@marker-1",
+            ),
+            (
+                RecoveryStabilityClassification::DeletedObjectResurrected,
+                FailureSeverity::FailCorrectness,
+                DataCorrectnessStatus::Failed,
+                AvailabilityStatus::Unknown,
+                Some(false),
+                Some(true),
+                None,
+                false,
+                "resurrected_deleted_object: k",
+            ),
+            (
+                RecoveryStabilityClassification::DeleteMarkerLineageIncomplete,
+                FailureSeverity::NeedsInvestigation,
+                DataCorrectnessStatus::Unknown,
+                AvailabilityStatus::Unknown,
+                None,
+                Some(false),
+                None,
+                false,
+                "delete_marker_lineage_incomplete: delete-op",
+            ),
+            (
+                RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite,
+                FailureSeverity::NeedsInvestigation,
+                DataCorrectnessStatus::Unknown,
+                AvailabilityStatus::Unknown,
+                None,
+                Some(false),
+                None,
+                false,
+                "committed_write_missing_version_id: put-op",
+            ),
+            (
+                RecoveryStabilityClassification::MultipartUploadLineageIncomplete,
+                FailureSeverity::NeedsInvestigation,
+                DataCorrectnessStatus::Unknown,
+                AvailabilityStatus::Unknown,
+                None,
+                Some(false),
+                None,
+                false,
+                "multipart_upload_lineage_incomplete: complete-op",
+            ),
+        ];
+
+        for (
+            classification,
+            severity,
+            data_correctness,
+            availability,
+            data_loss,
+            corruption,
+            recovered_within_window,
+            version_unavailable,
+            evidence,
+        ) in cases
+        {
+            let recovery = RecoveryStabilityReport {
+                immediate_passed: false,
+                reread_attempted_keys: Vec::new(),
+                reread_recovered_keys: Vec::new(),
+                still_unavailable_keys: if version_unavailable {
+                    vec!["version:k@v1".to_string()]
+                } else {
+                    Vec::new()
+                },
+                hash_mismatches: Vec::new(),
+                data_corruption_evidence: Vec::new(),
+                classification_evidence: vec![evidence.to_string()],
+                ambiguous_write_evidence: Vec::new(),
+                final_list_warning_count: 0,
+                list_warnings: Vec::new(),
+                harness_errors: Vec::new(),
+                max_recovery_seconds: 60,
+                recovered_within_seconds: None,
+                classification,
+            };
+            super::validate_recovery_stability_report(&recovery)
+                .expect("valid precise recovery classification");
+
+            let mut summary = failure_summary_v2_for_test();
+            summary.classification = classification.as_str().to_string();
+            summary.s3_model_classification = Some(classification.as_str().to_string());
+            summary.severity = severity;
+            summary.data_correctness = data_correctness;
+            summary.availability = availability;
+            summary.data_loss = data_loss;
+            summary.corruption = corruption;
+            summary.recovered_within_window = recovered_within_window;
+            summary.evidence_classifications = recovery.evidence_classifications();
+
+            super::validate_failure_summary_v2_classification(&summary)
+                .expect("valid precise summary projection");
+            super::validate_recovery_failure_summary_fields(&summary, &recovery)
+                .expect("valid precise recovery summary fields");
+        }
+    }
+
+    #[test]
+    fn rejects_version_timeout_summary_that_claims_data_loss() {
+        let recovery = RecoveryStabilityReport {
+            immediate_passed: false,
+            reread_attempted_keys: Vec::new(),
+            reread_recovered_keys: Vec::new(),
+            still_unavailable_keys: vec!["version:k@v1".to_string()],
+            hash_mismatches: Vec::new(),
+            data_corruption_evidence: Vec::new(),
+            classification_evidence: vec!["unavailable_committed_version: k@v1".to_string()],
+            ambiguous_write_evidence: Vec::new(),
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
+            harness_errors: Vec::new(),
+            max_recovery_seconds: 60,
+            recovered_within_seconds: None,
+            classification: RecoveryStabilityClassification::CommittedVersionUnavailable,
+        };
+        let mut summary = failure_summary_v2_for_test();
+        summary.classification = "committed_version_unavailable".to_string();
+        summary.s3_model_classification = Some("committed_version_unavailable".to_string());
+        summary.severity = FailureSeverity::FailAvailability;
+        summary.data_correctness = DataCorrectnessStatus::Unknown;
+        summary.availability = AvailabilityStatus::CommittedVersionUnavailable;
+        summary.data_loss = Some(true);
+        summary.corruption = Some(false);
+        summary.recovered_within_window = Some(false);
+        summary.evidence_classifications = recovery.evidence_classifications();
+
+        let error = super::validate_recovery_failure_summary_fields(&summary, &recovery)
+            .expect_err("timeout must not claim data loss");
+
+        assert!(error.to_string().contains("without claiming data loss"));
+    }
+
+    #[test]
+    fn rejects_timeout_list_and_harness_summaries_that_claim_data_loss() {
+        let reports = [
+            (
+                RecoveryStabilityReport {
+                    immediate_passed: false,
+                    reread_attempted_keys: vec!["object-key".to_string()],
+                    reread_recovered_keys: Vec::new(),
+                    still_unavailable_keys: vec!["object-key".to_string()],
+                    hash_mismatches: Vec::new(),
+                    data_corruption_evidence: Vec::new(),
+                    classification_evidence: Vec::new(),
+                    ambiguous_write_evidence: Vec::new(),
+                    final_list_warning_count: 0,
+                    list_warnings: Vec::new(),
+                    harness_errors: Vec::new(),
+                    max_recovery_seconds: 60,
+                    recovered_within_seconds: None,
+                    classification: RecoveryStabilityClassification::CommittedObjectUnavailable,
+                },
+                FailureSeverity::FailAvailability,
+                AvailabilityStatus::CommittedObjectUnavailable,
+                Some(false),
+                Some(false),
+            ),
+            (
+                RecoveryStabilityReport {
+                    immediate_passed: false,
+                    reread_attempted_keys: Vec::new(),
+                    reread_recovered_keys: Vec::new(),
+                    still_unavailable_keys: Vec::new(),
+                    hash_mismatches: Vec::new(),
+                    data_corruption_evidence: Vec::new(),
+                    classification_evidence: Vec::new(),
+                    ambiguous_write_evidence: Vec::new(),
+                    final_list_warning_count: 1,
+                    list_warnings: vec!["LIST prefix did not complete".to_string()],
+                    harness_errors: Vec::new(),
+                    max_recovery_seconds: 60,
+                    recovered_within_seconds: None,
+                    classification: RecoveryStabilityClassification::ListUnavailableOrUnknown,
+                },
+                FailureSeverity::FailAvailability,
+                AvailabilityStatus::ListUnavailableOrUnknown,
+                Some(false),
+                Some(false),
+            ),
+            (
+                RecoveryStabilityReport::harness_error(
+                    "synthetic checker error",
+                    std::time::Duration::from_secs(60),
+                ),
+                FailureSeverity::Infra,
+                AvailabilityStatus::Unknown,
+                None,
+                None,
+            ),
+        ];
+
+        for (recovery, severity, availability, corruption, recovered_within_window) in reports {
+            let mut summary = failure_summary_v2_for_test();
+            summary.classification = recovery.classification.as_str().to_string();
+            summary.severity = severity;
+            summary.data_correctness = DataCorrectnessStatus::Unknown;
+            summary.availability = availability;
+            summary.data_loss = Some(true);
+            summary.corruption = corruption;
+            summary.recovered_within_window = recovered_within_window;
+            summary.evidence_classifications = recovery.evidence_classifications();
+            summary.final_list_warning_count = recovery.final_list_warning_count;
+            summary.list_warnings = recovery.list_warnings.clone();
+            if recovery.classification == RecoveryStabilityClassification::HarnessError {
+                summary.s3_model_classification = None;
+                summary.run_failure_reason = Some("harness_error".to_string());
+                summary.responsibility_domain = Some(ResponsibilityDomain::Harness);
+            } else {
+                summary.s3_model_classification =
+                    Some(recovery.classification.as_str().to_string());
+                summary.run_failure_reason = None;
+                summary.responsibility_domain = Some(ResponsibilityDomain::Product);
+            }
+
+            super::validate_failure_summary_v2_classification(&summary)
+                .expect("classification tags remain valid");
+            let error = super::validate_recovery_failure_summary_fields(&summary, &recovery)
+                .expect_err("non-loss evidence must reject data_loss=true");
+            assert!(error.to_string().contains("data loss"));
+        }
+    }
+
+    #[test]
+    fn rejects_precise_classification_with_unrelated_evidence() {
+        let recovery = RecoveryStabilityReport {
+            immediate_passed: false,
+            reread_attempted_keys: Vec::new(),
+            reread_recovered_keys: Vec::new(),
+            still_unavailable_keys: Vec::new(),
+            hash_mismatches: Vec::new(),
+            data_corruption_evidence: Vec::new(),
+            classification_evidence: vec![
+                "missing_committed_delete_marker: k@marker-1".to_string(),
+            ],
+            ambiguous_write_evidence: Vec::new(),
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
+            harness_errors: Vec::new(),
+            max_recovery_seconds: 60,
+            recovered_within_seconds: None,
+            classification: RecoveryStabilityClassification::CommittedVersionMissing,
+        };
+
+        let error = super::validate_recovery_stability_report(&recovery)
+            .expect_err("unrelated evidence must not substantiate committed version loss");
+
+        assert!(
+            error
+                .to_string()
+                .contains("matching classification_evidence")
+        );
     }
 
     #[test]
     fn validate_written_failure_summary_reads_files_from_disk() {
         let dir = tempfile::tempdir().expect("temp dir");
 
-        // A v2 summary that violates the contract (phase missing) must be
+        // A v2 summary that violates the contract (phase mismatched) must be
         // caught when read back from disk — this is the failure-path
         // diagnostic entry used by reporting::write_failure_summary.
         let bad = dir.path().join("failure-summary.json");
@@ -3244,6 +4536,7 @@ mod tests {
                 "schema_version": 2,
                 "scenario": "io-eio",
                 "stage": "checker",
+                "phase": "workload",
                 "verdict": "failed",
                 "severity": "fail_correctness",
                 "classification": "data_corruption",
@@ -3254,7 +4547,8 @@ mod tests {
             .to_string(),
         )
         .expect("write bad summary");
-        let error = super::validate_written_failure_summary(&bad).expect_err("v2 violation");
+        let error =
+            super::validate_written_failure_summary(dir.path(), &bad).expect_err("v2 violation");
         assert!(
             error.to_string().contains("phase"),
             "unexpected error: {error:#}"
@@ -3278,12 +4572,13 @@ mod tests {
             .to_string(),
         )
         .expect("write legacy summary");
-        super::validate_written_failure_summary(&legacy).expect("legacy summary accepted");
+        super::validate_written_failure_summary(dir.path(), &legacy)
+            .expect("legacy summary accepted");
 
         // Unparseable JSON is a contract violation, not a silent pass.
         let torn = dir.path().join("torn-failure-summary.json");
         std::fs::write(&torn, "{ not json").expect("write torn summary");
-        assert!(super::validate_written_failure_summary(&torn).is_err());
+        assert!(super::validate_written_failure_summary(dir.path(), &torn).is_err());
     }
 
     #[test]
@@ -3302,7 +4597,7 @@ mod tests {
 
         assert_eq!(summary.schema_version, 0);
         assert!(summary.evidence_classifications.is_empty());
-        super::validate_failure_summary_v2_fields(&summary, None).expect("legacy summary");
+        super::validate_failure_summary_v2_fields(&summary, None, None).expect("legacy summary");
     }
 
     #[test]
@@ -3311,7 +4606,7 @@ mod tests {
         summary.phase = Some(FailurePhase::Workload);
 
         let error =
-            super::validate_failure_summary_v2_fields(&summary, None).expect_err("bad phase");
+            super::validate_failure_summary_v2_fields(&summary, None, None).expect_err("bad phase");
 
         assert!(error.to_string().contains("phase"));
     }
@@ -3321,7 +4616,7 @@ mod tests {
         let mut summary = failure_summary_v2_for_test();
         summary.run_failure_reason = Some("data_corruption".to_string());
 
-        let error = super::validate_failure_summary_v2_fields(&summary, None)
+        let error = super::validate_failure_summary_v2_fields(&summary, None, None)
             .expect_err("checker summary must not set run_failure_reason");
 
         assert!(error.to_string().contains("S3 model classification"));
@@ -3341,7 +4636,7 @@ mod tests {
             "run-events.jsonl".to_string(),
         ];
 
-        let error = super::validate_failure_summary_v2_fields(&summary, None)
+        let error = super::validate_failure_summary_v2_fields(&summary, None, None)
             .expect_err("wrong responsibility domain");
 
         assert!(error.to_string().contains("responsibility_domain"));
@@ -3354,7 +4649,7 @@ mod tests {
             .primary_evidence_refs
             .push("../outside.json".to_string());
 
-        let error = super::validate_failure_summary_v2_fields(&summary, None)
+        let error = super::validate_failure_summary_v2_fields(&summary, None, None)
             .expect_err("unsafe evidence ref");
 
         assert!(error.to_string().contains("artifact root"));
@@ -3963,6 +5258,7 @@ mod tests {
             schema_version: 2,
             scenario: "io-eio".to_string(),
             case_name: Some("fault_io_eio_preserves_committed_objects".to_string()),
+            observed_at_ms: None,
             stage: "checker-pre-recommit-verdict".to_string(),
             phase: Some(FailurePhase::Checker),
             verdict: FailureVerdict::Failed,

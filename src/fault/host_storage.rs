@@ -168,6 +168,7 @@ pub struct HostStorageQuarantineContract {
     pub taint_key: String,
     pub effect: String,
     pub required_on_rollback_failure: bool,
+    pub suspend_mapper: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -851,6 +852,13 @@ fn canonical_recovery_contract(
             taint_key: DM_CRASH_TAINT_KEY.to_string(),
             effect: "NoSchedule".to_string(),
             required_on_rollback_failure: true,
+            suspend_mapper: vec![
+                "/usr/sbin/dmsetup".to_string(),
+                "suspend".to_string(),
+                "--noflush".to_string(),
+                "--nolockfs".to_string(),
+                target.mapper_name.clone(),
+            ],
         },
         post_cleanup: HostStoragePostCleanupContract {
             require_recovery_table_match: true,

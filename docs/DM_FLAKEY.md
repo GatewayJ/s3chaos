@@ -204,8 +204,10 @@ export RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST=/dev/mapper/rustfs-fault-dm
 export RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST='<exact-target-pv-name>'
 ```
 
-Use the `SECTORS` and `BACKING` values from the DM node host-storage setup for
-`<sectors>` and `<backing-device>`. `RUSTFS_FAULT_TEST_DM_FAULT_TABLE` is
+Copy the length and backing-device fields from `sudo dmsetup table "$DM_NAME"`
+on the DM node into `<sectors>` and `<backing-device>`. Preserve the reported
+device identifier exactly (typically `major:minor`); an equivalent `/dev/loopN`
+path does not satisfy the exact table contract. `RUSTFS_FAULT_TEST_DM_FAULT_TABLE` is
 required only by the legacy `dm-flakey` EIO scenario. The
 `dm-flakey-versioned-hot` crash proxy ignores it and derives a fail-closed
 `drop_writes` table from the live, single-segment linear table.
@@ -257,6 +259,15 @@ post-cleanup requirements. Apply re-observes the same target and fails closed if
 it changed. Successful recovery writes `host-storage-post-cleanup.json` only
 after the recovery table, mapper-backed mount, and absent quarantine are
 observed.
+
+Activation, after-workload, and recovery snapshots bind the mapper name,
+canonical device, suspension state, table, and observation time to that proof.
+Missing snapshots or drift invalidate the run. If rollback fails, the adapter
+attempts to suspend the mapper with `--noflush --nolockfs` and verifies that
+I/O remains suspended. `NoSchedule` only prevents new scheduling; it does not
+stop an existing Pod. The helper and unresolved mutation marker remain for
+manual recovery even if the scheduling taint succeeds. The wrapper preserves
+that marker after the process exits; only verified recovery clears it.
 
 The Rust test reads the original `dmsetup table` as the recovery table when
 `RUSTFS_FAULT_TEST_DM_RECOVERY_TABLE` is unset. On normal failure paths it

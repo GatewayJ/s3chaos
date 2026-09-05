@@ -257,6 +257,10 @@ mod tests {
     fn recording_dm_snapshot(stage: &str, helper_pod: &str) -> DmStatusSnapshot {
         DmStatusSnapshot {
             stage: stage.to_string(),
+            mapper_name: "rustfs-fault-dm".to_string(),
+            canonical_device: "/dev/dm-0".to_string(),
+            suspended: false,
+            observed_at_ms: 1,
             helper_pod: helper_pod.to_string(),
             mapping: DmVolumeMapping {
                 node: "node-a".to_string(),

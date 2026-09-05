@@ -124,6 +124,41 @@ host_storage_mutation_active 111 "$2" token-a || printf 'cross-process-rejected\
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn wrapper_preserves_unresolved_host_state_after_process_exit() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let marker = temporary.path().join("marker.json");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    for phase in ["active", "rollback", "recovery-required"] {
+        let content =
+            format!(r#"{{"schemaVersion":1,"token":"token-a","ownerPid":4242,"phase":"{phase}"}}"#);
+        std::fs::write(&marker, &content).unwrap();
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                r#"
+source "$1"
+ACTIVE_HOST_MUTATION_STATE_FILE="$2"
+ACTIVE_HOST_MUTATION_STATE_TOKEN=token-a
+cleanup_host_mutation_state
+[[ -z "$ACTIVE_HOST_MUTATION_STATE_FILE" && -z "$ACTIVE_HOST_MUTATION_STATE_TOKEN" ]]
+"#,
+                "unresolved-host-state-test",
+                script,
+                marker.to_str().unwrap(),
+            ])
+            .output()
+            .expect("wrapper cleanup");
+        assert!(output.status.success());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), content);
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("preserving unresolved host mutation state")
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "destructive RustFS workload fault scenario; select with RUSTFS_FAULT_TEST_SCENARIO"]
 async fn fault_selected_scenario() -> Result<()> {
