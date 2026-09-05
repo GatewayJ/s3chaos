@@ -190,12 +190,14 @@ impl StorageVolumeIdentity {
         ensure!(
             self.mount_path.starts_with('/')
                 && self.mount_path != "/"
+                && !self.mount_path.chars().any(char::is_whitespace)
                 && !self.mount_path.split('/').any(|part| part == ".."),
-            "storage identity mount path must be an absolute normalized non-root path"
+            "storage identity mount path must be an absolute normalized non-root path without whitespace"
         );
         ensure!(
-            self.canonical_device.starts_with('/'),
-            "storage identity canonical device must be absolute"
+            self.canonical_device.starts_with('/')
+                && !self.canonical_device.chars().any(char::is_whitespace),
+            "storage identity canonical device must be absolute and contain no whitespace"
         );
         ensure!(
             self.local_volume_path.starts_with('/'),
@@ -219,7 +221,6 @@ impl StorageVolumeIdentity {
             && self.storage_class == other.storage_class
             && self.local_volume_path == other.local_volume_path
             && self.mount_path == other.mount_path
-            && self.target_mount_namespace_id == other.target_mount_namespace_id
             && self.pool_index == other.pool_index
             && self.set_index == other.set_index
     }
@@ -244,10 +245,30 @@ pub struct HostExecutionIdentity {
     pub helper_pod: String,
     pub helper_pod_uid: String,
     pub mount_namespace_id: String,
+    pub helper_pod_sha256: String,
+    pub helper_pod_body: String,
+    pub target_runtime_sha256: String,
+    pub target_runtime_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostTargetRuntimeResponse {
+    pub target_container_id: String,
+    pub container_pid: u32,
+    pub inspect_argv: Vec<String>,
+    pub inspect_exit_code: i32,
+    pub inspect_stdout_sha256: String,
+    pub inspect_stdout_body: String,
+    pub inspect_stderr: String,
+    pub mount_namespace_argv: Vec<String>,
+    pub mount_namespace_exit_code: i32,
+    pub mount_namespace_stdout: String,
+    pub mount_namespace_stderr: String,
 }
 
 impl HostExecutionIdentity {
-    fn validate_for(&self, volume: &StorageVolumeIdentity) -> Result<()> {
+    fn validate_for(&self, volume: &StorageVolumeIdentity) -> Result<u32> {
         ensure!(
             self.namespace == volume.namespace
                 && self.node == volume.node
@@ -260,7 +281,69 @@ impl HostExecutionIdentity {
                 && !self.helper_pod_uid.trim().is_empty(),
             "host helper execution identity is not bound to the target Pod, node, and mount namespace"
         );
-        Ok(())
+        for (label, digest, body) in [
+            (
+                "host helper Pod",
+                &self.helper_pod_sha256,
+                &self.helper_pod_body,
+            ),
+            (
+                "host target runtime",
+                &self.target_runtime_sha256,
+                &self.target_runtime_body,
+            ),
+        ] {
+            validate_sha256(label, digest)?;
+            ensure!(
+                digest == &sha256_bytes(body.as_bytes()),
+                "{label} digest does not match its captured response body"
+            );
+        }
+        let helper = serde_json::from_str::<serde_json::Value>(&self.helper_pod_body)
+            .context("decode captured host helper Pod")?;
+        let runtime = serde_json::from_str::<HostTargetRuntimeResponse>(&self.target_runtime_body)
+            .context("decode captured target runtime identity")?;
+        let inspect = serde_json::from_str::<serde_json::Value>(&runtime.inspect_stdout_body)
+            .context("decode captured target container inspect response")?;
+        fn string_at<'a>(value: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
+            value.pointer(pointer).and_then(serde_json::Value::as_str)
+        }
+        validate_sha256(
+            "target container inspect response",
+            &runtime.inspect_stdout_sha256,
+        )?;
+        ensure!(
+            runtime.inspect_stdout_sha256 == sha256_bytes(runtime.inspect_stdout_body.as_bytes())
+                && string_at(&helper, "/apiVersion") == Some("v1")
+                && string_at(&helper, "/kind") == Some("Pod")
+                && string_at(&helper, "/metadata/namespace") == Some(self.namespace.as_str())
+                && string_at(&helper, "/metadata/name") == Some(self.helper_pod.as_str())
+                && string_at(&helper, "/metadata/uid") == Some(self.helper_pod_uid.as_str())
+                && string_at(&helper, "/metadata/resourceVersion")
+                    .is_some_and(|value| !value.trim().is_empty())
+                && string_at(&helper, "/spec/nodeName") == Some(self.node.as_str())
+                && string_at(&helper, "/status/phase") == Some("Running")
+                && runtime.target_container_id == self.target_container_id
+                && runtime.container_pid > 0
+                && runtime.inspect_argv == ["crictl", "inspect", self.target_container_id.as_str()]
+                && runtime.inspect_exit_code == 0
+                && runtime.inspect_stderr.trim().is_empty()
+                && string_at(&inspect, "/status/id") == Some(self.target_container_id.as_str())
+                && inspect
+                    .pointer("/info/pid")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(runtime.container_pid))
+                && runtime.mount_namespace_argv
+                    == [
+                        "readlink".to_string(),
+                        format!("/proc/{}/ns/mnt", runtime.container_pid),
+                    ]
+                && runtime.mount_namespace_exit_code == 0
+                && runtime.mount_namespace_stdout.trim() == self.mount_namespace_id
+                && runtime.mount_namespace_stderr.trim().is_empty(),
+            "raw helper Pod, container runtime, and mount namespace responses do not prove the host execution identity"
+        );
+        Ok(runtime.container_pid)
     }
 }
 
@@ -604,24 +687,38 @@ impl RawDiskStateEvidence {
                 mount_path,
                 canonical_device,
             } => {
-                execution.validate_for(volume)?;
+                let target_pid = execution.validate_for(volume)?;
                 let expected_argv = vec![
-                    "findmnt".to_string(),
-                    "-rn".to_string(),
-                    "-o".to_string(),
-                    "SOURCE".to_string(),
+                    "nsenter".to_string(),
                     "--target".to_string(),
+                    target_pid.to_string(),
+                    "--mount".to_string(),
+                    "--".to_string(),
+                    "findmnt".to_string(),
+                    "-n".to_string(),
+                    "--raw".to_string(),
+                    "-o".to_string(),
+                    "SOURCE,TARGET".to_string(),
+                    "--mountpoint".to_string(),
                     volume.mount_path.clone(),
                 ];
+                let output_fields = stdout.split_whitespace().collect::<Vec<_>>();
                 let command_result_matches = match state {
                     DiskPresenceState::Present => {
                         exit_code == 0
-                            && stdout.trim() == volume.canonical_device
+                            && output_fields.as_slice()
+                                == [volume.canonical_device.as_str(), volume.mount_path.as_str()]
                             && stderr.trim().is_empty()
                     }
-                    DiskPresenceState::Absent => {
-                        exit_code == 1 && stdout.trim().is_empty() && stderr.trim().is_empty()
-                    }
+                    DiskPresenceState::Absent => match exit_code {
+                        1 => stdout.trim().is_empty() && stderr.trim().is_empty(),
+                        0 => {
+                            stderr.trim().is_empty()
+                                && output_fields.len() == 2
+                                && output_fields[1] != volume.mount_path
+                        }
+                        _ => false,
+                    },
                 };
                 ensure!(
                     cursor == self.response_sha256
@@ -884,8 +981,15 @@ impl DiskAbsenceObservation {
             &self.host_watch_evidence.response_body,
         )
         .context("decode captured disk-absence watch response")?;
-        Ok(response.samples.iter().any(|sample| {
-            sample.observed_at_ms == acknowledged_at_ms && sample.state == DiskPresenceState::Absent
+        Ok(response.samples.windows(2).any(|samples| {
+            let [before, after] = samples else {
+                return false;
+            };
+            before.state == DiskPresenceState::Absent
+                && after.state == DiskPresenceState::Absent
+                && before.observed_at_ms <= acknowledged_at_ms
+                && acknowledged_at_ms <= after.observed_at_ms
+                && after.observed_at_ms - before.observed_at_ms <= response.poll_interval_ms
         }))
     }
 }
@@ -927,7 +1031,7 @@ impl PostReturnCheckerEvidence {
                 && audit.started_at_ms > returned_generation_observed_at_ms
                 && audit.started_at_ms <= audit.completed_at_ms
                 && audit.history_prefix_record_count > 0
-                && audit.history_prefix_record_count <= history.len(),
+                && audit.history_prefix_record_count == history.len(),
             "post-return checker audit is not bound to this bucket and post-return interval"
         );
         let history_prefix = &history[..audit.history_prefix_record_count];
@@ -935,11 +1039,8 @@ impl PostReturnCheckerEvidence {
             history_prefix
                 .iter()
                 .all(|record| record.ended_at_ms <= audit.started_at_ms)
-                && history[audit.history_prefix_record_count..]
-                    .iter()
-                    .all(|record| record.started_at_ms >= audit.started_at_ms)
                 && audit.history_prefix_sha256 == checker_history_prefix_sha256(history_prefix)?,
-            "post-return checker audit does not bind the exact immutable history prefix consumed by the checker"
+            "post-return checker audit does not bind the complete quiesced history consumed by the checker"
         );
         let prefix_operation_ids = history_prefix
             .iter()
@@ -1211,7 +1312,7 @@ impl StaleDiskReturnProof {
                 absence.watch_started_at_ms <= mutation.acknowledged_at_ms
                     && absence.watch_ended_at_ms >= mutation.acknowledged_at_ms
                     && absence.proves_absent_at(mutation.acknowledged_at_ms)?,
-                "stale-disk mutation ACK lacks an exact target-node absence sample"
+                "stale-disk mutation ACK is not bracketed by bounded target-node absence samples"
             );
             let record = history_by_id
                 .get(mutation.operation_id.as_str())
@@ -1292,29 +1393,33 @@ impl StaleDiskReturnProof {
     )> {
         let detach = self.lifecycle_evidence.detach.receipt()?;
         let reattach = self.lifecycle_evidence.reattach.receipt()?;
-        for receipt in [&detach, &reattach] {
+        for (receipt, generation, state) in [
+            (
+                &detach,
+                &self.detached_generation,
+                DiskPresenceState::Absent,
+            ),
+            (
+                &reattach,
+                &self.returned_generation,
+                DiskPresenceState::Present,
+            ),
+        ] {
             ensure!(
-                receipt.persistent_volume == self.detached_generation.persistent_volume
-                    && receipt.persistent_volume_uid
-                        == self.detached_generation.persistent_volume_uid
-                    && receipt.canonical_device == self.detached_generation.canonical_device
-                    && receipt.filesystem_uuid == self.detached_generation.filesystem_uuid
-                    && receipt.rustfs_drive_uuid == self.detached_generation.rustfs_drive_uuid
-                    && receipt.target_proof_sha256 == self.detached_generation.target_proof_sha256
-                    && receipt.host_storage_proof_sha256
-                        == self.detached_generation.host_storage_proof_sha256
+                receipt.persistent_volume == generation.persistent_volume
+                    && receipt.persistent_volume_uid == generation.persistent_volume_uid
+                    && receipt.canonical_device == generation.canonical_device
+                    && receipt.filesystem_uuid == generation.filesystem_uuid
+                    && receipt.rustfs_drive_uuid == generation.rustfs_drive_uuid
+                    && receipt.target_proof_sha256 == generation.target_proof_sha256
+                    && receipt.host_storage_proof_sha256 == generation.host_storage_proof_sha256
                     && receipt.started_at_ms > 0
                     && receipt.started_at_ms < receipt.completed_at_ms,
-                "stale-disk lifecycle receipt is not bound to the detached storage generation"
+                "stale-disk lifecycle receipt is not bound to its action-specific storage generation"
             );
-        }
-        for (receipt, state) in [
-            (&detach, DiskPresenceState::Absent),
-            (&reattach, DiskPresenceState::Present),
-        ] {
             receipt
                 .kubernetes_binding_evidence
-                .validate(&self.detached_generation, receipt.completed_at_ms)?;
+                .validate(generation, receipt.completed_at_ms)?;
             let host_cursor = receipt.host_result_evidence.cursor()?;
             receipt
                 .host_result_evidence
@@ -1322,7 +1427,7 @@ impl StaleDiskReturnProof {
                     state,
                     observed_at_ms: receipt.completed_at_ms,
                     cursor: &host_cursor,
-                    volume: &self.detached_generation,
+                    volume: generation,
                 })?;
         }
         ensure!(
@@ -1540,7 +1645,7 @@ impl ShardMutationProof {
             &self.path_containment.resolver_response_body,
         )
         .context("decode captured openat2 shard path receipt")?;
-        path_receipt.execution.validate_for(&self.volume)?;
+        let _ = path_receipt.execution.validate_for(&self.volume)?;
         ensure!(
             self.shard_path
                 .starts_with(&format!("{}/", self.volume.mount_path))
@@ -1577,7 +1682,7 @@ impl ShardMutationProof {
             "shard mutation range must fall inside the proven non-empty shard inode"
         );
         let host_receipt = self.host_receipt()?;
-        host_receipt.execution.validate_for(&self.volume)?;
+        let _ = host_receipt.execution.validate_for(&self.volume)?;
         for (field, value) in [
             (
                 "receipt original shard",
@@ -4152,7 +4257,58 @@ mod tests {
         }
     }
 
+    fn returned_runtime(
+        mut volume: StorageVolumeIdentity,
+        observed_at_ms: u64,
+    ) -> StorageVolumeIdentity {
+        volume.pod_uid = "pod-returned".to_string();
+        volume.rustfs_container_id = "containerd://rustfs-returned".to_string();
+        volume.target_mount_namespace_id = "mnt:[4026533999]".to_string();
+        volume.target_proof_sha256 = HASH_C.to_string();
+        volume.host_storage_proof_sha256 = HASH_A.to_string();
+        volume.observed_at_ms = observed_at_ms;
+        volume
+    }
+
     fn host_execution(volume: &StorageVolumeIdentity) -> HostExecutionIdentity {
+        let helper_pod = format!("s3chaos-host-helper-{}", volume.node);
+        let helper_pod_uid = format!("helper-uid-{}", volume.node_uid);
+        let helper_pod_body = serde_json::to_string(&serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": volume.namespace,
+                "name": helper_pod,
+                "uid": helper_pod_uid,
+                "resourceVersion": "helper-rv-1"
+            },
+            "spec": {"nodeName": volume.node},
+            "status": {"phase": "Running"}
+        }))
+        .expect("host helper Pod");
+        let inspect_stdout_body = serde_json::to_string(&serde_json::json!({
+            "status": {"id": volume.rustfs_container_id},
+            "info": {"pid": 4242}
+        }))
+        .expect("container inspect response");
+        let runtime_body = serde_json::to_string(&HostTargetRuntimeResponse {
+            target_container_id: volume.rustfs_container_id.clone(),
+            container_pid: 4242,
+            inspect_argv: vec![
+                "crictl".to_string(),
+                "inspect".to_string(),
+                volume.rustfs_container_id.clone(),
+            ],
+            inspect_exit_code: 0,
+            inspect_stdout_sha256: sha256_bytes(inspect_stdout_body.as_bytes()),
+            inspect_stdout_body,
+            inspect_stderr: String::new(),
+            mount_namespace_argv: vec!["readlink".to_string(), "/proc/4242/ns/mnt".to_string()],
+            mount_namespace_exit_code: 0,
+            mount_namespace_stdout: volume.target_mount_namespace_id.clone(),
+            mount_namespace_stderr: String::new(),
+        })
+        .expect("target runtime identity");
         HostExecutionIdentity {
             namespace: volume.namespace.clone(),
             node: volume.node.clone(),
@@ -4160,9 +4316,13 @@ mod tests {
             target_pod: volume.pod.clone(),
             target_pod_uid: volume.pod_uid.clone(),
             target_container_id: volume.rustfs_container_id.clone(),
-            helper_pod: format!("s3chaos-host-helper-{}", volume.node),
-            helper_pod_uid: format!("helper-uid-{}", volume.node_uid),
+            helper_pod,
+            helper_pod_uid,
             mount_namespace_id: volume.target_mount_namespace_id.clone(),
+            helper_pod_sha256: sha256_bytes(helper_pod_body.as_bytes()),
+            helper_pod_body,
+            target_runtime_sha256: sha256_bytes(runtime_body.as_bytes()),
+            target_runtime_body: runtime_body,
         }
     }
 
@@ -4465,23 +4625,32 @@ mod tests {
         state: DiskPresenceState,
         observed_at_ms: u64,
     ) -> RawDiskStateEvidence {
+        let execution = host_execution(generation);
         let response = RawDiskStateResponse::HostDevice {
-            execution: host_execution(generation),
+            execution,
             argv: vec![
-                "findmnt".to_string(),
-                "-rn".to_string(),
-                "-o".to_string(),
-                "SOURCE".to_string(),
+                "nsenter".to_string(),
                 "--target".to_string(),
+                "4242".to_string(),
+                "--mount".to_string(),
+                "--".to_string(),
+                "findmnt".to_string(),
+                "-n".to_string(),
+                "--raw".to_string(),
+                "-o".to_string(),
+                "SOURCE,TARGET".to_string(),
+                "--mountpoint".to_string(),
                 generation.mount_path.clone(),
             ],
             exit_code: match state {
                 DiskPresenceState::Present => 0,
-                DiskPresenceState::Absent => 1,
+                DiskPresenceState::Absent => 0,
             },
             stdout: match state {
-                DiskPresenceState::Present => generation.canonical_device.clone(),
-                DiskPresenceState::Absent => String::new(),
+                DiskPresenceState::Present => {
+                    format!("{} {}", generation.canonical_device, generation.mount_path)
+                }
+                DiskPresenceState::Absent => "/dev/root /".to_string(),
             },
             stderr: String::new(),
             observed_at_ms,
@@ -4630,11 +4799,11 @@ mod tests {
             samples: vec![
                 sample(watch_started_at_ms, DiskPresenceState::Present),
                 sample(200, DiskPresenceState::Absent),
-                sample(250, DiskPresenceState::Absent),
-                sample(300, DiskPresenceState::Absent),
-                sample(325, DiskPresenceState::Absent),
-                sample(350, DiskPresenceState::Absent),
-                sample(360, DiskPresenceState::Absent),
+                sample(240, DiskPresenceState::Absent),
+                sample(280, DiskPresenceState::Absent),
+                sample(320, DiskPresenceState::Absent),
+                sample(340, DiskPresenceState::Absent),
+                sample(380, DiskPresenceState::Absent),
                 sample(400, DiskPresenceState::Absent),
             ],
             closed_normally: true,
@@ -4704,9 +4873,11 @@ mod tests {
     }
 
     fn stale_disk_lifecycle_evidence(
-        generation: &StorageVolumeIdentity,
+        detached_generation: &StorageVolumeIdentity,
+        returned_generation: &StorageVolumeIdentity,
     ) -> StaleDiskLifecycleEvidence {
-        let operation = |operation_id: &str,
+        let operation = |generation: &StorageVolumeIdentity,
+                         operation_id: &str,
                          action: StaleDiskLifecycleAction,
                          started_at_ms: u64,
                          completed_at_ms: u64| {
@@ -4739,8 +4910,20 @@ mod tests {
             }
         };
         StaleDiskLifecycleEvidence {
-            detach: operation("detach-1", StaleDiskLifecycleAction::Detach, 190, 200),
-            reattach: operation("reattach-1", StaleDiskLifecycleAction::Reattach, 425, 450),
+            detach: operation(
+                detached_generation,
+                "detach-1",
+                StaleDiskLifecycleAction::Detach,
+                190,
+                200,
+            ),
+            reattach: operation(
+                returned_generation,
+                "reattach-1",
+                StaleDiskLifecycleAction::Reattach,
+                425,
+                450,
+            ),
         }
     }
 
@@ -4873,9 +5056,7 @@ mod tests {
 
     fn stale_return_fixture() -> (StaleDiskReturnProof, Vec<OperationRecord>) {
         let original = volume("old", 100);
-        let mut returned = original.clone();
-        returned.pod_uid = "pod-returned".to_string();
-        returned.observed_at_ms = 500;
+        let returned = returned_runtime(original.clone(), 500);
         let history = vec![
             history_record(
                 "stale-put",
@@ -4899,14 +5080,14 @@ mod tests {
         let proof = StaleDiskReturnProof::prove(
             identity("stale-disk-return-detect"),
             original.clone(),
-            returned,
+            returned.clone(),
             StaleDiskReturnEvidence {
                 detached_at_ms: 200,
                 mutation_window_ended_at_ms: 400,
                 returned_at_ms: 450,
                 detachment_operation_id: "detach-1".to_string(),
                 reattachment_operation_id: "reattach-1".to_string(),
-                lifecycle_evidence: stale_disk_lifecycle_evidence(&original),
+                lifecycle_evidence: stale_disk_lifecycle_evidence(&original, &returned),
                 absence_observations: vec![absence_observation(&original, "absence-watch", 190)],
                 committed_mutations: vec![
                     CommittedMutationEvidence {
@@ -5067,9 +5248,7 @@ mod tests {
     #[test]
     fn stale_return_requires_the_original_generation_and_commits_while_absent() {
         let original = volume("old", 100);
-        let mut returned = original.clone();
-        returned.pod_uid = "pod-returned".to_string();
-        returned.observed_at_ms = 500;
+        let returned = returned_runtime(original.clone(), 500);
         let absence = vec![absence_observation(&original, "absence-watch", 190)];
         let history = vec![
             history_record(
@@ -5104,14 +5283,14 @@ mod tests {
         let proof = StaleDiskReturnProof::prove(
             identity("stale-disk-return-detect"),
             original.clone(),
-            returned,
+            returned.clone(),
             StaleDiskReturnEvidence {
                 detached_at_ms: 200,
                 mutation_window_ended_at_ms: 400,
                 returned_at_ms: 450,
                 detachment_operation_id: "detach-1".to_string(),
                 reattachment_operation_id: "reattach-1".to_string(),
-                lifecycle_evidence: stale_disk_lifecycle_evidence(&original),
+                lifecycle_evidence: stale_disk_lifecycle_evidence(&original, &returned),
                 absence_observations: absence,
                 committed_mutations: vec![
                     CommittedMutationEvidence {
@@ -5144,6 +5323,18 @@ mod tests {
             &history,
         )
         .expect("valid stale return");
+
+        let mut swapped_return_runtime = proof.clone();
+        swapped_return_runtime.returned_generation.pod_uid = "unrelated-pod".to_string();
+        swapped_return_runtime
+            .returned_generation
+            .rustfs_container_id = "containerd://unrelated".to_string();
+        assert!(
+            swapped_return_runtime
+                .validate_against_history(&history)
+                .is_err(),
+            "reattach evidence must prove the claimed returned Pod and container generation"
+        );
 
         let mut omitted_multipart = proof.clone();
         omitted_multipart
@@ -5238,6 +5429,29 @@ mod tests {
             "a clean checker receipt for an earlier history universe cannot be replayed after return"
         );
 
+        for (index, kind, value_sha256) in [
+            (0, OperationKind::Put, Some(HASH_C)),
+            (1, OperationKind::Delete, None),
+            (2, OperationKind::CompleteMultipartUpload, Some(HASH_C)),
+        ] {
+            let mut history_with_suffix = history.clone();
+            history_with_suffix.push(history_record(
+                &format!("post-checker-mutation-{index}"),
+                "stale-disk-return-detect",
+                kind,
+                &format!("post-checker-key-{index}"),
+                &format!("post-checker-version-{index}"),
+                value_sha256,
+                600 + index,
+            ));
+            assert!(
+                proof
+                    .validate_against_history(&history_with_suffix)
+                    .is_err(),
+                "post-return checker must reject any PUT, DELETE, or MPU suffix outside its quiesced history"
+            );
+        }
+
         let mut forged_detach = proof.clone();
         let mut detach_receipt = serde_json::from_str::<RustfsStaleDiskOperationReceipt>(
             &forged_detach.lifecycle_evidence.detach.response_body,
@@ -5298,17 +5512,16 @@ mod tests {
         mutate_host_watch(
             &mut missing_ack_sample.absence_observations[0],
             |response| {
-                response.poll_interval_ms = HOST_DISK_WATCH_MAX_POLL_INTERVAL_MS;
                 response
                     .samples
-                    .retain(|sample| sample.observed_at_ms != 300);
+                    .retain(|sample| sample.observed_at_ms != 320);
             },
         );
         assert!(
             missing_ack_sample
                 .validate_against_history(&history)
                 .is_err(),
-            "bounded absence polling must include an exact sample for every mutation ACK"
+            "bounded absence polling cannot leave a gap around a mutation ACK"
         );
 
         let mut wrong_host_node = proof.clone();
@@ -5316,8 +5529,8 @@ mod tests {
             let sample = response
                 .samples
                 .iter_mut()
-                .find(|sample| sample.observed_at_ms == 300)
-                .expect("ACK-time host sample");
+                .find(|sample| sample.observed_at_ms == 320)
+                .expect("host sample bounding an ACK");
             let mut raw =
                 serde_json::from_str::<RawDiskStateResponse>(&sample.raw_evidence.response_body)
                     .expect("raw host response");
@@ -5332,6 +5545,40 @@ mod tests {
         assert!(
             wrong_host_node.validate_against_history(&history).is_err(),
             "host absence from another node cannot stand in for the target mount namespace"
+        );
+
+        let mut wrong_helper_binding = proof.clone();
+        mutate_host_watch(
+            &mut wrong_helper_binding.absence_observations[0],
+            |response| {
+                let sample = response
+                    .samples
+                    .iter_mut()
+                    .find(|sample| sample.observed_at_ms == 320)
+                    .expect("host sample bounding an ACK");
+                let mut raw = serde_json::from_str::<RawDiskStateResponse>(
+                    &sample.raw_evidence.response_body,
+                )
+                .expect("raw host response");
+                let RawDiskStateResponse::HostDevice { execution, .. } = &mut raw;
+                let mut helper =
+                    serde_json::from_str::<serde_json::Value>(&execution.helper_pod_body)
+                        .expect("raw helper Pod");
+                helper["spec"]["nodeName"] = serde_json::json!("wrong-node");
+                execution.helper_pod_body = serde_json::to_string(&helper).expect("raw helper Pod");
+                execution.helper_pod_sha256 = sha256_bytes(execution.helper_pod_body.as_bytes());
+                sample.raw_evidence.response_body =
+                    serde_json::to_string(&raw).expect("raw host response");
+                sample.raw_evidence.response_sha256 =
+                    sha256_bytes(sample.raw_evidence.response_body.as_bytes());
+                sample.cursor = sample.raw_evidence.response_sha256.clone();
+            },
+        );
+        assert!(
+            wrong_helper_binding
+                .validate_against_history(&history)
+                .is_err(),
+            "raw helper Pod evidence must bind host execution to the target node"
         );
 
         let mut wrong_local_pv = proof.clone();
@@ -5405,7 +5652,10 @@ mod tests {
                 returned_at_ms: 450,
                 detachment_operation_id: "detach-1".to_string(),
                 reattachment_operation_id: "reattach-1".to_string(),
-                lifecycle_evidence: stale_disk_lifecycle_evidence(&volume("old", 100)),
+                lifecycle_evidence: stale_disk_lifecycle_evidence(
+                    &volume("old", 100),
+                    &volume("new", 500),
+                ),
                 absence_observations: vec![absence_observation(
                     &volume("old", 100),
                     "absence-watch",
@@ -5434,11 +5684,11 @@ mod tests {
         let reconnect_sample = reconnected_response
             .samples
             .iter_mut()
-            .find(|sample| sample.observed_at_ms == 300)
-            .expect("ACK-time host sample");
+            .find(|sample| sample.observed_at_ms == 320)
+            .expect("host sample bounding an ACK");
         reconnect_sample.state = DiskPresenceState::Present;
         reconnect_sample.raw_evidence =
-            raw_disk_state_evidence(&volume("old", 100), DiskPresenceState::Present, 300);
+            raw_disk_state_evidence(&volume("old", 100), DiskPresenceState::Present, 320);
         reconnect_sample.cursor = reconnect_sample.raw_evidence.response_sha256.clone();
         reconnected.host_watch_evidence.response_body =
             serde_json::to_string(&reconnected_response).expect("host watch response");
@@ -5470,15 +5720,15 @@ mod tests {
         assert!(
             StaleDiskReturnProof::prove(
                 identity("stale-disk-return-detect"),
-                original,
-                returned,
+                original.clone(),
+                returned.clone(),
                 StaleDiskReturnEvidence {
                     detached_at_ms: 200,
                     mutation_window_ended_at_ms: 400,
                     returned_at_ms: 450,
                     detachment_operation_id: "detach-1".to_string(),
                     reattachment_operation_id: "reattach-1".to_string(),
-                    lifecycle_evidence: stale_disk_lifecycle_evidence(&volume("old", 100)),
+                    lifecycle_evidence: stale_disk_lifecycle_evidence(&original, &returned),
                     absence_observations: vec![reconnected],
                     committed_mutations: vec![
                         CommittedMutationEvidence {
