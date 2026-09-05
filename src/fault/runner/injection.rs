@@ -16,9 +16,14 @@ use crate::fault::{reporting::FaultStatusSnapshot, workload::StagedMultipartUplo
 use crate::framework::port_forward::PortForwardGuard;
 use crate::{
     fault::{
-        events::RunEventStatus, fault_lifecycle::AppliedFault, history::DurabilityCohort,
+        events::RunEventStatus,
+        fault_lifecycle::AppliedFault,
+        history::DurabilityCohort,
         quorum::require_fresh_runtime_observation,
-        scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+        scenarios::{
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, requires_prefault_multipart_staging,
+        },
     },
     framework::resources,
 };
@@ -27,8 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::access::ensure_s3_access;
 use super::targets::{
-    FixedVolumeTargets, fixed_volume_target_count, require_active_fixed_volume_targets,
-    require_active_write_quorum_partition,
+    FixedVolumeTargets, require_active_fixed_volume_targets, require_active_write_quorum_partition,
 };
 use super::{
     ActiveFault, FaultRun, FaultWorkload, PreparedWorkload, ProvenTarget, WorkloadTargetEvidence,
@@ -36,7 +40,8 @@ use super::{
 };
 use crate::fault::backends::runtime::apply_fault;
 use crate::fault::workload::execution::{
-    MixedWorkloadRequest, MixedWorkloadResult, run_mixed_workload, run_warp_mixed,
+    MixedWorkloadRequest, MixedWorkloadResult, require_typed_quorum_read_survival,
+    run_mixed_workload, run_warp_mixed,
 };
 
 impl FaultRun<'_> {
@@ -52,6 +57,7 @@ impl FaultRun<'_> {
             target_proof,
             topology_observed_at_ms,
             host_storage_proof,
+            execution_injection,
         } = target;
         events.record(
             "fault-apply",
@@ -80,9 +86,9 @@ impl FaultRun<'_> {
             config,
             collector,
             scenario,
-            plan,
             run_id,
             host_storage_proof.as_ref(),
+            execution_injection,
         ) {
             Ok(fault) => fault,
             Err(error) => {
@@ -133,11 +139,16 @@ impl FaultRun<'_> {
             pods: fixed_volume_pods_at_fault_activation,
             records: active_fixed_volume_targets,
             containers: active_fixed_volume_containers,
-        } = if fixed_volume_target_count(plan).is_some() {
+        } = if matches!(
+            execution_injection.selection(),
+            crate::fault::plan::FaultSelection::FixedTargets(_)
+        ) && execution_injection.rustfs_volume_path().is_ok()
+        {
             match require_active_fixed_volume_targets(
                 config,
                 run_id,
-                plan,
+                execution_injection,
+                &plan.scenario,
                 pods_before,
                 target_proof,
                 &active_snapshots,
@@ -252,8 +263,7 @@ impl FaultRun<'_> {
             start_index: scenario.prefill_count(),
             count: scenario.mixed_workload_count(),
             ranged_get_percent: config.workload_ranged_get_percent,
-            staged_multipart_uploads: (plan.scenario
-                == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO)
+            staged_multipart_uploads: requires_prefault_multipart_staging(&plan.scenario)
                 .then_some(staged_multipart_uploads),
             deadline: self.deadline,
         })
@@ -283,7 +293,12 @@ impl FaultRun<'_> {
             "workload-summary.json",
             &serde_json::to_string_pretty(&workload.summary)?,
         )?;
-        let require_client_disruption = self.require_workload_impact(&workload, fault)?;
+        let require_client_disruption = self.require_workload_impact(
+            &workload,
+            fault,
+            workload_started_at_ms,
+            workload_ended_at_ms,
+        )?;
         events.record(
             "fault-snapshot-after-workload",
             RunEventStatus::Started,
@@ -463,11 +478,16 @@ impl FaultRun<'_> {
             pods: fixed_volume_pods_at_workload_snapshot,
             records: workload_fixed_volume_targets,
             containers: workload_fixed_volume_containers,
-        } = if fixed_volume_target_count(plan).is_some() {
+        } = if matches!(
+            target.execution_injection.selection(),
+            crate::fault::plan::FaultSelection::FixedTargets(_)
+        ) && target.execution_injection.rustfs_volume_path().is_ok()
+        {
             let validation = require_active_fixed_volume_targets(
                 config,
                 run_id,
-                plan,
+                &target.execution_injection,
+                &plan.scenario,
                 pods_before,
                 target_proof,
                 workload_snapshots,
@@ -571,6 +591,8 @@ impl FaultRun<'_> {
         &self,
         workload: &MixedWorkloadResult,
         fault: &AppliedFault,
+        workload_started_at_ms: u64,
+        workload_ended_at_ms: u64,
     ) -> Result<bool> {
         let config = self.config;
         let plan = self.plan;
@@ -582,8 +604,21 @@ impl FaultRun<'_> {
             .summary
             .require_fault_evidence(require_client_disruption)
             .and_then(|()| {
-                if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+                if matches!(
+                    plan.scenario.as_str(),
+                    NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+                        | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+                ) {
                     workload.summary.require_write_quorum_loss_effect()
+                } else if plan.scenario == QUORUM_P_IO_FAULT_SCENARIO {
+                    require_typed_quorum_read_survival(
+                        &self.context.history.records(),
+                        &plan.scenario,
+                        &self.context.bucket,
+                        plan.fault().parameters().quorum_case()?,
+                        workload_started_at_ms,
+                        workload_ended_at_ms,
+                    )
                 } else {
                     Ok(())
                 }

@@ -52,6 +52,199 @@ pub enum PersistedVersionClass {
     ZeroLengthObject,
 }
 
+/// The persisted S3 representation whose quorum boundary a volume fault must
+/// exercise. Payload and metadata objects use different parity rules in
+/// RustFS, so callers must select one explicitly rather than reusing a single
+/// hard-coded target count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QuorumCaseClass {
+    Payload,
+    Metadata,
+}
+
+impl QuorumCaseClass {
+    pub fn requirements(self, shape: &ErasureSetShape) -> Result<QuorumRequirements> {
+        match self {
+            Self::Payload => shape.payload_quorum(),
+            Self::Metadata => QuorumRequirements::for_persisted_version(
+                shape.total_shards,
+                shape.payload_parity_shards,
+                PersistedVersionClass::DeleteMarker,
+            ),
+        }
+    }
+}
+
+/// A semantic volume selection resolved only after the live RustFS erasure
+/// geometry has been authenticated and proven fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumVolumeBoundary {
+    pub class: QuorumCaseClass,
+    pub beyond_read_tolerance: bool,
+}
+
+impl QuorumVolumeBoundary {
+    pub fn target_count(self, shape: &ErasureSetShape) -> Result<u32> {
+        let requirements = self.class.requirements(shape)?;
+        let target_count = requirements
+            .read_tolerance
+            .checked_add(u32::from(self.beyond_read_tolerance))
+            .ok_or_else(|| anyhow::anyhow!("quorum volume target count overflow"))?;
+        ensure!(
+            target_count > 0 && target_count < shape.total_shards,
+            "quorum volume target count {target_count} must leave at least one shard online"
+        );
+        Ok(target_count)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumVolumeBinding {
+    pub pod_name: String,
+    pub pod_uid: String,
+    pub container_id: String,
+    pub mount_path: String,
+    pub persistent_volume_claim: String,
+    pub persistent_volume: String,
+    pub drive_uuid: String,
+    pub pool_index: u32,
+    pub set_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumVolumeTargetProof {
+    pub boundary: QuorumVolumeBoundary,
+    pub requirements: QuorumRequirements,
+    pub target_count: u32,
+    pub candidates: Vec<QuorumVolumeBinding>,
+}
+
+impl QuorumVolumeTargetProof {
+    pub fn from_runtime(
+        shape: &ErasureSetShape,
+        membership: &ErasureSetMembership,
+        boundary: QuorumVolumeBoundary,
+        mut candidates: Vec<QuorumVolumeBinding>,
+    ) -> Result<Self> {
+        candidates.sort_by(|left, right| left.pod_name.cmp(&right.pod_name));
+        let proof = Self {
+            boundary,
+            requirements: boundary.class.requirements(shape)?,
+            target_count: boundary.target_count(shape)?,
+            candidates,
+        };
+        proof.validate(shape, membership)?;
+        Ok(proof)
+    }
+
+    pub fn validate(
+        &self,
+        shape: &ErasureSetShape,
+        membership: &ErasureSetMembership,
+    ) -> Result<()> {
+        shape.validate()?;
+        membership.validate(shape)?;
+        ensure!(
+            shape.volumes_per_server == 1 && shape.server_count == shape.total_shards,
+            "volume quorum proof requires exactly one RustFS volume per server"
+        );
+        ensure!(
+            self.requirements == self.boundary.class.requirements(shape)?,
+            "volume quorum requirements do not match the typed runtime geometry"
+        );
+        ensure!(
+            self.target_count == self.boundary.target_count(shape)?,
+            "volume quorum target count does not match the runtime geometry"
+        );
+        ensure!(
+            self.candidates.len() == usize::try_from(shape.total_shards)?,
+            "volume quorum proof must bind every shard candidate"
+        );
+
+        let unique = |values: Vec<&str>, label: &str| -> Result<()> {
+            ensure!(
+                values.iter().all(|value| !value.trim().is_empty())
+                    && values.iter().copied().collect::<BTreeSet<_>>().len() == values.len(),
+                "volume quorum proof requires unique non-empty {label}"
+            );
+            Ok(())
+        };
+        unique(
+            self.candidates
+                .iter()
+                .map(|binding| binding.pod_name.as_str())
+                .collect(),
+            "Pod names",
+        )?;
+        unique(
+            self.candidates
+                .iter()
+                .map(|binding| binding.pod_uid.as_str())
+                .collect(),
+            "Pod UIDs",
+        )?;
+        unique(
+            self.candidates
+                .iter()
+                .map(|binding| binding.container_id.as_str())
+                .collect(),
+            "container IDs",
+        )?;
+        unique(
+            self.candidates
+                .iter()
+                .map(|binding| binding.persistent_volume_claim.as_str())
+                .collect(),
+            "PVC names",
+        )?;
+        unique(
+            self.candidates
+                .iter()
+                .map(|binding| binding.persistent_volume.as_str())
+                .collect(),
+            "PV names",
+        )?;
+        unique(
+            self.candidates
+                .iter()
+                .map(|binding| binding.drive_uuid.as_str())
+                .collect(),
+            "drive UUIDs",
+        )?;
+
+        let members = membership
+            .members
+            .iter()
+            .map(|member| (member.pod_name.as_str(), member))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for binding in &self.candidates {
+            ensure!(
+                binding.pool_index == shape.pool_index
+                    && binding.set_index == shape.set_index
+                    && !binding.mount_path.trim().is_empty(),
+                "volume quorum binding for Pod {:?} is outside the proven set or has no mount",
+                binding.pod_name
+            );
+            let member = members.get(binding.pod_name.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "volume quorum binding Pod {:?} is absent from runtime membership",
+                    binding.pod_name
+                )
+            })?;
+            ensure!(
+                member.shard_ids.as_slice() == [binding.drive_uuid.as_str()],
+                "volume quorum binding for Pod {:?} does not identify its sole runtime drive UUID",
+                binding.pod_name
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuorumRequirements {
@@ -420,9 +613,108 @@ impl ErasureSetShape {
 mod tests {
     use super::{
         ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape,
-        PersistedVersionClass, QuorumMutationClass, QuorumRequirements,
+        PersistedVersionClass, QuorumCaseClass, QuorumMutationClass, QuorumRequirements,
+        QuorumVolumeBinding, QuorumVolumeBoundary, QuorumVolumeTargetProof,
         require_fresh_runtime_observation,
     };
+
+    #[test]
+    fn semantic_volume_boundaries_resolve_from_runtime_geometry() {
+        let shape =
+            ErasureSetShape::from_runtime_single_set(8, 1, &[1], &[8], 2).expect("runtime shape");
+
+        assert_eq!(
+            QuorumVolumeBoundary {
+                class: QuorumCaseClass::Payload,
+                beyond_read_tolerance: false,
+            }
+            .target_count(&shape)
+            .expect("payload P"),
+            2
+        );
+        assert_eq!(
+            QuorumVolumeBoundary {
+                class: QuorumCaseClass::Payload,
+                beyond_read_tolerance: true,
+            }
+            .target_count(&shape)
+            .expect("payload P+1"),
+            3
+        );
+        assert_eq!(
+            QuorumVolumeBoundary {
+                class: QuorumCaseClass::Metadata,
+                beyond_read_tolerance: false,
+            }
+            .target_count(&shape)
+            .expect("metadata P"),
+            4
+        );
+        assert_eq!(
+            QuorumVolumeBoundary {
+                class: QuorumCaseClass::Metadata,
+                beyond_read_tolerance: true,
+            }
+            .target_count(&shape)
+            .expect("metadata P+1"),
+            5
+        );
+    }
+
+    #[test]
+    fn volume_quorum_proof_requires_complete_unique_one_volume_bindings() {
+        let shape =
+            ErasureSetShape::from_runtime_single_set(4, 1, &[1], &[4], 2).expect("runtime shape");
+        let membership = ErasureSetMembership::from_runtime(
+            &shape,
+            (0..4)
+                .map(|index| ErasureSetMember {
+                    pod_name: format!("rustfs-{index}"),
+                    server_endpoint: format!("http://rustfs-{index}:9000"),
+                    shard_ids: vec![format!("drive-{index}")],
+                })
+                .collect(),
+        )
+        .expect("membership");
+        let candidates = (0..4)
+            .map(|index| QuorumVolumeBinding {
+                pod_name: format!("rustfs-{index}"),
+                pod_uid: format!("uid-{index}"),
+                container_id: format!("containerd://container-{index}"),
+                mount_path: "/data/rustfs0".to_string(),
+                persistent_volume_claim: format!("data-rustfs-{index}"),
+                persistent_volume: format!("pv-{index}"),
+                drive_uuid: format!("drive-{index}"),
+                pool_index: 0,
+                set_index: 0,
+            })
+            .collect::<Vec<_>>();
+        let boundary = QuorumVolumeBoundary {
+            class: QuorumCaseClass::Metadata,
+            beyond_read_tolerance: false,
+        };
+
+        let proof = QuorumVolumeTargetProof::from_runtime(
+            &shape,
+            &membership,
+            boundary,
+            candidates.clone(),
+        )
+        .expect("complete proof");
+        assert_eq!(proof.target_count, 2);
+
+        let mut missing = candidates.clone();
+        missing.pop();
+        assert!(
+            QuorumVolumeTargetProof::from_runtime(&shape, &membership, boundary, missing).is_err()
+        );
+        let mut duplicate_drive = candidates;
+        duplicate_drive[3].drive_uuid = duplicate_drive[2].drive_uuid.clone();
+        assert!(
+            QuorumVolumeTargetProof::from_runtime(&shape, &membership, boundary, duplicate_drive,)
+                .is_err()
+        );
+    }
 
     #[test]
     fn mutations_and_persisted_versions_use_distinct_boundaries() {

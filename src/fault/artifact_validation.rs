@@ -57,7 +57,7 @@ use crate::fault::{
         FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunFaultSpec,
         FaultRunSpec, FaultRunTargetSpec,
     },
-    workload::WorkloadPlan,
+    workload::{WorkloadPlan, execution::require_typed_quorum_read_survival},
 };
 
 #[derive(Debug, Clone)]
@@ -800,19 +800,42 @@ fn validate_fault_artifacts_with_identity(
         summary.disrupted()? == evidence.client_disruptions,
         "fault-evidence.json client_disruptions does not match workload-summary.json"
     );
-    if options.scenario == scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+    if matches!(
+        options.scenario.as_str(),
+        scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+            | scenarios::QUORUM_P_IO_FAULT_SCENARIO
+            | scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+    ) {
         let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
-        summary.require_write_quorum_loss_effect(
-            &history,
-            &metadata.scenario,
-            &json_spec.metadata.bucket,
-            evidence
-                .workload_started_at_ms
-                .context("fault-evidence.json workload_started_at_ms is required")?,
-            evidence
-                .workload_ended_at_ms
-                .context("fault-evidence.json workload_ended_at_ms is required")?,
-        )?;
+        let workload_started_at_ms = evidence
+            .workload_started_at_ms
+            .context("fault-evidence.json workload_started_at_ms is required")?;
+        let workload_ended_at_ms = evidence
+            .workload_ended_at_ms
+            .context("fault-evidence.json workload_ended_at_ms is required")?;
+        if options.scenario == scenarios::QUORUM_P_IO_FAULT_SCENARIO {
+            require_typed_quorum_read_survival(
+                &history,
+                &metadata.scenario,
+                &json_spec.metadata.bucket,
+                json_spec
+                    .faults
+                    .first()
+                    .context("runtime quorum run-spec has no fault")?
+                    .parameters
+                    .quorum_case()?,
+                workload_started_at_ms,
+                workload_ended_at_ms,
+            )?;
+        } else {
+            summary.require_write_quorum_loss_effect(
+                &history,
+                &metadata.scenario,
+                &json_spec.metadata.bucket,
+                workload_started_at_ms,
+                workload_ended_at_ms,
+            )?;
+        }
     }
 
     Ok(ArtifactValidationReport {
@@ -931,8 +954,8 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
             fault.name
         );
         ensure!(
-            fault.selection.value > 0,
-            "run-spec fault {} has zero selection value",
+            fault.selection.value > 0 || fault.selection.kind == "runtime-quorum",
+            "run-spec fault {} has zero selection value outside a semantic runtime quorum selection",
             fault.name
         );
         ensure!(
@@ -1193,9 +1216,20 @@ fn validate_target_proof(
             .path
             .as_deref()
             .context("fixed volume path is missing")?;
+        let expected_targets = if fault.selection.kind == "runtime-quorum" {
+            proof
+                .faults
+                .iter()
+                .find_map(|fault| fault.erasure_set.as_ref())
+                .and_then(|proof| proof.volume_quorum.as_ref())
+                .map(|proof| proof.target_count)
+                .context("runtime quorum target proof is missing its resolved volume count")?
+        } else {
+            fault.selection.value
+        };
         ensure!(
-            fault.selection.value > 0
-                && proof.resolved_pods.len() >= usize::try_from(fault.selection.value)?
+            expected_targets > 0
+                && proof.resolved_pods.len() >= usize::try_from(expected_targets)?
                 && proof
                     .resolved_pods
                     .iter()
@@ -1309,6 +1343,28 @@ fn validate_target_proof(
                         fault.name
                     )
                 })?;
+        } else if spec_fault.selection.kind == "runtime-quorum" {
+            let volume_quorum = erasure_set.volume_quorum.as_ref().with_context(|| {
+                format!(
+                    "target-proof.json fault {} lacks runtime volume quorum bindings",
+                    fault.name
+                )
+            })?;
+            volume_quorum.validate(shape, membership).with_context(|| {
+                format!(
+                    "target-proof.json fault {} has invalid volume quorum bindings",
+                    fault.name
+                )
+            })?;
+            let class = spec_fault.parameters.quorum_case()?;
+            ensure!(
+                volume_quorum.boundary.class == class
+                    && volume_quorum.boundary.beyond_read_tolerance
+                        == (spec_fault.selection.value == 1)
+                    && spec_fault.selection.value <= 1,
+                "target-proof.json fault {} typed quorum boundary does not match run-spec",
+                fault.name
+            );
         }
     }
     Ok(())
@@ -1628,7 +1684,10 @@ fn fixed_volume_fault(spec: &FaultRunSpec) -> Option<&FaultRunFaultSpec> {
         return None;
     };
     (fault.target.kind == "rustfs-volume"
-        && fault.selection.kind == "fixed-targets"
+        && matches!(
+            fault.selection.kind.as_str(),
+            "fixed-targets" | "runtime-quorum"
+        )
         && matches!(
             fault.kind.as_str(),
             "rustfs_volume_io_error"
@@ -1646,7 +1705,33 @@ fn validate_fixed_volume_runtime_evidence(
 ) -> Result<()> {
     let fault = fixed_volume_fault(spec)
         .context("fixed volume runtime proof requires one fixed-target volume fault")?;
-    let injection = fixed_volume_injection_from_run_spec(fault)?;
+    let volume_quorum = if fault.selection.kind == "runtime-quorum" {
+        let erasure_set = proof
+            .faults
+            .iter()
+            .find_map(|fault| fault.erasure_set.as_ref())
+            .context("runtime quorum target proof has no erasure-set evidence")?;
+        let shape = erasure_set
+            .shape
+            .as_ref()
+            .context("runtime quorum target proof has no erasure-set shape")?;
+        let membership = erasure_set
+            .membership
+            .as_ref()
+            .context("runtime quorum target proof has no erasure-set membership")?;
+        let quorum = erasure_set
+            .volume_quorum
+            .as_ref()
+            .context("runtime quorum target proof has no volume bindings")?;
+        quorum.validate(shape, membership)?;
+        Some(quorum)
+    } else {
+        None
+    };
+    let expected_target_count = volume_quorum
+        .map(|proof| proof.target_count)
+        .unwrap_or(fault.selection.value);
+    let injection = fixed_volume_injection_from_run_spec(fault, expected_target_count)?;
     let runtime_contract =
         crate::fault::backends::chaos_mesh::volume_fault_runtime_contract(&injection)?;
     ensure!(
@@ -1658,7 +1743,7 @@ fn validate_fixed_volume_runtime_evidence(
         .path
         .as_deref()
         .context("fixed volume run-spec target has no path")?;
-    let expected_count = usize::try_from(fault.selection.value)?;
+    let expected_count = usize::try_from(expected_target_count)?;
     let before_identities = unique_pod_identities(
         "fault-evidence.json pods_before",
         evidence
@@ -1711,7 +1796,7 @@ fn validate_fixed_volume_runtime_evidence(
         active_targets.len() == expected_count
             && active_targets.len() == evidence.fixed_volume_targets_at_fault_activation.len(),
         "fault-evidence.json must persist exactly {} unique active fixed volume targets",
-        fault.selection.value
+        expected_target_count
     );
     ensure!(
         workload_targets == active_targets
@@ -1740,6 +1825,30 @@ fn validate_fixed_volume_runtime_evidence(
         active_identity_pods == selected_pods,
         "fault-evidence.json selected Pod identities do not match controller target names"
     );
+    if let Some(quorum) = volume_quorum {
+        let selected_names = active_identities
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<BTreeSet<_>>();
+        let selected_drives = quorum
+            .candidates
+            .iter()
+            .filter(|binding| selected_names.contains(binding.pod_name.as_str()))
+            .map(|binding| binding.drive_uuid.as_str())
+            .collect::<BTreeSet<_>>();
+        let non_target_drives = quorum
+            .candidates
+            .iter()
+            .filter(|binding| !selected_names.contains(binding.pod_name.as_str()))
+            .map(|binding| binding.drive_uuid.as_str())
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            selected_drives.len() == expected_count
+                && selected_drives.is_disjoint(&non_target_drives)
+                && selected_drives.len() + non_target_drives.len() == quorum.candidates.len(),
+            "runtime quorum evidence does not prove the complete selected/non-target drive partition"
+        );
+    }
     let selected_pod_names = active_identities
         .iter()
         .map(|(name, _)| name.clone())
@@ -1805,7 +1914,7 @@ fn validate_fixed_volume_runtime_evidence(
                 run_id: &spec.metadata.run_id,
                 scenario: &spec.scenario.name,
                 volume_path,
-                expected_targets: fault.selection.value,
+                expected_targets: expected_target_count,
                 candidate_pod_ids: &candidate_pod_ids,
                 runtime: &runtime_contract,
             },
@@ -1819,7 +1928,10 @@ fn validate_fixed_volume_runtime_evidence(
     Ok(())
 }
 
-fn fixed_volume_injection_from_run_spec(fault: &FaultRunFaultSpec) -> Result<FaultInjection> {
+fn fixed_volume_injection_from_run_spec(
+    fault: &FaultRunFaultSpec,
+    expected_target_count: u32,
+) -> Result<FaultInjection> {
     let kind = match fault.kind.as_str() {
         "rustfs_volume_io_error" => FaultKind::RustfsVolumeIoError,
         "rustfs_volume_latency" => FaultKind::RustfsVolumeLatency,
@@ -1836,7 +1948,7 @@ fn fixed_volume_injection_from_run_spec(fault: &FaultRunFaultSpec) -> Result<Fau
         kind,
         crate::fault::scenarios::FaultBackend::ChaosMeshIoChaos,
         FaultTarget::RustfsVolume { path: volume_path },
-        FaultSelection::FixedTargets(fault.selection.value),
+        FaultSelection::FixedTargets(expected_target_count),
         Duration::from_secs(fault.fault_duration_seconds),
         fault.parameters.clone(),
     )
@@ -3220,21 +3332,27 @@ mod tests {
             HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
             HostStoragePostCleanupObservation, HostStorageTargetObservation,
         },
-        plan::{FaultInjection, FaultKind, FaultPlan, FaultSelection, FaultTarget},
+        plan::{
+            FaultInjection, FaultInjectionParameters, FaultKind, FaultPlan, FaultPlanOptions,
+            FaultSelection, FaultTarget,
+        },
         preflight::{
             TargetNodeAffinityProof, TargetNodeSelectorRequirementProof,
             TargetNodeSelectorTermProof, TargetPersistentVolumeClaimProof,
             TargetPersistentVolumeProof, TargetProof, TargetResolvedPodProof,
             TargetVolumeMountProof,
         },
-        quorum::{ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape},
+        quorum::{
+            ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape,
+            QuorumCaseClass, QuorumVolumeBinding, QuorumVolumeBoundary, QuorumVolumeTargetProof,
+        },
         reporting::{
             AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity,
             FailureVerdict, ResponsibilityDomain,
         },
         scenarios::{
             DM_FLAKEY_SCENARIO, FaultScenario, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
-            scenario_spec,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, apply_catalog_defaults, scenario_spec,
         },
         spec::{FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec},
         workload::WorkloadPlan,
@@ -3922,6 +4040,132 @@ mod tests {
             .expect("pv")
             .device_or_path = None;
         assert!(validate_target_proof(&missing_device, &run_spec, &options).is_err());
+    }
+
+    #[test]
+    fn runtime_quorum_artifacts_bind_typed_boundary_to_every_volume() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO.to_string();
+        config.scenario_parameters = FaultInjectionParameters::QuorumIo {
+            class: QuorumCaseClass::Metadata,
+        };
+        apply_catalog_defaults(&mut config).expect("quorum defaults");
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario_with_options(
+            &scenario,
+            catalog,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("semantic plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let run_spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+        let shape =
+            ErasureSetShape::from_runtime_single_set(4, 1, &[1], &[4], 2).expect("runtime shape");
+        let membership = ErasureSetMembership::from_runtime(
+            &shape,
+            (0..4)
+                .map(|index| ErasureSetMember {
+                    pod_name: format!("rustfs-{index}"),
+                    server_endpoint: format!("http://rustfs-{index}:9000"),
+                    shard_ids: vec![format!("drive-{index}")],
+                })
+                .collect(),
+        )
+        .expect("runtime membership");
+        let pods = (0..4)
+            .map(|index| {
+                TargetResolvedPodProof::new(format!("rustfs-{index}"), format!("uid-{index}"))
+                    .with_node(format!("node-{index}"))
+                    .with_node_labels(BTreeMap::from([(
+                        "kubernetes.io/hostname".to_string(),
+                        format!("node-{index}"),
+                    )]))
+                    .with_ready(true)
+                    .with_rustfs_container_id(format!("containerd://rustfs-{index}"))
+                    .with_volume_mounts(vec![TargetVolumeMountProof {
+                        container_name: "rustfs".to_string(),
+                        mount_path: "/data/rustfs0".to_string(),
+                        volume_name: format!("data-{index}"),
+                        persistent_volume_claim: Some(format!("data-{index}")),
+                    }])
+                    .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
+                        name: format!("data-{index}"),
+                        volume_name: Some(format!("pv-{index}")),
+                        storage_class: Some("fast-csi".to_string()),
+                        persistent_volume: Some(TargetPersistentVolumeProof {
+                            name: format!("pv-{index}"),
+                            source: Some("csi".to_string()),
+                            required_node_affinity: None,
+                            node: None,
+                            device_or_path: Some(format!("csi://volume-{index}")),
+                        }),
+                    }])
+            })
+            .collect::<Vec<_>>();
+        let boundary = QuorumVolumeBoundary {
+            class: QuorumCaseClass::Metadata,
+            beyond_read_tolerance: true,
+        };
+        let volume_quorum = QuorumVolumeTargetProof::from_runtime(
+            &shape,
+            &membership,
+            boundary,
+            (0..4)
+                .map(|index| QuorumVolumeBinding {
+                    pod_name: format!("rustfs-{index}"),
+                    pod_uid: format!("uid-{index}"),
+                    container_id: format!("containerd://rustfs-{index}"),
+                    mount_path: "/data/rustfs0".to_string(),
+                    persistent_volume_claim: format!("data-{index}"),
+                    persistent_volume: format!("pv-{index}"),
+                    drive_uuid: format!("drive-{index}"),
+                    pool_index: 0,
+                    set_index: 0,
+                })
+                .collect(),
+        )
+        .expect("volume quorum proof");
+        assert_eq!(volume_quorum.target_count, 3);
+        let proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs(pods)
+            .with_erasure_set_topology_proven(
+                shape,
+                ErasureSetHealth::from_runtime(4, 4, 0, 0).expect("runtime health"),
+                membership,
+                "deployment-1",
+                100,
+            )
+            .expect("topology proof")
+            .with_volume_quorum_proven(volume_quorum)
+            .expect("drive binding proof");
+        let options = ArtifactValidationOptions {
+            scenario: scenario.name.clone(),
+            artifact_root: std::path::PathBuf::from("unused"),
+            expected_workload_objects: scenario.object_count,
+            expected_workload_concurrency: config.workload.concurrency,
+            expected_workload_versioning: true,
+            expected_rustfs_pod_count: config.expected_rustfs_pod_count,
+            expected_stable_window_seconds: config.rustfs_pod_stable_window.as_secs(),
+            expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
+            expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
+        };
+
+        validate_run_spec(&run_spec, &options).expect("semantic run spec");
+        validate_target_proof(&proof, &run_spec, &options).expect("runtime quorum target proof");
+
+        let mut wrong_boundary = run_spec;
+        wrong_boundary.faults[0].selection.value = 0;
+        assert!(validate_target_proof(&proof, &wrong_boundary, &options).is_err());
     }
 
     #[test]

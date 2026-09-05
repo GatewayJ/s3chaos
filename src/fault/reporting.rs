@@ -148,7 +148,7 @@ impl RunMetadata {
                 .iter()
                 .find_map(|fault| match fault.selection() {
                     FaultSelection::Percent(percent) => Some(percent),
-                    FaultSelection::FixedTargets(_) => None,
+                    FaultSelection::FixedTargets(_) | FaultSelection::RuntimeQuorum(_) => None,
                 }),
             fault_selection: plan
                 .faults()

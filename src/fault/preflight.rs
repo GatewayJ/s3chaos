@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,7 +22,7 @@ use std::{
 use crate::fault::{
     config::FaultTestConfig,
     plan::{FaultPlan, FaultTarget},
-    quorum::{ErasureSetHealth, ErasureSetMembership, ErasureSetShape},
+    quorum::{ErasureSetHealth, ErasureSetMembership, ErasureSetShape, QuorumVolumeTargetProof},
     reporting::ResponsibilityDomain,
     scenarios::{FaultScenario, FaultScenarioSpec},
 };
@@ -242,6 +242,8 @@ pub struct TargetErasureSetProof {
     pub health: Option<ErasureSetHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub membership: Option<ErasureSetMembership>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_quorum: Option<QuorumVolumeTargetProof>,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub observed_at_ms: u64,
     pub note: String,
@@ -503,6 +505,7 @@ impl TargetProof {
                 proof.shape = Some(shape.clone());
                 proof.health = Some(health);
                 proof.membership = Some(membership.clone());
+                proof.volume_quorum = None;
                 proof.observed_at_ms = observed_at_ms;
                 proof.note = ERASURE_SET_PROOF_RESOLVED_NOTE.to_string();
             }
@@ -511,6 +514,55 @@ impl TargetProof {
             if requirement.name == ERASURE_SET_PROOF_REQUIREMENT {
                 requirement.status = PreflightStatus::Passed;
                 requirement.message = ERASURE_SET_PROOF_RESOLVED_NOTE.to_string();
+            }
+        }
+        self.generated_at_ms = now_ms();
+        self.status = if self
+            .requirements
+            .iter()
+            .any(|requirement| requirement.status == PreflightStatus::Failed)
+        {
+            TargetProofStatus::Missing
+        } else {
+            TargetProofStatus::Satisfied
+        };
+        Ok(self)
+    }
+
+    pub fn with_volume_quorum_proven(mut self, quorum: QuorumVolumeTargetProof) -> Result<Self> {
+        let erasure_set = self
+            .faults
+            .iter_mut()
+            .find_map(|fault| fault.erasure_set.as_mut())
+            .context("target proof does not contain erasure-set evidence")?;
+        let shape = erasure_set
+            .shape
+            .as_ref()
+            .context("target proof erasure-set shape is unresolved")?;
+        let membership = erasure_set
+            .membership
+            .as_ref()
+            .context("target proof erasure-set membership is unresolved")?;
+        quorum.validate(shape, membership)?;
+        let proof_pods = self
+            .resolved_pods
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str()))
+            .collect::<BTreeSet<_>>();
+        let binding_pods = quorum
+            .candidates
+            .iter()
+            .map(|binding| (binding.pod_name.as_str(), binding.pod_uid.as_str()))
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            proof_pods == binding_pods,
+            "volume quorum bindings do not cover the exact resolved Pod identities"
+        );
+        erasure_set.volume_quorum = Some(quorum);
+        for requirement in &mut self.requirements {
+            if requirement.name == "volume_quorum_bindings" {
+                requirement.status = PreflightStatus::Passed;
+                requirement.message = "bound every one-volume-per-server Pod/container/PVC/PV/mount to its sole RustFS drive UUID and resolved the typed quorum target count".to_string();
             }
         }
         self.generated_at_ms = now_ms();
@@ -648,6 +700,17 @@ impl TargetProof {
                     ),
                 });
             }
+            if self
+                .faults
+                .iter()
+                .any(|fault| fault.selection_kind == "runtime-quorum")
+            {
+                self.requirements.push(TargetProofRequirement {
+                    name: "volume_quorum_bindings".to_string(),
+                    status: PreflightStatus::Failed,
+                    message: "runtime quorum count and drive-to-volume bindings are pending live RustFS topology observation".to_string(),
+                });
+            }
         }
         self.status = if self
             .requirements
@@ -677,6 +740,11 @@ impl TargetResolvedPodProof {
 
     pub fn with_node(mut self, node: impl Into<String>) -> Self {
         self.node = Some(node.into());
+        self
+    }
+
+    pub fn with_rustfs_container_id(mut self, container_id: impl Into<String>) -> Self {
+        self.rustfs_container_id = Some(container_id.into());
         self
     }
 
@@ -896,6 +964,7 @@ fn erasure_set_proof(spec: &FaultScenarioSpec) -> Option<TargetErasureSetProof> 
             shape: None,
             health: None,
             membership: None,
+            volume_quorum: None,
             observed_at_ms: 0,
             note: ERASURE_SET_PROOF_PENDING_NOTE.to_string(),
         })

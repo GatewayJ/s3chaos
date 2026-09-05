@@ -724,6 +724,9 @@ fn build_fault_spec(
             let targets = match injection.selection() {
                 FaultSelection::FixedTargets(count) => count,
                 FaultSelection::Percent(_) => 1,
+                FaultSelection::RuntimeQuorum(_) => {
+                    bail!("runtime quorum selection must be resolved before IOChaos rendering")
+                }
             };
             Ok(FaultSpec::Network(
                 NetworkChaosSpec::partition_rustfs_pods(

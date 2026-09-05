@@ -300,6 +300,7 @@ impl FaultRun<'_> {
             target_proof: _,
             topology_observed_at_ms: _,
             host_storage_proof: _,
+            execution_injection: _,
         } = target;
         let ActiveFault {
             fault,

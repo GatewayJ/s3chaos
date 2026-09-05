@@ -17,6 +17,7 @@ use crate::fault::{
     history::{
         ByteRange, DurabilityCohort, OperationKind, OperationOutcome, OperationRecord, Recorder,
     },
+    quorum::QuorumCaseClass,
     workload::{
         ObjectSpec, S3WorkloadClient, StagedMultipartUpload, WorkloadOperation, WorkloadPlan,
         sha256_hex,
@@ -269,6 +270,35 @@ fn multipart_workload_indices(plan: &WorkloadPlan, start_index: usize, count: us
         .filter(|offset| plan.operation_mix.operation_at(*offset) == WorkloadOperation::Multipart)
         .map(|offset| start_index + offset)
         .collect()
+}
+
+pub(in crate::fault) fn require_typed_quorum_read_survival(
+    records: &[OperationRecord],
+    scenario: &str,
+    bucket: &str,
+    class: QuorumCaseClass,
+    workload_started_at_ms: u64,
+    workload_ended_at_ms: u64,
+) -> Result<()> {
+    let expected_key = |key: &str| match class {
+        QuorumCaseClass::Payload => !key.ends_with('/'),
+        QuorumCaseClass::Metadata => key.ends_with('/'),
+    };
+    ensure!(
+        records.iter().any(|record| {
+            record.scenario == scenario
+                && record.bucket == bucket
+                && record.durability_cohort == Some(DurabilityCohort::FaultActive)
+                && record.kind == OperationKind::Get
+                && record.outcome == OperationOutcome::Ok
+                && record.started_at_ms >= workload_started_at_ms
+                && record.ended_at_ms <= workload_ended_at_ms
+                && record.started_at_ms <= record.ended_at_ms
+                && record.key.as_deref().is_some_and(expected_key)
+        }),
+        "quorum P workload did not record a successful fault-active {class:?} GET inside the workload window"
+    );
+    Ok(())
 }
 
 pub(in crate::fault) struct MixedWorkloadRequest<'a> {
@@ -1130,6 +1160,64 @@ mod tests {
     fn quorum_workload_stages_every_planned_multipart_completion() {
         let plan = WorkloadPlan::seeded(42, 24, 4);
         assert_eq!(multipart_workload_indices(&plan, 12, 12), vec![17, 23]);
+    }
+    #[test]
+    fn quorum_p_read_oracle_requires_a_typed_successful_fault_active_get() {
+        let record = |key: &str| {
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": format!("get-{key}"),
+                "scenario": "quorum-p-io-fault",
+                "kind": "get",
+                "bucket": "bucket",
+                "key": key,
+                "value_sha256": "abc",
+                "size_bytes": 0,
+                "version_id": null,
+                "started_at_ms": 110,
+                "ended_at_ms": 120,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "fault_active",
+                "fault_window_relation": "during_fault"
+            }))
+            .expect("GET record")
+        };
+        let marker = record("prefix/directory/");
+
+        assert!(
+            require_typed_quorum_read_survival(
+                std::slice::from_ref(&marker),
+                "quorum-p-io-fault",
+                "bucket",
+                QuorumCaseClass::Metadata,
+                100,
+                130,
+            )
+            .is_ok()
+        );
+        assert!(
+            require_typed_quorum_read_survival(
+                std::slice::from_ref(&marker),
+                "quorum-p-io-fault",
+                "bucket",
+                QuorumCaseClass::Payload,
+                100,
+                130,
+            )
+            .is_err()
+        );
+        assert!(
+            require_typed_quorum_read_survival(
+                &[record("prefix/object")],
+                "quorum-p-io-fault",
+                "bucket",
+                QuorumCaseClass::Payload,
+                100,
+                130,
+            )
+            .is_ok()
+        );
     }
     #[tokio::test]
     async fn multipart_staging_and_cleanup_drain_siblings_after_errors() {

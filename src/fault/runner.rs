@@ -274,6 +274,7 @@ struct ProvenTarget {
     target_proof: TargetProof,
     topology_observed_at_ms: Option<u64>,
     host_storage_proof: Option<HostStorageMutationProof>,
+    execution_injection: crate::fault::plan::FaultInjection,
 }
 
 struct ActiveFault {
