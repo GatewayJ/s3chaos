@@ -24,6 +24,11 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::fault::{
+    admin_topology::{
+        ADMIN_OPERATION_ARTIFACT, ADMIN_OPERATION_PROGRESS_ARTIFACT, ADMIN_TOPOLOGY_PROOF_ARTIFACT,
+        AdminOperationEvidence, AdminOperationProgressSample, AdminTopologyProof,
+        validate_admin_operation_progress, validate_admin_topology_artifacts,
+    },
     backends::chaos_mesh::{
         NetworkPartitionEvidenceContract, VolumeTargetEvidenceContract, iochaos_record_pod_id,
         validate_fixed_volume_snapshot, validate_network_partition_snapshot,
@@ -59,6 +64,17 @@ use crate::fault::{
     },
     workload::WorkloadPlan,
 };
+
+pub fn validate_admin_topology_artifact_files(scenario: &str, case_dir: &Path) -> Result<()> {
+    let proof = read_json::<AdminTopologyProof>(&case_dir.join(ADMIN_TOPOLOGY_PROOF_ARTIFACT))?;
+    let operation = read_json::<AdminOperationEvidence>(&case_dir.join(ADMIN_OPERATION_ARTIFACT))?;
+    let progress = read_jsonl::<AdminOperationProgressSample>(
+        &case_dir.join(ADMIN_OPERATION_PROGRESS_ARTIFACT),
+    )?;
+
+    validate_admin_topology_artifacts(scenario, &proof, &operation)?;
+    validate_admin_operation_progress(&operation, &progress)
+}
 
 #[derive(Debug, Clone)]
 pub struct ArtifactValidationOptions {
@@ -3205,8 +3221,8 @@ impl OutcomeCountsArtifact {
 mod tests {
     use super::{
         ArtifactValidationOptions, FailureSummary, FaultEvidenceArtifact, OutcomeCountsArtifact,
-        WorkloadSummaryArtifact, recursive_find, validate_fault_artifacts,
-        validate_fault_artifacts_and_write_report,
+        WorkloadSummaryArtifact, recursive_find, validate_admin_topology_artifact_files,
+        validate_fault_artifacts, validate_fault_artifacts_and_write_report,
         validate_fault_artifacts_for_planned_attempt_and_write_report,
         validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts, validate_run_spec,
         validate_target_proof, validate_write_quorum_runtime_evidence,
@@ -3241,6 +3257,121 @@ mod tests {
     };
     use serde_json::json;
     use std::{collections::BTreeMap, fs, time::Duration};
+
+    #[test]
+    fn admin_topology_files_require_successful_terminal_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pools = json!([
+            {
+                "id": 0,
+                "cmdline": "/data/pool0/disk{1...4}",
+                "status": "active",
+                "decommissionStatus": "none",
+                "rebalanceStatus": "none",
+                "totalSize": 2000,
+                "currentSize": 1500,
+                "usedSize": 500
+            },
+            {
+                "id": 1,
+                "cmdline": "/data/pool1/disk{1...4}",
+                "status": "active",
+                "decommissionStatus": "none",
+                "rebalanceStatus": "none",
+                "totalSize": 1000,
+                "currentSize": 800,
+                "usedSize": 200
+            }
+        ]);
+        write_json(
+            dir.path(),
+            "admin-topology-proof.json",
+            &json!({
+                "scenario": "admin-decommission",
+                "tenant": "fault-tenant",
+                "tenantUid": "tenant-uid",
+                "namespace": "fault-ns",
+                "tenantPools": [
+                    {"name": "primary", "runtimePoolId": 0, "servers": 4, "volumesPerServer": 1},
+                    {"name": "decommission-target", "runtimePoolId": 1, "servers": 4, "volumesPerServer": 1}
+                ],
+                "runtimePools": pools,
+                "targetPoolId": 1,
+                "targetPoolExpression": "/data/pool1/disk{1...4}",
+                "remainingFreeBytes": 1500,
+                "targetUsedBytes": 200,
+                "mutuallyExclusive": true,
+                "satisfied": true
+            }),
+        );
+        write_json(
+            dir.path(),
+            "admin-operation.json",
+            &json!({
+                "scenario": "admin-decommission",
+                "operationId": "decommission:1:2026-09-05T00:00:00Z",
+                "targetPoolId": 1,
+                "targetPoolExpression": "/data/pool1/disk{1...4}",
+                "terminalState": "complete",
+                "completed": true,
+                "failed": false,
+                "canceledOrStopped": false,
+                "requests": [
+                    {
+                        "method": "POST",
+                        "path": "/rustfs/admin/v3/pools/decommission",
+                        "query": {"pool": "1", "by-id": "true"},
+                        "status": 200
+                    },
+                    {
+                        "method": "GET",
+                        "path": "/rustfs/admin/v3/decommission/status",
+                        "query": {"pool": "1", "by-id": "true"},
+                        "status": 200
+                    }
+                ],
+                "poolsBefore": pools,
+                "poolsAfter": [
+                    {
+                        "id": 0,
+                        "cmdline": "/data/pool0/disk{1...4}",
+                        "status": "active",
+                        "decommissionStatus": "none",
+                        "rebalanceStatus": "none",
+                        "totalSize": 2000,
+                        "currentSize": 1700,
+                        "usedSize": 700
+                    }
+                ]
+            }),
+        );
+        let progress_path = dir.path().join("admin-operation-progress.jsonl");
+        fs::write(
+            &progress_path,
+            concat!(
+                "{\"operationId\":\"decommission:1:2026-09-05T00:00:00Z\",",
+                "\"observedAtMs\":1,\"state\":\"complete\",\"completed\":true,",
+                "\"failed\":false,\"canceledOrStopped\":false}\n"
+            ),
+        )
+        .expect("progress");
+
+        validate_admin_topology_artifact_files("admin-decommission", dir.path())
+            .expect("valid admin evidence");
+
+        fs::write(
+            progress_path,
+            concat!(
+                "{\"operationId\":\"decommission:1:2026-09-05T00:00:00Z\",",
+                "\"observedAtMs\":1,\"state\":\"canceled\",\"completed\":true,",
+                "\"failed\":false,\"canceledOrStopped\":true}\n"
+            ),
+        )
+        .expect("canceled progress");
+        let error = validate_admin_topology_artifact_files("admin-decommission", dir.path())
+            .expect_err("canceled evidence");
+        assert!(error.to_string().contains("cannot pass"));
+    }
 
     #[test]
     fn validates_successful_fault_artifacts() {
