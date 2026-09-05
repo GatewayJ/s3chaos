@@ -28,7 +28,6 @@ use crate::fault::{
         NetworkPartitionEvidenceContract, VolumeTargetEvidenceContract, iochaos_record_pod_id,
         validate_fixed_volume_snapshot, validate_network_partition_snapshot,
     },
-    backends::host::DmStatusSnapshot,
     checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
     config::{
         DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, DEFAULT_RUSTFS_POD_COUNT,
@@ -37,6 +36,7 @@ use crate::fault::{
     },
     events::{RunEvent, RunEventStatus},
     history::{DurabilityCohort, OperationKind, OperationOutcome, OperationRecord},
+    host_storage::DmStatusSnapshot,
     host_storage::{
         HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT, HostStorageMutationProof,
         HostStoragePostCleanupObservation, normalized_dm_table_sha256,
@@ -51,10 +51,7 @@ use crate::fault::{
         target_pod_has_bound_volume, target_pod_has_fixed_volume,
     },
     quorum::require_fresh_runtime_observation,
-    reporting::{
-        AvailabilityStatus, DataCorrectnessStatus, FailureClassification, FailurePhase,
-        FailureSeverity, FailureSummary, FailureVerdict, ResponsibilityDomain,
-    },
+    reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
     scenarios::{self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario},
     spec::{
         FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunFaultSpec,
@@ -2248,7 +2245,7 @@ fn validate_conditional_recovery_stability_artifact(
             "conditional recovery artifacts do not match the planned attempt"
         );
     }
-    let failure_summary = read_json::<FailureSummaryArtifact>(&failure_summary_path)?;
+    let failure_summary = read_json::<FailureSummary>(&failure_summary_path)?;
     if let Some(run_id) = planned_run_id {
         ensure!(
             failure_summary.scenario == scenario
@@ -2279,22 +2276,6 @@ fn validate_conditional_recovery_stability_artifact(
     )?;
     validate_recovery_failure_summary_fields(&failure_summary, &recovery)?;
     Ok(())
-}
-
-/// Diagnostic-mode contract check for a failure summary that was just written.
-///
-/// The strict success-path validator only runs on passing runs, so without
-/// this entry point a failed run's `failure-summary.json` was never validated
-/// by any automated path — a malformed or contract-violating summary would sit
-/// undetected exactly where it matters most. Called from
-/// `reporting::write_failure_summary` right after the write; violations are
-/// surfaced as warnings there so they never mask the run's original failure.
-pub(crate) fn validate_written_failure_summary(root: &Path, path: &Path) -> Result<()> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading just-written failure summary {}", path.display()))?;
-    let summary: FailureSummaryArtifact = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing just-written failure summary {}", path.display()))?;
-    validate_failure_summary_v2_fields(&summary, Some(root), Some(path))
 }
 
 pub(crate) fn validate_expected_failure_artifacts(
@@ -2335,11 +2316,9 @@ pub(crate) fn validate_expected_failure_artifacts(
     let summary_path = bound_case_artifact(&case_dir, "failure-summary.json")?;
     let summary_raw = fs::read_to_string(&summary_path)
         .with_context(|| format!("reading JSON artifact {}", summary_path.display()))?;
-    let summary = serde_json::from_str::<FailureSummaryArtifact>(&summary_raw)
+    let summary = serde_json::from_str::<FailureSummary>(&summary_raw)
         .with_context(|| format!("parsing JSON artifact {}", summary_path.display()))?;
-    let typed_summary = serde_json::from_str::<FailureSummary>(&summary_raw)
-        .with_context(|| format!("parsing typed failure summary {}", summary_path.display()))?;
-    typed_summary.validate_classification_projection()?;
+    summary.validate_classification_projection()?;
     let run_spec = read_json::<ExpectedFailureRunSpecIdentity>(&bound_case_artifact(
         &case_dir,
         "run-spec.json",
@@ -2470,13 +2449,13 @@ pub(crate) fn validate_expected_failure_artifacts(
             .context("failure-summary.json is outside suite artifact root")?
             .display()
             .to_string(),
-        summary: typed_summary,
+        summary,
         client_disruptions: disruption_evidence.client_disruptions,
     })
 }
 
 fn validate_expected_failure_signal(
-    summary: &FailureSummaryArtifact,
+    summary: &FailureSummary,
     referenced: &BTreeMap<String, PathBuf>,
     scenario: &str,
     run_id: &str,
@@ -2580,53 +2559,6 @@ fn read_expected_failure_checker(
     Ok(report)
 }
 
-fn validate_failure_summary_v2_fields(
-    summary: &FailureSummaryArtifact,
-    artifact_root: Option<&Path>,
-    artifact_path: Option<&Path>,
-) -> Result<()> {
-    if summary.schema_version < 2 {
-        return Ok(());
-    }
-
-    if let Some(phase) = summary.phase {
-        ensure!(
-            phase == FailurePhase::from_stage(&summary.stage),
-            "failure-summary.json phase {:?} does not match stage {:?}",
-            summary.phase,
-            summary.stage
-        );
-    }
-    ensure!(
-        summary
-            .case_name
-            .as_ref()
-            .is_none_or(|value| !value.trim().is_empty()),
-        "failure-summary.json case_name must be null or a non-empty string"
-    );
-    ensure!(
-        summary.observed_at_ms.is_none_or(|value| value > 0),
-        "failure-summary.json observed_at_ms must be greater than zero when present"
-    );
-
-    validate_failure_summary_v2_classification(summary)?;
-    if summary.primary_evidence_refs.is_empty() {
-        return Ok(());
-    }
-    ensure!(
-        summary.primary_evidence_refs.len() <= 5,
-        "failure-summary.json primary_evidence_refs must contain at most 5 entries"
-    );
-    ensure_unique(
-        &summary.primary_evidence_refs,
-        "failure-summary.json primary_evidence_refs",
-    )?;
-    for evidence_ref in &summary.primary_evidence_refs {
-        validate_primary_evidence_ref(evidence_ref, artifact_root, artifact_path)?;
-    }
-    Ok(())
-}
-
 fn failure_summary_reference_root(validation_root: &Path) -> &Path {
     validation_root
         .parent()
@@ -2636,90 +2568,8 @@ fn failure_summary_reference_root(validation_root: &Path) -> &Path {
         .unwrap_or(validation_root)
 }
 
-fn validate_failure_summary_v2_classification(summary: &FailureSummaryArtifact) -> Result<()> {
-    let classification =
-        FailureClassification::from_name(&summary.classification).with_context(|| {
-            format!(
-                "failure-summary.json classification {:?} is not in the writer allowlist",
-                summary.classification
-            )
-        })?;
-    if classification.is_s3_model() {
-        ensure!(
-            summary
-                .s3_model_classification
-                .as_deref()
-                .is_none_or(|value| value == summary.classification)
-                && summary.run_failure_reason.is_none(),
-            "failure-summary.json S3 model classification must match s3_model_classification when present and omit run_failure_reason"
-        );
-    } else {
-        ensure!(
-            summary.s3_model_classification.is_none()
-                && summary
-                    .run_failure_reason
-                    .as_deref()
-                    .is_none_or(|value| value == summary.classification),
-            "failure-summary.json non-S3-model classification must match run_failure_reason when present and omit s3_model_classification"
-        );
-    }
-    if let Some(responsibility_domain) = summary.responsibility_domain {
-        ensure!(
-            responsibility_domain
-                == ResponsibilityDomain::from_classification(&summary.classification),
-            "failure-summary.json responsibility_domain {:?} does not match classification {:?}",
-            summary.responsibility_domain,
-            summary.classification
-        );
-    }
-    Ok(())
-}
-
-fn validate_primary_evidence_ref(
-    evidence_ref: &str,
-    artifact_root: Option<&Path>,
-    artifact_path: Option<&Path>,
-) -> Result<()> {
-    let path = Path::new(evidence_ref);
-    ensure!(
-        !evidence_ref.trim().is_empty() && path.is_relative(),
-        "failure-summary.json primary_evidence_refs must be non-empty relative artifact paths"
-    );
-    ensure!(
-        path.components()
-            .all(|component| matches!(component, std::path::Component::Normal(_))),
-        "failure-summary.json primary_evidence_refs must stay inside the suite artifact root"
-    );
-    if let Some(artifact_root) = artifact_root {
-        // v2 was originally emitted with case-directory-relative leaf names.
-        // Keep those artifacts readable while all new writers use the stable
-        // suite-root-relative form, which necessarily includes the case path.
-        let legacy_case_relative = path.components().count() == 1;
-        let evidence_path = if legacy_case_relative {
-            artifact_path
-                .and_then(Path::parent)
-                .unwrap_or(artifact_root)
-                .join(path)
-        } else {
-            artifact_root.join(path)
-        };
-        if let Some(artifact_path) = artifact_path {
-            ensure!(
-                legacy_case_relative || evidence_path != artifact_path,
-                "failure-summary.json primary_evidence_refs must not reference the summary itself"
-            );
-        }
-        ensure!(
-            evidence_path.is_file(),
-            "failure-summary.json primary evidence ref {:?} does not exist under its compatible artifact root",
-            evidence_ref
-        );
-    }
-    Ok(())
-}
-
 fn validate_recovery_failure_summary_fields(
-    summary: &FailureSummaryArtifact,
+    summary: &FailureSummary,
     recovery: &RecoveryStabilityReport,
 ) -> Result<()> {
     ensure!(
@@ -2737,124 +2587,24 @@ fn validate_recovery_failure_summary_fields(
             && summary.list_warnings == recovery.list_warnings,
         "failure-summary.json LIST warning fields do not match recovery-stability-report.json"
     );
+    ensure!(
+        summary.classification == recovery.classification.as_str(),
+        "failure-summary.json classification must match recovery-stability-report.json"
+    );
+    summary.validate_classification_projection()?;
     match recovery.classification {
-        RecoveryStabilityClassification::RecoveryTailReadLatency => {
-            ensure!(
-                summary.severity == FailureSeverity::Degraded
-                    && summary.data_correctness == DataCorrectnessStatus::Passed
-                    && summary.availability == AvailabilityStatus::RecoveredAfterTailLatency
-                    && summary.data_loss == Some(false)
-                    && summary.corruption == Some(false)
-                    && summary.recovered_within_window == Some(true),
-                "recovery_tail_read_latency failure-summary.json must describe degraded recovered-tail latency without data loss or corruption"
-            );
-            ensure!(
-                summary.recovered_within_seconds == recovery.recovered_within_seconds
-                    && summary.recovered_within_seconds.is_some(),
-                "recovery_tail_read_latency failure-summary.json recovered_within_seconds must match recovery-stability-report.json"
-            );
-        }
-        RecoveryStabilityClassification::CommittedObjectUnavailable => {
-            ensure!(
-                summary.severity == FailureSeverity::FailAvailability
-                    && summary.data_correctness == DataCorrectnessStatus::Unknown
-                    && summary.availability == AvailabilityStatus::CommittedObjectUnavailable
-                    && summary.data_loss.is_none()
-                    && summary.corruption == Some(false)
-                    && summary.recovered_within_window == Some(false),
-                "committed_object_unavailable failure-summary.json must describe an availability failure without claiming data loss"
-            );
-        }
-        RecoveryStabilityClassification::CommittedVersionMissing => {
-            ensure!(
-                summary.severity == FailureSeverity::FailCorrectness
-                    && summary.data_correctness == DataCorrectnessStatus::Failed
-                    && summary.availability == AvailabilityStatus::Unknown
-                    && summary.data_loss == Some(true)
-                    && summary.corruption == Some(false)
-                    && summary.recovered_within_window == Some(false),
-                "committed_version_missing failure-summary.json must describe proven committed-version loss"
-            );
-        }
-        RecoveryStabilityClassification::CommittedVersionUnavailable => {
-            ensure!(
-                summary.severity == FailureSeverity::FailAvailability
-                    && summary.data_correctness == DataCorrectnessStatus::Unknown
-                    && summary.availability == AvailabilityStatus::CommittedVersionUnavailable
-                    && summary.data_loss.is_none()
-                    && summary.corruption == Some(false)
-                    && summary.recovered_within_window == Some(false),
-                "committed_version_unavailable failure-summary.json must preserve an availability verdict without claiming data loss"
-            );
-        }
-        RecoveryStabilityClassification::VersionHashMismatch
-        | RecoveryStabilityClassification::DeleteMarkerMissing
-        | RecoveryStabilityClassification::DeletedObjectResurrected => {
-            ensure!(
-                summary.severity == FailureSeverity::FailCorrectness
-                    && summary.data_correctness == DataCorrectnessStatus::Failed
-                    && summary.availability == AvailabilityStatus::Unknown
-                    && summary.data_loss == Some(false)
-                    && summary.corruption == Some(true),
-                "precise checker correctness failure-summary.json must describe proven semantic or content corruption"
-            );
-        }
-        RecoveryStabilityClassification::DeleteMarkerLineageIncomplete
-        | RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite
-        | RecoveryStabilityClassification::MultipartUploadLineageIncomplete => {
-            ensure!(
-                summary.severity == FailureSeverity::NeedsInvestigation
-                    && summary.data_correctness == DataCorrectnessStatus::Unknown
-                    && summary.availability == AvailabilityStatus::Unknown
-                    && summary.data_loss.is_none()
-                    && summary.corruption == Some(false)
-                    && summary.recovered_within_window.is_none(),
-                "incomplete version-lineage failure-summary.json must not claim data loss or corruption"
-            );
-        }
-        RecoveryStabilityClassification::ListUnavailableOrUnknown => {
-            ensure!(
-                summary.severity == FailureSeverity::FailAvailability
-                    && summary.data_correctness == DataCorrectnessStatus::Unknown
-                    && summary.availability == AvailabilityStatus::ListUnavailableOrUnknown
-                    && summary.data_loss.is_none()
-                    && summary.corruption == Some(false)
-                    && summary.recovered_within_window == Some(false),
-                "list_unavailable_or_unknown failure-summary.json must describe a LIST availability/unknown failure without claiming data loss or corruption"
-            );
-        }
-        RecoveryStabilityClassification::DataCorruption => {
-            ensure!(
-                summary.severity == FailureSeverity::FailCorrectness
-                    && summary.data_correctness == DataCorrectnessStatus::Failed
-                    && summary.corruption == Some(true),
-                "data_corruption failure-summary.json must describe a correctness failure"
-            );
-        }
-        RecoveryStabilityClassification::AmbiguousWriteMaterialized => {
-            ensure!(
-                summary.severity == FailureSeverity::NeedsInvestigation
-                    && summary.data_correctness == DataCorrectnessStatus::Unknown
-                    && summary.availability == AvailabilityStatus::Unknown
-                    && summary.data_loss.is_none()
-                    && summary.corruption == Some(false)
-                    && summary.recovered_within_window.is_none()
-                    && summary.recovered_within_seconds.is_none(),
-                "ambiguous_write_materialized failure-summary.json must describe an explicit ambiguous-write result without proven corruption"
-            );
-        }
-        RecoveryStabilityClassification::HarnessError => {
-            ensure!(
-                summary.severity == FailureSeverity::Infra
-                    && summary.data_correctness == DataCorrectnessStatus::Unknown
-                    && summary.availability == AvailabilityStatus::Unknown
-                    && summary.data_loss.is_none()
-                    && summary.corruption.is_none()
-                    && summary.recovered_within_window.is_none(),
-                "harness_error failure-summary.json must describe an infra/harness failure without data loss or product verdict fields"
-            );
-        }
+        RecoveryStabilityClassification::RecoveryTailReadLatency => ensure!(
+            summary.recovered_within_seconds == recovery.recovered_within_seconds
+                && summary.recovered_within_seconds.is_some(),
+            "recovery_tail_read_latency failure-summary.json recovered_within_seconds must match recovery-stability-report.json"
+        ),
+        RecoveryStabilityClassification::AmbiguousWriteMaterialized => ensure!(
+            summary.recovered_within_seconds.is_none(),
+            "ambiguous_write_materialized failure-summary.json must not claim recovery"
+        ),
+        _ => {}
     }
+
     Ok(())
 }
 
@@ -3000,16 +2750,6 @@ fn ensure_sorted_unique(values: &[String], field: &str) -> Result<()> {
         ensure!(
             pair[0] < pair[1],
             "{field} must be sorted and contain no duplicates"
-        );
-    }
-    Ok(())
-}
-
-fn ensure_unique(values: &[String], field: &str) -> Result<()> {
-    for (index, value) in values.iter().enumerate() {
-        ensure!(
-            !values[..index].iter().any(|seen| seen == value),
-            "{field} must contain no duplicates"
         );
     }
     Ok(())
@@ -3325,46 +3065,6 @@ struct RecommitReportArtifact {
 }
 
 #[derive(Debug, Deserialize)]
-struct FailureSummaryArtifact {
-    #[serde(default)]
-    schema_version: u8,
-    scenario: String,
-    #[serde(default)]
-    run_id: Option<String>,
-    #[serde(default)]
-    case_name: Option<String>,
-    #[serde(default)]
-    observed_at_ms: Option<u64>,
-    stage: String,
-    #[serde(default)]
-    phase: Option<FailurePhase>,
-    verdict: FailureVerdict,
-    severity: FailureSeverity,
-    classification: String,
-    #[serde(default)]
-    s3_model_classification: Option<String>,
-    #[serde(default)]
-    run_failure_reason: Option<String>,
-    #[serde(default)]
-    responsibility_domain: Option<ResponsibilityDomain>,
-    data_correctness: DataCorrectnessStatus,
-    availability: AvailabilityStatus,
-    #[serde(default)]
-    primary_evidence_refs: Vec<String>,
-    #[serde(default)]
-    evidence_classifications: Vec<String>,
-    #[serde(default)]
-    final_list_warning_count: usize,
-    #[serde(default)]
-    list_warnings: Vec<String>,
-    data_loss: Option<bool>,
-    corruption: Option<bool>,
-    recovered_within_window: Option<bool>,
-    recovered_within_seconds: Option<u64>,
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct WorkloadSummaryArtifact {
     #[serde(default)]
     scenario: Option<String>,
@@ -3504,8 +3204,8 @@ impl OutcomeCountsArtifact {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactValidationOptions, FailureSummaryArtifact, FaultEvidenceArtifact,
-        OutcomeCountsArtifact, WorkloadSummaryArtifact, recursive_find, validate_fault_artifacts,
+        ArtifactValidationOptions, FailureSummary, FaultEvidenceArtifact, OutcomeCountsArtifact,
+        WorkloadSummaryArtifact, recursive_find, validate_fault_artifacts,
         validate_fault_artifacts_and_write_report,
         validate_fault_artifacts_for_planned_attempt_and_write_report,
         validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts, validate_run_spec,
@@ -5439,7 +5139,7 @@ mod tests {
             summary.recovered_within_window = recovered_within_window;
             summary.evidence_classifications = recovery.evidence_classifications();
 
-            super::validate_failure_summary_v2_classification(&summary)
+            crate::fault::reporting::validate_failure_summary_v2_classification(&summary)
                 .expect("valid precise summary projection");
             super::validate_recovery_failure_summary_fields(&summary, &recovery)
                 .expect("valid precise recovery summary fields");
@@ -5480,7 +5180,11 @@ mod tests {
         let error = super::validate_recovery_failure_summary_fields(&summary, &recovery)
             .expect_err("timeout must not claim data loss");
 
-        assert!(error.to_string().contains("without claiming data loss"));
+        assert!(
+            error
+                .to_string()
+                .contains("outcome fields contradict classification committed_version_unavailable")
+        );
     }
 
     #[test]
@@ -5569,11 +5273,14 @@ mod tests {
                 summary.responsibility_domain = Some(ResponsibilityDomain::Product);
             }
 
-            super::validate_failure_summary_v2_classification(&summary)
+            crate::fault::reporting::validate_failure_summary_v2_classification(&summary)
                 .expect("classification tags remain valid");
             let error = super::validate_recovery_failure_summary_fields(&summary, &recovery)
                 .expect_err("non-loss evidence must reject data_loss=true");
-            assert!(error.to_string().contains("data loss"));
+            assert!(error.to_string().contains(&format!(
+                "outcome fields contradict classification {}",
+                recovery.classification.as_str()
+            )));
         }
     }
 
@@ -5635,8 +5342,8 @@ mod tests {
             .to_string(),
         )
         .expect("write bad summary");
-        let error =
-            super::validate_written_failure_summary(dir.path(), &bad).expect_err("v2 violation");
+        let error = crate::fault::reporting::validate_written_failure_summary(dir.path(), &bad)
+            .expect_err("v2 violation");
         assert!(
             error.to_string().contains("phase"),
             "unexpected error: {error:#}"
@@ -5660,18 +5367,20 @@ mod tests {
             .to_string(),
         )
         .expect("write legacy summary");
-        super::validate_written_failure_summary(dir.path(), &legacy)
+        crate::fault::reporting::validate_written_failure_summary(dir.path(), &legacy)
             .expect("legacy summary accepted");
 
         // Unparseable JSON is a contract violation, not a silent pass.
         let torn = dir.path().join("torn-failure-summary.json");
         std::fs::write(&torn, "{ not json").expect("write torn summary");
-        assert!(super::validate_written_failure_summary(dir.path(), &torn).is_err());
+        assert!(
+            crate::fault::reporting::validate_written_failure_summary(dir.path(), &torn).is_err()
+        );
     }
 
     #[test]
     fn parses_legacy_failure_summary_without_evidence_classifications() {
-        let summary: FailureSummaryArtifact = serde_json::from_value(json!({
+        let summary: FailureSummary = serde_json::from_value(json!({
             "scenario": "io-eio",
             "stage": "checker-pre-recommit-verdict",
             "verdict": "failed",
@@ -6189,7 +5898,11 @@ mod tests {
         )
         .expect_err("ambiguous summary with loss fields");
 
-        assert!(error.to_string().contains("without proven corruption"));
+        assert!(
+            error
+                .to_string()
+                .contains("outcome fields contradict classification ambiguous_write_materialized")
+        );
     }
 
     #[test]
@@ -6376,8 +6089,8 @@ mod tests {
         );
     }
 
-    fn failure_summary_v2_for_test() -> FailureSummaryArtifact {
-        FailureSummaryArtifact {
+    fn failure_summary_v2_for_test() -> FailureSummary {
+        FailureSummary {
             schema_version: 2,
             scenario: "io-eio".to_string(),
             run_id: None,

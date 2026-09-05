@@ -1357,24 +1357,6 @@ impl NetworkChaosSpec {
         Ok(spec)
     }
 
-    pub fn partition_one_rustfs_pod(
-        config: &ClusterTestConfig,
-        chaos_namespace: impl Into<String>,
-        run_id: impl Into<String>,
-        scenario: impl Into<String>,
-        duration: Duration,
-    ) -> Result<Self> {
-        Self::one_rustfs_pod(
-            config,
-            chaos_namespace,
-            run_id,
-            scenario,
-            duration,
-            "net-partition",
-            NetworkChaosAction::Partition,
-        )
-    }
-
     pub fn delay_one_rustfs_pod(
         config: &ClusterTestConfig,
         chaos_namespace: impl Into<String>,

@@ -13,25 +13,20 @@
 // limitations under the License.
 
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::{
     fault::{
-        backends::host::DmStatusSnapshot,
-        checker::RecoveryStabilityClassification,
         config::FaultTestConfig,
+        host_storage::DmStatusSnapshot,
         plan::{FaultPlan, FaultSelection},
         scenarios::{FaultScenario, FaultScenarioSpec},
         workload::WorkloadPlan,
     },
     framework::artifacts::ArtifactCollector,
 };
-
-const FAILURE_SUMMARY_SCHEMA_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct FaultStatusSnapshot {
@@ -178,802 +173,19 @@ impl RunMetadata {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FailureVerdict {
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FailureSeverity {
-    Degraded,
-    FailAvailability,
-    FailCorrectness,
-    Infra,
-    NeedsInvestigation,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-#[serde(rename_all = "snake_case")]
-pub enum FailurePhase {
-    Preflight,
-    Setup,
-    FaultInjection,
-    Workload,
-    Recovery,
-    Checker,
-    Cleanup,
-    Runner,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-#[serde(rename_all = "snake_case")]
-pub enum ResponsibilityDomain {
-    Product,
-    Harness,
-    Environment,
-    FaultBackend,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DataCorrectnessStatus {
-    Passed,
-    Failed,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AvailabilityStatus {
-    RecoveredAfterTailLatency,
-    CommittedObjectUnavailable,
-    CommittedVersionUnavailable,
-    ListUnavailableOrUnknown,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FailureClassification {
-    RecoveryTailReadLatency,
-    CommittedObjectUnavailable,
-    CommittedVersionMissing,
-    CommittedVersionUnavailable,
-    VersionHashMismatch,
-    DeleteMarkerMissing,
-    DeletedObjectResurrected,
-    DeleteMarkerLineageIncomplete,
-    VersionIdMissingOnCommittedWrite,
-    MultipartUploadLineageIncomplete,
-    ListUnavailableOrUnknown,
-    DataCorruption,
-    AmbiguousWriteMaterialized,
-    HarnessError,
-    TestHarness,
-    WorkloadExecutionError,
-    ArtifactValidationFailed,
-    CheckerExecutionError,
-    PreflightFailed,
-    HealthGuardFailed,
-    FaultBackendUnavailable,
-    FaultNotActive,
-    FaultNotRecovered,
-    Unknown,
-    CheckerOrEnvironment,
-    TestOrEnvironment,
-    EnvironmentOrFaultBackend,
-    ProductOrEnvironment,
-    EnvironmentOrWorkload,
-    WorkloadOrProduct,
-    NoSignal,
-}
-
-impl FailureClassification {
-    pub(crate) const ALL: [Self; 31] = [
-        Self::RecoveryTailReadLatency,
-        Self::CommittedObjectUnavailable,
-        Self::CommittedVersionMissing,
-        Self::CommittedVersionUnavailable,
-        Self::VersionHashMismatch,
-        Self::DeleteMarkerMissing,
-        Self::DeletedObjectResurrected,
-        Self::DeleteMarkerLineageIncomplete,
-        Self::VersionIdMissingOnCommittedWrite,
-        Self::MultipartUploadLineageIncomplete,
-        Self::ListUnavailableOrUnknown,
-        Self::DataCorruption,
-        Self::AmbiguousWriteMaterialized,
-        Self::HarnessError,
-        Self::TestHarness,
-        Self::WorkloadExecutionError,
-        Self::ArtifactValidationFailed,
-        Self::CheckerExecutionError,
-        Self::PreflightFailed,
-        Self::HealthGuardFailed,
-        Self::FaultBackendUnavailable,
-        Self::FaultNotActive,
-        Self::FaultNotRecovered,
-        Self::Unknown,
-        Self::CheckerOrEnvironment,
-        Self::TestOrEnvironment,
-        Self::EnvironmentOrFaultBackend,
-        Self::ProductOrEnvironment,
-        Self::EnvironmentOrWorkload,
-        Self::WorkloadOrProduct,
-        Self::NoSignal,
-    ];
-
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|classification| classification.as_str() == name)
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::RecoveryTailReadLatency => "recovery_tail_read_latency",
-            Self::CommittedObjectUnavailable => "committed_object_unavailable",
-            Self::CommittedVersionMissing => "committed_version_missing",
-            Self::CommittedVersionUnavailable => "committed_version_unavailable",
-            Self::VersionHashMismatch => "version_hash_mismatch",
-            Self::DeleteMarkerMissing => "delete_marker_missing",
-            Self::DeletedObjectResurrected => "deleted_object_resurrected",
-            Self::DeleteMarkerLineageIncomplete => "delete_marker_lineage_incomplete",
-            Self::VersionIdMissingOnCommittedWrite => "version_id_missing_on_committed_write",
-            Self::MultipartUploadLineageIncomplete => "multipart_upload_lineage_incomplete",
-            Self::ListUnavailableOrUnknown => "list_unavailable_or_unknown",
-            Self::DataCorruption => "data_corruption",
-            Self::AmbiguousWriteMaterialized => "ambiguous_write_materialized",
-            Self::HarnessError => "harness_error",
-            Self::TestHarness => "test_harness",
-            Self::WorkloadExecutionError => "workload_execution_error",
-            Self::ArtifactValidationFailed => "artifact_validation_failed",
-            Self::CheckerExecutionError => "checker_execution_error",
-            Self::PreflightFailed => "preflight_failed",
-            Self::HealthGuardFailed => "health_guard_failed",
-            Self::FaultBackendUnavailable => "fault_backend_unavailable",
-            Self::FaultNotActive => "fault_not_active",
-            Self::FaultNotRecovered => "fault_not_recovered",
-            Self::Unknown => "unknown",
-            Self::CheckerOrEnvironment => "checker_or_environment",
-            Self::TestOrEnvironment => "test_or_environment",
-            Self::EnvironmentOrFaultBackend => "environment_or_fault_backend",
-            Self::ProductOrEnvironment => "product_or_environment",
-            Self::EnvironmentOrWorkload => "environment_or_workload",
-            Self::WorkloadOrProduct => "workload_or_product",
-            Self::NoSignal => "no_signal",
-        }
-    }
-
-    pub const fn is_s3_model(self) -> bool {
-        matches!(
-            self,
-            Self::RecoveryTailReadLatency
-                | Self::CommittedObjectUnavailable
-                | Self::CommittedVersionMissing
-                | Self::CommittedVersionUnavailable
-                | Self::VersionHashMismatch
-                | Self::DeleteMarkerMissing
-                | Self::DeletedObjectResurrected
-                | Self::DeleteMarkerLineageIncomplete
-                | Self::VersionIdMissingOnCommittedWrite
-                | Self::MultipartUploadLineageIncomplete
-                | Self::ListUnavailableOrUnknown
-                | Self::DataCorruption
-                | Self::AmbiguousWriteMaterialized
-        )
-    }
-
-    pub const fn responsibility_domain(self) -> ResponsibilityDomain {
-        match self {
-            Self::RecoveryTailReadLatency
-            | Self::CommittedObjectUnavailable
-            | Self::CommittedVersionMissing
-            | Self::CommittedVersionUnavailable
-            | Self::VersionHashMismatch
-            | Self::DeleteMarkerMissing
-            | Self::DeletedObjectResurrected
-            | Self::DeleteMarkerLineageIncomplete
-            | Self::VersionIdMissingOnCommittedWrite
-            | Self::MultipartUploadLineageIncomplete
-            | Self::ListUnavailableOrUnknown
-            | Self::DataCorruption
-            | Self::AmbiguousWriteMaterialized => ResponsibilityDomain::Product,
-            Self::HarnessError
-            | Self::TestHarness
-            | Self::WorkloadExecutionError
-            | Self::ArtifactValidationFailed
-            | Self::CheckerExecutionError => ResponsibilityDomain::Harness,
-            Self::PreflightFailed | Self::HealthGuardFailed => ResponsibilityDomain::Environment,
-            Self::FaultBackendUnavailable | Self::FaultNotActive | Self::FaultNotRecovered => {
-                ResponsibilityDomain::FaultBackend
-            }
-            Self::Unknown
-            | Self::CheckerOrEnvironment
-            | Self::TestOrEnvironment
-            | Self::EnvironmentOrFaultBackend
-            | Self::ProductOrEnvironment
-            | Self::EnvironmentOrWorkload
-            | Self::WorkloadOrProduct
-            | Self::NoSignal => ResponsibilityDomain::Unknown,
-        }
-    }
-
-    pub const fn severity(self) -> FailureSeverity {
-        match self {
-            Self::RecoveryTailReadLatency => FailureSeverity::Degraded,
-            Self::CommittedObjectUnavailable
-            | Self::CommittedVersionUnavailable
-            | Self::ListUnavailableOrUnknown => FailureSeverity::FailAvailability,
-            Self::CommittedVersionMissing
-            | Self::VersionHashMismatch
-            | Self::DeleteMarkerMissing
-            | Self::DeletedObjectResurrected
-            | Self::DataCorruption => FailureSeverity::FailCorrectness,
-            Self::HarnessError
-            | Self::TestHarness
-            | Self::TestOrEnvironment
-            | Self::EnvironmentOrFaultBackend => FailureSeverity::Infra,
-            Self::AmbiguousWriteMaterialized
-            | Self::DeleteMarkerLineageIncomplete
-            | Self::VersionIdMissingOnCommittedWrite
-            | Self::MultipartUploadLineageIncomplete
-            | Self::WorkloadExecutionError
-            | Self::ArtifactValidationFailed
-            | Self::CheckerExecutionError
-            | Self::PreflightFailed
-            | Self::HealthGuardFailed
-            | Self::FaultBackendUnavailable
-            | Self::FaultNotActive
-            | Self::FaultNotRecovered
-            | Self::Unknown
-            | Self::CheckerOrEnvironment
-            | Self::ProductOrEnvironment
-            | Self::EnvironmentOrWorkload
-            | Self::WorkloadOrProduct
-            | Self::NoSignal => FailureSeverity::NeedsInvestigation,
-        }
-    }
-}
-
-impl From<RecoveryStabilityClassification> for FailureClassification {
-    fn from(classification: RecoveryStabilityClassification) -> Self {
-        match classification {
-            RecoveryStabilityClassification::DataCorruption => Self::DataCorruption,
-            RecoveryStabilityClassification::CommittedObjectUnavailable => {
-                Self::CommittedObjectUnavailable
-            }
-            RecoveryStabilityClassification::CommittedVersionMissing => {
-                Self::CommittedVersionMissing
-            }
-            RecoveryStabilityClassification::CommittedVersionUnavailable => {
-                Self::CommittedVersionUnavailable
-            }
-            RecoveryStabilityClassification::VersionHashMismatch => Self::VersionHashMismatch,
-            RecoveryStabilityClassification::DeleteMarkerMissing => Self::DeleteMarkerMissing,
-            RecoveryStabilityClassification::DeletedObjectResurrected => {
-                Self::DeletedObjectResurrected
-            }
-            RecoveryStabilityClassification::DeleteMarkerLineageIncomplete => {
-                Self::DeleteMarkerLineageIncomplete
-            }
-            RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite => {
-                Self::VersionIdMissingOnCommittedWrite
-            }
-            RecoveryStabilityClassification::MultipartUploadLineageIncomplete => {
-                Self::MultipartUploadLineageIncomplete
-            }
-            RecoveryStabilityClassification::ListUnavailableOrUnknown => {
-                Self::ListUnavailableOrUnknown
-            }
-            RecoveryStabilityClassification::RecoveryTailReadLatency => {
-                Self::RecoveryTailReadLatency
-            }
-            RecoveryStabilityClassification::AmbiguousWriteMaterialized => {
-                Self::AmbiguousWriteMaterialized
-            }
-            RecoveryStabilityClassification::HarnessError => Self::HarnessError,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FailureClassificationDetails {
-    severity: FailureSeverity,
-    data_correctness: DataCorrectnessStatus,
-    availability: AvailabilityStatus,
-    data_loss: Option<bool>,
-    corruption: Option<bool>,
-    recovered_within_window: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct FailureSummary {
-    #[serde(default = "legacy_failure_summary_schema_version")]
-    schema_version: u8,
-    scenario: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    run_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    case_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    observed_at_ms: Option<u64>,
-    stage: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    phase: Option<FailurePhase>,
-    verdict: FailureVerdict,
-    severity: FailureSeverity,
-    classification: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    s3_model_classification: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    run_failure_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    responsibility_domain: Option<ResponsibilityDomain>,
-    data_correctness: DataCorrectnessStatus,
-    availability: AvailabilityStatus,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    primary_evidence_refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    evidence_classifications: Vec<String>,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    final_list_warning_count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    list_warnings: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data_loss: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    corruption: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    recovered_within_window: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    recovered_within_seconds: Option<u64>,
-    message: String,
-}
-
-impl FailureSummary {
-    pub(crate) fn validate_classification_projection(&self) -> Result<()> {
-        let classification = FailureClassification::from_name(&self.classification)
-            .context("failure-summary.json has an unknown classification")?;
-        let details = FailureClassificationDetails::from_classification(classification);
-        ensure!(
-            self.severity == details.severity
-                && self.data_correctness == details.data_correctness
-                && self.availability == details.availability
-                && self.data_loss == details.data_loss
-                && self.corruption == details.corruption
-                && self.recovered_within_window == details.recovered_within_window,
-            "failure-summary.json outcome fields contradict classification {}",
-            self.classification
-        );
-        Ok(())
-    }
-
-    pub(crate) fn new(
-        scenario: impl Into<String>,
-        stage: impl Into<String>,
-        classification: impl AsRef<str>,
-        message: impl Into<String>,
-    ) -> Result<Self> {
-        let stage = stage.into();
-        let classification_name = classification.as_ref();
-        let classification =
-            FailureClassification::from_name(classification_name).with_context(|| {
-                format!(
-                    "failure classification {classification_name:?} is not in the writer allowlist"
-                )
-            })?;
-        Ok(Self::from_classification(
-            scenario,
-            stage,
-            classification,
-            message,
-        ))
-    }
-
-    pub(crate) fn from_checker(
-        scenario: impl Into<String>,
-        stage: impl Into<String>,
-        classification: RecoveryStabilityClassification,
-        message: impl Into<String>,
-    ) -> Self {
-        let classification = FailureClassification::from(classification);
-        let mut summary =
-            Self::from_classification(scenario, stage.into(), classification, message);
-        summary.evidence_classifications = vec![classification.as_str().to_string()];
-        summary
-    }
-
-    fn from_classification(
-        scenario: impl Into<String>,
-        stage: String,
-        classification: FailureClassification,
-        message: impl Into<String>,
-    ) -> Self {
-        let details = FailureClassificationDetails::from_classification(classification);
-        let phase = FailurePhase::from_stage(&stage);
-        let projection = FailureV2Projection::from_classification(classification);
-        Self {
-            schema_version: FAILURE_SUMMARY_SCHEMA_VERSION,
-            run_id: None,
-            scenario: scenario.into(),
-            case_name: None,
-            observed_at_ms: Some(now_ms()),
-            stage: stage.clone(),
-            phase: Some(phase),
-            verdict: FailureVerdict::Failed,
-            severity: details.severity,
-            classification: classification.as_str().to_string(),
-            s3_model_classification: projection.s3_model_classification,
-            run_failure_reason: projection.run_failure_reason,
-            responsibility_domain: Some(projection.responsibility_domain),
-            data_correctness: details.data_correctness,
-            availability: details.availability,
-            primary_evidence_refs: primary_evidence_refs_for(&stage, phase),
-            evidence_classifications: Vec::new(),
-            final_list_warning_count: 0,
-            list_warnings: Vec::new(),
-            data_loss: details.data_loss,
-            corruption: details.corruption,
-            recovered_within_window: details.recovered_within_window,
-            recovered_within_seconds: None,
-            message: message.into(),
-        }
-    }
-
-    pub(crate) fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
-        self.run_id = Some(run_id.into());
-        self
-    }
-
-    fn with_case_name(mut self, case_name: &str) -> Self {
-        if self.case_name.is_none() {
-            self.case_name = Some(case_name.to_string());
-        }
-        self
-    }
-
-    fn with_artifact_context(
-        mut self,
-        collector: &ArtifactCollector,
-        case_name: &str,
-    ) -> Result<Self> {
-        let case_dir = collector.case_dir(case_name);
-        self.primary_evidence_refs = self
-            .primary_evidence_refs
-            .into_iter()
-            .map(|artifact| case_dir.join(artifact))
-            .filter(|path| path.is_file())
-            .map(|path| {
-                collector
-                    .reference_path(&path)
-                    .map(|relative| relative.display().to_string())
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(self)
-    }
-
-    pub(crate) fn with_recovered_within_seconds(mut self, seconds: Option<u64>) -> Self {
-        self.recovered_within_seconds = seconds;
-        self
-    }
-
-    pub(crate) fn with_evidence_classifications(
-        mut self,
-        classifications: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.evidence_classifications = classifications.into_iter().map(Into::into).collect();
-        self.evidence_classifications.sort();
-        self.evidence_classifications.dedup();
-        self
-    }
-
-    pub(crate) fn with_list_warnings(
-        mut self,
-        final_list_warning_count: usize,
-        warnings: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.final_list_warning_count = final_list_warning_count;
-        self.list_warnings = warnings.into_iter().map(Into::into).collect();
-        self.list_warnings.sort();
-        self.list_warnings.dedup();
-        self
-    }
-
-    pub(crate) fn severity(&self) -> FailureSeverity {
-        self.severity
-    }
-
-    pub(crate) fn phase(&self) -> Option<FailurePhase> {
-        self.phase
-    }
-
-    pub(crate) fn classification(&self) -> &str {
-        &self.classification
-    }
-
-    pub(crate) fn s3_model_classification(&self) -> Option<&str> {
-        self.s3_model_classification.as_deref()
-    }
-
-    pub(crate) fn run_failure_reason(&self) -> Option<&str> {
-        self.run_failure_reason.as_deref()
-    }
-
-    pub(crate) fn responsibility_domain(&self) -> Option<ResponsibilityDomain> {
-        self.responsibility_domain
-    }
-
-    pub(crate) fn primary_evidence_refs(&self) -> &[String] {
-        &self.primary_evidence_refs
-    }
-
-    pub(crate) fn evidence_classifications(&self) -> &[String] {
-        &self.evidence_classifications
-    }
-}
-
-fn legacy_failure_summary_schema_version() -> u8 {
-    1
-}
-
-fn is_zero(value: &usize) -> bool {
-    *value == 0
-}
-
-#[derive(Debug, Clone)]
-struct FailureV2Projection {
-    s3_model_classification: Option<String>,
-    run_failure_reason: Option<String>,
-    responsibility_domain: ResponsibilityDomain,
-}
-
-impl FailureV2Projection {
-    fn from_classification(classification: FailureClassification) -> Self {
-        if classification.is_s3_model() {
-            return Self {
-                s3_model_classification: Some(classification.as_str().to_string()),
-                run_failure_reason: None,
-                responsibility_domain: ResponsibilityDomain::Product,
-            };
-        }
-
-        Self {
-            s3_model_classification: None,
-            run_failure_reason: Some(classification.as_str().to_string()),
-            responsibility_domain: classification.responsibility_domain(),
-        }
-    }
-}
-
-impl ResponsibilityDomain {
-    pub(crate) fn from_classification(classification: &str) -> Self {
-        FailureClassification::from_name(classification)
-            .map(FailureClassification::responsibility_domain)
-            .unwrap_or(Self::Unknown)
-    }
-}
-
-impl FailurePhase {
-    pub(crate) fn from_stage(stage: &str) -> Self {
-        match stage {
-            "scenario" | "fault-backend-preflight" | "fault-backend-pre-cleanup" => Self::Preflight,
-            "fixture-prepare"
-            | "tenant-ready-before-fault"
-            | "pod-stability-before-fault"
-            | "initial-s3-access"
-            | "s3-endpoint"
-            | "s3-client"
-            | "bucket-create"
-            | "prefill"
-            | "pod-identity-before-fault" => Self::Setup,
-            "fault-apply" | "wait-active" | "fault-snapshot-active" | "active-snapshot-failed" => {
-                Self::FaultInjection
-            }
-            "s3-access-under-fault"
-            | "warp-workload"
-            | "mixed-workload"
-            | "post-warp-s3-access"
-            | "post-warp-port-forward-failed"
-            | "fault-evidence"
-            | "workload-no-fault-evidence"
-            | "fault-still-active"
-            | "workload-outlived-fault"
-            | "fault-snapshot-after-workload"
-            | "after-workload-snapshot-failed" => Self::Workload,
-            "fault-delete" => Self::Cleanup,
-            "tenant-recovery"
-            | "pod-stability-after-recovery"
-            | "s3-access-after-recovery"
-            | "recommit-unconfirmed" => Self::Recovery,
-            "checker-pre-recommit"
-            | "checker-pre-recommit-verdict"
-            | "checker-final"
-            | "checker-verdict" => Self::Checker,
-            _ if stage.contains("preflight") => Self::Preflight,
-            _ if stage.starts_with("checker") || stage.ends_with("-verdict") => Self::Checker,
-            _ if stage.contains("cleanup") || stage.ends_with("-delete") => Self::Cleanup,
-            _ => Self::Runner,
-        }
-    }
-}
-
-fn primary_evidence_refs_for(stage: &str, phase: FailurePhase) -> Vec<String> {
-    let mut refs = Vec::new();
-
-    match phase {
-        FailurePhase::Checker => {
-            if stage == "checker-pre-recommit" {
-                push_unique(&mut refs, "recovery-stability-report.json");
-                push_unique(&mut refs, "checker-pre-recommit-error.txt");
-            } else if stage.contains("pre-recommit") {
-                push_unique(&mut refs, "recovery-stability-report.json");
-                push_unique(&mut refs, "checker-pre-recommit-report.json");
-            } else if stage == "checker-final" {
-                push_unique(&mut refs, "checker-final-error.txt");
-            } else {
-                push_unique(&mut refs, "checker-report.json");
-            }
-            push_unique(&mut refs, "fault-evidence.json");
-        }
-        FailurePhase::Recovery if stage == "recommit-unconfirmed" => {
-            push_unique(&mut refs, "fault-evidence.json");
-        }
-        FailurePhase::Preflight
-        | FailurePhase::Setup
-        | FailurePhase::FaultInjection
-        | FailurePhase::Workload
-        | FailurePhase::Recovery
-        | FailurePhase::Cleanup
-        | FailurePhase::Runner => {}
-    }
-
-    push_unique(&mut refs, "run-events.jsonl");
-    refs.truncate(5);
-    refs
-}
-
-fn push_unique(refs: &mut Vec<String>, artifact: &str) {
-    if !refs.iter().any(|item| item == artifact) {
-        refs.push(artifact.to_string());
-    }
-}
-
-impl FailureClassificationDetails {
-    fn from_classification(classification: FailureClassification) -> Self {
-        match classification {
-            FailureClassification::RecoveryTailReadLatency => Self {
-                severity: classification.severity(),
-                data_correctness: DataCorrectnessStatus::Passed,
-                availability: AvailabilityStatus::RecoveredAfterTailLatency,
-                data_loss: Some(false),
-                corruption: Some(false),
-                recovered_within_window: Some(true),
-            },
-            FailureClassification::CommittedObjectUnavailable => Self {
-                severity: classification.severity(),
-                data_correctness: DataCorrectnessStatus::Unknown,
-                availability: AvailabilityStatus::CommittedObjectUnavailable,
-                data_loss: None,
-                corruption: Some(false),
-                recovered_within_window: Some(false),
-            },
-            FailureClassification::CommittedVersionMissing => Self {
-                severity: FailureSeverity::FailCorrectness,
-                data_correctness: DataCorrectnessStatus::Failed,
-                availability: AvailabilityStatus::Unknown,
-                data_loss: Some(true),
-                corruption: Some(false),
-                recovered_within_window: Some(false),
-            },
-            FailureClassification::CommittedVersionUnavailable => Self {
-                severity: FailureSeverity::FailAvailability,
-                data_correctness: DataCorrectnessStatus::Unknown,
-                availability: AvailabilityStatus::CommittedVersionUnavailable,
-                data_loss: None,
-                corruption: Some(false),
-                recovered_within_window: Some(false),
-            },
-            FailureClassification::VersionHashMismatch
-            | FailureClassification::DeleteMarkerMissing
-            | FailureClassification::DeletedObjectResurrected => Self {
-                severity: FailureSeverity::FailCorrectness,
-                data_correctness: DataCorrectnessStatus::Failed,
-                availability: AvailabilityStatus::Unknown,
-                data_loss: Some(false),
-                corruption: Some(true),
-                recovered_within_window: None,
-            },
-            FailureClassification::DeleteMarkerLineageIncomplete
-            | FailureClassification::VersionIdMissingOnCommittedWrite
-            | FailureClassification::MultipartUploadLineageIncomplete => Self {
-                severity: FailureSeverity::NeedsInvestigation,
-                data_correctness: DataCorrectnessStatus::Unknown,
-                availability: AvailabilityStatus::Unknown,
-                data_loss: None,
-                corruption: Some(false),
-                recovered_within_window: None,
-            },
-            FailureClassification::ListUnavailableOrUnknown => Self {
-                severity: classification.severity(),
-                data_correctness: DataCorrectnessStatus::Unknown,
-                availability: AvailabilityStatus::ListUnavailableOrUnknown,
-                data_loss: None,
-                corruption: Some(false),
-                recovered_within_window: Some(false),
-            },
-            FailureClassification::DataCorruption => Self {
-                severity: classification.severity(),
-                data_correctness: DataCorrectnessStatus::Failed,
-                availability: AvailabilityStatus::Unknown,
-                data_loss: None,
-                corruption: Some(true),
-                recovered_within_window: None,
-            },
-            FailureClassification::AmbiguousWriteMaterialized => Self {
-                severity: classification.severity(),
-                data_correctness: DataCorrectnessStatus::Unknown,
-                availability: AvailabilityStatus::Unknown,
-                data_loss: None,
-                corruption: Some(false),
-                recovered_within_window: None,
-            },
-            FailureClassification::HarnessError
-            | FailureClassification::TestHarness
-            | FailureClassification::TestOrEnvironment
-            | FailureClassification::EnvironmentOrFaultBackend => Self {
-                severity: classification.severity(),
-                data_correctness: DataCorrectnessStatus::Unknown,
-                availability: AvailabilityStatus::Unknown,
-                data_loss: None,
-                corruption: None,
-                recovered_within_window: None,
-            },
-            FailureClassification::WorkloadExecutionError
-            | FailureClassification::ArtifactValidationFailed
-            | FailureClassification::CheckerExecutionError
-            | FailureClassification::PreflightFailed
-            | FailureClassification::HealthGuardFailed
-            | FailureClassification::FaultBackendUnavailable
-            | FailureClassification::FaultNotActive
-            | FailureClassification::FaultNotRecovered
-            | FailureClassification::Unknown
-            | FailureClassification::CheckerOrEnvironment
-            | FailureClassification::ProductOrEnvironment
-            | FailureClassification::EnvironmentOrWorkload
-            | FailureClassification::WorkloadOrProduct
-            | FailureClassification::NoSignal => Self {
-                severity: classification.severity(),
-                data_correctness: DataCorrectnessStatus::Unknown,
-                availability: AvailabilityStatus::Unknown,
-                data_loss: None,
-                corruption: None,
-                recovered_within_window: None,
-            },
-        }
-    }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+pub(crate) use crate::fault::verdict::FailureSummary;
+pub use crate::fault::verdict::{
+    AvailabilityStatus, DataCorrectnessStatus, FailureClassification, FailurePhase,
+    FailureSeverity, FailureVerdict, ResponsibilityDomain,
+};
 
 pub(crate) fn write_failure_summary(
     collector: &ArtifactCollector,
     case_name: &str,
     summary: FailureSummary,
 ) -> Result<()> {
-    let summary = summary
-        .with_case_name(case_name)
-        .with_artifact_context(collector, case_name)?;
+    let summary = summary.with_case_name(case_name);
+    let summary = resolve_summary_evidence(summary, collector, case_name)?;
     collector.write_text(
         case_name,
         "failure-summary.json",
@@ -984,10 +196,7 @@ pub(crate) fn write_failure_summary(
     // run's summary gets. Warning-only — a contract violation must never mask
     // the run's original failure.
     let path = collector.case_dir(case_name).join("failure-summary.json");
-    if let Err(violation) = crate::fault::artifact_validation::validate_written_failure_summary(
-        collector.reference_root(),
-        &path,
-    ) {
+    if let Err(violation) = validate_written_failure_summary(collector.reference_root(), &path) {
         eprintln!(
             "warning: failure-summary.json violates the artifact contract (diagnostic validation): {violation:#}"
         );
@@ -1017,8 +226,172 @@ pub(crate) fn write_checker_error(
     Ok(())
 }
 
+fn resolve_summary_evidence(
+    mut summary: FailureSummary,
+    collector: &ArtifactCollector,
+    case_name: &str,
+) -> Result<FailureSummary> {
+    let case_dir = collector.case_dir(case_name);
+    summary.primary_evidence_refs = summary
+        .primary_evidence_refs
+        .into_iter()
+        .map(|artifact| case_dir.join(artifact))
+        .filter(|path| path.is_file())
+        .map(|path| {
+            collector
+                .reference_path(&path)
+                .map(|relative| relative.display().to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(summary)
+}
+
+/// Check persisted summary metadata without requiring a complete successful run.
+pub(crate) fn validate_written_failure_summary(root: &Path, path: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading just-written failure summary {}", path.display()))?;
+    let summary: FailureSummary = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing just-written failure summary {}", path.display()))?;
+    validate_failure_summary_v2_fields(&summary, Some(root), Some(path))
+}
+
+pub(crate) fn validate_failure_summary_v2_fields(
+    summary: &FailureSummary,
+    artifact_root: Option<&Path>,
+    artifact_path: Option<&Path>,
+) -> Result<()> {
+    if summary.schema_version < 2 {
+        return Ok(());
+    }
+
+    if let Some(phase) = summary.phase {
+        ensure!(
+            phase == FailurePhase::from_stage(&summary.stage),
+            "failure-summary.json phase {:?} does not match stage {:?}",
+            summary.phase,
+            summary.stage
+        );
+    }
+    ensure!(
+        summary
+            .case_name
+            .as_ref()
+            .is_none_or(|value| !value.trim().is_empty()),
+        "failure-summary.json case_name must be null or a non-empty string"
+    );
+    ensure!(
+        summary.observed_at_ms.is_none_or(|value| value > 0),
+        "failure-summary.json observed_at_ms must be greater than zero when present"
+    );
+
+    validate_failure_summary_v2_classification(summary)?;
+    if summary.primary_evidence_refs.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        summary.primary_evidence_refs.len() <= 5,
+        "failure-summary.json primary_evidence_refs must contain at most 5 entries"
+    );
+    ensure!(
+        summary
+            .primary_evidence_refs
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == summary.primary_evidence_refs.len(),
+        "failure-summary.json primary_evidence_refs contains duplicates"
+    );
+    for evidence_ref in &summary.primary_evidence_refs {
+        validate_primary_evidence_ref(evidence_ref, artifact_root, artifact_path)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_failure_summary_v2_classification(summary: &FailureSummary) -> Result<()> {
+    let classification =
+        FailureClassification::from_name(&summary.classification).with_context(|| {
+            format!(
+                "failure-summary.json classification {:?} is not in the writer allowlist",
+                summary.classification
+            )
+        })?;
+    if classification.is_s3_model() {
+        ensure!(
+            summary
+                .s3_model_classification
+                .as_deref()
+                .is_none_or(|value| value == summary.classification)
+                && summary.run_failure_reason.is_none(),
+            "failure-summary.json S3 model classification must match s3_model_classification when present and omit run_failure_reason"
+        );
+    } else {
+        ensure!(
+            summary.s3_model_classification.is_none()
+                && summary
+                    .run_failure_reason
+                    .as_deref()
+                    .is_none_or(|value| value == summary.classification),
+            "failure-summary.json non-S3-model classification must match run_failure_reason when present and omit s3_model_classification"
+        );
+    }
+    if let Some(responsibility_domain) = summary.responsibility_domain {
+        ensure!(
+            responsibility_domain
+                == ResponsibilityDomain::from_classification(&summary.classification),
+            "failure-summary.json responsibility_domain {:?} does not match classification {:?}",
+            summary.responsibility_domain,
+            summary.classification
+        );
+    }
+    Ok(())
+}
+
+fn validate_primary_evidence_ref(
+    evidence_ref: &str,
+    artifact_root: Option<&Path>,
+    artifact_path: Option<&Path>,
+) -> Result<()> {
+    let path = Path::new(evidence_ref);
+    ensure!(
+        !evidence_ref.trim().is_empty() && path.is_relative(),
+        "failure-summary.json primary_evidence_refs must be non-empty relative artifact paths"
+    );
+    ensure!(
+        path.components()
+            .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "failure-summary.json primary_evidence_refs must stay inside the suite artifact root"
+    );
+    if let Some(artifact_root) = artifact_root {
+        // v2 was originally emitted with case-directory-relative leaf names.
+        // Keep those artifacts readable while all new writers use the stable
+        // suite-root-relative form, which necessarily includes the case path.
+        let legacy_case_relative = path.components().count() == 1;
+        let evidence_path = if legacy_case_relative {
+            artifact_path
+                .and_then(Path::parent)
+                .unwrap_or(artifact_root)
+                .join(path)
+        } else {
+            artifact_root.join(path)
+        };
+        if let Some(artifact_path) = artifact_path {
+            ensure!(
+                legacy_case_relative || evidence_path != artifact_path,
+                "failure-summary.json primary_evidence_refs must not reference the summary itself"
+            );
+        }
+        ensure!(
+            evidence_path.is_file(),
+            "failure-summary.json primary evidence ref {:?} does not exist under its compatible artifact root",
+            evidence_ref
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::validate_written_failure_summary;
     use super::{
         FailureClassification, FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain,
         write_failure_summary,
@@ -1067,8 +440,7 @@ mod tests {
                 value["primary_evidence_refs"],
                 json!([format!("{case_name}/checker-report.json")])
             );
-            crate::fault::artifact_validation::validate_written_failure_summary(dir.path(), &path)
-                .expect("valid final summary");
+            validate_written_failure_summary(dir.path(), &path).expect("valid final summary");
         }
     }
 

@@ -772,7 +772,7 @@ pub struct FaultPlan {
     pub scenario: String,
     pub case_name: &'static str,
     pub workload_mode: FaultWorkloadMode,
-    faults: Vec<FaultInjection>,
+    fault: FaultInjection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -819,7 +819,7 @@ impl FaultPlan {
             scenario: scenario.into(),
             case_name,
             workload_mode,
-            faults,
+            fault: faults.into_iter().next().expect("validated single fault"),
         })
     }
 
@@ -972,47 +972,32 @@ impl FaultPlan {
         )
     }
 
+    pub fn fault(&self) -> &FaultInjection {
+        &self.fault
+    }
+
     pub fn faults(&self) -> &[FaultInjection] {
-        &self.faults
+        std::slice::from_ref(&self.fault)
     }
 
     pub fn required_backends(&self) -> Vec<FaultBackend> {
-        let mut backends = Vec::new();
-        for fault in &self.faults {
-            let backend = fault.backend();
-            if !backends.contains(&backend) {
-                backends.push(backend);
-            }
-        }
-        backends
+        vec![self.fault.backend()]
     }
 
     pub fn requires_static_storage(&self) -> bool {
-        self.faults
-            .iter()
-            .any(|fault| fault.backend() == FaultBackend::DeviceMapper)
+        self.fault.backend() == FaultBackend::DeviceMapper
     }
 
     pub fn backend_summary(&self) -> String {
-        self.required_backends()
-            .into_iter()
-            .map(|backend| format!("{backend:?}"))
-            .collect::<Vec<_>>()
-            .join(" + ")
+        format!("{:?}", self.fault.backend())
     }
 
     pub fn target_summary(&self) -> String {
-        self.faults
-            .iter()
-            .map(|fault| {
-                format!(
-                    "{} via {}",
-                    fault.target_summary(),
-                    fault.selection().summary()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" + ")
+        format!(
+            "{} via {}",
+            self.fault.target_summary(),
+            self.fault.selection().summary()
+        )
     }
 }
 

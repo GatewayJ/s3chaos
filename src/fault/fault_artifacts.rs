@@ -20,8 +20,6 @@ pub(super) trait FaultFailureArtifactSource {
         &self,
         collector: &ArtifactCollector,
         case_name: &str,
-        total: usize,
-        index: usize,
         suffix: &str,
     ) -> Result<()>;
 }

@@ -899,6 +899,95 @@ fn require_exact_singleton(label: &str, allowlist: &[String], observed: &str) ->
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmVolumeMapping {
+    pub node: String,
+    pub node_uid: String,
+    pub node_labels: BTreeMap<String, String>,
+    pub pod: String,
+    pub pod_uid: String,
+    pub volume_name: String,
+    pub pvc: String,
+    pub pvc_uid: String,
+    pub pvc_phase: String,
+    pub pv: String,
+    pub pv_uid: String,
+    pub pv_phase: String,
+    pub pv_claim_ref: HostStoragePersistentVolumeClaimRef,
+    pub node_selector: HostStorageNodeSelector,
+    pub container_mount_path: String,
+    pub mount_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmStatusSnapshot {
+    pub stage: String,
+    pub mapper_name: String,
+    pub canonical_device: String,
+    pub suspended: bool,
+    pub observed_at_ms: u64,
+    pub helper_pod: String,
+    pub mapping: DmVolumeMapping,
+    pub table: String,
+    pub status: String,
+}
+
+impl DmStatusSnapshot {
+    pub(crate) fn validate_proof(
+        &self,
+        proof: &HostStorageMutationProof,
+        stage: &str,
+        expected_table: &str,
+    ) -> Result<()> {
+        let target = &proof.target;
+        let mapping = &self.mapping;
+        ensure!(
+            self.stage == stage
+                && self.helper_pod == helper_pod_name(&proof.run_id)
+                && self.mapper_name == target.mapper_name
+                && self.canonical_device == target.canonical_device
+                && !self.suspended
+                && self.observed_at_ms >= proof.generated_at_ms
+                && normalize_dm_table(&self.table) == normalize_dm_table(expected_table),
+            "device-mapper {stage} snapshot does not match the proven device, table, or active state"
+        );
+        ensure!(
+            mapping.node == target.node
+                && mapping.node_uid == target.node_uid
+                && mapping.node_labels == target.node_labels
+                && mapping.pod == target.pod
+                && mapping.pod_uid == target.pod_uid
+                && mapping.volume_name == target.volume_name
+                && mapping.pvc == target.persistent_volume_claim
+                && mapping.pvc_uid == target.persistent_volume_claim_uid
+                && mapping.pvc_phase == target.persistent_volume_claim_phase
+                && mapping.pv == target.persistent_volume
+                && mapping.pv_uid == target.persistent_volume_uid
+                && mapping.pv_phase == target.persistent_volume_phase
+                && mapping.pv_claim_ref == target.persistent_volume_claim_ref
+                && mapping.node_selector == target.node_selector
+                && mapping.container_mount_path == target.container_mount_path
+                && mapping.mount_path == target.persistent_volume_path,
+            "device-mapper {stage} snapshot does not match the proven Pod/PVC/PV/node mapping"
+        );
+        Ok(())
+    }
+}
+
+pub(crate) fn helper_pod_name(run_id: &str) -> String {
+    let suffix = run_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    format!("rustfs-fault-dm-helper-{suffix}")
+}
+
+pub(crate) fn normalize_dm_table(table: &str) -> String {
+    table.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

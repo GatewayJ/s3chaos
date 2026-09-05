@@ -14,12 +14,12 @@
 
 use crate::{
     fault::{
-        backends::host::DmStatusSnapshot, config::FaultTestConfig,
-        fault_artifacts::FaultFailureArtifactSource, reporting::FaultStatusSnapshot,
+        config::FaultTestConfig, fault_artifacts::FaultFailureArtifactSource,
+        host_storage::DmStatusSnapshot, reporting::FaultStatusSnapshot,
     },
     framework::artifacts::ArtifactCollector,
 };
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use std::time::{Duration, Instant};
 
 pub(super) trait FaultLifecyclePort {
@@ -52,99 +52,6 @@ pub(super) trait FaultLifecyclePort {
 
 pub(super) type AppliedFault = Box<dyn FaultLifecyclePort>;
 
-pub(super) struct AppliedFaults {
-    items: Vec<AppliedFault>,
-}
-
-impl AppliedFaults {
-    pub(super) fn new(items: Vec<AppliedFault>) -> Self {
-        Self { items }
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    pub(super) fn wait_active(&self, timeout: Duration) -> Result<()> {
-        for fault in &self.items {
-            fault.wait_active(timeout)?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn ensure_active(&self, stage: &str) -> Result<()> {
-        for fault in &self.items {
-            fault.ensure_active(stage)?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn requires_recovery_boundary(&self) -> bool {
-        self.items
-            .iter()
-            .any(|fault| fault.requires_recovery_boundary())
-    }
-
-    pub(super) fn prepare_recovery_boundary(
-        &mut self,
-        timeout: Duration,
-        started_at_ms: u64,
-    ) -> Result<()> {
-        for fault in self.items.iter_mut().rev() {
-            if fault.requires_recovery_boundary() {
-                fault.prepare_recovery_boundary(timeout, started_at_ms)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn delete(&mut self, timeout: Duration) -> Result<()> {
-        for fault in self.items.iter_mut().rev() {
-            fault.delete(timeout)?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot> {
-        ensure!(
-            self.items.len() == 1,
-            "single fault snapshot requested for {} applied faults",
-            self.items.len()
-        );
-        self.items[0].snapshot(stage)
-    }
-
-    pub(super) fn snapshots(&self, stage: &str) -> Result<Vec<FaultStatusSnapshot>> {
-        self.items
-            .iter()
-            .map(|fault| fault.snapshot(stage))
-            .collect()
-    }
-
-    pub(super) fn recovery_dm_snapshot(&self) -> Option<DmStatusSnapshot> {
-        self.items
-            .iter()
-            .find_map(|fault| fault.recovery_dm_snapshot())
-    }
-
-    pub(super) fn failure_artifacts(&self) -> Vec<&dyn FaultFailureArtifactSource> {
-        self.items
-            .iter()
-            .filter_map(|fault| fault.failure_artifacts())
-            .collect()
-    }
-
-    pub(super) fn recover_delete_timeout_with(
-        &mut self,
-        request: &FaultDeleteTimeoutRecoveryRequest<'_>,
-    ) -> Result<Option<FaultDeleteTimeoutRecovery>> {
-        if self.items.len() != 1 {
-            return Ok(None);
-        }
-        self.items[0].as_mut().recover_delete_timeout(request)
-    }
-}
-
 pub(super) struct FaultDeleteTimeoutRecoveryRequest<'a> {
     pub(super) config: &'a FaultTestConfig,
     pub(super) collector: &'a ArtifactCollector,
@@ -164,7 +71,7 @@ pub(super) struct FaultDeleteTimeoutRecovery {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppliedFaults, FaultDeleteTimeoutRecovery, FaultDeleteTimeoutRecoveryRequest,
+        AppliedFault, FaultDeleteTimeoutRecovery, FaultDeleteTimeoutRecoveryRequest,
         FaultLifecyclePort,
     };
     use crate::fault::{
@@ -312,112 +219,53 @@ mod tests {
     }
 
     #[test]
-    fn applied_faults_wait_active_visits_ports_in_insert_order() {
+    fn applied_fault_delegates_lifecycle_and_snapshot_to_its_owner() {
         let state = recording_state();
-        let faults = AppliedFaults::new(vec![
-            Box::new(RecordingFault::new("first", state.clone())),
-            Box::new(RecordingFault::new("second", state.clone())),
-            Box::new(RecordingFault::new("third", state.clone())),
-        ]);
-
-        faults
+        let mut fault: AppliedFault = Box::new(RecordingFault::new("target", state.clone()));
+        fault
             .wait_active(Duration::from_secs(7))
             .expect("wait active");
-
+        fault.ensure_active("workload").expect("active");
+        let snapshot = fault.snapshot("after-workload").expect("snapshot");
+        assert_eq!(snapshot.resource_name.as_deref(), Some("target"));
+        assert_eq!(snapshot.stage, "after-workload");
+        fault.delete(Duration::from_secs(1)).expect("delete");
         assert_eq!(
-            state.borrow().waits.as_slice(),
-            &[
-                ("first", Duration::from_secs(7)),
-                ("second", Duration::from_secs(7)),
-                ("third", Duration::from_secs(7)),
-            ]
+            state.borrow().waits,
+            vec![("target", Duration::from_secs(7))]
         );
-    }
-
-    #[test]
-    fn applied_faults_delete_visits_ports_in_reverse_order() {
-        let state = recording_state();
-        let mut faults = AppliedFaults::new(vec![
-            Box::new(RecordingFault::new("first", state.clone())),
-            Box::new(RecordingFault::new("second", state.clone())),
-            Box::new(RecordingFault::new("third", state.clone())),
-        ]);
-
-        faults
-            .delete(Duration::from_secs(1))
-            .expect("delete faults");
-
         assert_eq!(
-            state.borrow().deletes.as_slice(),
-            &[
-                ("third", Duration::from_secs(1)),
-                ("second", Duration::from_secs(1)),
-                ("first", Duration::from_secs(1)),
-            ]
+            state.borrow().deletes,
+            vec![("target", Duration::from_secs(1))]
         );
     }
 
     #[test]
-    fn applied_faults_single_snapshot_rejects_multiple_ports() {
+    fn applied_fault_routes_recovery_to_its_owner() {
         let state = recording_state();
-        let faults = AppliedFaults::new(vec![
-            Box::new(RecordingFault::new("first", state.clone())),
-            Box::new(RecordingFault::new("second", state)),
-        ]);
-
-        let error = faults
-            .snapshot("after-workload")
-            .expect_err("snapshot error");
-
-        assert!(
-            error
-                .to_string()
-                .contains("single fault snapshot requested for 2 applied faults")
-        );
-    }
-
-    #[test]
-    fn applied_faults_delete_timeout_recovery_skips_multiple_ports() {
-        let state = recording_state();
-        let mut faults = AppliedFaults::new(vec![
-            Box::new(RecordingFault::new("first", state.clone())),
-            Box::new(RecordingFault::new("second", state.clone())),
-        ]);
+        let mut fault: AppliedFault = Box::new(RecordingFault::new("target", state.clone()));
         let tempdir = tempfile::tempdir().expect("tempdir");
         let collector = ArtifactCollector::new(tempdir.path());
-        let config = FaultTestConfig::for_test("k3s-s3chaos", "local-path");
-        let original_error = anyhow!("delete timed out");
-
-        let recovery = faults
-            .recover_delete_timeout_with(&recovery_request(&config, &collector, &original_error))
-            .expect("recovery decision");
-
-        assert!(recovery.is_none());
+        let config = FaultTestConfig::for_test("context", "storage");
+        let original_error = anyhow!("timeout");
         assert!(
-            state.borrow().recoveries.is_empty(),
-            "multi fault recovery must not dispatch to a single backend"
+            fault
+                .recover_delete_timeout(&recovery_request(&config, &collector, &original_error))
+                .expect("recover")
+                .is_none()
         );
+        assert_eq!(state.borrow().recoveries, vec!["target"]);
     }
 
     #[test]
-    fn applied_faults_recovery_dm_snapshot_returns_first_available_snapshot() {
-        let state = recording_state();
-        let faults = AppliedFaults::new(vec![
-            Box::new(RecordingFault::new("none", state.clone())),
-            Box::new(
-                RecordingFault::new("first", state.clone())
-                    .with_recovery_dm_snapshot(recording_dm_snapshot("recovered", "helper-a")),
-            ),
-            Box::new(
-                RecordingFault::new("second", state)
-                    .with_recovery_dm_snapshot(recording_dm_snapshot("recovered", "helper-b")),
-            ),
-        ]);
-
-        let snapshot = faults
-            .recovery_dm_snapshot()
-            .expect("first recovery dm snapshot");
-
-        assert_eq!(snapshot.helper_pod, "helper-a");
+    fn applied_fault_preserves_backend_recovery_evidence() {
+        let expected = recording_dm_snapshot("recovered", "helper");
+        let fault: AppliedFault = Box::new(
+            RecordingFault::new("target", recording_state())
+                .with_recovery_dm_snapshot(expected.clone()),
+        );
+        assert_eq!(fault.recovery_dm_snapshot(), Some(expected));
+        assert!(!fault.requires_recovery_boundary());
+        assert!(fault.failure_artifacts().is_none());
     }
 }

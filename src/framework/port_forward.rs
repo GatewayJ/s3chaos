@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use uuid::Uuid;
 
-use crate::framework::{command::CommandSpec, config::ClusterTestConfig, kubectl::Kubectl};
+use crate::framework::{command::CommandSpec, kubectl::Kubectl};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortForwardSpec {
@@ -114,21 +114,6 @@ impl PortForwardSpec {
 
     pub fn local_base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.local_port)
-    }
-
-    pub fn start_console(config: &ClusterTestConfig) -> Result<PortForwardGuard> {
-        let kubectl = Kubectl::new(config);
-        Self::console(&config.operator_namespace).start_with_temp_log(&kubectl)
-    }
-
-    pub fn start_operator_sts(config: &ClusterTestConfig) -> Result<PortForwardGuard> {
-        let kubectl = Kubectl::new(config);
-        Self::operator_sts(&config.operator_namespace).start_with_temp_log(&kubectl)
-    }
-
-    pub fn start_tenant_io(config: &ClusterTestConfig) -> Result<PortForwardGuard> {
-        let kubectl = Kubectl::new(config);
-        Self::tenant_io(&config.test_namespace, &config.tenant_name).start_with_temp_log(&kubectl)
     }
 }
 
