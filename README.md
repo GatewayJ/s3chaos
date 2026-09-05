@@ -99,7 +99,17 @@ execution environments and verdicts separate:
 | `smoke.yaml` | Six short correctness and recovery checks across I/O, pod, and network faults | Dedicated cluster with Chaos Mesh |
 | `regression.yaml` | Remaining ordinary Chaos Mesh scenarios, including the write-quorum boundary | Reference four-server single-erasure-set topology for `network-partition-write-quorum-loss` |
 | `dm-lab.yaml` | `dm-flakey` and the versioned hot-key soft-power-loss proxy | Prepared dedicated block device and static local PV from `docs/DM_FLAKEY.md` |
-| `warp-performance.yaml` | Performance-only Warp-under-chaos campaign; correctness still comes from the normal checker | `warp` on `PATH`; tune `RUSTFS_FAULT_TEST_WARP_DURATION_SECONDS` as needed |
+| `warp-performance.yaml` | Performance-only Warp-under-chaos campaign; correctness still comes from the normal checker | `warp` on `PATH`; Warp defaults to 60 seconds |
+
+Warp planning requires a positive `RUSTFS_FAULT_TEST_WARP_DURATION_SECONDS`
+strictly below `faultDuration - RUSTFS_FAULT_TEST_TIMEOUT_SECONDS` to leave
+headroom for post-Warp operations. With this suite's 15-minute fault window and
+the default 300-second timeout, Warp must be shorter than 600 seconds. When
+increasing Warp duration, increase `faultDuration` and the suite's `maxDuration`
+as needed, then run `make fault-suite-plan SUITE=fault/examples/warp-performance.yaml`
+with the intended environment. Static `fault-suite-validate` checks YAML only.
+This headroom is not a runtime guarantee: Warp setup and the correctness workload
+also take time, and the run fails if the fault expires before they finish.
 
 Each suite runs its scenarios sequentially to keep their conflict domains from
 overlapping. Do not run multiple fault suites concurrently against the same
