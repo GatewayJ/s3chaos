@@ -157,6 +157,7 @@ pub struct GetObjectResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWriteResult {
+    pub write_operation_id: String,
     pub write_outcome: OperationOutcome,
     pub verify_get_outcome: Option<OperationOutcome>,
     pub verified: bool,
@@ -1082,9 +1083,11 @@ impl S3WorkloadClient {
         object: &PreparedObject,
         recorder: &Recorder,
     ) -> Result<VerifiedWriteResult> {
-        let write_outcome = self.put_object(object, recorder).await?;
+        let write_record = self.put_object_record(object, recorder).await?;
+        let write_outcome = write_record.outcome;
         if write_outcome != OperationOutcome::Ok {
             return Ok(VerifiedWriteResult {
+                write_operation_id: write_record.id,
                 write_outcome,
                 verify_get_outcome: None,
                 verified: false,
@@ -1097,6 +1100,7 @@ impl S3WorkloadClient {
             .as_deref()
             .is_some_and(|body| object.spec.matches_body(body));
         Ok(VerifiedWriteResult {
+            write_operation_id: write_record.id,
             write_outcome,
             verify_get_outcome: Some(get.outcome),
             verified,
@@ -1281,18 +1285,7 @@ impl S3WorkloadClient {
         Ok(Some(staged))
     }
 
-    pub(crate) async fn complete_staged_multipart_object(
-        &self,
-        staged: &StagedMultipartUpload,
-        recorder: &Recorder,
-    ) -> Result<OperationOutcome> {
-        Ok(self
-            .complete_staged_multipart_object_record(staged, recorder)
-            .await?
-            .outcome)
-    }
-
-    async fn complete_staged_multipart_object_record(
+    pub(crate) async fn complete_staged_multipart_object_record(
         &self,
         staged: &StagedMultipartUpload,
         recorder: &Recorder,

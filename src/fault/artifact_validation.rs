@@ -774,7 +774,6 @@ fn validate_fault_artifacts_with_identity(
             && recommit.attempts.len() == recommit.attempted,
         "recommit-report.json must have attempted == committed, failed == 0, harness_errors == 0, and attempts length matching attempted"
     );
-
     let summary =
         read_json::<WorkloadSummaryArtifact>(required(&artifacts, "workload-summary.json")?)?;
     validate_optional_identity_fields(
@@ -794,6 +793,17 @@ fn validate_fault_artifacts_with_identity(
         summary.recommitted_after_recovery == recommit.committed,
         "workload-summary.json recommitted_after_recovery does not match recommit-report.json committed"
     );
+    validate_checker_phase_chain(
+        &prechecker,
+        &checker,
+        &recommit,
+        summary
+            .recommit_candidates
+            .as_ref()
+            .context("workload-summary.json has no sealed recommit candidate manifest")?,
+        &json_spec.metadata.bucket,
+        &history,
+    )?;
     ensure!(
         summary.exercised_all_operation_families(),
         "workload-summary.json did not exercise every required S3 operation family"
@@ -1896,6 +1906,293 @@ fn validate_checker_report(
             "checker-report.json audit does not cover the terminal history.jsonl record"
         );
     }
+    Ok(())
+}
+
+fn validate_checker_phase_chain(
+    prechecker: &CheckerReport,
+    checker: &CheckerReport,
+    recommit: &RecommitReportArtifact,
+    manifest: &RecommitCandidateManifestArtifact,
+    expected_bucket: &str,
+    history: &[OperationRecord],
+) -> Result<()> {
+    let pre_audit = prechecker
+        .audit
+        .as_ref()
+        .context("checker-pre-recommit-report.json has no history-bound audit")?;
+    let final_audit = checker
+        .audit
+        .as_ref()
+        .context("checker-report.json has no history-bound audit")?;
+    let pre_end = pre_audit
+        .history_prefix_record_count
+        .checked_add(pre_audit.history_suffix_record_count)
+        .context("pre-recommit checker audit history bounds overflow")?;
+    ensure!(
+        pre_audit.history_suffix_record_count > 0 && final_audit.history_suffix_record_count > 0,
+        "checker phase audits must each contain independently captured operations"
+    );
+    ensure!(
+        pre_audit.bucket == expected_bucket
+            && final_audit.bucket == expected_bucket
+            && manifest.bucket == expected_bucket
+            && manifest.scenario == prechecker.scenario
+            && manifest.run_id == prechecker.run_id,
+        "checker phases and recommit candidate manifest do not match the run target identity"
+    );
+    ensure!(
+        manifest.history_record_count == pre_audit.history_prefix_record_count
+            && manifest.history_sha256 == pre_audit.history_prefix_sha256,
+        "recommit candidate manifest is not bound to the authenticated pre-recommit history"
+    );
+    ensure!(
+        pre_end <= final_audit.history_prefix_record_count
+            && pre_audit.completed_at_ms <= final_audit.started_at_ms,
+        "checker phase audits overlap or are out of order"
+    );
+
+    let recommit_record_count = recommit
+        .attempted
+        .checked_mul(2)
+        .context("recommit history record count overflow")?;
+    let recommit_end = pre_end
+        .checked_add(recommit_record_count)
+        .context("recommit history bounds overflow")?;
+    ensure!(
+        recommit_end == final_audit.history_prefix_record_count,
+        "history between checker phases must contain exactly one PUT and verification GET per recommit attempt"
+    );
+    let recommit_history = history
+        .get(pre_end..recommit_end)
+        .context("checker phase history bounds exceed history.jsonl")?;
+
+    type RecommitIdentity = (String, usize, String);
+    let mut latest_mutations = BTreeMap::<&str, (u64, &OperationRecord)>::new();
+    for record in &history[..manifest.history_record_count] {
+        if !matches!(
+            record.kind,
+            OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+        ) {
+            continue;
+        }
+        let key = record
+            .key
+            .as_deref()
+            .context("authenticated mutation history contains an operation without a key")?;
+        let sequence = record
+            .started_sequence
+            .context("authenticated mutation history contains an operation without a sequence")?;
+        match latest_mutations.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((sequence, record));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                ensure!(
+                    entry.get().0 != sequence,
+                    "authenticated mutation history contains duplicate start sequences"
+                );
+                if sequence > entry.get().0 {
+                    entry.insert((sequence, record));
+                }
+            }
+        }
+    }
+    let mut derived_candidates = BTreeMap::<RecommitIdentity, String>::new();
+    for (_, source) in latest_mutations.values() {
+        if !matches!(
+            source.kind,
+            OperationKind::Put | OperationKind::CompleteMultipartUpload
+        ) || source.outcome == OperationOutcome::Ok
+        {
+            continue;
+        }
+        let identity = (
+            source.key.clone().context("recommit source has no key")?,
+            source.size_bytes.context("recommit source has no size")?,
+            source
+                .value_sha256
+                .clone()
+                .context("recommit source has no body digest")?,
+        );
+        ensure!(
+            derived_candidates
+                .insert(identity, source.id.clone())
+                .is_none(),
+            "authenticated history produced duplicate recommit candidate identities"
+        );
+    }
+
+    let mut expected = BTreeMap::<RecommitIdentity, String>::new();
+    for candidate in &manifest.candidates {
+        ensure!(
+            expected
+                .insert(
+                    (
+                        candidate.key.clone(),
+                        candidate.size_bytes,
+                        candidate.sha256.clone(),
+                    ),
+                    candidate.source_operation_id.clone(),
+                )
+                .is_none(),
+            "recommit candidate manifest contains a duplicate object identity"
+        );
+        let source = history[..manifest.history_record_count]
+            .iter()
+            .find(|record| record.id == candidate.source_operation_id)
+            .with_context(|| {
+                format!(
+                    "recommit candidate {} source operation is absent from its authenticated history",
+                    candidate.key
+                )
+            })?;
+        ensure!(
+            matches!(
+                source.kind,
+                OperationKind::Put | OperationKind::CompleteMultipartUpload
+            ) && source.outcome != OperationOutcome::Ok
+                && source.bucket == expected_bucket
+                && source.key.as_deref() == Some(candidate.key.as_str())
+                && source.value_sha256.as_deref() == Some(candidate.sha256.as_str())
+                && source.size_bytes == Some(candidate.size_bytes),
+            "recommit candidate {} does not match its authenticated source operation",
+            candidate.key
+        );
+        let source_sequence = source.started_sequence.with_context(|| {
+            format!(
+                "recommit candidate source {} has no recorder sequence",
+                source.id
+            )
+        })?;
+        ensure!(
+            !history[..manifest.history_record_count]
+                .iter()
+                .any(|record| {
+                    record.key.as_deref() == Some(candidate.key.as_str())
+                        && matches!(
+                            record.kind,
+                            OperationKind::Put
+                                | OperationKind::Delete
+                                | OperationKind::CompleteMultipartUpload
+                        )
+                        && record
+                            .started_sequence
+                            .is_some_and(|sequence| sequence > source_sequence)
+                }),
+            "recommit candidate {} was superseded by a later mutation",
+            candidate.key
+        );
+    }
+    ensure!(
+        expected == derived_candidates,
+        "recommit candidate manifest does not match the final unconfirmed mutations in authenticated history"
+    );
+    ensure!(
+        manifest.candidates.len() == recommit.attempted,
+        "recommit candidate manifest count does not match recommit-report.json"
+    );
+    let mut attempts = BTreeMap::<RecommitIdentity, &RecommitAttemptArtifact>::new();
+    for attempt in &recommit.attempts {
+        ensure!(
+            attempt.outcome == Some(OperationOutcome::Ok)
+                && attempt.verify_get_outcome == Some(OperationOutcome::Ok)
+                && attempt.http_status == Some(200)
+                && attempt.error.is_none()
+                && attempt.harness_error.is_none(),
+            "recommit-report.json contains an unsuccessful attempt"
+        );
+        let identity = (
+            attempt.key.clone(),
+            attempt.size_bytes,
+            attempt.sha256.clone(),
+        );
+        ensure!(
+            expected.get(&identity) == Some(&attempt.source_operation_id)
+                && attempts.insert(identity, attempt).is_none(),
+            "recommit-report.json attempt does not match its sealed candidate manifest"
+        );
+    }
+
+    let mut put_by_key = BTreeMap::<String, (&OperationRecord, RecommitIdentity)>::new();
+    let mut get_by_key = BTreeMap::<String, (&OperationRecord, RecommitIdentity)>::new();
+    for record in recommit_history {
+        ensure!(
+            record.started_at_ms <= record.ended_at_ms
+                && record.started_at_ms >= pre_audit.completed_at_ms
+                && record.ended_at_ms <= final_audit.started_at_ms,
+            "recommit history is outside the authenticated checker phase interval"
+        );
+        let started_sequence = record
+            .started_sequence
+            .context("recommit history operation has no started sequence")?;
+        let ended_sequence = record
+            .ended_sequence
+            .context("recommit history operation has no ended sequence")?;
+        ensure!(
+            started_sequence < ended_sequence
+                && record.bucket == expected_bucket
+                && record.outcome == OperationOutcome::Ok
+                && record.http_status == Some(200)
+                && record.error.is_none(),
+            "recommit history contains an unsuccessful operation"
+        );
+        let identity = (
+            record
+                .key
+                .clone()
+                .context("recommit history operation has no key")?,
+            record
+                .size_bytes
+                .context("recommit history operation has no size")?,
+            record
+                .value_sha256
+                .clone()
+                .context("recommit history operation has no body digest")?,
+        );
+        let key = identity.0.clone();
+        match record.kind {
+            OperationKind::Put => ensure!(
+                put_by_key.insert(key, (record, identity)).is_none(),
+                "recommit history contains duplicate PUTs for one candidate key"
+            ),
+            OperationKind::Get if record.version_id.is_none() && record.range.is_none() => {
+                ensure!(
+                    get_by_key.insert(key, (record, identity)).is_none(),
+                    "recommit history contains duplicate verification GETs for one candidate key"
+                );
+            }
+            _ => bail!(
+                "history between checker phases contains a non-recommit operation {}",
+                record.id
+            ),
+        }
+    }
+    ensure!(
+        put_by_key.len() == expected.len() && get_by_key.len() == expected.len(),
+        "recommit history operation count does not match the sealed candidate manifest"
+    );
+    for identity in expected.keys() {
+        let (put, put_identity) = put_by_key
+            .get(&identity.0)
+            .context("recommit history is missing a candidate PUT")?;
+        let (get, get_identity) = get_by_key
+            .get(&identity.0)
+            .context("recommit history is missing a candidate verification GET")?;
+        ensure!(
+            put_identity == identity
+                && get_identity == identity
+                && put
+                    .ended_sequence
+                    .zip(get.started_sequence)
+                    .is_some_and(|(put_ended, get_started)| put_ended < get_started),
+            "recommit PUT/GET identity or happens-before order does not match the sealed candidate manifest"
+        );
+    }
+    ensure!(
+        attempts.len() == expected.len(),
+        "recommit-report.json attempts do not match the authenticated PUT/GET history between checker phases"
+    );
     Ok(())
 }
 
@@ -3054,7 +3351,20 @@ struct RecommitReportArtifact {
     committed: usize,
     failed: usize,
     harness_errors: usize,
-    attempts: Vec<Value>,
+    attempts: Vec<RecommitAttemptArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecommitAttemptArtifact {
+    source_operation_id: String,
+    key: String,
+    size_bytes: usize,
+    sha256: String,
+    outcome: Option<OperationOutcome>,
+    verify_get_outcome: Option<OperationOutcome>,
+    http_status: Option<u16>,
+    error: Option<String>,
+    harness_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3066,6 +3376,8 @@ struct WorkloadSummaryArtifact {
     seed: u64,
     object_count: usize,
     concurrency: usize,
+    #[serde(default)]
+    recommit_candidates: Option<RecommitCandidateManifestArtifact>,
     recommitted_after_recovery: usize,
     puts: OutcomeCountsArtifact,
     gets: OutcomeCountsArtifact,
@@ -3073,6 +3385,24 @@ struct WorkloadSummaryArtifact {
     lists: OutcomeCountsArtifact,
     multipart_completes: OutcomeCountsArtifact,
     multipart_aborts: OutcomeCountsArtifact,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecommitCandidateManifestArtifact {
+    scenario: String,
+    run_id: String,
+    bucket: String,
+    history_record_count: usize,
+    history_sha256: String,
+    candidates: Vec<RecommitCandidateArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecommitCandidateArtifact {
+    source_operation_id: String,
+    key: String,
+    size_bytes: usize,
+    sha256: String,
 }
 
 impl WorkloadSummaryArtifact {
@@ -3198,14 +3528,15 @@ impl OutcomeCountsArtifact {
 mod tests {
     use super::{
         ArtifactValidationOptions, FailureSummary, FaultEvidenceArtifact, OutcomeCountsArtifact,
-        WorkloadSummaryArtifact, recursive_find, validate_fault_artifacts,
-        validate_fault_artifacts_and_write_report,
+        RecommitCandidateManifestArtifact, RecommitReportArtifact, WorkloadSummaryArtifact,
+        read_json, read_jsonl, recursive_find, validate_checker_phase_chain,
+        validate_fault_artifacts, validate_fault_artifacts_and_write_report,
         validate_fault_artifacts_for_planned_attempt_and_write_report,
         validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts, validate_run_spec,
         validate_target_proof, validate_write_quorum_runtime_evidence,
     };
     use crate::fault::{
-        checker::{self, RecoveryStabilityClassification, RecoveryStabilityReport},
+        checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
         config::FaultTestConfig,
         history::{OperationOutcome, OperationRecord},
         host_storage::{
@@ -3256,7 +3587,7 @@ mod tests {
         assert_eq!(report.scenario, "io-eio");
         assert_eq!(
             report.validation_summary_tsv_row(),
-            "io-eio\t42\t0\t2\t1\t1\t0\t0\t0\t0\ttrue"
+            "io-eio\t42\t0\t2\t1\t2\t0\t0\t0\t0\ttrue"
         );
     }
 
@@ -3309,6 +3640,159 @@ mod tests {
         let error = validate_fault_artifacts(&success_options(dir.path()))
             .expect_err("final checker cannot ignore a later history mutation");
         assert!(format!("{error:#}").contains("terminal history.jsonl record"));
+    }
+
+    #[test]
+    fn checker_phase_audits_must_be_ordered_and_independent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let final_report =
+            fs::read_to_string(case_dir.join("checker-report.json")).expect("final checker report");
+        fs::write(
+            case_dir.join("checker-pre-recommit-report.json"),
+            final_report,
+        )
+        .expect("copy final checker report over pre-recommit report");
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("a final audit cannot stand in for the pre-recommit phase");
+        assert!(
+            format!("{error:#}").contains("authenticated pre-recommit history"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recommit_report_must_match_history_between_checker_phases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("recommit-report.json");
+        let mut recommit: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("recommit report"))
+                .expect("recommit JSON");
+        recommit["attempts"][0]["sha256"] = json!("forged-sha");
+        write_json(&case_dir, "recommit-report.json", &recommit);
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("recommit report must be bound to its history operations");
+        assert!(
+            format!("{error:#}").contains("sealed candidate manifest"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recommit_candidates_cannot_be_omitted_from_the_sealed_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("workload-summary.json");
+        let mut summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("workload summary"))
+                .expect("summary JSON");
+        summary["recommit_candidates"]["candidates"] = json!([]);
+        write_json(&case_dir, "workload-summary.json", &summary);
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("an authenticated final ambiguous mutation cannot be omitted");
+        assert!(
+            format!("{error:#}").contains("final unconfirmed mutations"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recommit_history_must_use_the_run_bucket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        rewrite_history_and_refresh_final_audit(&case_dir, |records| {
+            for record in &mut records[4..6] {
+                record.bucket = "other-bucket".to_string();
+            }
+        });
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("recommit evidence from another bucket must be rejected");
+        assert!(
+            format!("{error:#}").contains("unsuccessful operation"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recommit_put_must_happen_before_its_verification_get() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        rewrite_history_and_refresh_final_audit(&case_dir, |records| {
+            records[5].started_sequence = records[4].ended_sequence;
+        });
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("verification GET must begin after its candidate PUT ended");
+        assert!(
+            format!("{error:#}").contains("happens-before order"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn checker_phase_chain_accepts_zero_recommit_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let mut history = read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl"))
+            .expect("read fixture history");
+        history[1].outcome = OperationOutcome::Ok;
+        history[1].http_status = Some(200);
+        history[1].error = None;
+        history.drain(4..6);
+        let pre_prefix = &history[..2];
+        let final_prefix = &history[..4];
+
+        let mut prechecker =
+            read_json::<CheckerReport>(&case_dir.join("checker-pre-recommit-report.json"))
+                .expect("prechecker");
+        let mut checker =
+            read_json::<CheckerReport>(&case_dir.join("checker-report.json")).expect("checker");
+        let pre_audit = prechecker.audit.as_mut().expect("pre audit");
+        pre_audit.history_prefix_sha256 =
+            checker::checker_history_records_sha256(pre_prefix).expect("pre digest");
+        let final_audit = checker.audit.as_mut().expect("final audit");
+        final_audit.history_prefix_record_count = final_prefix.len();
+        final_audit.history_prefix_sha256 =
+            checker::checker_history_records_sha256(final_prefix).expect("final digest");
+        let manifest = RecommitCandidateManifestArtifact {
+            scenario: "io-eio".to_string(),
+            run_id: "run-00000000-0000-4000-8000-000000000001".to_string(),
+            bucket: "bucket".to_string(),
+            history_record_count: pre_prefix.len(),
+            history_sha256: checker::checker_history_records_sha256(pre_prefix)
+                .expect("manifest digest"),
+            candidates: Vec::new(),
+        };
+        let recommit = RecommitReportArtifact {
+            scenario: Some("io-eio".to_string()),
+            run_id: Some("run-00000000-0000-4000-8000-000000000001".to_string()),
+            attempted: 0,
+            committed: 0,
+            failed: 0,
+            harness_errors: 0,
+            attempts: Vec::new(),
+        };
+
+        validate_checker_phase_chain(
+            &prechecker,
+            &checker,
+            &recommit,
+            &manifest,
+            "bucket",
+            &history,
+        )
+        .expect("zero-candidate phase chain");
     }
 
     #[test]
@@ -4637,6 +5121,7 @@ mod tests {
                     seed: 42,
                     object_count: 3,
                     concurrency: 1,
+                    recommit_candidates: None,
                     recommitted_after_recovery: 0,
                 };
                 let error = invalid
@@ -6386,6 +6871,8 @@ mod tests {
                 "size_bytes": 1,
                 "started_at_ms": 1,
                 "ended_at_ms": 2,
+                "started_sequence": 1,
+                "ended_sequence": 2,
                 "outcome": "ok",
                 "http_status": 200,
                 "error": null,
@@ -6393,10 +6880,30 @@ mod tests {
                 "fault_window_relation": "before_fault"
             }))
             .expect("history PUT"),
-        ];
-        let history_suffix = vec![
             serde_json::from_value::<OperationRecord>(json!({
                 "id": "op-000002",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "put",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "recommit-sha",
+                "size_bytes": 1,
+                "started_at_ms": 3,
+                "ended_at_ms": 4,
+                "started_sequence": 3,
+                "ended_sequence": 4,
+                "outcome": "timeout",
+                "http_status": null,
+                "error": "put object timed out",
+                "durability_cohort": "fault_active",
+                "fault_window_relation": "during_fault"
+            }))
+            .expect("ambiguous workload PUT"),
+        ];
+        let pre_checker_suffix = vec![
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000003",
                 "scenario": scenario,
                 "run_id": run_id,
                 "kind": "get",
@@ -6406,13 +6913,17 @@ mod tests {
                 "size_bytes": 1,
                 "started_at_ms": 11,
                 "ended_at_ms": 12,
+                "started_sequence": 5,
+                "ended_sequence": 6,
                 "outcome": "ok",
                 "http_status": 200,
-                "error": null
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
             }))
             .expect("checker GET"),
             serde_json::from_value::<OperationRecord>(json!({
-                "id": "op-000003",
+                "id": "op-000004",
                 "scenario": scenario,
                 "run_id": run_id,
                 "kind": "list",
@@ -6423,14 +6934,106 @@ mod tests {
                 "listed_keys": ["key"],
                 "started_at_ms": 13,
                 "ended_at_ms": 14,
+                "started_sequence": 7,
+                "ended_sequence": 8,
                 "outcome": "ok",
                 "http_status": 200,
-                "error": null
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
             }))
             .expect("checker LIST"),
         ];
+        let recommit_history = vec![
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000005",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "put",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "recommit-sha",
+                "size_bytes": 1,
+                "started_at_ms": 16,
+                "ended_at_ms": 17,
+                "started_sequence": 9,
+                "ended_sequence": 10,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
+            }))
+            .expect("recommit PUT"),
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000006",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "get",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "recommit-sha",
+                "size_bytes": 1,
+                "started_at_ms": 18,
+                "ended_at_ms": 19,
+                "started_sequence": 11,
+                "ended_sequence": 12,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
+            }))
+            .expect("recommit verification GET"),
+        ];
+        let final_checker_suffix = vec![
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000007",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "get",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "recommit-sha",
+                "size_bytes": 1,
+                "started_at_ms": 21,
+                "ended_at_ms": 22,
+                "started_sequence": 13,
+                "ended_sequence": 14,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
+            }))
+            .expect("final checker GET"),
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000008",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "list",
+                "bucket": "bucket",
+                "key": format!("fault-test/{run_id}/"),
+                "value_sha256": null,
+                "size_bytes": 1,
+                "listed_keys": ["key"],
+                "started_at_ms": 23,
+                "ended_at_ms": 24,
+                "started_sequence": 15,
+                "ended_sequence": 16,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
+            }))
+            .expect("final checker LIST"),
+        ];
         let mut history = history_prefix.clone();
-        history.extend(history_suffix.clone());
+        history.extend(pre_checker_suffix.clone());
+        history.extend(recommit_history.clone());
+        let final_checker_prefix = history.clone();
+        history.extend(final_checker_suffix.clone());
         fs::write(
             case_dir.join("history.jsonl"),
             format!(
@@ -6453,12 +7056,25 @@ mod tests {
                 "object_count": 12,
                 "concurrency": 4,
                 "total_payload_bytes": 12582912,
-                "puts": {"ok": 1, "not_found": 0, "failed": 1, "timeout": 0, "unknown": 0},
+                "puts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
                 "gets": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
                 "deletes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
                 "lists": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
                 "multipart_completes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
                 "multipart_aborts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "recommit_candidates": {
+                    "scenario": scenario,
+                    "run_id": run_id,
+                    "bucket": "bucket",
+                    "history_record_count": history_prefix.len(),
+                    "history_sha256": checker::checker_history_records_sha256(&history_prefix).expect("candidate history digest"),
+                    "candidates": [{
+                        "source_operation_id": "op-000002",
+                        "key": "key",
+                        "size_bytes": 1,
+                        "sha256": "recommit-sha"
+                    }]
+                },
                 "recommitted_after_recovery": 1
             }),
         );
@@ -6472,47 +7088,63 @@ mod tests {
                 "committed": 1,
                 "failed": 0,
                 "harness_errors": 0,
-                "attempts": [{"key": "k", "size_bytes": 1, "sha256": "s", "outcome": "ok", "verify_get_outcome": "ok", "http_status": 200, "error": null, "harness_error": null}]
+                "attempts": [{"source_operation_id": "op-000002", "key": "key", "size_bytes": 1, "sha256": "recommit-sha", "outcome": "ok", "verify_get_outcome": "ok", "http_status": 200, "error": null, "harness_error": null}]
             }),
         );
-        let checker = json!({
-            "scenario": scenario,
-            "run_id": run_id,
-            "committed_puts": 1,
-            "expected_live_objects": 1,
-            "verified_live_objects": 1,
-            "missing_committed_objects": [],
-            "unavailable_committed_objects": [],
-            "unknown_committed_read_failures": [],
-            "hash_mismatches": [],
-            "successful_corrupted_reads": [],
-            "unexpected_visible_deleted_objects": [],
-            "unknown_writes_materialized": [],
-            "operation_cohorts": {"pre_fault": 1},
-            "fault_window_relations": {"before_fault": 1},
-            "list_history_warning_count": 0,
-            "final_list_warning_count": 0,
-            "list_history_warnings": [],
-            "list_warnings": [],
-            "final_listed_objects": 1,
-            "audit": {
-                "bucket": "bucket",
-                "started_at_ms": 10,
-                "completed_at_ms": 15,
-                "history_prefix_record_count": history_prefix.len(),
-                "history_prefix_sha256": checker::checker_history_records_sha256(&history_prefix).expect("checker prefix digest"),
-                "history_suffix_record_count": history_suffix.len(),
-                "history_suffix_sha256": checker::checker_history_records_sha256(&history_suffix).expect("checker suffix digest"),
-                "suffix_operations": checker::checker_operation_audits(&history_suffix),
-                "data_version_checks": [],
-                "delete_marker_checks": [],
-                "list_object_versions_completed": null
-            },
-            "tenant_recovered": true,
-            "passed": true
-        });
-        write_json(&case_dir, "checker-pre-recommit-report.json", &checker);
-        write_json(&case_dir, "checker-report.json", &checker);
+        let checker_report = |prefix: &[OperationRecord],
+                              suffix: &[OperationRecord],
+                              started_at_ms: u64,
+                              completed_at_ms: u64,
+                              committed_puts: usize| {
+            json!({
+                "scenario": scenario,
+                "run_id": run_id,
+                "committed_puts": committed_puts,
+                "expected_live_objects": 1,
+                "verified_live_objects": 1,
+                "missing_committed_objects": [],
+                "unavailable_committed_objects": [],
+                "unknown_committed_read_failures": [],
+                "hash_mismatches": [],
+                "successful_corrupted_reads": [],
+                "unexpected_visible_deleted_objects": [],
+                "unknown_writes_materialized": [],
+                "operation_cohorts": if committed_puts == 1 {
+                    json!({"pre_fault": 1, "fault_active": 1})
+                } else {
+                    json!({"pre_fault": 1, "fault_active": 1, "post_recovery": 4})
+                },
+                "fault_window_relations": if committed_puts == 1 {
+                    json!({"before_fault": 1, "during_fault": 1})
+                } else {
+                    json!({"before_fault": 1, "during_fault": 1, "after_fault": 4})
+                },
+                "list_history_warning_count": 0,
+                "final_list_warning_count": 0,
+                "list_history_warnings": [],
+                "list_warnings": [],
+                "final_listed_objects": 1,
+                "audit": {
+                    "bucket": "bucket",
+                    "started_at_ms": started_at_ms,
+                    "completed_at_ms": completed_at_ms,
+                    "history_prefix_record_count": prefix.len(),
+                    "history_prefix_sha256": checker::checker_history_records_sha256(prefix).expect("checker prefix digest"),
+                    "history_suffix_record_count": suffix.len(),
+                    "history_suffix_sha256": checker::checker_history_records_sha256(suffix).expect("checker suffix digest"),
+                    "suffix_operations": checker::checker_operation_audits(suffix),
+                    "data_version_checks": [],
+                    "delete_marker_checks": [],
+                    "list_object_versions_completed": null
+                },
+                "tenant_recovered": true,
+                "passed": true
+            })
+        };
+        let pre_checker = checker_report(&history_prefix, &pre_checker_suffix, 10, 15, 1);
+        let final_checker = checker_report(&final_checker_prefix, &final_checker_suffix, 20, 25, 2);
+        write_json(&case_dir, "checker-pre-recommit-report.json", &pre_checker);
+        write_json(&case_dir, "checker-report.json", &final_checker);
         write_json(
             &case_dir,
             "fault-evidence.json",
@@ -6564,6 +7196,40 @@ mod tests {
         mutate(&mut first);
         records[0] = first.to_string();
         fs::write(path, format!("{}\n", records.join("\n"))).expect("rewrite history");
+    }
+
+    fn rewrite_history_and_refresh_final_audit(
+        case_dir: &std::path::Path,
+        mutate: impl FnOnce(&mut Vec<OperationRecord>),
+    ) {
+        let history_path = case_dir.join("history.jsonl");
+        let mut records = read_jsonl::<OperationRecord>(&history_path).expect("history");
+        mutate(&mut records);
+        fs::write(
+            &history_path,
+            format!(
+                "{}\n",
+                records
+                    .iter()
+                    .map(|record| serde_json::to_string(record).expect("history record"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )
+        .expect("rewrite history");
+
+        let checker_path = case_dir.join("checker-report.json");
+        let mut checker: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&checker_path).expect("checker report"))
+                .expect("checker JSON");
+        let prefix_count = checker["audit"]["history_prefix_record_count"]
+            .as_u64()
+            .expect("prefix count") as usize;
+        checker["audit"]["history_prefix_sha256"] = json!(
+            checker::checker_history_records_sha256(&records[..prefix_count])
+                .expect("checker prefix digest")
+        );
+        write_json(case_dir, "checker-report.json", &checker);
     }
 
     fn rewrite_run_spec_versioning(case_dir: &std::path::Path, versioning: bool) {
