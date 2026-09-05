@@ -255,6 +255,8 @@ pub struct ConsoleFailureSummaryView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub case_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s3_model_classification: Option<String>,
@@ -266,6 +268,8 @@ pub struct ConsoleFailureSummaryView {
     pub data_correctness: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub availability: Option<String>,
+    // Console-root-relative links; raw references retain their artifact contract.
+    pub primary_evidence_artifacts: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub primary_evidence_refs: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1453,12 +1457,14 @@ fn failure_summary_view(root: &Path, path: &Path, raw: Value) -> ConsoleFailureS
         classification: json_string(&raw, "classification"),
         schema_version: json_u64(&raw, "schema_version"),
         case_name: json_string(&raw, "case_name"),
+        observed_at_ms: json_u64(&raw, "observed_at_ms"),
         phase: json_string(&raw, "phase"),
         s3_model_classification: json_string(&raw, "s3_model_classification"),
         run_failure_reason: json_string(&raw, "run_failure_reason"),
         responsibility_domain: json_string(&raw, "responsibility_domain"),
         data_correctness: json_string(&raw, "data_correctness"),
         availability: json_string(&raw, "availability"),
+        primary_evidence_artifacts: failure_evidence_artifacts(root, path, &raw),
         primary_evidence_refs: json_string_array(&raw, "primary_evidence_refs"),
         evidence_classifications: json_string_array(&raw, "evidence_classifications"),
         final_list_warning_count: json_u64(&raw, "final_list_warning_count"),
@@ -1470,6 +1476,41 @@ fn failure_summary_view(root: &Path, path: &Path, raw: Value) -> ConsoleFailureS
         message: json_string(&raw, "message"),
         raw,
     }
+}
+
+fn failure_evidence_artifacts(root: &Path, summary_path: &Path, raw: &Value) -> Vec<String> {
+    let case_dir = summary_path.parent().unwrap_or(root);
+    let reference_root = case_dir
+        .ancestors()
+        .find(|ancestor| suite_marker_exists(ancestor))
+        .unwrap_or_else(|| case_dir.parent().unwrap_or(root));
+    json_string_array(raw, "primary_evidence_refs")
+        .into_iter()
+        .filter_map(|reference| {
+            let reference = Path::new(&reference);
+            if reference.as_os_str().is_empty()
+                || !reference
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+            {
+                return None;
+            }
+            let base = if reference.components().count() == 1 {
+                case_dir
+            } else {
+                reference_root
+            };
+            let evidence = fs::canonicalize(base.join(reference)).ok()?;
+            if !evidence.starts_with(root)
+                || !evidence.starts_with(base)
+                || !evidence.is_file()
+                || evidence == summary_path
+            {
+                return None;
+            }
+            Some(display_path(root, &evidence))
+        })
+        .collect()
 }
 
 fn runner_failure_view(root: &Path, path: &Path, raw: Value) -> ConsoleRunnerFailureView {
@@ -1905,6 +1946,8 @@ mod tests {
     use super::{
         ArtifactIndex, ArtifactScanLimits, MAX_JSON_ARTIFACT_BYTES, build_console_snapshot,
     };
+    use crate::fault::reporting::{FailureSummary, write_failure_summary};
+    use crate::framework::artifacts::ArtifactCollector;
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
@@ -2048,6 +2091,97 @@ mod tests {
     }
 
     #[test]
+    fn evidence_links_follow_the_owning_suite_at_every_console_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        for (suite, legacy) in [("suite-a", false), ("suite-b", true)] {
+            let suite_root = dir.path().join(suite);
+            let attempt_root = suite_root.join("001-io-eio-r1");
+            let collector = ArtifactCollector::with_reference_root(&attempt_root, &suite_root)
+                .expect("collector");
+            collector
+                .write_text(case_name, "run-events.jsonl", "")
+                .expect("events");
+            fs::write(suite_root.join("suite-summary.json"), "{}").expect("suite marker");
+            write_failure_summary(
+                &collector,
+                case_name,
+                FailureSummary::new("io-eio", "checker-verdict", "data_corruption", "mismatch")
+                    .expect("summary"),
+            )
+            .expect("write summary");
+            if legacy {
+                let path = collector.case_dir(case_name).join("failure-summary.json");
+                let mut raw: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                raw["primary_evidence_refs"] = json!(["run-events.jsonl"]);
+                fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            }
+        }
+        let snapshot = build_console_snapshot(dir.path()).expect("parent snapshot");
+        assert_eq!(snapshot.attempts.len(), 2);
+        for attempt in &snapshot.attempts {
+            let case = &attempt.cases[0];
+            let failure = case.failure_summary.as_ref().expect("failure");
+            let expected = format!("{}/run-events.jsonl", case.artifact_dir);
+            assert_eq!(failure.primary_evidence_artifacts, vec![expected.clone()]);
+            assert!(dir.path().join(expected).is_file());
+            assert_eq!(
+                serde_json::to_value(failure).unwrap()["primaryEvidenceArtifacts"],
+                json!(failure.primary_evidence_artifacts)
+            );
+            assert_eq!(
+                json!(failure.primary_evidence_refs),
+                failure.raw["primary_evidence_refs"]
+            );
+        }
+        for suite in ["suite-a", "suite-b"] {
+            let suite_root = dir.path().join(suite);
+            let case_root = suite_root.join("001-io-eio-r1").join(case_name);
+            for (root, expected) in [
+                (
+                    suite_root,
+                    format!("001-io-eio-r1/{case_name}/run-events.jsonl"),
+                ),
+                (case_root, "run-events.jsonl".to_string()),
+            ] {
+                let snapshot = build_console_snapshot(&root).expect("focused snapshot");
+                let failure = snapshot.attempts[0].cases[0]
+                    .failure_summary
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(failure.primary_evidence_artifacts, vec![expected]);
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_evidence_links_exclude_invalid_missing_and_self_references() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector = ArtifactCollector::new(dir.path());
+        collector
+            .write_text("case", "run-events.jsonl", "")
+            .unwrap();
+        collector.write_text("case", "failure-summary.json", &json!({
+            "primary_evidence_refs": [
+                "case/run-events.jsonl", "case/failure-summary.json", "failure-summary.json",
+                "case/missing.json", "../outside.json", "/outside.json", ""
+            ]
+        }).to_string()).unwrap();
+        for (root, expected) in [
+            (dir.path().to_path_buf(), "case/run-events.jsonl"),
+            (dir.path().join("case"), "run-events.jsonl"),
+        ] {
+            let snapshot = build_console_snapshot(root).expect("standalone snapshot");
+            let failure = snapshot.attempts[0].cases[0]
+                .failure_summary
+                .as_ref()
+                .unwrap();
+            assert_eq!(failure.primary_evidence_artifacts, vec![expected]);
+        }
+    }
+
+    #[test]
     fn aggregates_suite_summary_attempt_events_and_failure_summary() {
         let dir = tempfile::tempdir().expect("tempdir");
         let attempt_dir = dir.path().join("001-io-eio-r1");
@@ -2080,10 +2214,7 @@ mod tests {
                     "repetition": 1,
                     "severity": "degraded",
                     "classification": "recovery_tail_read_latency",
-                    "primaryEvidenceArtifacts": [
-                        raw_failure_summary.clone(),
-                        raw_recovery_stability.clone()
-                    ],
+                    "primaryEvidenceArtifacts": [raw_recovery_stability.clone()],
                     "attemptArtifactsDir": raw_attempt_dir.clone(),
                     "failureSummary": raw_failure_summary.clone()
                 }],
@@ -2114,13 +2245,22 @@ mod tests {
         fs::write(
             case_dir.join("failure-summary.json"),
             serde_json::to_string_pretty(&json!({
+                "schema_version": 2,
                 "scenario": "io-eio",
+                "case_name": "fault_io_eio_preserves_committed_objects",
+                "observed_at_ms": 15,
                 "stage": "checker-pre-recommit",
+                "phase": "checker",
                 "verdict": "failed",
                 "severity": "degraded",
                 "classification": "recovery_tail_read_latency",
+                "s3_model_classification": "recovery_tail_read_latency",
+                "responsibility_domain": "product",
                 "data_correctness": "passed",
                 "availability": "recovered_after_tail_latency",
+                "primary_evidence_refs": [
+                    "001-io-eio-r1/fault_io_eio_preserves_committed_objects/recovery-stability-report.json"
+                ],
                 "evidence_classifications": ["recovery_tail_read_latency"],
                 "data_loss": false,
                 "corruption": false,
@@ -2195,10 +2335,7 @@ mod tests {
         );
         assert_eq!(
             suite_summary.failures[0].primary_evidence_artifacts,
-            vec![
-                expected_failure_summary.clone(),
-                expected_recovery_stability.clone()
-            ]
+            vec![expected_recovery_stability.clone()]
         );
         assert_eq!(
             suite_summary.raw["failures"][0]["attemptArtifactsDir"].as_str(),
@@ -2227,6 +2364,12 @@ mod tests {
                 .as_ref()
                 .and_then(|summary| summary.classification.as_deref()),
             Some("recovery_tail_read_latency")
+        );
+        assert_eq!(
+            case.failure_summary
+                .as_ref()
+                .and_then(|summary| summary.observed_at_ms),
+            Some(15)
         );
         assert_eq!(snapshot.runner_failures.len(), 1);
         assert_eq!(

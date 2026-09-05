@@ -26,8 +26,8 @@ use aws_sdk_s3::{
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
-use tokio::time::timeout;
+use std::{future::Future, time::Duration};
+use tokio::time::{Instant, timeout};
 
 use crate::fault::history::{
     ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef, Recorder,
@@ -42,7 +42,7 @@ pub struct ObjectSpec {
     index: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PreparedObject {
     pub spec: ObjectSpec,
     body: Vec<u8>,
@@ -50,7 +50,7 @@ pub struct PreparedObject {
 
 #[derive(Debug, Clone)]
 pub(crate) struct StagedMultipartUpload {
-    object: PreparedObject,
+    pub(crate) spec: ObjectSpec,
     upload_id: String,
     completed_parts: Vec<CompletedPart>,
 }
@@ -135,6 +135,7 @@ pub struct S3WorkloadClient {
     client: Client,
     bucket: String,
     request_timeout: Duration,
+    mutation_deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +159,11 @@ pub struct VerifiedWriteResult {
     pub write_outcome: OperationOutcome,
     pub verify_get_outcome: Option<OperationOutcome>,
     pub verified: bool,
+}
+
+struct RecordedDelete {
+    record: OperationRecord,
+    is_delete_marker: Option<bool>,
 }
 
 impl ObjectSpec {
@@ -623,7 +629,34 @@ impl S3WorkloadClient {
             client: Client::from_conf(s3_config),
             bucket: bucket.into(),
             request_timeout,
+            mutation_deadline: None,
         })
+    }
+
+    pub(crate) fn for_quiet_mutation(&self, deadline: Instant) -> Self {
+        let mut client = self.clone();
+        client.client = Client::from_conf(
+            self.client
+                .config()
+                .to_builder()
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+                .build(),
+        );
+        client.mutation_deadline = Some(deadline);
+        client
+    }
+
+    async fn mutation_request<F: Future>(&self, request: F) -> std::result::Result<F::Output, ()> {
+        let duration = self
+            .mutation_deadline
+            .map_or(self.request_timeout, |deadline| {
+                self.request_timeout
+                    .min(deadline.saturating_duration_since(Instant::now()))
+            });
+        if duration.is_zero() {
+            return Err(());
+        }
+        timeout(duration, request).await.map_err(|_| ())
     }
 
     pub async fn create_bucket(&self, recorder: &Recorder) -> Result<OperationOutcome> {
@@ -695,16 +728,16 @@ impl S3WorkloadClient {
             seed: spec.seed,
             index: spec.index,
         });
-        let result = timeout(
-            self.request_timeout,
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&spec.key)
-                .body(ByteStream::from(object.body.clone()))
-                .send(),
-        )
-        .await;
+        let result = self
+            .mutation_request(
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&spec.key)
+                    .body(ByteStream::from(object.body.clone()))
+                    .send(),
+            )
+            .await;
 
         match result {
             Ok(Ok(output)) => {
@@ -1066,6 +1099,33 @@ impl S3WorkloadClient {
     }
 
     pub async fn delete_object(&self, key: &str, recorder: &Recorder) -> Result<OperationOutcome> {
+        Ok(self.delete_object_record(key, recorder).await?.outcome)
+    }
+
+    pub(crate) async fn delete_object_record(
+        &self,
+        key: &str,
+        recorder: &Recorder,
+    ) -> Result<OperationRecord> {
+        Ok(self.delete_object_result(key, recorder).await?.record)
+    }
+
+    /// Returns no trigger candidate when a successful DELETE does not prove it
+    /// created a versioned delete marker. Failed attempts are returned so the
+    /// acknowledgement policy can preserve their exact outcome.
+    pub(crate) async fn delete_marker_record(
+        &self,
+        key: &str,
+        recorder: &Recorder,
+    ) -> Result<Option<OperationRecord>> {
+        let result = self.delete_object_result(key, recorder).await?;
+        if result.record.outcome == OperationOutcome::Ok && result.is_delete_marker != Some(true) {
+            return Ok(None);
+        }
+        Ok(Some(result.record))
+    }
+
+    async fn delete_object_result(&self, key: &str, recorder: &Recorder) -> Result<RecordedDelete> {
         let record = recorder.begin(
             OperationKind::Delete,
             self.bucket.clone(),
@@ -1073,42 +1133,46 @@ impl S3WorkloadClient {
             None,
             None,
         );
-        let result = timeout(
-            self.request_timeout,
-            self.client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .send(),
-        )
-        .await;
+        let result = self
+            .mutation_request(
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send(),
+            )
+            .await;
 
         match result {
             Ok(Ok(output)) => {
                 let mut record = record;
                 record.version_id = output.version_id().map(str::to_string);
-                recorder.finish(record, OperationOutcome::Ok, Some(204), None)?;
-                Ok(OperationOutcome::Ok)
+                Ok(RecordedDelete {
+                    record: recorder.finish(record, OperationOutcome::Ok, Some(204), None)?,
+                    is_delete_marker: output.delete_marker(),
+                })
             }
             Ok(Err(error)) => {
                 let outcome = classify_sdk_error(&error);
-                recorder.finish(
-                    record,
-                    outcome,
-                    sdk_error_status(&error),
-                    Some(format!("delete object failed: {error}")),
-                )?;
-                Ok(outcome)
+                Ok(RecordedDelete {
+                    record: recorder.finish(
+                        record,
+                        outcome,
+                        sdk_error_status(&error),
+                        Some(format!("delete object failed: {error}")),
+                    )?,
+                    is_delete_marker: None,
+                })
             }
-            Err(_) => {
-                recorder.finish(
+            Err(_) => Ok(RecordedDelete {
+                record: recorder.finish(
                     record,
                     OperationOutcome::Timeout,
                     None,
                     Some("delete object timed out".to_string()),
-                )?;
-                Ok(OperationOutcome::Timeout)
-            }
+                )?,
+                is_delete_marker: None,
+            }),
         }
     }
 
@@ -1130,19 +1194,38 @@ impl S3WorkloadClient {
         object: &PreparedObject,
         recorder: &Recorder,
     ) -> Result<OperationOutcome> {
-        let Some(staged) = self
-            .try_stage_multipart_object(object.clone(), recorder)
+        Ok(self
+            .complete_multipart_object_record(object, recorder)
             .await?
-        else {
-            return Ok(OperationOutcome::Unknown);
+            .map_or(OperationOutcome::Unknown, |record| record.outcome))
+    }
+
+    /// Completes one multipart object and returns its completion record. A
+    /// missing record means setup failed before CompleteMultipartUpload was
+    /// attempted, so callers must not treat it as an acknowledged mutation.
+    pub(crate) async fn complete_multipart_object_record(
+        &self,
+        object: &PreparedObject,
+        recorder: &Recorder,
+    ) -> Result<Option<OperationRecord>> {
+        let Some(staged) = self.try_stage_multipart_object(object, recorder).await? else {
+            return Ok(None);
         };
-        self.complete_staged_multipart_object(staged, recorder)
-            .await
+        let result = self
+            .complete_staged_multipart_object_record(&staged, recorder)
+            .await;
+        if self.mutation_deadline.is_some()
+            && !matches!(&result, Ok(record) if record.outcome == OperationOutcome::Ok)
+        {
+            self.abort_staged_multipart_object(&staged, recorder)
+                .await?;
+        }
+        result.map(Some)
     }
 
     pub(crate) async fn stage_multipart_object(
         &self,
-        object: PreparedObject,
+        object: &PreparedObject,
         recorder: &Recorder,
     ) -> Result<StagedMultipartUpload> {
         self.try_stage_multipart_object(object, recorder)
@@ -1152,7 +1235,7 @@ impl S3WorkloadClient {
 
     async fn try_stage_multipart_object(
         &self,
-        object: PreparedObject,
+        object: &PreparedObject,
         recorder: &Recorder,
     ) -> Result<Option<StagedMultipartUpload>> {
         let Some(upload_id) = self
@@ -1161,88 +1244,119 @@ impl S3WorkloadClient {
         else {
             return Ok(None);
         };
-        let mut completed_parts = Vec::new();
-        for (index, chunk) in object.body.chunks(5 * 1024 * 1024).enumerate() {
-            let part_number = (index + 1) as i32;
-            match self
-                .upload_part(&object.spec.key, &upload_id, part_number, chunk, recorder)
-                .await?
-            {
-                Some(part) => completed_parts.push(part),
-                None => {
-                    let _ = self
-                        .abort_multipart_upload(&object.spec.key, &upload_id, recorder)
-                        .await;
-                    return Ok(None);
-                }
-            }
-        }
-        Ok(Some(StagedMultipartUpload {
-            object,
+        let mut staged = StagedMultipartUpload {
+            spec: object.spec.clone(),
             upload_id,
-            completed_parts,
-        }))
+            completed_parts: Vec::new(),
+        };
+        let result: Result<bool> = async {
+            for (index, chunk) in object.body.chunks(5 * 1024 * 1024).enumerate() {
+                let Some(part) = self
+                    .upload_part(
+                        &staged.spec.key,
+                        &staged.upload_id,
+                        (index + 1) as i32,
+                        chunk,
+                        recorder,
+                    )
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                staged.completed_parts.push(part);
+            }
+            Ok(true)
+        }
+        .await;
+        if !matches!(result, Ok(true)) {
+            self.abort_staged_multipart_object(&staged, recorder)
+                .await?;
+            return result.map(|_| None);
+        }
+        Ok(Some(staged))
     }
 
     pub(crate) async fn complete_staged_multipart_object(
         &self,
-        staged: StagedMultipartUpload,
+        staged: &StagedMultipartUpload,
         recorder: &Recorder,
     ) -> Result<OperationOutcome> {
-        let StagedMultipartUpload {
-            object,
-            upload_id,
-            completed_parts,
-        } = staged;
+        Ok(self
+            .complete_staged_multipart_object_record(staged, recorder)
+            .await?
+            .outcome)
+    }
+
+    async fn complete_staged_multipart_object_record(
+        &self,
+        staged: &StagedMultipartUpload,
+        recorder: &Recorder,
+    ) -> Result<OperationRecord> {
         let record = recorder.begin(
             OperationKind::CompleteMultipartUpload,
             self.bucket.clone(),
-            Some(object.spec.key.clone()),
-            Some(object.spec.sha256.clone()),
-            Some(object.spec.size_bytes),
+            Some(staged.spec.key.clone()),
+            Some(staged.spec.sha256.clone()),
+            Some(staged.spec.size_bytes),
         );
         let upload = CompletedMultipartUpload::builder()
-            .set_parts(Some(completed_parts))
+            .set_parts(Some(staged.completed_parts.clone()))
             .build();
-        let result = timeout(
-            self.request_timeout,
-            self.client
-                .complete_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&object.spec.key)
-                .upload_id(upload_id)
-                .multipart_upload(upload)
-                .send(),
-        )
-        .await;
-
+        let result = self
+            .mutation_request(
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(&staged.spec.key)
+                    .upload_id(&staged.upload_id)
+                    .multipart_upload(upload)
+                    .send(),
+            )
+            .await;
         match result {
             Ok(Ok(output)) => {
                 let mut record = record;
                 record.version_id = output.version_id().map(str::to_string);
-                recorder.finish(record, OperationOutcome::Ok, Some(200), None)?;
-                Ok(OperationOutcome::Ok)
+                recorder.finish(record, OperationOutcome::Ok, Some(200), None)
             }
-            Ok(Err(error)) => {
-                let outcome = classify_sdk_error(&error);
-                recorder.finish(
-                    record,
-                    outcome,
-                    sdk_error_status(&error),
-                    Some(format!("complete multipart upload failed: {error}")),
-                )?;
-                Ok(outcome)
-            }
-            Err(_) => {
-                recorder.finish(
-                    record,
-                    OperationOutcome::Timeout,
-                    None,
-                    Some("complete multipart upload timed out".to_string()),
-                )?;
-                Ok(OperationOutcome::Timeout)
-            }
+            Ok(Err(error)) => recorder.finish(
+                record,
+                classify_sdk_error(&error),
+                sdk_error_status(&error),
+                Some(format!("complete multipart upload failed: {error}")),
+            ),
+            Err(_) => recorder.finish(
+                record,
+                OperationOutcome::Timeout,
+                None,
+                Some("complete multipart upload timed out".to_string()),
+            ),
         }
+    }
+
+    pub(crate) async fn abort_staged_multipart_object(
+        &self,
+        staged: &StagedMultipartUpload,
+        recorder: &Recorder,
+    ) -> Result<()> {
+        // Cleanup keeps its request timeout even after a quiet mutation expires.
+        let outcome = self
+            .abort_multipart_upload(&staged.spec.key, &staged.upload_id, recorder)
+            .await
+            .with_context(|| {
+                format!(
+                    "multipart cleanup for key {} upload {}",
+                    staged.spec.key, staged.upload_id
+                )
+            })?;
+        ensure!(
+            matches!(outcome, OperationOutcome::Ok | OperationOutcome::NotFound),
+            "multipart cleanup for key {} upload {} ended with {:?}",
+            staged.spec.key,
+            staged.upload_id,
+            outcome
+        );
+        Ok(())
     }
 
     pub async fn abort_multipart_object(
@@ -1272,15 +1386,15 @@ impl S3WorkloadClient {
             None,
             None,
         );
-        let result = timeout(
-            self.request_timeout,
-            self.client
-                .create_multipart_upload()
-                .bucket(&self.bucket)
-                .key(key)
-                .send(),
-        )
-        .await;
+        let result = self
+            .mutation_request(
+                self.client
+                    .create_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send(),
+            )
+            .await;
 
         match result {
             Ok(Ok(output)) => {
@@ -1333,18 +1447,18 @@ impl S3WorkloadClient {
             Some(sha256_hex(body)),
             Some(body.len()),
         );
-        let result = timeout(
-            self.request_timeout,
-            self.client
-                .upload_part()
-                .bucket(&self.bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .part_number(part_number)
-                .body(ByteStream::from(body.to_vec()))
-                .send(),
-        )
-        .await;
+        let result = self
+            .mutation_request(
+                self.client
+                    .upload_part()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(body.to_vec()))
+                    .send(),
+            )
+            .await;
 
         match result {
             Ok(Ok(output)) => {
@@ -1728,6 +1842,44 @@ mod tests {
         ObjectSpec, SplitMix64, WorkloadHotspot, WorkloadOperation, WorkloadOperationMix,
         WorkloadPayloadClass, WorkloadPayloadDistribution, WorkloadPlan, sha256_hex,
     };
+
+    #[tokio::test]
+    async fn quiet_deadline_does_not_poll_another_request_or_change_the_shared_client() {
+        let client = super::S3WorkloadClient::new(
+            "http://127.0.0.1:1",
+            "bucket",
+            "test-access",
+            "test-secret",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("client");
+        let original_retry = client.client.config().retry_config().cloned();
+        let quiet = client.for_quiet_mutation(tokio::time::Instant::now());
+        let polled = std::cell::Cell::new(false);
+        let result = quiet
+            .mutation_request(async {
+                polled.set(true);
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(!polled.get());
+        assert!(client.mutation_deadline.is_none());
+        assert_eq!(
+            client.client.config().retry_config(),
+            original_retry.as_ref()
+        );
+        assert_eq!(
+            quiet
+                .client
+                .config()
+                .retry_config()
+                .expect("quiet retries")
+                .max_attempts(),
+            1
+        );
+    }
 
     #[test]
     fn seeded_objects_have_stable_keys_sizes_and_hashes() {

@@ -134,6 +134,13 @@ pub(crate) fn validate_network_partition_snapshot(
         .pointer("/status/experiment/containerRecords")
         .and_then(Value::as_array)
         .context("runtime NetworkChaos has no per-target controller records")?;
+    ensure!(
+        records.iter().all(|record| matches!(
+            record.get("selectorKey").and_then(Value::as_str),
+            Some("." | ".Target")
+        )),
+        "runtime NetworkChaos contains an unknown or missing controller selector key"
+    );
     let source_ids = injected_record_ids(records, ".")?;
     let peer_ids = injected_record_ids(records, ".Target")?;
     ensure!(
@@ -1669,6 +1676,17 @@ mod tests {
             .expect("records")
             .remove(1);
         assert!(validate_network_partition_snapshot(&missing_injection, &contract).is_err());
+        for extra in [
+            serde_json::json!({"id": "foreign/pod", "selectorKey": ".Unexpected", "phase": "Injected", "injectedCount": 1}),
+            serde_json::json!({"id": "foreign/pod", "phase": "Injected", "injectedCount": 1}),
+        ] {
+            let mut unknown_selector = resource.clone();
+            unknown_selector["status"]["experiment"]["containerRecords"]
+                .as_array_mut()
+                .expect("records")
+                .push(extra);
+            assert!(validate_network_partition_snapshot(&unknown_selector, &contract).is_err());
+        }
     }
 
     #[test]

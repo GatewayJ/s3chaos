@@ -71,6 +71,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use kube::core::DynamicObject;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep as async_sleep;
 use uuid::Uuid;
@@ -92,7 +93,15 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
     run_scenario_with_config(config).await
 }
 
-pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()> {
+pub async fn run_scenario_with_config(config: FaultTestConfig) -> Result<()> {
+    let reference_root = config.cluster.artifacts_dir.clone();
+    run_scenario_with_config_and_reference_root(config, reference_root).await
+}
+
+pub(crate) async fn run_scenario_with_config_and_reference_root(
+    mut config: FaultTestConfig,
+    reference_root: impl Into<PathBuf>,
+) -> Result<()> {
     scenarios::apply_catalog_defaults(&mut config)?;
     let scenario = FaultScenario::from_config(&config)?;
     let spec = scenarios::scenario_spec(&scenario.name)?;
@@ -109,14 +118,15 @@ pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()>
         scenario.name, config.cluster.context
     );
 
-    let collector = ArtifactCollector::new(&config.cluster.artifacts_dir);
+    let collector =
+        ArtifactCollector::with_reference_root(&config.cluster.artifacts_dir, reference_root)?;
     let result = run_fault_case(&config, &collector, &scenario, &plan).await;
 
     if let Err(error) = &result {
         write_failure_summary_if_absent(
             &collector,
             scenario.case_name,
-            FailureSummary::new(&scenario.name, "scenario", "unknown", error.to_string()),
+            FailureSummary::new(&scenario.name, "scenario", "unknown", error.to_string())?,
         )
         .ok();
         match collector.collect_kubernetes_snapshot_with_diagnosis(
@@ -190,7 +200,7 @@ async fn run_fault_case(
                 "fault-backend-preflight",
                 "environment_or_fault_backend",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -241,7 +251,7 @@ async fn run_fault_case(
                 "fault-backend-pre-cleanup",
                 "environment_or_fault_backend",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -284,7 +294,7 @@ async fn run_fault_case(
                 "fixture-prepare",
                 "test_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -317,7 +327,7 @@ async fn run_fault_case(
                 "tenant-ready-before-fault",
                 "product_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -359,7 +369,7 @@ async fn run_fault_case(
                 "pod-stability-before-fault",
                 "product_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -396,7 +406,7 @@ async fn run_fault_case(
                     "s3-endpoint",
                     "test_or_environment",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -418,7 +428,7 @@ async fn run_fault_case(
                 "initial-s3-access",
                 "product_or_environment",
                 error.to_string(),
-            ),
+            )?,
         )?;
         return Err(error);
     }
@@ -458,7 +468,7 @@ async fn run_fault_case(
                     "s3-client",
                     "test_or_environment",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -494,7 +504,7 @@ async fn run_fault_case(
                     "bucket-create",
                     "test_harness",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -517,7 +527,7 @@ async fn run_fault_case(
                 "bucket-create",
                 "product_or_environment",
                 message.clone(),
-            ),
+            )?,
         )?;
         bail!("{message}");
     }
@@ -553,7 +563,7 @@ async fn run_fault_case(
                     "bucket-create",
                     "product_or_environment",
                     message.clone(),
-                ),
+                )?,
             )?;
             bail!("{message}");
         }
@@ -598,7 +608,7 @@ async fn run_fault_case(
                     "prefill",
                     "product_or_environment",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
@@ -609,661 +619,630 @@ async fn run_fault_case(
         "pre-fault objects were written and verified",
         Some(serde_json::json!({ "objects": prefilled.len() })),
     )?;
-    let staged_multipart_uploads = if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
-    {
-        events.record(
-            "multipart-stage",
-            RunEventStatus::Started,
-            "creating multipart uploads and uploading parts before quorum loss",
-            None,
-        )?;
-        let staged = match stage_write_quorum_multipart_uploads(
-            &s3,
-            &history,
-            &run_id,
-            &workload_plan,
-            scenario.prefill_count(),
-            scenario.mixed_workload_count(),
-        )
-        .await
+    let mut staged_multipart_uploads = BTreeMap::new();
+    let cleanup_concurrency = workload_plan.concurrency;
+    // Keep the S3 client and port-forward alive until every known staged upload
+    // has been cleaned up, including errors before fault activation.
+    let result: Result<()> = async {
+        if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
         {
-            Ok(staged) => staged,
-            Err(error) => {
-                events
-                    .record(
-                        "multipart-stage",
-                        RunEventStatus::Failed,
-                        error.to_string(),
-                        None,
-                    )
-                    .ok();
-                write_failure_summary(
-                    collector,
-                    scenario.case_name,
-                    FailureSummary::new(
-                        &scenario.name,
-                        "multipart-stage",
-                        "product_or_environment",
-                        error.to_string(),
-                    ),
-                )?;
-                return Err(error);
-            }
-        };
-        events.record(
-            "multipart-stage",
-            RunEventStatus::Succeeded,
-            "multipart uploads are ready for completion during quorum loss",
-            Some(serde_json::json!({ "uploads": staged.len() })),
-        )?;
-        Some(staged)
-    } else {
-        None
-    };
-    events.record(
-        "target-preflight",
-        RunEventStatus::Started,
-        "validating planned fault target proof",
-        Some(serde_json::json!({
-            "include_volume_bindings": plan_requires_volume_bindings(plan),
-        })),
-    )?;
-    let target_inventory =
-        match rustfs_target_inventory(cluster, plan_requires_volume_bindings(plan)) {
-            Ok(inventory) => inventory,
-            Err(error) => {
-                preflight_phases.push(PreflightPhase::new(
-                    "target-proof",
-                    vec![PreflightCheck::failed(
-                        "target_inventory",
-                        error.to_string(),
-                        crate::fault::reporting::ResponsibilityDomain::Harness,
-                    )],
-                ));
-                write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
-                events
-                    .record(
-                        "target-preflight",
-                        RunEventStatus::Failed,
-                        error.to_string(),
-                        None,
-                    )
-                    .ok();
-                write_failure_summary(
-                    collector,
-                    scenario.case_name,
-                    FailureSummary::new(
-                        &scenario.name,
-                        "target-preflight",
-                        "test_or_environment",
-                        error.to_string(),
-                    ),
-                )?;
-                return Err(error);
-            }
-        };
-    let pods_before = target_inventory.identities;
-    let mut target_proof = TargetProof::from_plan(config, scenario, spec, plan, &run_id)
-        .with_resolved_pod_proofs(target_inventory.pod_proofs);
-    let mut topology_observed_at_ms = None;
-    if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
-        events.record(
-            "write-quorum-loss-topology-proof",
-            RunEventStatus::Started,
-            "reading RustFS runtime erasure geometry immediately before fault activation",
-            None,
-        )?;
-        let target_servers = write_quorum_partition_target_count(plan)?;
-        let observation = match require_write_quorum_loss_topology(
-            config,
-            &endpoint,
-            access_key,
-            secret_key,
-            target_servers,
-            &pods_before,
-        )
-        .await
-        {
-            Ok(observation) => observation,
-            Err(error) => {
-                preflight_phases.push(PreflightPhase::new(
-                    "write-quorum-loss-topology-proof",
-                    vec![PreflightCheck::failed(
-                        "write_quorum_loss_topology",
-                        error.to_string(),
-                        crate::fault::reporting::ResponsibilityDomain::Environment,
-                    )],
-                ));
-                write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
-                events
-                    .record(
-                        "write-quorum-loss-topology-proof",
-                        RunEventStatus::Failed,
-                        error.to_string(),
-                        None,
-                    )
-                    .ok();
-                write_failure_summary(
-                    collector,
-                    scenario.case_name,
-                    FailureSummary::new(
-                        &scenario.name,
-                        "write-quorum-loss-topology-proof",
-                        "test_or_environment",
-                        error.to_string(),
-                    ),
-                )?;
-                return Err(error);
-            }
-        };
-        events.record(
-            "write-quorum-loss-topology-proof",
-            RunEventStatus::Succeeded,
-            "fresh, fully-online RustFS runtime geometry establishes the declared quorum boundary",
-            Some(serde_json::to_value(&observation)?),
-        )?;
-        topology_observed_at_ms = Some(observation.observed_at_ms);
-        target_proof = target_proof.with_erasure_set_topology_proven(
-            observation.shape,
-            observation.health,
-            observation.membership,
-            observation.deployment_id,
-            observation.observed_at_ms,
-        )?;
-    }
-    collector.write_text(
-        scenario.case_name,
-        "target-proof.json",
-        &serde_json::to_string_pretty(&target_proof)?,
-    )?;
-    preflight_phases.push(PreflightPhase::new(
-        "target-proof",
-        vec![target_proof.preflight_check()],
-    ));
-    write_preflight_summary(collector, scenario, config, &preflight_phases)?;
-    if let Err(error) = target_proof.require_satisfied() {
-        events
-            .record(
-                "target-preflight",
-                RunEventStatus::Failed,
-                error.to_string(),
+            events.record(
+                "multipart-stage",
+                RunEventStatus::Started,
+                "creating multipart uploads and uploading parts before quorum loss",
                 None,
-            )
-            .ok();
-        write_failure_summary(
-            collector,
-            scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "target-preflight",
-                "preflight_failed",
-                error.to_string(),
-            ),
-        )?;
-        return Err(error);
-    }
-    events.record(
-        "target-preflight",
-        RunEventStatus::Succeeded,
-        "planned fault target proof is satisfied",
-        None,
-    )?;
-    events.record(
-        "fault-apply",
-        RunEventStatus::Started,
-        "applying planned faults",
-        Some(serde_json::json!({
-            "faults": plan.faults().len(),
-            "backend": plan.backend_summary(),
-        })),
-    )?;
-    let fault_apply_started_at_ms = now_ms();
-    if let Some(observed_at_ms) = topology_observed_at_ms
-        && let Err(error) =
-            require_fresh_runtime_observation(observed_at_ms, fault_apply_started_at_ms)
-    {
-        events
-            .record(
-                "fault-apply",
-                RunEventStatus::Failed,
-                error.to_string(),
-                None,
-            )
-            .ok();
-        write_failure_summary(
-            collector,
-            scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "fault-apply",
-                "test_or_environment",
-                error.to_string(),
-            ),
-        )?;
-        return Err(error);
-    }
-    let mut fault = match AppliedFaults::apply(config, collector, scenario, plan, &run_id) {
-        Ok(fault) => fault,
-        Err(error) => {
-            events
-                .record(
-                    "fault-apply",
-                    RunEventStatus::Failed,
-                    error.to_string(),
-                    None,
-                )
-                .ok();
-            write_failure_summary(
-                collector,
-                scenario.case_name,
-                FailureSummary::new(
-                    &scenario.name,
-                    "fault-apply",
-                    "environment_or_fault_backend",
-                    error.to_string(),
-                ),
             )?;
-            return Err(error);
-        }
-    };
-    events.record(
-        "fault-apply",
-        RunEventStatus::Succeeded,
-        "planned faults were applied",
-        None,
-    )?;
-
-    events.record(
-        "wait-active",
-        RunEventStatus::Started,
-        "waiting for applied faults to become active",
-        None,
-    )?;
-    if let Err(error) = fault.wait_active(cluster.timeout) {
-        events
-            .record(
-                "wait-active",
-                RunEventStatus::Failed,
-                error.to_string(),
-                None,
-            )
-            .ok();
-        collect_fault_artifacts(collector, scenario.case_name, &fault, "wait-active-failed")?;
-        write_failure_summary(
-            collector,
-            scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "wait-active",
-                "environment_or_fault_backend",
-                error.to_string(),
-            ),
-        )?;
-        return Err(error);
-    }
-    let fault_active_at_ms = history.mark_fault_active_now();
-    events.record(
-        "wait-active",
-        RunEventStatus::Succeeded,
-        "applied faults are active",
-        None,
-    )?;
-    events.record(
-        "fault-snapshot-active",
-        RunEventStatus::Started,
-        "capturing active fault status snapshots",
-        None,
-    )?;
-    let active_snapshots = match fault.snapshots("active") {
-        Ok(snapshots) => snapshots,
-        Err(error) => {
-            events
-                .record(
-                    "fault-snapshot-active",
-                    RunEventStatus::Failed,
-                    error.to_string(),
-                    None,
-                )
-                .ok();
-            collect_fault_artifacts(
-                collector,
-                scenario.case_name,
-                &fault,
-                "active-snapshot-failed",
-            )?;
-            write_failure_summary(
-                collector,
-                scenario.case_name,
-                FailureSummary::new(
-                    &scenario.name,
-                    "fault-snapshot-active",
-                    "environment_or_fault_backend",
-                    error.to_string(),
-                ),
-            )?;
-            return Err(error);
-        }
-    };
-    let (pods_at_fault_activation, active_partition_targets) =
-        if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
-            match require_active_write_quorum_partition(
-                config,
+            match stage_write_quorum_multipart_uploads(
+                &s3,
+                &history,
                 &run_id,
-                plan,
-                &pods_before,
-                &target_proof,
-                &active_snapshots,
-            ) {
-                Ok(evidence) => evidence,
+                &workload_plan,
+                scenario.prefill_count(),
+                scenario.mixed_workload_count(),
+                &mut staged_multipart_uploads,
+            )
+            .await
+            {
+                Ok(()) => {},
                 Err(error) => {
                     events
                         .record(
-                            "fault-snapshot-active",
+                            "multipart-stage",
                             RunEventStatus::Failed,
                             error.to_string(),
                             None,
                         )
                         .ok();
-                    collect_fault_artifacts(
-                        collector,
-                        scenario.case_name,
-                        &fault,
-                        "active-target-evidence-failed",
-                    )?;
                     write_failure_summary(
                         collector,
                         scenario.case_name,
                         FailureSummary::new(
                             &scenario.name,
-                            "fault-snapshot-active",
-                            "environment_or_fault_backend",
+                            "multipart-stage",
+                            "product_or_environment",
                             error.to_string(),
-                        ),
+                        )?,
                     )?;
                     return Err(error);
                 }
-            }
-        } else {
-            (Vec::new(), BTreeSet::new())
-        };
-    events.record(
-        "fault-snapshot-active",
-        RunEventStatus::Succeeded,
-        "active fault status snapshots captured",
-        Some(serde_json::json!({ "snapshots": active_snapshots.len() })),
-    )?;
-
-    events.record(
-        "s3-access-under-fault",
-        RunEventStatus::Started,
-        "checking S3 access while faults are active",
-        Some(serde_json::json!({ "endpoint": endpoint })),
-    )?;
-    if let Err(error) = ensure_s3_access(&mut port_forward, cluster, &endpoint).await {
-        events
-            .record(
-                "s3-access-under-fault",
-                RunEventStatus::Failed,
-                error.to_string(),
-                Some(serde_json::json!({ "endpoint": endpoint })),
-            )
-            .ok();
-        collect_fault_artifacts(collector, scenario.case_name, &fault, "port-forward-failed")?;
-        write_failure_summary(
-            collector,
-            scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "s3-access-under-fault",
-                "environment_or_workload",
-                error.to_string(),
-            ),
-        )?;
-        return Err(error);
-    }
-    events.record(
-        "s3-access-under-fault",
-        RunEventStatus::Succeeded,
-        "S3 endpoint is reachable while faults are active",
-        Some(serde_json::json!({ "endpoint": endpoint })),
-    )?;
-
-    if plan.workload_mode.runs_warp() {
-        let warp_bucket = warp_bucket_name(&run_id);
+            };
+            events.record(
+                "multipart-stage",
+                RunEventStatus::Succeeded,
+                "multipart uploads are ready for completion during quorum loss",
+                Some(serde_json::json!({ "uploads": staged_multipart_uploads.len() })),
+            )?;
+        }
         events.record(
-            "warp-workload",
+            "target-preflight",
             RunEventStatus::Started,
-            "running Warp workload under active faults",
-            Some(serde_json::json!({ "bucket": warp_bucket })),
+            "validating planned fault target proof",
+            Some(serde_json::json!({
+                "include_volume_bindings": plan_requires_volume_bindings(plan),
+            })),
         )?;
-        if let Err(error) = host::run_warp_mixed(
-            config.warp_duration,
-            collector,
+        let target_inventory =
+            match rustfs_target_inventory(cluster, plan_requires_volume_bindings(plan)) {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    preflight_phases.push(PreflightPhase::new(
+                        "target-proof",
+                        vec![PreflightCheck::failed(
+                            "target_inventory",
+                            error.to_string(),
+                            crate::fault::reporting::ResponsibilityDomain::Harness,
+                        )],
+                    ));
+                    write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+                    events
+                        .record(
+                            "target-preflight",
+                            RunEventStatus::Failed,
+                            error.to_string(),
+                            None,
+                        )
+                        .ok();
+                    write_failure_summary(
+                        collector,
+                        scenario.case_name,
+                        FailureSummary::new(
+                            &scenario.name,
+                            "target-preflight",
+                            "test_or_environment",
+                            error.to_string(),
+                        )?,
+                    )?;
+                    return Err(error);
+                }
+            };
+        let pods_before = target_inventory.identities;
+        let mut target_proof = TargetProof::from_plan(config, scenario, spec, plan, &run_id)
+            .with_resolved_pod_proofs(target_inventory.pod_proofs);
+        let mut topology_observed_at_ms = None;
+        if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+            events.record(
+                "write-quorum-loss-topology-proof",
+                RunEventStatus::Started,
+                "reading RustFS runtime erasure geometry immediately before fault activation",
+                None,
+            )?;
+            let target_servers = write_quorum_partition_target_count(plan)?;
+            let observation = match require_write_quorum_loss_topology(
+                config,
+                &endpoint,
+                access_key,
+                secret_key,
+                target_servers,
+                &pods_before,
+            )
+            .await
+            {
+                Ok(observation) => observation,
+                Err(error) => {
+                    preflight_phases.push(PreflightPhase::new(
+                        "write-quorum-loss-topology-proof",
+                        vec![PreflightCheck::failed(
+                            "write_quorum_loss_topology",
+                            error.to_string(),
+                            crate::fault::reporting::ResponsibilityDomain::Environment,
+                        )],
+                    ));
+                    write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+                    events
+                        .record(
+                            "write-quorum-loss-topology-proof",
+                            RunEventStatus::Failed,
+                            error.to_string(),
+                            None,
+                        )
+                        .ok();
+                    write_failure_summary(
+                        collector,
+                        scenario.case_name,
+                        FailureSummary::new(
+                            &scenario.name,
+                            "write-quorum-loss-topology-proof",
+                            "test_or_environment",
+                            error.to_string(),
+                        )?,
+                    )?;
+                    return Err(error);
+                }
+            };
+            events.record(
+                "write-quorum-loss-topology-proof",
+                RunEventStatus::Succeeded,
+                "fresh, fully-online RustFS runtime geometry establishes the declared quorum boundary",
+                Some(serde_json::to_value(&observation)?),
+            )?;
+            topology_observed_at_ms = Some(observation.observed_at_ms);
+            target_proof = target_proof.with_erasure_set_topology_proven(
+                observation.shape,
+                observation.health,
+                observation.membership,
+                observation.deployment_id,
+                observation.observed_at_ms,
+            )?;
+        }
+        collector.write_text(
             scenario.case_name,
-            &endpoint,
-            &warp_bucket,
-            access_key,
-            secret_key,
-        ) {
+            "target-proof.json",
+            &serde_json::to_string_pretty(&target_proof)?,
+        )?;
+        preflight_phases.push(PreflightPhase::new(
+            "target-proof",
+            vec![target_proof.preflight_check()],
+        ));
+        write_preflight_summary(collector, scenario, config, &preflight_phases)?;
+        if let Err(error) = target_proof.require_satisfied() {
             events
                 .record(
-                    "warp-workload",
+                    "target-preflight",
                     RunEventStatus::Failed,
                     error.to_string(),
-                    Some(serde_json::json!({ "bucket": warp_bucket })),
+                    None,
                 )
                 .ok();
-            collect_fault_artifacts(collector, scenario.case_name, &fault, "warp-failed")?;
             write_failure_summary(
                 collector,
                 scenario.case_name,
                 FailureSummary::new(
                     &scenario.name,
-                    "warp-workload",
-                    "workload_or_product",
+                    "target-preflight",
+                    "preflight_failed",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
         events.record(
-            "warp-workload",
+            "target-preflight",
             RunEventStatus::Succeeded,
-            "Warp workload completed under active faults",
-            Some(serde_json::json!({ "bucket": warp_bucket })),
+            "planned fault target proof is satisfied",
+            None,
+        )?;
+        events.record(
+            "fault-apply",
+            RunEventStatus::Started,
+            "applying planned faults",
+            Some(serde_json::json!({
+                "faults": plan.faults().len(),
+                "backend": plan.backend_summary(),
+            })),
+        )?;
+        let fault_apply_started_at_ms = now_ms();
+        if let Some(observed_at_ms) = topology_observed_at_ms
+            && let Err(error) =
+                require_fresh_runtime_observation(observed_at_ms, fault_apply_started_at_ms)
+        {
+            events
+                .record(
+                    "fault-apply",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    None,
+                )
+                .ok();
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "fault-apply",
+                    "test_or_environment",
+                    error.to_string(),
+                )?,
+            )?;
+            return Err(error);
+        }
+        let mut fault = match AppliedFaults::apply(config, collector, scenario, plan, &run_id) {
+            Ok(fault) => fault,
+            Err(error) => {
+                events
+                    .record(
+                        "fault-apply",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "fault-apply",
+                        "environment_or_fault_backend",
+                        error.to_string(),
+                    )?,
+                )?;
+                return Err(error);
+            }
+        };
+        events.record(
+            "fault-apply",
+            RunEventStatus::Succeeded,
+            "planned faults were applied",
+            None,
         )?;
 
         events.record(
-            "post-warp-s3-access",
+            "wait-active",
             RunEventStatus::Started,
-            "checking S3 access after Warp workload",
+            "waiting for applied faults to become active",
+            None,
+        )?;
+        if let Err(error) = fault.wait_active(cluster.timeout) {
+            events
+                .record(
+                    "wait-active",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    None,
+                )
+                .ok();
+            collect_fault_artifacts(collector, scenario.case_name, &fault, "wait-active-failed")?;
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "wait-active",
+                    "environment_or_fault_backend",
+                    error.to_string(),
+                )?,
+            )?;
+            return Err(error);
+        }
+        let fault_active_at_ms = history.mark_fault_active_now();
+        events.record(
+            "wait-active",
+            RunEventStatus::Succeeded,
+            "applied faults are active",
+            None,
+        )?;
+        events.record(
+            "fault-snapshot-active",
+            RunEventStatus::Started,
+            "capturing active fault status snapshots",
+            None,
+        )?;
+        let active_snapshots = match fault.snapshots("active") {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                events
+                    .record(
+                        "fault-snapshot-active",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                collect_fault_artifacts(
+                    collector,
+                    scenario.case_name,
+                    &fault,
+                    "active-snapshot-failed",
+                )?;
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "fault-snapshot-active",
+                        "environment_or_fault_backend",
+                        error.to_string(),
+                    )?,
+                )?;
+                return Err(error);
+            }
+        };
+        let (pods_at_fault_activation, active_partition_targets) =
+            if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+                match require_active_write_quorum_partition(
+                    config,
+                    &run_id,
+                    plan,
+                    &pods_before,
+                    &target_proof,
+                    &active_snapshots,
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        events
+                            .record(
+                                "fault-snapshot-active",
+                                RunEventStatus::Failed,
+                                error.to_string(),
+                                None,
+                            )
+                            .ok();
+                        collect_fault_artifacts(
+                            collector,
+                            scenario.case_name,
+                            &fault,
+                            "active-target-evidence-failed",
+                        )?;
+                        write_failure_summary(
+                            collector,
+                            scenario.case_name,
+                            FailureSummary::new(
+                                &scenario.name,
+                                "fault-snapshot-active",
+                                "environment_or_fault_backend",
+                                error.to_string(),
+                            )?,
+                        )?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                (Vec::new(), BTreeSet::new())
+            };
+        events.record(
+            "fault-snapshot-active",
+            RunEventStatus::Succeeded,
+            "active fault status snapshots captured",
+            Some(serde_json::json!({ "snapshots": active_snapshots.len() })),
+        )?;
+
+        events.record(
+            "s3-access-under-fault",
+            RunEventStatus::Started,
+            "checking S3 access while faults are active",
             Some(serde_json::json!({ "endpoint": endpoint })),
         )?;
         if let Err(error) = ensure_s3_access(&mut port_forward, cluster, &endpoint).await {
             events
                 .record(
-                    "post-warp-s3-access",
+                    "s3-access-under-fault",
                     RunEventStatus::Failed,
                     error.to_string(),
                     Some(serde_json::json!({ "endpoint": endpoint })),
                 )
                 .ok();
-            collect_fault_artifacts(
-                collector,
-                scenario.case_name,
-                &fault,
-                "post-warp-port-forward-failed",
-            )?;
+            collect_fault_artifacts(collector, scenario.case_name, &fault, "port-forward-failed")?;
             write_failure_summary(
                 collector,
                 scenario.case_name,
                 FailureSummary::new(
                     &scenario.name,
-                    "post-warp-s3-access",
+                    "s3-access-under-fault",
                     "environment_or_workload",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
         events.record(
-            "post-warp-s3-access",
+            "s3-access-under-fault",
             RunEventStatus::Succeeded,
-            "S3 endpoint is reachable after Warp workload",
+            "S3 endpoint is reachable while faults are active",
             Some(serde_json::json!({ "endpoint": endpoint })),
         )?;
-    }
 
-    events.record(
-        "mixed-workload",
-        RunEventStatus::Started,
-        "running mixed S3 workload while faults are active",
-        Some(serde_json::json!({
-            "object_count": scenario.mixed_workload_count(),
-            "concurrency": workload_plan.concurrency,
-        })),
-    )?;
-    let workload_started_at_ms = now_ms();
-    history.set_durability_cohort(DurabilityCohort::FaultActive);
-    let mut workload = match run_mixed_workload(
-        &s3,
-        &history,
-        &run_id,
-        &workload_plan,
-        &prefilled,
-        scenario.prefill_count(),
-        scenario.mixed_workload_count(),
-        config.workload_ranged_get_percent,
-        staged_multipart_uploads.as_ref(),
-    )
-    .await
-    {
-        Ok(workload) => workload,
-        Err(error) => {
+        if plan.workload_mode.runs_warp() {
+            let warp_bucket = warp_bucket_name(&run_id);
+            events.record(
+                "warp-workload",
+                RunEventStatus::Started,
+                "running Warp workload under active faults",
+                Some(serde_json::json!({ "bucket": warp_bucket })),
+            )?;
+            if let Err(error) = host::run_warp_mixed(
+                config.warp_duration,
+                collector,
+                scenario.case_name,
+                &endpoint,
+                &warp_bucket,
+                access_key,
+                secret_key,
+            ) {
+                events
+                    .record(
+                        "warp-workload",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        Some(serde_json::json!({ "bucket": warp_bucket })),
+                    )
+                    .ok();
+                collect_fault_artifacts(collector, scenario.case_name, &fault, "warp-failed")?;
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "warp-workload",
+                        "workload_or_product",
+                        error.to_string(),
+                    )?,
+                )?;
+                return Err(error);
+            }
+            events.record(
+                "warp-workload",
+                RunEventStatus::Succeeded,
+                "Warp workload completed under active faults",
+                Some(serde_json::json!({ "bucket": warp_bucket })),
+            )?;
+
+            events.record(
+                "post-warp-s3-access",
+                RunEventStatus::Started,
+                "checking S3 access after Warp workload",
+                Some(serde_json::json!({ "endpoint": endpoint })),
+            )?;
+            if let Err(error) = ensure_s3_access(&mut port_forward, cluster, &endpoint).await {
+                events
+                    .record(
+                        "post-warp-s3-access",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        Some(serde_json::json!({ "endpoint": endpoint })),
+                    )
+                    .ok();
+                collect_fault_artifacts(
+                    collector,
+                    scenario.case_name,
+                    &fault,
+                    "post-warp-port-forward-failed",
+                )?;
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "post-warp-s3-access",
+                        "environment_or_workload",
+                        error.to_string(),
+                    )?,
+                )?;
+                return Err(error);
+            }
+            events.record(
+                "post-warp-s3-access",
+                RunEventStatus::Succeeded,
+                "S3 endpoint is reachable after Warp workload",
+                Some(serde_json::json!({ "endpoint": endpoint })),
+            )?;
+        }
+
+        events.record(
+            "mixed-workload",
+            RunEventStatus::Started,
+            "running mixed S3 workload while faults are active",
+            Some(serde_json::json!({
+                "object_count": scenario.mixed_workload_count(),
+                "concurrency": workload_plan.concurrency,
+            })),
+        )?;
+        let workload_started_at_ms = now_ms();
+        history.set_durability_cohort(DurabilityCohort::FaultActive);
+        let mut workload = match run_mixed_workload(
+            &s3,
+            &history,
+            &run_id,
+            &workload_plan,
+            &prefilled,
+            scenario.prefill_count(),
+            scenario.mixed_workload_count(),
+            config.workload_ranged_get_percent,
+            (plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO)
+                .then_some(&staged_multipart_uploads),
+        )
+        .await
+        {
+            Ok(workload) => workload,
+            Err(error) => {
+                events
+                    .record(
+                        "mixed-workload",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                collect_fault_artifacts(collector, scenario.case_name, &fault, "workload-failed")?;
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "mixed-workload",
+                        "workload_or_product",
+                        error.to_string(),
+                    )?,
+                )?;
+                return Err(error);
+            }
+        };
+        let workload_ended_at_ms = now_ms();
+        events.record(
+            "mixed-workload",
+            RunEventStatus::Succeeded,
+            "mixed S3 workload completed under active faults",
+            Some(serde_json::json!({ "disruptions": workload.summary.disrupted() })),
+        )?;
+        collector.write_text(
+            scenario.case_name,
+            "workload-summary.json",
+            &serde_json::to_string_pretty(&workload.summary)?,
+        )?;
+        let require_client_disruption =
+            config.require_client_disruption || spec.impact_policy.requires_client_disruption();
+        let fault_evidence_result = workload
+            .summary
+            .require_fault_evidence(require_client_disruption)
+            .and_then(|()| {
+                if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+                    workload.summary.require_write_quorum_loss_effect()
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = fault_evidence_result {
             events
                 .record(
-                    "mixed-workload",
+                    "fault-evidence",
                     RunEventStatus::Failed,
                     error.to_string(),
-                    None,
+                    Some(serde_json::json!({
+                        "require_client_disruption": require_client_disruption,
+                        "disruptions": workload.summary.disrupted(),
+                    })),
                 )
                 .ok();
-            collect_fault_artifacts(collector, scenario.case_name, &fault, "workload-failed")?;
+            collect_fault_artifacts(
+                collector,
+                scenario.case_name,
+                &fault,
+                "workload-no-fault-evidence",
+            )?;
             write_failure_summary(
                 collector,
                 scenario.case_name,
                 FailureSummary::new(
                     &scenario.name,
-                    "mixed-workload",
-                    "workload_or_product",
+                    "fault-evidence",
+                    "test_or_environment",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
-    };
-    let workload_ended_at_ms = now_ms();
-    events.record(
-        "mixed-workload",
-        RunEventStatus::Succeeded,
-        "mixed S3 workload completed under active faults",
-        Some(serde_json::json!({ "disruptions": workload.summary.disrupted() })),
-    )?;
-    collector.write_text(
-        scenario.case_name,
-        "workload-summary.json",
-        &serde_json::to_string_pretty(&workload.summary)?,
-    )?;
-    let require_client_disruption =
-        config.require_client_disruption || spec.impact_policy.requires_client_disruption();
-    let fault_evidence_result = workload
-        .summary
-        .require_fault_evidence(require_client_disruption)
-        .and_then(|()| {
-            if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
-                workload.summary.require_write_quorum_loss_effect()
-            } else {
-                Ok(())
-            }
-        });
-    if let Err(error) = fault_evidence_result {
-        events
-            .record(
-                "fault-evidence",
-                RunEventStatus::Failed,
-                error.to_string(),
-                Some(serde_json::json!({
-                    "require_client_disruption": require_client_disruption,
-                    "disruptions": workload.summary.disrupted(),
-                })),
-            )
-            .ok();
-        collect_fault_artifacts(
-            collector,
-            scenario.case_name,
-            &fault,
-            "workload-no-fault-evidence",
+        events.record(
+            "fault-evidence",
+            RunEventStatus::Observed,
+            "workload evidence matched the scenario impact policy",
+            Some(serde_json::json!({
+                "require_client_disruption": require_client_disruption,
+                "disruptions": workload.summary.disrupted(),
+            })),
         )?;
-        write_failure_summary(
-            collector,
-            scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "fault-evidence",
-                "test_or_environment",
-                error.to_string(),
-            ),
-        )?;
-        return Err(error);
-    }
-    events.record(
-        "fault-evidence",
-        RunEventStatus::Observed,
-        "workload evidence matched the scenario impact policy",
-        Some(serde_json::json!({
-            "require_client_disruption": require_client_disruption,
-            "disruptions": workload.summary.disrupted(),
-        })),
-    )?;
-    if let Err(error) = fault.ensure_active("after fault workload") {
-        events
-            .record(
-                "fault-still-active",
-                RunEventStatus::Failed,
-                error.to_string(),
-                None,
-            )
-            .ok();
-        collect_fault_artifacts(
-            collector,
-            scenario.case_name,
-            &fault,
-            "workload-outlived-fault",
-        )?;
-        write_failure_summary(
-            collector,
-            scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "fault-still-active",
-                "test_or_environment",
-                error.to_string(),
-            ),
-        )?;
-        return Err(error);
-    }
-    events.record(
-        "fault-snapshot-after-workload",
-        RunEventStatus::Started,
-        "capturing fault status snapshots after workload",
-        None,
-    )?;
-    let workload_snapshots = match fault.snapshots("after-workload") {
-        Ok(snapshots) => snapshots,
-        Err(error) => {
+        if let Err(error) = fault.ensure_active("after fault workload") {
             events
                 .record(
-                    "fault-snapshot-after-workload",
+                    "fault-still-active",
                     RunEventStatus::Failed,
                     error.to_string(),
                     None,
@@ -1273,40 +1252,28 @@ async fn run_fault_case(
                 collector,
                 scenario.case_name,
                 &fault,
-                "after-workload-snapshot-failed",
+                "workload-outlived-fault",
             )?;
             write_failure_summary(
                 collector,
                 scenario.case_name,
                 FailureSummary::new(
                     &scenario.name,
-                    "fault-snapshot-after-workload",
-                    "environment_or_fault_backend",
+                    "fault-still-active",
+                    "test_or_environment",
                     error.to_string(),
-                ),
+                )?,
             )?;
             return Err(error);
         }
-    };
-    let pods_at_workload_snapshot = if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
-    {
-        let validation = require_active_write_quorum_partition(
-            config,
-            &run_id,
-            plan,
-            &pods_before,
-            &target_proof,
-            &workload_snapshots,
-        )
-        .and_then(|(pods, workload_partition_targets)| {
-            ensure!(
-                workload_partition_targets == active_partition_targets,
-                "NetworkChaos source targets changed while the quorum workload was running"
-            );
-            Ok(pods)
-        });
-        match validation {
-            Ok(pods) => pods,
+        events.record(
+            "fault-snapshot-after-workload",
+            RunEventStatus::Started,
+            "capturing fault status snapshots after workload",
+            None,
+        )?;
+        let workload_snapshots = match fault.snapshots("after-workload") {
+            Ok(snapshots) => snapshots,
             Err(error) => {
                 events
                     .record(
@@ -1320,7 +1287,7 @@ async fn run_fault_case(
                     collector,
                     scenario.case_name,
                     &fault,
-                    "workload-target-evidence-failed",
+                    "after-workload-snapshot-failed",
                 )?;
                 write_failure_summary(
                     collector,
@@ -1330,54 +1297,423 @@ async fn run_fault_case(
                         "fault-snapshot-after-workload",
                         "environment_or_fault_backend",
                         error.to_string(),
-                    ),
+                    )?,
                 )?;
                 return Err(error);
             }
-        }
-    } else {
-        Vec::new()
-    };
-    events.record(
-        "fault-snapshot-after-workload",
-        RunEventStatus::Succeeded,
-        "fault status snapshots captured after workload",
-        Some(serde_json::json!({ "snapshots": workload_snapshots.len() })),
-    )?;
-
-    if fault.requires_recovery_boundary() {
+        };
+        let pods_at_workload_snapshot = if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+        {
+            let validation = require_active_write_quorum_partition(
+                config,
+                &run_id,
+                plan,
+                &pods_before,
+                &target_proof,
+                &workload_snapshots,
+            )
+            .and_then(|(pods, workload_partition_targets)| {
+                ensure!(
+                    workload_partition_targets == active_partition_targets,
+                    "NetworkChaos source targets changed while the quorum workload was running"
+                );
+                Ok(pods)
+            });
+            match validation {
+                Ok(pods) => pods,
+                Err(error) => {
+                    events
+                        .record(
+                            "fault-snapshot-after-workload",
+                            RunEventStatus::Failed,
+                            error.to_string(),
+                            None,
+                        )
+                        .ok();
+                    collect_fault_artifacts(
+                        collector,
+                        scenario.case_name,
+                        &fault,
+                        "workload-target-evidence-failed",
+                    )?;
+                    write_failure_summary(
+                        collector,
+                        scenario.case_name,
+                        FailureSummary::new(
+                            &scenario.name,
+                            "fault-snapshot-after-workload",
+                            "environment_or_fault_backend",
+                            error.to_string(),
+                        )?,
+                    )?;
+                    return Err(error);
+                }
+            }
+        } else {
+            Vec::new()
+        };
         events.record(
-            "crash-recovery-boundary",
-            RunEventStatus::Started,
-            "proving an acknowledged mutation and forcing the backend-owned crash boundary",
-            None,
+            "fault-snapshot-after-workload",
+            RunEventStatus::Succeeded,
+            "fault status snapshots captured after workload",
+            Some(serde_json::json!({ "snapshots": workload_snapshots.len() })),
         )?;
-        let crash_boundary_started_at_ms = now_ms();
-        let crash_window_evidence = match crash_window_evidence(
-            &history.records(),
-            &scenario.name,
-            &run_id,
-            fault_active_at_ms,
-            crash_boundary_started_at_ms,
-        ) {
-            Ok(evidence) => evidence,
-            Err(error) => {
+
+        if fault.requires_recovery_boundary() {
+            events.record(
+                "crash-recovery-boundary",
+                RunEventStatus::Started,
+                "proving an acknowledged mutation and forcing the backend-owned crash boundary",
+                None,
+            )?;
+            let crash_boundary_started_at_ms = now_ms();
+            let crash_window_evidence = match crash_window_evidence(
+                &history.records(),
+                &scenario.name,
+                &run_id,
+                fault_active_at_ms,
+                crash_boundary_started_at_ms,
+            ) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    events
+                        .record(
+                            "crash-recovery-boundary",
+                            RunEventStatus::Failed,
+                            error.to_string(),
+                            None,
+                        )
+                        .ok();
+                    write_failure_summary(
+                        collector,
+                        scenario.case_name,
+                        FailureSummary::new(
+                            &scenario.name,
+                            "crash-recovery-boundary",
+                            "no_signal",
+                            error.to_string(),
+                        )?,
+                    )?;
+                    return Err(error);
+                }
+            };
+            collector.write_text(
+                scenario.case_name,
+                "crash-window-evidence.json",
+                &serde_json::to_string_pretty(&crash_window_evidence)?,
+            )?;
+            if let Err(error) =
+                fault.prepare_recovery_boundary(cluster.timeout, crash_boundary_started_at_ms)
+            {
                 events
                     .record(
                         "crash-recovery-boundary",
                         RunEventStatus::Failed,
                         error.to_string(),
-                        None,
+                        Some(serde_json::json!({
+                            "trigger_operation_id": crash_window_evidence.trigger_operation_id,
+                        })),
                     )
                     .ok();
+                collect_fault_artifacts(
+                    collector,
+                    scenario.case_name,
+                    &fault,
+                    "crash-boundary-failed",
+                )?;
                 write_failure_summary(
                     collector,
                     scenario.case_name,
                     FailureSummary::new(
                         &scenario.name,
                         "crash-recovery-boundary",
-                        "no_signal",
+                        "environment_or_fault_backend",
                         error.to_string(),
+                    )?,
+                )?;
+                return Err(error);
+            }
+            events.record(
+                "crash-recovery-boundary",
+                RunEventStatus::Succeeded,
+                "target Pod was force-deleted and the filesystem was unmounted while drop_writes remained active",
+                Some(serde_json::json!({
+                    "trigger_operation_id": crash_window_evidence.trigger_operation_id,
+                    "ack_to_crash_boundary_ms": crash_window_evidence.ack_to_crash_boundary_ms,
+                })),
+            )?;
+        }
+
+        events.record(
+            "fault-delete",
+            RunEventStatus::Started,
+            "removing applied faults",
+            None,
+        )?;
+        let fault_delete_started_at_ms = history.mark_fault_ended_now();
+        let fault_delete_started_at = Instant::now();
+        if let Err(error) = fault.delete(cluster.timeout) {
+            let finalizer_recovery = match fault.recover_delete_timeout(
+                config,
+                collector,
+                scenario.case_name,
+                &run_id,
+                &error,
+                fault_delete_started_at,
+            ) {
+                Ok(recovery) => recovery,
+                Err(recovery_error) => {
+                    let _ = collector.write_text(
+                        scenario.case_name,
+                        "iochaos-finalizer-recovery-error.txt",
+                        &format!(
+                            "failed to evaluate or apply IOChaos finalizer recovery:\n{recovery_error}"
+                        ),
+                    );
+                    None
+                }
+            };
+            if let Some(recovery) = finalizer_recovery {
+                events.record(
+                    "fault-delete",
+                    RunEventStatus::Succeeded,
+                    "patched stuck IOChaos finalizer after recovery evidence",
+                    Some(serde_json::json!({
+                        "warning_artifact": recovery.warning_artifact,
+                        "iochaos": recovery.resource_name,
+                        "target_nodes": recovery.target_nodes,
+                    })),
+                )?;
+            } else {
+                events
+                    .record(
+                        "fault-delete",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                collect_fault_artifacts(collector, scenario.case_name, &fault, "delete-failed")?;
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "fault-delete",
+                        "environment_or_fault_backend",
+                        error.to_string(),
+                    )?,
+                )?;
+                return Err(error);
+            }
+        } else {
+            events.record(
+                "fault-delete",
+                RunEventStatus::Succeeded,
+                "applied faults were removed",
+                None,
+            )?;
+        }
+
+        events.record(
+            "tenant-recovery",
+            RunEventStatus::Started,
+            "waiting for Tenant readiness after fault removal",
+            None,
+        )?;
+        let recovery_started_at_ms = now_ms();
+        history.set_durability_cohort(DurabilityCohort::PostRecovery);
+        if let Err(error) = wait_for_ready_tenant(cluster).await {
+            events
+                .record(
+                    "tenant-recovery",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    None,
+                )
+                .ok();
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "tenant-recovery",
+                    "product_or_environment",
+                    error.to_string(),
+                )?,
+            )?;
+            return Err(error);
+        }
+        events.record(
+            "tenant-recovery",
+            RunEventStatus::Succeeded,
+            "Tenant is Ready after fault removal",
+            None,
+        )?;
+        events.record(
+            "pod-stability-after-recovery",
+            RunEventStatus::Started,
+            "waiting for RustFS pods to remain stable after recovery",
+            Some(serde_json::json!({
+                "expected_pod_count": config.expected_rustfs_pod_count,
+                "stable_window_seconds": config.rustfs_pod_stable_window.as_secs(),
+            })),
+        )?;
+        if let Err(error) = wait_for_stable_rustfs_pods(
+            cluster,
+            config.expected_rustfs_pod_count,
+            config.rustfs_pod_stable_window,
+        )
+        .await
+        {
+            events
+                .record(
+                    "pod-stability-after-recovery",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    None,
+                )
+                .ok();
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "pod-stability-after-recovery",
+                    "product_or_environment",
+                    error.to_string(),
+                )?,
+            )?;
+            return Err(error);
+        }
+        events.record(
+            "pod-stability-after-recovery",
+            RunEventStatus::Succeeded,
+            "RustFS pods were stable after recovery",
+            None,
+        )?;
+        let pods_after = rustfs_pod_identities(cluster)?;
+        events.record(
+            "s3-access-after-recovery",
+            RunEventStatus::Started,
+            "checking S3 access after recovery",
+            Some(serde_json::json!({ "endpoint": endpoint })),
+        )?;
+        if let Err(error) = ensure_s3_access(&mut port_forward, cluster, &endpoint).await {
+            events
+                .record(
+                    "s3-access-after-recovery",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    Some(serde_json::json!({ "endpoint": endpoint })),
+                )
+                .ok();
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "s3-access-after-recovery",
+                    "product_or_environment",
+                    error.to_string(),
+                )?,
+            )?;
+            return Err(error);
+        }
+        events.record(
+            "s3-access-after-recovery",
+            RunEventStatus::Succeeded,
+            "S3 endpoint is reachable after recovery",
+            Some(serde_json::json!({ "endpoint": endpoint })),
+        )?;
+        cleanup_staged_multipart_uploads(
+            &s3, &history, std::mem::take(&mut staged_multipart_uploads), cleanup_concurrency,
+        ).await.context("cleaning staged uploads before recovery verification")?;
+        let recovery_ended_at_ms = now_ms();
+        let recovered_evidence = FaultEvidence {
+            scenario: scenario.name.clone(),
+            backend: plan.backend_summary(),
+            target: plan.target_summary(),
+            injected: true,
+            active_during_workload: true,
+            recovered: true,
+            require_client_disruption,
+            client_disruptions: workload.summary.disrupted(),
+            workload_plan: workload_plan.clone(),
+            pods_before: pods_before.clone(),
+            pods_at_fault_activation: pods_at_fault_activation.clone(),
+            pods_at_workload_snapshot: pods_at_workload_snapshot.clone(),
+            pods_after: pods_after.clone(),
+            active_snapshots: active_snapshots.clone(),
+            workload_snapshots: workload_snapshots.clone(),
+            dm_recovery_snapshot: fault.recovery_dm_snapshot(),
+            fault_apply_started_at_ms: Some(fault_apply_started_at_ms),
+            fault_active_at_ms: Some(fault_active_at_ms),
+            workload_started_at_ms: Some(workload_started_at_ms),
+            workload_ended_at_ms: Some(workload_ended_at_ms),
+            fault_delete_started_at_ms: Some(fault_delete_started_at_ms),
+            recovery_started_at_ms: Some(recovery_started_at_ms),
+            recovery_ended_at_ms: Some(recovery_ended_at_ms),
+        };
+        collector.write_text(
+            scenario.case_name,
+            "fault-evidence.json",
+            &serde_json::to_string_pretty(&recovered_evidence)?,
+        )?;
+        events.record(
+            "checker-pre-recommit",
+            RunEventStatus::Started,
+            "checking recovered object model before recommit",
+            None,
+        )?;
+        let pre_recommit_record_start = history.records().len();
+        let pre_recommit_report = match checker::check_s3_history(
+            &s3,
+            &history,
+            true,
+            workload_plan.concurrency,
+            config.workload_versioning,
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                let message = error.to_string();
+                events
+                    .record(
+                        "checker-pre-recommit",
+                        RunEventStatus::Failed,
+                        message.clone(),
+                        None,
+                    )
+                    .ok();
+                write_checker_error(
+                    collector,
+                    scenario.case_name,
+                    "checker-pre-recommit-error.txt",
+                    &message,
+                )?;
+                let recovery_stability_report = checker::RecoveryStabilityReport::harness_error(
+                    message.clone(),
+                    config.recovery_stability_reread,
+                );
+                collector.write_text(
+                    scenario.case_name,
+                    "recovery-stability-report.json",
+                    &serde_json::to_string_pretty(&recovery_stability_report)?,
+                )?;
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::from_checker(
+                        &scenario.name,
+                        "checker-pre-recommit",
+                        recovery_stability_report.classification,
+                        message,
+                    )
+                    .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds)
+                    .with_evidence_classifications(
+                        recovery_stability_report.evidence_classifications(),
                     ),
                 )?;
                 return Err(error);
@@ -1385,301 +1721,71 @@ async fn run_fault_case(
         };
         collector.write_text(
             scenario.case_name,
-            "crash-window-evidence.json",
-            &serde_json::to_string_pretty(&crash_window_evidence)?,
+            "checker-pre-recommit-report.json",
+            &serde_json::to_string_pretty(&pre_recommit_report)?,
         )?;
-        if let Err(error) =
-            fault.prepare_recovery_boundary(cluster.timeout, crash_boundary_started_at_ms)
-        {
-            events
-                .record(
-                    "crash-recovery-boundary",
-                    RunEventStatus::Failed,
-                    error.to_string(),
-                    Some(serde_json::json!({
-                        "trigger_operation_id": crash_window_evidence.trigger_operation_id,
-                    })),
-                )
-                .ok();
-            collect_fault_artifacts(
-                collector,
-                scenario.case_name,
-                &fault,
-                "crash-boundary-failed",
-            )?;
-            write_failure_summary(
-                collector,
-                scenario.case_name,
-                FailureSummary::new(
-                    &scenario.name,
-                    "crash-recovery-boundary",
-                    "environment_or_fault_backend",
-                    error.to_string(),
-                ),
-            )?;
-            return Err(error);
-        }
-        events.record(
-            "crash-recovery-boundary",
-            RunEventStatus::Succeeded,
-            "target Pod was force-deleted and the filesystem was unmounted while drop_writes remained active",
-            Some(serde_json::json!({
-                "trigger_operation_id": crash_window_evidence.trigger_operation_id,
-                "ack_to_crash_boundary_ms": crash_window_evidence.ack_to_crash_boundary_ms,
-            })),
-        )?;
-    }
-
-    events.record(
-        "fault-delete",
-        RunEventStatus::Started,
-        "removing applied faults",
-        None,
-    )?;
-    let fault_delete_started_at_ms = history.mark_fault_ended_now();
-    let fault_delete_started_at = Instant::now();
-    if let Err(error) = fault.delete(cluster.timeout) {
-        let finalizer_recovery = match fault.recover_delete_timeout(
-            config,
-            collector,
-            scenario.case_name,
-            &run_id,
-            &error,
-            fault_delete_started_at,
-        ) {
-            Ok(recovery) => recovery,
-            Err(recovery_error) => {
-                let _ = collector.write_text(
-                    scenario.case_name,
-                    "iochaos-finalizer-recovery-error.txt",
-                    &format!(
-                        "failed to evaluate or apply IOChaos finalizer recovery:\n{recovery_error}"
-                    ),
-                );
-                None
-            }
-        };
-        if let Some(recovery) = finalizer_recovery {
-            events.record(
-                "fault-delete",
-                RunEventStatus::Succeeded,
-                "patched stuck IOChaos finalizer after recovery evidence",
-                Some(serde_json::json!({
-                    "warning_artifact": recovery.warning_artifact,
-                    "iochaos": recovery.resource_name,
-                    "target_nodes": recovery.target_nodes,
-                })),
-            )?;
-        } else {
-            events
-                .record(
-                    "fault-delete",
-                    RunEventStatus::Failed,
-                    error.to_string(),
-                    None,
-                )
-                .ok();
-            collect_fault_artifacts(collector, scenario.case_name, &fault, "delete-failed")?;
-            write_failure_summary(
-                collector,
-                scenario.case_name,
-                FailureSummary::new(
-                    &scenario.name,
-                    "fault-delete",
-                    "environment_or_fault_backend",
-                    error.to_string(),
-                ),
-            )?;
-            return Err(error);
-        }
-    } else {
-        events.record(
-            "fault-delete",
-            RunEventStatus::Succeeded,
-            "applied faults were removed",
-            None,
-        )?;
-    }
-
-    events.record(
-        "tenant-recovery",
-        RunEventStatus::Started,
-        "waiting for Tenant readiness after fault removal",
-        None,
-    )?;
-    let recovery_started_at_ms = now_ms();
-    history.set_durability_cohort(DurabilityCohort::PostRecovery);
-    if let Err(error) = wait_for_ready_tenant(cluster).await {
-        events
-            .record(
-                "tenant-recovery",
-                RunEventStatus::Failed,
-                error.to_string(),
-                None,
-            )
-            .ok();
-        write_failure_summary(
-            collector,
-            scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "tenant-recovery",
-                "product_or_environment",
-                error.to_string(),
-            ),
-        )?;
-        return Err(error);
-    }
-    events.record(
-        "tenant-recovery",
-        RunEventStatus::Succeeded,
-        "Tenant is Ready after fault removal",
-        None,
-    )?;
-    events.record(
-        "pod-stability-after-recovery",
-        RunEventStatus::Started,
-        "waiting for RustFS pods to remain stable after recovery",
-        Some(serde_json::json!({
-            "expected_pod_count": config.expected_rustfs_pod_count,
-            "stable_window_seconds": config.rustfs_pod_stable_window.as_secs(),
-        })),
-    )?;
-    if let Err(error) = wait_for_stable_rustfs_pods(
-        cluster,
-        config.expected_rustfs_pod_count,
-        config.rustfs_pod_stable_window,
-    )
-    .await
-    {
-        events
-            .record(
-                "pod-stability-after-recovery",
-                RunEventStatus::Failed,
-                error.to_string(),
-                None,
-            )
-            .ok();
-        write_failure_summary(
-            collector,
-            scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "pod-stability-after-recovery",
-                "product_or_environment",
-                error.to_string(),
-            ),
-        )?;
-        return Err(error);
-    }
-    events.record(
-        "pod-stability-after-recovery",
-        RunEventStatus::Succeeded,
-        "RustFS pods were stable after recovery",
-        None,
-    )?;
-    let pods_after = rustfs_pod_identities(cluster)?;
-    events.record(
-        "s3-access-after-recovery",
-        RunEventStatus::Started,
-        "checking S3 access after recovery",
-        Some(serde_json::json!({ "endpoint": endpoint })),
-    )?;
-    if let Err(error) = ensure_s3_access(&mut port_forward, cluster, &endpoint).await {
-        events
-            .record(
-                "s3-access-after-recovery",
-                RunEventStatus::Failed,
-                error.to_string(),
-                Some(serde_json::json!({ "endpoint": endpoint })),
-            )
-            .ok();
-        write_failure_summary(
-            collector,
-            scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "s3-access-after-recovery",
-                "product_or_environment",
-                error.to_string(),
-            ),
-        )?;
-        return Err(error);
-    }
-    events.record(
-        "s3-access-after-recovery",
-        RunEventStatus::Succeeded,
-        "S3 endpoint is reachable after recovery",
-        Some(serde_json::json!({ "endpoint": endpoint })),
-    )?;
-    let recovery_ended_at_ms = now_ms();
-    let recovered_evidence = FaultEvidence {
-        scenario: scenario.name.clone(),
-        backend: plan.backend_summary(),
-        target: plan.target_summary(),
-        injected: true,
-        active_during_workload: true,
-        recovered: true,
-        require_client_disruption,
-        client_disruptions: workload.summary.disrupted(),
-        workload_plan: workload_plan.clone(),
-        pods_before: pods_before.clone(),
-        pods_at_fault_activation: pods_at_fault_activation.clone(),
-        pods_at_workload_snapshot: pods_at_workload_snapshot.clone(),
-        pods_after: pods_after.clone(),
-        active_snapshots: active_snapshots.clone(),
-        workload_snapshots: workload_snapshots.clone(),
-        dm_recovery_snapshot: fault.recovery_dm_snapshot(),
-        fault_apply_started_at_ms: Some(fault_apply_started_at_ms),
-        fault_active_at_ms: Some(fault_active_at_ms),
-        workload_started_at_ms: Some(workload_started_at_ms),
-        workload_ended_at_ms: Some(workload_ended_at_ms),
-        fault_delete_started_at_ms: Some(fault_delete_started_at_ms),
-        recovery_started_at_ms: Some(recovery_started_at_ms),
-        recovery_ended_at_ms: Some(recovery_ended_at_ms),
-    };
-    collector.write_text(
-        scenario.case_name,
-        "fault-evidence.json",
-        &serde_json::to_string_pretty(&recovered_evidence)?,
-    )?;
-    events.record(
-        "checker-pre-recommit",
-        RunEventStatus::Started,
-        "checking recovered object model before recommit",
-        None,
-    )?;
-    let pre_recommit_record_start = history.records().len();
-    let pre_recommit_report = match checker::check_s3_history(
-        &s3,
-        &history,
-        true,
-        workload_plan.concurrency,
-        config.workload_versioning,
-    )
-    .await
-    {
-        Ok(report) => report,
-        Err(error) => {
-            let message = error.to_string();
+        if let Err(error) = pre_recommit_report.require_success() {
             events
                 .record(
                     "checker-pre-recommit",
                     RunEventStatus::Failed,
-                    message.clone(),
+                    error.to_string(),
                     None,
                 )
                 .ok();
-            write_checker_error(
-                collector,
-                scenario.case_name,
-                "checker-pre-recommit-error.txt",
-                &message,
-            )?;
-            let recovery_stability_report = checker::RecoveryStabilityReport::harness_error(
-                message.clone(),
+            events
+                .record(
+                    "recovery-stability-reread",
+                    RunEventStatus::Started,
+                    "bounded reread of recovery-tail committed GET failures",
+                    Some(serde_json::json!({
+                        "max_recovery_seconds": config.recovery_stability_reread.as_secs()
+                    })),
+                )
+                .ok();
+            let recovery_stability_report = match checker::recovery_stability_reread(
+                &s3,
+                &history,
+                &pre_recommit_report,
+                pre_recommit_record_start,
+                workload_plan.concurrency,
                 config.recovery_stability_reread,
-            );
+            )
+            .await
+            {
+                Ok(report) => {
+                    events
+                        .record(
+                            "recovery-stability-reread",
+                            RunEventStatus::Succeeded,
+                            "bounded recovery stability reread completed",
+                            Some(serde_json::json!({
+                                "classification": report.classification.as_str(),
+                                "attempted_keys": report.reread_attempted_keys.len(),
+                                "recovered_keys": report.reread_recovered_keys.len(),
+                                "still_unavailable_keys": report.still_unavailable_keys.len(),
+                                "hash_mismatches": report.hash_mismatches.len()
+                            })),
+                        )
+                        .ok();
+                    report
+                }
+                Err(reread_error) => {
+                    let message = format!("recovery stability reread failed: {reread_error}");
+                    events
+                        .record(
+                            "recovery-stability-reread",
+                            RunEventStatus::Failed,
+                            message.clone(),
+                            None,
+                        )
+                        .ok();
+                    checker::RecoveryStabilityReport::harness_error(
+                        message,
+                        config.recovery_stability_reread,
+                    )
+                }
+            };
             collector.write_text(
                 scenario.case_name,
                 "recovery-stability-report.json",
@@ -1688,288 +1794,235 @@ async fn run_fault_case(
             write_failure_summary(
                 collector,
                 scenario.case_name,
-                FailureSummary::new(
+                FailureSummary::from_checker(
                     &scenario.name,
-                    "checker-pre-recommit",
-                    recovery_stability_report.classification.as_str(),
-                    message,
+                    "checker-pre-recommit-verdict",
+                    recovery_stability_report.classification,
+                    error.to_string(),
                 )
                 .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds)
-                .with_evidence_classifications(
-                    recovery_stability_report.evidence_classifications(),
+                .with_evidence_classifications(recovery_stability_report.evidence_classifications())
+                .with_list_warnings(
+                    recovery_stability_report.final_list_warning_count,
+                    recovery_stability_report.list_warnings.clone(),
                 ),
             )?;
             return Err(error);
         }
-    };
-    collector.write_text(
-        scenario.case_name,
-        "checker-pre-recommit-report.json",
-        &serde_json::to_string_pretty(&pre_recommit_report)?,
-    )?;
-    if let Err(error) = pre_recommit_report.require_success() {
-        events
-            .record(
-                "checker-pre-recommit",
-                RunEventStatus::Failed,
-                error.to_string(),
-                None,
-            )
-            .ok();
-        events
-            .record(
-                "recovery-stability-reread",
-                RunEventStatus::Started,
-                "bounded reread of recovery-tail committed GET failures",
-                Some(serde_json::json!({
-                    "max_recovery_seconds": config.recovery_stability_reread.as_secs()
-                })),
-            )
-            .ok();
-        let recovery_stability_report = match checker::recovery_stability_reread(
+        events.record(
+            "checker-pre-recommit",
+            RunEventStatus::Succeeded,
+            "pre-recommit object model check passed",
+            None,
+        )?;
+        events.record(
+            "recommit-unconfirmed",
+            RunEventStatus::Started,
+            "recommitting previously unconfirmed writes after recovery",
+            Some(serde_json::json!({ "attempted": workload.unconfirmed_puts.len() })),
+        )?;
+        let recommit_report = recommit_unconfirmed_objects(
             &s3,
             &history,
-            &pre_recommit_report,
-            pre_recommit_record_start,
+            &workload.unconfirmed_puts,
             workload_plan.concurrency,
-            config.recovery_stability_reread,
         )
-        .await
-        {
-            Ok(report) => {
-                events
-                    .record(
-                        "recovery-stability-reread",
-                        RunEventStatus::Succeeded,
-                        "bounded recovery stability reread completed",
-                        Some(serde_json::json!({
-                            "classification": report.classification.as_str(),
-                            "attempted_keys": report.reread_attempted_keys.len(),
-                            "recovered_keys": report.reread_recovered_keys.len(),
-                            "still_unavailable_keys": report.still_unavailable_keys.len(),
-                            "hash_mismatches": report.hash_mismatches.len()
-                        })),
-                    )
-                    .ok();
-                report
-            }
-            Err(reread_error) => {
-                let message = format!("recovery stability reread failed: {reread_error}");
-                events
-                    .record(
-                        "recovery-stability-reread",
-                        RunEventStatus::Failed,
-                        message.clone(),
-                        None,
-                    )
-                    .ok();
-                checker::RecoveryStabilityReport::harness_error(
-                    message,
-                    config.recovery_stability_reread,
-                )
-            }
-        };
+        .await;
         collector.write_text(
             scenario.case_name,
-            "recovery-stability-report.json",
-            &serde_json::to_string_pretty(&recovery_stability_report)?,
+            "recommit-report.json",
+            &serde_json::to_string_pretty(&recommit_report)?,
         )?;
-        write_failure_summary(
-            collector,
+        workload.summary.recommitted_after_recovery = recommit_report.committed;
+        collector.write_text(
             scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "checker-pre-recommit-verdict",
-                recovery_stability_report.classification.as_str(),
-                error.to_string(),
-            )
-            .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds)
-            .with_evidence_classifications(recovery_stability_report.evidence_classifications())
-            .with_list_warnings(
-                recovery_stability_report.final_list_warning_count,
-                recovery_stability_report.list_warnings.clone(),
-            ),
+            "workload-summary.json",
+            &serde_json::to_string_pretty(&workload.summary)?,
         )?;
-        return Err(error);
-    }
-    events.record(
-        "checker-pre-recommit",
-        RunEventStatus::Succeeded,
-        "pre-recommit object model check passed",
-        None,
-    )?;
-    events.record(
-        "recommit-unconfirmed",
-        RunEventStatus::Started,
-        "recommitting previously unconfirmed writes after recovery",
-        Some(serde_json::json!({ "attempted": workload.unconfirmed_puts.len() })),
-    )?;
-    let recommit_report = recommit_unconfirmed_objects(
-        &s3,
-        &history,
-        &workload.unconfirmed_puts,
-        workload_plan.concurrency,
-    )
-    .await;
-    collector.write_text(
-        scenario.case_name,
-        "recommit-report.json",
-        &serde_json::to_string_pretty(&recommit_report)?,
-    )?;
-    workload.summary.recommitted_after_recovery = recommit_report.committed;
-    collector.write_text(
-        scenario.case_name,
-        "workload-summary.json",
-        &serde_json::to_string_pretty(&workload.summary)?,
-    )?;
-    if recommit_report.has_failures() {
-        let message = recommit_report.failure_message();
-        events
-            .record(
-                "recommit-unconfirmed",
-                RunEventStatus::Failed,
-                message.clone(),
-                Some(serde_json::json!({
-                    "failed": recommit_report.failed,
-                    "harness_errors": recommit_report.harness_errors,
-                })),
-            )
-            .ok();
-        write_failure_summary(
-            collector,
-            scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "recommit-unconfirmed",
-                recommit_report.failure_classification(),
-                message.clone(),
-            ),
-        )?;
-        bail!("{message}");
-    }
-    events.record(
-        "recommit-unconfirmed",
-        RunEventStatus::Succeeded,
-        "previously unconfirmed writes were recommitted",
-        Some(serde_json::json!({ "committed": recommit_report.committed })),
-    )?;
-    events.record(
-        "checker-final",
-        RunEventStatus::Started,
-        "checking final recovered object model",
-        None,
-    )?;
-    let report = match checker::check_s3_history(
-        &s3,
-        &history,
-        true,
-        workload_plan.concurrency,
-        config.workload_versioning,
-    )
-    .await
-    {
-        Ok(report) => report,
-        Err(error) => {
-            let message = error.to_string();
+        if recommit_report.has_failures() {
+            let message = recommit_report.failure_message();
             events
                 .record(
-                    "checker-final",
+                    "recommit-unconfirmed",
                     RunEventStatus::Failed,
                     message.clone(),
-                    None,
+                    Some(serde_json::json!({
+                        "failed": recommit_report.failed,
+                        "harness_errors": recommit_report.harness_errors,
+                    })),
                 )
                 .ok();
-            write_checker_error(
-                collector,
-                scenario.case_name,
-                "checker-final-error.txt",
-                &message,
-            )?;
             write_failure_summary(
                 collector,
                 scenario.case_name,
                 FailureSummary::new(
                     &scenario.name,
+                    "recommit-unconfirmed",
+                    recommit_report.failure_classification(),
+                    message.clone(),
+                )?,
+            )?;
+            bail!("{message}");
+        }
+        events.record(
+            "recommit-unconfirmed",
+            RunEventStatus::Succeeded,
+            "previously unconfirmed writes were recommitted",
+            Some(serde_json::json!({ "committed": recommit_report.committed })),
+        )?;
+        events.record(
+            "checker-final",
+            RunEventStatus::Started,
+            "checking final recovered object model",
+            None,
+        )?;
+        let report = match checker::check_s3_history(
+            &s3,
+            &history,
+            true,
+            workload_plan.concurrency,
+            config.workload_versioning,
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                let message = error.to_string();
+                events
+                    .record(
+                        "checker-final",
+                        RunEventStatus::Failed,
+                        message.clone(),
+                        None,
+                    )
+                    .ok();
+                write_checker_error(
+                    collector,
+                    scenario.case_name,
+                    "checker-final-error.txt",
+                    &message,
+                )?;
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "checker-final",
+                        "checker_or_environment",
+                        message,
+                    )?,
+                )?;
+                return Err(error);
+            }
+        };
+        collector.write_text(
+            scenario.case_name,
+            "checker-report.json",
+            &serde_json::to_string_pretty(&report)?,
+        )?;
+        let evidence = FaultEvidence {
+            scenario: scenario.name.clone(),
+            backend: plan.backend_summary(),
+            target: plan.target_summary(),
+            injected: true,
+            active_during_workload: true,
+            recovered: report.tenant_recovered,
+            require_client_disruption,
+            client_disruptions: workload.summary.disrupted(),
+            workload_plan,
+            pods_before,
+            pods_at_fault_activation,
+            pods_at_workload_snapshot,
+            pods_after,
+            active_snapshots,
+            workload_snapshots,
+            dm_recovery_snapshot: fault.recovery_dm_snapshot(),
+            fault_apply_started_at_ms: Some(fault_apply_started_at_ms),
+            fault_active_at_ms: Some(fault_active_at_ms),
+            workload_started_at_ms: Some(workload_started_at_ms),
+            workload_ended_at_ms: Some(workload_ended_at_ms),
+            fault_delete_started_at_ms: Some(fault_delete_started_at_ms),
+            recovery_started_at_ms: Some(recovery_started_at_ms),
+            recovery_ended_at_ms: Some(recovery_ended_at_ms),
+        };
+        collector.write_text(
+            scenario.case_name,
+            "fault-evidence.json",
+            &serde_json::to_string_pretty(&evidence)?,
+        )?;
+        if let Err(error) = report.require_success() {
+            events
+                .record(
                     "checker-final",
-                    "checker_or_environment",
-                    message,
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    None,
+                )
+                .ok();
+            let classification = report.failure_classification();
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::from_checker(
+                    &scenario.name,
+                    "checker-verdict",
+                    classification,
+                    error.to_string(),
+                )
+                .with_list_warnings(
+                    report.final_list_warning_count,
+                    report.list_warnings.clone(),
                 ),
             )?;
             return Err(error);
         }
-    };
-    collector.write_text(
-        scenario.case_name,
-        "checker-report.json",
-        &serde_json::to_string_pretty(&report)?,
-    )?;
-    let evidence = FaultEvidence {
-        scenario: scenario.name.clone(),
-        backend: plan.backend_summary(),
-        target: plan.target_summary(),
-        injected: true,
-        active_during_workload: true,
-        recovered: report.tenant_recovered,
-        require_client_disruption,
-        client_disruptions: workload.summary.disrupted(),
-        workload_plan,
-        pods_before,
-        pods_at_fault_activation,
-        pods_at_workload_snapshot,
-        pods_after,
-        active_snapshots,
-        workload_snapshots,
-        dm_recovery_snapshot: fault.recovery_dm_snapshot(),
-        fault_apply_started_at_ms: Some(fault_apply_started_at_ms),
-        fault_active_at_ms: Some(fault_active_at_ms),
-        workload_started_at_ms: Some(workload_started_at_ms),
-        workload_ended_at_ms: Some(workload_ended_at_ms),
-        fault_delete_started_at_ms: Some(fault_delete_started_at_ms),
-        recovery_started_at_ms: Some(recovery_started_at_ms),
-        recovery_ended_at_ms: Some(recovery_ended_at_ms),
-    };
-    collector.write_text(
-        scenario.case_name,
-        "fault-evidence.json",
-        &serde_json::to_string_pretty(&evidence)?,
-    )?;
-    if let Err(error) = report.require_success() {
+        events.record(
+            "checker-final",
+            RunEventStatus::Succeeded,
+            "final object model check passed",
+            Some(serde_json::json!({
+                "committed_puts": report.committed_puts,
+                "verified_live_objects": report.verified_live_objects,
+                "final_listed_objects": report.final_listed_objects,
+            })),
+        )?;
+        Ok(())
+    }.await;
+    let cleanup = cleanup_staged_multipart_uploads(
+        &s3,
+        &history,
+        staged_multipart_uploads,
+        cleanup_concurrency,
+    )
+    .await;
+    if let Err(error) = cleanup {
         events
             .record(
-                "checker-final",
+                "multipart-cleanup",
                 RunEventStatus::Failed,
-                error.to_string(),
+                format!("{error:#}"),
                 None,
             )
             .ok();
-        // Derive the S3-model classification from the checker's own evidence
-        // instead of the catch-all product_or_environment: a committed-loss or
-        // corruption verdict at the FINAL gate is the strongest product signal
-        // this harness produces, and it must route like the identical failure
-        // caught at the pre-recommit gate (review finding C3-3).
-        let classification = checker::classify_without_reread(&report);
-        write_failure_summary(
+        write_failure_summary_if_absent(
             collector,
             scenario.case_name,
             FailureSummary::new(
                 &scenario.name,
-                "checker-verdict",
-                classification.as_str(),
-                error.to_string(),
-            ),
-        )?;
-        return Err(error);
+                "multipart-cleanup",
+                "test_or_environment",
+                format!("{error:#}"),
+            )?,
+        )
+        .ok();
+        return match result {
+            Ok(()) => Err(error),
+            Err(original) => {
+                Err(original.context(format!("multipart cleanup also failed: {error:#}")))
+            }
+        };
     }
-    events.record(
-        "checker-final",
-        RunEventStatus::Succeeded,
-        "final object model check passed",
-        Some(serde_json::json!({
-            "committed_puts": report.committed_puts,
-            "verified_live_objects": report.verified_live_objects,
-            "final_listed_objects": report.final_listed_objects,
-        })),
-    )?;
+    result?;
     events.record(
         "run",
         RunEventStatus::Succeeded,
@@ -2196,6 +2249,11 @@ fn runtime_single_set_membership(
                 .drives
                 .iter()
                 .map(|drive| {
+                    ensure!(
+                        drive.state == "ok",
+                        "RustFS runtime drive {:?} for Pod {pod_name:?} is not healthy: {:?}",
+                        drive.uuid, drive.state
+                    );
                     ensure!(
                         drive.pool_index == i32::try_from(shape.pool_index)?
                             && drive.set_index == i32::try_from(shape.set_index)?,
@@ -3766,31 +3824,74 @@ async fn stage_write_quorum_multipart_uploads(
     plan: &WorkloadPlan,
     start_index: usize,
     count: usize,
-) -> Result<BTreeMap<usize, StagedMultipartUpload>> {
+    staged: &mut BTreeMap<usize, StagedMultipartUpload>,
+) -> Result<()> {
     let tasks = multipart_workload_indices(plan, start_index, count)
         .into_iter()
         .map(|index| {
             let s3 = s3.clone();
             let history = history.clone();
             let run_id = run_id.to_string();
-            let object = ObjectSpec::prepare_seeded(&run_id, index, plan.size_at(index), plan.seed);
             async move {
+                let object =
+                    ObjectSpec::prepare_seeded(&run_id, index, plan.size_at(index), plan.seed);
                 let staged = s3
-                    .stage_multipart_object(object, &history)
+                    .stage_multipart_object(&object, &history)
                     .await
                     .with_context(|| format!("stage multipart workload object at index {index}"))?;
                 Ok::<_, anyhow::Error>((index, staged))
             }
         });
-    let staged = stream::iter(tasks)
+    let results = stream::iter(tasks)
         .buffer_unordered(plan.concurrency)
-        .try_collect::<Vec<_>>()
-        .await?;
+        .collect::<Vec<_>>()
+        .await;
+    let mut errors = Vec::new();
+    for result in results {
+        match result {
+            Ok((index, upload)) => {
+                staged.insert(index, upload);
+            }
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+    }
+    ensure!(
+        errors.is_empty(),
+        "multipart staging failed: {}",
+        errors.join("; ")
+    );
     ensure!(
         !staged.is_empty(),
         "write-quorum-loss workload contains no multipart completion operation"
     );
-    Ok(staged.into_iter().collect())
+    Ok(())
+}
+
+async fn cleanup_staged_multipart_uploads(
+    s3: &S3WorkloadClient,
+    history: &Recorder,
+    staged: BTreeMap<usize, StagedMultipartUpload>,
+    concurrency: usize,
+) -> Result<()> {
+    let results = stream::iter(
+        staged
+            .into_values()
+            .map(|upload| async move { s3.abort_staged_multipart_object(&upload, history).await }),
+    )
+    .buffer_unordered(concurrency)
+    .collect::<Vec<_>>()
+    .await;
+    let errors = results
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| format!("{error:#}"))
+        .collect::<Vec<_>>();
+    ensure!(
+        errors.is_empty(),
+        "staged multipart cleanup failed: {}",
+        errors.join("; ")
+    );
+    Ok(())
 }
 
 fn multipart_workload_indices(plan: &WorkloadPlan, start_index: usize, count: usize) -> Vec<usize> {
@@ -3894,14 +3995,19 @@ async fn run_mixed_workload(
                     }
                 }
                 WorkloadOperation::Multipart => {
-                    let object = ObjectSpec::prepare_seeded(&run_id, index, size_bytes, seed);
-                    let spec = object.spec.clone();
-                    let complete_outcome = match staged_multipart {
+                    let (spec, complete_outcome) = match staged_multipart {
                         Some(staged) => {
-                            s3.complete_staged_multipart_object(staged, &history)
-                                .await?
+                            let outcome = s3
+                                .complete_staged_multipart_object(&staged, &history)
+                                .await?;
+                            (staged.spec, outcome)
                         }
-                        None => s3.complete_multipart_object(&object, &history).await?,
+                        None => {
+                            let object =
+                                ObjectSpec::prepare_seeded(&run_id, index, size_bytes, seed);
+                            let outcome = s3.complete_multipart_object(&object, &history).await?;
+                            (object.spec, outcome)
+                        }
                     };
                     result.multipart_completes.push(complete_outcome);
                     if complete_outcome == OperationOutcome::Ok {
@@ -4357,17 +4463,16 @@ impl WorkloadSummary {
                 && self.multipart_completes.total() > 0,
             "write-quorum-loss workload did not exercise PUT, DELETE, and multipart completion"
         );
-        let acknowledged_mutations = self.puts.ok + self.deletes.ok + self.multipart_completes.ok;
-        ensure!(
-            acknowledged_mutations == 0,
-            "write-quorum-loss workload observed {acknowledged_mutations} successfully acknowledged PUT, DELETE, or multipart completion operations"
-        );
-        let disrupted_mutations =
-            self.puts.disrupted() + self.deletes.disrupted() + self.multipart_completes.disrupted();
-        ensure!(
-            disrupted_mutations > 0,
-            "write-quorum-loss workload observed no disrupted mutation operation"
-        );
+        for (kind, counts) in [
+            ("PUT", &self.puts),
+            ("DELETE", &self.deletes),
+            ("CompleteMultipartUpload", &self.multipart_completes),
+        ] {
+            ensure!(
+                counts.ok == 0 && counts.not_found == 0 && counts.disrupted() > 0,
+                "write-quorum-loss {kind} outcomes must all be failed, timed out, or unknown: {counts:?}"
+            );
+        }
         Ok(())
     }
 
@@ -4927,9 +5032,191 @@ mod tests {
     }
 
     #[test]
+    fn write_quorum_loss_rejects_invalid_outcomes_in_each_mutation_family() {
+        let mut baseline = WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2));
+        baseline.puts.record(OperationOutcome::Failed);
+        baseline.deletes.record(OperationOutcome::Timeout);
+        baseline
+            .multipart_completes
+            .record(OperationOutcome::Unknown);
+        for family in 0..3 {
+            for outcome in [OperationOutcome::Ok, OperationOutcome::NotFound] {
+                for replace in [true, false] {
+                    let mut summary = baseline.clone();
+                    let counts = match family {
+                        0 => &mut summary.puts,
+                        1 => &mut summary.deletes,
+                        _ => &mut summary.multipart_completes,
+                    };
+                    if replace {
+                        *counts = OutcomeCounts::default();
+                    }
+                    counts.record(outcome);
+                    assert!(
+                        summary.require_write_quorum_loss_effect().is_err(),
+                        "{summary:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn quorum_workload_stages_every_planned_multipart_completion() {
         let plan = WorkloadPlan::seeded(42, 24, 4);
         assert_eq!(multipart_workload_indices(&plan, 12, 12), vec![17, 23]);
+    }
+
+    #[tokio::test]
+    async fn multipart_staging_and_cleanup_drain_siblings_after_errors() {
+        use crate::fault::{
+            history::{OperationKind, Recorder},
+            workload::{
+                S3WorkloadClient, WorkloadOperationMix, WorkloadPayloadClass,
+                WorkloadPayloadDistribution,
+            },
+        };
+        use axum::{
+            Router,
+            body::{Body, Bytes},
+            http::{Method, Response, Uri},
+        };
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::Notify;
+
+        for fail_stage in [true, false] {
+            let second_part_started = Arc::new(Notify::new());
+            let aborted = Arc::new(Mutex::new(Vec::new()));
+            let observed_aborts = aborted.clone();
+            let app = Router::new().fallback(move |method: Method, uri: Uri, _body: Bytes| {
+                let second_part_started = second_part_started.clone();
+                let aborted = aborted.clone();
+                async move {
+                    let first = uri.path().ends_with("object-000017");
+                    let index = if first { 17 } else { 23 };
+                    match method {
+                        Method::POST => Response::builder().body(Body::from(format!(
+                            "<InitiateMultipartUploadResult><UploadId>upload-{index}</UploadId></InitiateMultipartUploadResult>"
+                        ))).expect("create response"),
+                        Method::PUT => {
+                            if first {
+                                second_part_started.notified().await;
+                                if fail_stage {
+                                    return Response::builder().status(400).body(Body::from(
+                                        "<Error><Code>InvalidPart</Code><Message>injected failure</Message></Error>"
+                                    )).expect("part error");
+                                }
+                            } else {
+                                second_part_started.notify_one();
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                            Response::builder().header("etag", "etag").body(Body::empty()).expect("part response")
+                        }
+                        Method::DELETE => {
+                            assert!(uri.query().expect("query").contains(&format!("uploadId=upload-{index}")));
+                            aborted.lock().expect("aborts").push(index);
+                            if first && !fail_stage {
+                                Response::builder().status(403).body(Body::from(
+                                    "<Error><Code>AccessDenied</Code></Error>"
+                                )).expect("abort error")
+                            } else {
+                                Response::builder().status(204).body(Body::empty()).expect("abort response")
+                            }
+                        }
+                        _ => panic!("unexpected S3 request: {method} {uri}"),
+                    }
+                }
+            });
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("listener");
+            let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("mock S3");
+            });
+            let client = S3WorkloadClient::new(
+                endpoint,
+                "bucket",
+                "test-access",
+                "test-secret",
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("client");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let history = Recorder::create(dir.path().join("history.jsonl"), "quorum", "run")
+                .expect("history");
+            let plan = WorkloadPlan::seeded_with_profile(
+                42,
+                24,
+                2,
+                WorkloadOperationMix::default(),
+                Some(WorkloadPayloadDistribution {
+                    classes: vec![WorkloadPayloadClass {
+                        size_bytes: 1024,
+                        weight: 1,
+                    }],
+                }),
+                None,
+            )
+            .expect("plan");
+            let mut staged = std::collections::BTreeMap::new();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                super::stage_write_quorum_multipart_uploads(
+                    &client,
+                    &history,
+                    "run",
+                    &plan,
+                    12,
+                    12,
+                    &mut staged,
+                ),
+            )
+            .await
+            .expect("staging is bounded");
+            assert_eq!(result.is_err(), fail_stage);
+            assert_eq!(
+                staged.keys().copied().collect::<Vec<_>>(),
+                if fail_stage { vec![23] } else { vec![17, 23] }
+            );
+            let cleanup = tokio::time::timeout(
+                Duration::from_secs(5),
+                super::cleanup_staged_multipart_uploads(&client, &history, staged, 2),
+            )
+            .await
+            .expect("cleanup is bounded");
+            assert_eq!(cleanup.is_err(), !fail_stage);
+            if let Err(error) = cleanup {
+                assert!(error.to_string().contains("upload-17"));
+            }
+            let mut aborted = observed_aborts.lock().expect("observed aborts").clone();
+            aborted.sort_unstable();
+            assert_eq!(aborted, vec![17, 23]);
+            let records = history.records();
+            assert_eq!(
+                records.len(),
+                6,
+                "both Create, UploadPart, and Abort attempts must finish"
+            );
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.kind == OperationKind::UploadPart
+                        && record.key.as_ref().expect("key").ends_with("object-000023")
+                        && record.outcome == OperationOutcome::Ok)
+            );
+            let persisted: Vec<OperationRecord> = std::fs::read_to_string(history.path())
+                .expect("persisted history")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("record"))
+                .collect();
+            assert_eq!(
+                serde_json::to_value(persisted).expect("persisted records"),
+                serde_json::to_value(records).expect("records")
+            );
+            server.abort();
+        }
     }
 
     #[test]
@@ -5170,6 +5457,14 @@ mod tests {
                 .require_selected_boundary(&shape, ["rustfs-0", "rustfs-1"])
                 .is_ok()
         );
+        for state in ["offline", "unformatted", "unknown", ""] {
+            let mut unhealthy = runtime.clone();
+            unhealthy.servers[0].drives[0].state = state.to_string();
+            assert!(
+                runtime_single_set_membership(&unhealthy, &shape, &pods).is_err(),
+                "aggregate online count must not override individual drive state {state:?}"
+            );
+        }
 
         let candidates = pods.iter().map(|pod| pod.name.as_str()).collect();
         assert_eq!(

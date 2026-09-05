@@ -46,6 +46,12 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
+      - name: Validate fault suites
+        run: |
+          for suite in fault/examples/*.yaml; do
+            scripts/fault-test.sh suite-validate "$suite"
+          done
+
       - name: Validate protocol contracts and suites
         run: |
           scripts/protocol-test.sh profile-validate smoke protocol/examples/smoke.yaml
