@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     fault::{
@@ -218,6 +219,133 @@ pub enum AvailabilityStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureClassification {
+    RecoveryTailReadLatency,
+    CommittedObjectUnavailable,
+    ListUnavailableOrUnknown,
+    DataCorruption,
+    AmbiguousWriteMaterialized,
+    HarnessError,
+    TestHarness,
+    WorkloadExecutionError,
+    ArtifactValidationFailed,
+    CheckerExecutionError,
+    PreflightFailed,
+    HealthGuardFailed,
+    FaultBackendUnavailable,
+    FaultNotActive,
+    FaultNotRecovered,
+    Unknown,
+    CheckerOrEnvironment,
+    TestOrEnvironment,
+    EnvironmentOrFaultBackend,
+    ProductOrEnvironment,
+    EnvironmentOrWorkload,
+    WorkloadOrProduct,
+    NoSignal,
+}
+
+impl FailureClassification {
+    pub(crate) const ALL: [Self; 23] = [
+        Self::RecoveryTailReadLatency,
+        Self::CommittedObjectUnavailable,
+        Self::ListUnavailableOrUnknown,
+        Self::DataCorruption,
+        Self::AmbiguousWriteMaterialized,
+        Self::HarnessError,
+        Self::TestHarness,
+        Self::WorkloadExecutionError,
+        Self::ArtifactValidationFailed,
+        Self::CheckerExecutionError,
+        Self::PreflightFailed,
+        Self::HealthGuardFailed,
+        Self::FaultBackendUnavailable,
+        Self::FaultNotActive,
+        Self::FaultNotRecovered,
+        Self::Unknown,
+        Self::CheckerOrEnvironment,
+        Self::TestOrEnvironment,
+        Self::EnvironmentOrFaultBackend,
+        Self::ProductOrEnvironment,
+        Self::EnvironmentOrWorkload,
+        Self::WorkloadOrProduct,
+        Self::NoSignal,
+    ];
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|classification| classification.as_str() == name)
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecoveryTailReadLatency => "recovery_tail_read_latency",
+            Self::CommittedObjectUnavailable => "committed_object_unavailable",
+            Self::ListUnavailableOrUnknown => "list_unavailable_or_unknown",
+            Self::DataCorruption => "data_corruption",
+            Self::AmbiguousWriteMaterialized => "ambiguous_write_materialized",
+            Self::HarnessError => "harness_error",
+            Self::TestHarness => "test_harness",
+            Self::WorkloadExecutionError => "workload_execution_error",
+            Self::ArtifactValidationFailed => "artifact_validation_failed",
+            Self::CheckerExecutionError => "checker_execution_error",
+            Self::PreflightFailed => "preflight_failed",
+            Self::HealthGuardFailed => "health_guard_failed",
+            Self::FaultBackendUnavailable => "fault_backend_unavailable",
+            Self::FaultNotActive => "fault_not_active",
+            Self::FaultNotRecovered => "fault_not_recovered",
+            Self::Unknown => "unknown",
+            Self::CheckerOrEnvironment => "checker_or_environment",
+            Self::TestOrEnvironment => "test_or_environment",
+            Self::EnvironmentOrFaultBackend => "environment_or_fault_backend",
+            Self::ProductOrEnvironment => "product_or_environment",
+            Self::EnvironmentOrWorkload => "environment_or_workload",
+            Self::WorkloadOrProduct => "workload_or_product",
+            Self::NoSignal => "no_signal",
+        }
+    }
+
+    pub(crate) const fn is_s3_model(self) -> bool {
+        matches!(
+            self,
+            Self::RecoveryTailReadLatency
+                | Self::CommittedObjectUnavailable
+                | Self::ListUnavailableOrUnknown
+                | Self::DataCorruption
+                | Self::AmbiguousWriteMaterialized
+        )
+    }
+
+    const fn responsibility_domain(self) -> ResponsibilityDomain {
+        match self {
+            Self::RecoveryTailReadLatency
+            | Self::CommittedObjectUnavailable
+            | Self::ListUnavailableOrUnknown
+            | Self::DataCorruption
+            | Self::AmbiguousWriteMaterialized => ResponsibilityDomain::Product,
+            Self::HarnessError
+            | Self::TestHarness
+            | Self::WorkloadExecutionError
+            | Self::ArtifactValidationFailed
+            | Self::CheckerExecutionError => ResponsibilityDomain::Harness,
+            Self::PreflightFailed | Self::HealthGuardFailed => ResponsibilityDomain::Environment,
+            Self::FaultBackendUnavailable | Self::FaultNotActive | Self::FaultNotRecovered => {
+                ResponsibilityDomain::FaultBackend
+            }
+            Self::Unknown
+            | Self::CheckerOrEnvironment
+            | Self::TestOrEnvironment
+            | Self::EnvironmentOrFaultBackend
+            | Self::ProductOrEnvironment
+            | Self::EnvironmentOrWorkload
+            | Self::WorkloadOrProduct
+            | Self::NoSignal => ResponsibilityDomain::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FailureClassificationDetails {
     severity: FailureSeverity,
@@ -235,6 +363,8 @@ pub(crate) struct FailureSummary {
     scenario: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     case_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_at_ms: Option<u64>,
     stage: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<FailurePhase>,
@@ -272,23 +402,30 @@ impl FailureSummary {
     pub(crate) fn new(
         scenario: impl Into<String>,
         stage: impl Into<String>,
-        classification: impl Into<String>,
+        classification: impl AsRef<str>,
         message: impl Into<String>,
-    ) -> Self {
-        let classification = classification.into();
+    ) -> Result<Self> {
         let stage = stage.into();
-        let details = FailureClassificationDetails::from_classification(&classification);
+        let classification_name = classification.as_ref();
+        let classification =
+            FailureClassification::from_name(classification_name).with_context(|| {
+                format!(
+                    "failure classification {classification_name:?} is not in the writer allowlist"
+                )
+            })?;
+        let details = FailureClassificationDetails::from_classification(classification);
         let phase = FailurePhase::from_stage(&stage);
-        let projection = FailureV2Projection::from_classification(&classification);
-        Self {
+        let projection = FailureV2Projection::from_classification(classification);
+        Ok(Self {
             schema_version: FAILURE_SUMMARY_SCHEMA_VERSION,
             scenario: scenario.into(),
             case_name: None,
+            observed_at_ms: Some(now_ms()),
             stage: stage.clone(),
             phase: Some(phase),
             verdict: FailureVerdict::Failed,
             severity: details.severity,
-            classification,
+            classification: classification.as_str().to_string(),
             s3_model_classification: projection.s3_model_classification,
             run_failure_reason: projection.run_failure_reason,
             responsibility_domain: Some(projection.responsibility_domain),
@@ -303,7 +440,7 @@ impl FailureSummary {
             recovered_within_window: details.recovered_within_window,
             recovered_within_seconds: None,
             message: message.into(),
-        }
+        })
     }
 
     fn with_case_name(mut self, case_name: &str) -> Self {
@@ -311,6 +448,26 @@ impl FailureSummary {
             self.case_name = Some(case_name.to_string());
         }
         self
+    }
+
+    fn with_artifact_context(
+        mut self,
+        collector: &ArtifactCollector,
+        case_name: &str,
+    ) -> Result<Self> {
+        let case_dir = collector.case_dir(case_name);
+        self.primary_evidence_refs = self
+            .primary_evidence_refs
+            .into_iter()
+            .map(|artifact| case_dir.join(artifact))
+            .filter(|path| path.is_file())
+            .map(|path| {
+                collector
+                    .reference_path(&path)
+                    .map(|relative| relative.display().to_string())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self)
     }
 
     pub(crate) fn with_recovered_within_seconds(mut self, seconds: Option<u64>) -> Self {
@@ -389,10 +546,10 @@ struct FailureV2Projection {
 }
 
 impl FailureV2Projection {
-    fn from_classification(classification: &str) -> Self {
-        if is_s3_model_classification(classification) {
+    fn from_classification(classification: FailureClassification) -> Self {
+        if classification.is_s3_model() {
             return Self {
-                s3_model_classification: Some(classification.to_string()),
+                s3_model_classification: Some(classification.as_str().to_string()),
                 run_failure_reason: None,
                 responsibility_domain: ResponsibilityDomain::Product,
             };
@@ -400,52 +557,17 @@ impl FailureV2Projection {
 
         Self {
             s3_model_classification: None,
-            run_failure_reason: Some(classification.to_string()),
-            responsibility_domain: ResponsibilityDomain::from_run_failure_reason(classification),
+            run_failure_reason: Some(classification.as_str().to_string()),
+            responsibility_domain: classification.responsibility_domain(),
         }
     }
-}
-
-pub(crate) fn is_s3_model_classification(classification: &str) -> bool {
-    matches!(
-        classification,
-        "recovery_tail_read_latency"
-            | "committed_object_unavailable"
-            | "list_unavailable_or_unknown"
-            | "data_corruption"
-            | "ambiguous_write_materialized"
-    )
 }
 
 impl ResponsibilityDomain {
     pub(crate) fn from_classification(classification: &str) -> Self {
-        if is_s3_model_classification(classification) {
-            Self::Product
-        } else {
-            Self::from_run_failure_reason(classification)
-        }
-    }
-
-    fn from_run_failure_reason(reason: &str) -> Self {
-        match reason {
-            "harness_error"
-            | "test_harness"
-            | "workload_execution_error"
-            | "artifact_validation_failed"
-            | "checker_execution_error" => Self::Harness,
-            "preflight_failed" | "health_guard_failed" => Self::Environment,
-            "fault_backend_unavailable" | "fault_not_active" | "fault_not_recovered" => {
-                Self::FaultBackend
-            }
-            "unknown"
-            | "checker_or_environment"
-            | "test_or_environment"
-            | "environment_or_fault_backend"
-            | "product_or_environment"
-            | "environment_or_workload"
-            | "workload_or_product" => Self::Unknown,
-            _ => Self::Unknown,
-        }
+        FailureClassification::from_name(classification)
+            .map(FailureClassification::responsibility_domain)
+            .unwrap_or(Self::Unknown)
     }
 }
 
@@ -495,7 +617,6 @@ impl FailurePhase {
 
 fn primary_evidence_refs_for(stage: &str, phase: FailurePhase) -> Vec<String> {
     let mut refs = Vec::new();
-    push_unique(&mut refs, "failure-summary.json");
 
     match phase {
         FailurePhase::Checker => {
@@ -536,9 +657,9 @@ fn push_unique(refs: &mut Vec<String>, artifact: &str) {
 }
 
 impl FailureClassificationDetails {
-    fn from_classification(classification: &str) -> Self {
+    fn from_classification(classification: FailureClassification) -> Self {
         match classification {
-            "recovery_tail_read_latency" => Self {
+            FailureClassification::RecoveryTailReadLatency => Self {
                 severity: FailureSeverity::Degraded,
                 data_correctness: DataCorrectnessStatus::Passed,
                 availability: AvailabilityStatus::RecoveredAfterTailLatency,
@@ -546,7 +667,7 @@ impl FailureClassificationDetails {
                 corruption: Some(false),
                 recovered_within_window: Some(true),
             },
-            "committed_object_unavailable" => Self {
+            FailureClassification::CommittedObjectUnavailable => Self {
                 severity: FailureSeverity::FailAvailability,
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::CommittedObjectUnavailable,
@@ -554,7 +675,7 @@ impl FailureClassificationDetails {
                 corruption: Some(false),
                 recovered_within_window: Some(false),
             },
-            "list_unavailable_or_unknown" => Self {
+            FailureClassification::ListUnavailableOrUnknown => Self {
                 severity: FailureSeverity::FailAvailability,
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::ListUnavailableOrUnknown,
@@ -562,7 +683,7 @@ impl FailureClassificationDetails {
                 corruption: Some(false),
                 recovered_within_window: Some(false),
             },
-            "data_corruption" => Self {
+            FailureClassification::DataCorruption => Self {
                 severity: FailureSeverity::FailCorrectness,
                 data_correctness: DataCorrectnessStatus::Failed,
                 availability: AvailabilityStatus::Unknown,
@@ -570,7 +691,7 @@ impl FailureClassificationDetails {
                 corruption: Some(true),
                 recovered_within_window: None,
             },
-            "ambiguous_write_materialized" => Self {
+            FailureClassification::AmbiguousWriteMaterialized => Self {
                 severity: FailureSeverity::NeedsInvestigation,
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::Unknown,
@@ -578,10 +699,10 @@ impl FailureClassificationDetails {
                 corruption: Some(false),
                 recovered_within_window: None,
             },
-            "harness_error"
-            | "test_harness"
-            | "test_or_environment"
-            | "environment_or_fault_backend" => Self {
+            FailureClassification::HarnessError
+            | FailureClassification::TestHarness
+            | FailureClassification::TestOrEnvironment
+            | FailureClassification::EnvironmentOrFaultBackend => Self {
                 severity: FailureSeverity::Infra,
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::Unknown,
@@ -589,7 +710,20 @@ impl FailureClassificationDetails {
                 corruption: None,
                 recovered_within_window: None,
             },
-            _ => Self {
+            FailureClassification::WorkloadExecutionError
+            | FailureClassification::ArtifactValidationFailed
+            | FailureClassification::CheckerExecutionError
+            | FailureClassification::PreflightFailed
+            | FailureClassification::HealthGuardFailed
+            | FailureClassification::FaultBackendUnavailable
+            | FailureClassification::FaultNotActive
+            | FailureClassification::FaultNotRecovered
+            | FailureClassification::Unknown
+            | FailureClassification::CheckerOrEnvironment
+            | FailureClassification::ProductOrEnvironment
+            | FailureClassification::EnvironmentOrWorkload
+            | FailureClassification::WorkloadOrProduct
+            | FailureClassification::NoSignal => Self {
                 severity: FailureSeverity::NeedsInvestigation,
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::Unknown,
@@ -601,12 +735,21 @@ impl FailureClassificationDetails {
     }
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 pub(crate) fn write_failure_summary(
     collector: &ArtifactCollector,
     case_name: &str,
     summary: FailureSummary,
 ) -> Result<()> {
-    let summary = summary.with_case_name(case_name);
+    let summary = summary
+        .with_case_name(case_name)
+        .with_artifact_context(collector, case_name)?;
     collector.write_text(
         case_name,
         "failure-summary.json",
@@ -617,9 +760,10 @@ pub(crate) fn write_failure_summary(
     // run's summary gets. Warning-only — a contract violation must never mask
     // the run's original failure.
     let path = collector.case_dir(case_name).join("failure-summary.json");
-    if let Err(violation) =
-        crate::fault::artifact_validation::validate_written_failure_summary(&path)
-    {
+    if let Err(violation) = crate::fault::artifact_validation::validate_written_failure_summary(
+        collector.reference_root(),
+        &path,
+    ) {
         eprintln!(
             "warning: failure-summary.json violates the artifact contract (diagnostic validation): {violation:#}"
         );
@@ -651,8 +795,13 @@ pub(crate) fn write_checker_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{FailurePhase, FailureSummary, ResponsibilityDomain};
+    use super::{
+        FailureClassification, FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain,
+        write_failure_summary,
+    };
+    use crate::framework::artifacts::ArtifactCollector;
     use serde_json::json;
+    use std::{collections::BTreeSet, fs};
 
     #[test]
     fn checker_classification_projects_to_s3_model_fields() {
@@ -661,7 +810,8 @@ mod tests {
             "checker-pre-recommit-verdict",
             "data_corruption",
             "hash mismatch",
-        );
+        )
+        .expect("known classification");
 
         assert_eq!(summary.phase(), Some(FailurePhase::Checker));
         assert_eq!(summary.s3_model_classification(), Some("data_corruption"));
@@ -681,7 +831,6 @@ mod tests {
         assert_eq!(
             value["primary_evidence_refs"],
             json!([
-                "failure-summary.json",
                 "recovery-stability-report.json",
                 "checker-pre-recommit-report.json",
                 "fault-evidence.json",
@@ -697,7 +846,8 @@ mod tests {
             "fault-backend-preflight",
             "environment_or_fault_backend",
             "missing chaos mesh",
-        );
+        )
+        .expect("known classification");
 
         assert_eq!(summary.phase(), Some(FailurePhase::Preflight));
         assert_eq!(summary.s3_model_classification(), None);
@@ -745,12 +895,153 @@ mod tests {
     #[test]
     fn writer_fills_case_name_without_touching_call_sites() {
         let summary = FailureSummary::new("io-eio", "checker-verdict", "data_corruption", "bad")
+            .expect("known classification")
             .with_case_name("fault_io_eio_preserves_committed_objects");
         let value = serde_json::to_value(&summary).expect("summary json");
 
         assert_eq!(
             value["case_name"],
             json!("fault_io_eio_preserves_committed_objects")
+        );
+    }
+
+    #[test]
+    fn writer_classification_allowlist_is_exhaustive_and_unique() {
+        let expected = BTreeSet::from([
+            "recovery_tail_read_latency",
+            "committed_object_unavailable",
+            "list_unavailable_or_unknown",
+            "data_corruption",
+            "ambiguous_write_materialized",
+            "harness_error",
+            "test_harness",
+            "workload_execution_error",
+            "artifact_validation_failed",
+            "checker_execution_error",
+            "preflight_failed",
+            "health_guard_failed",
+            "fault_backend_unavailable",
+            "fault_not_active",
+            "fault_not_recovered",
+            "unknown",
+            "checker_or_environment",
+            "test_or_environment",
+            "environment_or_fault_backend",
+            "product_or_environment",
+            "environment_or_workload",
+            "workload_or_product",
+            "no_signal",
+        ]);
+        let mut names = BTreeSet::new();
+        for classification in FailureClassification::ALL {
+            let name = classification.as_str();
+            assert!(names.insert(name), "duplicate classification {name}");
+            let summary = FailureSummary::new("io-eio", "scenario", name, "failure")
+                .expect("allowlisted classification");
+            assert_eq!(summary.classification(), name);
+            assert_eq!(
+                summary.responsibility_domain(),
+                Some(classification.responsibility_domain())
+            );
+            assert_eq!(
+                summary.s3_model_classification().is_some(),
+                classification.is_s3_model()
+            );
+            assert_eq!(
+                summary.run_failure_reason().is_some(),
+                !classification.is_s3_model()
+            );
+        }
+        assert_eq!(names, expected);
+
+        assert!(FailureSummary::new("io-eio", "checker", "data_corrupton", "typo").is_err());
+    }
+
+    #[test]
+    fn writer_preserves_product_classification_severity() {
+        for (classification, severity) in [
+            ("recovery_tail_read_latency", FailureSeverity::Degraded),
+            (
+                "committed_object_unavailable",
+                FailureSeverity::FailAvailability,
+            ),
+            (
+                "list_unavailable_or_unknown",
+                FailureSeverity::FailAvailability,
+            ),
+            ("data_corruption", FailureSeverity::FailCorrectness),
+            (
+                "ambiguous_write_materialized",
+                FailureSeverity::NeedsInvestigation,
+            ),
+        ] {
+            let summary = FailureSummary::new("io-eio", "checker", classification, "failure")
+                .expect("allowlisted product classification");
+            assert_eq!(summary.severity(), severity, "{classification}");
+            assert_eq!(
+                summary.responsibility_domain(),
+                Some(ResponsibilityDomain::Product)
+            );
+        }
+    }
+
+    #[test]
+    fn writer_emits_suite_root_relative_primary_evidence_without_self_reference() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite_root = dir.path().join("suite");
+        let attempt_root = suite_root.join("001-io-eio-r1");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let case_dir = attempt_root.join(case_name);
+        fs::create_dir_all(&case_dir).expect("case dir");
+        for artifact in [
+            "recovery-stability-report.json",
+            "checker-pre-recommit-report.json",
+            "fault-evidence.json",
+            "run-events.jsonl",
+        ] {
+            fs::write(case_dir.join(artifact), "{}").expect("evidence");
+        }
+        let collector = ArtifactCollector::with_reference_root(&attempt_root, &suite_root)
+            .expect("collector roots");
+
+        write_failure_summary(
+            &collector,
+            case_name,
+            FailureSummary::new(
+                "io-eio",
+                "checker-pre-recommit-verdict",
+                "data_corruption",
+                "hash mismatch",
+            )
+            .expect("known classification"),
+        )
+        .expect("write failure summary");
+
+        let raw = fs::read_to_string(case_dir.join("failure-summary.json")).expect("summary");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("summary json");
+        assert_eq!(
+            value["primary_evidence_refs"],
+            json!([
+                format!("001-io-eio-r1/{case_name}/recovery-stability-report.json"),
+                format!("001-io-eio-r1/{case_name}/checker-pre-recommit-report.json"),
+                format!("001-io-eio-r1/{case_name}/fault-evidence.json"),
+                format!("001-io-eio-r1/{case_name}/run-events.jsonl")
+            ])
+        );
+        assert!(
+            value["observed_at_ms"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+        assert!(
+            value["primary_evidence_refs"]
+                .as_array()
+                .expect("refs")
+                .iter()
+                .all(|value| !value
+                    .as_str()
+                    .expect("ref")
+                    .ends_with("failure-summary.json"))
         );
     }
 }
