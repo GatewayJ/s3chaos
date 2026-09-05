@@ -54,7 +54,12 @@ Status legend:
   classifications come from a closed allowlist; unknown or misspelled values
   are writer errors instead of falling through to `needs_investigation`.
 - S3-model classifications are `recovery_tail_read_latency`,
-  `committed_object_unavailable`, `list_unavailable_or_unknown`,
+  `committed_object_unavailable`, `committed_version_missing`,
+  `committed_version_unavailable`, `version_hash_mismatch`,
+  `delete_marker_missing`, `deleted_object_resurrected`,
+  `delete_marker_lineage_incomplete`,
+  `version_id_missing_on_committed_write`,
+  `multipart_upload_lineage_incomplete`, `list_unavailable_or_unknown`,
   `data_corruption`, and `ambiguous_write_materialized`.
 - Current run-failure reasons are `harness_error`, `test_harness`,
   `workload_execution_error`, `artifact_validation_failed`,
@@ -91,11 +96,10 @@ Status legend:
   evidence, while a completed LIST with wrong content remains correctness
   evidence.
 
-- [ ] PARTIAL: Versioned checker semantics.
+- [x] DONE: Versioned checker semantics.
   Meaning: committed version reads, delete marker checks, resurrection checks,
-  ambiguous writes, and recovery-tail classification exist. Dedicated primary
-  classifications such as `committed_version_missing` and
-  `delete_marker_missing` are not fully wired as final failure-summary outputs.
+  ambiguous writes, recovery-tail classification, and dedicated final
+  classifications are wired through failure-summary output.
 
 - [x] DONE: Read-only artifact console exists.
   Meaning: `fault-console-json` and `fault-console-serve` inspect artifact
@@ -338,21 +342,31 @@ guardrails when implementing the ordered TODO below.
 
 ### 7. Wire Precise Final Checker Classifications
 
-- [ ] TODO: Project final checker evidence to product classifications.
+- [x] DONE: Project final checker evidence to product classifications.
   Meaning: final checker failures must map to S3-visible product classes such
   as `committed_version_missing`, `committed_object_unavailable`,
   `delete_marker_missing`, or `version_hash_mismatch`, not generic
   `product_or_environment`.
 
-- [ ] TODO: Split committed version/delete marker/MPU primary classifications.
+- [x] DONE: Split committed version/delete marker/MPU primary classifications.
   Meaning: checker already records many facts; reporting must expose the
   highest-signal one as the primary `s3_model_classification` so #4221-style
   ACK-then-loss is routed to product correctness/availability, not unknown.
 
-- [ ] TODO: Add durability checker goldens.
+- [x] DONE: Add durability checker goldens.
   Meaning: synthetic histories should cover PUT 200 loss, DELETE 204
   resurrection, committed MPU complete loss, missing version id, ambiguous
   materialization, LIST timeout, and completed LIST wrong content.
+
+The checker owns classification precedence. Exact committed-version 404 or
+complete-version-list omission is `committed_version_missing`; exact-version
+timeouts remain `committed_version_unavailable`; version body mismatch is
+`version_hash_mismatch`; missing committed delete markers and visible deleted
+objects are `delete_marker_missing` and `deleted_object_resurrected`. A 2xx
+write response without a version id is incomplete lineage, not proven loss;
+DELETE uses `delete_marker_lineage_incomplete`, while MPU completion uses the
+more specific `multipart_upload_lineage_incomplete`.
+Reporting only projects this typed checker result into failure-summary fields.
 
 ### 8. Add The First Calibrated Destructive Smoke Scenarios
 

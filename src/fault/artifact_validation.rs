@@ -687,6 +687,8 @@ fn validate_checker_report(
             && report.version_hash_mismatches.is_empty()
             && report.missing_committed_delete_markers.is_empty()
             && report.resurrected_deleted_objects.is_empty()
+            && report.delete_marker_lineage_incomplete.is_empty()
+            && report.multipart_upload_lineage_incomplete.is_empty()
             && report.tenant_recovered,
         "{name} contains a non-clean checker verdict"
     );
@@ -1181,9 +1183,57 @@ fn validate_recovery_failure_summary_fields(
                 summary.severity == FailureSeverity::FailAvailability
                     && summary.data_correctness == DataCorrectnessStatus::Unknown
                     && summary.availability == AvailabilityStatus::CommittedObjectUnavailable
+                    && summary.data_loss.is_none()
                     && summary.corruption == Some(false)
                     && summary.recovered_within_window == Some(false),
-                "committed_object_unavailable failure-summary.json must describe an availability failure with unverified data correctness"
+                "committed_object_unavailable failure-summary.json must describe an availability failure without claiming data loss"
+            );
+        }
+        RecoveryStabilityClassification::CommittedVersionMissing => {
+            ensure!(
+                summary.severity == FailureSeverity::FailCorrectness
+                    && summary.data_correctness == DataCorrectnessStatus::Failed
+                    && summary.availability == AvailabilityStatus::Unknown
+                    && summary.data_loss == Some(true)
+                    && summary.corruption == Some(false)
+                    && summary.recovered_within_window == Some(false),
+                "committed_version_missing failure-summary.json must describe proven committed-version loss"
+            );
+        }
+        RecoveryStabilityClassification::CommittedVersionUnavailable => {
+            ensure!(
+                summary.severity == FailureSeverity::FailAvailability
+                    && summary.data_correctness == DataCorrectnessStatus::Unknown
+                    && summary.availability == AvailabilityStatus::CommittedVersionUnavailable
+                    && summary.data_loss.is_none()
+                    && summary.corruption == Some(false)
+                    && summary.recovered_within_window == Some(false),
+                "committed_version_unavailable failure-summary.json must preserve an availability verdict without claiming data loss"
+            );
+        }
+        RecoveryStabilityClassification::VersionHashMismatch
+        | RecoveryStabilityClassification::DeleteMarkerMissing
+        | RecoveryStabilityClassification::DeletedObjectResurrected => {
+            ensure!(
+                summary.severity == FailureSeverity::FailCorrectness
+                    && summary.data_correctness == DataCorrectnessStatus::Failed
+                    && summary.availability == AvailabilityStatus::Unknown
+                    && summary.data_loss == Some(false)
+                    && summary.corruption == Some(true),
+                "precise checker correctness failure-summary.json must describe proven semantic or content corruption"
+            );
+        }
+        RecoveryStabilityClassification::DeleteMarkerLineageIncomplete
+        | RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite
+        | RecoveryStabilityClassification::MultipartUploadLineageIncomplete => {
+            ensure!(
+                summary.severity == FailureSeverity::NeedsInvestigation
+                    && summary.data_correctness == DataCorrectnessStatus::Unknown
+                    && summary.availability == AvailabilityStatus::Unknown
+                    && summary.data_loss.is_none()
+                    && summary.corruption == Some(false)
+                    && summary.recovered_within_window.is_none(),
+                "incomplete version-lineage failure-summary.json must not claim data loss or corruption"
             );
         }
         RecoveryStabilityClassification::ListUnavailableOrUnknown => {
@@ -1191,9 +1241,10 @@ fn validate_recovery_failure_summary_fields(
                 summary.severity == FailureSeverity::FailAvailability
                     && summary.data_correctness == DataCorrectnessStatus::Unknown
                     && summary.availability == AvailabilityStatus::ListUnavailableOrUnknown
+                    && summary.data_loss.is_none()
                     && summary.corruption == Some(false)
                     && summary.recovered_within_window == Some(false),
-                "list_unavailable_or_unknown failure-summary.json must describe a LIST availability/unknown failure without proven corruption"
+                "list_unavailable_or_unknown failure-summary.json must describe a LIST availability/unknown failure without claiming data loss or corruption"
             );
         }
         RecoveryStabilityClassification::DataCorruption => {
@@ -1220,8 +1271,11 @@ fn validate_recovery_failure_summary_fields(
             ensure!(
                 summary.severity == FailureSeverity::Infra
                     && summary.data_correctness == DataCorrectnessStatus::Unknown
-                    && summary.availability == AvailabilityStatus::Unknown,
-                "harness_error failure-summary.json must describe an infra/harness failure"
+                    && summary.availability == AvailabilityStatus::Unknown
+                    && summary.data_loss.is_none()
+                    && summary.corruption.is_none()
+                    && summary.recovered_within_window.is_none(),
+                "harness_error failure-summary.json must describe an infra/harness failure without data loss or product verdict fields"
             );
         }
     }
@@ -1244,6 +1298,10 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
     ensure_sorted_unique(
         &report.data_corruption_evidence,
         "recovery-stability-report.json data_corruption_evidence",
+    )?;
+    ensure_sorted_unique(
+        &report.classification_evidence,
+        "recovery-stability-report.json classification_evidence",
     )?;
     ensure_sorted_unique(
         &report.ambiguous_write_evidence,
@@ -1277,6 +1335,45 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
                     && report.data_corruption_evidence.is_empty()
                     && report.harness_errors.is_empty(),
                 "committed_object_unavailable requires still_unavailable_keys without higher-priority recovery failures"
+            );
+        }
+        classification @ (RecoveryStabilityClassification::CommittedVersionMissing
+        | RecoveryStabilityClassification::VersionHashMismatch
+        | RecoveryStabilityClassification::DeleteMarkerMissing
+        | RecoveryStabilityClassification::DeletedObjectResurrected) => {
+            ensure!(
+                report
+                    .classification_evidence
+                    .iter()
+                    .any(|item| classification.matches_classification_evidence(item)),
+                "precise checker correctness classification {:?} requires matching classification_evidence",
+                classification
+            );
+        }
+        RecoveryStabilityClassification::CommittedVersionUnavailable => {
+            ensure!(
+                report
+                    .classification_evidence
+                    .iter()
+                    .any(|item| report.classification.matches_classification_evidence(item))
+                    && !report.still_unavailable_keys.is_empty()
+                    && report.hash_mismatches.is_empty()
+                    && report.data_corruption_evidence.is_empty(),
+                "committed_version_unavailable requires exact-version availability evidence without proven data loss"
+            );
+        }
+        classification @ (RecoveryStabilityClassification::DeleteMarkerLineageIncomplete
+        | RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite
+        | RecoveryStabilityClassification::MultipartUploadLineageIncomplete) => {
+            ensure!(
+                report
+                    .classification_evidence
+                    .iter()
+                    .any(|item| classification.matches_classification_evidence(item))
+                    && report.hash_mismatches.is_empty()
+                    && report.data_corruption_evidence.is_empty()
+                    && report.still_unavailable_keys.is_empty(),
+                "incomplete version-lineage classification requires classification_evidence without loss, corruption, or availability evidence"
             );
         }
         RecoveryStabilityClassification::ListUnavailableOrUnknown => {
@@ -1672,6 +1769,7 @@ mod tests {
         validate_fault_artifacts, validate_fault_artifacts_and_write_report,
     };
     use crate::fault::{
+        checker::{RecoveryStabilityClassification, RecoveryStabilityReport},
         reporting::{
             AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity,
             FailureVerdict, ResponsibilityDomain,
@@ -2048,6 +2146,308 @@ mod tests {
             .expect_err("zero timestamp");
 
         assert!(error.to_string().contains("observed_at_ms"));
+    }
+
+    #[test]
+    fn validates_precise_checker_recovery_summary_contracts() {
+        let cases = [
+            (
+                RecoveryStabilityClassification::CommittedVersionMissing,
+                FailureSeverity::FailCorrectness,
+                DataCorrectnessStatus::Failed,
+                AvailabilityStatus::Unknown,
+                Some(true),
+                Some(false),
+                Some(false),
+                false,
+                "missing_committed_version: k@v1",
+            ),
+            (
+                RecoveryStabilityClassification::CommittedVersionUnavailable,
+                FailureSeverity::FailAvailability,
+                DataCorrectnessStatus::Unknown,
+                AvailabilityStatus::CommittedVersionUnavailable,
+                None,
+                Some(false),
+                Some(false),
+                true,
+                "unavailable_committed_version: k@v1 timeout",
+            ),
+            (
+                RecoveryStabilityClassification::VersionHashMismatch,
+                FailureSeverity::FailCorrectness,
+                DataCorrectnessStatus::Failed,
+                AvailabilityStatus::Unknown,
+                Some(false),
+                Some(true),
+                None,
+                false,
+                "version_hash_mismatch: k@v1",
+            ),
+            (
+                RecoveryStabilityClassification::DeleteMarkerMissing,
+                FailureSeverity::FailCorrectness,
+                DataCorrectnessStatus::Failed,
+                AvailabilityStatus::Unknown,
+                Some(false),
+                Some(true),
+                None,
+                false,
+                "missing_committed_delete_marker: k@marker-1",
+            ),
+            (
+                RecoveryStabilityClassification::DeletedObjectResurrected,
+                FailureSeverity::FailCorrectness,
+                DataCorrectnessStatus::Failed,
+                AvailabilityStatus::Unknown,
+                Some(false),
+                Some(true),
+                None,
+                false,
+                "resurrected_deleted_object: k",
+            ),
+            (
+                RecoveryStabilityClassification::DeleteMarkerLineageIncomplete,
+                FailureSeverity::NeedsInvestigation,
+                DataCorrectnessStatus::Unknown,
+                AvailabilityStatus::Unknown,
+                None,
+                Some(false),
+                None,
+                false,
+                "delete_marker_lineage_incomplete: delete-op",
+            ),
+            (
+                RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite,
+                FailureSeverity::NeedsInvestigation,
+                DataCorrectnessStatus::Unknown,
+                AvailabilityStatus::Unknown,
+                None,
+                Some(false),
+                None,
+                false,
+                "committed_write_missing_version_id: put-op",
+            ),
+            (
+                RecoveryStabilityClassification::MultipartUploadLineageIncomplete,
+                FailureSeverity::NeedsInvestigation,
+                DataCorrectnessStatus::Unknown,
+                AvailabilityStatus::Unknown,
+                None,
+                Some(false),
+                None,
+                false,
+                "multipart_upload_lineage_incomplete: complete-op",
+            ),
+        ];
+
+        for (
+            classification,
+            severity,
+            data_correctness,
+            availability,
+            data_loss,
+            corruption,
+            recovered_within_window,
+            version_unavailable,
+            evidence,
+        ) in cases
+        {
+            let recovery = RecoveryStabilityReport {
+                immediate_passed: false,
+                reread_attempted_keys: Vec::new(),
+                reread_recovered_keys: Vec::new(),
+                still_unavailable_keys: if version_unavailable {
+                    vec!["version:k@v1".to_string()]
+                } else {
+                    Vec::new()
+                },
+                hash_mismatches: Vec::new(),
+                data_corruption_evidence: Vec::new(),
+                classification_evidence: vec![evidence.to_string()],
+                ambiguous_write_evidence: Vec::new(),
+                final_list_warning_count: 0,
+                list_warnings: Vec::new(),
+                harness_errors: Vec::new(),
+                max_recovery_seconds: 60,
+                recovered_within_seconds: None,
+                classification,
+            };
+            super::validate_recovery_stability_report(&recovery)
+                .expect("valid precise recovery classification");
+
+            let mut summary = failure_summary_v2_for_test();
+            summary.classification = classification.as_str().to_string();
+            summary.s3_model_classification = Some(classification.as_str().to_string());
+            summary.severity = severity;
+            summary.data_correctness = data_correctness;
+            summary.availability = availability;
+            summary.data_loss = data_loss;
+            summary.corruption = corruption;
+            summary.recovered_within_window = recovered_within_window;
+            summary.evidence_classifications = recovery.evidence_classifications();
+
+            super::validate_failure_summary_v2_classification(&summary)
+                .expect("valid precise summary projection");
+            super::validate_recovery_failure_summary_fields(&summary, &recovery)
+                .expect("valid precise recovery summary fields");
+        }
+    }
+
+    #[test]
+    fn rejects_version_timeout_summary_that_claims_data_loss() {
+        let recovery = RecoveryStabilityReport {
+            immediate_passed: false,
+            reread_attempted_keys: Vec::new(),
+            reread_recovered_keys: Vec::new(),
+            still_unavailable_keys: vec!["version:k@v1".to_string()],
+            hash_mismatches: Vec::new(),
+            data_corruption_evidence: Vec::new(),
+            classification_evidence: vec!["unavailable_committed_version: k@v1".to_string()],
+            ambiguous_write_evidence: Vec::new(),
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
+            harness_errors: Vec::new(),
+            max_recovery_seconds: 60,
+            recovered_within_seconds: None,
+            classification: RecoveryStabilityClassification::CommittedVersionUnavailable,
+        };
+        let mut summary = failure_summary_v2_for_test();
+        summary.classification = "committed_version_unavailable".to_string();
+        summary.s3_model_classification = Some("committed_version_unavailable".to_string());
+        summary.severity = FailureSeverity::FailAvailability;
+        summary.data_correctness = DataCorrectnessStatus::Unknown;
+        summary.availability = AvailabilityStatus::CommittedVersionUnavailable;
+        summary.data_loss = Some(true);
+        summary.corruption = Some(false);
+        summary.recovered_within_window = Some(false);
+        summary.evidence_classifications = recovery.evidence_classifications();
+
+        let error = super::validate_recovery_failure_summary_fields(&summary, &recovery)
+            .expect_err("timeout must not claim data loss");
+
+        assert!(error.to_string().contains("without claiming data loss"));
+    }
+
+    #[test]
+    fn rejects_timeout_list_and_harness_summaries_that_claim_data_loss() {
+        let reports = [
+            (
+                RecoveryStabilityReport {
+                    immediate_passed: false,
+                    reread_attempted_keys: vec!["object-key".to_string()],
+                    reread_recovered_keys: Vec::new(),
+                    still_unavailable_keys: vec!["object-key".to_string()],
+                    hash_mismatches: Vec::new(),
+                    data_corruption_evidence: Vec::new(),
+                    classification_evidence: Vec::new(),
+                    ambiguous_write_evidence: Vec::new(),
+                    final_list_warning_count: 0,
+                    list_warnings: Vec::new(),
+                    harness_errors: Vec::new(),
+                    max_recovery_seconds: 60,
+                    recovered_within_seconds: None,
+                    classification: RecoveryStabilityClassification::CommittedObjectUnavailable,
+                },
+                FailureSeverity::FailAvailability,
+                AvailabilityStatus::CommittedObjectUnavailable,
+                Some(false),
+                Some(false),
+            ),
+            (
+                RecoveryStabilityReport {
+                    immediate_passed: false,
+                    reread_attempted_keys: Vec::new(),
+                    reread_recovered_keys: Vec::new(),
+                    still_unavailable_keys: Vec::new(),
+                    hash_mismatches: Vec::new(),
+                    data_corruption_evidence: Vec::new(),
+                    classification_evidence: Vec::new(),
+                    ambiguous_write_evidence: Vec::new(),
+                    final_list_warning_count: 1,
+                    list_warnings: vec!["LIST prefix did not complete".to_string()],
+                    harness_errors: Vec::new(),
+                    max_recovery_seconds: 60,
+                    recovered_within_seconds: None,
+                    classification: RecoveryStabilityClassification::ListUnavailableOrUnknown,
+                },
+                FailureSeverity::FailAvailability,
+                AvailabilityStatus::ListUnavailableOrUnknown,
+                Some(false),
+                Some(false),
+            ),
+            (
+                RecoveryStabilityReport::harness_error(
+                    "synthetic checker error",
+                    std::time::Duration::from_secs(60),
+                ),
+                FailureSeverity::Infra,
+                AvailabilityStatus::Unknown,
+                None,
+                None,
+            ),
+        ];
+
+        for (recovery, severity, availability, corruption, recovered_within_window) in reports {
+            let mut summary = failure_summary_v2_for_test();
+            summary.classification = recovery.classification.as_str().to_string();
+            summary.severity = severity;
+            summary.data_correctness = DataCorrectnessStatus::Unknown;
+            summary.availability = availability;
+            summary.data_loss = Some(true);
+            summary.corruption = corruption;
+            summary.recovered_within_window = recovered_within_window;
+            summary.evidence_classifications = recovery.evidence_classifications();
+            summary.final_list_warning_count = recovery.final_list_warning_count;
+            summary.list_warnings = recovery.list_warnings.clone();
+            if recovery.classification == RecoveryStabilityClassification::HarnessError {
+                summary.s3_model_classification = None;
+                summary.run_failure_reason = Some("harness_error".to_string());
+                summary.responsibility_domain = Some(ResponsibilityDomain::Harness);
+            } else {
+                summary.s3_model_classification =
+                    Some(recovery.classification.as_str().to_string());
+                summary.run_failure_reason = None;
+                summary.responsibility_domain = Some(ResponsibilityDomain::Product);
+            }
+
+            super::validate_failure_summary_v2_classification(&summary)
+                .expect("classification tags remain valid");
+            let error = super::validate_recovery_failure_summary_fields(&summary, &recovery)
+                .expect_err("non-loss evidence must reject data_loss=true");
+            assert!(error.to_string().contains("data loss"));
+        }
+    }
+
+    #[test]
+    fn rejects_precise_classification_with_unrelated_evidence() {
+        let recovery = RecoveryStabilityReport {
+            immediate_passed: false,
+            reread_attempted_keys: Vec::new(),
+            reread_recovered_keys: Vec::new(),
+            still_unavailable_keys: Vec::new(),
+            hash_mismatches: Vec::new(),
+            data_corruption_evidence: Vec::new(),
+            classification_evidence: vec![
+                "missing_committed_delete_marker: k@marker-1".to_string(),
+            ],
+            ambiguous_write_evidence: Vec::new(),
+            final_list_warning_count: 0,
+            list_warnings: Vec::new(),
+            harness_errors: Vec::new(),
+            max_recovery_seconds: 60,
+            recovered_within_seconds: None,
+            classification: RecoveryStabilityClassification::CommittedVersionMissing,
+        };
+
+        let error = super::validate_recovery_stability_report(&recovery)
+            .expect_err("unrelated evidence must not substantiate committed version loss");
+
+        assert!(
+            error
+                .to_string()
+                .contains("matching classification_evidence")
+        );
     }
 
     #[test]

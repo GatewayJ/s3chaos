@@ -72,6 +72,10 @@ pub struct CheckerReport {
     pub missing_committed_delete_markers: Vec<String>,
     #[serde(default)]
     pub resurrected_deleted_objects: Vec<String>,
+    #[serde(default)]
+    pub delete_marker_lineage_incomplete: Vec<String>,
+    #[serde(default)]
+    pub multipart_upload_lineage_incomplete: Vec<String>,
     /// Committed-present keys whose latest delete was ambiguous and that
     /// returned 404 after recovery: the delete legitimately took effect, so
     /// these are recorded for audit but do not fail the run.
@@ -90,6 +94,14 @@ pub struct CheckerReport {
 pub enum RecoveryStabilityClassification {
     DataCorruption,
     CommittedObjectUnavailable,
+    CommittedVersionMissing,
+    CommittedVersionUnavailable,
+    VersionHashMismatch,
+    DeleteMarkerMissing,
+    DeletedObjectResurrected,
+    DeleteMarkerLineageIncomplete,
+    VersionIdMissingOnCommittedWrite,
+    MultipartUploadLineageIncomplete,
     ListUnavailableOrUnknown,
     RecoveryTailReadLatency,
     AmbiguousWriteMaterialized,
@@ -101,11 +113,47 @@ impl RecoveryStabilityClassification {
         match self {
             Self::DataCorruption => "data_corruption",
             Self::CommittedObjectUnavailable => "committed_object_unavailable",
+            Self::CommittedVersionMissing => "committed_version_missing",
+            Self::CommittedVersionUnavailable => "committed_version_unavailable",
+            Self::VersionHashMismatch => "version_hash_mismatch",
+            Self::DeleteMarkerMissing => "delete_marker_missing",
+            Self::DeletedObjectResurrected => "deleted_object_resurrected",
+            Self::DeleteMarkerLineageIncomplete => "delete_marker_lineage_incomplete",
+            Self::VersionIdMissingOnCommittedWrite => "version_id_missing_on_committed_write",
+            Self::MultipartUploadLineageIncomplete => "multipart_upload_lineage_incomplete",
             Self::ListUnavailableOrUnknown => "list_unavailable_or_unknown",
             Self::RecoveryTailReadLatency => "recovery_tail_read_latency",
             Self::AmbiguousWriteMaterialized => "ambiguous_write_materialized",
             Self::HarnessError => "harness_error",
         }
+    }
+
+    fn from_classification_evidence(evidence: &str) -> Option<Self> {
+        if evidence.starts_with("missing_committed_version:") {
+            Some(Self::CommittedVersionMissing)
+        } else if evidence.starts_with("unavailable_committed_version:") {
+            Some(Self::CommittedVersionUnavailable)
+        } else if evidence.starts_with("version_hash_mismatch:") {
+            Some(Self::VersionHashMismatch)
+        } else if evidence.starts_with("missing_committed_delete_marker:") {
+            Some(Self::DeleteMarkerMissing)
+        } else if evidence.starts_with("resurrected_deleted_object:") {
+            Some(Self::DeletedObjectResurrected)
+        } else if evidence.starts_with("delete_marker_lineage_incomplete:") {
+            Some(Self::DeleteMarkerLineageIncomplete)
+        } else if evidence.starts_with("committed_write_missing_version_id:")
+            || evidence.starts_with("committed_writes_missing_version_id_count:")
+        {
+            Some(Self::VersionIdMissingOnCommittedWrite)
+        } else if evidence.starts_with("multipart_upload_lineage_incomplete:") {
+            Some(Self::MultipartUploadLineageIncomplete)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn matches_classification_evidence(self, evidence: &str) -> bool {
+        Self::from_classification_evidence(evidence) == Some(self)
     }
 }
 
@@ -118,6 +166,8 @@ pub struct RecoveryStabilityReport {
     pub hash_mismatches: Vec<String>,
     #[serde(default)]
     pub data_corruption_evidence: Vec<String>,
+    #[serde(default)]
+    pub classification_evidence: Vec<String>,
     #[serde(default)]
     pub ambiguous_write_evidence: Vec<String>,
     #[serde(default)]
@@ -140,6 +190,7 @@ impl RecoveryStabilityReport {
             still_unavailable_keys: Vec::new(),
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
+            classification_evidence: Vec::new(),
             ambiguous_write_evidence: Vec::new(),
             final_list_warning_count: 0,
             list_warnings: Vec::new(),
@@ -160,7 +211,18 @@ impl RecoveryStabilityReport {
                     .to_string(),
             );
         }
-        if !self.still_unavailable_keys.is_empty() {
+        for evidence in &self.classification_evidence {
+            if let Some(classification) =
+                RecoveryStabilityClassification::from_classification_evidence(evidence)
+            {
+                classifications.insert(classification.as_str().to_string());
+            }
+        }
+        if self
+            .still_unavailable_keys
+            .iter()
+            .any(|key| !key.starts_with("version:"))
+        {
             classifications.insert(
                 RecoveryStabilityClassification::CommittedObjectUnavailable
                     .as_str()
@@ -185,6 +247,7 @@ impl RecoveryStabilityReport {
             && self.reread_attempted_keys == self.reread_recovered_keys
             && self.still_unavailable_keys.is_empty()
             && self.hash_mismatches.is_empty()
+            && self.classification_evidence.is_empty()
             && self.harness_errors.is_empty()
         {
             classifications.insert(
@@ -214,6 +277,10 @@ impl CheckerReport {
             serde_json::to_string_pretty(self)?
         );
         Ok(())
+    }
+
+    pub(crate) fn failure_classification(&self) -> RecoveryStabilityClassification {
+        classify_without_reread(self)
     }
 }
 
@@ -263,6 +330,8 @@ pub async fn check_s3_history(
         version_hash_mismatches: Vec::new(),
         missing_committed_delete_markers: Vec::new(),
         resurrected_deleted_objects: Vec::new(),
+        delete_marker_lineage_incomplete: Vec::new(),
+        multipart_upload_lineage_incomplete: Vec::new(),
         tolerated_ambiguous_deletes: Vec::new(),
         operation_cohorts: operation_cohort_counts(&initial_records),
         fault_window_relations: fault_window_relation_counts(&initial_records),
@@ -333,10 +402,17 @@ pub async fn check_s3_history(
     let run_id = recorder.run_id();
     let prefix = ObjectSpec::key_prefix(&run_id);
 
+    let mut final_list_warnings = WarningSummary::default();
     if let Some(lineage) = version_lineage {
         report.expected_committed_versions = lineage.versions.len();
         report.committed_writes_missing_version_id_count = lineage.missing_version_id_count;
         report.committed_writes_missing_version_id = lineage.missing_version_id_samples.clone();
+        report
+            .delete_marker_lineage_incomplete
+            .extend(lineage.delete_marker_lineage_incomplete.clone());
+        report
+            .multipart_upload_lineage_incomplete
+            .extend(lineage.multipart_upload_lineage_incomplete.clone());
 
         let mut version_results = stream::iter(lineage.versions.iter().cloned().map(|version| {
             let s3 = s3.clone();
@@ -356,10 +432,19 @@ pub async fn check_s3_history(
 
         match s3.list_object_versions(&prefix, recorder).await? {
             Some(entries) => {
+                let (missing_versions, multipart_lineage) =
+                    missing_committed_version_entries(&lineage.versions, &entries);
+                report.missing_committed_versions.extend(missing_versions);
+                report
+                    .multipart_upload_lineage_incomplete
+                    .extend(multipart_lineage);
                 report.missing_committed_delete_markers =
                     missing_committed_delete_markers(&lineage.delete_markers, &entries);
-                report.resurrected_deleted_objects =
-                    resurrected_deleted_objects(&model.deleted, &latest_version_entries(&entries));
+                evaluate_deleted_latest_versions(
+                    &mut report,
+                    &model.deleted,
+                    &latest_version_entries(&entries),
+                );
                 let (materialized, conflicts) = materialized_ambiguous_versions(
                     s3,
                     recorder,
@@ -372,13 +457,10 @@ pub async fn check_s3_history(
                 report.unknown_writes_materialized.extend(materialized);
                 report.unknown_write_value_conflicts.extend(conflicts);
             }
-            None => report.unavailable_committed_versions.push(format!(
-                "list_object_versions prefix {prefix} did not complete"
-            )),
+            None => record_version_list_unavailable(&mut final_list_warnings, &prefix),
         }
     }
 
-    let mut final_list_warnings = WarningSummary::default();
     match s3.list_prefix(&prefix, recorder).await? {
         Some(keys) => {
             report.final_listed_objects = Some(keys.len());
@@ -417,7 +499,9 @@ pub async fn check_s3_history(
     report.unavailable_committed_versions.sort();
     report.version_hash_mismatches.sort();
     report.missing_committed_delete_markers.sort();
-    report.resurrected_deleted_objects.sort();
+    sort_dedup(&mut report.resurrected_deleted_objects);
+    sort_dedup(&mut report.delete_marker_lineage_incomplete);
+    sort_dedup(&mut report.multipart_upload_lineage_incomplete);
     report.tolerated_ambiguous_deletes.sort();
     report.passed = report.tenant_recovered
         && report.missing_committed_objects.is_empty()
@@ -434,7 +518,9 @@ pub async fn check_s3_history(
         && report.unavailable_committed_versions.is_empty()
         && report.version_hash_mismatches.is_empty()
         && report.missing_committed_delete_markers.is_empty()
-        && report.resurrected_deleted_objects.is_empty();
+        && report.resurrected_deleted_objects.is_empty()
+        && report.delete_marker_lineage_incomplete.is_empty()
+        && report.multipart_upload_lineage_incomplete.is_empty();
 
     Ok(report)
 }
@@ -456,6 +542,7 @@ pub async fn recovery_stability_reread(
     let mut hash_mismatches = immediate_report.hash_mismatches.clone();
     hash_mismatches.extend(immediate_report.successful_corrupted_reads.iter().cloned());
     let data_corruption_evidence = immediate_data_corruption_evidence(immediate_report);
+    let classification_evidence = immediate_classification_evidence(immediate_report);
     let ambiguous_write_evidence = immediate_ambiguous_write_evidence(immediate_report);
     let mut report = RecoveryStabilityReport {
         immediate_passed: immediate_report.passed,
@@ -464,6 +551,7 @@ pub async fn recovery_stability_reread(
         still_unavailable_keys: immediate_still_unavailable_keys(immediate_report, &attempted_keys),
         hash_mismatches,
         data_corruption_evidence,
+        classification_evidence,
         ambiguous_write_evidence,
         final_list_warning_count: immediate_report.final_list_warning_count,
         list_warnings: immediate_report.list_warnings.clone(),
@@ -629,6 +717,7 @@ struct CommittedVersion {
     version_id: String,
     sha256: String,
     size_bytes: usize,
+    kind: OperationKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,6 +732,8 @@ struct VersionLineage {
     delete_markers: Vec<CommittedDeleteMarker>,
     missing_version_id_count: usize,
     missing_version_id_samples: Vec<String>,
+    delete_marker_lineage_incomplete: Vec<String>,
+    multipart_upload_lineage_incomplete: Vec<String>,
 }
 
 fn committed_version_lineage(records: &[OperationRecord]) -> VersionLineage {
@@ -670,6 +761,7 @@ fn committed_version_lineage(records: &[OperationRecord]) -> VersionLineage {
                     version_id: version_id.clone(),
                     sha256: expected.sha256,
                     size_bytes: expected.size_bytes,
+                    kind: record.kind,
                 });
             }
             Some(version_id) if is_committed_delete => {
@@ -680,12 +772,22 @@ fn committed_version_lineage(records: &[OperationRecord]) -> VersionLineage {
             }
             Some(_) => {}
             None => {
-                lineage.missing_version_id_count += 1;
-                if lineage.missing_version_id_samples.len() < MAX_WARNING_SAMPLES {
-                    lineage.missing_version_id_samples.push(format!(
-                        "{}: committed {:?} response omitted x-amz-version-id for {key}",
-                        record.id, record.kind
-                    ));
+                let message = format!(
+                    "{}: committed {:?} response omitted x-amz-version-id for {key}",
+                    record.id, record.kind
+                );
+                if is_committed_write {
+                    lineage.missing_version_id_count += 1;
+                    if lineage.missing_version_id_samples.len() < MAX_WARNING_SAMPLES {
+                        lineage.missing_version_id_samples.push(message.clone());
+                    }
+                    if record.kind == OperationKind::CompleteMultipartUpload
+                        && lineage.multipart_upload_lineage_incomplete.len() < MAX_WARNING_SAMPLES
+                    {
+                        lineage.multipart_upload_lineage_incomplete.push(message);
+                    }
+                } else if lineage.delete_marker_lineage_incomplete.len() < MAX_WARNING_SAMPLES {
+                    lineage.delete_marker_lineage_incomplete.push(message);
                 }
             }
         }
@@ -714,7 +816,12 @@ fn evaluate_committed_version_get(
             }
         }
         (OperationOutcome::NotFound, None) => {
-            report.missing_committed_versions.push(reference);
+            report.missing_committed_versions.push(reference.clone());
+            if version.kind == OperationKind::CompleteMultipartUpload {
+                report.multipart_upload_lineage_incomplete.push(format!(
+                    "{reference}: committed multipart completion version is missing"
+                ));
+            }
         }
         (outcome, body) => report
             .unavailable_committed_versions
@@ -729,6 +836,34 @@ fn evaluate_committed_version_get(
     }
 }
 
+fn missing_committed_version_entries(
+    committed: &[CommittedVersion],
+    entries: &[ObjectVersionEntry],
+) -> (Vec<String>, Vec<String>) {
+    let present = entries
+        .iter()
+        .filter(|entry| !entry.is_delete_marker)
+        .filter_map(|entry| Some((entry.key.as_str(), entry.version_id.as_deref()?)))
+        .collect::<BTreeSet<_>>();
+    let mut missing = Vec::new();
+    let mut multipart_lineage = Vec::new();
+    for version in committed {
+        if present.contains(&(version.key.as_str(), version.version_id.as_str())) {
+            continue;
+        }
+        let reference = format!("{}@{}", version.key, version.version_id);
+        missing.push(format!(
+            "{reference}: committed version missing from ListObjectVersions"
+        ));
+        if version.kind == OperationKind::CompleteMultipartUpload {
+            multipart_lineage.push(format!(
+                "{reference}: committed multipart completion missing from ListObjectVersions"
+            ));
+        }
+    }
+    (missing, multipart_lineage)
+}
+
 fn latest_version_entries(entries: &[ObjectVersionEntry]) -> BTreeMap<String, ObjectVersionEntry> {
     let mut latest = BTreeMap::new();
     for entry in entries {
@@ -739,22 +874,24 @@ fn latest_version_entries(entries: &[ObjectVersionEntry]) -> BTreeMap<String, Ob
     latest
 }
 
-fn resurrected_deleted_objects(
+fn evaluate_deleted_latest_versions(
+    report: &mut CheckerReport,
     deleted: &BTreeSet<String>,
     latest: &BTreeMap<String, ObjectVersionEntry>,
-) -> Vec<String> {
-    deleted
-        .iter()
-        .filter_map(|key| match latest.get(key) {
-            Some(entry) if !entry.is_delete_marker => Some(format!(
-                "{key}: latest version is not a delete marker after committed delete"
+) {
+    for key in deleted {
+        match latest.get(key) {
+            Some(entry) if !entry.is_delete_marker => {
+                report.resurrected_deleted_objects.push(format!(
+                    "{key}: latest version is not a delete marker after committed delete"
+                ));
+            }
+            None => report.delete_marker_lineage_incomplete.push(format!(
+                "{key}: ListObjectVersions has no latest entry after committed delete"
             )),
-            None => Some(format!(
-                "{key}: no latest version entry after committed delete"
-            )),
-            _ => None,
-        })
-        .collect()
+            Some(_) => {}
+        }
+    }
 }
 
 fn missing_committed_delete_markers(
@@ -884,6 +1021,12 @@ impl WarningSummary {
             self.samples.push(warning);
         }
     }
+}
+
+fn record_version_list_unavailable(warnings: &mut WarningSummary, prefix: &str) {
+    warnings.push(format!(
+        "ListObjectVersions prefix {prefix} did not complete"
+    ));
 }
 
 fn sort_dedup(values: &mut Vec<String>) {
@@ -1395,15 +1538,33 @@ fn ambiguous_write_attempt_label(attempt: &AmbiguousWriteAttempt) -> String {
 /// Derive the S3-model classification for a failing checker report. Shared by
 /// the recovery-stability path and the final checker verdict so the same
 /// evidence never classifies differently depending on which gate caught it.
-pub(crate) fn classify_without_reread(report: &CheckerReport) -> RecoveryStabilityClassification {
-    if has_data_corruption_signal(report) {
+fn classify_without_reread(report: &CheckerReport) -> RecoveryStabilityClassification {
+    if !report.version_hash_mismatches.is_empty() {
+        RecoveryStabilityClassification::VersionHashMismatch
+    } else if !report.missing_committed_delete_markers.is_empty() {
+        RecoveryStabilityClassification::DeleteMarkerMissing
+    } else if !report.resurrected_deleted_objects.is_empty()
+        || !report.unexpected_visible_deleted_objects.is_empty()
+    {
+        RecoveryStabilityClassification::DeletedObjectResurrected
+    } else if !report.missing_committed_versions.is_empty() {
+        RecoveryStabilityClassification::CommittedVersionMissing
+    } else if has_data_corruption_signal(report) {
         RecoveryStabilityClassification::DataCorruption
-    } else if !report.unknown_writes_materialized.is_empty() {
-        RecoveryStabilityClassification::AmbiguousWriteMaterialized
+    } else if !report.unavailable_committed_versions.is_empty() {
+        RecoveryStabilityClassification::CommittedVersionUnavailable
     } else if has_committed_unavailable_signal(report) {
         RecoveryStabilityClassification::CommittedObjectUnavailable
     } else if has_list_unavailable_or_unknown_signal(report) {
         RecoveryStabilityClassification::ListUnavailableOrUnknown
+    } else if !report.delete_marker_lineage_incomplete.is_empty() {
+        RecoveryStabilityClassification::DeleteMarkerLineageIncomplete
+    } else if !report.multipart_upload_lineage_incomplete.is_empty() {
+        RecoveryStabilityClassification::MultipartUploadLineageIncomplete
+    } else if report.committed_writes_missing_version_id_count > 0 {
+        RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite
+    } else if !report.unknown_writes_materialized.is_empty() {
+        RecoveryStabilityClassification::AmbiguousWriteMaterialized
     } else {
         RecoveryStabilityClassification::HarnessError
     }
@@ -1412,28 +1573,33 @@ pub(crate) fn classify_without_reread(report: &CheckerReport) -> RecoveryStabili
 fn has_data_corruption_signal(report: &CheckerReport) -> bool {
     !report.hash_mismatches.is_empty()
         || !report.successful_corrupted_reads.is_empty()
-        || !report.unexpected_visible_deleted_objects.is_empty()
         || !report.unknown_write_value_conflicts.is_empty()
         || final_list_content_corruption_signal(report)
-        || !report.version_hash_mismatches.is_empty()
-        || !report.missing_committed_versions.is_empty()
-        || !report.missing_committed_delete_markers.is_empty()
-        || !report.resurrected_deleted_objects.is_empty()
-        || report.committed_writes_missing_version_id_count > 0
 }
 
 fn final_list_content_corruption_signal(report: &CheckerReport) -> bool {
-    report.list_warnings.iter().any(|warning| {
-        warning.contains("did not include expected live key")
-            || warning.contains("included deleted key")
-    })
+    report
+        .list_warnings
+        .iter()
+        .any(|warning| final_list_content_corruption_warning(report, warning))
+}
+
+fn final_list_content_corruption_warning(report: &CheckerReport, warning: &str) -> bool {
+    if let Some((_, key)) = warning.split_once(" did not include expected live key ") {
+        // GET 404 and a matching LIST omission describe the same unavailable
+        // object, not an independent content mismatch.
+        return !report
+            .missing_committed_objects
+            .iter()
+            .any(|missing| missing == key);
+    }
+    warning.contains("included deleted key")
 }
 
 fn has_committed_unavailable_signal(report: &CheckerReport) -> bool {
     !report.missing_committed_objects.is_empty()
         || !report.unavailable_committed_objects.is_empty()
         || !report.unknown_committed_read_failures.is_empty()
-        || !report.unavailable_committed_versions.is_empty()
 }
 
 fn has_list_unavailable_or_unknown_signal(report: &CheckerReport) -> bool {
@@ -1463,16 +1629,32 @@ fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
     let mut evidence = Vec::new();
     evidence.extend(
         report
-            .unexpected_visible_deleted_objects
-            .iter()
-            .map(|item| format!("unexpected_visible_deleted_object: {item}")),
-    );
-    evidence.extend(
-        report
             .unknown_write_value_conflicts
             .iter()
             .map(|item| format!("unknown_write_value_conflict: {item}")),
     );
+    let corruption_list_warnings = report
+        .list_warnings
+        .iter()
+        .filter(|item| final_list_content_corruption_warning(report, item))
+        .map(|item| format!("final_list_warning: {item}"))
+        .collect::<Vec<_>>();
+    let corruption_list_warning_count = corruption_list_warnings.len();
+    evidence.extend(corruption_list_warnings);
+    if final_list_content_corruption_signal(report)
+        && report.final_list_warning_count > corruption_list_warning_count
+    {
+        evidence.push(format!(
+            "final_list_content_warning_count: {} total, {} sampled",
+            report.final_list_warning_count, corruption_list_warning_count
+        ));
+    }
+    evidence.sort();
+    evidence
+}
+
+fn immediate_classification_evidence(report: &CheckerReport) -> Vec<String> {
+    let mut evidence = Vec::new();
     evidence.extend(
         report
             .version_hash_mismatches
@@ -1487,6 +1669,12 @@ fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
     );
     evidence.extend(
         report
+            .unavailable_committed_versions
+            .iter()
+            .map(|item| format!("unavailable_committed_version: {item}")),
+    );
+    evidence.extend(
+        report
             .missing_committed_delete_markers
             .iter()
             .map(|item| format!("missing_committed_delete_marker: {item}")),
@@ -1495,6 +1683,7 @@ fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
         report
             .resurrected_deleted_objects
             .iter()
+            .chain(report.unexpected_visible_deleted_objects.iter())
             .map(|item| format!("resurrected_deleted_object: {item}")),
     );
     evidence.extend(
@@ -1512,26 +1701,20 @@ fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
             report.committed_writes_missing_version_id.len()
         ));
     }
-    let corruption_list_warnings = report
-        .list_warnings
-        .iter()
-        .filter(|item| {
-            item.contains("did not include expected live key")
-                || item.contains("included deleted key")
-        })
-        .map(|item| format!("final_list_warning: {item}"))
-        .collect::<Vec<_>>();
-    let corruption_list_warning_count = corruption_list_warnings.len();
-    evidence.extend(corruption_list_warnings);
-    if final_list_content_corruption_signal(report)
-        && report.final_list_warning_count > corruption_list_warning_count
-    {
-        evidence.push(format!(
-            "final_list_content_warning_count: {} total, {} sampled",
-            report.final_list_warning_count, corruption_list_warning_count
-        ));
-    }
+    evidence.extend(
+        report
+            .delete_marker_lineage_incomplete
+            .iter()
+            .map(|item| format!("delete_marker_lineage_incomplete: {item}")),
+    );
+    evidence.extend(
+        report
+            .multipart_upload_lineage_incomplete
+            .iter()
+            .map(|item| format!("multipart_upload_lineage_incomplete: {item}")),
+    );
     evidence.sort();
+    evidence.dedup();
     evidence
 }
 
@@ -1589,12 +1772,31 @@ fn finish_recovery_stability_report(
     report: &mut RecoveryStabilityReport,
     immediate_report: &CheckerReport,
 ) {
+    let immediate_classification = immediate_report.failure_classification();
+    if !report.classification_evidence.is_empty()
+        && matches!(
+            immediate_classification,
+            RecoveryStabilityClassification::CommittedVersionMissing
+                | RecoveryStabilityClassification::VersionHashMismatch
+                | RecoveryStabilityClassification::DeleteMarkerMissing
+                | RecoveryStabilityClassification::DeletedObjectResurrected
+        )
+    {
+        report.classification = immediate_classification;
+        return;
+    }
     if !report.hash_mismatches.is_empty() || !report.data_corruption_evidence.is_empty() {
         report.classification = RecoveryStabilityClassification::DataCorruption;
         return;
     }
     if !report.harness_errors.is_empty() {
         report.classification = RecoveryStabilityClassification::HarnessError;
+        return;
+    }
+    if !report.classification_evidence.is_empty()
+        && immediate_classification == RecoveryStabilityClassification::CommittedVersionUnavailable
+    {
+        report.classification = immediate_classification;
         return;
     }
     if !report.still_unavailable_keys.is_empty() {
@@ -1607,6 +1809,21 @@ fn finish_recovery_stability_report(
     }
     if has_list_unavailable_or_unknown_signal(immediate_report) {
         report.classification = RecoveryStabilityClassification::ListUnavailableOrUnknown;
+        return;
+    }
+    if let Some(classification) = [
+        RecoveryStabilityClassification::DeleteMarkerLineageIncomplete,
+        RecoveryStabilityClassification::MultipartUploadLineageIncomplete,
+        RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite,
+    ]
+    .into_iter()
+    .find(|classification| {
+        report
+            .classification_evidence
+            .iter()
+            .any(|evidence| classification.matches_classification_evidence(evidence))
+    }) {
+        report.classification = classification;
         return;
     }
     if !report.reread_attempted_keys.is_empty()
@@ -1638,6 +1855,10 @@ fn immediate_failures_are_only_reread_candidates(
         && immediate_report.version_hash_mismatches.is_empty()
         && immediate_report.missing_committed_delete_markers.is_empty()
         && immediate_report.resurrected_deleted_objects.is_empty()
+        && immediate_report.delete_marker_lineage_incomplete.is_empty()
+        && immediate_report
+            .multipart_upload_lineage_incomplete
+            .is_empty()
         && immediate_report.unavailable_committed_objects.len()
             + immediate_report.unknown_committed_read_failures.len()
             == recovery_report.reread_attempted_keys.len()
@@ -2687,6 +2908,259 @@ mod tests {
     }
 
     #[test]
+    fn precise_final_classification_goldens_use_history_derived_evidence() {
+        let committed_put = record(
+            "put-200",
+            OperationKind::Put,
+            "put-key",
+            &sha256_hex(b"expected"),
+            OperationOutcome::Ok,
+        );
+        let put_model = object_model(std::slice::from_ref(&committed_put));
+
+        let mut object_missing = empty_report();
+        evaluate_final_get(
+            &mut object_missing,
+            "put-key".to_string(),
+            put_model.live.get("put-key"),
+            &[],
+            GetObjectResult {
+                outcome: OperationOutcome::NotFound,
+                http_status: Some(404),
+                error: None,
+                body: None,
+            },
+        );
+        object_missing.final_listed_objects = Some(0);
+        object_missing.final_list_warning_count = 1;
+        object_missing
+            .list_warnings
+            .push("LIST prefix fault-test/ did not include expected live key put-key".to_string());
+
+        let mut object_content_mismatch = empty_report();
+        evaluate_final_get(
+            &mut object_content_mismatch,
+            "put-key".to_string(),
+            put_model.live.get("put-key"),
+            &[],
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"different".to_vec()),
+            },
+        );
+
+        let mut versioned_put = committed_put.clone();
+        versioned_put.version_id = Some("version-1".to_string());
+        let version_lineage = super::committed_version_lineage(&[versioned_put]);
+        let version = version_lineage.versions.first().expect("committed version");
+        let mut version_missing = empty_report();
+        super::evaluate_committed_version_get(
+            &mut version_missing,
+            version,
+            GetObjectResult {
+                outcome: OperationOutcome::NotFound,
+                http_status: Some(404),
+                error: None,
+                body: None,
+            },
+        );
+        let mut version_content_mismatch = empty_report();
+        super::evaluate_committed_version_get(
+            &mut version_content_mismatch,
+            version,
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"different".to_vec()),
+            },
+        );
+        let mut version_unavailable = empty_report();
+        super::evaluate_committed_version_get(
+            &mut version_unavailable,
+            version,
+            GetObjectResult {
+                outcome: OperationOutcome::Timeout,
+                http_status: None,
+                error: Some("get object timed out".to_string()),
+                body: None,
+            },
+        );
+
+        let mut committed_delete = record(
+            "delete-204",
+            OperationKind::Delete,
+            "deleted-key",
+            "",
+            OperationOutcome::Ok,
+        );
+        committed_delete.version_id = Some("marker-1".to_string());
+        let delete_lineage = super::committed_version_lineage(&[committed_delete]);
+        let mut delete_marker_missing = empty_report();
+        delete_marker_missing.missing_committed_delete_markers =
+            super::missing_committed_delete_markers(&delete_lineage.delete_markers, &[]);
+
+        let delete_without_marker_id = record(
+            "delete-204-no-version-id",
+            OperationKind::Delete,
+            "deleted-key",
+            "",
+            OperationOutcome::Ok,
+        );
+        let incomplete_delete_lineage =
+            super::committed_version_lineage(&[delete_without_marker_id]);
+        let mut delete_marker_lineage_incomplete = empty_report();
+        delete_marker_lineage_incomplete.delete_marker_lineage_incomplete =
+            incomplete_delete_lineage.delete_marker_lineage_incomplete;
+
+        let mut deleted_object_resurrected = empty_report();
+        deleted_object_resurrected.resurrected_deleted_objects.push(
+            super::evaluate_deleted_reread(
+                "deleted-key",
+                &GetObjectResult {
+                    outcome: OperationOutcome::Ok,
+                    http_status: Some(200),
+                    error: None,
+                    body: Some(b"resurrected".to_vec()),
+                },
+            )
+            .expect("resurrection evidence"),
+        );
+
+        let committed_multipart = record(
+            "mpu-200",
+            OperationKind::CompleteMultipartUpload,
+            "mpu-key",
+            &sha256_hex(b"multipart"),
+            OperationOutcome::Ok,
+        );
+        let incomplete_multipart_lineage =
+            super::committed_version_lineage(std::slice::from_ref(&committed_multipart));
+        let mut multipart_lineage_incomplete = empty_report();
+        multipart_lineage_incomplete.committed_writes_missing_version_id_count =
+            incomplete_multipart_lineage.missing_version_id_count;
+        multipart_lineage_incomplete.committed_writes_missing_version_id =
+            incomplete_multipart_lineage.missing_version_id_samples;
+        multipart_lineage_incomplete.multipart_upload_lineage_incomplete =
+            incomplete_multipart_lineage.multipart_upload_lineage_incomplete;
+
+        let mut committed_multipart_with_version = committed_multipart;
+        committed_multipart_with_version.version_id = Some("mpu-version-1".to_string());
+        let multipart_lineage =
+            super::committed_version_lineage(&[committed_multipart_with_version]);
+        let multipart_version = multipart_lineage
+            .versions
+            .first()
+            .expect("multipart committed version");
+        let mut multipart_complete_loss = empty_report();
+        super::evaluate_committed_version_get(
+            &mut multipart_complete_loss,
+            multipart_version,
+            GetObjectResult {
+                outcome: OperationOutcome::NotFound,
+                http_status: Some(404),
+                error: None,
+                body: None,
+            },
+        );
+
+        let mut ambiguous_write = empty_report();
+        ambiguous_write
+            .unknown_writes_materialized
+            .push("timeout-put materialized".to_string());
+        let mut list_timeout = empty_report();
+        list_timeout.final_list_warning_count = 1;
+        list_timeout
+            .list_warnings
+            .push("LIST prefix fault-test/ did not complete".to_string());
+        let mut list_content_mismatch = empty_report();
+        list_content_mismatch.final_list_warning_count = 1;
+        list_content_mismatch
+            .list_warnings
+            .push("LIST prefix did not include expected live key put-key".to_string());
+
+        let golden = [
+            ("put_200_loss", object_missing.failure_classification()),
+            (
+                "committed_object_content_mismatch",
+                object_content_mismatch.failure_classification(),
+            ),
+            (
+                "committed_version_missing",
+                version_missing.failure_classification(),
+            ),
+            (
+                "committed_version_hash_mismatch",
+                version_content_mismatch.failure_classification(),
+            ),
+            (
+                "committed_version_timeout",
+                version_unavailable.failure_classification(),
+            ),
+            (
+                "delete_204_marker_missing",
+                delete_marker_missing.failure_classification(),
+            ),
+            (
+                "delete_204_resurrection",
+                deleted_object_resurrected.failure_classification(),
+            ),
+            (
+                "delete_204_missing_marker_id",
+                delete_marker_lineage_incomplete.failure_classification(),
+            ),
+            (
+                "committed_mpu_missing_version_id",
+                multipart_lineage_incomplete.failure_classification(),
+            ),
+            (
+                "committed_mpu_version_loss",
+                multipart_complete_loss.failure_classification(),
+            ),
+            (
+                "ambiguous_write_materialized",
+                ambiguous_write.failure_classification(),
+            ),
+            ("list_timeout", list_timeout.failure_classification()),
+            (
+                "completed_list_wrong_content",
+                list_content_mismatch.failure_classification(),
+            ),
+        ]
+        .map(|(case, classification)| (case, classification.as_str()));
+
+        assert_eq!(
+            golden,
+            [
+                ("put_200_loss", "committed_object_unavailable"),
+                ("committed_object_content_mismatch", "data_corruption"),
+                ("committed_version_missing", "committed_version_missing"),
+                ("committed_version_hash_mismatch", "version_hash_mismatch"),
+                ("committed_version_timeout", "committed_version_unavailable"),
+                ("delete_204_marker_missing", "delete_marker_missing"),
+                ("delete_204_resurrection", "deleted_object_resurrected"),
+                (
+                    "delete_204_missing_marker_id",
+                    "delete_marker_lineage_incomplete"
+                ),
+                (
+                    "committed_mpu_missing_version_id",
+                    "multipart_upload_lineage_incomplete"
+                ),
+                ("committed_mpu_version_loss", "committed_version_missing"),
+                (
+                    "ambiguous_write_materialized",
+                    "ambiguous_write_materialized"
+                ),
+                ("list_timeout", "list_unavailable_or_unknown"),
+                ("completed_list_wrong_content", "data_corruption"),
+            ]
+        );
+    }
+
+    #[test]
     fn superseded_ambiguous_final_get_is_data_corruption_evidence() {
         let mut report = empty_report();
         let committed = ExpectedObject {
@@ -3104,6 +3578,133 @@ mod tests {
     }
 
     #[test]
+    fn recovery_evidence_classifications_preserve_secondary_precise_signals() {
+        let mut recovery = recovery_report_with_attempted_key("k");
+        recovery.classification = RecoveryStabilityClassification::VersionHashMismatch;
+        recovery.classification_evidence = vec![
+            "missing_committed_version: k@v1".to_string(),
+            "version_hash_mismatch: k@v2".to_string(),
+        ];
+
+        assert_eq!(
+            recovery.evidence_classifications(),
+            vec![
+                "committed_version_missing".to_string(),
+                "version_hash_mismatch".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_list_omission_preserves_missing_object_evidence_in_recovery() {
+        let mut immediate = empty_report();
+        immediate.missing_committed_objects.push("k".to_string());
+        immediate.final_list_warning_count = 1;
+        immediate
+            .list_warnings
+            .push("LIST prefix fault-test/ did not include expected live key k".to_string());
+        let mut recovery = recovery_report_with_attempted_key("k");
+        recovery.reread_attempted_keys.clear();
+        recovery.still_unavailable_keys = immediate_still_unavailable_keys(&immediate, &[]);
+        recovery.data_corruption_evidence = super::immediate_data_corruption_evidence(&immediate);
+        recovery.final_list_warning_count = immediate.final_list_warning_count;
+        recovery.list_warnings = immediate.list_warnings.clone();
+
+        finish_recovery_stability_report(&mut recovery, &immediate);
+
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::CommittedObjectUnavailable
+        );
+        assert_eq!(recovery.still_unavailable_keys, vec!["k"]);
+        assert!(recovery.data_corruption_evidence.is_empty());
+        assert_eq!(recovery.list_warnings, immediate.list_warnings);
+
+        let mut independent_list = immediate.clone();
+        independent_list.list_warnings.push(
+            "LIST prefix fault-test/ did not include expected live key another-key".to_string(),
+        );
+        independent_list.final_list_warning_count += 1;
+        assert_eq!(
+            independent_list.failure_classification(),
+            RecoveryStabilityClassification::DataCorruption
+        );
+        assert!(!super::immediate_data_corruption_evidence(&independent_list).is_empty());
+        immediate
+            .hash_mismatches
+            .push("other-key: checksum mismatch".to_string());
+        assert_eq!(
+            immediate.failure_classification(),
+            RecoveryStabilityClassification::DataCorruption
+        );
+    }
+
+    #[test]
+    fn recovered_reads_reclassify_remaining_lineage_evidence() {
+        for (evidence, expected) in [
+            (
+                "delete_marker_lineage_incomplete: deleted-key",
+                RecoveryStabilityClassification::DeleteMarkerLineageIncomplete,
+            ),
+            (
+                "committed_write_missing_version_id: put-key",
+                RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite,
+            ),
+            (
+                "multipart_upload_lineage_incomplete: multipart-key",
+                RecoveryStabilityClassification::MultipartUploadLineageIncomplete,
+            ),
+        ] {
+            let mut immediate = empty_report();
+            immediate
+                .unavailable_committed_objects
+                .push("k: outcome=Timeout".to_string());
+            match expected {
+                RecoveryStabilityClassification::DeleteMarkerLineageIncomplete => immediate
+                    .delete_marker_lineage_incomplete
+                    .push("deleted-key".to_string()),
+                RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite => {
+                    immediate.committed_writes_missing_version_id_count = 1;
+                    immediate
+                        .committed_writes_missing_version_id
+                        .push("put-key".to_string());
+                }
+                RecoveryStabilityClassification::MultipartUploadLineageIncomplete => immediate
+                    .multipart_upload_lineage_incomplete
+                    .push("multipart-key".to_string()),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                immediate.failure_classification(),
+                RecoveryStabilityClassification::CommittedObjectUnavailable
+            );
+            let mut recovery = recovery_report_with_attempted_key("k");
+            recovery.classification_evidence = super::immediate_classification_evidence(&immediate);
+            assert_eq!(recovery.classification_evidence, vec![evidence]);
+            recovery.reread_recovered_keys.push("k".to_string());
+            recovery.recovered_within_seconds = Some(1);
+
+            finish_recovery_stability_report(&mut recovery, &immediate);
+
+            assert_eq!(recovery.classification, expected);
+            assert!(recovery.still_unavailable_keys.is_empty());
+            assert!(
+                !recovery
+                    .evidence_classifications()
+                    .contains(&"committed_object_unavailable".to_string())
+            );
+
+            recovery.reread_recovered_keys.clear();
+            recovery.still_unavailable_keys.push("k".to_string());
+            finish_recovery_stability_report(&mut recovery, &immediate);
+            assert_eq!(
+                recovery.classification,
+                RecoveryStabilityClassification::CommittedObjectUnavailable
+            );
+        }
+    }
+
+    #[test]
     fn recovery_stability_report_keeps_unavailable_and_corrupt_classifications_hard() {
         let mut immediate = empty_report();
         immediate
@@ -3143,10 +3744,12 @@ mod tests {
             super::immediate_ambiguous_write_evidence(&immediate_corrupt);
         corrupt.data_corruption_evidence =
             super::immediate_data_corruption_evidence(&immediate_corrupt);
+        corrupt.classification_evidence =
+            super::immediate_classification_evidence(&immediate_corrupt);
         finish_recovery_stability_report(&mut corrupt, &immediate_corrupt);
         assert_eq!(
             corrupt.classification,
-            RecoveryStabilityClassification::DataCorruption
+            RecoveryStabilityClassification::VersionHashMismatch
         );
 
         let mut immediate_unavailable = empty_report();
@@ -3160,12 +3763,140 @@ mod tests {
         let mut unavailable = recovery_report_with_attempted_key("k");
         unavailable.ambiguous_write_evidence =
             super::immediate_ambiguous_write_evidence(&immediate_unavailable);
+        unavailable.classification_evidence =
+            super::immediate_classification_evidence(&immediate_unavailable);
         unavailable.still_unavailable_keys = keys;
         finish_recovery_stability_report(&mut unavailable, &immediate_unavailable);
         assert_eq!(
             unavailable.classification,
-            RecoveryStabilityClassification::CommittedObjectUnavailable
+            RecoveryStabilityClassification::CommittedVersionUnavailable
         );
+    }
+
+    #[test]
+    fn precise_availability_and_lineage_do_not_mask_stronger_evidence() {
+        let mut unavailable_and_corrupt = empty_report();
+        unavailable_and_corrupt
+            .unavailable_committed_versions
+            .push("k@v1: outcome=Timeout".to_string());
+        unavailable_and_corrupt
+            .hash_mismatches
+            .push("k: expected old, got new".to_string());
+        let mut recovery = recovery_report_with_attempted_key("k");
+        recovery.hash_mismatches = unavailable_and_corrupt.hash_mismatches.clone();
+        recovery.classification_evidence =
+            super::immediate_classification_evidence(&unavailable_and_corrupt);
+        finish_recovery_stability_report(&mut recovery, &unavailable_and_corrupt);
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::DataCorruption
+        );
+
+        let mut incomplete_and_list_unavailable = empty_report();
+        incomplete_and_list_unavailable
+            .delete_marker_lineage_incomplete
+            .push("delete response omitted marker id".to_string());
+        incomplete_and_list_unavailable.final_list_warning_count = 1;
+        incomplete_and_list_unavailable
+            .list_warnings
+            .push("LIST prefix fault-test/ did not complete".to_string());
+        let mut recovery =
+            RecoveryStabilityReport::harness_error("placeholder", std::time::Duration::ZERO);
+        recovery.harness_errors.clear();
+        recovery.classification_evidence =
+            super::immediate_classification_evidence(&incomplete_and_list_unavailable);
+        recovery.final_list_warning_count = 1;
+        recovery.list_warnings = incomplete_and_list_unavailable.list_warnings.clone();
+        finish_recovery_stability_report(&mut recovery, &incomplete_and_list_unavailable);
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::ListUnavailableOrUnknown
+        );
+    }
+
+    #[test]
+    fn recovery_stability_preserves_precise_non_reread_classifications() {
+        let mut version_missing = empty_report();
+        version_missing
+            .missing_committed_versions
+            .push("k@v1".to_string());
+        let mut version_unavailable = empty_report();
+        version_unavailable
+            .unavailable_committed_versions
+            .push("k@v1: outcome=Timeout".to_string());
+        let mut delete_marker_missing = empty_report();
+        delete_marker_missing
+            .missing_committed_delete_markers
+            .push("k@marker-1".to_string());
+        let mut delete_marker_lineage = empty_report();
+        delete_marker_lineage
+            .delete_marker_lineage_incomplete
+            .push("op-delete: missing delete marker id".to_string());
+        let mut incomplete_lineage = empty_report();
+        incomplete_lineage.committed_writes_missing_version_id_count = 1;
+        incomplete_lineage
+            .committed_writes_missing_version_id
+            .push("op-1: missing version id".to_string());
+        let mut multipart_lineage = incomplete_lineage.clone();
+        multipart_lineage
+            .multipart_upload_lineage_incomplete
+            .push("op-1: committed CompleteMultipartUpload missing version id".to_string());
+        let mut ambiguous = empty_report();
+        ambiguous
+            .unknown_writes_materialized
+            .push("timeout put materialized".to_string());
+
+        for (immediate, expected) in [
+            (
+                version_missing,
+                RecoveryStabilityClassification::CommittedVersionMissing,
+            ),
+            (
+                version_unavailable,
+                RecoveryStabilityClassification::CommittedVersionUnavailable,
+            ),
+            (
+                delete_marker_missing,
+                RecoveryStabilityClassification::DeleteMarkerMissing,
+            ),
+            (
+                delete_marker_lineage,
+                RecoveryStabilityClassification::DeleteMarkerLineageIncomplete,
+            ),
+            (
+                incomplete_lineage,
+                RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite,
+            ),
+            (
+                multipart_lineage,
+                RecoveryStabilityClassification::MultipartUploadLineageIncomplete,
+            ),
+            (
+                ambiguous,
+                RecoveryStabilityClassification::AmbiguousWriteMaterialized,
+            ),
+        ] {
+            let mut recovery = RecoveryStabilityReport {
+                immediate_passed: false,
+                reread_attempted_keys: Vec::new(),
+                reread_recovered_keys: Vec::new(),
+                still_unavailable_keys: immediate_still_unavailable_keys(&immediate, &[]),
+                hash_mismatches: immediate.hash_mismatches.clone(),
+                data_corruption_evidence: super::immediate_data_corruption_evidence(&immediate),
+                classification_evidence: super::immediate_classification_evidence(&immediate),
+                ambiguous_write_evidence: super::immediate_ambiguous_write_evidence(&immediate),
+                final_list_warning_count: immediate.final_list_warning_count,
+                list_warnings: immediate.list_warnings.clone(),
+                harness_errors: Vec::new(),
+                max_recovery_seconds: 60,
+                recovered_within_seconds: None,
+                classification: immediate.failure_classification(),
+            };
+
+            finish_recovery_stability_report(&mut recovery, &immediate);
+
+            assert_eq!(recovery.classification, expected);
+        }
     }
 
     #[test]
@@ -3211,11 +3942,12 @@ mod tests {
             .push("k: deleted object returned body".to_string());
         assert_eq!(
             super::classify_without_reread(&visible_deleted),
-            RecoveryStabilityClassification::DataCorruption
+            RecoveryStabilityClassification::DeletedObjectResurrected
         );
+        assert!(super::immediate_data_corruption_evidence(&visible_deleted).is_empty());
         assert_eq!(
-            super::immediate_data_corruption_evidence(&visible_deleted),
-            vec!["unexpected_visible_deleted_object: k: deleted object returned body"]
+            super::immediate_classification_evidence(&visible_deleted),
+            vec!["resurrected_deleted_object: k: deleted object returned body"]
         );
     }
 
@@ -3233,6 +3965,7 @@ mod tests {
             still_unavailable_keys: keys,
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
+            classification_evidence: Vec::new(),
             ambiguous_write_evidence: Vec::new(),
             final_list_warning_count: 0,
             list_warnings: Vec::new(),
@@ -3313,19 +4046,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("k1", "marker-1")]
         );
-        assert_eq!(lineage.missing_version_id_count, 2);
+        assert_eq!(lineage.missing_version_id_count, 1);
         assert!(
             lineage
                 .missing_version_id_samples
                 .iter()
                 .any(|sample| sample.contains("op-3"))
         );
-        assert!(
-            lineage
-                .missing_version_id_samples
-                .iter()
-                .any(|sample| sample.contains("op-5"))
-        );
+        assert_eq!(lineage.delete_marker_lineage_incomplete.len(), 1);
+        assert!(lineage.delete_marker_lineage_incomplete[0].contains("op-5"));
     }
 
     #[test]
@@ -3335,6 +4064,7 @@ mod tests {
             version_id: "ver-1".to_string(),
             sha256: crate::fault::workload::sha256_hex(b"x"),
             size_bytes: 1,
+            kind: OperationKind::Put,
         };
 
         let mut report = empty_report();
@@ -3389,7 +4119,70 @@ mod tests {
     }
 
     #[test]
-    fn resurrected_deleted_objects_require_latest_delete_marker() {
+    fn complete_version_listing_reports_only_omitted_committed_lineage() {
+        let committed = vec![
+            super::CommittedVersion {
+                key: "put".to_string(),
+                version_id: "put-v1".to_string(),
+                sha256: "put-sha".to_string(),
+                size_bytes: 1,
+                kind: OperationKind::Put,
+            },
+            super::CommittedVersion {
+                key: "mpu".to_string(),
+                version_id: "mpu-v1".to_string(),
+                sha256: "mpu-sha".to_string(),
+                size_bytes: 1,
+                kind: OperationKind::CompleteMultipartUpload,
+            },
+        ];
+        let entries = vec![crate::fault::workload::ObjectVersionEntry {
+            key: "put".to_string(),
+            version_id: Some("put-v1".to_string()),
+            is_latest: true,
+            is_delete_marker: false,
+        }];
+
+        let (missing, multipart) = super::missing_committed_version_entries(&committed, &entries);
+
+        assert_eq!(
+            missing,
+            vec!["mpu@mpu-v1: committed version missing from ListObjectVersions"]
+        );
+        assert_eq!(
+            multipart,
+            vec!["mpu@mpu-v1: committed multipart completion missing from ListObjectVersions"]
+        );
+    }
+
+    #[test]
+    fn delete_only_version_list_timeout_is_list_unavailable_not_version_unavailable() {
+        let delete = record(
+            "delete-204",
+            OperationKind::Delete,
+            "deleted-key",
+            "",
+            OperationOutcome::Ok,
+        );
+        let lineage = super::committed_version_lineage(&[delete]);
+        assert!(lineage.versions.is_empty());
+
+        let mut report = empty_report();
+        report.delete_marker_lineage_incomplete = lineage.delete_marker_lineage_incomplete;
+        let mut warnings = super::WarningSummary::default();
+        super::record_version_list_unavailable(&mut warnings, "fault-test/run-1/");
+        report.final_list_warning_count = warnings.total_count;
+        report.list_warnings = warnings.samples;
+
+        assert!(report.unavailable_committed_versions.is_empty());
+        assert_eq!(
+            report.failure_classification(),
+            RecoveryStabilityClassification::ListUnavailableOrUnknown
+        );
+    }
+
+    #[test]
+    fn resurrected_deleted_objects_require_visible_latest_non_marker() {
         use crate::fault::workload::ObjectVersionEntry;
         use std::collections::BTreeSet;
 
@@ -3419,15 +4212,54 @@ mod tests {
         ];
         let latest = super::latest_version_entries(&entries);
 
-        let violations = super::resurrected_deleted_objects(&deleted, &latest);
+        let mut report = empty_report();
+        super::evaluate_deleted_latest_versions(&mut report, &deleted, &latest);
 
         assert_eq!(
-            violations,
+            report.resurrected_deleted_objects,
             vec![
-                "absent: no latest version entry after committed delete".to_string(),
                 "resurrected: latest version is not a delete marker after committed delete"
                     .to_string()
             ]
+        );
+        assert_eq!(
+            report.delete_marker_lineage_incomplete,
+            vec!["absent: ListObjectVersions has no latest entry after committed delete"]
+        );
+    }
+
+    #[test]
+    fn listed_delete_marker_without_latest_entry_is_incomplete_lineage() {
+        let mut delete = record(
+            "delete-200",
+            OperationKind::Delete,
+            "k",
+            "",
+            OperationOutcome::Ok,
+        );
+        delete.version_id = Some("marker-1".to_string());
+        let model = object_model(std::slice::from_ref(&delete));
+        let lineage = super::committed_version_lineage(&[delete]);
+        let entries = vec![crate::fault::workload::ObjectVersionEntry {
+            key: "k".to_string(),
+            version_id: Some("marker-1".to_string()),
+            is_latest: false,
+            is_delete_marker: true,
+        }];
+        let mut report = empty_report();
+        report.missing_committed_delete_markers =
+            super::missing_committed_delete_markers(&lineage.delete_markers, &entries);
+        super::evaluate_deleted_latest_versions(
+            &mut report,
+            &model.deleted,
+            &super::latest_version_entries(&entries),
+        );
+        assert!(report.missing_committed_delete_markers.is_empty());
+        assert!(report.resurrected_deleted_objects.is_empty());
+        assert_eq!(report.delete_marker_lineage_incomplete.len(), 1);
+        assert_eq!(
+            report.failure_classification(),
+            RecoveryStabilityClassification::DeleteMarkerLineageIncomplete
         );
     }
 
@@ -4191,6 +5023,8 @@ mod tests {
             version_hash_mismatches: Vec::new(),
             missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
+            delete_marker_lineage_incomplete: Vec::new(),
+            multipart_upload_lineage_incomplete: Vec::new(),
             tolerated_ambiguous_deletes: Vec::new(),
             operation_cohorts: BTreeMap::new(),
             fault_window_relations: BTreeMap::new(),
@@ -4232,6 +5066,8 @@ mod tests {
             version_hash_mismatches: Vec::new(),
             missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
+            delete_marker_lineage_incomplete: Vec::new(),
+            multipart_upload_lineage_incomplete: Vec::new(),
             tolerated_ambiguous_deletes: Vec::new(),
             operation_cohorts: BTreeMap::new(),
             fault_window_relations: BTreeMap::new(),
@@ -4248,6 +5084,7 @@ mod tests {
             still_unavailable_keys: Vec::new(),
             hash_mismatches: Vec::new(),
             data_corruption_evidence: Vec::new(),
+            classification_evidence: Vec::new(),
             ambiguous_write_evidence: Vec::new(),
             final_list_warning_count: 0,
             list_warnings: Vec::new(),

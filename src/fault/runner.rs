@@ -1503,12 +1503,12 @@ async fn run_fault_case(
             write_failure_summary(
                 collector,
                 scenario.case_name,
-                FailureSummary::new(
+                FailureSummary::from_checker(
                     &scenario.name,
                     "checker-pre-recommit",
-                    recovery_stability_report.classification.as_str(),
+                    recovery_stability_report.classification,
                     message,
-                )?
+                )
                 .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds)
                 .with_evidence_classifications(
                     recovery_stability_report.evidence_classifications(),
@@ -1592,12 +1592,12 @@ async fn run_fault_case(
         write_failure_summary(
             collector,
             scenario.case_name,
-            FailureSummary::new(
+            FailureSummary::from_checker(
                 &scenario.name,
                 "checker-pre-recommit-verdict",
-                recovery_stability_report.classification.as_str(),
+                recovery_stability_report.classification,
                 error.to_string(),
-            )?
+            )
             .with_recovered_within_seconds(recovery_stability_report.recovered_within_seconds)
             .with_evidence_classifications(recovery_stability_report.evidence_classifications())
             .with_list_warnings(
@@ -1755,21 +1755,20 @@ async fn run_fault_case(
                 None,
             )
             .ok();
-        // Derive the S3-model classification from the checker's own evidence
-        // instead of the catch-all product_or_environment: a committed-loss or
-        // corruption verdict at the FINAL gate is the strongest product signal
-        // this harness produces, and it must route like the identical failure
-        // caught at the pre-recommit gate (review finding C3-3).
-        let classification = checker::classify_without_reread(&report);
+        let classification = report.failure_classification();
         write_failure_summary(
             collector,
             scenario.case_name,
-            FailureSummary::new(
+            FailureSummary::from_checker(
                 &scenario.name,
                 "checker-verdict",
-                classification.as_str(),
+                classification,
                 error.to_string(),
-            )?,
+            )
+            .with_list_warnings(
+                report.final_list_warning_count,
+                report.list_warnings.clone(),
+            ),
         )?;
         return Err(error);
     }

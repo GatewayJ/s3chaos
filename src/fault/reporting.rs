@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{
     fault::{
         backends::host::DmStatusSnapshot,
+        checker::RecoveryStabilityClassification,
         config::FaultTestConfig,
         plan::{FaultPlan, FaultSelection},
         scenarios::{FaultScenario, FaultScenarioSpec},
@@ -215,6 +216,7 @@ pub enum DataCorrectnessStatus {
 pub enum AvailabilityStatus {
     RecoveredAfterTailLatency,
     CommittedObjectUnavailable,
+    CommittedVersionUnavailable,
     ListUnavailableOrUnknown,
     Unknown,
 }
@@ -223,6 +225,14 @@ pub enum AvailabilityStatus {
 pub(crate) enum FailureClassification {
     RecoveryTailReadLatency,
     CommittedObjectUnavailable,
+    CommittedVersionMissing,
+    CommittedVersionUnavailable,
+    VersionHashMismatch,
+    DeleteMarkerMissing,
+    DeletedObjectResurrected,
+    DeleteMarkerLineageIncomplete,
+    VersionIdMissingOnCommittedWrite,
+    MultipartUploadLineageIncomplete,
     ListUnavailableOrUnknown,
     DataCorruption,
     AmbiguousWriteMaterialized,
@@ -247,9 +257,17 @@ pub(crate) enum FailureClassification {
 }
 
 impl FailureClassification {
-    pub(crate) const ALL: [Self; 23] = [
+    pub(crate) const ALL: [Self; 31] = [
         Self::RecoveryTailReadLatency,
         Self::CommittedObjectUnavailable,
+        Self::CommittedVersionMissing,
+        Self::CommittedVersionUnavailable,
+        Self::VersionHashMismatch,
+        Self::DeleteMarkerMissing,
+        Self::DeletedObjectResurrected,
+        Self::DeleteMarkerLineageIncomplete,
+        Self::VersionIdMissingOnCommittedWrite,
+        Self::MultipartUploadLineageIncomplete,
         Self::ListUnavailableOrUnknown,
         Self::DataCorruption,
         Self::AmbiguousWriteMaterialized,
@@ -283,6 +301,14 @@ impl FailureClassification {
         match self {
             Self::RecoveryTailReadLatency => "recovery_tail_read_latency",
             Self::CommittedObjectUnavailable => "committed_object_unavailable",
+            Self::CommittedVersionMissing => "committed_version_missing",
+            Self::CommittedVersionUnavailable => "committed_version_unavailable",
+            Self::VersionHashMismatch => "version_hash_mismatch",
+            Self::DeleteMarkerMissing => "delete_marker_missing",
+            Self::DeletedObjectResurrected => "deleted_object_resurrected",
+            Self::DeleteMarkerLineageIncomplete => "delete_marker_lineage_incomplete",
+            Self::VersionIdMissingOnCommittedWrite => "version_id_missing_on_committed_write",
+            Self::MultipartUploadLineageIncomplete => "multipart_upload_lineage_incomplete",
             Self::ListUnavailableOrUnknown => "list_unavailable_or_unknown",
             Self::DataCorruption => "data_corruption",
             Self::AmbiguousWriteMaterialized => "ambiguous_write_materialized",
@@ -312,6 +338,14 @@ impl FailureClassification {
             self,
             Self::RecoveryTailReadLatency
                 | Self::CommittedObjectUnavailable
+                | Self::CommittedVersionMissing
+                | Self::CommittedVersionUnavailable
+                | Self::VersionHashMismatch
+                | Self::DeleteMarkerMissing
+                | Self::DeletedObjectResurrected
+                | Self::DeleteMarkerLineageIncomplete
+                | Self::VersionIdMissingOnCommittedWrite
+                | Self::MultipartUploadLineageIncomplete
                 | Self::ListUnavailableOrUnknown
                 | Self::DataCorruption
                 | Self::AmbiguousWriteMaterialized
@@ -322,6 +356,14 @@ impl FailureClassification {
         match self {
             Self::RecoveryTailReadLatency
             | Self::CommittedObjectUnavailable
+            | Self::CommittedVersionMissing
+            | Self::CommittedVersionUnavailable
+            | Self::VersionHashMismatch
+            | Self::DeleteMarkerMissing
+            | Self::DeletedObjectResurrected
+            | Self::DeleteMarkerLineageIncomplete
+            | Self::VersionIdMissingOnCommittedWrite
+            | Self::MultipartUploadLineageIncomplete
             | Self::ListUnavailableOrUnknown
             | Self::DataCorruption
             | Self::AmbiguousWriteMaterialized => ResponsibilityDomain::Product,
@@ -342,6 +384,47 @@ impl FailureClassification {
             | Self::EnvironmentOrWorkload
             | Self::WorkloadOrProduct
             | Self::NoSignal => ResponsibilityDomain::Unknown,
+        }
+    }
+}
+
+impl From<RecoveryStabilityClassification> for FailureClassification {
+    fn from(classification: RecoveryStabilityClassification) -> Self {
+        match classification {
+            RecoveryStabilityClassification::DataCorruption => Self::DataCorruption,
+            RecoveryStabilityClassification::CommittedObjectUnavailable => {
+                Self::CommittedObjectUnavailable
+            }
+            RecoveryStabilityClassification::CommittedVersionMissing => {
+                Self::CommittedVersionMissing
+            }
+            RecoveryStabilityClassification::CommittedVersionUnavailable => {
+                Self::CommittedVersionUnavailable
+            }
+            RecoveryStabilityClassification::VersionHashMismatch => Self::VersionHashMismatch,
+            RecoveryStabilityClassification::DeleteMarkerMissing => Self::DeleteMarkerMissing,
+            RecoveryStabilityClassification::DeletedObjectResurrected => {
+                Self::DeletedObjectResurrected
+            }
+            RecoveryStabilityClassification::DeleteMarkerLineageIncomplete => {
+                Self::DeleteMarkerLineageIncomplete
+            }
+            RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite => {
+                Self::VersionIdMissingOnCommittedWrite
+            }
+            RecoveryStabilityClassification::MultipartUploadLineageIncomplete => {
+                Self::MultipartUploadLineageIncomplete
+            }
+            RecoveryStabilityClassification::ListUnavailableOrUnknown => {
+                Self::ListUnavailableOrUnknown
+            }
+            RecoveryStabilityClassification::RecoveryTailReadLatency => {
+                Self::RecoveryTailReadLatency
+            }
+            RecoveryStabilityClassification::AmbiguousWriteMaterialized => {
+                Self::AmbiguousWriteMaterialized
+            }
+            RecoveryStabilityClassification::HarnessError => Self::HarnessError,
         }
     }
 }
@@ -413,10 +496,37 @@ impl FailureSummary {
                     "failure classification {classification_name:?} is not in the writer allowlist"
                 )
             })?;
+        Ok(Self::from_classification(
+            scenario,
+            stage,
+            classification,
+            message,
+        ))
+    }
+
+    pub(crate) fn from_checker(
+        scenario: impl Into<String>,
+        stage: impl Into<String>,
+        classification: RecoveryStabilityClassification,
+        message: impl Into<String>,
+    ) -> Self {
+        let classification = FailureClassification::from(classification);
+        let mut summary =
+            Self::from_classification(scenario, stage.into(), classification, message);
+        summary.evidence_classifications = vec![classification.as_str().to_string()];
+        summary
+    }
+
+    fn from_classification(
+        scenario: impl Into<String>,
+        stage: String,
+        classification: FailureClassification,
+        message: impl Into<String>,
+    ) -> Self {
         let details = FailureClassificationDetails::from_classification(classification);
         let phase = FailurePhase::from_stage(&stage);
         let projection = FailureV2Projection::from_classification(classification);
-        Ok(Self {
+        Self {
             schema_version: FAILURE_SUMMARY_SCHEMA_VERSION,
             scenario: scenario.into(),
             case_name: None,
@@ -440,7 +550,7 @@ impl FailureSummary {
             recovered_within_window: details.recovered_within_window,
             recovered_within_seconds: None,
             message: message.into(),
-        })
+        }
     }
 
     fn with_case_name(mut self, case_name: &str) -> Self {
@@ -675,6 +785,42 @@ impl FailureClassificationDetails {
                 corruption: Some(false),
                 recovered_within_window: Some(false),
             },
+            FailureClassification::CommittedVersionMissing => Self {
+                severity: FailureSeverity::FailCorrectness,
+                data_correctness: DataCorrectnessStatus::Failed,
+                availability: AvailabilityStatus::Unknown,
+                data_loss: Some(true),
+                corruption: Some(false),
+                recovered_within_window: Some(false),
+            },
+            FailureClassification::CommittedVersionUnavailable => Self {
+                severity: FailureSeverity::FailAvailability,
+                data_correctness: DataCorrectnessStatus::Unknown,
+                availability: AvailabilityStatus::CommittedVersionUnavailable,
+                data_loss: None,
+                corruption: Some(false),
+                recovered_within_window: Some(false),
+            },
+            FailureClassification::VersionHashMismatch
+            | FailureClassification::DeleteMarkerMissing
+            | FailureClassification::DeletedObjectResurrected => Self {
+                severity: FailureSeverity::FailCorrectness,
+                data_correctness: DataCorrectnessStatus::Failed,
+                availability: AvailabilityStatus::Unknown,
+                data_loss: Some(false),
+                corruption: Some(true),
+                recovered_within_window: None,
+            },
+            FailureClassification::DeleteMarkerLineageIncomplete
+            | FailureClassification::VersionIdMissingOnCommittedWrite
+            | FailureClassification::MultipartUploadLineageIncomplete => Self {
+                severity: FailureSeverity::NeedsInvestigation,
+                data_correctness: DataCorrectnessStatus::Unknown,
+                availability: AvailabilityStatus::Unknown,
+                data_loss: None,
+                corruption: Some(false),
+                recovered_within_window: None,
+            },
             FailureClassification::ListUnavailableOrUnknown => Self {
                 severity: FailureSeverity::FailAvailability,
                 data_correctness: DataCorrectnessStatus::Unknown,
@@ -799,19 +945,63 @@ mod tests {
         FailureClassification, FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain,
         write_failure_summary,
     };
-    use crate::framework::artifacts::ArtifactCollector;
+    use crate::{
+        fault::checker::RecoveryStabilityClassification, framework::artifacts::ArtifactCollector,
+    };
     use serde_json::json;
     use std::{collections::BTreeSet, fs};
 
     #[test]
+    fn final_checker_summary_preserves_list_warning_count_and_samples() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector = ArtifactCollector::new(dir.path());
+        for classification in [
+            RecoveryStabilityClassification::ListUnavailableOrUnknown,
+            RecoveryStabilityClassification::DataCorruption,
+        ] {
+            let case_name = classification.as_str();
+            collector
+                .write_text(case_name, "checker-report.json", "{}")
+                .expect("checker evidence");
+            let warnings = vec!["LIST warning b".to_string(), "LIST warning a".to_string()];
+            write_failure_summary(
+                &collector,
+                case_name,
+                FailureSummary::from_checker(
+                    "io-eio",
+                    "checker-verdict",
+                    classification,
+                    "LIST failed",
+                )
+                .with_list_warnings(3, warnings),
+            )
+            .expect("write summary");
+            let path = collector.case_dir(case_name).join("failure-summary.json");
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).expect("summary")).expect("json");
+            assert_eq!(value["classification"], classification.as_str());
+            assert_eq!(value["final_list_warning_count"], 3);
+            assert_eq!(
+                value["list_warnings"],
+                json!(["LIST warning a", "LIST warning b"])
+            );
+            assert_eq!(
+                value["primary_evidence_refs"],
+                json!([format!("{case_name}/checker-report.json")])
+            );
+            crate::fault::artifact_validation::validate_written_failure_summary(dir.path(), &path)
+                .expect("valid final summary");
+        }
+    }
+
+    #[test]
     fn checker_classification_projects_to_s3_model_fields() {
-        let summary = FailureSummary::new(
+        let summary = FailureSummary::from_checker(
             "io-eio",
             "checker-pre-recommit-verdict",
-            "data_corruption",
+            RecoveryStabilityClassification::DataCorruption,
             "hash mismatch",
-        )
-        .expect("known classification");
+        );
 
         assert_eq!(summary.phase(), Some(FailurePhase::Checker));
         assert_eq!(summary.s3_model_classification(), Some("data_corruption"));
@@ -837,6 +1027,112 @@ mod tests {
                 "run-events.jsonl"
             ])
         );
+    }
+
+    #[test]
+    fn typed_checker_classifications_project_to_stable_failure_fields() {
+        let cases = [
+            (
+                RecoveryStabilityClassification::CommittedVersionMissing,
+                "committed_version_missing",
+                "fail_correctness",
+                "failed",
+                "unknown",
+                Some(true),
+                Some(false),
+            ),
+            (
+                RecoveryStabilityClassification::CommittedVersionUnavailable,
+                "committed_version_unavailable",
+                "fail_availability",
+                "unknown",
+                "committed_version_unavailable",
+                None,
+                Some(false),
+            ),
+            (
+                RecoveryStabilityClassification::VersionHashMismatch,
+                "version_hash_mismatch",
+                "fail_correctness",
+                "failed",
+                "unknown",
+                Some(false),
+                Some(true),
+            ),
+            (
+                RecoveryStabilityClassification::DeleteMarkerMissing,
+                "delete_marker_missing",
+                "fail_correctness",
+                "failed",
+                "unknown",
+                Some(false),
+                Some(true),
+            ),
+            (
+                RecoveryStabilityClassification::DeletedObjectResurrected,
+                "deleted_object_resurrected",
+                "fail_correctness",
+                "failed",
+                "unknown",
+                Some(false),
+                Some(true),
+            ),
+            (
+                RecoveryStabilityClassification::DeleteMarkerLineageIncomplete,
+                "delete_marker_lineage_incomplete",
+                "needs_investigation",
+                "unknown",
+                "unknown",
+                None,
+                Some(false),
+            ),
+            (
+                RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite,
+                "version_id_missing_on_committed_write",
+                "needs_investigation",
+                "unknown",
+                "unknown",
+                None,
+                Some(false),
+            ),
+            (
+                RecoveryStabilityClassification::MultipartUploadLineageIncomplete,
+                "multipart_upload_lineage_incomplete",
+                "needs_investigation",
+                "unknown",
+                "unknown",
+                None,
+                Some(false),
+            ),
+        ];
+
+        for (classification, name, severity, correctness, availability, data_loss, corruption) in
+            cases
+        {
+            let summary = FailureSummary::from_checker(
+                "io-eio",
+                "checker-verdict",
+                classification,
+                "checker failed",
+            );
+            let value = serde_json::to_value(summary).expect("summary json");
+            assert_eq!(value["classification"], json!(name), "{name}");
+            assert_eq!(value["s3_model_classification"], json!(name), "{name}");
+            assert!(value.get("run_failure_reason").is_none(), "{name}");
+            assert_eq!(value["severity"], json!(severity), "{name}");
+            assert_eq!(value["data_correctness"], json!(correctness), "{name}");
+            assert_eq!(value["availability"], json!(availability), "{name}");
+            assert_eq!(
+                value.get("data_loss").and_then(serde_json::Value::as_bool),
+                data_loss,
+                "{name}"
+            );
+            assert_eq!(
+                value.get("corruption").and_then(serde_json::Value::as_bool),
+                corruption,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -910,6 +1206,14 @@ mod tests {
         let expected = BTreeSet::from([
             "recovery_tail_read_latency",
             "committed_object_unavailable",
+            "committed_version_missing",
+            "committed_version_unavailable",
+            "version_hash_mismatch",
+            "delete_marker_missing",
+            "deleted_object_resurrected",
+            "delete_marker_lineage_incomplete",
+            "version_id_missing_on_committed_write",
+            "multipart_upload_lineage_incomplete",
             "list_unavailable_or_unknown",
             "data_corruption",
             "ambiguous_write_materialized",
@@ -964,6 +1268,32 @@ mod tests {
             (
                 "committed_object_unavailable",
                 FailureSeverity::FailAvailability,
+            ),
+            (
+                "committed_version_missing",
+                FailureSeverity::FailCorrectness,
+            ),
+            (
+                "committed_version_unavailable",
+                FailureSeverity::FailAvailability,
+            ),
+            ("version_hash_mismatch", FailureSeverity::FailCorrectness),
+            ("delete_marker_missing", FailureSeverity::FailCorrectness),
+            (
+                "deleted_object_resurrected",
+                FailureSeverity::FailCorrectness,
+            ),
+            (
+                "delete_marker_lineage_incomplete",
+                FailureSeverity::NeedsInvestigation,
+            ),
+            (
+                "version_id_missing_on_committed_write",
+                FailureSeverity::NeedsInvestigation,
+            ),
+            (
+                "multipart_upload_lineage_incomplete",
+                FailureSeverity::NeedsInvestigation,
             ),
             (
                 "list_unavailable_or_unknown",
