@@ -1393,6 +1393,7 @@ struct AmbiguousWriteAttempt {
     payload_ref: Option<PayloadRef>,
     started_at_ms: u64,
     ended_at_ms: u64,
+    ended_sequence: Option<u64>,
     superseded_by: Option<SupersedingMutation>,
 }
 
@@ -2972,6 +2973,7 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
                         payload_ref: record.payload_ref,
                         started_at_ms: record.started_at_ms,
                         ended_at_ms: record.ended_at_ms,
+                        ended_sequence: record.ended_sequence,
                         superseded_by: None,
                     });
             }
@@ -3021,7 +3023,12 @@ fn mark_superseded_attempts(
     };
     for attempt in attempts {
         if attempt.superseded_by.is_none()
-            && superseding_record.started_at_ms >= attempt.ended_at_ms
+            && completion_precedes_start(
+                attempt.ended_sequence,
+                attempt.ended_at_ms,
+                superseding_record.started_sequence,
+                superseding_record.started_at_ms,
+            )
         {
             attempt.superseded_by = Some(SupersedingMutation {
                 id: superseding_record.id.clone(),
@@ -3032,7 +3039,37 @@ fn mark_superseded_attempts(
     }
 }
 
+fn completion_precedes_start(
+    ended_sequence: Option<u64>,
+    ended_at_ms: u64,
+    started_sequence: Option<u64>,
+    started_at_ms: u64,
+) -> bool {
+    // Authenticated histories require both recorder sequences. The timestamp
+    // fallback exists only for legacy in-memory model callers; equal
+    // millisecond values never override an available sequence order.
+    match (ended_sequence, started_sequence) {
+        (Some(ended), Some(started)) => ended < started,
+        _ => ended_at_ms < started_at_ms,
+    }
+}
+
+fn operation_completed_before_started(
+    completed: &OperationRecord,
+    following: &OperationRecord,
+) -> bool {
+    completion_precedes_start(
+        completed.ended_sequence,
+        completed.ended_at_ms,
+        following.started_sequence,
+        following.started_at_ms,
+    )
+}
+
 fn list_history_warnings(records: &[OperationRecord]) -> WarningSummary {
+    let use_recorder_sequences = records
+        .iter()
+        .all(|record| record.started_sequence.is_some() && record.ended_sequence.is_some());
     let mut mutations = records
         .iter()
         .enumerate()
@@ -3043,7 +3080,16 @@ fn list_history_warnings(records: &[OperationRecord]) -> WarningSummary {
             )
         })
         .collect::<Vec<_>>();
-    mutations.sort_by_key(|(index, record)| (record.ended_at_ms, *index));
+    mutations.sort_by_key(|(index, record)| {
+        (
+            if use_recorder_sequences {
+                record.ended_sequence.unwrap_or_default()
+            } else {
+                record.ended_at_ms
+            },
+            *index,
+        )
+    });
     let mut lists = records
         .iter()
         .enumerate()
@@ -3051,7 +3097,16 @@ fn list_history_warnings(records: &[OperationRecord]) -> WarningSummary {
             record.kind == OperationKind::List && record.outcome == OperationOutcome::Ok
         })
         .collect::<Vec<_>>();
-    lists.sort_by_key(|(index, record)| (record.started_at_ms, *index));
+    lists.sort_by_key(|(index, record)| {
+        (
+            if use_recorder_sequences {
+                record.started_sequence.unwrap_or_default()
+            } else {
+                record.started_at_ms
+            },
+            *index,
+        )
+    });
 
     let mut stable = ObjectModel::default();
     let mut next_mutation = 0;
@@ -3059,7 +3114,7 @@ fn list_history_warnings(records: &[OperationRecord]) -> WarningSummary {
     for (record_index, record) in lists {
         while mutations
             .get(next_mutation)
-            .is_some_and(|(_, mutation)| mutation.ended_at_ms < record.started_at_ms)
+            .is_some_and(|(_, mutation)| operation_completed_before_started(mutation, record))
         {
             apply_record_to_model(&mut stable, mutations[next_mutation].1);
             next_mutation += 1;
@@ -3135,6 +3190,9 @@ struct StableLiveObject {
 fn stable_live_objects_at_read_starts(
     records: &[OperationRecord],
 ) -> BTreeMap<usize, StableLiveObject> {
+    let use_recorder_sequences = records
+        .iter()
+        .all(|record| record.started_sequence.is_some() && record.ended_sequence.is_some());
     let mut reads = records
         .iter()
         .enumerate()
@@ -3145,10 +3203,19 @@ fn stable_live_objects_at_read_starts(
             {
                 return None;
             }
-            Some((index, record.started_at_ms, record.key.as_deref()?))
+            Some((index, record, record.key.as_deref()?))
         })
         .collect::<Vec<_>>();
-    reads.sort_by_key(|(_, started_at_ms, _)| *started_at_ms);
+    reads.sort_by_key(|(index, record, _)| {
+        (
+            if use_recorder_sequences {
+                record.started_sequence.unwrap_or_default()
+            } else {
+                record.started_at_ms
+            },
+            *index,
+        )
+    });
 
     let mut mutations = records
         .iter()
@@ -3162,14 +3229,20 @@ fn stable_live_objects_at_read_starts(
                 )
         })
         .collect::<Vec<_>>();
-    mutations.sort_by_key(|record| record.ended_at_ms);
+    mutations.sort_by_key(|record| {
+        if use_recorder_sequences {
+            record.ended_sequence.unwrap_or_default()
+        } else {
+            record.ended_at_ms
+        }
+    });
 
     let mut live = BTreeMap::<String, StableLiveObject>::new();
     let mut next_mutation = 0;
     let mut stable = BTreeMap::new();
-    for (index, started_at_ms, key) in reads {
+    for (index, read, key) in reads {
         while let Some(record) = mutations.get(next_mutation) {
-            if record.ended_at_ms >= started_at_ms {
+            if !operation_completed_before_started(record, read) {
                 break;
             }
             match record.kind {
@@ -3207,6 +3280,7 @@ fn stable_live_objects_at_read_starts(
 struct CommittedWriteWindow {
     object: ExpectedObject,
     ended_at_ms: u64,
+    ended_sequence: Option<u64>,
     /// Generator inputs for regenerating this write's exact body (absent for
     /// multipart bodies and legacy records, which cannot be slice-verified).
     payload_ref: Option<PayloadRef>,
@@ -3215,16 +3289,24 @@ struct CommittedWriteWindow {
 #[derive(Debug, Default)]
 struct CommittedWriteHistory {
     windows: Vec<CommittedWriteWindow>,
-    prior_max_ended_by_object: BTreeMap<ExpectedObject, u64>,
+    prior_latest_completion_by_object: BTreeMap<ExpectedObject, (Option<u64>, u64)>,
 }
 
 impl CommittedWriteHistory {
     fn push(&mut self, window: CommittedWriteWindow) {
         if let Some(previous) = self.windows.last() {
-            self.prior_max_ended_by_object
+            self.prior_latest_completion_by_object
                 .entry(previous.object.clone())
-                .and_modify(|ended_at_ms| *ended_at_ms = (*ended_at_ms).max(previous.ended_at_ms))
-                .or_insert(previous.ended_at_ms);
+                .and_modify(|completion| {
+                    let current_is_later = match (completion.0, previous.ended_sequence) {
+                        (Some(current), Some(previous)) => previous > current,
+                        _ => previous.ended_at_ms > completion.1,
+                    };
+                    if current_is_later {
+                        *completion = (previous.ended_sequence, previous.ended_at_ms);
+                    }
+                })
+                .or_insert((previous.ended_sequence, previous.ended_at_ms));
         }
         self.windows.push(window);
     }
@@ -3240,19 +3322,19 @@ impl CommittedWriteHistory {
 /// S3 gives concurrent overwrites of one key no client-observable order, so a
 /// GET may legally return:
 /// - the value of any committed write whose completion window overlaps the
-///   GET itself (`w.ended >= get.started`), or
+///   GET itself (`w.ended_sequence > get.started_sequence`), or
 /// - the previous committed value while the *latest* write was still in
-///   flight when the GET started (`latest.ended >= get.started`).
+///   flight when the GET started.
 ///
-/// Both legs keep real stale-read detection intact: if every write finished
-/// before the GET started, no exemption applies and an old value is still
-/// reported as corruption. This complements `stable_live_objects_at_read_starts`
-/// (which exempts a GET that returned the value stable-live at its start,
-/// e.g. across an overlapping delete); this function additionally exempts a GET
-/// that returned a value whose write window merely overlaps the GET.
+/// Recorder event sequences are authoritative because millisecond timestamps
+/// can be equal even when the write completed strictly before the GET began.
+/// If every write finished first, no exemption applies and an old value is
+/// still reported as corruption. This complements
+/// `stable_live_objects_at_read_starts` (which exempts a GET that returned the
+/// value stable-live at its start, e.g. across an overlapping delete).
 fn concurrent_committed_read(
     history: &CommittedWriteHistory,
-    get_started_at_ms: u64,
+    get: &OperationRecord,
     actual: &ExpectedObject,
 ) -> bool {
     let Some((latest, prior)) = history.windows.split_last() else {
@@ -3262,14 +3344,25 @@ fn concurrent_committed_read(
         w.object.sha256 == actual.sha256 && w.object.size_bytes == actual.size_bytes
     };
     if history
-        .prior_max_ended_by_object
+        .prior_latest_completion_by_object
         .get(actual)
-        .is_some_and(|ended_at_ms| *ended_at_ms >= get_started_at_ms)
+        .is_some_and(|(ended_sequence, ended_at_ms)| {
+            !completion_precedes_start(
+                *ended_sequence,
+                *ended_at_ms,
+                get.started_sequence,
+                get.started_at_ms,
+            )
+        })
     {
         return true;
     }
-    if latest.ended_at_ms >= get_started_at_ms
-        && let Some(previous) = prior.last()
+    if !completion_precedes_start(
+        latest.ended_sequence,
+        latest.ended_at_ms,
+        get.started_sequence,
+        get.started_at_ms,
+    ) && let Some(previous) = prior.last()
     {
         return matches(previous);
     }
@@ -3351,12 +3444,21 @@ fn verify_ranged_get(
     if let Some((latest, prior)) = state.history.split_last() {
         candidates.push((latest.payload_ref, latest.object.size_bytes));
         for window in prior {
-            if window.ended_at_ms >= record.started_at_ms {
+            if !completion_precedes_start(
+                window.ended_sequence,
+                window.ended_at_ms,
+                record.started_sequence,
+                record.started_at_ms,
+            ) {
                 candidates.push((window.payload_ref, window.object.size_bytes));
             }
         }
-        if latest.ended_at_ms >= record.started_at_ms
-            && let Some(previous) = prior.last()
+        if !completion_precedes_start(
+            latest.ended_sequence,
+            latest.ended_at_ms,
+            record.started_sequence,
+            record.started_at_ms,
+        ) && let Some(previous) = prior.last()
         {
             candidates.push((previous.payload_ref, previous.object.size_bytes));
         }
@@ -3481,6 +3583,7 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                         .push(CommittedWriteWindow {
                             object: object.clone(),
                             ended_at_ms: record.ended_at_ms,
+                            ended_sequence: record.ended_sequence,
                             payload_ref: record.payload_ref,
                         });
                     live.insert(key, object);
@@ -3504,6 +3607,7 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                             payload_ref: record.payload_ref,
                             started_at_ms: record.started_at_ms,
                             ended_at_ms: record.ended_at_ms,
+                            ended_sequence: record.ended_sequence,
                             superseded_by: None,
                         });
                 }
@@ -3601,7 +3705,7 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                         let history = committed_history
                             .get(key)
                             .expect("a live committed object has write history");
-                        if !concurrent_committed_read(history, record.started_at_ms, &actual) {
+                        if !concurrent_committed_read(history, record, &actual) {
                             anomalies.corrupted_reads.push(format!(
                                 "{key}: expected {} ({} bytes), got {} ({} bytes)",
                                 expected.sha256,
@@ -3662,7 +3766,8 @@ mod tests {
         validate_checker_audit_against_history, validate_recovery_key_sets,
     };
     use crate::fault::history::{
-        ByteRange, ListedVersionEntry, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
+        ByteRange, ListedVersionEntry, OperationKind, OperationOutcome, OperationRecord,
+        PayloadRef, validate_history_scope_and_order,
     };
     use crate::fault::workload::seeded_bytes;
     use crate::fault::workload::{GetObjectResult, ObjectVersionEntry, sha256_hex};
@@ -3717,6 +3822,16 @@ mod tests {
         }
     }
 
+    fn with_sequences(
+        mut record: OperationRecord,
+        started_sequence: u64,
+        ended_sequence: u64,
+    ) -> OperationRecord {
+        record.started_sequence = Some(started_sequence);
+        record.ended_sequence = Some(ended_sequence);
+        record
+    }
+
     fn assign_recorder_sequences(records: &mut [OperationRecord]) {
         for (index, record) in records.iter_mut().enumerate() {
             record.started_sequence = Some((index as u64) * 2 + 1);
@@ -3769,6 +3884,7 @@ mod tests {
             payload_ref: None,
             started_at_ms: 1,
             ended_at_ms: 2,
+            ended_sequence: None,
             superseded_by: None,
         }
     }
@@ -3960,6 +4076,29 @@ mod tests {
                 .any(|warning| warning.contains("boundary")),
             "a mutation ending exactly when LIST starts is not stably visible"
         );
+    }
+
+    #[test]
+    fn list_uses_sequence_when_a_settled_mutation_has_the_same_millisecond() {
+        let put = with_sequences(
+            timed_record(
+                "op-1",
+                OperationKind::Put,
+                "fault-test/run-1/stable",
+                "v1",
+                OperationOutcome::Ok,
+                10,
+                10,
+            ),
+            1,
+            2,
+        );
+        let list = with_sequences(list_record("op-2", "fault-test/run-1/", 10, 10, &[]), 3, 4);
+
+        let warnings = list_history_warnings(&[put, list]);
+
+        assert_eq!(warnings.total_count, 1);
+        assert!(warnings.samples[0].contains("stable live key"));
     }
 
     #[test]
@@ -4590,6 +4729,45 @@ mod tests {
         assert!(
             anomalies.unknown_write_value_conflicts[0].contains("superseded ambiguous attempt")
         );
+    }
+
+    #[test]
+    fn same_millisecond_overlapping_mutation_does_not_supersede_ambiguous_write() {
+        let ambiguous = with_sequences(
+            timed_record(
+                "op-1",
+                OperationKind::Put,
+                "k",
+                "ambiguous",
+                OperationOutcome::Timeout,
+                10,
+                10,
+            ),
+            1,
+            3,
+        );
+        let committed = with_sequences(
+            timed_record(
+                "op-2",
+                OperationKind::Put,
+                "k",
+                "committed",
+                OperationOutcome::Ok,
+                10,
+                10,
+            ),
+            2,
+            4,
+        );
+
+        let model = object_model(&[ambiguous, committed]);
+        let attempt = model
+            .unknown_writes
+            .get("k")
+            .and_then(|attempts| attempts.first())
+            .expect("ambiguous attempt");
+
+        assert!(attempt.superseded_by.is_none());
     }
 
     #[test]
@@ -5858,28 +6036,41 @@ mod tests {
         let key = "hot-key";
         let mut records = Vec::with_capacity(VERSION_COUNT * 2);
         for index in 0..VERSION_COUNT {
-            records.push(timed_record(
-                &format!("put-{index:05}"),
-                OperationKind::Put,
-                key,
-                &format!("hash-{index:05}"),
-                OperationOutcome::Ok,
-                index as u64,
-                index as u64 + 1,
+            records.push(with_sequences(
+                timed_record(
+                    &format!("put-{index:05}"),
+                    OperationKind::Put,
+                    key,
+                    &format!("hash-{index:05}"),
+                    OperationOutcome::Ok,
+                    10,
+                    10,
+                ),
+                VERSION_COUNT as u64 + (index as u64) * 2 + 1,
+                VERSION_COUNT as u64 + (index as u64) * 2 + 2,
             ));
         }
         let prior_hash = format!("hash-{:05}", VERSION_COUNT - 2);
         for index in 0..VERSION_COUNT {
-            records.push(timed_record(
-                &format!("get-{index:05}"),
-                OperationKind::Get,
-                key,
-                &prior_hash,
-                OperationOutcome::Ok,
-                (VERSION_COUNT - 1) as u64,
-                VERSION_COUNT as u64 + 1,
+            records.push(with_sequences(
+                timed_record(
+                    &format!("get-{index:05}"),
+                    OperationKind::Get,
+                    key,
+                    &prior_hash,
+                    OperationOutcome::Ok,
+                    10,
+                    10,
+                ),
+                index as u64 + 1,
+                (VERSION_COUNT as u64) * 3 + index as u64 + 1,
             ));
         }
+        for record in &mut records {
+            record.run_id = Some("run-1".to_string());
+        }
+        validate_history_scope_and_order(&records, "io-eio", "run-1", "bucket")
+            .expect("stress history has an authentic recorder order");
 
         let anomalies = successful_read_anomalies(&records);
         assert!(anomalies.corrupted_reads.is_empty());
@@ -5979,6 +6170,25 @@ mod tests {
             "concurrent ranged read flagged: {:?}",
             anomalies.corrupted_reads
         );
+    }
+
+    #[test]
+    fn ranged_get_uses_sequence_when_settled_writes_share_its_millisecond() {
+        let range = ByteRange {
+            offset: 5,
+            length: 32,
+        };
+        let first = with_sequences(committed_put("op-1", "k", 7, 3, 4096, 10, 10), 1, 2);
+        let second = with_sequences(committed_put("op-2", "k", 99, 3, 4096, 10, 10), 3, 4);
+        let get = with_sequences(
+            ranged_get("op-3", "k", range, &slice_sha(7, 3, 4096, range), 10, 10),
+            5,
+            6,
+        );
+
+        let anomalies = successful_read_anomalies(&[first, second, get]);
+
+        assert_eq!(anomalies.corrupted_reads.len(), 1);
     }
 
     /// A slice matching no committed value (after all writes settled) is
@@ -6348,6 +6558,53 @@ mod tests {
             1,
             "a stale read after settled overwrites must stay flagged"
         );
+    }
+
+    #[test]
+    fn whole_get_uses_sequence_when_settled_writes_share_its_millisecond() {
+        let first = with_sequences(
+            timed_record(
+                "op-1",
+                OperationKind::Put,
+                "k",
+                "a",
+                OperationOutcome::Ok,
+                10,
+                10,
+            ),
+            1,
+            2,
+        );
+        let second = with_sequences(
+            timed_record(
+                "op-2",
+                OperationKind::Put,
+                "k",
+                "b",
+                OperationOutcome::Ok,
+                10,
+                10,
+            ),
+            3,
+            4,
+        );
+        let get = with_sequences(
+            timed_record(
+                "op-3",
+                OperationKind::Get,
+                "k",
+                "a",
+                OperationOutcome::Ok,
+                10,
+                10,
+            ),
+            5,
+            6,
+        );
+
+        let anomalies = successful_read_anomalies(&[first, second, get]);
+
+        assert_eq!(anomalies.corrupted_reads.len(), 1);
     }
 
     /// A GET racing the latest in-flight write may legally observe the

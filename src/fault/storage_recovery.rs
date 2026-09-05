@@ -37,6 +37,7 @@ use crate::fault::{
     },
     history::{
         DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome, OperationRecord,
+        validate_history_phase_boundary, validate_history_scope_and_order,
     },
     preflight::{PreflightStatus, TARGET_PROOF_SCHEMA_VERSION, TargetProof, TargetProofStatus},
     quorum::{ErasureSetMembership, ErasureSetShape, PersistedVersionClass, QuorumRequirements},
@@ -1045,6 +1046,13 @@ impl PostReturnCheckerEvidence {
             .audit
             .as_ref()
             .context("post-return CheckerReport lacks its producer-native audit")?;
+        validate_history_scope_and_order(
+            history,
+            &identity.scenario,
+            &identity.run_id,
+            &identity.bucket,
+        )
+        .context("post-return checker history violates the run history contract")?;
         validate_sha256("post-return history prefix", &audit.history_prefix_sha256)?;
         validate_sha256("post-return checker suffix", &audit.history_suffix_sha256)?;
         ensure!(
@@ -1057,6 +1065,11 @@ impl PostReturnCheckerEvidence {
         );
         let history_prefix = &history[..audit.history_prefix_record_count];
         let history_suffix = &history[audit.history_prefix_record_count..];
+        validate_history_phase_boundary(
+            history_prefix,
+            history_suffix,
+            "post-return prefix/checker",
+        )?;
         validate_settled_current_mutations(history_prefix, identity)?;
         ensure!(
             history_prefix.iter().all(|record| {
@@ -5475,6 +5488,10 @@ mod tests {
             }
             history.push(record);
         }
+        for (index, record) in history.iter_mut().enumerate() {
+            record.started_sequence = Some((index as u64) * 2 + 1);
+            record.ended_sequence = Some((index as u64) * 2 + 2);
+        }
     }
 
     fn committed_current_state_for_test(
@@ -5622,6 +5639,44 @@ mod tests {
         )
         .expect("valid stale return fixture");
         (proof, history)
+    }
+
+    #[test]
+    fn post_return_checker_rejects_duplicate_recorder_sequence() {
+        let (mut proof, mut history) = stale_return_fixture();
+        let prefix_count = checker_prefix_record_count(&proof.post_return_checker);
+        history[prefix_count].started_sequence = history[0].started_sequence;
+        proof.post_return_checker = post_return_checker(&history);
+
+        let error = proof
+            .validate_against_history(&history)
+            .expect_err("duplicate recorder sequence must invalidate post-return evidence");
+
+        assert!(
+            format!("{error:#}").contains("duplicate recorder event sequence"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn post_return_checker_rejects_suffix_sequence_inside_prefix() {
+        let (mut proof, mut history) = stale_return_fixture();
+        let prefix_count = checker_prefix_record_count(&proof.post_return_checker);
+        let prefix_end = history[prefix_count - 1]
+            .ended_sequence
+            .expect("prefix end sequence");
+        let suffix_start = history[prefix_count]
+            .started_sequence
+            .expect("suffix start sequence");
+        history[prefix_count - 1].ended_sequence = Some(suffix_start);
+        history[prefix_count].started_sequence = Some(prefix_end);
+        proof.post_return_checker = post_return_checker(&history);
+
+        let error = proof
+            .validate_against_history(&history)
+            .expect_err("checker suffix cannot start before its prefix completes");
+
+        assert!(error.to_string().contains("post-return prefix/checker"));
     }
 
     #[test]
@@ -6098,12 +6153,16 @@ mod tests {
         );
 
         let mut overlapping_history = history[..checker_prefix_count].to_vec();
-        let put_end_sequence = overlapping_history[0]
-            .ended_sequence
-            .expect("PUT event sequence");
         overlapping_history[1].key = Some("key-a".to_string());
-        overlapping_history[1].started_sequence = Some(put_end_sequence.saturating_sub(1));
         append_post_return_checker_suffix(&mut overlapping_history);
+        let first_end = overlapping_history[0]
+            .ended_sequence
+            .expect("first mutation end sequence");
+        let second_start = overlapping_history[1]
+            .started_sequence
+            .expect("second mutation start sequence");
+        overlapping_history[0].ended_sequence = Some(second_start);
+        overlapping_history[1].started_sequence = Some(first_end);
         let mut overlapping_mutations = proof.clone();
         overlapping_mutations.committed_mutations[1].object_key = "key-a".to_string();
         overlapping_mutations.post_return_checker = post_return_checker(&overlapping_history);
@@ -6111,7 +6170,7 @@ mod tests {
             .validate_against_history(&overlapping_history)
             .expect_err("same-key overlapping mutations have no unique latest state");
         assert!(
-            error.to_string().contains("overlap"),
+            format!("{error:#}").contains("overlap"),
             "same-key mutation overlap must fail before latest-state inference: {error:#}"
         );
 
