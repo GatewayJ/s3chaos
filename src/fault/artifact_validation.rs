@@ -3466,17 +3466,29 @@ mod tests {
             "responseSha256": info_sha256,
             "responseBody": info_body
         });
-        let mut runtime_mutation = runtime_before.clone();
-        runtime_mutation["target"]["endpoint"]["clusterStartedAtMs"] = json!(91);
-        runtime_mutation["target"]["endpoint"]["clusterObservedAtMs"] = json!(91);
-        runtime_mutation["target"]["endpoint"]["serviceStartedAtMs"] = json!(92);
-        runtime_mutation["target"]["endpoint"]["serviceObservedAtMs"] = json!(92);
-        runtime_mutation["target"]["endpoint"]["tenantStartedAtMs"] = json!(93);
-        runtime_mutation["target"]["endpoint"]["tenantObservedAtMs"] = json!(93);
-        runtime_mutation["startedAtMs"] = json!(94);
-        runtime_mutation["observedAtMs"] = json!(94);
-        runtime_mutation["requestId"] = json!("admin-info-before-decommission");
+        let runtime_probe = |request_started_at_ms: u64| {
+            let mut probe = runtime_before.clone();
+            probe["target"]["endpoint"]["clusterStartedAtMs"] = json!(request_started_at_ms - 3);
+            probe["target"]["endpoint"]["clusterObservedAtMs"] = json!(request_started_at_ms - 3);
+            probe["target"]["endpoint"]["serviceStartedAtMs"] = json!(request_started_at_ms - 2);
+            probe["target"]["endpoint"]["serviceObservedAtMs"] = json!(request_started_at_ms - 2);
+            probe["target"]["endpoint"]["tenantStartedAtMs"] = json!(request_started_at_ms - 1);
+            probe["target"]["endpoint"]["tenantObservedAtMs"] = json!(request_started_at_ms - 1);
+            probe["startedAtMs"] = json!(request_started_at_ms - 1);
+            probe["observedAtMs"] = json!(request_started_at_ms - 1);
+            probe["requestId"] = json!(format!("admin-info-before-{request_started_at_ms}"));
+            probe
+        };
+        let request_target_at =
+            |request_started_at_ms| runtime_probe(request_started_at_ms)["target"].clone();
+        let runtime_mutation = runtime_probe(95);
         let mut runtime_after = runtime_before.clone();
+        runtime_after["target"]["endpoint"]["clusterStartedAtMs"] = json!(201);
+        runtime_after["target"]["endpoint"]["clusterObservedAtMs"] = json!(201);
+        runtime_after["target"]["endpoint"]["serviceStartedAtMs"] = json!(201);
+        runtime_after["target"]["endpoint"]["serviceObservedAtMs"] = json!(201);
+        runtime_after["target"]["endpoint"]["tenantStartedAtMs"] = json!(201);
+        runtime_after["target"]["endpoint"]["tenantObservedAtMs"] = json!(201);
         runtime_after["startedAtMs"] = json!(201);
         runtime_after["observedAtMs"] = json!(204);
         runtime_after["requestId"] = json!("admin-info-after");
@@ -3559,7 +3571,7 @@ mod tests {
                 "bytesMoved": 200,
                 "requests": [
                     {
-                        "target": request_target,
+                        "target": request_target_at(95),
                         "runtimeProbe": runtime_mutation,
                         "method": "POST",
                         "path": "/rustfs/admin/v3/pools/decommission",
@@ -3570,7 +3582,7 @@ mod tests {
                         "requestId": "decommission-start-request"
                     },
                     {
-                        "target": request_target,
+                        "target": request_target_at(195),
                         "method": "GET",
                         "path": "/rustfs/admin/v3/decommission/status",
                         "query": {"pool": "1", "by-id": "true"},
@@ -3601,12 +3613,13 @@ mod tests {
                     "runtime": runtime_before,
                     "observedAtMs": 90,
                     "request": {
-                        "target": request_target,
+                        "target": request_target_at(90),
+                        "runtimeProbe": runtime_probe(90),
                         "method": "GET",
                         "path": "/rustfs/admin/v3/pools/list",
                         "query": {},
                         "status": 200,
-                        "startedAtMs": 86,
+                        "startedAtMs": 90,
                         "observedAtMs": 90,
                         "responseSha256": pools_sha256,
                         "responseBody": pools_body
@@ -3632,12 +3645,13 @@ mod tests {
                     "runtime": runtime_after,
                     "observedAtMs": 210,
                     "request": {
-                        "target": request_target,
+                        "target": request_target_at(210),
+                        "runtimeProbe": runtime_probe(210),
                         "method": "GET",
                         "path": "/rustfs/admin/v3/pools/list",
                         "query": {},
                         "status": 200,
-                        "startedAtMs": 207,
+                        "startedAtMs": 210,
                         "observedAtMs": 210,
                         "responseSha256": pools_after_sha256,
                         "responseBody": pools_after_body

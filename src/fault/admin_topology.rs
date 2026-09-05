@@ -335,6 +335,15 @@ pub struct AdminEndpointIdentity {
 }
 
 impl AdminEndpointIdentity {
+    fn capture_within(&self, window: AdminAttemptWindow) -> bool {
+        window.contains(self.cluster_started_at_ms)
+            && window.contains(self.cluster_observed_at_ms)
+            && window.contains(self.service_started_at_ms)
+            && window.contains(self.service_observed_at_ms)
+            && window.contains(self.tenant_started_at_ms)
+            && window.contains(self.tenant_observed_at_ms)
+    }
+
     fn from_live_port_forward(port_forward: &mut PortForwardGuard) -> Result<Self> {
         let snapshot = port_forward.capture_target()?;
         let service: Value = serde_json::from_str(snapshot.service_response_body())
@@ -550,6 +559,17 @@ pub struct AdminRequestTarget {
     pub deployment_id: String,
 }
 
+impl AdminRequestTarget {
+    fn require_same_runtime_identity(&self, current: &Self) -> Result<()> {
+        self.endpoint.require_same_live_target(&current.endpoint)?;
+        ensure!(
+            self.deployment_id == current.deployment_id,
+            "RustFS deployment changed across admin evidence"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminRuntimeBinding {
@@ -608,12 +628,9 @@ impl AdminRuntimeBinding {
     fn require_same_runtime(&self, current: &Self) -> Result<()> {
         self.validate()?;
         current.validate()?;
-        self.target
-            .endpoint
-            .require_same_live_target(&current.target.endpoint)?;
+        self.target.require_same_runtime_identity(&current.target)?;
         ensure!(
-            self.target.deployment_id == current.target.deployment_id
-                && self.observed_at_ms <= current.started_at_ms,
+            self.observed_at_ms <= current.started_at_ms,
             "RustFS deployment changed before a destructive admin request"
         );
         Ok(())
@@ -626,27 +643,21 @@ impl AdminRequestEvidence {
         ensure!(
             !self.target.deployment_id.trim().is_empty()
                 && self.started_at_ms > 0
+                && self.target.endpoint.tenant_observed_at_ms <= self.started_at_ms
                 && self.started_at_ms <= self.observed_at_ms,
             "admin request evidence lacks a deployment or an ordered request interval"
         );
-        if self.method == Method::GET.as_str() {
+        if self.method != Method::GET.as_str() {
             ensure!(
-                self.runtime_probe.is_none(),
-                "read-only admin request unexpectedly carries a destructive-request runtime probe"
+                self.runtime_probe.is_some(),
+                "destructive admin request lacks its fresh RustFS runtime probe"
             );
-        } else {
-            let probe = self
-                .runtime_probe
-                .as_ref()
-                .context("destructive admin request lacks its fresh RustFS runtime probe")?;
+        }
+        if let Some(probe) = &self.runtime_probe {
             probe.validate()?;
-            self.target
-                .endpoint
-                .require_same_live_target(&probe.target.endpoint)?;
             ensure!(
-                probe.target.deployment_id == self.target.deployment_id
-                    && probe.observed_at_ms <= self.started_at_ms,
-                "destructive admin request is not preceded by a matching RustFS runtime probe"
+                probe.target == self.target && probe.observed_at_ms <= self.started_at_ms,
+                "admin request is not preceded by its exact fresh RustFS runtime probe"
             );
         }
         ensure!(
@@ -800,6 +811,14 @@ impl AdminPoolSnapshot {
         self.tenant_get.validate()?;
         self.runtime.validate()?;
         self.request.validate()?;
+        let request_runtime = self
+            .request
+            .runtime_probe
+            .as_ref()
+            .context("pools/list request lacks a fresh RustFS runtime probe")?;
+        self.runtime
+            .target
+            .require_same_runtime_identity(&request_runtime.target)?;
         self.runtime.target.endpoint.validate_for_tenant(
             &self.tenant_get.namespace,
             &self.tenant_get.name,
@@ -811,6 +830,9 @@ impl AdminPoolSnapshot {
                 && self.request.started_at_ms > 0
                 && self.request.started_at_ms <= self.request.observed_at_ms
                 && self.tenant_get.observed_at_ms < self.request.started_at_ms
+                && self.tenant_get.observed_at_ms
+                    <= request_runtime.target.endpoint.cluster_started_at_ms
+                && request_runtime.observed_at_ms <= self.request.started_at_ms
                 && self.request.method == "GET"
                 && self.request.path == "/rustfs/admin/v3/pools/list"
                 && self.request.query.is_empty()
@@ -818,7 +840,7 @@ impl AdminPoolSnapshot {
             "pool snapshot is not bound to one Kubernetes Tenant GET and one successful pools/list observation"
         );
         ensure!(
-            self.request.target == self.runtime.target
+            self.request.target == request_runtime.target
                 && self.tenant_get.kubernetes_context
                     == self.runtime.target.endpoint.kubernetes_context
                 && self.tenant_get.cluster_uid == self.runtime.target.endpoint.cluster_uid
@@ -928,17 +950,28 @@ impl RustfsAdminTopologyAdapter {
         probe_runtime_binding(&self.transport, endpoint).await
     }
 
-    async fn ensure_request_target(&self, method: &Method) -> Result<AdminRequestPreflight> {
+    async fn ensure_request_target(
+        &self,
+        method: &Method,
+        path: &str,
+    ) -> Result<AdminRequestPreflight> {
         let endpoint = self.ensure_port_forward_target()?;
-        let runtime_probe = if *method != Method::GET {
-            let current = probe_runtime_binding(&self.transport, endpoint).await?;
+        let target = AdminRequestTarget {
+            endpoint,
+            deployment_id: self.runtime.target.deployment_id.clone(),
+        };
+        let runtime_probe = if *method != Method::GET || path == "/rustfs/admin/v3/pools/list" {
+            let current = probe_runtime_binding(&self.transport, target.endpoint.clone()).await?;
             self.runtime.require_same_runtime(&current)?;
             Some(current)
         } else {
             None
         };
+        let target = runtime_probe
+            .as_ref()
+            .map_or(target, |probe| probe.target.clone());
         Ok(AdminRequestPreflight {
-            target: self.runtime.target.clone(),
+            target,
             runtime_probe,
         })
     }
@@ -949,7 +982,7 @@ impl RustfsAdminTopologyAdapter {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<AdminCall<T>> {
-        let preflight = self.ensure_request_target(&method).await?;
+        let preflight = self.ensure_request_target(&method, path).await?;
         let started_at_ms = now_ms();
         let response = self
             .transport
@@ -977,7 +1010,7 @@ impl RustfsAdminTopologyAdapter {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<AdminCall<()>> {
-        let preflight = self.ensure_request_target(&method).await?;
+        let preflight = self.ensure_request_target(&method, path).await?;
         let started_at_ms = now_ms();
         let response = self
             .transport
@@ -1716,15 +1749,13 @@ fn validate_pre_start_snapshot(
     operation_requests: &[AdminRequestEvidence],
 ) -> Result<()> {
     snapshot.validate_list_request()?;
+    validate_request_targets(operation_requests, &proof.runtime.target)?;
     ensure!(
         snapshot.attempt == proof.attempt,
         "pre-start pool snapshot does not belong to the current run/case/Tenant attempt"
     );
     ensure!(
-        snapshot.runtime == proof.runtime
-            && operation_requests
-                .iter()
-                .all(|request| request.target == proof.runtime.target),
+        snapshot.runtime == proof.runtime,
         "pre-start topology and destructive request transcript are not bound to the proven RustFS endpoint and deployment"
     );
     ensure!(
@@ -1773,16 +1804,14 @@ fn validate_post_operation_snapshot(
     operation_requests: &[AdminRequestEvidence],
 ) -> Result<()> {
     snapshot.validate_list_request()?;
+    proof
+        .runtime
+        .target
+        .require_same_runtime_identity(&snapshot.runtime.target)?;
+    validate_request_targets(operation_requests, &proof.runtime.target)?;
     ensure!(
         snapshot.attempt == proof.attempt,
         "post-operation pool snapshot does not belong to the current run/case/Tenant attempt"
-    );
-    ensure!(
-        snapshot.runtime.target == proof.runtime.target
-            && operation_requests
-                .iter()
-                .all(|request| request.target == proof.runtime.target),
-        "post-operation topology and request transcript changed RustFS endpoint or deployment"
     );
     ensure!(
         snapshot.tenant_get.namespace == proof.namespace
@@ -1795,7 +1824,9 @@ fn validate_post_operation_snapshot(
     let (_, _, terminal_status_observed_at_ms) =
         validate_start_before_status(operation_requests, &proof.scenario, proof.target_pool_id)?;
     ensure!(
-        terminal_status_observed_at_ms < snapshot.runtime.started_at_ms
+        terminal_status_observed_at_ms < snapshot.runtime.target.endpoint.cluster_started_at_ms
+            && snapshot.runtime.target.endpoint.tenant_observed_at_ms
+                <= snapshot.runtime.started_at_ms
             && snapshot.runtime.observed_at_ms < snapshot.tenant_get.started_at_ms
             && snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
             && snapshot.observed_at_ms >= snapshot.request.started_at_ms,
@@ -2106,18 +2137,20 @@ impl AdminOperationEvidence {
                 .all(|request| (200..300).contains(&request.status)),
             "admin operation evidence contains a failed HTTP request"
         );
-        ensure!(
-            self.requests
-                .iter()
-                .all(|request| request.target == self.pools_before.runtime.target)
-                && self.pools_after.runtime.target == self.pools_before.runtime.target,
-            "admin operation requests and topology snapshots do not share one endpoint/deployment identity"
-        );
+        self.pools_before
+            .runtime
+            .target
+            .require_same_runtime_identity(&self.pools_after.runtime.target)?;
+        validate_request_targets(&self.requests, &self.pools_before.runtime.target)?;
         validate_request_timing(&self.requests, attempt_window)?;
         let (start_started_at_ms, _, terminal_status_observed_at_ms) =
             validate_start_before_status(&self.requests, &self.scenario, self.target_pool_id)?;
         self.validate_terminal_status_response()?;
         self.pools_before.validate_list_request()?;
+        validate_request_timing(
+            std::slice::from_ref(&self.pools_before.request),
+            attempt_window,
+        )?;
         ensure!(
             self.pools_before.attempt == self.attempt
                 && attempt_window.contains(self.pools_before.runtime.started_at_ms)
@@ -2140,8 +2173,18 @@ impl AdminOperationEvidence {
         );
         validate_pool_wire_invariants("before", &self.pools_before.pools)?;
         self.pools_after.validate_list_request()?;
+        validate_request_timing(
+            std::slice::from_ref(&self.pools_after.request),
+            attempt_window,
+        )?;
         ensure!(
             self.pools_after.attempt == self.attempt
+                && self
+                    .pools_after
+                    .runtime
+                    .target
+                    .endpoint
+                    .capture_within(attempt_window)
                 && attempt_window.contains(self.pools_after.runtime.started_at_ms)
                 && attempt_window.contains(self.pools_after.runtime.observed_at_ms)
                 && attempt_window.contains(self.pools_after.tenant_get.started_at_ms)
@@ -2149,7 +2192,13 @@ impl AdminOperationEvidence {
                 && attempt_window.contains(self.pools_after.request.started_at_ms)
                 && attempt_window.contains(self.pools_after.request.observed_at_ms)
                 && attempt_window.contains(self.pools_after.observed_at_ms)
-                && terminal_status_observed_at_ms < self.pools_after.runtime.started_at_ms
+                && terminal_status_observed_at_ms
+                    < self
+                        .pools_after
+                        .runtime
+                        .target
+                        .endpoint
+                        .cluster_started_at_ms
                 && self.pools_after.runtime.observed_at_ms
                     < self.pools_after.tenant_get.started_at_ms
                 && self.pools_after.tenant_get.observed_at_ms
@@ -2634,6 +2683,7 @@ fn validate_request_timing(
         ensure!(
             attempt_window.contains(request.started_at_ms)
                 && attempt_window.contains(request.observed_at_ms)
+                && request.target.endpoint.capture_within(attempt_window)
                 && request.runtime_probe.as_ref().is_none_or(|probe| {
                     attempt_window.contains(probe.started_at_ms)
                         && attempt_window.contains(probe.observed_at_ms)
@@ -2648,14 +2698,21 @@ fn validate_request_timing(
         );
     }
     ensure!(
-        requests.windows(2).all(|pair| {
-            pair[1].runtime_probe.as_ref().map_or_else(
-                || pair[0].observed_at_ms <= pair[1].started_at_ms,
-                |probe| pair[0].observed_at_ms < probe.target.endpoint.cluster_started_at_ms,
-            )
-        }),
+        requests
+            .windows(2)
+            .all(|pair| pair[0].observed_at_ms < pair[1].target.endpoint.cluster_started_at_ms),
         "admin request and runtime-probe transcript intervals overlap or are not ordered"
     );
+    Ok(())
+}
+
+fn validate_request_targets(
+    requests: &[AdminRequestEvidence],
+    expected: &AdminRequestTarget,
+) -> Result<()> {
+    for request in requests {
+        expected.require_same_runtime_identity(&request.target)?;
+    }
     Ok(())
 }
 
@@ -3084,14 +3141,14 @@ pub fn validate_admin_topology_artifacts(
         "admin topology artifacts do not belong to the current run/case/Tenant attempt"
     );
     ensure!(
-        proof.runtime == operation.pools_before.runtime
-            && proof.runtime.target == operation.pools_after.runtime.target
-            && operation
-                .requests
-                .iter()
-                .all(|request| request.target == proof.runtime.target),
-        "admin topology artifacts mix Kubernetes endpoint or RustFS deployment identities"
+        proof.runtime == operation.pools_before.runtime,
+        "admin topology artifacts changed the pre-start RustFS runtime receipt"
     );
+    proof
+        .runtime
+        .target
+        .require_same_runtime_identity(&operation.pools_after.runtime.target)?;
+    validate_request_targets(&operation.requests, &proof.runtime.target)?;
     proof.require_satisfied()?;
     operation.require_success(attempt_window)?;
     validate_pre_start_snapshot(proof, &operation.pools_before, &operation.requests)?;
@@ -3274,19 +3331,27 @@ mod tests {
         }
     }
 
-    fn mutation_runtime_probe(request_started_at_ms: u64) -> Option<AdminRuntimeBinding> {
+    fn request_runtime_probe(request_started_at_ms: u64) -> AdminRuntimeBinding {
         let mut binding = runtime_binding(
             request_started_at_ms.saturating_sub(1),
             request_started_at_ms.saturating_sub(1),
         );
         let endpoint = &mut binding.target.endpoint;
-        endpoint.cluster_started_at_ms = request_started_at_ms.saturating_sub(4);
-        endpoint.cluster_observed_at_ms = request_started_at_ms.saturating_sub(4);
-        endpoint.service_started_at_ms = request_started_at_ms.saturating_sub(3);
-        endpoint.service_observed_at_ms = request_started_at_ms.saturating_sub(3);
-        endpoint.tenant_started_at_ms = request_started_at_ms.saturating_sub(2);
-        endpoint.tenant_observed_at_ms = request_started_at_ms.saturating_sub(2);
-        Some(binding)
+        endpoint.cluster_started_at_ms = request_started_at_ms.saturating_sub(3);
+        endpoint.cluster_observed_at_ms = request_started_at_ms.saturating_sub(3);
+        endpoint.service_started_at_ms = request_started_at_ms.saturating_sub(2);
+        endpoint.service_observed_at_ms = request_started_at_ms.saturating_sub(2);
+        endpoint.tenant_started_at_ms = request_started_at_ms.saturating_sub(1);
+        endpoint.tenant_observed_at_ms = request_started_at_ms.saturating_sub(1);
+        binding
+    }
+
+    fn fresh_request_target(request_started_at_ms: u64) -> AdminRequestTarget {
+        request_runtime_probe(request_started_at_ms).target
+    }
+
+    fn mutation_runtime_probe(request_started_at_ms: u64) -> Option<AdminRuntimeBinding> {
+        Some(request_runtime_probe(request_started_at_ms))
     }
 
     fn context(scenario: &str) -> AdminTopologyBuildContext {
@@ -3372,7 +3437,7 @@ mod tests {
     fn rebalance_requests() -> Vec<AdminRequestEvidence> {
         let mut requests = vec![
             AdminRequestEvidence {
-                target: request_target(),
+                target: fresh_request_target(95),
                 runtime_probe: mutation_runtime_probe(95),
                 method: "POST".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/start"),
@@ -3385,7 +3450,7 @@ mod tests {
                 response_body: None,
             },
             AdminRequestEvidence {
-                target: request_target(),
+                target: fresh_request_target(195),
                 runtime_probe: None,
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/status"),
@@ -3423,7 +3488,7 @@ mod tests {
         requests.insert(
             1,
             AdminRequestEvidence {
-                target: request_target(),
+                target: fresh_request_target(110),
                 runtime_probe: None,
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/status"),
@@ -3460,7 +3525,7 @@ mod tests {
         let pool_id = pool_id.to_string();
         let mut requests = vec![
             AdminRequestEvidence {
-                target: request_target(),
+                target: fresh_request_target(95),
                 runtime_probe: mutation_runtime_probe(95),
                 method: "POST".to_string(),
                 path: format!("{ADMIN_PREFIX}/pools/decommission"),
@@ -3476,7 +3541,7 @@ mod tests {
                 response_body: None,
             },
             AdminRequestEvidence {
-                target: request_target(),
+                target: fresh_request_target(195),
                 runtime_probe: None,
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/decommission/status"),
@@ -3519,7 +3584,7 @@ mod tests {
             requests.insert(
                 1,
                 AdminRequestEvidence {
-                    target: request_target(),
+                    target: fresh_request_target(started_at_ms),
                     runtime_probe: None,
                     method: "GET".to_string(),
                     path: format!("{ADMIN_PREFIX}/decommission/status"),
@@ -3593,24 +3658,22 @@ mod tests {
         pools: Vec<AdminPool>,
         observed_at_ms: u64,
     ) -> AdminPoolSnapshot {
-        let (tenant_started_at_ms, tenant_observed_at_ms, list_started_at_ms) =
-            if observed_at_ms < 200 {
-                (
-                    observed_at_ms.saturating_sub(10),
-                    observed_at_ms.saturating_sub(5),
-                    observed_at_ms.saturating_sub(4),
-                )
-            } else {
-                (
-                    observed_at_ms.saturating_sub(5),
-                    observed_at_ms.saturating_sub(4),
-                    observed_at_ms.saturating_sub(3),
-                )
-            };
+        let (tenant_started_at_ms, tenant_observed_at_ms) = if observed_at_ms < 200 {
+            (
+                observed_at_ms.saturating_sub(10),
+                observed_at_ms.saturating_sub(5),
+            )
+        } else {
+            (
+                observed_at_ms.saturating_sub(5),
+                observed_at_ms.saturating_sub(4),
+            )
+        };
+        let list_started_at_ms = observed_at_ms;
         let request = with_json_response(
             AdminRequestEvidence {
-                target: request_target(),
-                runtime_probe: None,
+                target: fresh_request_target(list_started_at_ms),
+                runtime_probe: Some(request_runtime_probe(list_started_at_ms)),
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/pools/list"),
                 query: BTreeMap::new(),
@@ -3627,7 +3690,7 @@ mod tests {
         let runtime = if observed_at_ms < 200 {
             runtime_binding(60, 70)
         } else {
-            runtime_binding(201, 204)
+            request_runtime_probe(205)
         };
         AdminPoolSnapshot {
             attempt: attempt(scenario),
@@ -3776,6 +3839,11 @@ mod tests {
             Some("rustfs-admin-request-1")
         );
         assert_eq!(response.request.response_body.as_deref(), Some("[]"));
+        assert!(response.request.runtime_probe.is_some());
+        assert_eq!(
+            response.request.target,
+            response.request.runtime_probe.unwrap().target
+        );
         server.abort();
     }
 
@@ -3886,8 +3954,8 @@ mod tests {
                 value: current_pools.clone(),
                 request: with_json_response(
                     AdminRequestEvidence {
-                        target: request_target(),
-                        runtime_probe: None,
+                        target: fresh_request_target(85),
+                        runtime_probe: Some(request_runtime_probe(85)),
                         method: "GET".to_string(),
                         path: format!("{ADMIN_PREFIX}/pools/list"),
                         query: BTreeMap::new(),
@@ -3924,8 +3992,8 @@ mod tests {
                     value: current_pools.clone(),
                     request: with_json_response(
                         AdminRequestEvidence {
-                            target: request_target(),
-                            runtime_probe: None,
+                            target: fresh_request_target(85),
+                            runtime_probe: Some(request_runtime_probe(85)),
                             method: "GET".to_string(),
                             path: format!("{ADMIN_PREFIX}/pools/list"),
                             query: BTreeMap::new(),
@@ -3958,8 +4026,8 @@ mod tests {
                     value: current_pools.clone(),
                     request: with_json_response(
                         AdminRequestEvidence {
-                            target: request_target(),
-                            runtime_probe: None,
+                            target: fresh_request_target(85),
+                            runtime_probe: Some(request_runtime_probe(85)),
                             method: "GET".to_string(),
                             path: format!("{ADMIN_PREFIX}/pools/list"),
                             query: BTreeMap::new(),
@@ -4607,6 +4675,14 @@ mod tests {
             &operation,
         )
         .unwrap();
+        assert_ne!(
+            proof.runtime.target, operation.pools_after.runtime.target,
+            "post-operation runtime must retain its fresh observation receipt"
+        );
+        assert_ne!(
+            operation.pools_after.runtime.target, operation.pools_after.request.target,
+            "pools/list must retain its own later observation receipt"
+        );
         let mut missing_runtime_probe = operation.clone();
         missing_runtime_probe.requests[0].runtime_probe = None;
         assert!(
@@ -4621,12 +4697,14 @@ mod tests {
             "destructive request must retain its fresh RustFS runtime probe"
         );
         let mut stale_endpoint_probe = operation.clone();
+        let initial_endpoint = proof.runtime.target.endpoint.clone();
+        stale_endpoint_probe.requests[0].target.endpoint = initial_endpoint.clone();
         stale_endpoint_probe.requests[0]
             .runtime_probe
             .as_mut()
             .expect("runtime probe")
             .target
-            .endpoint = proof.runtime.target.endpoint.clone();
+            .endpoint = initial_endpoint;
         assert!(
             validate_admin_topology_artifacts(
                 ADMIN_DECOMMISSION_SCENARIO,
@@ -4835,7 +4913,7 @@ mod tests {
         );
         operation.canceled_or_stopped = false;
         operation.requests.push(AdminRequestEvidence {
-            target: request_target(),
+            target: fresh_request_target(240),
             runtime_probe: mutation_runtime_probe(240),
             method: "POST".to_string(),
             path: format!("{ADMIN_PREFIX}/pools/cancel"),
@@ -4873,7 +4951,7 @@ mod tests {
         ] {
             let mut injected_mutation = operation.clone();
             injected_mutation.requests.push(AdminRequestEvidence {
-                target: request_target(),
+                target: fresh_request_target(240),
                 runtime_probe: mutation_runtime_probe(240),
                 method: "POST".to_string(),
                 path,
@@ -4991,7 +5069,7 @@ mod tests {
         repeated_terminal_operation
             .requests
             .push(AdminRequestEvidence {
-                target: request_target(),
+                target: fresh_request_target(205),
                 runtime_probe: None,
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/status"),
@@ -5150,7 +5228,7 @@ mod tests {
 
         let mut wrong_terminal_request = operation.clone();
         wrong_terminal_request.requests.push(AdminRequestEvidence {
-            target: request_target(),
+            target: fresh_request_target(205),
             runtime_probe: None,
             method: "GET".to_string(),
             path: format!("{ADMIN_PREFIX}/decommission/status"),
@@ -5210,7 +5288,7 @@ mod tests {
             bytes_moved: Some(20),
             requests: vec![
                 AdminRequestEvidence {
-                    target: request_target(),
+                    target: fresh_request_target(95),
                     runtime_probe: mutation_runtime_probe(95),
                     method: "POST".to_string(),
                     path: format!("{ADMIN_PREFIX}/rebalance/start"),
@@ -5223,7 +5301,7 @@ mod tests {
                     response_body: None,
                 },
                 AdminRequestEvidence {
-                    target: request_target(),
+                    target: fresh_request_target(195),
                     runtime_probe: None,
                     method: "GET".to_string(),
                     path: format!("{ADMIN_PREFIX}/rebalance/status"),
