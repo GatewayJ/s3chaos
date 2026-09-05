@@ -211,12 +211,37 @@ pub struct EmptyVolumeObservation {
     pub filesystem_uuid: String,
     pub rustfs_process_can_access_volume: bool,
     pub data_entries: Vec<String>,
+    pub scan_response_sha256: String,
+    pub scan_response_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmptyVolumeScanResponse {
+    pub persistent_volume_uid: String,
+    pub canonical_device: String,
+    pub filesystem_uuid: String,
+    pub rustfs_process_can_access_volume: bool,
+    pub scan_started_at_ms: u64,
+    pub scan_completed_at_ms: u64,
+    pub exhaustive: bool,
+    pub data_entries: Vec<String>,
 }
 
 impl EmptyVolumeObservation {
     fn validate(&self, replacement: &StorageVolumeIdentity) -> Result<()> {
+        validate_sha256("empty-volume scan response", &self.scan_response_sha256)?;
         ensure!(
-            self.observed_at_ms > 0 && self.observed_at_ms <= replacement.observed_at_ms,
+            self.scan_response_sha256 == sha256_bytes(self.scan_response_body.as_bytes()),
+            "empty-volume scan response digest does not match its captured body"
+        );
+        let response = serde_json::from_str::<EmptyVolumeScanResponse>(&self.scan_response_body)
+            .context("decode captured empty-volume scan response")?;
+        ensure!(
+            response.scan_started_at_ms > 0
+                && response.scan_started_at_ms < response.scan_completed_at_ms
+                && response.scan_completed_at_ms == self.observed_at_ms
+                && self.observed_at_ms <= replacement.observed_at_ms,
             "empty-volume observation must precede the replacement identity observation"
         );
         ensure!(
@@ -232,6 +257,16 @@ impl EmptyVolumeObservation {
         ensure!(
             self.data_entries.is_empty(),
             "replacement volume contains data entries before RustFS adoption"
+        );
+        ensure!(
+            response.persistent_volume_uid == self.persistent_volume_uid
+                && response.canonical_device == self.canonical_device
+                && response.filesystem_uuid == self.filesystem_uuid
+                && response.rustfs_process_can_access_volume
+                    == self.rustfs_process_can_access_volume
+                && response.data_entries == self.data_entries
+                && response.exhaustive,
+            "empty-volume fields are not derived from one exhaustive host scan response"
         );
         Ok(())
     }
@@ -572,6 +607,7 @@ pub enum ShardMappingSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RustfsShardMutationMappingResponse {
+    pub bucket: String,
     pub object_key: String,
     pub version_id: String,
     pub object_sha256: String,
@@ -648,9 +684,46 @@ pub struct ShardMutationProof {
     pub byte_length: u64,
     pub original_sha256: String,
     pub mutated_sha256: String,
+    pub host_mutation_evidence: Option<ShardMutationHostEvidence>,
     pub rollback: ShardRollbackObservation,
     pub mapped_at_ms: u64,
     pub mutated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShardMutationHostReceipt {
+    pub shard_path: String,
+    pub shard_device_id: String,
+    pub shard_inode: u64,
+    pub shard_size_bytes: u64,
+    pub byte_offset: u64,
+    pub byte_length: u64,
+    pub original_sha256: String,
+    pub mutated_sha256: String,
+    pub rollback_sha256: String,
+    pub original_observed_at_ms: u64,
+    pub pwrite_completed_at_ms: u64,
+    pub mutation_fsync_completed_at_ms: u64,
+    pub mutation_fstat_observed_at_ms: u64,
+    pub mutated_readback_at_ms: u64,
+    pub rollback_pwrite_completed_at_ms: u64,
+    pub rollback_fsync_completed_at_ms: u64,
+    pub rollback_fstat_observed_at_ms: u64,
+    pub rollback_readback_at_ms: u64,
+    pub pwrite_bytes: u64,
+    pub rollback_pwrite_bytes: u64,
+    pub mutation_fsync_succeeded: bool,
+    pub rollback_fsync_succeeded: bool,
+    pub target_proof_sha256: String,
+    pub host_storage_proof_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShardMutationHostEvidence {
+    pub response_sha256: String,
+    pub response_body: String,
 }
 
 impl ShardMutationProof {
@@ -694,7 +767,8 @@ impl ShardMutationProof {
             serde_json::from_str::<RustfsShardMutationMappingResponse>(&self.mapping_response_body)
                 .context("decode captured RustFS shard mutation mapping response")?;
         ensure!(
-            mapping_response.object_key == self.object_key
+            mapping_response.bucket == self.identity.bucket
+                && mapping_response.object_key == self.object_key
                 && mapping_response.version_id == self.version_id
                 && mapping_response.object_sha256 == self.expected_object_sha256
                 && mapping_response.drive_uuid == self.volume.rustfs_drive_uuid
@@ -753,6 +827,73 @@ impl ShardMutationProof {
             self.shard_inode > 0 && self.shard_size_bytes > 0 && byte_end <= self.shard_size_bytes,
             "shard mutation range must fall inside the proven non-empty shard inode"
         );
+        let host_evidence = self
+            .host_mutation_evidence
+            .as_ref()
+            .context("shard mutation lacks a captured host-helper receipt")?;
+        validate_sha256("host mutation receipt", &host_evidence.response_sha256)?;
+        ensure!(
+            host_evidence.response_sha256 == sha256_bytes(host_evidence.response_body.as_bytes()),
+            "host mutation receipt digest does not match its captured body"
+        );
+        let host_receipt =
+            serde_json::from_str::<ShardMutationHostReceipt>(&host_evidence.response_body)
+                .context("decode captured shard-mutation host-helper receipt")?;
+        for (field, value) in [
+            (
+                "receipt original shard",
+                host_receipt.original_sha256.as_str(),
+            ),
+            (
+                "receipt mutated shard",
+                host_receipt.mutated_sha256.as_str(),
+            ),
+            (
+                "receipt rollback shard",
+                host_receipt.rollback_sha256.as_str(),
+            ),
+        ] {
+            validate_sha256(field, value)?;
+        }
+        ensure!(
+            host_receipt.shard_path == self.shard_path
+                && host_receipt.shard_device_id == self.shard_device_id
+                && host_receipt.shard_inode == self.shard_inode
+                && host_receipt.shard_size_bytes == self.shard_size_bytes
+                && host_receipt.byte_offset == self.byte_offset
+                && host_receipt.byte_length == self.byte_length
+                && host_receipt.pwrite_bytes == self.byte_length
+                && host_receipt.rollback_pwrite_bytes == self.byte_length
+                && host_receipt.original_sha256 == self.original_sha256
+                && host_receipt.mutated_sha256 == self.mutated_sha256
+                && host_receipt.rollback_sha256 == self.rollback.observed_sha256
+                && host_receipt.target_proof_sha256 == self.volume.target_proof_sha256
+                && host_receipt.host_storage_proof_sha256 == self.volume.host_storage_proof_sha256
+                && host_receipt.mutation_fsync_succeeded
+                && host_receipt.rollback_fsync_succeeded,
+            "shard mutation fields are not derived from a successful host-helper receipt for the proven inode"
+        );
+        ensure!(
+            host_receipt.original_observed_at_ms >= self.path_containment.observed_at_ms
+                && host_receipt.original_observed_at_ms < host_receipt.pwrite_completed_at_ms
+                && host_receipt.pwrite_completed_at_ms
+                    <= host_receipt.mutation_fsync_completed_at_ms
+                && host_receipt.mutation_fsync_completed_at_ms
+                    <= host_receipt.mutation_fstat_observed_at_ms
+                && host_receipt.mutation_fstat_observed_at_ms
+                    <= host_receipt.mutated_readback_at_ms
+                && host_receipt.mutated_readback_at_ms == self.mutated_at_ms
+                && host_receipt.mutated_readback_at_ms
+                    < host_receipt.rollback_pwrite_completed_at_ms
+                && host_receipt.rollback_pwrite_completed_at_ms
+                    <= host_receipt.rollback_fsync_completed_at_ms
+                && host_receipt.rollback_fsync_completed_at_ms
+                    <= host_receipt.rollback_fstat_observed_at_ms
+                && host_receipt.rollback_fstat_observed_at_ms
+                    <= host_receipt.rollback_readback_at_ms
+                && host_receipt.rollback_readback_at_ms == self.rollback.observed_at_ms,
+            "host-helper pwrite, fsync, fstat, readback, and rollback receipt is not strictly ordered"
+        );
         ensure!(
             self.original_sha256 != self.mutated_sha256,
             "shard mutation did not change the shard hash"
@@ -790,14 +931,18 @@ impl ShardMutationProof {
                         .is_some_and(|status| (200..300).contains(&status))
                     && record.key.as_deref() == Some(self.object_key.as_str())
                     && record.version_id.as_deref() == Some(self.version_id.as_str())
-                    && record.value_sha256.as_deref() == Some(self.expected_object_sha256.as_str())
                     && valid_operation_interval(record)
                     && record.ended_at_ms <= self.mapped_at_ms
             })
-            .count();
+            .collect::<Vec<_>>();
+        let [committed_write] = matching_history.as_slice() else {
+            anyhow::bail!(
+                "shard mapping must match exactly one committed object version identity in workload history"
+            )
+        };
         ensure!(
-            matching_history == 1,
-            "shard mapping must match exactly one committed object version in workload history"
+            committed_write.value_sha256.as_deref() == Some(self.expected_object_sha256.as_str()),
+            "committed object version identity has a conflicting content hash"
         );
         Ok(())
     }
@@ -866,6 +1011,30 @@ pub struct HealProgressSample {
     pub scanned: u64,
     pub repaired: u64,
     pub failed: u64,
+    pub status_evidence: Option<HealStatusEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealStatusEvidence {
+    pub api_revision: String,
+    pub response_sha256: String,
+    pub response_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RustfsHealStatusResponse {
+    pub observer: HealObserverIdentity,
+    pub observed_at_ms: u64,
+    pub state: HealProgressState,
+    pub scanned: u64,
+    pub repaired: u64,
+    pub failed: u64,
+    pub cluster_definitive: bool,
+    pub target_drive_uuid: Option<String>,
+    pub pool_index: u32,
+    pub set_index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -958,6 +1127,36 @@ impl HealSummary {
                 sample.observer == self.observer,
                 "heal progress observer identity does not match the summary"
             );
+            let status_evidence = sample
+                .status_evidence
+                .as_ref()
+                .context("heal progress sample lacks a captured RustFS status response")?;
+            ensure!(
+                !status_evidence.api_revision.trim().is_empty(),
+                "heal progress status response lacks an API revision"
+            );
+            validate_sha256("heal status response", &status_evidence.response_sha256)?;
+            ensure!(
+                status_evidence.response_sha256
+                    == sha256_bytes(status_evidence.response_body.as_bytes()),
+                "heal status response digest does not match its captured body"
+            );
+            let response =
+                serde_json::from_str::<RustfsHealStatusResponse>(&status_evidence.response_body)
+                    .context("decode captured RustFS heal status response")?;
+            ensure!(
+                response.observer == sample.observer
+                    && response.observed_at_ms == sample.observed_at_ms
+                    && response.state == sample.state
+                    && response.scanned == sample.scanned
+                    && response.repaired == sample.repaired
+                    && response.failed == sample.failed
+                    && response.cluster_definitive == self.cluster_definitive
+                    && response.target_drive_uuid == self.target_drive_uuid
+                    && response.pool_index == self.pool_index
+                    && response.set_index == self.set_index,
+                "heal progress fields are not derived from the captured RustFS status response"
+            );
             ensure!(
                 sample.observed_at_ms >= self.started_at_ms
                     && sample.observed_at_ms <= self.completed_at_ms,
@@ -1028,6 +1227,7 @@ pub struct VersionShardMappingObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RustfsVersionShardMappingResponse {
+    pub bucket: String,
     pub object_key: String,
     pub version_id: String,
     pub object_sha256: String,
@@ -1062,10 +1262,43 @@ pub struct ForceReadThroughProof {
     pub repaired_shard_id: String,
     pub target_proof_sha256: String,
     pub fault_evidence_sha256: String,
+    pub fault_evidence_body: Option<String>,
     pub unavailable_shards: Vec<UnavailableShardObservation>,
     pub fault_active_from_ms: u64,
     pub fault_active_until_ms: u64,
     pub probes: Vec<ForcedReadProbe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageFaultPodIdentity {
+    name: String,
+    uid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StorageFaultStatusSnapshot {
+    stage: String,
+    resource_kind: Option<String>,
+    resource_name: Option<String>,
+    chaos_status: Option<serde_json::Value>,
+    dm_status: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StorageFaultEvidenceResponse {
+    scenario: String,
+    run_id: String,
+    injected: bool,
+    active_during_workload: bool,
+    pods_at_fault_activation: Vec<StorageFaultPodIdentity>,
+    pods_at_workload_snapshot: Vec<StorageFaultPodIdentity>,
+    active_snapshots: Vec<StorageFaultStatusSnapshot>,
+    workload_snapshots: Vec<StorageFaultStatusSnapshot>,
+    fault_active_at_ms: Option<u64>,
+    workload_started_at_ms: Option<u64>,
+    workload_ended_at_ms: Option<u64>,
+    fault_delete_started_at_ms: Option<u64>,
 }
 
 impl ForceReadThroughProof {
@@ -1095,6 +1328,8 @@ impl ForceReadThroughProof {
         membership.validate(&self.shape)?;
         validate_sha256("target proof", &self.target_proof_sha256)?;
         validate_sha256("fault evidence", &self.fault_evidence_sha256)?;
+        let (evidence_pods, evidence_snapshot_id, evidence_resource_id) =
+            self.validate_fault_evidence()?;
         ensure!(
             self.persisted_version_class == PersistedVersionClass::DataObject,
             "force-read heal proof requires a data-bearing object version"
@@ -1191,20 +1426,17 @@ impl ForceReadThroughProof {
             validate_unique_nonempty("version-shard mapping shard id", &response.shard_ids, true)?;
             mappings_by_id.insert(mapping.observation_id.as_str(), (mapping, response));
         }
-        let mut fault_resources = BTreeSet::new();
         let mut snapshot_ids = BTreeSet::new();
         let target_pods = target_selected_pods
             .iter()
-            .map(String::as_str)
+            .cloned()
             .collect::<BTreeSet<_>>();
-        let evidence_pods = fault_selected_pods
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
+        let reported_evidence_pods = fault_selected_pods.iter().cloned().collect::<BTreeSet<_>>();
         ensure!(
             target_pods.len() == target_selected_pods.len()
-                && evidence_pods.len() == fault_selected_pods.len()
-                && target_pods == evidence_pods,
+                && reported_evidence_pods.len() == fault_selected_pods.len()
+                && target_pods == evidence_pods
+                && reported_evidence_pods == evidence_pods,
             "target proof and active fault evidence select different Pods"
         );
         let selected_membership_shards = membership
@@ -1216,7 +1448,7 @@ impl ForceReadThroughProof {
         let unavailable_pods = self
             .unavailable_shards
             .iter()
-            .map(|observation| observation.pod_name.as_str())
+            .map(|observation| observation.pod_name.clone())
             .collect::<BTreeSet<_>>();
         ensure!(
             unavailable_pods == target_pods && selected_membership_shards == unavailable,
@@ -1239,9 +1471,8 @@ impl ForceReadThroughProof {
                     && member.shard_ids.contains(&observation.drive_uuid)
                     && observation.pool_index == self.shape.pool_index
                     && observation.set_index == self.shape.set_index
-                    && !observation.fault_resource_id.trim().is_empty()
-                    && fault_resources.insert(observation.fault_resource_id.as_str())
-                    && !observation.active_snapshot_id.trim().is_empty()
+                    && observation.fault_resource_id == evidence_resource_id
+                    && observation.active_snapshot_id == evidence_snapshot_id
                     && observation.active_from_ms <= self.fault_active_from_ms
                     && observation.active_until_ms >= self.fault_active_until_ms
                     && observation.target_proof_sha256 == self.target_proof_sha256
@@ -1285,6 +1516,7 @@ impl ForceReadThroughProof {
                 })?;
             ensure!(
                 used_mapping_ids.insert(mapping.observation_id.as_str())
+                    && response.bucket == self.identity.bucket
                     && response.object_key == probe.object_key
                     && response.version_id == probe.version_id
                     && response.object_sha256 == probe.expected_sha256
@@ -1310,7 +1542,6 @@ impl ForceReadThroughProof {
                             .is_some_and(|status| (200..300).contains(&status))
                         && record.key.as_deref() == Some(probe.object_key.as_str())
                         && record.version_id.as_deref() == Some(probe.version_id.as_str())
-                        && record.value_sha256.as_deref() == Some(probe.expected_sha256.as_str())
                         && record.durability_cohort == Some(DurabilityCohort::PreFault)
                         && matches!(
                             record.fault_window_relation,
@@ -1322,9 +1553,13 @@ impl ForceReadThroughProof {
                 .collect::<Vec<_>>();
             let [committed_write] = committed_writes.as_slice() else {
                 anyhow::bail!(
-                    "force-read probe must match exactly one successful pre-fault PUT or multipart completion"
+                    "force-read probe must match exactly one successful pre-fault object version identity"
                 )
             };
+            ensure!(
+                committed_write.value_sha256.as_deref() == Some(probe.expected_sha256.as_str()),
+                "force-read object version identity has a conflicting committed content hash"
+            );
             ensure!(
                 mapping.observed_at_ms >= committed_write.ended_at_ms,
                 "version-shard mapping was observed before the committed object version existed"
@@ -1361,12 +1596,159 @@ impl ForceReadThroughProof {
         );
         Ok(())
     }
+
+    fn validate_fault_evidence(&self) -> Result<(BTreeSet<String>, String, String)> {
+        let body = self
+            .fault_evidence_body
+            .as_deref()
+            .context("force-read proof lacks captured fault-evidence.json")?;
+        ensure!(
+            self.fault_evidence_sha256 == sha256_bytes(body.as_bytes()),
+            "force-read fault-evidence digest does not match its captured body"
+        );
+        let evidence = serde_json::from_str::<StorageFaultEvidenceResponse>(body)
+            .context("decode captured force-read fault evidence")?;
+        ensure!(
+            evidence.run_id == self.identity.run_id
+                && evidence.scenario == self.identity.scenario
+                && evidence.injected
+                && evidence.active_during_workload,
+            "force-read fault evidence is not the active fault from this scenario run"
+        );
+        let active_at = evidence
+            .fault_active_at_ms
+            .context("force-read fault evidence lacks activation time")?;
+        let workload_started = evidence
+            .workload_started_at_ms
+            .context("force-read fault evidence lacks workload start time")?;
+        let workload_ended = evidence
+            .workload_ended_at_ms
+            .context("force-read fault evidence lacks workload end time")?;
+        let delete_started = evidence
+            .fault_delete_started_at_ms
+            .context("force-read fault evidence lacks fault-delete start time")?;
+        ensure!(
+            active_at == self.fault_active_from_ms
+                && delete_started == self.fault_active_until_ms
+                && active_at <= workload_started
+                && workload_started <= workload_ended
+                && workload_ended <= delete_started,
+            "force-read window is not derived from the captured fault lifecycle"
+        );
+        let active_pods =
+            unique_storage_fault_pods("activation", &evidence.pods_at_fault_activation)?;
+        let workload_pods =
+            unique_storage_fault_pods("workload", &evidence.pods_at_workload_snapshot)?;
+        ensure!(
+            !active_pods.is_empty() && active_pods == workload_pods,
+            "force-read selected Pod identities changed while the fault was active"
+        );
+        let [active_snapshot] = evidence.active_snapshots.as_slice() else {
+            anyhow::bail!("force-read fault evidence must contain one active snapshot")
+        };
+        let [workload_snapshot] = evidence.workload_snapshots.as_slice() else {
+            anyhow::bail!("force-read fault evidence must contain one workload snapshot")
+        };
+        ensure!(
+            active_snapshot.stage == "active"
+                && workload_snapshot.stage == "after-workload"
+                && active_snapshot.resource_kind == workload_snapshot.resource_kind
+                && active_snapshot.resource_name == workload_snapshot.resource_name,
+            "force-read fault snapshots do not identify one resource across the active window"
+        );
+        let resource_kind = active_snapshot
+            .resource_kind
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .context("force-read active snapshot lacks a resource kind")?;
+        ensure!(
+            resource_kind == "iochaos",
+            "force-read exact-quorum proof requires a RustFS volume IOChaos resource"
+        );
+        let name = active_snapshot
+            .resource_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .context("force-read IOChaos snapshot lacks a resource name")?;
+        validate_active_iochaos_snapshot(active_snapshot, name)?;
+        validate_active_iochaos_snapshot(workload_snapshot, name)?;
+        let resource_id = format!("{resource_kind}/{name}");
+        let snapshot_id = sha256_bytes(&serde_json::to_vec(active_snapshot)?);
+        Ok((
+            active_pods.keys().cloned().collect(),
+            snapshot_id,
+            resource_id,
+        ))
+    }
+}
+
+fn validate_active_iochaos_snapshot(
+    snapshot: &StorageFaultStatusSnapshot,
+    expected_name: &str,
+) -> Result<()> {
+    ensure!(
+        snapshot.dm_status.is_none(),
+        "force-read IOChaos snapshot unexpectedly contains device-mapper status"
+    );
+    let resource = snapshot
+        .chaos_status
+        .as_ref()
+        .context("force-read IOChaos snapshot lacks the captured resource")?;
+    ensure!(
+        resource
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+            == Some(expected_name)
+            && resource
+                .pointer("/status/experiment/desiredPhase")
+                .and_then(serde_json::Value::as_str)
+                == Some("Run"),
+        "force-read IOChaos snapshot does not identify the active resource"
+    );
+    let conditions = resource
+        .pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array)
+        .context("force-read IOChaos snapshot lacks status conditions")?;
+    for (condition_type, expected_status) in [
+        ("Selected", "True"),
+        ("AllInjected", "True"),
+        ("AllRecovered", "False"),
+    ] {
+        ensure!(
+            conditions.iter().any(|condition| {
+                condition.get("type").and_then(serde_json::Value::as_str) == Some(condition_type)
+                    && condition.get("status").and_then(serde_json::Value::as_str)
+                        == Some(expected_status)
+            }),
+            "force-read IOChaos snapshot lacks active {condition_type}={expected_status} status"
+        );
+    }
+    Ok(())
+}
+
+fn unique_storage_fault_pods<'a>(
+    stage: &str,
+    pods: &'a [StorageFaultPodIdentity],
+) -> Result<BTreeMap<String, &'a str>> {
+    let mut identities = BTreeMap::new();
+    for pod in pods {
+        ensure!(
+            !pod.name.trim().is_empty()
+                && !pod.uid.trim().is_empty()
+                && identities
+                    .insert(pod.name.clone(), pod.uid.as_str())
+                    .is_none(),
+            "force-read {stage} fault evidence contains an empty or duplicate Pod identity"
+        );
+    }
+    Ok(identities)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShardInventoryEntry {
     pub fragment_id: String,
+    pub bucket: String,
     pub object_key: String,
     pub version_id: String,
     pub drive_uuid: String,
@@ -1396,12 +1778,15 @@ pub struct ShardInventoryScanReceipt {
     pub api_revision: String,
     pub response_sha256: String,
     pub response_body: String,
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
     pub observed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RustfsShardInventoryResponse {
+    pub bucket: String,
     pub drive_uuid: String,
     pub filesystem_uuid: String,
     pub start_cursor: Option<String>,
@@ -1445,6 +1830,7 @@ impl ShardInventoryEntry {
     fn validate(&self) -> Result<()> {
         for (field, value) in [
             ("fragment id", self.fragment_id.as_str()),
+            ("bucket", self.bucket.as_str()),
             ("object key", self.object_key.as_str()),
             ("version id", self.version_id.as_str()),
             ("drive UUID", self.drive_uuid.as_str()),
@@ -1488,6 +1874,9 @@ impl ShardInventorySnapshot {
             !self.receipt.snapshot_id.trim().is_empty()
                 && self.receipt.source == ShardInventorySource::RustfsDiagnosticApi
                 && !self.receipt.api_revision.trim().is_empty()
+                && self.receipt.started_at_ms > 0
+                && self.receipt.started_at_ms < self.receipt.completed_at_ms
+                && self.receipt.completed_at_ms == self.receipt.observed_at_ms
                 && self.receipt.observed_at_ms >= self.volume.observed_at_ms,
             "shard inventory lacks a complete, ordered scan receipt"
         );
@@ -1501,7 +1890,8 @@ impl ShardInventorySnapshot {
         );
         let response = self.response()?;
         ensure!(
-            response.drive_uuid == self.volume.rustfs_drive_uuid
+            response.bucket == self.identity.bucket
+                && response.drive_uuid == self.volume.rustfs_drive_uuid
                 && response.filesystem_uuid == self.volume.filesystem_uuid
                 && response.start_cursor.is_none()
                 && !response.end_cursor.trim().is_empty()
@@ -1512,8 +1902,9 @@ impl ShardInventorySnapshot {
         for entry in &response.entries {
             entry.validate()?;
             ensure!(
-                entry.drive_uuid == self.volume.rustfs_drive_uuid,
-                "shard inventory entry is not located on the scanned drive"
+                entry.drive_uuid == self.volume.rustfs_drive_uuid
+                    && entry.bucket == self.identity.bucket,
+                "shard inventory entry is not located in the run bucket on the scanned drive"
             );
         }
         unique_fragments("shard-inventory", &response.entries)?;
@@ -1609,13 +2000,14 @@ impl DanglingCleanupProof {
         )?;
         ensure!(
             self.writes_quiesced_at_ms > self.returned_generation.observed_at_ms
-                && before_inventory.receipt.observed_at_ms > self.writes_quiesced_at_ms
-                && self.started_at_ms > before_inventory.receipt.observed_at_ms
-                && self.started_at_ms - before_inventory.receipt.observed_at_ms
+                && before_inventory.receipt.started_at_ms > self.writes_quiesced_at_ms
+                && self.started_at_ms > before_inventory.receipt.completed_at_ms
+                && self.started_at_ms - before_inventory.receipt.completed_at_ms
                     <= STORAGE_OBSERVATION_MAX_AGE_MS
                 && self.completed_at_ms > self.started_at_ms
-                && after_inventory.receipt.observed_at_ms > self.completed_at_ms
-                && after_inventory.receipt.observed_at_ms - self.completed_at_ms
+                && after_inventory.receipt.started_at_ms > self.completed_at_ms
+                && after_inventory.receipt.completed_at_ms > after_inventory.receipt.started_at_ms
+                && after_inventory.receipt.completed_at_ms - self.completed_at_ms
                     <= STORAGE_OBSERVATION_MAX_AGE_MS,
             "dangling-cleanup and complete inventory observations are not ordered after the stale return"
         );
@@ -1629,7 +2021,7 @@ impl DanglingCleanupProof {
                 .all(|record| {
                     valid_operation_interval(record)
                         && (record.ended_at_ms <= self.writes_quiesced_at_ms
-                            || record.started_at_ms > after_inventory.receipt.observed_at_ms)
+                            || record.started_at_ms > after_inventory.receipt.completed_at_ms)
                 }),
             "object mutation overlapped the quiesced inventory and dangling-cleanup window"
         );
@@ -1853,11 +2245,14 @@ impl DanglingCleanupProof {
                 && valid_operation_interval(record)
                 && record.ended_at_ms <= self.writes_quiesced_at_ms
         }) {
-            let (Some(key), Some(object_sha256)) =
-                (record.key.as_deref(), record.value_sha256.as_deref())
-            else {
-                continue;
-            };
+            let key = record
+                .key
+                .as_deref()
+                .context("a possibly committed write lacks an object key")?;
+            let object_sha256 = record
+                .value_sha256
+                .as_deref()
+                .context("a possibly committed write lacks a content hash")?;
             let matches_inventory = match record.version_id.as_deref() {
                 Some(version_id) if version_id != "null" => {
                     inventory_versions.contains(&(key, version_id, object_sha256))
@@ -2056,6 +2451,17 @@ mod tests {
         replacement: &StorageVolumeIdentity,
         observed_at_ms: u64,
     ) -> EmptyVolumeObservation {
+        let response = serde_json::to_string(&EmptyVolumeScanResponse {
+            persistent_volume_uid: replacement.persistent_volume_uid.clone(),
+            canonical_device: replacement.canonical_device.clone(),
+            filesystem_uuid: replacement.filesystem_uuid.clone(),
+            rustfs_process_can_access_volume: false,
+            scan_started_at_ms: observed_at_ms - 1,
+            scan_completed_at_ms: observed_at_ms,
+            exhaustive: true,
+            data_entries: vec![],
+        })
+        .expect("empty-volume scan response");
         EmptyVolumeObservation {
             observed_at_ms,
             persistent_volume_uid: replacement.persistent_volume_uid.clone(),
@@ -2063,6 +2469,8 @@ mod tests {
             filesystem_uuid: replacement.filesystem_uuid.clone(),
             rustfs_process_can_access_volume: false,
             data_entries: vec![],
+            scan_response_sha256: sha256_bytes(response.as_bytes()),
+            scan_response_body: response,
         }
     }
 
@@ -2212,10 +2620,30 @@ mod tests {
             FreshVolumeReplacementProof::prove(
                 identity("fresh-volume-replacement"),
                 volume("old", 100),
-                replacement,
+                replacement.clone(),
                 unrelated_empty,
             )
             .is_err()
+        );
+
+        let mut fabricated_empty = empty_observation(&replacement, 200);
+        let mut raw =
+            serde_json::from_str::<EmptyVolumeScanResponse>(&fabricated_empty.scan_response_body)
+                .expect("empty-volume scan response");
+        raw.exhaustive = false;
+        fabricated_empty.scan_response_body =
+            serde_json::to_string(&raw).expect("empty-volume scan response");
+        fabricated_empty.scan_response_sha256 =
+            sha256_bytes(fabricated_empty.scan_response_body.as_bytes());
+        assert!(
+            FreshVolumeReplacementProof::prove(
+                identity("fresh-volume-replacement"),
+                volume("old", 100),
+                replacement,
+                fabricated_empty,
+            )
+            .is_err(),
+            "a self-reported empty Vec cannot replace one exhaustive host scan"
         );
     }
 
@@ -2469,6 +2897,7 @@ mod tests {
             90,
         )];
         let mapping_response = serde_json::to_string(&RustfsShardMutationMappingResponse {
+            bucket: "bucket-1".to_string(),
             object_key: "bitrot/key".to_string(),
             version_id: "version-1".to_string(),
             object_sha256: HASH_A.to_string(),
@@ -2491,6 +2920,33 @@ mod tests {
             returned_fd_inode: 42,
         })
         .expect("openat2 path receipt");
+        let host_mutation_response = serde_json::to_string(&ShardMutationHostReceipt {
+            shard_path: "/data0/.rustfs/shard".to_string(),
+            shard_device_id: "259:0".to_string(),
+            shard_inode: 42,
+            shard_size_bytes: 8192,
+            byte_offset: 4096,
+            byte_length: 1,
+            original_sha256: HASH_A.to_string(),
+            mutated_sha256: HASH_B.to_string(),
+            rollback_sha256: HASH_A.to_string(),
+            original_observed_at_ms: 200,
+            pwrite_completed_at_ms: 201,
+            mutation_fsync_completed_at_ms: 201,
+            mutation_fstat_observed_at_ms: 201,
+            mutated_readback_at_ms: 201,
+            rollback_pwrite_completed_at_ms: 202,
+            rollback_fsync_completed_at_ms: 202,
+            rollback_fstat_observed_at_ms: 202,
+            rollback_readback_at_ms: 202,
+            pwrite_bytes: 1,
+            rollback_pwrite_bytes: 1,
+            mutation_fsync_succeeded: true,
+            rollback_fsync_succeeded: true,
+            target_proof_sha256: HASH_A.to_string(),
+            host_storage_proof_sha256: HASH_B.to_string(),
+        })
+        .expect("host mutation receipt");
         let proof = ShardMutationProof {
             schema_version: STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
             identity: identity("on-disk-bitrot"),
@@ -2517,6 +2973,10 @@ mod tests {
             byte_length: 1,
             original_sha256: HASH_A.to_string(),
             mutated_sha256: HASH_B.to_string(),
+            host_mutation_evidence: Some(ShardMutationHostEvidence {
+                response_sha256: sha256_bytes(host_mutation_response.as_bytes()),
+                response_body: host_mutation_response,
+            }),
             rollback: ShardRollbackObservation {
                 shard_path: "/data0/.rustfs/shard".to_string(),
                 shard_device_id: "259:0".to_string(),
@@ -2574,6 +3034,64 @@ mod tests {
             "a shard reached through a symlink or mount crossing must be rejected"
         );
 
+        let mut no_host_receipt = proof.clone();
+        no_host_receipt.host_mutation_evidence = None;
+        assert!(
+            no_host_receipt.validate_against_history(&history).is_err(),
+            "serialized A/B/A hashes cannot substitute for a host-helper mutation receipt"
+        );
+
+        let mut no_persisted_mutation = proof.clone();
+        let host_evidence = no_persisted_mutation
+            .host_mutation_evidence
+            .as_mut()
+            .expect("host mutation evidence");
+        let mut receipt =
+            serde_json::from_str::<ShardMutationHostReceipt>(&host_evidence.response_body)
+                .expect("host mutation receipt");
+        receipt.mutation_fsync_succeeded = false;
+        host_evidence.response_body =
+            serde_json::to_string(&receipt).expect("host mutation receipt");
+        host_evidence.response_sha256 = sha256_bytes(host_evidence.response_body.as_bytes());
+        assert!(
+            no_persisted_mutation
+                .validate_against_history(&history)
+                .is_err(),
+            "a failed fsync cannot prove an on-disk bitrot mutation"
+        );
+
+        let mut conflicting_history = history.clone();
+        conflicting_history.push(history_record(
+            "put-bitrot-conflict",
+            "on-disk-bitrot",
+            OperationKind::Put,
+            "bitrot/key",
+            "version-1",
+            Some(HASH_B),
+            95,
+        ));
+        assert!(
+            proof
+                .validate_against_history(&conflicting_history)
+                .is_err(),
+            "one immutable version identity cannot have two committed content hashes"
+        );
+
+        let mut foreign_bucket = proof.clone();
+        let mut mapping = serde_json::from_str::<RustfsShardMutationMappingResponse>(
+            &foreign_bucket.mapping_response_body,
+        )
+        .expect("shard mapping response");
+        mapping.bucket = "bucket-foreign".to_string();
+        foreign_bucket.mapping_response_body =
+            serde_json::to_string(&mapping).expect("shard mapping response");
+        foreign_bucket.mapping_response_sha256 =
+            sha256_bytes(foreign_bucket.mapping_response_body.as_bytes());
+        assert!(
+            foreign_bucket.validate_against_history(&history).is_err(),
+            "a same-key mapping from another bucket cannot identify the mutated shard"
+        );
+
         let mut inferred_path = proof;
         inferred_path.shard_path = "/tmp/guessed-shard".to_string();
         assert!(inferred_path.validate_against_history(&history).is_err());
@@ -2584,7 +3102,7 @@ mod tests {
         let observer = HealObserverIdentity::AdminOperation {
             operation_id: "heal-1".to_string(),
         };
-        let samples = vec![
+        let mut samples = vec![
             HealProgressSample {
                 schema_version: STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
                 identity: identity("fresh-volume-replacement"),
@@ -2594,6 +3112,7 @@ mod tests {
                 scanned: 10,
                 repaired: 1,
                 failed: 0,
+                status_evidence: None,
             },
             HealProgressSample {
                 schema_version: STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
@@ -2604,8 +3123,29 @@ mod tests {
                 scanned: 20,
                 repaired: 2,
                 failed: 0,
+                status_evidence: None,
             },
         ];
+        for sample in &mut samples {
+            let response = serde_json::to_string(&RustfsHealStatusResponse {
+                observer: sample.observer.clone(),
+                observed_at_ms: sample.observed_at_ms,
+                state: sample.state,
+                scanned: sample.scanned,
+                repaired: sample.repaired,
+                failed: sample.failed,
+                cluster_definitive: true,
+                target_drive_uuid: Some("drive-new".to_string()),
+                pool_index: 0,
+                set_index: 0,
+            })
+            .expect("heal status response");
+            sample.status_evidence = Some(HealStatusEvidence {
+                api_revision: "v1".to_string(),
+                response_sha256: sha256_bytes(response.as_bytes()),
+                response_body: response,
+            });
+        }
         let summary = HealSummary {
             schema_version: STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
             identity: identity("fresh-volume-replacement"),
@@ -2647,6 +3187,31 @@ mod tests {
             wrong_qualified_variant
                 .validate_progress(&samples, Some(("drive-new", 0, 0)))
                 .is_err()
+        );
+        let mut missing_status = samples.clone();
+        missing_status[0].status_evidence = None;
+        assert!(
+            summary
+                .validate_progress(&missing_status, Some(("drive-new", 0, 0)))
+                .is_err(),
+            "self-reported heal counters require a captured RustFS status response"
+        );
+        let mut forged_status = samples.clone();
+        let evidence = forged_status[1]
+            .status_evidence
+            .as_mut()
+            .expect("heal status evidence");
+        let mut response =
+            serde_json::from_str::<RustfsHealStatusResponse>(&evidence.response_body)
+                .expect("heal status response");
+        response.repaired = 99;
+        evidence.response_body = serde_json::to_string(&response).expect("heal status response");
+        evidence.response_sha256 = sha256_bytes(evidence.response_body.as_bytes());
+        assert!(
+            summary
+                .validate_progress(&forged_status, Some(("drive-new", 0, 0)))
+                .is_err(),
+            "heal progress must be derived from the captured RustFS status body"
         );
         let mut no_op = summary.clone();
         no_op.scanned = 0;
@@ -2714,6 +3279,7 @@ mod tests {
             ),
         ];
         let mapping_response = serde_json::to_string(&RustfsVersionShardMappingResponse {
+            bucket: "bucket-1".to_string(),
             object_key: "key".to_string(),
             version_id: "version-1".to_string(),
             object_sha256: HASH_A.to_string(),
@@ -2733,6 +3299,57 @@ mod tests {
             target_proof_sha256: HASH_A.to_string(),
             observed_at_ms: 299,
         }];
+        let active_snapshot = StorageFaultStatusSnapshot {
+            stage: "active".to_string(),
+            resource_kind: Some("iochaos".to_string()),
+            resource_name: Some("force-read-fault".to_string()),
+            chaos_status: Some(serde_json::json!({
+                "metadata": {"name": "force-read-fault"},
+                "status": {
+                    "conditions": [
+                        {"type": "Selected", "status": "True"},
+                        {"type": "AllInjected", "status": "True"},
+                        {"type": "AllRecovered", "status": "False"}
+                    ],
+                    "experiment": {"desiredPhase": "Run"}
+                }
+            })),
+            dm_status: None,
+        };
+        let workload_snapshot = StorageFaultStatusSnapshot {
+            stage: "after-workload".to_string(),
+            ..active_snapshot.clone()
+        };
+        let fault_snapshot_id =
+            sha256_bytes(&serde_json::to_vec(&active_snapshot).expect("active fault snapshot"));
+        let fault_evidence_body = serde_json::to_string(&StorageFaultEvidenceResponse {
+            scenario: "fresh-volume-replacement".to_string(),
+            run_id: "run-1".to_string(),
+            injected: true,
+            active_during_workload: true,
+            pods_at_fault_activation: selected_pods
+                .iter()
+                .map(|name| StorageFaultPodIdentity {
+                    name: name.clone(),
+                    uid: format!("uid-{name}"),
+                })
+                .collect(),
+            pods_at_workload_snapshot: selected_pods
+                .iter()
+                .map(|name| StorageFaultPodIdentity {
+                    name: name.clone(),
+                    uid: format!("uid-{name}"),
+                })
+                .collect(),
+            active_snapshots: vec![active_snapshot],
+            workload_snapshots: vec![workload_snapshot],
+            fault_active_at_ms: Some(300),
+            workload_started_at_ms: Some(300),
+            workload_ended_at_ms: Some(400),
+            fault_delete_started_at_ms: Some(400),
+        })
+        .expect("fault evidence");
+        let fault_evidence_sha256 = sha256_bytes(fault_evidence_body.as_bytes());
         let proof = ForceReadThroughProof {
             schema_version: STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
             identity: identity("fresh-volume-replacement"),
@@ -2741,17 +3358,18 @@ mod tests {
             all_shard_ids: (0..8).map(|index| format!("drive-{index}")).collect(),
             repaired_shard_id: "drive-7".to_string(),
             target_proof_sha256: HASH_A.to_string(),
-            fault_evidence_sha256: HASH_B.to_string(),
+            fault_evidence_sha256: fault_evidence_sha256.clone(),
+            fault_evidence_body: Some(fault_evidence_body),
             unavailable_shards: (0..4)
                 .map(|index| UnavailableShardObservation {
                     pod_name: format!("rustfs-{index}"),
                     drive_uuid: format!("drive-{index}"),
                     pool_index: 0,
                     set_index: 0,
-                    fault_resource_id: format!("fault-{index}"),
-                    active_snapshot_id: "snapshot-1".to_string(),
+                    fault_resource_id: "iochaos/force-read-fault".to_string(),
+                    active_snapshot_id: fault_snapshot_id.clone(),
                     target_proof_sha256: HASH_A.to_string(),
-                    fault_evidence_sha256: HASH_B.to_string(),
+                    fault_evidence_sha256: fault_evidence_sha256.clone(),
                     active_from_ms: 290,
                     active_until_ms: 410,
                 })
@@ -2767,7 +3385,7 @@ mod tests {
                 http_status: 200,
                 observed_at_ms: 350,
                 mapping_observation_id: "mapping-1".to_string(),
-                active_fault_snapshot_id: "snapshot-1".to_string(),
+                active_fault_snapshot_id: fault_snapshot_id,
             }],
         };
         proof
@@ -2780,6 +3398,60 @@ mod tests {
                 &mapping_observations,
             )
             .expect("valid forced read");
+
+        let mut missing_fault_receipt = proof.clone();
+        missing_fault_receipt.fault_evidence_body = None;
+        assert!(
+            missing_fault_receipt
+                .validate_against_runtime(
+                    &membership,
+                    &selected_pods,
+                    &selected_pods,
+                    "drive-7",
+                    &history,
+                    &mapping_observations,
+                )
+                .is_err(),
+            "Pod names and active timestamps cannot replace captured fault evidence"
+        );
+
+        let mut inactive_fault = proof.clone();
+        let mut raw = serde_json::from_str::<StorageFaultEvidenceResponse>(
+            inactive_fault
+                .fault_evidence_body
+                .as_deref()
+                .expect("fault evidence"),
+        )
+        .expect("fault evidence");
+        *raw.active_snapshots[0]
+            .chaos_status
+            .as_mut()
+            .expect("IOChaos resource")
+            .pointer_mut("/status/conditions/1/status")
+            .expect("AllInjected condition") = serde_json::json!("False");
+        let inactive_snapshot_id =
+            sha256_bytes(&serde_json::to_vec(&raw.active_snapshots[0]).expect("active snapshot"));
+        let body = serde_json::to_string(&raw).expect("fault evidence");
+        inactive_fault.fault_evidence_sha256 = sha256_bytes(body.as_bytes());
+        inactive_fault.fault_evidence_body = Some(body);
+        for shard in &mut inactive_fault.unavailable_shards {
+            shard.fault_evidence_sha256 = inactive_fault.fault_evidence_sha256.clone();
+            shard.active_snapshot_id = inactive_snapshot_id.clone();
+        }
+        inactive_fault.probes[0].active_fault_snapshot_id = inactive_snapshot_id;
+        assert!(
+            inactive_fault
+                .validate_against_runtime(
+                    &membership,
+                    &selected_pods,
+                    &selected_pods,
+                    "drive-7",
+                    &history,
+                    &mapping_observations,
+                )
+                .is_err(),
+            "a self-consistent but inactive IOChaos snapshot cannot prove forced reading"
+        );
 
         let mut wrong_mapping = mapping_observations.clone();
         let mut wrong_response = serde_json::from_str::<RustfsVersionShardMappingResponse>(
@@ -2802,6 +3474,57 @@ mod tests {
                 )
                 .is_err(),
             "the probe cannot self-assert membership in the repaired erasure set"
+        );
+
+        let mut wrong_bucket_mapping = mapping_observations.clone();
+        let mut response = serde_json::from_str::<RustfsVersionShardMappingResponse>(
+            &wrong_bucket_mapping[0].response_body,
+        )
+        .expect("mapping response");
+        response.bucket = "bucket-foreign".to_string();
+        wrong_bucket_mapping[0].response_body =
+            serde_json::to_string(&response).expect("mapping response");
+        wrong_bucket_mapping[0].response_sha256 =
+            sha256_bytes(wrong_bucket_mapping[0].response_body.as_bytes());
+        assert!(
+            proof
+                .validate_against_runtime(
+                    &membership,
+                    &selected_pods,
+                    &selected_pods,
+                    "drive-7",
+                    &history,
+                    &wrong_bucket_mapping,
+                )
+                .is_err(),
+            "a same-key mapping from another bucket cannot select force-read shards"
+        );
+
+        let mut conflicting_commits = history.clone();
+        let mut conflicting = history_record(
+            "put-2",
+            "fresh-volume-replacement",
+            OperationKind::Put,
+            "key",
+            "version-1",
+            Some(HASH_B),
+            260,
+        );
+        conflicting.durability_cohort = Some(DurabilityCohort::PreFault);
+        conflicting.fault_window_relation = None;
+        conflicting_commits.push(conflicting);
+        assert!(
+            proof
+                .validate_against_runtime(
+                    &membership,
+                    &selected_pods,
+                    &selected_pods,
+                    "drive-7",
+                    &conflicting_commits,
+                    &mapping_observations,
+                )
+                .is_err(),
+            "conflicting successful writes for one immutable version identity must fail closed"
         );
 
         let mut contradictory_commit_window = history.clone();
@@ -2959,6 +3682,7 @@ mod tests {
         let (stale_return, mut history) = stale_return_fixture();
         let committed = ShardInventoryEntry {
             fragment_id: "fragment-committed".to_string(),
+            bucket: "bucket-1".to_string(),
             object_key: "key".to_string(),
             version_id: "version-1".to_string(),
             drive_uuid: "drive-old".to_string(),
@@ -2968,6 +3692,7 @@ mod tests {
         };
         let dangling = ShardInventoryEntry {
             fragment_id: "fragment-dangling".to_string(),
+            bucket: "bucket-1".to_string(),
             object_key: "key".to_string(),
             version_id: "unknown-write".to_string(),
             drive_uuid: "drive-old".to_string(),
@@ -2977,6 +3702,7 @@ mod tests {
         };
         let unknown = ShardInventoryEntry {
             fragment_id: "fragment-unknown".to_string(),
+            bucket: "bucket-1".to_string(),
             object_key: "key".to_string(),
             version_id: "ack-lost-version".to_string(),
             drive_uuid: "drive-old".to_string(),
@@ -3011,6 +3737,7 @@ mod tests {
                          observed_at_ms: u64,
                          entries: Vec<ShardInventoryEntry>| {
             let response = serde_json::to_string(&RustfsShardInventoryResponse {
+                bucket: "bucket-1".to_string(),
                 drive_uuid: stale_return.returned_generation.rustfs_drive_uuid.clone(),
                 filesystem_uuid: stale_return.returned_generation.filesystem_uuid.clone(),
                 start_cursor: None,
@@ -3029,6 +3756,8 @@ mod tests {
                     api_revision: "v1".to_string(),
                     response_sha256: sha256_bytes(response.as_bytes()),
                     response_body: response,
+                    started_at_ms: observed_at_ms - 5,
+                    completed_at_ms: observed_at_ms,
                     observed_at_ms,
                 },
             )
@@ -3109,10 +3838,10 @@ mod tests {
             &after_inventory
         ));
         let mut before_at_quiesce = before_inventory.clone();
-        before_at_quiesce.receipt.observed_at_ms = proof.writes_quiesced_at_ms;
+        before_at_quiesce.receipt.started_at_ms = proof.writes_quiesced_at_ms;
         assert!(rejects_order(&proof, &before_at_quiesce, &after_inventory));
         let mut cleanup_at_before = proof.clone();
-        cleanup_at_before.started_at_ms = before_inventory.receipt.observed_at_ms;
+        cleanup_at_before.started_at_ms = before_inventory.receipt.completed_at_ms;
         assert!(rejects_order(
             &cleanup_at_before,
             &before_inventory,
@@ -3126,7 +3855,7 @@ mod tests {
             &after_inventory
         ));
         let mut after_at_complete = after_inventory.clone();
-        after_at_complete.receipt.observed_at_ms = proof.completed_at_ms;
+        after_at_complete.receipt.started_at_ms = proof.completed_at_ms;
         assert!(rejects_order(&proof, &before_inventory, &after_at_complete));
 
         let mut inverted_cleanup_history = history.clone();
@@ -3306,6 +4035,35 @@ mod tests {
                 )
                 .is_err(),
             "inventory from a foreign drive must not prove stale-drive cleanup"
+        );
+
+        let mut foreign_bucket_inventory = before_inventory.clone();
+        let mut foreign_bucket_response = foreign_bucket_inventory
+            .response()
+            .expect("inventory response");
+        foreign_bucket_response.bucket = "bucket-foreign".to_string();
+        for entry in &mut foreign_bucket_response.entries {
+            entry.bucket = "bucket-foreign".to_string();
+        }
+        foreign_bucket_inventory.entries_sha256 =
+            inventory_entries_sha256(&foreign_bucket_response.entries).expect("inventory digest");
+        foreign_bucket_inventory.receipt.response_body =
+            serde_json::to_string(&foreign_bucket_response).expect("inventory response");
+        foreign_bucket_inventory.receipt.response_sha256 =
+            sha256_bytes(foreign_bucket_inventory.receipt.response_body.as_bytes());
+        let mut foreign_bucket_proof = proof.clone();
+        foreign_bucket_proof.before_inventory_sha256 =
+            foreign_bucket_inventory.entries_sha256.clone();
+        assert!(
+            foreign_bucket_proof
+                .validate_against_stale_return(
+                    &stale_return,
+                    &foreign_bucket_inventory,
+                    &after_inventory,
+                    &history,
+                )
+                .is_err(),
+            "same-key fragments from another bucket cannot enter this cleanup universe"
         );
 
         let mut definite_http_failure = history.clone();
