@@ -14,7 +14,10 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     fault::{
@@ -61,6 +64,14 @@ pub(crate) struct FaultEvidence {
     pub(crate) pods_at_fault_activation: Vec<PodIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) pods_at_workload_snapshot: Vec<PodIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) fixed_volume_targets_at_fault_activation: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) fixed_volume_targets_at_workload_snapshot: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) fixed_volume_containers_at_fault_activation: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) fixed_volume_containers_at_workload_snapshot: BTreeMap<String, String>,
     pub(crate) pods_after: Vec<PodIdentity>,
     pub(crate) active_snapshots: Vec<FaultStatusSnapshot>,
     pub(crate) workload_snapshots: Vec<FaultStatusSnapshot>,

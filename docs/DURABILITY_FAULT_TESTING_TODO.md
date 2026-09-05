@@ -311,18 +311,34 @@ guardrails when implementing the ordered TODO below.
 
 ### 5. Implement Volume-Kind Fixed Targeting
 
-- [ ] TODO: Allow `FixedTargets(N)` for RustFS volume fault kinds.
-  Meaning: current plan validation rejects fixed target counts for the volume
-  family. Quorum IO and heal force-read scenarios need same-kind multi-volume
-  targeting without introducing a generic composition DSL.
+- [ ] PARTIAL: Allow `FixedTargets(N)` for RustFS volume fault kinds.
+  Meaning: the typed fault and backend layers accept bounded fixed target
+  counts while existing percent-based scenarios retain their one-Pod selector
+  and independent I/O sampling behavior. No executable catalog/config source
+  selects this mode yet, so artifact validation rejects a fixed selection for
+  the current percent-based scenarios. Composite fault plans remain rejected.
 
-- [ ] TODO: Render Chaos Mesh or host volume faults for `FixedTargets(N)`.
-  Meaning: type-checking a target count is not enough; backend renderers must
-  actually target N volumes/pods/devices and record the selected target set.
+- [ ] PARTIAL: Render and prove Chaos Mesh volume faults for `FixedTargets(N)`.
+  Meaning: IOChaos renders `mode: fixed` with the declared count, injects all
+  matching I/O on those selected volumes, and records the controller-selected
+  container targets. Runtime proof binds the exact RustFS container mount path
+  through Pod volume name, PVC, PV, storage source, and supported required Node
+  label constraints; unsupported affinity forms fail closed. Every Pod in the
+  tenant selector must pass preflight before a fixed count can be injected.
+  Activation and workload evidence preserve the selected Pod names, UIDs, and
+  running RustFS container IDs and reject controller record drift. Replacing a
+  container invalidates its mount-namespace proof even when the Pod UID stays
+  unchanged. The proof also validates action,
+  methods, parameters, sampling, and duration. End-to-end execution remains
+  pending a trusted catalog/config selection source. The host DeviceMapper
+  backend remains deliberately single-target because its configuration names
+  one mapper/device.
 
-- [ ] TODO: Keep quorum targeting separate from heterogeneous composition.
-  Meaning: quorum P/P+1 is same-kind multi-target IO faulting. It should not
-  require a generic multi-phase workflow abstraction or raw YAML backend steps.
+- [x] DONE: Keep quorum targeting separate from heterogeneous composition.
+  Meaning: `FixedTargets(N)` changes only the selector of one typed volume
+  injection. It does not introduce a generic multi-phase workflow abstraction,
+  heterogeneous faults, or raw YAML backend steps. P/P+1 volume scenarios stay
+  blocked until exact same-erasure-set volume proof exists.
 
 ### 6. Harden Target-Aware Safety Gates
 
