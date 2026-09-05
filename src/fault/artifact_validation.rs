@@ -3467,7 +3467,13 @@ mod tests {
             "responseBody": info_body
         });
         let mut runtime_mutation = runtime_before.clone();
-        runtime_mutation["startedAtMs"] = json!(91);
+        runtime_mutation["target"]["endpoint"]["clusterStartedAtMs"] = json!(91);
+        runtime_mutation["target"]["endpoint"]["clusterObservedAtMs"] = json!(91);
+        runtime_mutation["target"]["endpoint"]["serviceStartedAtMs"] = json!(92);
+        runtime_mutation["target"]["endpoint"]["serviceObservedAtMs"] = json!(92);
+        runtime_mutation["target"]["endpoint"]["tenantStartedAtMs"] = json!(93);
+        runtime_mutation["target"]["endpoint"]["tenantObservedAtMs"] = json!(93);
+        runtime_mutation["startedAtMs"] = json!(94);
         runtime_mutation["observedAtMs"] = json!(94);
         runtime_mutation["requestId"] = json!("admin-info-before-decommission");
         let mut runtime_after = runtime_before.clone();

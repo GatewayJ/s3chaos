@@ -1755,7 +1755,8 @@ fn validate_pre_start_snapshot(
     ensure!(
         snapshot.runtime.observed_at_ms < snapshot.tenant_get.started_at_ms
             && snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
-            && snapshot.request.observed_at_ms < start_runtime_probe.started_at_ms
+            && snapshot.request.observed_at_ms
+                < start_runtime_probe.target.endpoint.cluster_started_at_ms
             && start_runtime_probe.observed_at_ms <= start_started_at_ms
             && snapshot.tenant_get.observed_at_ms < start_started_at_ms
             && start_started_at_ms - snapshot.tenant_get.observed_at_ms
@@ -2636,16 +2637,23 @@ fn validate_request_timing(
                 && request.runtime_probe.as_ref().is_none_or(|probe| {
                     attempt_window.contains(probe.started_at_ms)
                         && attempt_window.contains(probe.observed_at_ms)
+                        && attempt_window.contains(probe.target.endpoint.cluster_started_at_ms)
+                        && attempt_window.contains(probe.target.endpoint.cluster_observed_at_ms)
+                        && attempt_window.contains(probe.target.endpoint.service_started_at_ms)
+                        && attempt_window.contains(probe.target.endpoint.service_observed_at_ms)
+                        && attempt_window.contains(probe.target.endpoint.tenant_started_at_ms)
+                        && attempt_window.contains(probe.target.endpoint.tenant_observed_at_ms)
                 }),
             "admin request or runtime-probe interval falls outside the current attempt window"
         );
     }
     ensure!(
-        requests.windows(2).all(|pair| pair[0].observed_at_ms
-            <= pair[1]
-                .runtime_probe
-                .as_ref()
-                .map_or(pair[1].started_at_ms, |probe| probe.started_at_ms)),
+        requests.windows(2).all(|pair| {
+            pair[1].runtime_probe.as_ref().map_or_else(
+                || pair[0].observed_at_ms <= pair[1].started_at_ms,
+                |probe| pair[0].observed_at_ms < probe.target.endpoint.cluster_started_at_ms,
+            )
+        }),
         "admin request and runtime-probe transcript intervals overlap or are not ordered"
     );
     Ok(())
@@ -3267,10 +3275,18 @@ mod tests {
     }
 
     fn mutation_runtime_probe(request_started_at_ms: u64) -> Option<AdminRuntimeBinding> {
-        Some(runtime_binding(
-            request_started_at_ms.saturating_sub(2),
+        let mut binding = runtime_binding(
             request_started_at_ms.saturating_sub(1),
-        ))
+            request_started_at_ms.saturating_sub(1),
+        );
+        let endpoint = &mut binding.target.endpoint;
+        endpoint.cluster_started_at_ms = request_started_at_ms.saturating_sub(4);
+        endpoint.cluster_observed_at_ms = request_started_at_ms.saturating_sub(4);
+        endpoint.service_started_at_ms = request_started_at_ms.saturating_sub(3);
+        endpoint.service_observed_at_ms = request_started_at_ms.saturating_sub(3);
+        endpoint.tenant_started_at_ms = request_started_at_ms.saturating_sub(2);
+        endpoint.tenant_observed_at_ms = request_started_at_ms.saturating_sub(2);
+        Some(binding)
     }
 
     fn context(scenario: &str) -> AdminTopologyBuildContext {
@@ -4604,18 +4620,23 @@ mod tests {
             .is_err(),
             "destructive request must retain its fresh RustFS runtime probe"
         );
-        let mut stale_runtime_probe = operation.clone();
-        stale_runtime_probe.requests[0].runtime_probe = Some(proof.runtime.clone());
+        let mut stale_endpoint_probe = operation.clone();
+        stale_endpoint_probe.requests[0]
+            .runtime_probe
+            .as_mut()
+            .expect("runtime probe")
+            .target
+            .endpoint = proof.runtime.target.endpoint.clone();
         assert!(
             validate_admin_topology_artifacts(
                 ADMIN_DECOMMISSION_SCENARIO,
                 &attempt(ADMIN_DECOMMISSION_SCENARIO),
                 attempt_window(),
                 &proof,
-                &stale_runtime_probe,
+                &stale_endpoint_probe,
             )
             .is_err(),
-            "destructive request runtime probe must be fresher than the pre-start snapshot"
+            "fresh /info cannot reuse a Kubernetes endpoint receipt older than the pre-start snapshot"
         );
         let mut late_runtime_probe = operation.clone();
         late_runtime_probe.requests[0]
