@@ -22,7 +22,7 @@ use tokio::time::{sleep as async_sleep, timeout};
 use crate::fault::{
     history::{
         ByteRange, ListedVersionEntry, OperationKind, OperationOutcome, OperationRecord,
-        PayloadRef, Recorder,
+        PayloadRef, Recorder, validate_history_phase_boundary, validate_history_scope_and_order,
     },
     workload::{
         GetObjectResult, ObjectSpec, ObjectVersionEntry, S3WorkloadClient, seeded_bytes, sha256_hex,
@@ -479,6 +479,13 @@ pub(crate) fn validate_checker_audit_against_history(
     );
     let prefix = &history[..audit.history_prefix_record_count];
     let suffix = &history[audit.history_prefix_record_count..suffix_end];
+    validate_history_scope_and_order(
+        &history[..suffix_end],
+        &report.scenario,
+        &report.run_id,
+        &audit.bucket,
+    )?;
+    validate_history_phase_boundary(prefix, suffix, "workload/checker")?;
     ensure!(
         checker_history_records_sha256(prefix)? == audit.history_prefix_sha256,
         "checker audit prefix digest does not match history.jsonl"
@@ -925,6 +932,9 @@ pub async fn check_s3_history(
     expect_versioning: bool,
 ) -> Result<CheckerReport> {
     let initial_records = recorder.records();
+    let scenario = recorder.scenario();
+    let run_id = recorder.run_id();
+    validate_history_scope_and_order(&initial_records, &scenario, &run_id, s3.bucket())?;
     let checker_started_at_ms = now_ms();
     let history_prefix_sha256 = checker_history_records_sha256(&initial_records)?;
     let model = object_model(&initial_records);
@@ -936,8 +946,8 @@ pub async fn check_s3_history(
         None
     };
     let mut report = CheckerReport {
-        scenario: recorder.scenario(),
-        run_id: recorder.run_id(),
+        scenario,
+        run_id,
         committed_puts: model.committed_writes,
         expected_live_objects: model.live.len(),
         verified_live_objects: 0,
@@ -1202,9 +1212,16 @@ pub async fn check_s3_history(
     delete_marker_checks
         .sort_by(|left, right| (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id)));
     let checker_records = recorder.records();
+    validate_history_scope_and_order(
+        &checker_records,
+        &report.scenario,
+        &report.run_id,
+        s3.bucket(),
+    )?;
     let checker_suffix = checker_records
         .get(initial_records.len()..)
         .context("checker history shrank while producing its audit")?;
+    validate_history_phase_boundary(&initial_records, checker_suffix, "workload/checker")?;
     report.audit = Some(CheckerAudit {
         bucket: s3.bucket().to_string(),
         started_at_ms: checker_started_at_ms,
@@ -1358,7 +1375,7 @@ pub async fn recovery_stability_reread(
     Ok(report)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ExpectedObject {
     sha256: String,
     size_bytes: usize,
@@ -3195,6 +3212,28 @@ struct CommittedWriteWindow {
     payload_ref: Option<PayloadRef>,
 }
 
+#[derive(Debug, Default)]
+struct CommittedWriteHistory {
+    windows: Vec<CommittedWriteWindow>,
+    prior_max_ended_by_object: BTreeMap<ExpectedObject, u64>,
+}
+
+impl CommittedWriteHistory {
+    fn push(&mut self, window: CommittedWriteWindow) {
+        if let Some(previous) = self.windows.last() {
+            self.prior_max_ended_by_object
+                .entry(previous.object.clone())
+                .and_modify(|ended_at_ms| *ended_at_ms = (*ended_at_ms).max(previous.ended_at_ms))
+                .or_insert(previous.ended_at_ms);
+        }
+        self.windows.push(window);
+    }
+
+    fn windows(&self) -> &[CommittedWriteWindow] {
+        &self.windows
+    }
+}
+
 /// Whether a successful GET that does not match the latest committed value is
 /// still a legal concurrent read rather than corruption.
 ///
@@ -3212,19 +3251,20 @@ struct CommittedWriteWindow {
 /// e.g. across an overlapping delete); this function additionally exempts a GET
 /// that returned a value whose write window merely overlaps the GET.
 fn concurrent_committed_read(
-    history: &[CommittedWriteWindow],
+    history: &CommittedWriteHistory,
     get_started_at_ms: u64,
     actual: &ExpectedObject,
 ) -> bool {
-    let Some((latest, prior)) = history.split_last() else {
+    let Some((latest, prior)) = history.windows.split_last() else {
         return false;
     };
     let matches = |w: &CommittedWriteWindow| {
         w.object.sha256 == actual.sha256 && w.object.size_bytes == actual.size_bytes
     };
-    if prior
-        .iter()
-        .any(|w| matches(w) && w.ended_at_ms >= get_started_at_ms)
+    if history
+        .prior_max_ended_by_object
+        .get(actual)
+        .is_some_and(|ended_at_ms| *ended_at_ms >= get_started_at_ms)
     {
         return true;
     }
@@ -3424,7 +3464,7 @@ fn verify_ranged_get(
 
 fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
     let mut live = BTreeMap::<String, ExpectedObject>::new();
-    let mut committed_history = BTreeMap::<String, Vec<CommittedWriteWindow>>::new();
+    let mut committed_history = BTreeMap::<String, CommittedWriteHistory>::new();
     let mut ambiguous_writes = BTreeMap::<String, Vec<AmbiguousWriteAttempt>>::new();
     let stable_live_at_start = stable_live_objects_at_read_starts(records);
     let mut anomalies = ReadAnomalies::default();
@@ -3495,7 +3535,7 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                         RangedReadState {
                             history: committed_history
                                 .get(key)
-                                .map(Vec::as_slice)
+                                .map(CommittedWriteHistory::windows)
                                 .unwrap_or_default(),
                             ambiguous: ambiguous_writes
                                 .get(key)
@@ -3560,8 +3600,7 @@ fn successful_read_anomalies(records: &[OperationRecord]) -> ReadAnomalies {
                     Some(expected) => {
                         let history = committed_history
                             .get(key)
-                            .map(Vec::as_slice)
-                            .unwrap_or_default();
+                            .expect("a live committed object has write history");
                         if !concurrent_committed_read(history, record.started_at_ms, &actual) {
                             anomalies.corrupted_reads.push(format!(
                                 "{key}: expected {} ({} bytes), got {} ({} bytes)",
@@ -3675,6 +3714,13 @@ mod tests {
             started_at_ms,
             ended_at_ms,
             ..record(id, kind, key, hash, outcome)
+        }
+    }
+
+    fn assign_recorder_sequences(records: &mut [OperationRecord]) {
+        for (index, record) in records.iter_mut().enumerate() {
+            record.started_sequence = Some((index as u64) * 2 + 1);
+            record.ended_sequence = Some((index as u64) * 2 + 2);
         }
     }
 
@@ -5806,6 +5852,41 @@ mod tests {
         assert!(anomalies.visible_deleted_objects.is_empty());
     }
 
+    #[test]
+    fn successful_hot_key_prior_version_lookup_scales_to_twenty_thousand_versions() {
+        const VERSION_COUNT: usize = 20_000;
+        let key = "hot-key";
+        let mut records = Vec::with_capacity(VERSION_COUNT * 2);
+        for index in 0..VERSION_COUNT {
+            records.push(timed_record(
+                &format!("put-{index:05}"),
+                OperationKind::Put,
+                key,
+                &format!("hash-{index:05}"),
+                OperationOutcome::Ok,
+                index as u64,
+                index as u64 + 1,
+            ));
+        }
+        let prior_hash = format!("hash-{:05}", VERSION_COUNT - 2);
+        for index in 0..VERSION_COUNT {
+            records.push(timed_record(
+                &format!("get-{index:05}"),
+                OperationKind::Get,
+                key,
+                &prior_hash,
+                OperationOutcome::Ok,
+                (VERSION_COUNT - 1) as u64,
+                VERSION_COUNT as u64 + 1,
+            ));
+        }
+
+        let anomalies = successful_read_anomalies(&records);
+        assert!(anomalies.corrupted_reads.is_empty());
+        assert!(anomalies.unknown_write_value_conflicts.is_empty());
+        assert!(anomalies.visible_deleted_objects.is_empty());
+    }
+
     fn slice_sha(seed: u64, index: usize, size: usize, range: ByteRange) -> String {
         let body = seeded_bytes(seed, index, size);
         sha256_hex(&body[range.offset as usize..(range.offset + range.length) as usize])
@@ -6662,6 +6743,9 @@ mod tests {
         let suffix = vec![final_list];
         let mut history = prefix.clone();
         history.extend(suffix.clone());
+        assign_recorder_sequences(&mut history);
+        let prefix = history[..LIST_COUNT].to_vec();
+        let suffix = history[LIST_COUNT..].to_vec();
 
         let mut report = empty_report();
         report.final_listed_objects = Some(0);
@@ -6709,6 +6793,40 @@ mod tests {
             expected,
             "the audit digest must bind the complete operation record"
         );
+    }
+
+    #[test]
+    fn checker_audit_rejects_a_foreign_bucket_in_its_history_prefix() {
+        let mut foreign = record(
+            "foreign-put",
+            OperationKind::Put,
+            "same-key",
+            "hash",
+            OperationOutcome::Ok,
+        );
+        foreign.run_id = Some("run-1".to_string());
+        foreign.bucket = "other-bucket".to_string();
+        foreign.started_sequence = Some(1);
+        foreign.ended_sequence = Some(2);
+        let prefix = vec![foreign];
+        let mut report = empty_report();
+        report.audit = Some(CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 3,
+            completed_at_ms: 4,
+            history_prefix_record_count: prefix.len(),
+            history_prefix_sha256: checker_history_records_sha256(&prefix).expect("prefix digest"),
+            history_suffix_record_count: 0,
+            history_suffix_sha256: checker_history_records_sha256(&[]).expect("suffix digest"),
+            suffix_operations: Vec::new(),
+            data_version_checks: Vec::new(),
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: None,
+        });
+
+        let error = validate_checker_audit_against_history(&report, &prefix)
+            .expect_err("foreign-bucket history cannot define the checker model");
+        assert!(error.to_string().contains("outside the checker run"));
     }
 
     #[test]
@@ -6879,6 +6997,9 @@ mod tests {
         let suffix = vec![get, list];
         let mut history = prefix.clone();
         history.extend(suffix.clone());
+        assign_recorder_sequences(&mut history);
+        let prefix = history[..2].to_vec();
+        let suffix = history[2..].to_vec();
 
         let mut report = empty_report();
         report.committed_puts = 1;
@@ -7061,6 +7182,9 @@ mod tests {
         }
         let mut history = prefix.clone();
         history.extend(suffix.clone());
+        assign_recorder_sequences(&mut history);
+        let prefix = history[..4].to_vec();
+        let suffix = history[4..].to_vec();
 
         let mut report = empty_report();
         report.committed_puts = 2;

@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -153,6 +154,112 @@ pub struct OperationRecord {
     pub durability_cohort: Option<DurabilityCohort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fault_window_relation: Option<FaultWindowRelation>,
+}
+
+pub(crate) fn validate_history_scope_and_order(
+    records: &[OperationRecord],
+    scenario: &str,
+    run_id: &str,
+    bucket: &str,
+) -> Result<()> {
+    ensure!(
+        records.iter().all(|record| {
+            record.scenario == scenario
+                && record.run_id.as_deref() == Some(run_id)
+                && record.bucket == bucket
+        }),
+        "history contains an operation outside the checker run scenario, run id, or bucket"
+    );
+
+    let expected_event_count = records
+        .len()
+        .checked_mul(2)
+        .context("history event count overflow")?;
+    let expected_last_sequence = u64::try_from(expected_event_count)
+        .context("history event count does not fit a recorder sequence")?;
+    let mut event_sequences = vec![false; expected_event_count];
+    let mut operation_ids = HashSet::with_capacity(records.len());
+    let mut previous_ended_sequence = None;
+    let mut previous_mutation_end_by_key = HashMap::<&str, u64>::new();
+
+    for record in records {
+        ensure!(
+            !record.id.trim().is_empty() && operation_ids.insert(record.id.as_str()),
+            "history contains an empty or duplicate operation id"
+        );
+        let started_sequence = record
+            .started_sequence
+            .context("history operation has no recorder start sequence")?;
+        let ended_sequence = record
+            .ended_sequence
+            .context("history operation has no recorder end sequence")?;
+        ensure!(
+            started_sequence < ended_sequence,
+            "history contains an inverted recorder event sequence"
+        );
+        for sequence in [started_sequence, ended_sequence] {
+            ensure!(
+                sequence > 0 && sequence <= expected_last_sequence,
+                "history recorder event sequence is outside the complete monotonic range"
+            );
+            let index = usize::try_from(sequence - 1)
+                .context("history recorder event sequence does not fit an index")?;
+            ensure!(
+                !event_sequences[index],
+                "history contains a duplicate recorder event sequence"
+            );
+            event_sequences[index] = true;
+        }
+        if let Some(previous) = previous_ended_sequence {
+            ensure!(
+                previous < ended_sequence,
+                "history records are not in monotonically increasing completion order"
+            );
+        }
+        previous_ended_sequence = Some(ended_sequence);
+
+        if matches!(
+            record.kind,
+            OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+        ) {
+            let key = record
+                .key
+                .as_deref()
+                .context("object mutation history record has no key")?;
+            if let Some(previous_end) = previous_mutation_end_by_key.insert(key, ended_sequence) {
+                ensure!(
+                    previous_end < started_sequence,
+                    "history mutations for key {key:?} overlap; their latest state is ambiguous"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_history_phase_boundary(
+    completed: &[OperationRecord],
+    following: &[OperationRecord],
+    boundary: &str,
+) -> Result<()> {
+    if completed.is_empty() || following.is_empty() {
+        return Ok(());
+    }
+    let completed_sequence = completed
+        .iter()
+        .filter_map(|record| record.ended_sequence)
+        .max()
+        .context("completed history phase has no recorder end sequence")?;
+    let following_sequence = following
+        .iter()
+        .filter_map(|record| record.started_sequence)
+        .min()
+        .context("following history phase has no recorder start sequence")?;
+    ensure!(
+        completed_sequence < following_sequence,
+        "history phases overlap at {boundary}; the previous phase had not completed before the next phase began"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -366,7 +473,10 @@ fn truncate_error(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DurabilityCohort, OperationKind, OperationOutcome, Recorder};
+    use super::{
+        DurabilityCohort, OperationKind, OperationOutcome, Recorder,
+        validate_history_scope_and_order,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -450,6 +560,88 @@ mod tests {
                 .zip(record.ended_sequence)
                 .is_some_and(|(started, ended)| started < ended)
         }));
+    }
+
+    #[test]
+    fn history_contract_rejects_cross_bucket_and_duplicate_sequences() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Recorder::create(dir.path().join("history.jsonl"), "storage", "run-1")
+            .expect("recorder");
+        let record = recorder.begin(
+            OperationKind::Put,
+            "bucket",
+            Some("key".to_string()),
+            Some("hash".to_string()),
+            Some(4),
+        );
+        recorder
+            .finish(record, OperationOutcome::Ok, Some(200), None)
+            .expect("finish");
+        let record = recorder.begin(
+            OperationKind::Get,
+            "bucket",
+            Some("key".to_string()),
+            Some("hash".to_string()),
+            Some(4),
+        );
+        recorder
+            .finish(record, OperationOutcome::Ok, Some(200), None)
+            .expect("finish");
+        let records = recorder.records();
+        validate_history_scope_and_order(&records, "storage", "run-1", "bucket")
+            .expect("valid recorder history");
+
+        let mut cross_bucket = records.clone();
+        cross_bucket[0].bucket = "other-bucket".to_string();
+        assert!(
+            validate_history_scope_and_order(&cross_bucket, "storage", "run-1", "bucket").is_err()
+        );
+
+        let mut duplicated_sequence = records.clone();
+        duplicated_sequence[1].started_sequence = duplicated_sequence[0].started_sequence;
+        assert!(
+            validate_history_scope_and_order(&duplicated_sequence, "storage", "run-1", "bucket")
+                .is_err()
+        );
+
+        let mut reversed_completion = records;
+        reversed_completion.swap(0, 1);
+        let error =
+            validate_history_scope_and_order(&reversed_completion, "storage", "run-1", "bucket")
+                .expect_err("completion records must preserve recorder order");
+        assert!(error.to_string().contains("completion order"));
+    }
+
+    #[test]
+    fn history_contract_rejects_overlapping_same_key_mutations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Recorder::create(dir.path().join("history.jsonl"), "storage", "run-1")
+            .expect("recorder");
+        let first = recorder.begin(
+            OperationKind::Put,
+            "bucket",
+            Some("hot-key".to_string()),
+            Some("first".to_string()),
+            Some(4),
+        );
+        let second = recorder.begin(
+            OperationKind::Delete,
+            "bucket",
+            Some("hot-key".to_string()),
+            None,
+            None,
+        );
+        recorder
+            .finish(first, OperationOutcome::Ok, Some(200), None)
+            .expect("first");
+        recorder
+            .finish(second, OperationOutcome::Ok, Some(204), None)
+            .expect("second");
+
+        let error =
+            validate_history_scope_and_order(&recorder.records(), "storage", "run-1", "bucket")
+                .expect_err("overlapping same-key mutations must fail closed");
+        assert!(error.to_string().contains("mutations for key"));
     }
 
     #[test]

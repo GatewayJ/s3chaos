@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -35,7 +35,10 @@ use crate::fault::{
         DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS,
     },
     events::{RunEvent, RunEventStatus},
-    history::{DurabilityCohort, OperationKind, OperationOutcome, OperationRecord},
+    history::{
+        DurabilityCohort, OperationKind, OperationOutcome, OperationRecord,
+        validate_history_phase_boundary, validate_history_scope_and_order,
+    },
     host_storage::DmStatusSnapshot,
     host_storage::{
         HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT, HostStorageMutationProof,
@@ -1909,6 +1912,60 @@ fn validate_checker_report(
     Ok(())
 }
 
+type RecommitIdentity = (String, usize, String);
+
+fn derive_recommit_candidates(
+    history_prefix: &[OperationRecord],
+) -> Result<HashMap<RecommitIdentity, String>> {
+    let mut latest_mutations = HashMap::<&str, (u64, &OperationRecord)>::new();
+    for record in history_prefix.iter().filter(|record| {
+        matches!(
+            record.kind,
+            OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+        )
+    }) {
+        let key = record
+            .key
+            .as_deref()
+            .context("authenticated mutation history contains an operation without a key")?;
+        let sequence = record
+            .started_sequence
+            .context("authenticated mutation history contains an operation without a sequence")?;
+        latest_mutations
+            .entry(key)
+            .and_modify(|latest| {
+                if sequence > latest.0 {
+                    *latest = (sequence, record);
+                }
+            })
+            .or_insert((sequence, record));
+    }
+
+    let mut candidates = HashMap::with_capacity(latest_mutations.len());
+    for (_, source) in latest_mutations.into_values() {
+        if !matches!(
+            source.kind,
+            OperationKind::Put | OperationKind::CompleteMultipartUpload
+        ) || source.outcome == OperationOutcome::Ok
+        {
+            continue;
+        }
+        let identity = (
+            source.key.clone().context("recommit source has no key")?,
+            source.size_bytes.context("recommit source has no size")?,
+            source
+                .value_sha256
+                .clone()
+                .context("recommit source has no body digest")?,
+        );
+        ensure!(
+            candidates.insert(identity, source.id.clone()).is_none(),
+            "authenticated history produced duplicate recommit candidate identities"
+        );
+    }
+    Ok(candidates)
+}
+
 fn validate_checker_phase_chain(
     prechecker: &CheckerReport,
     checker: &CheckerReport,
@@ -1929,6 +1986,12 @@ fn validate_checker_phase_chain(
         .history_prefix_record_count
         .checked_add(pre_audit.history_suffix_record_count)
         .context("pre-recommit checker audit history bounds overflow")?;
+    validate_history_scope_and_order(
+        history,
+        &prechecker.scenario,
+        &prechecker.run_id,
+        expected_bucket,
+    )?;
     ensure!(
         pre_audit.history_suffix_record_count > 0 && final_audit.history_suffix_record_count > 0,
         "checker phase audits must each contain independently captured operations"
@@ -1938,7 +2001,9 @@ fn validate_checker_phase_chain(
             && final_audit.bucket == expected_bucket
             && manifest.bucket == expected_bucket
             && manifest.scenario == prechecker.scenario
-            && manifest.run_id == prechecker.run_id,
+            && manifest.run_id == prechecker.run_id
+            && checker.scenario == prechecker.scenario
+            && checker.run_id == prechecker.run_id,
         "checker phases and recommit candidate manifest do not match the run target identity"
     );
     ensure!(
@@ -1966,64 +2031,37 @@ fn validate_checker_phase_chain(
     let recommit_history = history
         .get(pre_end..recommit_end)
         .context("checker phase history bounds exceed history.jsonl")?;
+    let pre_prefix = history
+        .get(..pre_audit.history_prefix_record_count)
+        .context("pre-recommit checker prefix exceeds history.jsonl")?;
+    let pre_suffix = history
+        .get(pre_audit.history_prefix_record_count..pre_end)
+        .context("pre-recommit checker suffix exceeds history.jsonl")?;
+    let final_suffix_end = final_audit
+        .history_prefix_record_count
+        .checked_add(final_audit.history_suffix_record_count)
+        .context("final checker audit history bounds overflow")?;
+    let final_prefix = history
+        .get(..final_audit.history_prefix_record_count)
+        .context("final checker prefix exceeds history.jsonl")?;
+    let final_suffix = history
+        .get(final_audit.history_prefix_record_count..final_suffix_end)
+        .context("final checker suffix exceeds history.jsonl")?;
+    ensure!(
+        final_suffix_end == history.len(),
+        "final checker audit does not cover terminal history.jsonl"
+    );
+    validate_history_phase_boundary(pre_prefix, pre_suffix, "workload/prechecker")?;
+    validate_history_phase_boundary(&history[..pre_end], recommit_history, "prechecker/recommit")?;
+    validate_history_phase_boundary(final_prefix, final_suffix, "recommit/final-checker")?;
 
-    type RecommitIdentity = (String, usize, String);
-    let mut latest_mutations = BTreeMap::<&str, (u64, &OperationRecord)>::new();
+    let mut records_by_id = HashMap::with_capacity(manifest.history_record_count);
     for record in &history[..manifest.history_record_count] {
-        if !matches!(
-            record.kind,
-            OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
-        ) {
-            continue;
-        }
-        let key = record
-            .key
-            .as_deref()
-            .context("authenticated mutation history contains an operation without a key")?;
-        let sequence = record
-            .started_sequence
-            .context("authenticated mutation history contains an operation without a sequence")?;
-        match latest_mutations.entry(key) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert((sequence, record));
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                ensure!(
-                    entry.get().0 != sequence,
-                    "authenticated mutation history contains duplicate start sequences"
-                );
-                if sequence > entry.get().0 {
-                    entry.insert((sequence, record));
-                }
-            }
-        }
+        records_by_id.insert(record.id.as_str(), record);
     }
-    let mut derived_candidates = BTreeMap::<RecommitIdentity, String>::new();
-    for (_, source) in latest_mutations.values() {
-        if !matches!(
-            source.kind,
-            OperationKind::Put | OperationKind::CompleteMultipartUpload
-        ) || source.outcome == OperationOutcome::Ok
-        {
-            continue;
-        }
-        let identity = (
-            source.key.clone().context("recommit source has no key")?,
-            source.size_bytes.context("recommit source has no size")?,
-            source
-                .value_sha256
-                .clone()
-                .context("recommit source has no body digest")?,
-        );
-        ensure!(
-            derived_candidates
-                .insert(identity, source.id.clone())
-                .is_none(),
-            "authenticated history produced duplicate recommit candidate identities"
-        );
-    }
+    let derived_candidates = derive_recommit_candidates(&history[..manifest.history_record_count])?;
 
-    let mut expected = BTreeMap::<RecommitIdentity, String>::new();
+    let mut expected = HashMap::<RecommitIdentity, String>::new();
     for candidate in &manifest.candidates {
         ensure!(
             expected
@@ -2038,9 +2076,9 @@ fn validate_checker_phase_chain(
                 .is_none(),
             "recommit candidate manifest contains a duplicate object identity"
         );
-        let source = history[..manifest.history_record_count]
-            .iter()
-            .find(|record| record.id == candidate.source_operation_id)
+        let source = records_by_id
+            .get(candidate.source_operation_id.as_str())
+            .copied()
             .with_context(|| {
                 format!(
                     "recommit candidate {} source operation is absent from its authenticated history",
@@ -2059,30 +2097,6 @@ fn validate_checker_phase_chain(
             "recommit candidate {} does not match its authenticated source operation",
             candidate.key
         );
-        let source_sequence = source.started_sequence.with_context(|| {
-            format!(
-                "recommit candidate source {} has no recorder sequence",
-                source.id
-            )
-        })?;
-        ensure!(
-            !history[..manifest.history_record_count]
-                .iter()
-                .any(|record| {
-                    record.key.as_deref() == Some(candidate.key.as_str())
-                        && matches!(
-                            record.kind,
-                            OperationKind::Put
-                                | OperationKind::Delete
-                                | OperationKind::CompleteMultipartUpload
-                        )
-                        && record
-                            .started_sequence
-                            .is_some_and(|sequence| sequence > source_sequence)
-                }),
-            "recommit candidate {} was superseded by a later mutation",
-            candidate.key
-        );
     }
     ensure!(
         expected == derived_candidates,
@@ -2092,7 +2106,7 @@ fn validate_checker_phase_chain(
         manifest.candidates.len() == recommit.attempted,
         "recommit candidate manifest count does not match recommit-report.json"
     );
-    let mut attempts = BTreeMap::<RecommitIdentity, &RecommitAttemptArtifact>::new();
+    let mut attempts = HashMap::<RecommitIdentity, &RecommitAttemptArtifact>::new();
     for attempt in &recommit.attempts {
         ensure!(
             attempt.outcome == Some(OperationOutcome::Ok)
@@ -3529,8 +3543,9 @@ mod tests {
     use super::{
         ArtifactValidationOptions, FailureSummary, FaultEvidenceArtifact, OutcomeCountsArtifact,
         RecommitCandidateManifestArtifact, RecommitReportArtifact, WorkloadSummaryArtifact,
-        read_json, read_jsonl, recursive_find, validate_checker_phase_chain,
-        validate_fault_artifacts, validate_fault_artifacts_and_write_report,
+        derive_recommit_candidates, read_json, read_jsonl, recursive_find,
+        validate_checker_phase_chain, validate_fault_artifacts,
+        validate_fault_artifacts_and_write_report,
         validate_fault_artifacts_for_planned_attempt_and_write_report,
         validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts, validate_run_spec,
         validate_target_proof, validate_write_quorum_runtime_evidence,
@@ -3538,7 +3553,7 @@ mod tests {
     use crate::fault::{
         checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
         config::FaultTestConfig,
-        history::{OperationOutcome, OperationRecord},
+        history::{OperationKind, OperationOutcome, OperationRecord},
         host_storage::{
             HostStorageAllowlist, HostStorageMutationIntent, HostStorageMutationProof,
             HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
@@ -3717,7 +3732,7 @@ mod tests {
         let error = validate_fault_artifacts(&success_options(dir.path()))
             .expect_err("recommit evidence from another bucket must be rejected");
         assert!(
-            format!("{error:#}").contains("unsuccessful operation"),
+            format!("{error:#}").contains("outside the checker run"),
             "{error:#}"
         );
     }
@@ -3728,7 +3743,9 @@ mod tests {
         write_success_artifacts(dir.path(), "io-eio");
         let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
         rewrite_history_and_refresh_final_audit(&case_dir, |records| {
-            records[5].started_sequence = records[4].ended_sequence;
+            let put_ended = records[4].ended_sequence;
+            records[4].ended_sequence = records[5].started_sequence;
+            records[5].started_sequence = put_ended;
         });
 
         let error = validate_fault_artifacts(&success_options(dir.path()))
@@ -3737,6 +3754,92 @@ mod tests {
             format!("{error:#}").contains("happens-before order"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn checker_phase_chain_rejects_cross_phase_sequence_overlap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let original = read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl"))
+            .expect("fixture history");
+        let prechecker =
+            read_json::<CheckerReport>(&case_dir.join("checker-pre-recommit-report.json"))
+                .expect("prechecker");
+        let checker =
+            read_json::<CheckerReport>(&case_dir.join("checker-report.json")).expect("checker");
+        let recommit = read_json::<RecommitReportArtifact>(&case_dir.join("recommit-report.json"))
+            .expect("recommit");
+        let summary = read_json::<WorkloadSummaryArtifact>(&case_dir.join("workload-summary.json"))
+            .expect("summary");
+        let manifest = summary.recommit_candidates.as_ref().expect("manifest");
+        let pre_audit = prechecker.audit.as_ref().expect("pre audit");
+        let pre_end = pre_audit.history_prefix_record_count + pre_audit.history_suffix_record_count;
+        let final_prefix_count = checker
+            .audit
+            .as_ref()
+            .expect("final audit")
+            .history_prefix_record_count;
+
+        for (left, right, boundary) in [
+            (pre_end - 1, pre_end, "prechecker/recommit"),
+            (
+                final_prefix_count - 1,
+                final_prefix_count,
+                "recommit/final-checker",
+            ),
+        ] {
+            let mut history = original.clone();
+            let left_end = history[left].ended_sequence.expect("left end");
+            let right_start = history[right].started_sequence.expect("right start");
+            history[left].ended_sequence = Some(right_start);
+            history[right].started_sequence = Some(left_end);
+
+            let error = validate_checker_phase_chain(
+                &prechecker,
+                &checker,
+                &recommit,
+                manifest,
+                "bucket",
+                &history,
+            )
+            .expect_err("cross-phase operations must not overlap");
+            assert!(error.to_string().contains(boundary), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn offline_candidate_derivation_scales_to_twenty_thousand_keys() {
+        const CANDIDATES: usize = 20_000;
+        let records = (0..CANDIDATES)
+            .map(|index| OperationRecord {
+                id: format!("op-{index:06}"),
+                scenario: "storage".to_string(),
+                run_id: Some("run-1".to_string()),
+                kind: OperationKind::Put,
+                bucket: "bucket".to_string(),
+                key: Some(format!("key-{index:06}")),
+                value_sha256: Some(format!("hash-{index:06}")),
+                size_bytes: Some(1),
+                version_id: None,
+                listed_keys: None,
+                listed_versions: None,
+                payload_ref: None,
+                range: None,
+                started_sequence: Some((index as u64) * 2 + 1),
+                ended_sequence: Some((index as u64) * 2 + 2),
+                started_at_ms: (index as u64) * 2 + 1,
+                ended_at_ms: (index as u64) * 2 + 2,
+                outcome: OperationOutcome::Timeout,
+                http_status: None,
+                error: Some("timeout".to_string()),
+                durability_cohort: None,
+                fault_window_relation: None,
+            })
+            .collect::<Vec<_>>();
+
+        let candidates = derive_recommit_candidates(&records).expect("linear derivation");
+        assert_eq!(candidates.len(), CANDIDATES);
     }
 
     #[test]
@@ -3750,6 +3853,10 @@ mod tests {
         history[1].http_status = Some(200);
         history[1].error = None;
         history.drain(4..6);
+        for (index, record) in history.iter_mut().enumerate() {
+            record.started_sequence = Some((index as u64) * 2 + 1);
+            record.ended_sequence = Some((index as u64) * 2 + 2);
+        }
         let pre_prefix = &history[..2];
         let final_prefix = &history[..4];
 

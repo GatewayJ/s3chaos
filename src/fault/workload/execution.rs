@@ -16,6 +16,7 @@ use crate::fault::shutdown::RunDeadline;
 use crate::fault::{
     history::{
         ByteRange, DurabilityCohort, OperationKind, OperationOutcome, OperationRecord, Recorder,
+        validate_history_scope_and_order,
     },
     workload::{
         ObjectSpec, S3WorkloadClient, StagedMultipartUpload, WorkloadOperation, WorkloadPlan,
@@ -26,7 +27,7 @@ use crate::framework::{artifacts::ArtifactCollector, command::CommandSpec};
 use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -828,6 +829,38 @@ impl MixedWorkloadResult {
         history: &Recorder,
     ) -> Result<()> {
         let records = history.records();
+        validate_history_scope_and_order(
+            &records,
+            &self.summary.scenario,
+            &self.summary.run_id,
+            s3.bucket(),
+        )?;
+        let mut records_by_id = HashMap::with_capacity(records.len());
+        let mut latest_mutations = HashMap::<&str, (u64, &OperationRecord)>::new();
+        for record in &records {
+            records_by_id.insert(record.id.as_str(), record);
+            if !matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+            ) {
+                continue;
+            }
+            let key = record
+                .key
+                .as_deref()
+                .context("object mutation history record has no key")?;
+            let sequence = record
+                .started_sequence
+                .context("object mutation history record has no start sequence")?;
+            latest_mutations
+                .entry(key)
+                .and_modify(|latest| {
+                    if sequence > latest.0 {
+                        *latest = (sequence, record);
+                    }
+                })
+                .or_insert((sequence, record));
+        }
         let mut candidates = Vec::with_capacity(self.unconfirmed_puts.len());
         let mut keys = std::collections::BTreeSet::new();
         for candidate in &self.unconfirmed_puts {
@@ -836,9 +869,9 @@ impl MixedWorkloadResult {
                 "recommit candidates contain duplicate key {}",
                 candidate.object.key
             );
-            let source = records
-                .iter()
-                .find(|record| record.id == candidate.source_operation_id)
+            let source = records_by_id
+                .get(candidate.source_operation_id.as_str())
+                .copied()
                 .with_context(|| {
                     format!(
                         "recommit candidate {} source operation {} is absent from history",
@@ -858,25 +891,10 @@ impl MixedWorkloadResult {
                 candidate.object.key,
                 candidate.source_operation_id
             );
-            let source_sequence = source.started_sequence.with_context(|| {
-                format!(
-                    "recommit candidate source {} has no recorder sequence",
-                    source.id
-                )
-            })?;
             ensure!(
-                !records.iter().any(|record| {
-                    record.key.as_deref() == Some(candidate.object.key.as_str())
-                        && matches!(
-                            record.kind,
-                            OperationKind::Put
-                                | OperationKind::Delete
-                                | OperationKind::CompleteMultipartUpload
-                        )
-                        && record
-                            .started_sequence
-                            .is_some_and(|sequence| sequence > source_sequence)
-                }),
+                latest_mutations
+                    .get(candidate.object.key.as_str())
+                    .is_some_and(|(_, latest)| latest.id == source.id),
                 "recommit candidate {} was superseded by a later mutation",
                 candidate.object.key
             );
@@ -1473,6 +1491,122 @@ mod tests {
         assert_eq!(
             manifest.history_sha256,
             sha256_hex(&serde_json::to_vec(&history.records()).expect("history JSON"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recommit_candidate_sealing_rejects_cross_bucket_history() {
+        let client = S3WorkloadClient::new(
+            "http://127.0.0.1:1",
+            "bucket",
+            "test-access",
+            "test-secret",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history =
+            Recorder::create(dir.path().join("history.jsonl"), "storage", "run").expect("history");
+        let object = ObjectSpec::prepare_seeded("run", 1, 1, 42).spec;
+        let source = history.begin(
+            OperationKind::Put,
+            "bucket",
+            Some(object.key.clone()),
+            Some(object.sha256.clone()),
+            Some(object.size_bytes),
+        );
+        let source = history
+            .finish(
+                source,
+                OperationOutcome::Timeout,
+                None,
+                Some("timeout".to_string()),
+            )
+            .expect("source");
+        let foreign = history.begin(
+            OperationKind::Delete,
+            "other-bucket",
+            Some(object.key.clone()),
+            None,
+            None,
+        );
+        history
+            .finish(foreign, OperationOutcome::Ok, Some(204), None)
+            .expect("foreign mutation");
+        let mut workload = MixedWorkloadResult {
+            summary: WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2), "storage", "run"),
+            unconfirmed_puts: vec![RecommitCandidate {
+                object,
+                source_operation_id: source.id,
+            }],
+        };
+
+        let error = workload
+            .seal_recommit_candidates(&client, &history)
+            .expect_err("another bucket cannot suppress a run-bucket candidate");
+        assert!(error.to_string().contains("outside the checker run"));
+    }
+
+    #[tokio::test]
+    async fn recommit_candidate_sealing_scales_to_twenty_thousand_candidates() {
+        const CANDIDATES: usize = 20_000;
+        let client = S3WorkloadClient::new(
+            "http://127.0.0.1:1",
+            "bucket",
+            "test-access",
+            "test-secret",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history =
+            Recorder::create(dir.path().join("history.jsonl"), "storage", "run").expect("history");
+        let mut candidates = Vec::with_capacity(CANDIDATES);
+        for index in 0..CANDIDATES {
+            let object = ObjectSpec::prepare_seeded("run", index, 1, 42).spec;
+            let source = history.begin(
+                OperationKind::Put,
+                "bucket",
+                Some(object.key.clone()),
+                Some(object.sha256.clone()),
+                Some(object.size_bytes),
+            );
+            let source = history
+                .finish(
+                    source,
+                    OperationOutcome::Timeout,
+                    None,
+                    Some("timeout".to_string()),
+                )
+                .expect("source");
+            candidates.push(RecommitCandidate {
+                object,
+                source_operation_id: source.id,
+            });
+        }
+        let mut workload = MixedWorkloadResult {
+            summary: WorkloadSummary::new(
+                &WorkloadPlan::seeded(42, CANDIDATES, 8),
+                "storage",
+                "run",
+            ),
+            unconfirmed_puts: candidates,
+        };
+
+        workload
+            .seal_recommit_candidates(&client, &history)
+            .expect("linear candidate sealing");
+        assert_eq!(
+            workload
+                .summary
+                .recommit_candidates
+                .as_ref()
+                .expect("manifest")
+                .candidates
+                .len(),
+            CANDIDATES
         );
     }
     #[tokio::test]
