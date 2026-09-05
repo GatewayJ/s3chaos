@@ -138,6 +138,12 @@ pub struct OperationRecord {
     /// returned slice, not the whole object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<ByteRange>,
+    /// Recorder-local event order. Unlike wall-clock milliseconds, these
+    /// counters prove whether one request completed before another began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_sequence: Option<u64>,
     pub started_at_ms: u64,
     pub ended_at_ms: u64,
     pub outcome: OperationOutcome,
@@ -160,6 +166,7 @@ struct RecorderState {
     scenario: String,
     run_id: String,
     next_id: usize,
+    next_event_sequence: u64,
     durability_cohort: DurabilityCohort,
     fault_window: FaultWindow,
     records: Vec<OperationRecord>,
@@ -189,6 +196,7 @@ impl Recorder {
                 scenario: scenario.into(),
                 run_id: run_id.into(),
                 next_id: 1,
+                next_event_sequence: 1,
                 durability_cohort: DurabilityCohort::PreFault,
                 fault_window: FaultWindow::default(),
                 records: Vec::new(),
@@ -208,6 +216,8 @@ impl Recorder {
         let mut state = self.state();
         let id = format!("op-{:06}", state.next_id);
         state.next_id += 1;
+        let started_sequence = state.next_event_sequence;
+        state.next_event_sequence += 1;
         let started_at_ms = now_ms();
 
         OperationRecord {
@@ -224,6 +234,8 @@ impl Recorder {
             listed_versions: None,
             payload_ref: None,
             range: None,
+            started_sequence: Some(started_sequence),
+            ended_sequence: None,
             started_at_ms,
             ended_at_ms: started_at_ms,
             outcome: OperationOutcome::Unknown,
@@ -249,6 +261,8 @@ impl Recorder {
         record.error = error.map(|message| truncate_error(&message));
 
         let mut state = self.state();
+        record.ended_sequence = Some(state.next_event_sequence);
+        state.next_event_sequence += 1;
         record.durability_cohort = Some(state.durability_cohort);
         record.fault_window_relation = state
             .fault_window
@@ -422,8 +436,20 @@ mod tests {
             .iter()
             .map(|record| record.id.as_str())
             .collect::<BTreeSet<_>>();
+        let event_sequences = records
+            .iter()
+            .flat_map(|record| [record.started_sequence, record.ended_sequence])
+            .flatten()
+            .collect::<BTreeSet<_>>();
         assert_eq!(records.len(), 200);
         assert_eq!(ids.len(), 200);
+        assert_eq!(event_sequences.len(), 400);
+        assert!(records.iter().all(|record| {
+            record
+                .started_sequence
+                .zip(record.ended_sequence)
+                .is_some_and(|(started, ended)| started < ended)
+        }));
     }
 
     #[test]

@@ -64,6 +64,10 @@ pub struct CheckerOperationAudit {
     pub listed_keys: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listed_versions: Option<Vec<ListedVersionEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_sequence: Option<u64>,
     pub outcome: OperationOutcome,
     pub http_status: Option<u16>,
     pub error: Option<String>,
@@ -295,7 +299,6 @@ impl CheckerReport {
             && self.unexpected_visible_deleted_objects.is_empty()
             && self.unknown_writes_materialized.is_empty()
             && self.unknown_write_value_conflicts.is_empty()
-            && self.expected_live_objects == self.verified_live_objects
             && self.final_list_warning_count == 0
             && self.list_warnings.is_empty()
             && self.committed_writes_missing_version_id_count == 0
@@ -334,6 +337,8 @@ pub(crate) fn checker_operation_audits(records: &[OperationRecord]) -> Vec<Check
             size_bytes: record.size_bytes,
             listed_keys: record.listed_keys.clone(),
             listed_versions: record.listed_versions.clone(),
+            started_sequence: record.started_sequence,
+            ended_sequence: record.ended_sequence,
             outcome: record.outcome,
             http_status: record.http_status,
             error: record.error.clone(),
@@ -598,7 +603,7 @@ pub async fn check_s3_history(
             report.final_listed_objects = Some(keys.len());
             let listed = keys.into_iter().collect::<BTreeSet<_>>();
             for key in model.live.keys() {
-                if !listed.contains(key) {
+                if !listed.contains(key) && !model.ambiguous_delete_pending.contains(key) {
                     final_list_warnings.push(format!(
                         "LIST prefix {prefix} did not include expected live key {key}"
                     ));
@@ -2834,11 +2839,12 @@ mod tests {
     use super::{
         AmbiguousWriteAttempt, CheckerReport, CommittedDeleteMarker, CommittedVersion,
         ExpectedObject, RecoveryStabilityClassification, RecoveryStabilityReport, WarningSummary,
-        checker_data_version_audit, checker_delete_marker_audits, checker_history_records_sha256,
-        evaluate_committed_get, evaluate_final_get, evaluate_recovery_reread_get,
-        finish_recovery_stability_report, immediate_still_unavailable_keys,
-        is_recovery_tail_read_failure, list_history_warnings, object_model,
-        recovery_tail_candidate_keys, successful_read_anomalies, validate_recovery_key_sets,
+        checker_data_version_audit, checker_delete_marker_audits,
+        checker_expected_current_get_keys, checker_history_records_sha256, evaluate_committed_get,
+        evaluate_final_get, evaluate_recovery_reread_get, finish_recovery_stability_report,
+        immediate_still_unavailable_keys, is_recovery_tail_read_failure, list_history_warnings,
+        object_model, recovery_tail_candidate_keys, successful_read_anomalies,
+        validate_recovery_key_sets,
     };
     use crate::fault::history::{
         ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
@@ -2866,6 +2872,8 @@ mod tests {
             version_id: None,
             payload_ref: None,
             range: None,
+            started_sequence: None,
+            ended_sequence: None,
             started_at_ms: 1,
             ended_at_ms: 2,
             outcome,
@@ -2915,6 +2923,8 @@ mod tests {
             listed_versions: None,
             payload_ref: None,
             range: None,
+            started_sequence: None,
+            ended_sequence: None,
             started_at_ms,
             ended_at_ms,
             outcome: OperationOutcome::Ok,
@@ -5633,6 +5643,34 @@ mod tests {
         assert!(
             forged_incomplete_multipart.require_success().is_err(),
             "passed=true cannot hide incomplete multipart lineage"
+        );
+
+        let mut tolerated_delete = forged_incomplete_multipart;
+        tolerated_delete.multipart_upload_lineage_incomplete.clear();
+        tolerated_delete.expected_live_objects = 1;
+        tolerated_delete.verified_live_objects = 0;
+        tolerated_delete
+            .tolerated_ambiguous_deletes
+            .push("key".to_string());
+        assert!(
+            tolerated_delete.require_success().is_ok(),
+            "a materialized ambiguous delete is clean when GET and LIST agree on absence"
+        );
+    }
+
+    #[test]
+    fn checker_current_get_keys_include_ambiguous_only_writes() {
+        let timeout = record(
+            "op-timeout",
+            OperationKind::Put,
+            "ambiguous-only",
+            "hash",
+            OperationOutcome::Timeout,
+        );
+
+        assert_eq!(
+            checker_expected_current_get_keys(&[timeout]),
+            BTreeSet::from(["ambiguous-only".to_string()])
         );
     }
 

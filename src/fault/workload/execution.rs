@@ -28,6 +28,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep as async_sleep;
 
 pub(in crate::fault) fn run_warp_mixed(
@@ -297,7 +298,13 @@ pub(in crate::fault) async fn run_mixed_workload(
         deadline,
         ..
     } = *request;
-    let tasks = (0..count).map(|offset| execute_mixed_operation(request, offset));
+    // Mutations of one S3 key must have a real-time order. The checker may
+    // otherwise mistake response completion order for the server's
+    // linearization order when concurrent overwrite/delete requests overlap.
+    let mutation_locks = (0..request.prefilled.len())
+        .map(|_| AsyncMutex::new(()))
+        .collect::<Vec<_>>();
+    let tasks = (0..count).map(|offset| execute_mixed_operation(request, offset, &mutation_locks));
     let results = stream::iter(tasks)
         .buffer_unordered(plan.concurrency)
         .collect::<Vec<_>>()
@@ -326,6 +333,7 @@ pub(in crate::fault) async fn run_mixed_workload(
 async fn execute_mixed_operation(
     request: &MixedWorkloadRequest<'_>,
     offset: usize,
+    mutation_locks: &[AsyncMutex<()>],
 ) -> Result<MixedTaskResult> {
     let MixedWorkloadRequest {
         s3,
@@ -343,8 +351,16 @@ async fn execute_mixed_operation(
     let index = start_index + offset;
     let size_bytes = plan.size_at(index);
     let seed = plan.seed;
-    let existing = prefilled[plan.existing_object_offset(offset, prefilled.len())].clone();
+    let existing_offset = plan.existing_object_offset(offset, prefilled.len());
+    let existing = prefilled[existing_offset].clone();
     let operation = plan.operation_mix.operation_at(offset);
+    let _mutation_guard = match operation {
+        WorkloadOperation::Overwrite | WorkloadOperation::Delete => {
+            Some(mutation_locks[existing_offset].lock().await)
+        }
+        _ => None,
+    };
+    deadline.check()?;
     let staged_multipart = if operation == WorkloadOperation::Multipart {
         staged_multipart_uploads.map(|uploads| {
             uploads

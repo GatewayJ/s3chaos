@@ -881,6 +881,8 @@ mod tests {
             listed_versions: None,
             payload_ref: None,
             range: None,
+            started_sequence: None,
+            ended_sequence: None,
             started_at_ms,
             ended_at_ms,
             outcome,

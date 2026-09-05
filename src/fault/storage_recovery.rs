@@ -1057,6 +1057,7 @@ impl PostReturnCheckerEvidence {
         );
         let history_prefix = &history[..audit.history_prefix_record_count];
         let history_suffix = &history[audit.history_prefix_record_count..];
+        validate_settled_current_mutations(history_prefix, identity)?;
         ensure!(
             history_prefix.iter().all(|record| {
                 record_matches_identity(record, identity)
@@ -1109,15 +1110,11 @@ impl PostReturnCheckerEvidence {
                             .http_status
                             .is_some_and(|status| (200..300).contains(&status)) =>
                 {
-                    committed_current_state.insert(
-                        key.clone(),
-                        Some(
-                            record
-                                .value_sha256
-                                .clone()
-                                .expect("validated committed writes carry a hash"),
-                        ),
-                    );
+                    let expected_sha256 = record
+                        .value_sha256
+                        .clone()
+                        .context("committed current-object write lacks its content hash")?;
+                    committed_current_state.insert(key.clone(), Some(expected_sha256));
                     pending_ambiguous_deletes.remove(key);
                 }
                 OperationKind::Delete
@@ -4330,6 +4327,90 @@ fn write_may_have_committed(record: &OperationRecord) -> bool {
     }
 }
 
+fn validate_settled_current_mutations(
+    history: &[OperationRecord],
+    identity: &StorageRecoveryArtifactIdentity,
+) -> Result<()> {
+    let mut committed_by_key = BTreeMap::<String, Vec<&OperationRecord>>::new();
+    for record in history.iter().filter(|record| {
+        record_matches_identity(record, identity)
+            && matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+            )
+    }) {
+        if record.kind == OperationKind::Delete && write_may_have_committed(record) {
+            ensure!(
+                record.outcome == OperationOutcome::Ok
+                    && record
+                        .http_status
+                        .is_some_and(|status| (200..300).contains(&status)),
+                "stale-return history contains an ambiguous delete that could have committed: {}",
+                record.id
+            );
+        }
+        if record.outcome != OperationOutcome::Ok
+            || !record
+                .http_status
+                .is_some_and(|status| (200..300).contains(&status))
+        {
+            continue;
+        }
+        let key = record
+            .key
+            .as_ref()
+            .context("committed stale-return mutation lacks an object key")?;
+        ensure!(
+            record
+                .version_id
+                .as_deref()
+                .is_some_and(|version_id| !version_id.is_empty() && version_id != "null"),
+            "committed stale-return mutation {} lacks a usable version id",
+            record.id
+        );
+        if is_object_commit(record.kind) {
+            ensure!(
+                record.value_sha256.is_some() && record.size_bytes.is_some(),
+                "committed stale-return write {} lacks content identity",
+                record.id
+            );
+        }
+        let (Some(started_sequence), Some(ended_sequence)) =
+            (record.started_sequence, record.ended_sequence)
+        else {
+            anyhow::bail!(
+                "committed stale-return mutation {} lacks recorder event ordering",
+                record.id
+            );
+        };
+        ensure!(
+            started_sequence < ended_sequence,
+            "committed stale-return mutation {} has an invalid recorder event interval",
+            record.id
+        );
+        committed_by_key
+            .entry(key.clone())
+            .or_default()
+            .push(record);
+    }
+    for (key, records) in &mut committed_by_key {
+        records.sort_by_key(|record| record.started_sequence);
+        for pair in records.windows(2) {
+            let previous_end = pair[0]
+                .ended_sequence
+                .expect("committed mutation sequence validated above");
+            let next_start = pair[1]
+                .started_sequence
+                .expect("committed mutation sequence validated above");
+            ensure!(
+                previous_end < next_start,
+                "stale-return mutations for key {key:?} overlap; response order cannot prove latest S3 state"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_immutable_version_history(
     history: &[OperationRecord],
     identity: &StorageRecoveryArtifactIdentity,
@@ -5469,6 +5550,8 @@ mod tests {
             listed_versions: None,
             payload_ref: None,
             range: None,
+            started_sequence: Some(ended_at_ms.saturating_mul(2).saturating_sub(1)),
+            ended_sequence: Some(ended_at_ms.saturating_mul(2)),
             started_at_ms: ended_at_ms.saturating_sub(1),
             ended_at_ms,
             outcome: OperationOutcome::Ok,
@@ -5974,36 +6057,62 @@ mod tests {
 
         let checker_prefix_count = checker_prefix_record_count(&proof.post_return_checker);
         let mut ambiguous_history = history[..checker_prefix_count].to_vec();
-        let mut ambiguous_put = history_record(
-            "ambiguous-put-only",
+        let mut ambiguous_delete = history_record(
+            "ambiguous-delete",
             "stale-disk-return-detect",
-            OperationKind::Put,
-            "ambiguous-only-key",
-            "ambiguous-version",
-            Some(HASH_C),
+            OperationKind::Delete,
+            "key-a",
+            "",
+            None,
             375,
         );
-        ambiguous_put.outcome = OperationOutcome::Timeout;
-        ambiguous_put.http_status = None;
-        ambiguous_put.error = Some("put timed out after request dispatch".to_string());
-        ambiguous_history.push(ambiguous_put);
+        ambiguous_delete.version_id = None;
+        ambiguous_delete.outcome = OperationOutcome::Timeout;
+        ambiguous_delete.http_status = None;
+        ambiguous_delete.error = Some("delete timed out after request dispatch".to_string());
+        ambiguous_history.push(ambiguous_delete);
         append_post_return_checker_suffix(&mut ambiguous_history);
-        let mut missing_ambiguous_probe = proof.clone();
-        missing_ambiguous_probe.post_return_checker = post_return_checker(&ambiguous_history);
-        ambiguous_history.retain(|record| {
-            !(record.kind == OperationKind::Get
-                && record.version_id.is_none()
-                && record.key.as_deref() == Some("ambiguous-only-key"))
-        });
-        rebind_checker_suffix(
-            &mut missing_ambiguous_probe.post_return_checker,
-            &ambiguous_history,
-        );
+        let mut ambiguous_mutation_proof = proof.clone();
+        ambiguous_mutation_proof.post_return_checker = post_return_checker(&ambiguous_history);
+        let error = ambiguous_mutation_proof
+            .validate_against_history(&ambiguous_history)
+            .expect_err("an ambiguous delete cannot prove exact stale-return state");
         assert!(
-            missing_ambiguous_probe
-                .validate_against_history(&ambiguous_history)
-                .is_err(),
-            "an ambiguous-only write key must receive its required current-object GET"
+            error.to_string().contains("ambiguous delete"),
+            "a potentially committed delete timeout must fail closed: {error:#}"
+        );
+
+        let mut malformed_history = history.clone();
+        let malformed_put = malformed_history
+            .iter_mut()
+            .find(|record| record.id == "put-1")
+            .expect("committed PUT");
+        malformed_put.value_sha256 = None;
+        malformed_put.size_bytes = None;
+        let error = proof
+            .validate_against_history(&malformed_history)
+            .expect_err("malformed committed writes must return an error");
+        assert!(
+            error.to_string().contains("content"),
+            "malformed history must fail closed without panicking: {error:#}"
+        );
+
+        let mut overlapping_history = history[..checker_prefix_count].to_vec();
+        let put_end_sequence = overlapping_history[0]
+            .ended_sequence
+            .expect("PUT event sequence");
+        overlapping_history[1].key = Some("key-a".to_string());
+        overlapping_history[1].started_sequence = Some(put_end_sequence.saturating_sub(1));
+        append_post_return_checker_suffix(&mut overlapping_history);
+        let mut overlapping_mutations = proof.clone();
+        overlapping_mutations.committed_mutations[1].object_key = "key-a".to_string();
+        overlapping_mutations.post_return_checker = post_return_checker(&overlapping_history);
+        let error = overlapping_mutations
+            .validate_against_history(&overlapping_history)
+            .expect_err("same-key overlapping mutations have no unique latest state");
+        assert!(
+            error.to_string().contains("overlap"),
+            "same-key mutation overlap must fail before latest-state inference: {error:#}"
         );
 
         for (index, kind, value_sha256) in [

@@ -1077,6 +1077,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target_proof: &[
             "artifact must bind the detached and returned PV, device, filesystem, and RustFS drive identities to the same storage generation",
             "artifact must bind raw Local PV/PVC/Pod/Node and helper/runtime/mount-namespace generations, run bounded exact-mountpoint host sampling from detach through mutations, and bracket every committed mutation ACK with absent samples",
+            "the workload must serialize mutations per object key and record monotonic begin/end event sequences; an ambiguous delete makes the exact latest-state proof inconclusive, while ambiguous data writes are resolved through exact version listing and content probes",
             "post-return checking must bind the immutable workload prefix plus its exact read-only GET/LIST suffix and reject any concurrent or later PUT, DELETE, or multipart completion",
             "artifact must classify the complete pre-cleanup inventory as committed, recoverable-unknown, or uncommitted-dangling and retain both protected classes",
         ],
