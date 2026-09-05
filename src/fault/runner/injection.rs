@@ -27,12 +27,13 @@ use crate::{
     },
     framework::resources,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::access::ensure_s3_access;
 use super::targets::{
-    FixedVolumeTargets, require_active_fixed_volume_targets, require_active_write_quorum_partition,
+    FixedVolumeTargets, observe_volume_quorum_health, require_active_fixed_volume_targets,
+    require_active_write_quorum_partition, volume_quorum_boundary,
 };
 use super::{
     ActiveFault, FaultRun, FaultWorkload, PreparedWorkload, ProvenTarget, WorkloadTargetEvidence,
@@ -214,6 +215,57 @@ impl FaultRun<'_> {
             prefilled,
         } = prepared;
         let fault = &active.fault;
+        let volume_quorum_scenario = matches!(
+            plan.scenario.as_str(),
+            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        );
+        let quorum_health_before_workload = if volume_quorum_scenario {
+            events.record(
+                "quorum-health-before-workload",
+                RunEventStatus::Started,
+                "capturing the pre-workload RustFS quorum health boundary",
+                None,
+            )?;
+            let selected_pods = active
+                .pods_at_fault_activation
+                .iter()
+                .map(|pod| pod.name.clone())
+                .collect::<BTreeSet<_>>();
+            let (access_key, secret_key) = resources::test_credentials();
+            let observation = match self
+                .deadline
+                .run(observe_volume_quorum_health(
+                    endpoint,
+                    access_key,
+                    secret_key,
+                    &target.target_proof,
+                    &selected_pods,
+                ))
+                .await
+            {
+                Ok(observation) => observation,
+                Err(error) => {
+                    self.record_failure(
+                        "quorum-health-before-workload",
+                        "product_or_environment",
+                        &error,
+                        None,
+                        Some((fault, "quorum-health-before-workload-failed")),
+                    )?;
+                    return Err(error);
+                }
+            };
+            observation.require_within(active.fault_active_at_ms, now_ms())?;
+            events.record(
+                "quorum-health-before-workload",
+                RunEventStatus::Succeeded,
+                "captured one bounded quorum health sample before read probes and mixed mutations",
+                Some(serde_json::to_value(&observation)?),
+            )?;
+            Some(observation)
+        } else {
+            None
+        };
         events.record(
             "s3-access-under-fault",
             RunEventStatus::Started,
@@ -334,6 +386,7 @@ impl FaultRun<'_> {
         )?;
         let require_client_disruption = self.require_workload_impact(
             &workload,
+            target,
             fault,
             prefilled,
             active.fault_active_at_ms,
@@ -372,6 +425,52 @@ impl FaultRun<'_> {
             "fault status snapshots captured after workload",
             Some(serde_json::json!({ "snapshots": workload_snapshots.len() })),
         )?;
+        let quorum_health_after_workload = if volume_quorum_scenario {
+            events.record(
+                "quorum-health-after-workload",
+                RunEventStatus::Started,
+                "capturing the post-workload RustFS quorum health boundary",
+                None,
+            )?;
+            let selected_pods = pods_at_workload_snapshot
+                .iter()
+                .map(|pod| pod.name.clone())
+                .collect::<BTreeSet<_>>();
+            let (access_key, secret_key) = resources::test_credentials();
+            let observation = match self
+                .deadline
+                .run(observe_volume_quorum_health(
+                    endpoint,
+                    access_key,
+                    secret_key,
+                    &target.target_proof,
+                    &selected_pods,
+                ))
+                .await
+            {
+                Ok(observation) => observation,
+                Err(error) => {
+                    self.record_failure(
+                        "quorum-health-after-workload",
+                        "product_or_environment",
+                        &error,
+                        None,
+                        Some((fault, "quorum-health-after-workload-failed")),
+                    )?;
+                    return Err(error);
+                }
+            };
+            observation.require_within(workload_ended_at_ms, now_ms())?;
+            events.record(
+                "quorum-health-after-workload",
+                RunEventStatus::Succeeded,
+                "captured one bounded quorum health sample after workload and controller recheck",
+                Some(serde_json::to_value(&observation)?),
+            )?;
+            Some(observation)
+        } else {
+            None
+        };
         Ok(FaultWorkload {
             workload,
             workload_started_at_ms,
@@ -381,6 +480,8 @@ impl FaultRun<'_> {
             pods_at_workload_snapshot,
             workload_fixed_volume_targets,
             workload_fixed_volume_containers,
+            quorum_health_before_workload,
+            quorum_health_after_workload,
         })
     }
     pub(super) async fn run_warp_workload(
@@ -630,6 +731,7 @@ impl FaultRun<'_> {
     fn require_workload_impact(
         &self,
         workload: &MixedWorkloadResult,
+        target: &ProvenTarget,
         fault: &AppliedFault,
         prefilled: &[crate::fault::workload::ObjectSpec],
         fault_active_at_ms: u64,
@@ -647,24 +749,41 @@ impl FaultRun<'_> {
             .and_then(|()| {
                 if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
                     workload.summary.require_write_quorum_loss_effect()
-                } else if plan.scenario == QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO {
-                    workload.summary.require_typed_write_quorum_loss_effect(
-                        plan.fault().parameters().quorum_case()?,
-                    )
-                } else if plan.scenario == QUORUM_P_IO_FAULT_SCENARIO {
-                    require_typed_quorum_read_survival(
-                        &self.context.history.records(),
-                        &TypedQuorumReadExpectation {
-                            scenario: &plan.scenario,
-                            run_id: &self.context.run_id,
-                            bucket: &self.context.bucket,
-                            class: plan.fault().parameters().quorum_case()?,
-                            workload_plan: &self.context.workload_plan,
-                            cohort_source: TypedQuorumReadCohortSource::RuntimePrefilled(prefilled),
-                            fault_active_at_ms,
-                            workload_started_at_ms,
-                        },
-                    )
+                } else if matches!(
+                    plan.scenario.as_str(),
+                    QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+                ) {
+                    let shape = target
+                        .target_proof
+                        .faults
+                        .iter()
+                        .find_map(|fault| fault.erasure_set.as_ref())
+                        .and_then(|proof| proof.shape.as_ref())
+                        .context("volume quorum workload lacks proven runtime geometry")?;
+                    let unavailable = volume_quorum_boundary(plan)
+                        .context("volume quorum workload lacks a typed boundary")?
+                        .unavailable_mutations(shape)?;
+                    workload
+                        .summary
+                        .require_typed_write_quorum_loss_effect(&unavailable)?;
+                    if plan.scenario == QUORUM_P_IO_FAULT_SCENARIO {
+                        require_typed_quorum_read_survival(
+                            &self.context.history.records(),
+                            &TypedQuorumReadExpectation {
+                                scenario: &plan.scenario,
+                                run_id: &self.context.run_id,
+                                bucket: &self.context.bucket,
+                                class: plan.fault().parameters().quorum_case()?,
+                                workload_plan: &self.context.workload_plan,
+                                cohort_source: TypedQuorumReadCohortSource::RuntimePrefilled(
+                                    prefilled,
+                                ),
+                                fault_active_at_ms,
+                                workload_started_at_ms,
+                            },
+                        )?;
+                    }
+                    Ok(())
                 } else {
                     Ok(())
                 }

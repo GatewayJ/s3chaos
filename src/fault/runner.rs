@@ -15,6 +15,7 @@
 use crate::fault::shutdown::RunDeadline;
 use crate::fault::{
     host_storage::HostStorageMutationProof,
+    quorum::QuorumHealthObservation,
     reporting::{FaultStatusSnapshot, PodIdentity},
     workload::ObjectSpec,
 };
@@ -185,7 +186,9 @@ async fn run_fault_case(
             .await?;
         let mut evidence =
             run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
-        deadline.run(run.verify_recovered(&prepared.s3)).await?;
+        deadline
+            .run(run.verify_recovered(&prepared.s3, &mut workload.workload))
+            .await?;
         deadline
             .run(run.recommit(&prepared.s3, &mut workload.workload))
             .await?;
@@ -297,6 +300,8 @@ struct FaultWorkload {
     pods_at_workload_snapshot: Vec<PodIdentity>,
     workload_fixed_volume_targets: BTreeSet<String>,
     workload_fixed_volume_containers: BTreeMap<String, String>,
+    quorum_health_before_workload: Option<QuorumHealthObservation>,
+    quorum_health_after_workload: Option<QuorumHealthObservation>,
 }
 
 struct WorkloadTargetEvidence {

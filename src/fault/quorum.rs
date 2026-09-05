@@ -14,7 +14,7 @@
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const RUNTIME_TOPOLOGY_MAX_AGE_MS: u64 = 5_000;
 pub const MAX_ERASURE_SET_SHARDS: u32 = 16;
@@ -87,6 +87,30 @@ pub struct QuorumVolumeBoundary {
 }
 
 impl QuorumVolumeBoundary {
+    pub fn unavailable_mutations(
+        self,
+        shape: &ErasureSetShape,
+    ) -> Result<Vec<QuorumMutationClass>> {
+        shape.validate()?;
+        let remaining_shards = shape.total_shards - self.target_count(shape)?;
+        let mut unavailable = Vec::new();
+        for mutation in [
+            QuorumMutationClass::PutObject,
+            QuorumMutationClass::DeleteMarker,
+            QuorumMutationClass::MultipartComplete,
+        ] {
+            let requirements = QuorumRequirements::for_mutation(
+                shape.total_shards,
+                shape.payload_parity_shards,
+                mutation,
+            )?;
+            if remaining_shards < requirements.write_quorum {
+                unavailable.push(mutation);
+            }
+        }
+        Ok(unavailable)
+    }
+
     pub fn target_count(self, shape: &ErasureSetShape) -> Result<u32> {
         let requirements = self.class.requirements(shape)?;
         let target_count = requirements
@@ -122,6 +146,124 @@ pub struct QuorumVolumeTargetProof {
     pub requirements: QuorumRequirements,
     pub target_count: u32,
     pub candidates: Vec<QuorumVolumeBinding>,
+}
+
+/// One bounded `/rustfs/admin/v3/info` observation made while the volume
+/// fault is active. This proves endpoint health only at the observation
+/// boundary; it is not evidence of continuous health between observations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumHealthObservation {
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+    pub deployment_id: String,
+    pub shape: ErasureSetShape,
+    pub drives: Vec<QuorumDriveHealth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumDriveHealth {
+    pub pod_name: String,
+    pub server_endpoint: String,
+    pub drive_uuid: String,
+    pub state: String,
+    pub pool_index: i32,
+    pub set_index: i32,
+}
+
+impl QuorumHealthObservation {
+    pub fn validate(
+        &self,
+        deployment_id: &str,
+        shape: &ErasureSetShape,
+        membership: &ErasureSetMembership,
+        target: &QuorumVolumeTargetProof,
+        selected_pods: &BTreeSet<String>,
+    ) -> Result<()> {
+        ensure!(
+            self.started_at_ms > 0 && self.started_at_ms <= self.completed_at_ms,
+            "quorum health observation has an invalid request interval"
+        );
+        ensure!(
+            !deployment_id.trim().is_empty() && self.deployment_id == deployment_id,
+            "quorum health observation deployment identity changed"
+        );
+        ensure!(
+            &self.shape == shape,
+            "quorum health observation erasure geometry changed"
+        );
+        target.validate(shape, membership)?;
+        ensure!(
+            selected_pods.len() == usize::try_from(target.target_count)?
+                && selected_pods.iter().all(|pod| target
+                    .candidates
+                    .iter()
+                    .any(|candidate| &candidate.pod_name == pod)),
+            "quorum health observation selected Pods do not match the exact target boundary"
+        );
+
+        let candidates = target
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.pod_name.as_str(), candidate))
+            .collect::<BTreeMap<_, _>>();
+        let members = membership
+            .members
+            .iter()
+            .map(|member| (member.pod_name.as_str(), member))
+            .collect::<BTreeMap<_, _>>();
+        let mut observed = BTreeMap::new();
+        for drive in &self.drives {
+            ensure!(
+                !drive.pod_name.trim().is_empty()
+                    && !drive.server_endpoint.trim().is_empty()
+                    && !drive.drive_uuid.trim().is_empty()
+                    && !drive.state.trim().is_empty()
+                    && observed.insert(drive.pod_name.as_str(), drive).is_none(),
+                "quorum health observation contains an empty or duplicate drive identity"
+            );
+        }
+        ensure!(
+            observed.len() == candidates.len(),
+            "quorum health observation does not cover every proven drive candidate"
+        );
+        for (pod_name, candidate) in candidates {
+            let member = members.get(pod_name).ok_or_else(|| {
+                anyhow::anyhow!("quorum health candidate Pod {pod_name:?} has no membership row")
+            })?;
+            let drive = observed.get(pod_name).ok_or_else(|| {
+                anyhow::anyhow!("quorum health observation omitted Pod {pod_name:?}")
+            })?;
+            ensure!(
+                member.shard_ids.as_slice() == [candidate.drive_uuid.as_str()]
+                    && drive.server_endpoint == member.server_endpoint
+                    && drive.drive_uuid == candidate.drive_uuid
+                    && drive.pool_index == i32::try_from(shape.pool_index)?
+                    && drive.set_index == i32::try_from(shape.set_index)?,
+                "quorum health observation identity for Pod {pod_name:?} changed"
+            );
+            if !selected_pods.contains(pod_name) {
+                ensure!(
+                    drive.state == "ok",
+                    "non-target quorum drive {:?} for Pod {pod_name:?} is not healthy: {:?}",
+                    drive.drive_uuid,
+                    drive.state
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn require_within(&self, window_start_ms: u64, window_end_ms: u64) -> Result<()> {
+        ensure!(
+            window_start_ms <= window_end_ms
+                && self.started_at_ms >= window_start_ms
+                && self.completed_at_ms <= window_end_ms,
+            "quorum health observation is outside its bounded fault window"
+        );
+        Ok(())
+    }
 }
 
 impl QuorumVolumeTargetProof {
@@ -612,11 +754,13 @@ impl ErasureSetShape {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape,
-        PersistedVersionClass, QuorumCaseClass, QuorumMutationClass, QuorumRequirements,
-        QuorumVolumeBinding, QuorumVolumeBoundary, QuorumVolumeTargetProof,
-        require_fresh_runtime_observation,
+        PersistedVersionClass, QuorumCaseClass, QuorumDriveHealth, QuorumHealthObservation,
+        QuorumMutationClass, QuorumRequirements, QuorumVolumeBinding, QuorumVolumeBoundary,
+        QuorumVolumeTargetProof, require_fresh_runtime_observation,
     };
 
     #[test]
@@ -660,6 +804,42 @@ mod tests {
             .expect("metadata P+1"),
             5
         );
+    }
+
+    #[test]
+    fn unavailable_mutations_follow_each_write_quorum_at_p_and_p_plus_one() {
+        for (shards, parity, class, beyond, reject_data, reject_delete) in [
+            (4, 2, QuorumCaseClass::Payload, false, true, true),
+            (4, 2, QuorumCaseClass::Payload, true, true, true),
+            (8, 4, QuorumCaseClass::Payload, true, true, true),
+            (8, 2, QuorumCaseClass::Payload, false, false, false),
+            (8, 2, QuorumCaseClass::Payload, true, true, false),
+            (12, 4, QuorumCaseClass::Payload, true, true, false),
+            (8, 2, QuorumCaseClass::Metadata, false, true, true),
+            (8, 2, QuorumCaseClass::Metadata, true, true, true),
+        ] {
+            let shape =
+                ErasureSetShape::from_runtime_single_set(shards, 1, &[1], &[shards], parity)
+                    .expect("runtime shape");
+            let unavailable = QuorumVolumeBoundary {
+                class,
+                beyond_read_tolerance: beyond,
+            }
+            .unavailable_mutations(&shape)
+            .expect("mutation quorum");
+            assert_eq!(
+                unavailable.contains(&QuorumMutationClass::PutObject),
+                reject_data
+            );
+            assert_eq!(
+                unavailable.contains(&QuorumMutationClass::MultipartComplete),
+                reject_data
+            );
+            assert_eq!(
+                unavailable.contains(&QuorumMutationClass::DeleteMarker),
+                reject_delete
+            );
+        }
     }
 
     #[test]
@@ -715,6 +895,114 @@ mod tests {
             QuorumVolumeTargetProof::from_runtime(&shape, &membership, boundary, duplicate_drive,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn quorum_health_guards_bind_complete_topology_and_non_targets() {
+        let shape =
+            ErasureSetShape::from_runtime_single_set(4, 1, &[1], &[4], 2).expect("runtime shape");
+        let membership = ErasureSetMembership::from_runtime(
+            &shape,
+            (0..4)
+                .map(|index| ErasureSetMember {
+                    pod_name: format!("rustfs-{index}"),
+                    server_endpoint: format!("http://rustfs-{index}:9000"),
+                    shard_ids: vec![format!("drive-{index}")],
+                })
+                .collect(),
+        )
+        .expect("membership");
+        let target = QuorumVolumeTargetProof::from_runtime(
+            &shape,
+            &membership,
+            QuorumVolumeBoundary {
+                class: QuorumCaseClass::Metadata,
+                beyond_read_tolerance: false,
+            },
+            (0..4)
+                .map(|index| QuorumVolumeBinding {
+                    pod_name: format!("rustfs-{index}"),
+                    pod_uid: format!("uid-{index}"),
+                    container_id: format!("containerd://container-{index}"),
+                    mount_path: "/data/rustfs0".to_string(),
+                    persistent_volume_claim: format!("data-rustfs-{index}"),
+                    persistent_volume: format!("pv-{index}"),
+                    drive_uuid: format!("drive-{index}"),
+                    pool_index: 0,
+                    set_index: 0,
+                })
+                .collect(),
+        )
+        .expect("target proof");
+        let selected = ["rustfs-0".to_string(), "rustfs-1".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let observation = QuorumHealthObservation {
+            started_at_ms: 110,
+            completed_at_ms: 120,
+            deployment_id: "deployment-1".to_string(),
+            shape: shape.clone(),
+            drives: (0..4)
+                .map(|index| QuorumDriveHealth {
+                    pod_name: format!("rustfs-{index}"),
+                    server_endpoint: format!("http://rustfs-{index}:9000"),
+                    drive_uuid: format!("drive-{index}"),
+                    state: if index < 2 { "offline" } else { "ok" }.to_string(),
+                    pool_index: 0,
+                    set_index: 0,
+                })
+                .collect(),
+        };
+        observation
+            .validate("deployment-1", &shape, &membership, &target, &selected)
+            .expect("selected drives may be faulted while every non-target is healthy");
+        observation
+            .require_within(100, 130)
+            .expect("bounded request interval");
+
+        let mut missing = observation.clone();
+        missing.drives.pop();
+        assert!(
+            missing
+                .validate("deployment-1", &shape, &membership, &target, &selected)
+                .is_err()
+        );
+        let mut offline_non_target = observation.clone();
+        offline_non_target.drives[2].state = "offline".to_string();
+        assert!(
+            offline_non_target
+                .validate("deployment-1", &shape, &membership, &target, &selected)
+                .is_err()
+        );
+        let mut swapped_identity = observation.clone();
+        swapped_identity.drives.swap(0, 1);
+        swapped_identity.drives[0].pod_name = "rustfs-0".to_string();
+        swapped_identity.drives[1].pod_name = "rustfs-1".to_string();
+        assert!(
+            swapped_identity
+                .validate("deployment-1", &shape, &membership, &target, &selected)
+                .is_err()
+        );
+        assert!(
+            observation
+                .validate("deployment-2", &shape, &membership, &target, &selected)
+                .is_err()
+        );
+        let mut drifted_shape = shape.clone();
+        drifted_shape.payload_parity_shards = 1;
+        assert!(
+            observation
+                .validate(
+                    "deployment-1",
+                    &drifted_shape,
+                    &membership,
+                    &target,
+                    &selected
+                )
+                .is_err()
+        );
+        assert!(observation.require_within(111, 130).is_err());
+        assert!(observation.require_within(100, 119).is_err());
     }
 
     #[test]

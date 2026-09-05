@@ -170,15 +170,16 @@ guardrails when implementing the ordered TODO below.
   not implemented yet.
   Meaning: current executable catalog scenarios still mostly cover
   inject-recover-verify faults. The stateful RustFS reliability flows remain in
-  the ordered TODO below: quorum P/P+1, fresh volume replacement, admin heal/
-  decommission/rebalance, on-disk bitrot, stale disk, dangling cleanup, and
-  long-run campaigns.
+  the ordered TODO below: quorum P/P+1, fresh volume replacement, admin
+  decommission/rebalance, on-disk bitrot, stale disk with dangling cleanup,
+  and long-run suite campaigns.
 
 - [ ] TODO: Keep admin operations as scenario-owned product/recovery steps.
   Meaning: RustFS admin APIs such as heal, decommission, and rebalance should be
   orchestrated by scenarios and observed through workload/history/checker
-  verdicts. They are not generic fault backend behavior. Decommission needs a
-  multi-pool Tenant shape first.
+  verdicts. They are not generic fault backend behavior. Heal is a recovery
+  strategy for replacement/bitrot, not a healthy-cluster scenario.
+  Decommission needs a multi-pool Tenant shape first.
 
 ### Console And Reporting Boundary
 
@@ -346,9 +347,12 @@ guardrails when implementing the ordered TODO below.
 
 - [ ] PARTIAL: Make the health guard target-aware.
   Meaning: volume quorum proves the exact selected IOChaos targets and complete
-  non-target drive set at activation and after the workload. A post-recovery
-  RustFS admin snapshot still needs to assert every non-target drive stayed
-  online throughout the recovery boundary.
+  non-target drive set at activation and after the workload. RustFS admin
+  observations before the read probes/mutations and after the workload require
+  all non-target drives to be healthy, with unchanged deployment, geometry,
+  and drive identities. These are two endpoint guards, not proof of continuous
+  health between samples. Continuous monitoring and post-recovery target-aware
+  guards remain pending.
 
 - [x] DONE: Add host/storage mutation preflight.
   Meaning: executable device-mapper scenarios now require exact singleton
@@ -421,54 +425,77 @@ Reporting only projects this typed checker result into failure-summary fields.
   Meaning: these target exactly P and P+1 volumes in one erasure set with
   same-set proof. Payload and metadata are explicit typed cases, producing four
   suite attempts. P verifies the complete stable typed read cohort remains
-  readable with intact hashes. At payload P+1, PUT and multipart completion
-  must receive no success ACK while DELETE may still succeed through metadata
-  quorum; at metadata P+1, PUT, DELETE, and multipart completion must all
-  receive no success ACK.
+  readable with intact hashes. At both P and P+1, every mutation whose write
+  quorum exceeds the remaining shard count must receive no success ACK.
+  Payload P+1 permits DELETE success only when metadata write quorum remains;
+  for EC2+2 it rejects PUT, DELETE, and multipart completion. EC6+2 payload P
+  still permits writes, while metadata P and P+1 reject all three mutations.
+  Both boundaries stage multipart uploads before injection so completion
+  rejection is observed directly rather than inferred from failed staging.
+  Bounded `/rustfs/admin/v3/info` samples before the probes/workload and after
+  the workload/controller recheck bind the unchanged deployment, geometry,
+  endpoints, Pods, and drive UUIDs and require every non-target drive to be
+  healthy. These two endpoint samples are guards, not continuous-health proof.
   Live qualification evidence is still required before release gating.
 
 ### 9. Fix Heal-Family Oracle Blind Spots
 
-- [ ] TODO: Add force-read-through-repaired-volume support.
+- [ ] PARTIAL: Add force-read-through-repaired-volume support.
   Meaning: after replacing or corrupting one volume, normal GET can reconstruct
   from other shards and pass even if heal is broken. The scenario must force
   reads through the healed/repaired volume, for example by faulting the other P
-  volumes, before declaring heal success.
+  volumes, before declaring heal success. `ForceReadThroughProof` now rejects
+  any artifact that does not leave exactly read quorum online or excludes the
+  repaired shard; runtime orchestration still depends on executable quorum
+  targeting.
 
-- [ ] TODO: Add `fresh-volume-replacement-heal`.
+- [ ] PARTIAL: Add `fresh-volume-replacement-heal`.
   Meaning: replace one PVC/PV with an empty volume, record original and
   replacement generation, quarantine/restore path, heal progress, and then force
-  proof that the new volume contains the committed versions.
+  proof that the new volume contains the committed versions. The typed
+  generation, pre-adoption emptiness, heal, and forced-read evidence contracts
+  exist; a safe Operator/PVC replacement adapter is still required.
 
-- [ ] TODO: Add `on-disk-bitrot-heal`.
+- [ ] PARTIAL: Add `on-disk-bitrot-heal`.
   Meaning: mutate bytes in one shard on a dedicated host volume, prove exact
   object-to-shard mapping, byte offset, original/mutated hash, rollback path,
-  and verify corrupt bytes are never returned as successful S3 data.
+  and verify corrupt bytes are never returned as successful S3 data. The
+  mutation proof accepts only a versioned RustFS diagnostic mapping and refuses
+  guessed private paths; RustFS does not yet expose that stable hook to S3Chaos.
 
-- [ ] TODO: Add heal observer artifacts.
+- [ ] PARTIAL: Add heal observer artifacts.
   Meaning: `heal-summary.json` and `heal-progress.jsonl` should explain heal
   convergence/non-convergence, but checker/history remain the S3-visible verdict
-  source.
+  source. Typed summary/progress validation now requires monotonic counters and
+  a matching successful terminal sample; the admin/scanner adapters must emit
+  the artifacts during execution.
 
 ### 10. Add Stale Disk, Dangling Cleanup, And Campaign Scenarios
 
-- [ ] TODO: Add disk generation evidence.
+- [x] DONE: Add disk generation evidence contracts.
   Meaning: stale-disk and fresh-volume flows need PV/PVC/node/device generation,
-  mount identity, reattach event, and old/new generation comparison.
+  mount identity, reattach event, and old/new generation comparison. The
+  contracts reject generation reuse for fresh replacement and reject a
+  different generation for stale return.
 
-- [ ] TODO: Add `stale-disk-return-detect`.
+- [ ] PARTIAL: Add `stale-disk-return-detect`.
   Meaning: continue writes/deletes while one disk generation is absent, reattach
   the old generation, and prove latest version id, delete marker latest state,
-  and object hash do not roll back.
+  and object hash do not roll back. The catalog and evidence contracts exist;
+  the detach/reattach runtime adapter remains intentionally blocked.
 
-- [ ] TODO: Add `dangling-cleanup-after-ack-loss`.
+- [ ] PARTIAL: Cover dangling cleanup inside `stale-disk-return-detect`.
   Meaning: record shard inventory before/after dangling cleanup and prove the
-  cleanup actor did not delete recoverable committed fragments.
+  cleanup actor did not delete recoverable committed fragments. This is a
+  recovery phase and oracle of stale-disk return rather than a separate fault
+  family. The proof contract exists; the RustFS inventory/cleanup adapter is
+  still required.
 
 - [ ] TODO: Add `long-run-durability-campaign`.
   Meaning: run repeated calibrated scenarios under continuous workload with
   periodic full verification and fd/RSS/artifact-size trend gates for release
-  qualification.
+  qualification. Implement this as suite orchestration after the component
+  scenarios are executable, not as a planned fault backend.
 
 ### 11. Document Network Faults As A Separate Axis
 

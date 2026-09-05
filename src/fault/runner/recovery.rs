@@ -321,6 +321,8 @@ impl FaultRun<'_> {
             pods_at_workload_snapshot,
             workload_fixed_volume_targets,
             workload_fixed_volume_containers,
+            quorum_health_before_workload,
+            quorum_health_after_workload,
         } = workload;
         let FaultRemoval {
             fault_delete_started_at_ms,
@@ -362,6 +364,8 @@ impl FaultRun<'_> {
             fault_delete_started_at_ms: Some(*fault_delete_started_at_ms),
             recovery_started_at_ms: Some(*recovery_started_at_ms),
             recovery_ended_at_ms: Some(*recovery_ended_at_ms),
+            quorum_health_before_workload: quorum_health_before_workload.clone(),
+            quorum_health_after_workload: quorum_health_after_workload.clone(),
         };
         collector.write_text(
             scenario.case_name,

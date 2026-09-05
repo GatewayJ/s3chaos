@@ -22,6 +22,7 @@ use crate::{
         config::FaultTestConfig,
         host_storage::DmStatusSnapshot,
         plan::{FaultPlan, FaultSelection},
+        quorum::QuorumHealthObservation,
         scenarios::{FaultScenario, FaultScenarioSpec},
         workload::WorkloadPlan,
     },
@@ -86,6 +87,10 @@ pub(crate) struct FaultEvidence {
     pub(crate) recovery_started_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) recovery_ended_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) quorum_health_before_workload: Option<QuorumHealthObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) quorum_health_after_workload: Option<QuorumHealthObservation>,
 }
 
 #[derive(Debug, Clone, Serialize)]

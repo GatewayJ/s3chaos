@@ -22,7 +22,8 @@ use crate::{
         preflight::{TargetProof, TargetResolvedPodProof, target_pod_has_fixed_volume},
         quorum::{
             ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape,
-            QuorumVolumeBinding, QuorumVolumeBoundary, QuorumVolumeTargetProof,
+            QuorumDriveHealth, QuorumHealthObservation, QuorumVolumeBinding, QuorumVolumeBoundary,
+            QuorumVolumeTargetProof,
         },
         reporting::{FaultStatusSnapshot, PodIdentity},
     },
@@ -183,6 +184,83 @@ pub(super) async fn require_volume_quorum_topology(
         },
         volume_quorum,
     })
+}
+
+pub(super) async fn observe_volume_quorum_health(
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    target_proof: &TargetProof,
+    selected_pods: &BTreeSet<String>,
+) -> Result<QuorumHealthObservation> {
+    let erasure_set = target_proof
+        .faults
+        .iter()
+        .find_map(|fault| fault.erasure_set.as_ref())
+        .context("volume quorum health guard has no proven erasure set")?;
+    let expected_shape = erasure_set
+        .shape
+        .as_ref()
+        .context("volume quorum health guard has no proven erasure geometry")?;
+    let expected_membership = erasure_set
+        .membership
+        .as_ref()
+        .context("volume quorum health guard has no proven membership")?;
+    let target = erasure_set
+        .volume_quorum
+        .as_ref()
+        .context("volume quorum health guard has no proven volume candidates")?;
+    let deployment_id = erasure_set
+        .deployment_id
+        .as_deref()
+        .context("volume quorum health guard has no deployment identity")?;
+    let candidate_pods = target
+        .candidates
+        .iter()
+        .map(|candidate| candidate.pod_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let started_at_ms = now_ms();
+    let runtime = read_erasure_layout(endpoint, "us-east-1", access_key, secret_key)
+        .await
+        .context("reading bounded RustFS quorum health observation")?;
+    let completed_at_ms = now_ms();
+    let shape = ErasureSetShape::from_runtime_single_set(
+        usize::try_from(expected_shape.server_count)?,
+        u64::from(expected_shape.volumes_per_server),
+        &runtime.total_sets,
+        &runtime.drives_per_set,
+        runtime.standard_parity,
+    )
+    .context("quorum health observation erasure geometry changed")?;
+    let mut drives = Vec::new();
+    for server in runtime.servers {
+        let pod_name = runtime_server_pod_name(&server.endpoint, &candidate_pods)?;
+        for drive in server.drives {
+            drives.push(QuorumDriveHealth {
+                pod_name: pod_name.clone(),
+                server_endpoint: server.endpoint.clone(),
+                drive_uuid: drive.uuid,
+                state: drive.state,
+                pool_index: drive.pool_index,
+                set_index: drive.set_index,
+            });
+        }
+    }
+    let observation = QuorumHealthObservation {
+        started_at_ms,
+        completed_at_ms,
+        deployment_id: runtime.deployment_id,
+        shape,
+        drives,
+    };
+    observation.validate(
+        deployment_id,
+        expected_shape,
+        expected_membership,
+        target,
+        selected_pods,
+    )?;
+    Ok(observation)
 }
 
 fn bind_runtime_drives_to_volumes(
@@ -736,10 +814,12 @@ mod tests {
             .with_rustfs_container_id(format!("containerd://container-{index}"))
             .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
                 name: format!("data-rustfs-{index}"),
+                uid: format!("pvc-uid-{index}"),
                 volume_name: Some(format!("pv-{index}")),
                 storage_class: Some("fast-csi".to_string()),
                 persistent_volume: Some(TargetPersistentVolumeProof {
                     name: format!("pv-{index}"),
+                    uid: format!("pv-uid-{index}"),
                     source: Some("csi".to_string()),
                     required_node_affinity: None,
                     node: None,

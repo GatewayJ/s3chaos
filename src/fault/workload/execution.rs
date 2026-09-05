@@ -16,9 +16,9 @@ use crate::fault::shutdown::RunDeadline;
 use crate::fault::{
     history::{
         ByteRange, DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome,
-        OperationRecord, PayloadRef, Recorder,
+        OperationRecord, PayloadRef, Recorder, validate_history_scope_and_order,
     },
-    quorum::QuorumCaseClass,
+    quorum::{QuorumCaseClass, QuorumMutationClass},
     workload::{
         ObjectSpec, S3WorkloadClient, StagedMultipartUpload, WorkloadOperation, WorkloadPlan,
         sha256_hex,
@@ -29,7 +29,9 @@ use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep as async_sleep;
 
 pub(in crate::fault) fn run_warp_mixed(
@@ -539,6 +541,10 @@ pub(in crate::fault) fn require_typed_quorum_read_survival(
             verification.range.is_none()
                 && verification.value_sha256.as_deref() == Some(committed_sha256)
                 && verification.size_bytes == Some(object.size_bytes)
+                && prefill_put
+                    .ended_sequence
+                    .zip(verification.started_sequence)
+                    .is_some_and(|(put_end, get_start)| put_end < get_start)
                 && verification.started_at_ms >= prefill_put.ended_at_ms
                 && verification.started_at_ms <= verification.ended_at_ms
                 && verification.ended_at_ms <= expected.fault_active_at_ms,
@@ -554,6 +560,10 @@ pub(in crate::fault) fn require_typed_quorum_read_survival(
         };
         ensure!(
             probe.outcome == OperationOutcome::Ok
+                && verification
+                    .ended_sequence
+                    .zip(probe.started_sequence)
+                    .is_some_and(|(verify_end, probe_start)| verify_end < probe_start)
                 && probe.range.is_none()
                 && probe.value_sha256.as_deref() == Some(committed_sha256)
                 && probe.size_bytes == Some(object.size_bytes)
@@ -599,7 +609,16 @@ pub(in crate::fault) async fn run_mixed_workload(
         deadline,
         ..
     } = *request;
-    let tasks = (0..count).map(|offset| execute_mixed_operation(request, offset));
+    // Mutations of one S3 key must have a real-time order. The checker may
+    // otherwise mistake response completion order for the server's
+    // linearization order when concurrent overwrite/delete requests overlap.
+    let mutation_locks = (0..request.prefilled.len())
+        .map(|_| AsyncMutex::new(()))
+        .collect::<Vec<_>>();
+    let next_mutation_sequence = AtomicU64::new(1);
+    let tasks = (0..count).map(|offset| {
+        execute_mixed_operation(request, offset, &mutation_locks, &next_mutation_sequence)
+    });
     let results = stream::iter(tasks)
         .buffer_unordered(plan.concurrency)
         .collect::<Vec<_>>()
@@ -609,13 +628,16 @@ pub(in crate::fault) async fn run_mixed_workload(
     for result in results {
         completed.push(result?);
     }
+    // Same-key mutations are serialized above, so completion order is their
+    // observed real-time order. Only the final mutation of a key can remain a
+    // recommit candidate: replaying an earlier ambiguous PUT after a later
+    // overwrite or DELETE would manufacture a new latest value after recovery.
+    let unconfirmed_puts = final_unconfirmed_puts(&completed);
     completed.sort_by_key(|result| result.index);
 
     let mut summary = WorkloadSummary::new(plan, scenario, run_id);
-    let mut unconfirmed_puts = Vec::new();
     for result in completed {
         summary.record_all(&result);
-        unconfirmed_puts.extend(result.unconfirmed_puts);
     }
 
     summary.require_exercised()?;
@@ -628,6 +650,8 @@ pub(in crate::fault) async fn run_mixed_workload(
 async fn execute_mixed_operation(
     request: &MixedWorkloadRequest<'_>,
     offset: usize,
+    mutation_locks: &[AsyncMutex<()>],
+    next_mutation_sequence: &AtomicU64,
 ) -> Result<MixedTaskResult> {
     let MixedWorkloadRequest {
         s3,
@@ -645,8 +669,16 @@ async fn execute_mixed_operation(
     let index = start_index + offset;
     let size_bytes = plan.size_at(index);
     let seed = plan.seed;
-    let existing = prefilled[plan.existing_object_offset(offset, prefilled.len())].clone();
+    let existing_offset = plan.existing_object_offset(offset, prefilled.len());
+    let existing = prefilled[existing_offset].clone();
     let operation = plan.operation_mix.operation_at(offset);
+    let _mutation_guard = match operation {
+        WorkloadOperation::Overwrite | WorkloadOperation::Delete => {
+            Some(mutation_locks[existing_offset].lock().await)
+        }
+        _ => None,
+    };
+    deadline.check()?;
     let staged_multipart = if operation == WorkloadOperation::Multipart {
         staged_multipart_uploads.map(|uploads| {
             uploads
@@ -664,25 +696,35 @@ async fn execute_mixed_operation(
         WorkloadOperation::Put => {
             let object = ObjectSpec::prepare_seeded(run_id, index, size_bytes, seed);
             let spec = object.spec.clone();
+            result.mutation_sequence = Some(next_mutation_sequence.fetch_add(1, Ordering::Relaxed));
             let verified = s3.put_and_verify_object(&object, history).await?;
+            result.mutation_key = Some(spec.key.clone());
             result.puts.push(verified.write_outcome);
             if let Some(get_outcome) = verified.verify_get_outcome {
                 result.gets.push(get_outcome);
             }
             if verified.write_outcome != OperationOutcome::Ok {
-                result.unconfirmed_puts.push(spec);
+                result.unconfirmed_puts.push(RecommitCandidate {
+                    object: spec,
+                    source_operation_id: verified.write_operation_id,
+                });
             }
         }
         WorkloadOperation::Overwrite => {
             let object = existing.prepare_overwrite(index as u64 + 1);
             let spec = object.spec.clone();
+            result.mutation_sequence = Some(next_mutation_sequence.fetch_add(1, Ordering::Relaxed));
             let verified = s3.put_and_verify_object(&object, history).await?;
+            result.mutation_key = Some(spec.key.clone());
             result.puts.push(verified.write_outcome);
             if let Some(get_outcome) = verified.verify_get_outcome {
                 result.gets.push(get_outcome);
             }
             if verified.write_outcome != OperationOutcome::Ok {
-                result.unconfirmed_puts.push(spec);
+                result.unconfirmed_puts.push(RecommitCandidate {
+                    object: spec,
+                    source_operation_id: verified.write_operation_id,
+                });
             }
         }
         WorkloadOperation::Get => {
@@ -710,6 +752,8 @@ async fn execute_mixed_operation(
             result.lists.push(outcome);
         }
         WorkloadOperation::Delete => {
+            result.mutation_key = Some(existing.key.clone());
+            result.mutation_sequence = Some(next_mutation_sequence.fetch_add(1, Ordering::Relaxed));
             let (delete_outcome, verify_get) =
                 s3.delete_and_verify_absent(&existing.key, history).await?;
             result.deletes.push(delete_outcome);
@@ -718,26 +762,36 @@ async fn execute_mixed_operation(
             }
         }
         WorkloadOperation::Multipart => {
-            let (spec, complete_outcome) = match staged_multipart {
+            let (spec, complete_record) = match staged_multipart {
                 Some(staged) => {
-                    let outcome = s3
-                        .complete_staged_multipart_object(&staged, history)
+                    let record = s3
+                        .complete_staged_multipart_object_record(&staged, history)
                         .await?;
-                    (staged.spec, outcome)
+                    (staged.spec, Some(record))
                 }
                 None => {
                     let object = ObjectSpec::prepare_seeded(run_id, index, size_bytes, seed);
-                    let outcome = s3.complete_multipart_object(&object, history).await?;
-                    (object.spec, outcome)
+                    let record = s3
+                        .complete_multipart_object_record(&object, history)
+                        .await?;
+                    (object.spec, record)
                 }
             };
+            let complete_outcome = complete_record
+                .as_ref()
+                .map_or(OperationOutcome::Unknown, |record| record.outcome);
+            result.mutation_key = Some(spec.key.clone());
+            result.mutation_sequence = Some(next_mutation_sequence.fetch_add(1, Ordering::Relaxed));
             result.multipart_completes.push(complete_outcome);
             if complete_outcome == OperationOutcome::Ok {
                 result
                     .gets
                     .push(s3.get_object_result(&spec.key, history).await?.outcome);
-            } else {
-                result.unconfirmed_puts.push(spec);
+            } else if let Some(record) = complete_record {
+                result.unconfirmed_puts.push(RecommitCandidate {
+                    object: spec,
+                    source_operation_id: record.id,
+                });
             }
             let abort_object =
                 ObjectSpec::prepare_seeded(run_id, plan.object_count + index, 4 * 1024, seed);
@@ -747,6 +801,31 @@ async fn execute_mixed_operation(
         }
     }
     Ok(result)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::fault) struct RecommitCandidate {
+    object: ObjectSpec,
+    source_operation_id: String,
+}
+
+fn final_unconfirmed_puts(completed: &[MixedTaskResult]) -> Vec<RecommitCandidate> {
+    let mut pending = BTreeMap::<String, RecommitCandidate>::new();
+    let mut mutations = completed
+        .iter()
+        .filter_map(|result| Some((result.mutation_sequence?, result)))
+        .collect::<Vec<_>>();
+    mutations.sort_by_key(|(sequence, _)| *sequence);
+    for (_, result) in mutations {
+        let Some(key) = &result.mutation_key else {
+            continue;
+        };
+        pending.remove(key);
+        if let Some(candidate) = result.unconfirmed_puts.last() {
+            pending.insert(key.clone(), candidate.clone());
+        }
+    }
+    pending.into_values().collect()
 }
 
 /// Decide whether the GET at `index` runs as a ranged read, and derive a
@@ -779,38 +858,60 @@ fn ranged_get_range(percent: u8, seed: u64, index: usize, size_bytes: usize) -> 
 pub(in crate::fault) async fn recommit_unconfirmed_objects(
     s3: &S3WorkloadClient,
     history: &Recorder,
-    objects: &[ObjectSpec],
+    objects: &[RecommitCandidate],
     concurrency: usize,
 ) -> RecommitReport {
-    let tasks = objects.iter().cloned().map(|object| {
-        let s3 = s3.clone();
-        let history = history.clone();
-        async move {
-            let prepared = object.prepare();
-            match s3.put_object_record(&prepared, &history).await {
-                Ok(record) => {
-                    let verify_get_outcome = if record.outcome == OperationOutcome::Ok {
-                        match s3.get_object_result(&object.key, &history).await {
-                            Ok(get) => Some(get.outcome),
-                            Err(_) => Some(OperationOutcome::Unknown),
+    let tasks = unconfirmed_objects_by_key(objects)
+        .into_iter()
+        .map(|objects| {
+            let s3 = s3.clone();
+            let history = history.clone();
+            async move {
+                let mut attempts = Vec::with_capacity(objects.len());
+                for candidate in objects {
+                    let prepared = candidate.object.prepare();
+                    let attempt = match s3.put_object_record(&prepared, &history).await {
+                        Ok(record) => {
+                            let verify_get_outcome = if record.outcome == OperationOutcome::Ok {
+                                match s3.get_object_result(&candidate.object.key, &history).await {
+                                    Ok(get) => Some(get.outcome),
+                                    Err(_) => Some(OperationOutcome::Unknown),
+                                }
+                            } else {
+                                None
+                            };
+                            RecommitAttempt::from_record(candidate, record, verify_get_outcome)
                         }
-                    } else {
-                        None
+                        Err(error) => RecommitAttempt::from_harness_error(
+                            candidate,
+                            format!("record PUT: {error}"),
+                        ),
                     };
-                    RecommitAttempt::from_record(object, record, verify_get_outcome)
+                    attempts.push(attempt);
                 }
-                Err(error) => {
-                    RecommitAttempt::from_harness_error(object, format!("record PUT: {error}"))
-                }
+                attempts
             }
-        }
-    });
+        });
     let mut attempts = stream::iter(tasks)
         .buffer_unordered(concurrency)
         .collect::<Vec<_>>()
-        .await;
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     attempts.sort_by(|left, right| left.key.cmp(&right.key));
     RecommitReport::from_attempts(attempts).with_identity(&history.scenario(), &history.run_id())
+}
+
+fn unconfirmed_objects_by_key(objects: &[RecommitCandidate]) -> Vec<Vec<RecommitCandidate>> {
+    let mut by_key = BTreeMap::<String, Vec<RecommitCandidate>>::new();
+    for candidate in objects {
+        by_key
+            .entry(candidate.object.key.clone())
+            .or_default()
+            .push(candidate.clone());
+    }
+    by_key.into_values().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -893,6 +994,7 @@ impl RecommitReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct RecommitAttempt {
+    source_operation_id: String,
     key: String,
     size_bytes: usize,
     sha256: String,
@@ -905,11 +1007,16 @@ struct RecommitAttempt {
 
 impl RecommitAttempt {
     fn from_record(
-        object: ObjectSpec,
+        candidate: RecommitCandidate,
         record: OperationRecord,
         verify_get_outcome: Option<OperationOutcome>,
     ) -> Self {
+        let RecommitCandidate {
+            object,
+            source_operation_id,
+        } = candidate;
         Self {
+            source_operation_id,
             key: object.key,
             size_bytes: object.size_bytes,
             sha256: object.sha256,
@@ -921,8 +1028,13 @@ impl RecommitAttempt {
         }
     }
 
-    fn from_harness_error(object: ObjectSpec, error: String) -> Self {
+    fn from_harness_error(candidate: RecommitCandidate, error: String) -> Self {
+        let RecommitCandidate {
+            object,
+            source_operation_id,
+        } = candidate;
         Self {
+            source_operation_id,
             key: object.key,
             size_bytes: object.size_bytes,
             sha256: object.sha256,
@@ -982,22 +1094,26 @@ impl RecommitAttempt {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MixedTaskResult {
     index: usize,
+    mutation_key: Option<String>,
+    mutation_sequence: Option<u64>,
     puts: Vec<OperationOutcome>,
     gets: Vec<OperationOutcome>,
     deletes: Vec<OperationOutcome>,
     lists: Vec<OperationOutcome>,
     multipart_completes: Vec<OperationOutcome>,
     multipart_aborts: Vec<OperationOutcome>,
-    unconfirmed_puts: Vec<ObjectSpec>,
+    unconfirmed_puts: Vec<RecommitCandidate>,
 }
 
 impl MixedTaskResult {
     fn new(index: usize) -> Self {
         Self {
             index,
+            mutation_key: None,
+            mutation_sequence: None,
             puts: Vec::new(),
             gets: Vec::new(),
             deletes: Vec::new(),
@@ -1012,7 +1128,103 @@ impl MixedTaskResult {
 #[derive(Debug)]
 pub(in crate::fault) struct MixedWorkloadResult {
     pub(in crate::fault) summary: WorkloadSummary,
-    pub(in crate::fault) unconfirmed_puts: Vec<ObjectSpec>,
+    pub(in crate::fault) unconfirmed_puts: Vec<RecommitCandidate>,
+}
+
+impl MixedWorkloadResult {
+    pub(in crate::fault) fn seal_recommit_candidates(
+        &mut self,
+        s3: &S3WorkloadClient,
+        history: &Recorder,
+    ) -> Result<()> {
+        let records = history.records();
+        validate_history_scope_and_order(
+            &records,
+            &self.summary.scenario,
+            &self.summary.run_id,
+            s3.bucket(),
+        )?;
+        let mut records_by_id = HashMap::with_capacity(records.len());
+        let mut latest_mutations = HashMap::<&str, (u64, &OperationRecord)>::new();
+        for record in &records {
+            records_by_id.insert(record.id.as_str(), record);
+            if !matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+            ) {
+                continue;
+            }
+            let key = record
+                .key
+                .as_deref()
+                .context("object mutation history record has no key")?;
+            let sequence = record
+                .started_sequence
+                .context("object mutation history record has no start sequence")?;
+            latest_mutations
+                .entry(key)
+                .and_modify(|latest| {
+                    if sequence > latest.0 {
+                        *latest = (sequence, record);
+                    }
+                })
+                .or_insert((sequence, record));
+        }
+        let mut candidates = Vec::with_capacity(self.unconfirmed_puts.len());
+        let mut keys = std::collections::BTreeSet::new();
+        for candidate in &self.unconfirmed_puts {
+            ensure!(
+                keys.insert(candidate.object.key.as_str()),
+                "recommit candidates contain duplicate key {}",
+                candidate.object.key
+            );
+            let source = records_by_id
+                .get(candidate.source_operation_id.as_str())
+                .copied()
+                .with_context(|| {
+                    format!(
+                        "recommit candidate {} source operation {} is absent from history",
+                        candidate.object.key, candidate.source_operation_id
+                    )
+                })?;
+            ensure!(
+                matches!(
+                    source.kind,
+                    OperationKind::Put | OperationKind::CompleteMultipartUpload
+                ) && source.outcome != OperationOutcome::Ok
+                    && source.bucket == s3.bucket()
+                    && source.key.as_deref() == Some(candidate.object.key.as_str())
+                    && source.value_sha256.as_deref() == Some(candidate.object.sha256.as_str())
+                    && source.size_bytes == Some(candidate.object.size_bytes),
+                "recommit candidate {} does not match its source operation {}",
+                candidate.object.key,
+                candidate.source_operation_id
+            );
+            ensure!(
+                latest_mutations
+                    .get(candidate.object.key.as_str())
+                    .is_some_and(|(_, latest)| latest.id == source.id),
+                "recommit candidate {} was superseded by a later mutation",
+                candidate.object.key
+            );
+            candidates.push(RecommitCandidateEvidence {
+                source_operation_id: candidate.source_operation_id.clone(),
+                key: candidate.object.key.clone(),
+                size_bytes: candidate.object.size_bytes,
+                sha256: candidate.object.sha256.clone(),
+            });
+        }
+        candidates.sort_by(|left, right| left.key.cmp(&right.key));
+        self.summary.recommit_candidates = Some(RecommitCandidateManifest {
+            scenario: self.summary.scenario.clone(),
+            run_id: self.summary.run_id.clone(),
+            bucket: s3.bucket().to_string(),
+            history_record_count: records.len(),
+            history_sha256: sha256_hex(&serde_json::to_vec(&records)?),
+            candidates,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1091,6 +1303,24 @@ pub(in crate::fault) struct WorkloadPlanArtifact<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(in crate::fault) struct RecommitCandidateEvidence {
+    pub(in crate::fault) source_operation_id: String,
+    pub(in crate::fault) key: String,
+    pub(in crate::fault) size_bytes: usize,
+    pub(in crate::fault) sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(in crate::fault) struct RecommitCandidateManifest {
+    pub(in crate::fault) scenario: String,
+    pub(in crate::fault) run_id: String,
+    pub(in crate::fault) bucket: String,
+    pub(in crate::fault) history_record_count: usize,
+    pub(in crate::fault) history_sha256: String,
+    pub(in crate::fault) candidates: Vec<RecommitCandidateEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(in crate::fault) struct WorkloadSummary {
     pub(in crate::fault) scenario: String,
     pub(in crate::fault) run_id: String,
@@ -1104,6 +1334,8 @@ pub(in crate::fault) struct WorkloadSummary {
     lists: OutcomeCounts,
     multipart_completes: OutcomeCounts,
     multipart_aborts: OutcomeCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::fault) recommit_candidates: Option<RecommitCandidateManifest>,
     pub(in crate::fault) recommitted_after_recovery: usize,
 }
 
@@ -1122,6 +1354,7 @@ impl WorkloadSummary {
             lists: OutcomeCounts::default(),
             multipart_completes: OutcomeCounts::default(),
             multipart_aborts: OutcomeCounts::default(),
+            recommit_candidates: None,
             recommitted_after_recovery: 0,
         }
     }
@@ -1187,19 +1420,19 @@ impl WorkloadSummary {
 
     pub(in crate::fault) fn require_typed_write_quorum_loss_effect(
         &self,
-        class: QuorumCaseClass,
+        unavailable_mutations: &[QuorumMutationClass],
     ) -> Result<()> {
-        match class {
-            QuorumCaseClass::Payload => self.require_rejected_write_mutations(&[
-                ("PUT", &self.puts),
-                ("CompleteMultipartUpload", &self.multipart_completes),
-            ]),
-            QuorumCaseClass::Metadata => self.require_rejected_write_mutations(&[
-                ("PUT", &self.puts),
-                ("DELETE", &self.deletes),
-                ("CompleteMultipartUpload", &self.multipart_completes),
-            ]),
-        }
+        let mutations = unavailable_mutations
+            .iter()
+            .map(|mutation| match mutation {
+                QuorumMutationClass::PutObject => ("PUT", &self.puts),
+                QuorumMutationClass::DeleteMarker => ("DELETE", &self.deletes),
+                QuorumMutationClass::MultipartComplete => {
+                    ("CompleteMultipartUpload", &self.multipart_completes)
+                }
+            })
+            .collect::<Vec<_>>();
+        self.require_rejected_write_mutations(&mutations)
     }
 
     fn require_rejected_write_mutations(&self, mutations: &[(&str, &OutcomeCounts)]) -> Result<()> {
@@ -1380,6 +1613,7 @@ mod tests {
             lists: OutcomeCounts::default(),
             multipart_completes: OutcomeCounts::default(),
             multipart_aborts: OutcomeCounts::default(),
+            recommit_candidates: None,
             recommitted_after_recovery: 0,
         };
 
@@ -1448,43 +1682,64 @@ mod tests {
         }
     }
     #[test]
-    fn typed_write_quorum_loss_checks_only_the_selected_quorum_class() {
-        let mut payload = WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2), "io-eio", "run-1");
-        payload.puts.record(OperationOutcome::Failed);
-        payload.deletes.record(OperationOutcome::Ok);
-        payload
-            .multipart_completes
-            .record(OperationOutcome::Timeout);
-        assert!(
+    fn typed_write_quorum_loss_follows_runtime_geometry() {
+        use crate::fault::quorum::{ErasureSetShape, QuorumVolumeBoundary};
+        for (shards, parity, class, beyond, delete_allowed, put_allowed) in [
+            (4, 2, QuorumCaseClass::Payload, false, false, false),
+            (4, 2, QuorumCaseClass::Payload, true, false, false),
+            (8, 4, QuorumCaseClass::Payload, true, false, false),
+            (8, 2, QuorumCaseClass::Payload, false, true, true),
+            (8, 2, QuorumCaseClass::Payload, true, true, false),
+            (12, 4, QuorumCaseClass::Payload, true, true, false),
+            (8, 2, QuorumCaseClass::Metadata, false, false, false),
+            (8, 2, QuorumCaseClass::Metadata, true, false, false),
+        ] {
+            let shape =
+                ErasureSetShape::from_runtime_single_set(shards, 1, &[1], &[shards], parity)
+                    .expect("runtime shape");
+            let unavailable = QuorumVolumeBoundary {
+                class,
+                beyond_read_tolerance: beyond,
+            }
+            .unavailable_mutations(&shape)
+            .expect("mutation quorum");
+            let mut payload =
+                WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2), "io-eio", "run-1");
+            payload.puts.record(OperationOutcome::Failed);
+            payload.deletes.record(OperationOutcome::Ok);
             payload
-                .require_typed_write_quorum_loss_effect(QuorumCaseClass::Payload)
-                .is_ok()
-        );
-        assert!(
-            payload
-                .require_typed_write_quorum_loss_effect(QuorumCaseClass::Metadata)
-                .is_err()
-        );
+                .multipart_completes
+                .record(OperationOutcome::Timeout);
+            assert_eq!(
+                payload
+                    .require_typed_write_quorum_loss_effect(&unavailable)
+                    .is_ok(),
+                delete_allowed,
+                "DELETE at {shards}/{parity} {class:?} beyond={beyond}"
+            );
 
-        let mut metadata =
-            WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2), "io-eio", "run-1");
-        metadata.puts.record(OperationOutcome::Failed);
-        metadata.deletes.record(OperationOutcome::Unknown);
-        metadata
-            .multipart_completes
-            .record(OperationOutcome::Timeout);
-        assert!(
+            let mut metadata =
+                WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2), "io-eio", "run-1");
+            metadata.puts.record(OperationOutcome::Failed);
+            metadata.deletes.record(OperationOutcome::Unknown);
             metadata
-                .require_typed_write_quorum_loss_effect(QuorumCaseClass::Metadata)
-                .is_ok()
-        );
+                .multipart_completes
+                .record(OperationOutcome::Timeout);
+            assert!(
+                metadata
+                    .require_typed_write_quorum_loss_effect(&unavailable)
+                    .is_ok()
+            );
 
-        metadata.puts.record(OperationOutcome::Ok);
-        assert!(
-            metadata
-                .require_typed_write_quorum_loss_effect(QuorumCaseClass::Metadata)
-                .is_err()
-        );
+            metadata.puts.record(OperationOutcome::Ok);
+            assert_eq!(
+                metadata
+                    .require_typed_write_quorum_loss_effect(&unavailable)
+                    .is_ok(),
+                put_allowed,
+                "PUT at {shards}/{parity} {class:?} beyond={beyond}"
+            );
+        }
     }
     #[test]
     fn quorum_workload_stages_every_planned_multipart_completion() {
@@ -1566,7 +1821,40 @@ mod tests {
             ));
         }
 
+        records.sort_by_key(|record| record.ended_at_ms);
+        for (index, record) in records.iter_mut().enumerate() {
+            record.started_sequence = Some(index as u64 * 2 + 1);
+            record.ended_sequence = Some(index as u64 * 2 + 2);
+        }
+        validate_history_scope_and_order(&records, expectation.scenario, run_id, "bucket")
+            .expect("valid recorder history");
         assert!(require_typed_quorum_read_survival(&records, &expectation).is_ok());
+
+        let mut same_ms = records.clone();
+        for record in &mut same_ms {
+            record.started_at_ms = 100;
+            record.ended_at_ms = 100;
+        }
+        assert!(require_typed_quorum_read_survival(&same_ms, &expectation).is_ok());
+        for (left_id, right_id) in [("put-0", "verify-0"), ("verify-0", "probe-0")] {
+            let mut reversed = same_ms.clone();
+            let left = reversed
+                .iter()
+                .position(|record| record.id == left_id)
+                .expect("left");
+            let right = reversed
+                .iter()
+                .position(|record| record.id == right_id)
+                .expect("right");
+            reversed.swap(left, right);
+            for (index, record) in reversed.iter_mut().enumerate() {
+                record.started_sequence = Some(index as u64 * 2 + 1);
+                record.ended_sequence = Some(index as u64 * 2 + 2);
+            }
+            validate_history_scope_and_order(&reversed, expectation.scenario, run_id, "bucket")
+                .expect("globally valid but causally reversed history");
+            assert!(require_typed_quorum_read_survival(&reversed, &expectation).is_err());
+        }
 
         let mut missing_probe = records.clone();
         missing_probe.retain(|record| record.id != "probe-1");
@@ -1676,8 +1964,11 @@ mod tests {
             size_bytes: Some(size_bytes),
             version_id: None,
             listed_keys: None,
+            listed_versions: None,
             payload_ref,
             range: None,
+            started_sequence: None,
+            ended_sequence: None,
             started_at_ms,
             ended_at_ms,
             outcome: OperationOutcome::Ok,
@@ -1728,7 +2019,354 @@ mod tests {
             ));
         }
 
+        records.sort_by_key(|record| record.ended_at_ms);
+        for (index, record) in records.iter_mut().enumerate() {
+            record.started_sequence = Some(index as u64 * 2 + 1);
+            record.ended_sequence = Some(index as u64 * 2 + 2);
+        }
+        validate_history_scope_and_order(&records, expectation.scenario, run_id, "bucket")
+            .expect("valid recorder history");
         assert!(require_typed_quorum_read_survival(&records, &expectation).is_ok());
+    }
+    #[test]
+    fn recommit_groups_same_key_attempts_in_original_order() {
+        let first = ObjectSpec::prepare_seeded("run", 1, 1024, 42).spec;
+        let second = first.prepare_overwrite(1).spec;
+        let other = ObjectSpec::prepare_seeded("run", 2, 1024, 42).spec;
+
+        let candidate = |object: ObjectSpec, source: &str| RecommitCandidate {
+            object,
+            source_operation_id: source.to_string(),
+        };
+        let first_candidate = candidate(first.clone(), "op-1");
+        let other_candidate = candidate(other.clone(), "op-2");
+        let second_candidate = candidate(second.clone(), "op-3");
+        let grouped = unconfirmed_objects_by_key(&[
+            first_candidate.clone(),
+            other_candidate.clone(),
+            second_candidate.clone(),
+        ]);
+        assert_eq!(grouped.len(), 2);
+        let same_key = grouped
+            .iter()
+            .find(|objects| objects[0].object.key == first.key)
+            .expect("same-key retry group");
+        assert_eq!(same_key, &[first_candidate, second_candidate]);
+        assert_eq!(
+            grouped
+                .iter()
+                .filter(|objects| objects[0].object.key == other.key)
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn recommit_candidates_follow_the_final_same_key_mutation() {
+        let first = ObjectSpec::prepare_seeded("run", 1, 1024, 42).spec;
+        let latest = first.prepare_overwrite(2).spec;
+
+        let mut ambiguous_first = MixedTaskResult::new(0);
+        ambiguous_first.mutation_key = Some(first.key.clone());
+        ambiguous_first.mutation_sequence = Some(10);
+        ambiguous_first.unconfirmed_puts.push(RecommitCandidate {
+            object: first.clone(),
+            source_operation_id: "op-first".to_string(),
+        });
+
+        let mut later_delete = MixedTaskResult::new(1);
+        later_delete.mutation_key = Some(first.key.clone());
+        later_delete.mutation_sequence = Some(20);
+        assert!(
+            final_unconfirmed_puts(&[ambiguous_first.clone(), later_delete]).is_empty(),
+            "a later DELETE must suppress an earlier ambiguous PUT"
+        );
+
+        let mut later_committed_overwrite = MixedTaskResult::new(2);
+        later_committed_overwrite.mutation_key = Some(first.key.clone());
+        later_committed_overwrite.mutation_sequence = Some(30);
+        assert!(
+            final_unconfirmed_puts(&[ambiguous_first.clone(), later_committed_overwrite,])
+                .is_empty(),
+            "a later committed overwrite must suppress an earlier ambiguous PUT"
+        );
+
+        let mut later_ambiguous_overwrite = MixedTaskResult::new(3);
+        later_ambiguous_overwrite.mutation_key = Some(first.key.clone());
+        later_ambiguous_overwrite.mutation_sequence = Some(40);
+        later_ambiguous_overwrite
+            .unconfirmed_puts
+            .push(RecommitCandidate {
+                object: latest.clone(),
+                source_operation_id: "op-latest".to_string(),
+            });
+        assert_eq!(
+            final_unconfirmed_puts(&[later_ambiguous_overwrite, ambiguous_first]),
+            vec![RecommitCandidate {
+                object: latest,
+                source_operation_id: "op-latest".to_string(),
+            }],
+            "only the final ambiguous write remains eligible, independent of task collection order"
+        );
+    }
+    #[tokio::test]
+    async fn recommit_candidate_manifest_binds_the_source_history_checkpoint() {
+        let client = S3WorkloadClient::new(
+            "http://127.0.0.1:1",
+            "bucket",
+            "test-access",
+            "test-secret",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history =
+            Recorder::create(dir.path().join("history.jsonl"), "storage", "run").expect("history");
+        let object = ObjectSpec::prepare_seeded("run", 1, 1024, 42).spec;
+        let source = history.begin(
+            OperationKind::Put,
+            "bucket",
+            Some(object.key.clone()),
+            Some(object.sha256.clone()),
+            Some(object.size_bytes),
+        );
+        let source = history
+            .finish(
+                source,
+                OperationOutcome::Timeout,
+                None,
+                Some("timeout".to_string()),
+            )
+            .expect("source record");
+        let mut workload = MixedWorkloadResult {
+            summary: WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2), "storage", "run"),
+            unconfirmed_puts: vec![RecommitCandidate {
+                object: object.clone(),
+                source_operation_id: source.id.clone(),
+            }],
+        };
+
+        workload
+            .seal_recommit_candidates(&client, &history)
+            .expect("seal candidates");
+        let manifest = workload
+            .summary
+            .recommit_candidates
+            .as_ref()
+            .expect("manifest");
+        assert_eq!(manifest.history_record_count, 1);
+        assert_eq!(manifest.candidates.len(), 1);
+        assert_eq!(manifest.candidates[0].source_operation_id, source.id);
+        assert_eq!(manifest.candidates[0].key, object.key);
+        assert_eq!(
+            manifest.history_sha256,
+            sha256_hex(&serde_json::to_vec(&history.records()).expect("history JSON"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recommit_candidate_sealing_rejects_cross_bucket_history() {
+        let client = S3WorkloadClient::new(
+            "http://127.0.0.1:1",
+            "bucket",
+            "test-access",
+            "test-secret",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history =
+            Recorder::create(dir.path().join("history.jsonl"), "storage", "run").expect("history");
+        let object = ObjectSpec::prepare_seeded("run", 1, 1, 42).spec;
+        let source = history.begin(
+            OperationKind::Put,
+            "bucket",
+            Some(object.key.clone()),
+            Some(object.sha256.clone()),
+            Some(object.size_bytes),
+        );
+        let source = history
+            .finish(
+                source,
+                OperationOutcome::Timeout,
+                None,
+                Some("timeout".to_string()),
+            )
+            .expect("source");
+        let foreign = history.begin(
+            OperationKind::Delete,
+            "other-bucket",
+            Some(object.key.clone()),
+            None,
+            None,
+        );
+        history
+            .finish(foreign, OperationOutcome::Ok, Some(204), None)
+            .expect("foreign mutation");
+        let mut workload = MixedWorkloadResult {
+            summary: WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2), "storage", "run"),
+            unconfirmed_puts: vec![RecommitCandidate {
+                object,
+                source_operation_id: source.id,
+            }],
+        };
+
+        let error = workload
+            .seal_recommit_candidates(&client, &history)
+            .expect_err("another bucket cannot suppress a run-bucket candidate");
+        assert!(error.to_string().contains("outside the checker run"));
+    }
+
+    #[tokio::test]
+    async fn recommit_candidate_sealing_scales_to_twenty_thousand_candidates() {
+        const CANDIDATES: usize = 20_000;
+        let client = S3WorkloadClient::new(
+            "http://127.0.0.1:1",
+            "bucket",
+            "test-access",
+            "test-secret",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history =
+            Recorder::create(dir.path().join("history.jsonl"), "storage", "run").expect("history");
+        let mut candidates = Vec::with_capacity(CANDIDATES);
+        for index in 0..CANDIDATES {
+            let object = ObjectSpec::prepare_seeded("run", index, 1, 42).spec;
+            let source = history.begin(
+                OperationKind::Put,
+                "bucket",
+                Some(object.key.clone()),
+                Some(object.sha256.clone()),
+                Some(object.size_bytes),
+            );
+            let source = history
+                .finish(
+                    source,
+                    OperationOutcome::Timeout,
+                    None,
+                    Some("timeout".to_string()),
+                )
+                .expect("source");
+            candidates.push(RecommitCandidate {
+                object,
+                source_operation_id: source.id,
+            });
+        }
+        let mut workload = MixedWorkloadResult {
+            summary: WorkloadSummary::new(
+                &WorkloadPlan::seeded(42, CANDIDATES, 8),
+                "storage",
+                "run",
+            ),
+            unconfirmed_puts: candidates,
+        };
+
+        workload
+            .seal_recommit_candidates(&client, &history)
+            .expect("linear candidate sealing");
+        assert_eq!(
+            workload
+                .summary
+                .recommit_candidates
+                .as_ref()
+                .expect("manifest")
+                .candidates
+                .len(),
+            CANDIDATES
+        );
+    }
+    #[tokio::test]
+    async fn recommit_never_overlaps_requests_for_the_same_key() {
+        use axum::{
+            Router,
+            body::{Body, Bytes},
+            http::{Method, Response},
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let active_puts = Arc::new(AtomicUsize::new(0));
+        let max_active_puts = Arc::new(AtomicUsize::new(0));
+        let stored = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().fallback({
+            let active_puts = active_puts.clone();
+            let max_active_puts = max_active_puts.clone();
+            let stored = stored.clone();
+            move |method: Method, body: Bytes| {
+                let active_puts = active_puts.clone();
+                let max_active_puts = max_active_puts.clone();
+                let stored = stored.clone();
+                async move {
+                    match method {
+                        Method::PUT => {
+                            let active = active_puts.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_active_puts.fetch_max(active, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            *stored.lock().expect("stored body") = body.to_vec();
+                            active_puts.fetch_sub(1, Ordering::SeqCst);
+                            Response::builder()
+                                .status(200)
+                                .header("x-amz-version-id", "version")
+                                .body(Body::empty())
+                                .expect("PUT response")
+                        }
+                        Method::GET => Response::builder()
+                            .status(200)
+                            .body(Body::from(stored.lock().expect("stored body").clone()))
+                            .expect("GET response"),
+                        _ => panic!("unexpected S3 method {method}"),
+                    }
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock S3");
+        });
+        let client = S3WorkloadClient::new(
+            endpoint,
+            "bucket",
+            "test-access",
+            "test-secret",
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history =
+            Recorder::create(dir.path().join("history.jsonl"), "storage", "run").expect("history");
+        let first = ObjectSpec::prepare_seeded("run", 1, 1024, 42).spec;
+        let second = first.prepare_overwrite(1).spec;
+
+        let report = recommit_unconfirmed_objects(
+            &client,
+            &history,
+            &[
+                RecommitCandidate {
+                    object: first,
+                    source_operation_id: "source-1".to_string(),
+                },
+                RecommitCandidate {
+                    object: second,
+                    source_operation_id: "source-2".to_string(),
+                },
+            ],
+            2,
+        )
+        .await;
+        assert_eq!(report.attempted, 2);
+        assert_eq!(report.committed, 2);
+        assert_eq!(max_active_puts.load(Ordering::SeqCst), 1);
+        server.abort();
     }
     #[tokio::test]
     async fn multipart_staging_and_cleanup_drain_siblings_after_errors() {
@@ -1951,6 +2589,7 @@ mod tests {
     fn recommit_report_counts_and_summarizes_failed_attempts() {
         let report = RecommitReport::from_attempts(vec![
             RecommitAttempt {
+                source_operation_id: "source-a".to_string(),
                 key: "object-a".to_string(),
                 size_bytes: 4096,
                 sha256: "sha-a".to_string(),
@@ -1961,6 +2600,7 @@ mod tests {
                 harness_error: None,
             },
             RecommitAttempt {
+                source_operation_id: "source-b".to_string(),
                 key: "object-b".to_string(),
                 size_bytes: 4096,
                 sha256: "sha-b".to_string(),
@@ -1987,6 +2627,7 @@ mod tests {
     #[test]
     fn recommit_report_separates_harness_errors_from_s3_failures() {
         let report = RecommitReport::from_attempts(vec![RecommitAttempt {
+            source_operation_id: "source-a".to_string(),
             key: "object-a".to_string(),
             size_bytes: 4096,
             sha256: "sha-a".to_string(),

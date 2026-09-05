@@ -30,7 +30,8 @@ use std::{future::Future, time::Duration};
 use tokio::time::{Instant, timeout};
 
 use crate::fault::history::{
-    ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef, Recorder,
+    ByteRange, ListedVersionEntry, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
+    Recorder,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +157,7 @@ pub struct GetObjectResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWriteResult {
+    pub write_operation_id: String,
     pub write_outcome: OperationOutcome,
     pub verify_get_outcome: Option<OperationOutcome>,
     pub verified: bool,
@@ -641,6 +643,10 @@ impl S3WorkloadClient {
         })
     }
 
+    pub(crate) fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
     pub(crate) fn for_quiet_mutation(&self, deadline: Instant) -> Self {
         let mut client = self.clone();
         client.client = Client::from_conf(
@@ -1085,9 +1091,11 @@ impl S3WorkloadClient {
         object: &PreparedObject,
         recorder: &Recorder,
     ) -> Result<VerifiedWriteResult> {
-        let write_outcome = self.put_object(object, recorder).await?;
+        let write_record = self.put_object_record(object, recorder).await?;
+        let write_outcome = write_record.outcome;
         if write_outcome != OperationOutcome::Ok {
             return Ok(VerifiedWriteResult {
+                write_operation_id: write_record.id,
                 write_outcome,
                 verify_get_outcome: None,
                 verified: false,
@@ -1100,6 +1108,7 @@ impl S3WorkloadClient {
             .as_deref()
             .is_some_and(|body| object.spec.matches_body(body));
         Ok(VerifiedWriteResult {
+            write_operation_id: write_record.id,
             write_outcome,
             verify_get_outcome: Some(get.outcome),
             verified,
@@ -1284,18 +1293,7 @@ impl S3WorkloadClient {
         Ok(Some(staged))
     }
 
-    pub(crate) async fn complete_staged_multipart_object(
-        &self,
-        staged: &StagedMultipartUpload,
-        recorder: &Recorder,
-    ) -> Result<OperationOutcome> {
-        Ok(self
-            .complete_staged_multipart_object_record(staged, recorder)
-            .await?
-            .outcome)
-    }
-
-    async fn complete_staged_multipart_object_record(
+    pub(crate) async fn complete_staged_multipart_object_record(
         &self,
         staged: &StagedMultipartUpload,
         recorder: &Recorder,
@@ -1759,6 +1757,17 @@ impl S3WorkloadClient {
 
         let mut record = record;
         record.size_bytes = Some(entries.len());
+        record.listed_versions = Some(
+            entries
+                .iter()
+                .map(|entry| ListedVersionEntry {
+                    key: entry.key.clone(),
+                    version_id: entry.version_id.clone(),
+                    is_latest: entry.is_latest,
+                    is_delete_marker: entry.is_delete_marker,
+                })
+                .collect(),
+        );
         recorder.finish(record, OperationOutcome::Ok, Some(200), None)?;
         Ok(Some(entries))
     }
