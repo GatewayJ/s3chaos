@@ -218,7 +218,7 @@ Optional:
 export RUSTFS_FAULT_TEST_DM_RECOVERY_TABLE='<dmsetup recovery table>'
 export RUSTFS_FAULT_TEST_DM_HELPER_IMAGE='rancher/mirrored-library-busybox:1.37.0'
 export RUSTFS_FAULT_TEST_ACK_OPERATION_TIMEOUT_MS=30000
-export RUSTFS_FAULT_TEST_MAX_ACK_TO_FAULT_MS=5000
+export RUSTFS_FAULT_TEST_MAX_ACK_TO_FAULT_MS=1000
 ```
 
 Run:
@@ -256,6 +256,10 @@ timestamp, fault activation timestamp, measured ACK-to-fault interval, and
 `maxAckToFaultMs`. No S3 request is allowed between that ACK and the forced
 crash boundary. A timeout, unknown result, missing version identity, late
 activation, or extra request invalidates the run rather than producing PASS.
+The gate contract rejects `maxAckToFaultMs` above 1000 ms. Both checker reports
+must enumerate the exact history-derived `key@version` values, including the
+trigger version or DELETE marker. Multipart staging is registered for normal
+error cleanup and guarded for cancellation before the completion ACK.
 
 Its recovery boundary is intentionally owned by the host backend:
 

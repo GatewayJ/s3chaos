@@ -33,7 +33,7 @@ use crate::fault::{
     config::{
         DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, DEFAULT_RUSTFS_POD_COUNT,
         DEFAULT_RUSTFS_POD_STABLE_WINDOW_SECONDS, DEFAULT_RUSTFS_VOLUME_PATH,
-        DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS,
+        DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS, MAX_ACK_TO_FAULT_MS,
     },
     events::{RunEvent, RunEventStatus},
     history::{DurabilityCohort, OperationKind, OperationOutcome, OperationRecord},
@@ -278,7 +278,7 @@ fn validate_failed_attempt_disruption_evidence(
         let full_run_spec = read_json::<FaultRunSpec>(&run_spec_path)?;
         let history =
             read_jsonl::<OperationRecord>(&bound_case_artifact(&case_dir, "history.jsonl")?)?;
-        validate_ack_triggered_dm_artifacts(
+        let _ = validate_ack_triggered_dm_artifacts(
             AckArtifactValidationContext {
                 root: &case_dir,
                 case_name,
@@ -804,8 +804,8 @@ fn validate_fault_artifacts_with_identity(
             &json_spec.metadata.bucket,
         )?;
     }
-    if let Some(expected_mutation) = ack_mutation {
-        validate_ack_triggered_dm_artifacts(
+    let ack_checker_expectation = if let Some(expected_mutation) = ack_mutation {
+        Some(validate_ack_triggered_dm_artifacts(
             AckArtifactValidationContext {
                 root: &options.artifact_root,
                 case_name: scenario_spec.case_name,
@@ -818,8 +818,10 @@ fn validate_fault_artifacts_with_identity(
                 run_spec: &json_spec,
             },
             expected_mutation,
-        )?;
-    }
+        )?)
+    } else {
+        None
+    };
 
     let prechecker =
         read_json::<CheckerReport>(required(&artifacts, "checker-pre-recommit-report.json")?)?;
@@ -836,6 +838,10 @@ fn validate_fault_artifacts_with_identity(
         &checker,
         options.expected_workload_versioning,
     )?;
+    if let Some(expectation) = &ack_checker_expectation {
+        validate_ack_checker_report("checker-pre-recommit-report.json", &prechecker, expectation)?;
+        validate_ack_checker_report("checker-report.json", &checker, expectation)?;
+    }
 
     if ack_mutation.is_some() {
         return Ok(ArtifactValidationReport {
@@ -1064,8 +1070,9 @@ fn validate_run_spec_catalog_contract(
     );
     if let Some(trigger) = &spec.scenario.ack_trigger {
         ensure!(
-            trigger.operation_timeout_ms > 0 && trigger.max_ack_to_fault_ms > 0,
-            "run-spec ACK trigger timeouts must be greater than zero"
+            trigger.operation_timeout_ms > 0
+                && (1..=MAX_ACK_TO_FAULT_MS).contains(&trigger.max_ack_to_fault_ms),
+            "run-spec ACK trigger requires a positive operation timeout and max_ack_to_fault_ms between 1 and {MAX_ACK_TO_FAULT_MS}"
         );
         ensure!(
             !spec.recovery.recommit_unconfirmed_writes
@@ -2186,10 +2193,18 @@ struct AckArtifactValidationContext<'a> {
     run_spec: &'a FaultRunSpec,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct AckCheckerExpectation {
+    trigger_reference: String,
+    trigger_is_delete_marker: bool,
+    committed_version_refs: BTreeSet<String>,
+    committed_delete_marker_refs: BTreeSet<String>,
+}
+
 fn validate_ack_triggered_dm_artifacts(
     context: AckArtifactValidationContext<'_>,
     expected_mutation: AcknowledgedMutationKind,
-) -> Result<()> {
+) -> Result<AckCheckerExpectation> {
     let AckArtifactValidationContext {
         root,
         case_name,
@@ -2266,6 +2281,7 @@ fn validate_ack_triggered_dm_artifacts(
     }
     validate_ack_quiet_gap(history, trigger, ack.crash_boundary_started_at_ms)?;
     validate_ack_mutation_shape(history, trigger, expected_mutation)?;
+    let checker_expectation = ack_checker_expectation(history, trigger, expected_mutation)?;
 
     let boundary = read_json::<DmCrashBoundaryArtifact>(&locate_artifact(
         root,
@@ -2323,19 +2339,13 @@ fn validate_ack_triggered_dm_artifacts(
                 .any(|field| field == "drop_writes"),
         "dm-crash-recovered.json does not prove recovery of the ACK-triggered fault"
     );
-    let before = evidence
-        .pods_before
-        .iter()
-        .find(|pod| pod.uid == boundary.old_pod_uid)
-        .context("fault-evidence.json lacks the ACK-triggered DM target Pod UID")?;
-    ensure!(
-        evidence
-            .pods_after
-            .iter()
-            .any(|pod| pod.name == before.name && pod.uid != before.uid),
-        "fault-evidence.json does not prove replacement of the ACK-triggered DM target Pod"
-    );
-    Ok(())
+    let host_proof = read_json::<HostStorageMutationProof>(&locate_artifact(
+        root,
+        case_name,
+        HOST_STORAGE_PROOF_ARTIFACT,
+    )?)?;
+    validate_ack_crash_target_identity(&boundary, &host_proof, evidence)?;
+    Ok(checker_expectation)
 }
 
 fn validate_ack_trigger_contract(
@@ -2351,6 +2361,7 @@ fn validate_ack_trigger_contract(
             && ack.run_id == run_id
             && ack.trigger_kind == expected_mutation
             && planned.mutation == expected_mutation
+            && (1..=MAX_ACK_TO_FAULT_MS).contains(&planned.max_ack_to_fault_ms)
             && ack.max_ack_to_fault_ms == planned.max_ack_to_fault_ms
             && !ack.trigger_operation_id.is_empty()
             && !ack.trigger_key.is_empty()
@@ -2370,6 +2381,127 @@ fn validate_ack_trigger_contract(
                     .crash_boundary_started_at_ms
                     .saturating_sub(ack.trigger_acknowledged_at_ms),
         "ack-to-fault-evidence.json does not prove the planned mutation ACK preceded bounded fault application and activation"
+    );
+    Ok(())
+}
+
+fn ack_checker_expectation(
+    history: &[OperationRecord],
+    trigger: &OperationRecord,
+    mutation: AcknowledgedMutationKind,
+) -> Result<AckCheckerExpectation> {
+    let committed_version_refs = history
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::CompleteMultipartUpload
+            ) && record.outcome == OperationOutcome::Ok
+                && record.value_sha256.is_some()
+                && record.size_bytes.is_some()
+        })
+        .filter_map(operation_version_reference)
+        .collect::<BTreeSet<_>>();
+    let committed_delete_marker_refs = history
+        .iter()
+        .filter(|record| {
+            record.kind == OperationKind::Delete && record.outcome == OperationOutcome::Ok
+        })
+        .filter_map(operation_version_reference)
+        .collect::<BTreeSet<_>>();
+    let trigger_reference = operation_version_reference(trigger)
+        .context("eligible ACK trigger lacks an exact key@version reference")?;
+    let trigger_is_delete_marker = mutation == AcknowledgedMutationKind::DeleteMarker;
+    let expected_set = if trigger_is_delete_marker {
+        &committed_delete_marker_refs
+    } else {
+        &committed_version_refs
+    };
+    ensure!(
+        expected_set.contains(&trigger_reference),
+        "eligible ACK trigger is absent from the history-derived checker expectation"
+    );
+    Ok(AckCheckerExpectation {
+        trigger_reference,
+        trigger_is_delete_marker,
+        committed_version_refs,
+        committed_delete_marker_refs,
+    })
+}
+
+fn operation_version_reference(record: &OperationRecord) -> Option<String> {
+    let key = record.key.as_deref()?;
+    let version_id = record.version_id.as_deref()?;
+    (!key.is_empty() && !version_id.is_empty() && version_id != "null")
+        .then(|| format!("{key}@{version_id}"))
+}
+
+fn validate_ack_checker_report(
+    name: &str,
+    report: &CheckerReport,
+    expectation: &AckCheckerExpectation,
+) -> Result<()> {
+    let verified_versions = report
+        .verified_committed_version_refs
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let verified_delete_markers = report
+        .verified_committed_delete_marker_refs
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        report.versioning_expected
+            && report.expected_committed_versions == expectation.committed_version_refs.len()
+            && report.verified_committed_versions == expectation.committed_version_refs.len()
+            && report.verified_committed_version_refs.len() == verified_versions.len()
+            && verified_versions == expectation.committed_version_refs
+            && report.verified_committed_delete_marker_refs.len() == verified_delete_markers.len()
+            && verified_delete_markers == expectation.committed_delete_marker_refs,
+        "{name} exact committed version/delete-marker proof does not match history.jsonl"
+    );
+    let trigger_verified = if expectation.trigger_is_delete_marker {
+        verified_delete_markers.contains(&expectation.trigger_reference)
+    } else {
+        verified_versions.contains(&expectation.trigger_reference)
+    };
+    ensure!(
+        trigger_verified,
+        "{name} does not prove the exact ACK trigger {}",
+        expectation.trigger_reference
+    );
+    Ok(())
+}
+
+fn validate_ack_crash_target_identity(
+    boundary: &DmCrashBoundaryArtifact,
+    proof: &HostStorageMutationProof,
+    evidence: &FaultEvidenceArtifact,
+) -> Result<()> {
+    ensure!(
+        boundary.old_pod_uid == proof.target.pod_uid
+            && boundary.mount_before.canonical_source == proof.target.mount_canonical_source
+            && boundary.mount_before.filesystem == proof.target.filesystem,
+        "dm-crash-boundary.json is not bound to the host-storage proof target"
+    );
+    ensure!(
+        evidence
+            .pods_before
+            .iter()
+            .any(|pod| pod.name == proof.target.pod && pod.uid == proof.target.pod_uid),
+        "fault-evidence.json lacks the exact host-storage proof target Pod name/UID"
+    );
+    ensure!(
+        evidence.pods_after.iter().any(|pod| {
+            pod.name == proof.target.pod
+                && pod.uid != proof.target.pod_uid
+                && boundary
+                    .replacement_pod_uid
+                    .as_ref()
+                    .is_none_or(|replacement| replacement == &pod.uid)
+        }),
+        "fault-evidence.json does not prove replacement of the host-storage proof target Pod"
     );
     Ok(())
 }
@@ -4782,7 +4914,7 @@ mod tests {
         ack_spec.scenario.ack_trigger = Some(crate::fault::spec::FaultRunAckTriggerSpec {
             mutation: crate::fault::acknowledged_mutation::AcknowledgedMutationKind::Put,
             operation_timeout_ms: 30_000,
-            max_ack_to_fault_ms: 5_000,
+            max_ack_to_fault_ms: 1_000,
         });
         let mut ack_evidence = evidence.clone();
         ack_evidence.active_during_workload = false;
@@ -4797,6 +4929,73 @@ mod tests {
             &ack_evidence,
         )
         .expect("valid ACK-triggered host-storage artifacts");
+
+        ack_evidence.pods_before = vec![
+            super::PodIdentityArtifact {
+                name: "rustfs-0".to_string(),
+                uid: "uid-0".to_string(),
+            },
+            super::PodIdentityArtifact {
+                name: "rustfs-1".to_string(),
+                uid: "uid-1".to_string(),
+            },
+        ];
+        ack_evidence.pods_after = vec![
+            super::PodIdentityArtifact {
+                name: "rustfs-0".to_string(),
+                uid: "uid-0-replacement".to_string(),
+            },
+            super::PodIdentityArtifact {
+                name: "rustfs-1".to_string(),
+                uid: "uid-1-replacement".to_string(),
+            },
+        ];
+        let boundary: super::DmCrashBoundaryArtifact = serde_json::from_value(json!({
+            "scenario": scenario.name,
+            "run_id": "run-1",
+            "started_at_ms": 170,
+            "completed_at_ms": 180,
+            "old_pod_uid": "uid-0",
+            "replacement_pod_uid": "uid-0-replacement",
+            "filesystem_unmounted": true,
+            "mount_before": {
+                "source": "/dev/mapper/rustfs-fault-dm",
+                "canonical_source": "/dev/dm-0",
+                "filesystem": "ext4",
+                "options": "rw"
+            },
+            "fault": {"table": "0 1024 drop_writes /dev/loop0 0"}
+        }))
+        .expect("boundary");
+        super::validate_ack_crash_target_identity(&boundary, &host_proof, &ack_evidence)
+            .expect("boundary is bound to the proven target Pod");
+
+        let masquerading_boundary: super::DmCrashBoundaryArtifact = serde_json::from_value(json!({
+            "scenario": scenario.name,
+            "run_id": "run-1",
+            "started_at_ms": 170,
+            "completed_at_ms": 180,
+            "old_pod_uid": "uid-1",
+            "replacement_pod_uid": "uid-1-replacement",
+            "filesystem_unmounted": true,
+            "mount_before": {
+                "source": "/dev/mapper/rustfs-fault-dm",
+                "canonical_source": "/dev/dm-0",
+                "filesystem": "ext4",
+                "options": "rw"
+            },
+            "fault": {"table": "0 1024 drop_writes /dev/loop0 0"}
+        }))
+        .expect("masquerading boundary");
+        assert!(
+            super::validate_ack_crash_target_identity(
+                &masquerading_boundary,
+                &host_proof,
+                &ack_evidence,
+            )
+            .is_err(),
+            "a same-tenant Pod restart must not masquerade as the target disk Pod crash"
+        );
 
         for workload in [false, true] {
             for replacement in [vec![], vec![json!({})], vec![json!({}), json!({})]] {
@@ -5187,7 +5386,7 @@ mod tests {
                 "kind": kind,
                 "bucket": "bucket",
                 "key": key,
-                "value_sha256": null,
+                "value_sha256": if matches!(kind, OperationKind::Put | OperationKind::CompleteMultipartUpload) { Some("sha256") } else { None },
                 "size_bytes": size_bytes,
                 "version_id": if matches!(kind, OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload) { Some("version-1") } else { None },
                 "started_at_ms": started_at_ms,
@@ -5376,6 +5575,193 @@ mod tests {
             )
             .is_err(),
             "starting fault application before the ACK must be rejected"
+        );
+
+        let over_wide_plan = FaultRunAckTriggerSpec {
+            max_ack_to_fault_ms: crate::fault::config::MAX_ACK_TO_FAULT_MS + 1,
+            ..planned
+        };
+        let mut over_wide_evidence = valid;
+        over_wide_evidence.max_ack_to_fault_ms = over_wide_plan.max_ack_to_fault_ms;
+        assert!(
+            super::validate_ack_trigger_contract(
+                &over_wide_evidence,
+                &over_wide_plan,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+            )
+            .is_err(),
+            "artifact validation must reject an ACK window too wide for durability evidence"
+        );
+    }
+
+    #[test]
+    fn ack_checker_must_prove_the_exact_history_derived_version() {
+        use crate::fault::{
+            acknowledged_mutation::AcknowledgedMutationKind, checker::CheckerReport,
+            history::OperationRecord,
+        };
+
+        let trigger: OperationRecord = serde_json::from_value(json!({
+            "id": "put-1",
+            "scenario": "dm-drop-writes-after-ack-put",
+            "run_id": "run-1",
+            "kind": "put",
+            "bucket": "bucket",
+            "key": "key-1",
+            "value_sha256": "hash-1",
+            "size_bytes": 4,
+            "version_id": "version-1",
+            "started_at_ms": 10,
+            "ended_at_ms": 11,
+            "outcome": "ok",
+            "http_status": 200,
+            "error": null
+        }))
+        .expect("trigger");
+        let expectation = super::ack_checker_expectation(
+            std::slice::from_ref(&trigger),
+            &trigger,
+            AcknowledgedMutationKind::Put,
+        )
+        .expect("expectation");
+        let report = |verified_refs: Vec<&str>| {
+            serde_json::from_value::<CheckerReport>(json!({
+                "scenario": "dm-drop-writes-after-ack-put",
+                "run_id": "run-1",
+                "committed_puts": 1,
+                "expected_live_objects": 1,
+                "verified_live_objects": 1,
+                "missing_committed_objects": [],
+                "unavailable_committed_objects": [],
+                "unknown_committed_read_failures": [],
+                "hash_mismatches": [],
+                "successful_corrupted_reads": [],
+                "unexpected_visible_deleted_objects": [],
+                "list_history_warning_count": 0,
+                "final_list_warning_count": 0,
+                "list_history_warnings": [],
+                "list_warnings": [],
+                "final_listed_objects": 1,
+                "versioning_expected": true,
+                "expected_committed_versions": 1,
+                "verified_committed_versions": verified_refs.len(),
+                "verified_committed_version_refs": verified_refs,
+                "operation_cohorts": {"pre_fault": 1},
+                "fault_window_relations": {},
+                "tenant_recovered": true,
+                "passed": true
+            }))
+            .expect("checker report")
+        };
+
+        super::validate_ack_checker_report(
+            "checker-report.json",
+            &report(vec!["key-1@version-1"]),
+            &expectation,
+        )
+        .expect("exact version proof");
+        assert!(
+            super::validate_ack_checker_report(
+                "checker-report.json",
+                &report(Vec::new()),
+                &expectation,
+            )
+            .is_err(),
+            "an empty passed checker must not prove ACK durability"
+        );
+        assert!(
+            super::validate_ack_checker_report(
+                "checker-report.json",
+                &report(vec!["key-1@other-version"]),
+                &expectation,
+            )
+            .is_err(),
+            "a different version from the same run must not prove the trigger"
+        );
+    }
+
+    #[test]
+    fn ack_checker_must_prove_the_exact_delete_marker() {
+        use crate::fault::{
+            acknowledged_mutation::AcknowledgedMutationKind, checker::CheckerReport,
+            history::OperationRecord,
+        };
+
+        let record = |id: &str, kind: &str, version_id: &str, hash: Option<&str>| {
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": id,
+                "scenario": "dm-drop-writes-after-ack-delete-marker",
+                "run_id": "run-1",
+                "kind": kind,
+                "bucket": "bucket",
+                "key": "key-1",
+                "value_sha256": hash,
+                "size_bytes": hash.map(|_| 4),
+                "version_id": version_id,
+                "started_at_ms": if kind == "put" { 1 } else { 10 },
+                "ended_at_ms": if kind == "put" { 2 } else { 11 },
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null
+            }))
+            .expect("record")
+        };
+        let baseline = record("put-1", "put", "version-1", Some("hash-1"));
+        let trigger = record("delete-1", "delete", "marker-1", None);
+        let expectation = super::ack_checker_expectation(
+            &[baseline, trigger.clone()],
+            &trigger,
+            AcknowledgedMutationKind::DeleteMarker,
+        )
+        .expect("expectation");
+        let report = |markers: Vec<&str>| {
+            serde_json::from_value::<CheckerReport>(json!({
+                "scenario": "dm-drop-writes-after-ack-delete-marker",
+                "run_id": "run-1",
+                "committed_puts": 1,
+                "expected_live_objects": 0,
+                "verified_live_objects": 0,
+                "missing_committed_objects": [],
+                "unavailable_committed_objects": [],
+                "unknown_committed_read_failures": [],
+                "hash_mismatches": [],
+                "successful_corrupted_reads": [],
+                "unexpected_visible_deleted_objects": [],
+                "list_history_warning_count": 0,
+                "final_list_warning_count": 0,
+                "list_history_warnings": [],
+                "list_warnings": [],
+                "final_listed_objects": 0,
+                "versioning_expected": true,
+                "expected_committed_versions": 1,
+                "verified_committed_versions": 1,
+                "verified_committed_version_refs": ["key-1@version-1"],
+                "verified_committed_delete_marker_refs": markers,
+                "operation_cohorts": {"pre_fault": 2},
+                "fault_window_relations": {},
+                "tenant_recovered": true,
+                "passed": true
+            }))
+            .expect("checker report")
+        };
+
+        super::validate_ack_checker_report(
+            "checker-report.json",
+            &report(vec!["key-1@marker-1"]),
+            &expectation,
+        )
+        .expect("exact delete marker proof");
+        assert!(
+            super::validate_ack_checker_report(
+                "checker-report.json",
+                &report(Vec::new()),
+                &expectation,
+            )
+            .is_err(),
+            "a passed checker without the trigger delete marker must fail closed"
         );
     }
 

@@ -168,8 +168,12 @@ async fn run_fault_case(
     let mut staged_multipart_uploads = BTreeMap::new();
     // Keep the S3 client and access guard alive through cleanup on every exit.
     let result = if scenarios::acknowledged_mutation_kind(&scenario.name).is_some() {
-        run.run_ack_triggered_case(&mut prepared, &mut preflight_phases)
-            .await
+        run.run_ack_triggered_case(
+            &mut prepared,
+            &mut preflight_phases,
+            &mut staged_multipart_uploads,
+        )
+        .await
     } else {
         async {
             run.stage_uploads(&prepared.s3, &mut staged_multipart_uploads)

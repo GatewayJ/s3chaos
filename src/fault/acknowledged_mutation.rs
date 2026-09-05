@@ -129,19 +129,6 @@ impl QuietMutationWorkload {
         }
     }
 
-    pub(crate) async fn cleanup(
-        self,
-        client: &S3WorkloadClient,
-        recorder: &Recorder,
-    ) -> Result<()> {
-        if let QuietMutation::StagedMultipartComplete(staged) = self.mutation {
-            client
-                .abort_staged_multipart_object(&staged, recorder)
-                .await?;
-        }
-        Ok(())
-    }
-
     async fn execute(
         self,
         client: &S3WorkloadClient,
@@ -562,7 +549,7 @@ mod tests {
     };
     use crate::fault::{
         history::{OperationKind, OperationOutcome, OperationRecord, Recorder},
-        workload::{ObjectSpec, S3WorkloadClient},
+        workload::{ObjectSpec, S3WorkloadClient, StagedMultipartCleanupGuard},
     };
 
     enum MockReply {
@@ -801,6 +788,60 @@ mod tests {
             assert_eq!(requests.lock().expect("requests").len(), 3);
             server.abort();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_pre_staged_completion_aborts_the_registered_upload() {
+        let expected = vec![
+            OperationKind::CreateMultipartUpload,
+            OperationKind::UploadPart,
+            OperationKind::CompleteMultipartUpload,
+            OperationKind::AbortMultipartUpload,
+        ];
+        let (client, requests, server) = mock_s3(vec![
+            (OperationKind::CreateMultipartUpload, MockReply::Ok),
+            (OperationKind::UploadPart, MockReply::Ok),
+            (OperationKind::CompleteMultipartUpload, MockReply::Hang),
+            (OperationKind::AbortMultipartUpload, MockReply::Ok),
+        ])
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder =
+            Recorder::create(dir.path().join("history.jsonl"), "ack", "run").expect("recorder");
+        let staged = client
+            .stage_multipart_object(&test_object().prepare(), &recorder)
+            .await
+            .expect("staged upload");
+        let cleanup =
+            StagedMultipartCleanupGuard::new(client.clone(), recorder.clone(), staged.clone());
+        let trigger =
+            AcknowledgedMutationTrigger::new(Duration::from_secs(5), Duration::from_secs(1))
+                .expect("trigger");
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            trigger.execute_and_activate_fault(
+                &client,
+                &recorder,
+                QuietMutationWorkload::staged_multipart_complete(staged),
+                || panic!("cancelled completion armed the fault"),
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "completion must still be in flight");
+        drop(cleanup);
+
+        assert_eq!(*requests.lock().expect("requests"), expected);
+        let records = persisted_records(&recorder);
+        assert_eq!(
+            records.iter().map(|record| record.kind).collect::<Vec<_>>(),
+            vec![
+                OperationKind::CreateMultipartUpload,
+                OperationKind::UploadPart,
+                OperationKind::AbortMultipartUpload,
+            ]
+        );
+        server.abort();
     }
 
     #[tokio::test]

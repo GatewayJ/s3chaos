@@ -429,8 +429,11 @@ impl FaultSuitePlan {
             );
             if let Some(trigger) = &attempt.ack_trigger {
                 ensure!(
-                    trigger.operation_timeout_ms > 0 && trigger.max_ack_to_fault_ms > 0,
-                    "current fault suite plan ACK trigger timeouts must be greater than zero"
+                    trigger.operation_timeout_ms > 0
+                        && (1..=crate::fault::config::MAX_ACK_TO_FAULT_MS)
+                            .contains(&trigger.max_ack_to_fault_ms),
+                    "current fault suite plan ACK trigger requires a positive operation timeout and max_ack_to_fault_ms between 1 and {}",
+                    crate::fault::config::MAX_ACK_TO_FAULT_MS
                 );
             }
             if let Some(expected) = &attempt.expected_failure {
@@ -1250,6 +1253,12 @@ scenarios:
             .as_mut()
             .expect("ACK trigger")
             .max_ack_to_fault_ms = 0;
+        assert!(tampered.to_json().is_err());
+        tampered.attempts[0]
+            .ack_trigger
+            .as_mut()
+            .expect("ACK trigger")
+            .max_ack_to_fault_ms = crate::fault::config::MAX_ACK_TO_FAULT_MS + 1;
         assert!(tampered.to_json().is_err());
     }
 

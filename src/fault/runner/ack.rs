@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use crate::fault::{
     acknowledged_mutation::{
@@ -24,7 +25,7 @@ use crate::fault::{
     history::OperationOutcome,
     reporting::FaultEvidence,
     scenarios::acknowledged_mutation_kind,
-    workload::{ObjectSpec, S3WorkloadClient},
+    workload::{ObjectSpec, S3WorkloadClient, StagedMultipartCleanupGuard, StagedMultipartUpload},
 };
 
 use super::{ActiveFault, FaultRemoval, FaultRun, PreparedWorkload, ProvenTarget, now_ms};
@@ -43,51 +44,68 @@ struct AckTriggeredCrashEvidence {
     ack_to_crash_boundary_ms: u64,
 }
 
+struct PreparedQuietMutation {
+    workload: QuietMutationWorkload,
+    staged_upload_index: Option<usize>,
+    cancellation_cleanup: Option<StagedMultipartCleanupGuard>,
+}
+
 impl FaultRun<'_> {
     pub(super) async fn run_ack_triggered_case(
         &self,
         prepared: &mut PreparedWorkload,
         preflight_phases: &mut Vec<crate::fault::preflight::PreflightPhase>,
+        staged_uploads: &mut BTreeMap<usize, StagedMultipartUpload>,
     ) -> Result<()> {
-        let quiet = self.prepare_quiet_mutation(&prepared.s3).await?;
-        let target = match self
-            .deadline
-            .run(self.prove_target(&prepared.endpoint, preflight_phases))
-            .await
-        {
-            Ok(target) => target,
-            Err(error) => {
-                if let Err(cleanup_error) = quiet.cleanup(&prepared.s3, &self.context.history).await
-                {
-                    return Err(error.context(format!(
-                        "prepared ACK mutation cleanup also failed: {cleanup_error:#}"
-                    )));
-                }
-                return Err(error);
+        let PreparedQuietMutation {
+            workload,
+            staged_upload_index,
+            mut cancellation_cleanup,
+        } = self
+            .prepare_quiet_mutation(&prepared.s3, staged_uploads)
+            .await?;
+        let result = async {
+            let target = self
+                .deadline
+                .run(self.prove_target(&prepared.endpoint, preflight_phases))
+                .await?;
+            self.deadline.check()?;
+            let (mut active, trigger) = self
+                .activate_fault_after_ack(&prepared.s3, &target, workload)
+                .await?;
+            if let Some(index) = staged_upload_index {
+                staged_uploads.remove(&index);
             }
-        };
-        self.deadline.check()?;
-        let (mut active, trigger) = self
-            .activate_fault_after_ack(&prepared.s3, &target, quiet)
-            .await?;
-        self.deadline.check()?;
-        self.prepare_ack_crash_boundary(&mut active, trigger)?;
-        let removal = self.remove_fault(&mut active.fault)?;
-        let mut no_staged_uploads = std::collections::BTreeMap::new();
-        let recovered = self
-            .recover_access(prepared, &mut no_staged_uploads)
-            .await?;
-        let mut evidence =
-            self.write_ack_recovery_evidence(&target, &active, &removal, &recovered)?;
-        self.deadline
-            .run(self.verify_recovered(&prepared.s3))
-            .await?;
-        self.deadline
-            .run(self.verify_final_without_recommit(&prepared.s3, &mut evidence))
-            .await
+            self.deadline.check()?;
+            self.prepare_ack_crash_boundary(&mut active, trigger)?;
+            let removal = self.remove_fault(&mut active.fault)?;
+            let mut no_staged_uploads = BTreeMap::new();
+            let recovered = self
+                .recover_access(prepared, &mut no_staged_uploads)
+                .await?;
+            let mut evidence =
+                self.write_ack_recovery_evidence(&target, &active, &removal, &recovered)?;
+            self.deadline
+                .run(self.verify_recovered(&prepared.s3))
+                .await?;
+            self.deadline
+                .run(self.verify_final_without_recommit(&prepared.s3, &mut evidence))
+                .await
+        }
+        .await;
+        if let Some(cleanup) = &mut cancellation_cleanup {
+            // Normal errors are handled by the outer registry. Keeping this
+            // armed until here makes dropping the run future cancellation-safe.
+            cleanup.disarm();
+        }
+        result
     }
 
-    async fn prepare_quiet_mutation(&self, s3: &S3WorkloadClient) -> Result<QuietMutationWorkload> {
+    async fn prepare_quiet_mutation(
+        &self,
+        s3: &S3WorkloadClient,
+        staged_uploads: &mut BTreeMap<usize, StagedMultipartUpload>,
+    ) -> Result<PreparedQuietMutation> {
         let kind = acknowledged_mutation_kind(&self.scenario.name)
             .context("ACK-triggered scenario lacks a typed mutation kind")?;
         let index = self
@@ -114,6 +132,8 @@ impl FaultRun<'_> {
             Some(serde_json::json!({ "mutation": kind })),
         )?;
 
+        let mut staged_upload_index = None;
+        let mut cancellation_cleanup = None;
         let workload = match kind {
             AcknowledgedMutationKind::Put => QuietMutationWorkload::put(object),
             AcknowledgedMutationKind::Overwrite | AcknowledgedMutationKind::DeleteMarker => {
@@ -153,6 +173,13 @@ impl FaultRun<'_> {
                     .stage_multipart_object(&object.prepare(), &self.context.history)
                     .await
                     .context("stage ACK-trigger multipart upload")?;
+                staged_uploads.insert(index, staged.clone());
+                staged_upload_index = Some(index);
+                cancellation_cleanup = Some(StagedMultipartCleanupGuard::new(
+                    s3.clone(),
+                    self.context.history.clone(),
+                    staged.clone(),
+                ));
                 QuietMutationWorkload::staged_multipart_complete(staged)
             }
         };
@@ -162,7 +189,11 @@ impl FaultRun<'_> {
             "the ACK mutation is prepared; no fault has been activated",
             Some(serde_json::json!({ "mutation": kind })),
         )?;
-        Ok(workload)
+        Ok(PreparedQuietMutation {
+            workload,
+            staged_upload_index,
+            cancellation_cleanup,
+        })
     }
 
     async fn activate_fault_after_ack(
