@@ -15,7 +15,11 @@ use async_trait::async_trait;
 use http::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::fault::scenarios::{ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO};
 use crate::rustfs::{RustfsAdminResponse, RustfsAdminTransport};
@@ -25,6 +29,14 @@ pub const ADMIN_TOPOLOGY_PROOF_ARTIFACT: &str = "admin-topology-proof.json";
 pub const ADMIN_OPERATION_ARTIFACT: &str = "admin-operation.json";
 pub const ADMIN_OPERATION_PROGRESS_ARTIFACT: &str = "admin-operation-progress.jsonl";
 pub const DECOMMISSION_TARGET_POOL_NAME: &str = "decommission-target";
+pub const RUSTFS_DECOMMISSION_CAPACITY_PERCENT: u64 = 130;
+const ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS: u64 = 5_000;
+
+const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
+const DEFAULT_POOL_DATA_PATH: &str = "/data";
+const ADMIN_DECOMMISSION_CASE_NAME: &str = "fault_admin_decommission_preserves_object_model";
+const ADMIN_REBALANCE_CASE_NAME: &str = "fault_admin_rebalance_preserves_object_model";
+const POOL_USED_RATIO_TOLERANCE: f64 = 0.000_001;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -38,7 +50,7 @@ pub enum AdminTopologyKind {
 pub struct AdminTopologyPlan {
     pub kind: AdminTopologyKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_pool_id: Option<usize>,
+    pub target_pool_name: Option<String>,
 }
 
 impl AdminTopologyPlan {
@@ -46,15 +58,65 @@ impl AdminTopologyPlan {
         match scenario {
             ADMIN_DECOMMISSION_SCENARIO => Ok(Self {
                 kind: AdminTopologyKind::Decommission,
-                // Pool zero remains the destination. The fresh test fixture
-                // creates pool one solely as the decommission target.
-                target_pool_id: Some(1),
+                target_pool_name: Some(DECOMMISSION_TARGET_POOL_NAME.to_string()),
             }),
             ADMIN_REBALANCE_SCENARIO => Ok(Self {
                 kind: AdminTopologyKind::Rebalance,
-                target_pool_id: None,
+                target_pool_name: None,
             }),
             other => bail!("scenario {other:?} is not an admin topology case"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminAttemptIdentity {
+    pub run_id: String,
+    pub case_name: String,
+    pub tenant_uid: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminAttemptWindow {
+    pub started_at_ms: u64,
+    pub evaluated_at_ms: u64,
+}
+
+impl AdminAttemptWindow {
+    fn validate(self) -> Result<()> {
+        ensure!(
+            self.started_at_ms > 0 && self.started_at_ms <= self.evaluated_at_ms,
+            "admin attempt time window is invalid"
+        );
+        Ok(())
+    }
+
+    fn contains(self, observed_at_ms: u64) -> bool {
+        (self.started_at_ms..=self.evaluated_at_ms).contains(&observed_at_ms)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminTopologyBuildContext {
+    pub run_id: String,
+    pub case_name: String,
+    pub cluster_domain: String,
+    /// Upper bound on net-new bytes admitted while the admin operation runs.
+    pub workload_max_bytes: u64,
+}
+
+impl AdminTopologyBuildContext {
+    pub fn new(
+        run_id: impl Into<String>,
+        case_name: impl Into<String>,
+        workload_max_bytes: u64,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            case_name: case_name.into(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            workload_max_bytes,
         }
     }
 }
@@ -145,6 +207,8 @@ pub struct RebalancePoolStatus {
     #[serde(default)]
     pub status: String,
     #[serde(default)]
+    pub stopping: bool,
+    #[serde(default)]
     pub last_error: Option<String>,
     #[serde(default)]
     pub cleanup_warnings: RebalanceCleanupWarnings,
@@ -173,6 +237,19 @@ pub struct RebalanceStatus {
     pub pools: Vec<RebalancePoolStatus>,
     #[serde(default)]
     pub stopped_at: Option<String>,
+    #[serde(default)]
+    pub stop_propagation: RebalanceStopPropagationStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RebalanceStopPropagationStatus {
+    #[serde(default)]
+    pub failed_peers: Vec<String>,
+    #[serde(default)]
+    pub terminal_reload_failed_peers: Vec<String>,
+    #[serde(default)]
+    pub pending_terminal_reload: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,8 +260,14 @@ pub struct AdminRequestEvidence {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub query: BTreeMap<String, String>,
     pub status: u16,
+    pub started_at_ms: u64,
+    pub observed_at_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -192,6 +275,104 @@ pub struct AdminRequestEvidence {
 pub struct AdminCall<T> {
     pub value: T,
     pub request: AdminRequestEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KubernetesTenantGetEvidence {
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+    pub resource_version: String,
+    pub started_at_ms: u64,
+    pub observed_at_ms: u64,
+}
+
+impl KubernetesTenantGetEvidence {
+    pub fn from_resource(tenant: &Value, started_at_ms: u64, observed_at_ms: u64) -> Result<Self> {
+        let evidence = Self {
+            namespace: required_string(tenant, "/metadata/namespace")?,
+            name: required_string(tenant, "/metadata/name")?,
+            uid: required_string(tenant, "/metadata/uid")?,
+            resource_version: required_string(tenant, "/metadata/resourceVersion")?,
+            started_at_ms,
+            observed_at_ms,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.namespace.trim().is_empty()
+                && !self.name.trim().is_empty()
+                && !self.uid.trim().is_empty()
+                && !self.resource_version.trim().is_empty()
+                && self.started_at_ms > 0
+                && self.started_at_ms <= self.observed_at_ms,
+            "Kubernetes Tenant GET evidence lacks namespace/name/UID/resourceVersion or an ordered startedAt/observedAt interval"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminPoolSnapshot {
+    #[serde(flatten)]
+    pub attempt: AdminAttemptIdentity,
+    pub tenant_get: KubernetesTenantGetEvidence,
+    pub observed_at_ms: u64,
+    pub request: AdminRequestEvidence,
+    pub pools: Vec<AdminPool>,
+}
+
+impl AdminPoolSnapshot {
+    pub fn from_list(
+        run_id: impl Into<String>,
+        case_name: impl Into<String>,
+        tenant: &Value,
+        tenant_started_at_ms: u64,
+        tenant_observed_at_ms: u64,
+        call: AdminCall<Vec<AdminPool>>,
+    ) -> Result<Self> {
+        let tenant_get = KubernetesTenantGetEvidence::from_resource(
+            tenant,
+            tenant_started_at_ms,
+            tenant_observed_at_ms,
+        )?;
+        let snapshot = Self {
+            attempt: AdminAttemptIdentity {
+                run_id: run_id.into(),
+                case_name: case_name.into(),
+                tenant_uid: tenant_get.uid.clone(),
+            },
+            tenant_get,
+            observed_at_ms: call.request.observed_at_ms,
+            request: call.request,
+            pools: call.value,
+        };
+        snapshot.validate_list_request()?;
+        Ok(snapshot)
+    }
+
+    fn validate_list_request(&self) -> Result<()> {
+        validate_attempt_identity(&self.attempt)?;
+        self.tenant_get.validate()?;
+        ensure!(
+            self.tenant_get.uid == self.attempt.tenant_uid
+                && self.observed_at_ms == self.request.observed_at_ms
+                && self.request.started_at_ms > 0
+                && self.request.started_at_ms <= self.request.observed_at_ms
+                && self.tenant_get.observed_at_ms < self.request.started_at_ms
+                && self.request.method == "GET"
+                && self.request.path == "/rustfs/admin/v3/pools/list"
+                && self.request.query.is_empty()
+                && (200..300).contains(&self.request.status),
+            "pool snapshot is not bound to one Kubernetes Tenant GET and one successful pools/list observation"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -235,17 +416,25 @@ impl RustfsAdminTopologyAdapter {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<AdminCall<T>> {
+        let started_at_ms = now_ms();
         let response = self
             .transport
             .request(method.clone(), path, query, Vec::new(), None)
             .await?;
+        let observed_at_ms = now_ms();
         require_success(&response, path)?;
+        let request = request_evidence(
+            method,
+            path,
+            query,
+            &response,
+            started_at_ms,
+            observed_at_ms,
+            Some(&response.body),
+        );
         let value = serde_json::from_slice(&response.body)
             .with_context(|| format!("decode RustFS admin response for {path}"))?;
-        Ok(AdminCall {
-            value,
-            request: request_evidence(method, path, query, response),
-        })
+        Ok(AdminCall { value, request })
     }
 
     async fn empty(
@@ -254,14 +443,24 @@ impl RustfsAdminTopologyAdapter {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<AdminCall<()>> {
+        let started_at_ms = now_ms();
         let response = self
             .transport
             .request(method.clone(), path, query, Vec::new(), None)
             .await?;
+        let observed_at_ms = now_ms();
         require_success(&response, path)?;
         Ok(AdminCall {
             value: (),
-            request: request_evidence(method, path, query, response),
+            request: request_evidence(
+                method,
+                path,
+                query,
+                &response,
+                started_at_ms,
+                observed_at_ms,
+                None,
+            ),
         })
     }
 }
@@ -270,7 +469,10 @@ fn request_evidence(
     method: Method,
     path: &str,
     query: &[(&str, &str)],
-    response: RustfsAdminResponse,
+    response: &RustfsAdminResponse,
+    started_at_ms: u64,
+    observed_at_ms: u64,
+    response_body: Option<&[u8]>,
 ) -> AdminRequestEvidence {
     AdminRequestEvidence {
         method: method.to_string(),
@@ -280,8 +482,23 @@ fn request_evidence(
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect(),
         status: response.status,
-        request_id: response.request_id,
+        started_at_ms,
+        observed_at_ms,
+        request_id: response.request_id.clone(),
+        response_sha256: response_body.map(sha256_hex),
+        response_body: response_body.map(|body| String::from_utf8_lossy(body).into_owned()),
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn require_success(response: &RustfsAdminResponse, path: &str) -> Result<()> {
@@ -377,6 +594,12 @@ impl AdminTopologyPort for RustfsAdminTopologyAdapter {
 #[serde(rename_all = "camelCase")]
 pub struct TenantPoolProof {
     pub name: String,
+    pub tenant_uid: String,
+    pub stateful_set_name: String,
+    pub expected_endpoint_set: String,
+    pub internode_scheme: String,
+    pub cluster_domain: String,
+    pub data_path: String,
     pub runtime_pool_id: usize,
     pub servers: u64,
     pub volumes_per_server: u64,
@@ -385,9 +608,10 @@ pub struct TenantPoolProof {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminTopologyProof {
+    #[serde(flatten)]
+    pub attempt: AdminAttemptIdentity,
     pub scenario: String,
     pub tenant: String,
-    pub tenant_uid: String,
     pub namespace: String,
     pub tenant_pools: Vec<TenantPoolProof>,
     pub runtime_pools: Vec<AdminPool>,
@@ -397,6 +621,9 @@ pub struct AdminTopologyProof {
     pub target_pool_expression: Option<String>,
     pub remaining_free_bytes: u64,
     pub target_used_bytes: u64,
+    pub workload_max_bytes: u64,
+    pub capacity_guard_percent: u64,
+    pub required_remaining_free_bytes: u64,
     pub mutually_exclusive: bool,
     pub satisfied: bool,
 }
@@ -407,6 +634,7 @@ impl AdminTopologyProof {
         scenario: &str,
         tenant: &Value,
         runtime_pools: Vec<AdminPool>,
+        context: &AdminTopologyBuildContext,
     ) -> Result<Self> {
         ensure!(
             AdminTopologyPlan::for_scenario(scenario)? == *plan,
@@ -415,39 +643,57 @@ impl AdminTopologyProof {
         let tenant_name = required_string(tenant, "/metadata/name")?;
         let tenant_uid = required_string(tenant, "/metadata/uid")?;
         let namespace = required_string(tenant, "/metadata/namespace")?;
+        validate_build_context(scenario, context)?;
         let tenant_pools = tenant
             .pointer("/spec/pools")
             .and_then(Value::as_array)
             .context("Tenant spec.pools must be an array")?
             .iter()
-            .enumerate()
-            .map(|(runtime_pool_id, pool)| {
-                Ok(TenantPoolProof {
-                    name: required_field_string(pool, "name")?,
-                    runtime_pool_id,
-                    servers: required_field_u64(pool, "servers")?,
-                    volumes_per_server: pool
-                        .pointer("/persistence/volumesPerServer")
-                        .and_then(Value::as_u64)
-                        .context("Tenant pool persistence.volumesPerServer is required")?,
-                })
+            .map(|pool| {
+                tenant_pool_proof(
+                    pool,
+                    &tenant_name,
+                    &tenant_uid,
+                    &namespace,
+                    tenant,
+                    &context.cluster_domain,
+                    &runtime_pools,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         validate_runtime_pools(&tenant_pools, &runtime_pools)?;
         let mutually_exclusive = true;
-        let (target_pool_expression, target_used_bytes, remaining_free_bytes) =
-            topology_capacity(plan, &runtime_pools)?;
+        let target_pool_id = plan
+            .target_pool_name
+            .as_deref()
+            .map(|target_name| {
+                tenant_pools
+                    .iter()
+                    .find(|pool| pool.name == target_name)
+                    .map(|pool| pool.runtime_pool_id)
+                    .with_context(|| format!("Tenant target pool {target_name:?} does not exist"))
+            })
+            .transpose()?;
+        let capacity =
+            topology_capacity(target_pool_id, &runtime_pools, context.workload_max_bytes)?;
         let proof = Self {
+            attempt: AdminAttemptIdentity {
+                run_id: context.run_id.clone(),
+                case_name: context.case_name.clone(),
+                tenant_uid: tenant_uid.clone(),
+            },
             scenario: scenario.to_string(),
             tenant: tenant_name,
-            tenant_uid,
             namespace,
             tenant_pools,
             runtime_pools,
-            target_pool_id: plan.target_pool_id,
-            target_pool_expression,
-            remaining_free_bytes,
-            target_used_bytes,
+            target_pool_id,
+            target_pool_expression: capacity.target_pool_expression,
+            remaining_free_bytes: capacity.remaining_free_bytes,
+            target_used_bytes: capacity.target_used_bytes,
+            workload_max_bytes: context.workload_max_bytes,
+            capacity_guard_percent: RUSTFS_DECOMMISSION_CAPACITY_PERCENT,
+            required_remaining_free_bytes: capacity.required_remaining_free_bytes,
             mutually_exclusive,
             satisfied: true,
         };
@@ -462,35 +708,206 @@ impl AdminTopologyProof {
         );
         ensure!(
             !self.tenant.trim().is_empty()
-                && !self.tenant_uid.trim().is_empty()
+                && !self.attempt.tenant_uid.trim().is_empty()
                 && !self.namespace.trim().is_empty(),
             "admin topology proof lacks Tenant identity"
         );
-        let plan = AdminTopologyPlan::for_scenario(&self.scenario)?;
-        ensure!(
-            self.target_pool_id == plan.target_pool_id,
-            "admin topology proof target does not match its scenario"
-        );
-        if let Some(target_pool_id) = plan.target_pool_id {
+        validate_attempt_identity(&self.attempt)?;
+        for pool in &self.tenant_pools {
             ensure!(
-                self.tenant_pools.iter().any(|pool| {
-                    pool.runtime_pool_id == target_pool_id
-                        && pool.name == DECOMMISSION_TARGET_POOL_NAME
-                }),
-                "decommission target ID is not bound to the dedicated Tenant target pool"
+                pool.tenant_uid == self.attempt.tenant_uid,
+                "Tenant pool {:?} UID does not match the topology attempt",
+                pool.name
+            );
+            let (stateful_set_name, expected_endpoint_set) = expected_pool_endpoint_set(
+                &self.tenant,
+                &pool.name,
+                &self.namespace,
+                &pool.internode_scheme,
+                &pool.cluster_domain,
+                &pool.data_path,
+                (pool.servers, pool.volumes_per_server),
+            )?;
+            ensure!(
+                pool.stateful_set_name == stateful_set_name
+                    && pool.expected_endpoint_set == expected_endpoint_set,
+                "Tenant pool {:?} endpoint ownership fields are inconsistent",
+                pool.name
             );
         }
+        let plan = AdminTopologyPlan::for_scenario(&self.scenario)?;
         validate_runtime_pools(&self.tenant_pools, &self.runtime_pools)?;
-        let (expression, target_used, remaining_free) =
-            topology_capacity(&plan, &self.runtime_pools)?;
+        let expected_target_id = plan
+            .target_pool_name
+            .as_deref()
+            .map(|target_name| {
+                self.tenant_pools
+                    .iter()
+                    .find(|pool| pool.name == target_name)
+                    .map(|pool| pool.runtime_pool_id)
+                    .with_context(|| {
+                        format!("decommission target {target_name:?} lacks a Tenant pool binding")
+                    })
+            })
+            .transpose()?;
         ensure!(
-            self.target_pool_expression == expression
-                && self.target_used_bytes == target_used
-                && self.remaining_free_bytes == remaining_free,
+            self.target_pool_id == expected_target_id,
+            "admin topology proof target does not match its named Tenant pool binding"
+        );
+        ensure!(
+            self.capacity_guard_percent == RUSTFS_DECOMMISSION_CAPACITY_PERCENT,
+            "admin topology proof uses the wrong RustFS capacity guard"
+        );
+        let capacity = topology_capacity(
+            expected_target_id,
+            &self.runtime_pools,
+            self.workload_max_bytes,
+        )?;
+        ensure!(
+            self.target_pool_expression == capacity.target_pool_expression
+                && self.target_used_bytes == capacity.target_used_bytes
+                && self.remaining_free_bytes == capacity.remaining_free_bytes
+                && self.required_remaining_free_bytes == capacity.required_remaining_free_bytes,
             "admin topology proof capacity or target facts do not match its runtime snapshot"
         );
         Ok(())
     }
+}
+
+fn validate_build_context(scenario: &str, context: &AdminTopologyBuildContext) -> Result<()> {
+    ensure!(
+        context.case_name == expected_case_name(scenario)?,
+        "admin topology build context case does not match scenario {scenario:?}"
+    );
+    ensure!(
+        !context.run_id.trim().is_empty() && !context.cluster_domain.trim().is_empty(),
+        "admin topology build context lacks run or cluster-domain identity"
+    );
+    ensure!(
+        context.workload_max_bytes > 0,
+        "admin topology workload must have a positive bounded byte budget"
+    );
+    Ok(())
+}
+
+fn validate_attempt_identity(identity: &AdminAttemptIdentity) -> Result<()> {
+    ensure!(
+        !identity.run_id.trim().is_empty()
+            && !identity.case_name.trim().is_empty()
+            && !identity.tenant_uid.trim().is_empty(),
+        "admin artifact lacks runId, caseName, or tenantUid"
+    );
+    Ok(())
+}
+
+fn expected_case_name(scenario: &str) -> Result<&'static str> {
+    match scenario {
+        ADMIN_DECOMMISSION_SCENARIO => Ok(ADMIN_DECOMMISSION_CASE_NAME),
+        ADMIN_REBALANCE_SCENARIO => Ok(ADMIN_REBALANCE_CASE_NAME),
+        other => bail!("scenario {other:?} is not an admin topology case"),
+    }
+}
+
+fn tenant_pool_proof(
+    pool: &Value,
+    tenant_name: &str,
+    tenant_uid: &str,
+    namespace: &str,
+    tenant: &Value,
+    cluster_domain: &str,
+    runtime_pools: &[AdminPool],
+) -> Result<TenantPoolProof> {
+    let name = required_field_string(pool, "name")?;
+    let servers = required_field_u64(pool, "servers")?;
+    let volumes_per_server = pool
+        .pointer("/persistence/volumesPerServer")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .context("Tenant pool persistence.volumesPerServer must be positive")?;
+    let scheme = if tenant
+        .pointer("/spec/tls/enableInternodeHttps")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "https".to_string()
+    } else {
+        "http".to_string()
+    };
+    let base_path = pool
+        .pointer("/persistence/path")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_POOL_DATA_PATH)
+        .trim_end_matches('/')
+        .to_string();
+    ensure!(
+        !base_path.is_empty() && base_path.starts_with('/'),
+        "Tenant pool {name:?} persistence.path must be an absolute non-root path"
+    );
+    let (stateful_set_name, expected_endpoint_set) = expected_pool_endpoint_set(
+        tenant_name,
+        &name,
+        namespace,
+        &scheme,
+        cluster_domain,
+        &base_path,
+        (servers, volumes_per_server),
+    )?;
+    let matches = runtime_pools
+        .iter()
+        .filter(|runtime| runtime.expression.trim() == expected_endpoint_set)
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "Tenant pool {name:?} owned by UID {tenant_uid:?} maps to {} RustFS runtime cmdlines; expected exactly one match for {expected_endpoint_set:?}",
+        matches.len()
+    );
+
+    Ok(TenantPoolProof {
+        name,
+        tenant_uid: tenant_uid.to_string(),
+        stateful_set_name,
+        expected_endpoint_set,
+        internode_scheme: scheme,
+        cluster_domain: cluster_domain.to_string(),
+        data_path: base_path,
+        runtime_pool_id: matches[0].id,
+        servers,
+        volumes_per_server,
+    })
+}
+
+fn expected_pool_endpoint_set(
+    tenant_name: &str,
+    pool_name: &str,
+    namespace: &str,
+    scheme: &str,
+    cluster_domain: &str,
+    data_path: &str,
+    shape: (u64, u64),
+) -> Result<(String, String)> {
+    ensure!(
+        matches!(scheme, "http" | "https")
+            && !tenant_name.trim().is_empty()
+            && !pool_name.trim().is_empty()
+            && !namespace.trim().is_empty()
+            && !cluster_domain.trim().is_empty()
+            && data_path.starts_with('/')
+            && data_path != "/",
+        "Tenant pool endpoint identity fields are invalid"
+    );
+    let last_server = shape
+        .0
+        .checked_sub(1)
+        .context("pool server range underflow")?;
+    let last_volume = shape
+        .1
+        .checked_sub(1)
+        .context("pool volume range underflow")?;
+    let stateful_set_name = format!("{tenant_name}-{pool_name}");
+    let endpoint_set = format!(
+        "{scheme}://{stateful_set_name}-{{0...{last_server}}}.{tenant_name}-hl.{namespace}.svc.{cluster_domain}:9000{data_path}/rustfs{{0...{last_volume}}}"
+    );
+    Ok((stateful_set_name, endpoint_set))
 }
 
 fn validate_runtime_pools(
@@ -519,17 +936,26 @@ fn validate_runtime_pools(
     );
     ensure!(
         tenant_pools.iter().all(|pool| {
-            !pool.name.trim().is_empty() && pool.servers > 0 && pool.volumes_per_server > 0
+            !pool.name.trim().is_empty()
+                && !pool.tenant_uid.trim().is_empty()
+                && !pool.stateful_set_name.trim().is_empty()
+                && !pool.expected_endpoint_set.trim().is_empty()
+                && matches!(pool.internode_scheme.as_str(), "http" | "https")
+                && !pool.cluster_domain.trim().is_empty()
+                && !pool.data_path.trim().is_empty()
+                && pool.servers > 0
+                && pool.volumes_per_server > 0
         }),
-        "Tenant pools must have names and positive server/volume counts"
+        "Tenant pool binding identity or positive server/volume counts are missing"
     );
     ensure!(
         tenant_pools.iter().all(|pool| {
-            runtime_pools
-                .iter()
-                .any(|runtime| runtime.id == pool.runtime_pool_id)
+            runtime_pools.iter().any(|runtime| {
+                runtime.id == pool.runtime_pool_id
+                    && runtime.expression.trim() == pool.expected_endpoint_set
+            })
         }),
-        "Tenant pool order does not bind to the reported zero-based RustFS runtime pool IDs"
+        "Tenant pool endpoint sets do not bind to exact RustFS runtime cmdlines"
     );
     ensure!(
         runtime_pools.len() == tenant_pools.len(),
@@ -537,30 +963,7 @@ fn validate_runtime_pools(
         runtime_pools.len(),
         tenant_pools.len()
     );
-    let ids = runtime_pools
-        .iter()
-        .map(|pool| pool.id)
-        .collect::<BTreeSet<_>>();
-    ensure!(
-        ids.len() == runtime_pools.len(),
-        "RustFS runtime pool IDs must be unique"
-    );
-    ensure!(
-        runtime_pools
-            .iter()
-            .all(|pool| !pool.expression.trim().is_empty()),
-        "RustFS runtime pools must report exact non-empty command-line expressions"
-    );
-    ensure!(
-        runtime_pools.iter().all(|pool| {
-            pool.total_size > 0
-                && pool.current_size <= pool.total_size
-                && pool.used_size <= pool.total_size
-                && pool.used.is_finite()
-                && (0.0..=1.0).contains(&pool.used)
-        }),
-        "RustFS runtime pool capacity or used ratio is invalid"
-    );
+    validate_pool_wire_invariants("runtime", runtime_pools)?;
     ensure!(
         runtime_pools.iter().all(pool_is_idle),
         "a pool is unhealthy, another topology operation is active, or a failure is uncleared"
@@ -568,15 +971,23 @@ fn validate_runtime_pools(
     Ok(())
 }
 
+struct TopologyCapacity {
+    target_pool_expression: Option<String>,
+    target_used_bytes: u64,
+    remaining_free_bytes: u64,
+    required_remaining_free_bytes: u64,
+}
+
 fn topology_capacity(
-    plan: &AdminTopologyPlan,
+    target_pool_id: Option<usize>,
     runtime_pools: &[AdminPool],
-) -> Result<(Option<String>, u64, u64)> {
-    if let Some(target_id) = plan.target_pool_id {
-        ensure!(
-            target_id != 0,
-            "pool zero is reserved as the decommission destination"
-        );
+    workload_max_bytes: u64,
+) -> Result<TopologyCapacity> {
+    ensure!(
+        workload_max_bytes > 0,
+        "admin operation must reserve a positive bounded workload budget"
+    );
+    if let Some(target_id) = target_pool_id {
         let target = runtime_pools
             .iter()
             .find(|pool| pool.id == target_id)
@@ -587,21 +998,45 @@ fn topology_capacity(
             .try_fold(0_u64, |total, pool| total.checked_add(pool.current_size))
             .context("remaining pool free capacity overflowed")?;
         ensure!(
-            remaining_free >= target.used_size,
-            "remaining pools have {remaining_free} free bytes but target pool {target_id} uses {} bytes",
-            target.used_size
+            target.used_size > 0,
+            "decommission target pool must contain data so the case proves migration"
         );
-        Ok((
-            Some(target.expression.clone()),
+        let guarded_target_bytes = target
+            .used_size
+            .checked_mul(RUSTFS_DECOMMISSION_CAPACITY_PERCENT)
+            .and_then(|value| value.checked_add(99))
+            .map(|value| value / 100)
+            .context("decommission capacity guard overflowed")?;
+        let required_remaining_free = guarded_target_bytes
+            .checked_add(workload_max_bytes)
+            .context("decommission workload headroom overflowed")?;
+        ensure!(
+            remaining_free >= required_remaining_free,
+            "remaining pools have {remaining_free} free bytes but RustFS requires at least {required_remaining_free} bytes for target pool {target_id}: {} used bytes at {}% plus {workload_max_bytes} bounded workload bytes",
             target.used_size,
-            remaining_free,
-        ))
+            RUSTFS_DECOMMISSION_CAPACITY_PERCENT
+        );
+        Ok(TopologyCapacity {
+            target_pool_expression: Some(target.expression.clone()),
+            target_used_bytes: target.used_size,
+            remaining_free_bytes: remaining_free,
+            required_remaining_free_bytes: required_remaining_free,
+        })
     } else {
         let remaining_free = runtime_pools
             .iter()
             .try_fold(0_u64, |total, pool| total.checked_add(pool.current_size))
             .context("pool free capacity overflowed")?;
-        Ok((None, 0, remaining_free))
+        ensure!(
+            remaining_free >= workload_max_bytes,
+            "runtime pools lack free capacity for the bounded admin workload"
+        );
+        Ok(TopologyCapacity {
+            target_pool_expression: None,
+            target_used_bytes: 0,
+            remaining_free_bytes: remaining_free,
+            required_remaining_free_bytes: workload_max_bytes,
+        })
     }
 }
 
@@ -610,21 +1045,109 @@ fn pool_is_idle(pool: &AdminPool) -> bool {
         pool.status.to_ascii_lowercase().as_str(),
         "active" | "ready"
     );
-    let lifecycle_idle = |value: &str| {
-        matches!(
-            value.to_ascii_lowercase().as_str(),
-            "none" | "idle" | "complete" | "completed"
-        )
-    };
     pool_healthy
-        && lifecycle_idle(&pool.decommission_status)
-        && lifecycle_idle(&pool.rebalance_status)
-        && pool.decommission.as_ref().is_none_or(|progress| {
-            !progress.failed
+        && pool.decommission_status.eq_ignore_ascii_case("none")
+        && matches!(
+            pool.rebalance_status.to_ascii_lowercase().as_str(),
+            "none" | "completed"
+        )
+        && pool.decommission.is_none()
+}
+
+fn pool_is_decommissioned_target(
+    pool: &AdminPool,
+    operation_id: &str,
+    objects_moved: Option<u64>,
+    bytes_moved: Option<u64>,
+) -> bool {
+    pool.status.eq_ignore_ascii_case("decommissioned")
+        && pool.decommission_status.eq_ignore_ascii_case("complete")
+        && matches!(
+            pool.rebalance_status.to_ascii_lowercase().as_str(),
+            "none" | "completed"
+        )
+        && pool.decommission.as_ref().is_some_and(|progress| {
+            progress.complete
+                && !progress.failed
                 && !progress.canceled
                 && !progress.queued
-                && progress.start_time.is_none()
+                && progress.objects_decommissioned_failed == 0
+                && progress.bytes_decommissioned_failed == 0
+                && progress.start_time.as_deref().is_some_and(|start_time| {
+                    !start_time.trim().is_empty()
+                        && operation_id == format!("decommission:{}:{start_time}", pool.id)
+                })
+                && objects_moved == Some(progress.objects_decommissioned)
+                && bytes_moved == Some(progress.bytes_decommissioned)
         })
+}
+
+fn validate_pre_start_snapshot(
+    proof: &AdminTopologyProof,
+    snapshot: &AdminPoolSnapshot,
+    operation_requests: &[AdminRequestEvidence],
+) -> Result<()> {
+    snapshot.validate_list_request()?;
+    ensure!(
+        snapshot.attempt == proof.attempt,
+        "pre-start pool snapshot does not belong to the current run/case/Tenant attempt"
+    );
+    ensure!(
+        snapshot.tenant_get.namespace == proof.namespace
+            && snapshot.tenant_get.name == proof.tenant
+            && snapshot.tenant_get.uid == proof.attempt.tenant_uid,
+        "pre-start Kubernetes Tenant GET does not match the proven Tenant identity"
+    );
+    validate_runtime_pools(&proof.tenant_pools, &snapshot.pools)?;
+    let capacity = topology_capacity(
+        proof.target_pool_id,
+        &snapshot.pools,
+        proof.workload_max_bytes,
+    )?;
+    ensure!(
+        capacity.target_pool_expression == proof.target_pool_expression,
+        "pre-start pool snapshot target identity drifted after preflight"
+    );
+    let (start_started_at_ms, _, _) =
+        validate_start_before_status(operation_requests, &proof.scenario, proof.target_pool_id)?;
+    ensure!(
+        snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
+            && snapshot.request.observed_at_ms < start_started_at_ms
+            && snapshot.tenant_get.observed_at_ms < start_started_at_ms
+            && start_started_at_ms - snapshot.tenant_get.observed_at_ms
+                <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS
+            && start_started_at_ms - snapshot.observed_at_ms <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS,
+        "pre-start Tenant GET and pools/list intervals are stale, overlapping, or not complete before admin start"
+    );
+    Ok(())
+}
+
+fn validate_post_operation_snapshot(
+    proof: &AdminTopologyProof,
+    snapshot: &AdminPoolSnapshot,
+    operation_requests: &[AdminRequestEvidence],
+) -> Result<()> {
+    snapshot.validate_list_request()?;
+    ensure!(
+        snapshot.attempt == proof.attempt,
+        "post-operation pool snapshot does not belong to the current run/case/Tenant attempt"
+    );
+    ensure!(
+        snapshot.tenant_get.namespace == proof.namespace
+            && snapshot.tenant_get.name == proof.tenant
+            && snapshot.tenant_get.uid == proof.attempt.tenant_uid,
+        "post-operation Kubernetes Tenant GET does not match the proven Tenant identity"
+    );
+    validate_pool_wire_invariants("after", &snapshot.pools)?;
+    let (_, _, terminal_status_observed_at_ms) =
+        validate_start_before_status(operation_requests, &proof.scenario, proof.target_pool_id)?;
+    ensure!(
+        terminal_status_observed_at_ms < snapshot.tenant_get.started_at_ms
+            && snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
+            && snapshot.observed_at_ms >= snapshot.request.started_at_ms,
+        "post-operation Tenant GET and pools/list were not observed in order after terminal status"
+    );
+    Ok(())
 }
 
 fn required_string(value: &Value, pointer: &str) -> Result<String> {
@@ -656,6 +1179,8 @@ fn required_field_u64(value: &Value, field: &str) -> Result<u64> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminOperationEvidence {
+    #[serde(flatten)]
+    pub attempt: AdminAttemptIdentity,
     pub scenario: String,
     pub operation_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -666,15 +1191,26 @@ pub struct AdminOperationEvidence {
     pub completed: bool,
     pub failed: bool,
     pub canceled_or_stopped: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participating_pool_ids: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objects_moved: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub versions_moved: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_moved: Option<u64>,
     pub requests: Vec<AdminRequestEvidence>,
-    pub pools_before: Vec<AdminPool>,
-    pub pools_after: Vec<AdminPool>,
+    pub pools_before: AdminPoolSnapshot,
+    pub pools_after: AdminPoolSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminOperationProgressSample {
+    #[serde(flatten)]
+    pub attempt: AdminAttemptIdentity,
     pub operation_id: String,
+    pub status_request_id: String,
     pub observed_at_ms: u64,
     pub state: String,
     pub completed: bool,
@@ -691,11 +1227,14 @@ pub struct AdminOperationProgressSample {
 impl AdminOperationEvidence {
     pub fn from_decommission(
         proof: &AdminTopologyProof,
+        pools_before: AdminPoolSnapshot,
         status: DecommissionPoolStatus,
         requests: Vec<AdminRequestEvidence>,
-        pools_after: Vec<AdminPool>,
+        pools_after: AdminPoolSnapshot,
     ) -> Result<Self> {
         proof.require_satisfied()?;
+        validate_pre_start_snapshot(proof, &pools_before, &requests)?;
+        validate_post_operation_snapshot(proof, &pools_after, &requests)?;
         let target_pool_id = proof
             .target_pool_id
             .context("decommission topology proof has no target pool ID")?;
@@ -717,41 +1256,56 @@ impl AdminOperationEvidence {
             .filter(|value| !value.trim().is_empty())
             .context("decommission status is missing operation start time")?;
         let state = status.status.to_ascii_lowercase();
-        let completed = progress.complete
-            && !progress.failed
-            && !progress.canceled
-            && progress.objects_decommissioned_failed == 0
-            && progress.bytes_decommissioned_failed == 0;
+        let failed = progress.failed
+            || progress.objects_decommissioned_failed > 0
+            || progress.bytes_decommissioned_failed > 0
+            || state == "failed";
+        let canceled = progress.canceled || state == "canceled";
+        let completed = status.pool_status.eq_ignore_ascii_case("decommissioned")
+            && progress.complete
+            && !progress.queued
+            && !failed
+            && !canceled
+            && (progress.objects_decommissioned > 0 || progress.bytes_decommissioned > 0);
+        let terminal_control_requested = requests.iter().any(is_cancel_or_stop_request);
         Ok(Self {
+            attempt: proof.attempt.clone(),
             scenario: ADMIN_DECOMMISSION_SCENARIO.to_string(),
             operation_id: format!("decommission:{target_pool_id}:{start_time}"),
             target_pool_id: Some(target_pool_id),
             target_pool_expression: Some(target_pool_expression),
             terminal_state: state.clone(),
             completed,
-            failed: progress.failed || state == "failed",
-            canceled_or_stopped: progress.canceled || state == "canceled",
+            failed,
+            canceled_or_stopped: canceled || terminal_control_requested,
+            participating_pool_ids: vec![target_pool_id],
+            objects_moved: Some(progress.objects_decommissioned),
+            versions_moved: None,
+            bytes_moved: Some(progress.bytes_decommissioned),
             requests,
-            pools_before: proof.runtime_pools.clone(),
+            pools_before,
             pools_after,
         })
     }
 
     pub fn from_rebalance(
         proof: &AdminTopologyProof,
+        pools_before: AdminPoolSnapshot,
         start: &RebalanceStart,
         status: RebalanceStatus,
         requests: Vec<AdminRequestEvidence>,
-        pools_after: Vec<AdminPool>,
+        pools_after: AdminPoolSnapshot,
     ) -> Result<Self> {
         proof.require_satisfied()?;
+        validate_pre_start_snapshot(proof, &pools_before, &requests)?;
+        validate_post_operation_snapshot(proof, &pools_after, &requests)?;
         ensure!(
             !start.id.trim().is_empty() && status.id == start.id,
             "rebalance status operation ID does not match the start response"
         );
         ensure!(
-            !status.pools.is_empty(),
-            "rebalance status must report per-pool state"
+            status.pools.len() == proof.runtime_pools.len(),
+            "rebalance status raw pool count does not match the proven topology"
         );
         let status_pool_ids = status
             .pools
@@ -759,7 +1313,7 @@ impl AdminOperationEvidence {
             .map(|pool| pool.id)
             .collect::<BTreeSet<_>>();
         ensure!(
-            status_pool_ids.len() == proof.runtime_pools.len()
+            status_pool_ids.len() == status.pools.len()
                 && proof
                     .runtime_pools
                     .iter()
@@ -770,7 +1324,9 @@ impl AdminOperationEvidence {
             || status
                 .pools
                 .iter()
-                .any(|pool| pool.status.eq_ignore_ascii_case("stopped"));
+                .any(|pool| pool.stopping || pool.status.eq_ignore_ascii_case("stopped"))
+            || status.stop_propagation.pending_terminal_reload
+            || requests.iter().any(is_cancel_or_stop_request);
         let failed = status.pools.iter().any(|pool| {
             pool.last_error
                 .as_deref()
@@ -781,16 +1337,55 @@ impl AdminOperationEvidence {
                     .last_message
                     .as_deref()
                     .is_some_and(|warning| !warning.is_empty())
-                || pool.status.eq_ignore_ascii_case("failed")
-        });
-        let completed = !failed
-            && !stopped
-            && status.pools.iter().all(|pool| {
+                || matches!(
+                    pool.status.to_ascii_lowercase().as_str(),
+                    "failed" | "blocked"
+                )
+        }) || !status.stop_propagation.failed_peers.is_empty()
+            || !status
+                .stop_propagation
+                .terminal_reload_failed_peers
+                .is_empty();
+        let participating = status
+            .pools
+            .iter()
+            .filter(|pool| pool.progress.is_some())
+            .collect::<Vec<_>>();
+        let participating_pool_ids = participating.iter().map(|pool| pool.id).collect::<Vec<_>>();
+        let (objects_moved, versions_moved, bytes_moved) = participating.iter().try_fold(
+            (0_u64, 0_u64, 0_u64),
+            |(objects, versions, bytes), pool| {
+                let progress = pool.progress.as_ref().expect("participants have progress");
+                Ok::<_, anyhow::Error>((
+                    objects
+                        .checked_add(progress.objects)
+                        .context("rebalance object progress overflowed")?,
+                    versions
+                        .checked_add(progress.versions)
+                        .context("rebalance version progress overflowed")?,
+                    bytes
+                        .checked_add(progress.bytes)
+                        .context("rebalance byte progress overflowed")?,
+                ))
+            },
+        )?;
+        let moved = objects_moved > 0 || versions_moved > 0 || bytes_moved > 0;
+        let participants_completed = !participating.is_empty()
+            && participating
+                .iter()
+                .all(|pool| pool.status.eq_ignore_ascii_case("completed"));
+        let nonparticipants_terminal = status
+            .pools
+            .iter()
+            .filter(|pool| pool.progress.is_none())
+            .all(|pool| {
                 matches!(
                     pool.status.to_ascii_lowercase().as_str(),
-                    "complete" | "completed"
+                    "none" | "completed"
                 )
             });
+        let completed =
+            moved && participants_completed && nonparticipants_terminal && !failed && !stopped;
         let terminal_state = if failed {
             "failed"
         } else if stopped {
@@ -801,6 +1396,7 @@ impl AdminOperationEvidence {
             "incomplete"
         };
         Ok(Self {
+            attempt: proof.attempt.clone(),
             scenario: ADMIN_REBALANCE_SCENARIO.to_string(),
             operation_id: start.id.clone(),
             target_pool_id: None,
@@ -809,23 +1405,36 @@ impl AdminOperationEvidence {
             completed,
             failed,
             canceled_or_stopped: stopped,
+            participating_pool_ids,
+            objects_moved: Some(objects_moved),
+            versions_moved: Some(versions_moved),
+            bytes_moved: Some(bytes_moved),
             requests,
-            pools_before: proof.runtime_pools.clone(),
+            pools_before,
             pools_after,
         })
     }
 
-    pub fn require_success(&self) -> Result<()> {
+    pub fn require_success(&self, attempt_window: AdminAttemptWindow) -> Result<()> {
+        attempt_window.validate()?;
+        validate_attempt_identity(&self.attempt)?;
+        ensure!(
+            self.attempt.case_name == expected_case_name(&self.scenario)?,
+            "admin operation caseName does not match its scenario"
+        );
         ensure!(
             !self.operation_id.trim().is_empty(),
             "admin operation identity is missing"
         );
         ensure!(self.completed, "admin operation did not complete");
+        let expected_terminal_state = match self.scenario.as_str() {
+            ADMIN_DECOMMISSION_SCENARIO => "complete",
+            ADMIN_REBALANCE_SCENARIO => "completed",
+            other => bail!("unsupported admin operation scenario {other:?}"),
+        };
         ensure!(
-            matches!(
-                self.terminal_state.to_ascii_lowercase().as_str(),
-                "complete" | "completed"
-            ),
+            self.terminal_state
+                .eq_ignore_ascii_case(expected_terminal_state),
             "admin operation terminal state is not complete"
         );
         ensure!(!self.failed, "admin operation reached a failed state");
@@ -834,11 +1443,51 @@ impl AdminOperationEvidence {
             "canceled/stopped admin operation cannot pass"
         );
         ensure!(
+            !self.requests.iter().any(is_cancel_or_stop_request),
+            "admin operation transcript contains a cancel/stop request"
+        );
+        ensure!(
             self.requests
                 .iter()
                 .all(|request| (200..300).contains(&request.status)),
             "admin operation evidence contains a failed HTTP request"
         );
+        validate_request_timing(&self.requests, attempt_window)?;
+        let (start_started_at_ms, _, terminal_status_observed_at_ms) =
+            validate_start_before_status(&self.requests, &self.scenario, self.target_pool_id)?;
+        self.validate_terminal_status_response()?;
+        self.pools_before.validate_list_request()?;
+        ensure!(
+            self.pools_before.attempt == self.attempt
+                && attempt_window.contains(self.pools_before.tenant_get.started_at_ms)
+                && attempt_window.contains(self.pools_before.tenant_get.observed_at_ms)
+                && attempt_window.contains(self.pools_before.request.started_at_ms)
+                && attempt_window.contains(self.pools_before.request.observed_at_ms)
+                && self.pools_before.tenant_get.observed_at_ms
+                    < self.pools_before.request.started_at_ms
+                && self.pools_before.request.observed_at_ms < start_started_at_ms
+                && start_started_at_ms - self.pools_before.tenant_get.observed_at_ms
+                    <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS
+                && attempt_window.contains(self.pools_before.observed_at_ms)
+                && start_started_at_ms - self.pools_before.observed_at_ms
+                    <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS,
+            "pre-start Tenant/pool snapshot identity or observation time is invalid"
+        );
+        validate_pool_wire_invariants("before", &self.pools_before.pools)?;
+        self.pools_after.validate_list_request()?;
+        ensure!(
+            self.pools_after.attempt == self.attempt
+                && attempt_window.contains(self.pools_after.tenant_get.started_at_ms)
+                && attempt_window.contains(self.pools_after.tenant_get.observed_at_ms)
+                && attempt_window.contains(self.pools_after.request.started_at_ms)
+                && attempt_window.contains(self.pools_after.request.observed_at_ms)
+                && attempt_window.contains(self.pools_after.observed_at_ms)
+                && terminal_status_observed_at_ms < self.pools_after.tenant_get.started_at_ms
+                && self.pools_after.tenant_get.observed_at_ms
+                    < self.pools_after.request.started_at_ms,
+            "post-operation pool snapshot identity or observation time is invalid"
+        );
+        validate_pool_wire_invariants("after", &self.pools_after.pools)?;
         if self.scenario == ADMIN_DECOMMISSION_SCENARIO {
             let target_id = self
                 .target_pool_id
@@ -849,6 +1498,13 @@ impl AdminOperationEvidence {
                 .filter(|value| !value.is_empty())
                 .context("decommission target expression is missing")?;
             let target_id_string = target_id.to_string();
+            ensure!(
+                self.participating_pool_ids == [target_id]
+                    && self.versions_moved.is_none()
+                    && (self.objects_moved.is_some_and(|value| value > 0)
+                        || self.bytes_moved.is_some_and(|value| value > 0)),
+                "decommission evidence lacks the exact target participant or positive movement"
+            );
             ensure!(
                 self.requests.iter().any(|request| {
                     request.method == "POST"
@@ -873,39 +1529,77 @@ impl AdminOperationEvidence {
             );
             ensure!(
                 self.pools_before
+                    .pools
                     .iter()
                     .any(|pool| pool.id == target_id && pool.expression == expression),
                 "decommission target was not present in the before topology"
             );
             ensure!(
-                self.pools_after.iter().all(|pool| pool.id != target_id)
-                    || self.pools_after.iter().any(|pool| {
+                self.pools_after
+                    .pools
+                    .iter()
+                    .all(|pool| pool.id != target_id)
+                    || self.pools_after.pools.iter().any(|pool| {
                         pool.id == target_id
                             && pool.expression == expression
-                            && matches!(
-                                pool.status.to_ascii_lowercase().as_str(),
-                                "decommissioned" | "complete" | "completed"
+                            && pool_is_decommissioned_target(
+                                pool,
+                                &self.operation_id,
+                                self.objects_moved,
+                                self.bytes_moved,
                             )
                     }),
                 "decommission target remains active after the claimed completion"
             );
             ensure!(
-                self.pools_after.iter().all(|after| {
-                    self.pools_before.iter().any(|before| {
+                self.pools_after.pools.iter().all(|after| {
+                    self.pools_before.pools.iter().any(|before| {
                         before.id == after.id && before.expression == after.expression
                     })
                 }) && self
                     .pools_before
+                    .pools
                     .iter()
                     .filter(|before| before.id != target_id)
                     .all(|before| {
-                        self.pools_after.iter().any(|after| {
+                        self.pools_after.pools.iter().any(|after| {
                             after.id == before.id && after.expression == before.expression
                         })
                     }),
                 "decommission changed a non-target pool identity or introduced a new pool"
             );
+            ensure!(
+                self.pools_after
+                    .pools
+                    .iter()
+                    .filter(|pool| pool.id != target_id)
+                    .all(pool_is_idle),
+                "a surviving non-target pool is not healthy and idle after decommission"
+            );
         } else if self.scenario == ADMIN_REBALANCE_SCENARIO {
+            ensure!(
+                self.target_pool_id.is_none() && self.target_pool_expression.is_none(),
+                "rebalance evidence must not claim a single target pool"
+            );
+            ensure!(
+                !self.participating_pool_ids.is_empty()
+                    && (self.objects_moved.is_some_and(|value| value > 0)
+                        || self.versions_moved.is_some_and(|value| value > 0)
+                        || self.bytes_moved.is_some_and(|value| value > 0)),
+                "rebalance evidence lacks a participating pool or positive movement signal"
+            );
+            let participating_ids = self
+                .participating_pool_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            ensure!(
+                participating_ids.len() == self.participating_pool_ids.len()
+                    && participating_ids
+                        .iter()
+                        .all(|id| { self.pools_before.pools.iter().any(|pool| pool.id == *id) }),
+                "rebalance participating pool IDs are duplicated or outside the proven topology"
+            );
             ensure!(
                 self.requests.iter().any(|request| {
                     request.method == "POST"
@@ -919,62 +1613,682 @@ impl AdminOperationEvidence {
                 "rebalance evidence must contain start and status requests"
             );
             ensure!(
-                self.pools_before.len() == self.pools_after.len()
-                    && self.pools_before.iter().all(|before| {
-                        self.pools_after.iter().any(|after| {
+                self.pools_before.pools.len() == self.pools_after.pools.len()
+                    && self.pools_before.pools.iter().all(|before| {
+                        self.pools_after.pools.iter().any(|after| {
                             after.id == before.id && after.expression == before.expression
                         })
                     }),
                 "rebalance changed pool identity or topology scope"
+            );
+            ensure!(
+                self.pools_after.pools.iter().all(pool_is_idle),
+                "a pool is not healthy and idle after rebalance"
             );
         } else {
             bail!("unsupported admin operation scenario {:?}", self.scenario);
         }
         Ok(())
     }
+
+    fn validate_terminal_status_response(&self) -> Result<()> {
+        let (_, status_path) = admin_request_paths(&self.scenario)?;
+        let terminal_request = self
+            .requests
+            .iter()
+            .rev()
+            .find(|request| request.method == "GET" && request.path == status_path)
+            .context("admin operation lacks a terminal status response")?;
+        match self.scenario.as_str() {
+            ADMIN_DECOMMISSION_SCENARIO => {
+                let status = parse_status_response::<DecommissionPoolStatus>(terminal_request)?;
+                let target_pool_id = self
+                    .target_pool_id
+                    .context("decommission terminal response lacks a target pool")?;
+                let expression = self
+                    .target_pool_expression
+                    .as_deref()
+                    .context("decommission terminal response lacks a target expression")?;
+                let projection = project_decommission_status(
+                    &status,
+                    target_pool_id,
+                    expression,
+                    &self.operation_id,
+                )?;
+                ensure!(
+                    self.terminal_state.eq_ignore_ascii_case(&projection.state)
+                        && self.completed == projection.completed
+                        && self.failed == projection.failed
+                        && self.canceled_or_stopped == projection.canceled
+                        && self.participating_pool_ids == [target_pool_id]
+                        && self.objects_moved == Some(projection.objects_moved)
+                        && self.versions_moved.is_none()
+                        && self.bytes_moved == Some(projection.bytes_moved),
+                    "decommission operation fields are not derived from the terminal RustFS status response"
+                );
+            }
+            ADMIN_REBALANCE_SCENARIO => {
+                let status = parse_status_response::<RebalanceStatus>(terminal_request)?;
+                let projection = project_rebalance_status(
+                    &status,
+                    &self.pools_before.pools,
+                    self.requests.iter().any(is_cancel_or_stop_request),
+                )?;
+                ensure!(
+                    status.id == self.operation_id
+                        && self.terminal_state.eq_ignore_ascii_case(projection.state)
+                        && self.completed == projection.completed
+                        && self.failed == projection.failed
+                        && self.canceled_or_stopped == projection.stopped
+                        && self.participating_pool_ids == projection.participating_pool_ids
+                        && self.objects_moved == Some(projection.objects_moved)
+                        && self.versions_moved == Some(projection.versions_moved)
+                        && self.bytes_moved == Some(projection.bytes_moved),
+                    "rebalance operation fields are not derived from the terminal RustFS status response"
+                );
+            }
+            other => bail!("unsupported admin operation scenario {other:?}"),
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct DecommissionStatusProjection {
+    state: String,
+    completed: bool,
+    failed: bool,
+    canceled: bool,
+    objects_moved: u64,
+    bytes_moved: u64,
+}
+
+fn project_decommission_status(
+    status: &DecommissionPoolStatus,
+    target_pool_id: usize,
+    target_pool_expression: &str,
+    operation_id: &str,
+) -> Result<DecommissionStatusProjection> {
+    ensure!(
+        status.id == target_pool_id && status.expression == target_pool_expression,
+        "decommission status response does not match the proven target"
+    );
+    let progress = status
+        .decommission
+        .as_ref()
+        .context("decommission status response lacks operation progress")?;
+    let start_time = progress
+        .start_time
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context("decommission status response lacks operation start time")?;
+    ensure!(
+        operation_id == format!("decommission:{target_pool_id}:{start_time}"),
+        "decommission status response belongs to a different operation"
+    );
+    let state = status.status.to_ascii_lowercase();
+    ensure!(
+        matches!(
+            state.as_str(),
+            "queued" | "running" | "complete" | "failed" | "canceled"
+        ),
+        "decommission status response has unknown state {:?}",
+        status.status
+    );
+    let failed = progress.failed
+        || progress.objects_decommissioned_failed > 0
+        || progress.bytes_decommissioned_failed > 0
+        || state == "failed";
+    let canceled = progress.canceled || state == "canceled";
+    match state.as_str() {
+        "queued" => ensure!(
+            progress.queued && !progress.complete && !failed && !canceled,
+            "queued decommission status response has contradictory flags"
+        ),
+        "running" => ensure!(
+            !progress.queued && !progress.complete && !failed && !canceled,
+            "running decommission status response has contradictory flags"
+        ),
+        "complete" => ensure!(
+            !progress.queued && progress.complete && !failed && !canceled,
+            "terminal decommission status response has failure, cancellation, queue, or failed-fragment evidence"
+        ),
+        "failed" | "canceled" => {}
+        _ => unreachable!("state allowlist checked above"),
+    }
+    let completed = state == "complete"
+        && status.pool_status.eq_ignore_ascii_case("decommissioned")
+        && progress.complete
+        && !progress.queued
+        && !failed
+        && !canceled
+        && (progress.objects_decommissioned > 0 || progress.bytes_decommissioned > 0);
+    Ok(DecommissionStatusProjection {
+        state,
+        completed,
+        failed,
+        canceled,
+        objects_moved: progress.objects_decommissioned,
+        bytes_moved: progress.bytes_decommissioned,
+    })
+}
+
+#[derive(Debug)]
+struct RebalanceStatusProjection {
+    state: &'static str,
+    completed: bool,
+    failed: bool,
+    stopped: bool,
+    participating_pool_ids: Vec<usize>,
+    objects_moved: u64,
+    versions_moved: u64,
+    bytes_moved: u64,
+}
+
+fn project_rebalance_status(
+    status: &RebalanceStatus,
+    runtime_pools: &[AdminPool],
+    terminal_control_requested: bool,
+) -> Result<RebalanceStatusProjection> {
+    ensure!(
+        status.pools.len() == runtime_pools.len(),
+        "rebalance status raw pool count does not match the proven topology"
+    );
+    let status_pool_ids = status
+        .pools
+        .iter()
+        .map(|pool| pool.id)
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        status_pool_ids.len() == status.pools.len()
+            && runtime_pools
+                .iter()
+                .all(|pool| status_pool_ids.contains(&pool.id)),
+        "rebalance status does not cover every proven runtime pool exactly once"
+    );
+    ensure!(
+        status.pools.iter().all(|pool| matches!(
+            pool.status.to_ascii_lowercase().as_str(),
+            "none" | "started" | "stopping" | "stopped" | "completed" | "failed" | "blocked"
+        )),
+        "rebalance status response contains an unknown pool state"
+    );
+    let stopped = status.stopped_at.is_some()
+        || status
+            .pools
+            .iter()
+            .any(|pool| pool.stopping || pool.status.eq_ignore_ascii_case("stopped"))
+        || status.stop_propagation.pending_terminal_reload
+        || terminal_control_requested;
+    let failed = status.pools.iter().any(|pool| {
+        pool.last_error
+            .as_deref()
+            .is_some_and(|error| !error.is_empty())
+            || pool.cleanup_warnings.count > 0
+            || pool
+                .cleanup_warnings
+                .last_message
+                .as_deref()
+                .is_some_and(|warning| !warning.is_empty())
+            || matches!(
+                pool.status.to_ascii_lowercase().as_str(),
+                "failed" | "blocked"
+            )
+    }) || !status.stop_propagation.failed_peers.is_empty()
+        || !status
+            .stop_propagation
+            .terminal_reload_failed_peers
+            .is_empty();
+    let participating = status
+        .pools
+        .iter()
+        .filter(|pool| pool.progress.is_some())
+        .collect::<Vec<_>>();
+    let participating_pool_ids = participating.iter().map(|pool| pool.id).collect::<Vec<_>>();
+    let (objects_moved, versions_moved, bytes_moved) = participating.iter().try_fold(
+        (0_u64, 0_u64, 0_u64),
+        |(objects, versions, bytes), pool| {
+            let progress = pool.progress.as_ref().expect("participants have progress");
+            Ok::<_, anyhow::Error>((
+                objects
+                    .checked_add(progress.objects)
+                    .context("rebalance object progress overflowed")?,
+                versions
+                    .checked_add(progress.versions)
+                    .context("rebalance version progress overflowed")?,
+                bytes
+                    .checked_add(progress.bytes)
+                    .context("rebalance byte progress overflowed")?,
+            ))
+        },
+    )?;
+    let moved = objects_moved > 0 || versions_moved > 0 || bytes_moved > 0;
+    let participants_completed = !participating.is_empty()
+        && participating
+            .iter()
+            .all(|pool| pool.status.eq_ignore_ascii_case("completed"));
+    let nonparticipants_terminal = status
+        .pools
+        .iter()
+        .filter(|pool| pool.progress.is_none())
+        .all(|pool| {
+            matches!(
+                pool.status.to_ascii_lowercase().as_str(),
+                "none" | "completed"
+            )
+        });
+    let completed =
+        moved && participants_completed && nonparticipants_terminal && !failed && !stopped;
+    let state = if failed {
+        "failed"
+    } else if stopped {
+        "stopped"
+    } else if completed {
+        "completed"
+    } else {
+        "started"
+    };
+    Ok(RebalanceStatusProjection {
+        state,
+        completed,
+        failed,
+        stopped,
+        participating_pool_ids,
+        objects_moved,
+        versions_moved,
+        bytes_moved,
+    })
+}
+
+fn parse_status_response<T: for<'de> Deserialize<'de>>(
+    request: &AdminRequestEvidence,
+) -> Result<T> {
+    let response_body = request
+        .response_body
+        .as_deref()
+        .context("admin status GET lacks a captured RustFS response body")?;
+    let response_sha256 = request
+        .response_sha256
+        .as_deref()
+        .context("admin status GET lacks a captured RustFS response digest")?;
+    ensure!(
+        response_sha256 == sha256_hex(response_body.as_bytes()),
+        "admin status GET response digest does not match its captured RustFS body"
+    );
+    serde_json::from_str(response_body).context("decode captured RustFS admin status response")
+}
+
+fn validate_request_timing(
+    requests: &[AdminRequestEvidence],
+    attempt_window: AdminAttemptWindow,
+) -> Result<()> {
+    ensure!(
+        !requests.is_empty(),
+        "admin operation request transcript is empty"
+    );
+    ensure!(
+        requests.iter().all(|request| request.started_at_ms > 0
+            && request.started_at_ms <= request.observed_at_ms
+            && attempt_window.contains(request.started_at_ms)
+            && attempt_window.contains(request.observed_at_ms)),
+        "admin request interval is inverted or falls outside the current attempt window"
+    );
+    ensure!(
+        requests
+            .windows(2)
+            .all(|pair| pair[0].observed_at_ms <= pair[1].started_at_ms),
+        "admin request transcript intervals overlap or are not ordered"
+    );
+    Ok(())
+}
+
+fn validate_start_before_status(
+    requests: &[AdminRequestEvidence],
+    scenario: &str,
+    target_pool_id: Option<usize>,
+) -> Result<(u64, u64, u64)> {
+    let (start_path, status_path) = admin_request_paths(scenario)?;
+    let exact_query = |request: &AdminRequestEvidence| match scenario {
+        ADMIN_DECOMMISSION_SCENARIO => target_pool_id.is_some_and(|target_pool_id| {
+            request.query.len() == 2
+                && request.query.get("pool") == Some(&target_pool_id.to_string())
+                && request
+                    .query
+                    .get("by-id")
+                    .is_some_and(|value| value == "true")
+        }),
+        ADMIN_REBALANCE_SCENARIO => request.query.is_empty(),
+        _ => false,
+    };
+    ensure!(
+        requests
+            .iter()
+            .filter(|request| request.path == start_path || request.path == status_path)
+            .all(|request| {
+                ((request.path == start_path && request.method == "POST")
+                    || (request.path == status_path && request.method == "GET"))
+                    && exact_query(request)
+            }),
+        "admin start/status transcript contains a request for the wrong operation target"
+    );
+    let starts = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.method == "POST" && request.path == start_path)
+        .collect::<Vec<_>>();
+    let [(start_index, start)] = starts.as_slice() else {
+        bail!("admin operation must contain exactly one start request")
+    };
+    let statuses = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.method == "GET" && request.path == status_path)
+        .collect::<Vec<_>>();
+    ensure!(
+        !statuses.is_empty()
+            && statuses.iter().all(|(status_index, status)| {
+                status_index > start_index && status.started_at_ms >= start.observed_at_ms
+            }),
+        "admin status requests must follow the start request"
+    );
+    let last_status = statuses
+        .last()
+        .map(|(_, request)| *request)
+        .expect("non-empty checked above");
+    Ok((
+        start.started_at_ms,
+        start.observed_at_ms,
+        last_status.observed_at_ms,
+    ))
+}
+
+fn admin_request_paths(scenario: &str) -> Result<(&'static str, &'static str)> {
+    match scenario {
+        ADMIN_DECOMMISSION_SCENARIO => Ok((
+            "/rustfs/admin/v3/pools/decommission",
+            "/rustfs/admin/v3/decommission/status",
+        )),
+        ADMIN_REBALANCE_SCENARIO => Ok((
+            "/rustfs/admin/v3/rebalance/start",
+            "/rustfs/admin/v3/rebalance/status",
+        )),
+        other => bail!("unsupported admin operation scenario {other:?}"),
+    }
+}
+
+fn is_cancel_or_stop_request(request: &AdminRequestEvidence) -> bool {
+    request.method == "POST"
+        && matches!(
+            request.path.as_str(),
+            "/rustfs/admin/v3/pools/cancel" | "/rustfs/admin/v3/rebalance/stop"
+        )
+}
+
+fn validate_pool_wire_invariants(label: &str, pools: &[AdminPool]) -> Result<()> {
+    ensure!(!pools.is_empty(), "admin {label} pool snapshot is empty");
+    let ids = pools.iter().map(|pool| pool.id).collect::<BTreeSet<_>>();
+    let expressions = pools
+        .iter()
+        .map(|pool| pool.expression.trim())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        ids.len() == pools.len()
+            && expressions.len() == pools.len()
+            && expressions.iter().all(|expression| !expression.is_empty()),
+        "admin {label} pool snapshot contains duplicate or empty identities"
+    );
+    ensure!(
+        pools.iter().all(|pool| {
+            if pool.total_size == 0 {
+                return false;
+            }
+            let expected_used = pool.used_size as f64 / pool.total_size as f64;
+            pool.current_size
+                .checked_add(pool.used_size)
+                .is_some_and(|total| total == pool.total_size)
+                && pool.used.is_finite()
+                && (0.0..=1.0).contains(&pool.used)
+                && (pool.used - expected_used).abs() <= POOL_USED_RATIO_TOLERANCE
+        }),
+        "admin {label} pool snapshot contains inconsistent total/free/used capacity or used ratio"
+    );
+    Ok(())
 }
 
 pub fn validate_admin_operation_progress(
     operation: &AdminOperationEvidence,
     samples: &[AdminOperationProgressSample],
+    attempt_window: AdminAttemptWindow,
 ) -> Result<()> {
+    attempt_window.validate()?;
     ensure!(!samples.is_empty(), "admin operation progress is empty");
+    validate_request_timing(&operation.requests, attempt_window)?;
+    let (_, start_observed_at_ms, terminal_status_observed_at_ms) = validate_start_before_status(
+        &operation.requests,
+        &operation.scenario,
+        operation.target_pool_id,
+    )?;
+    let (_, status_path) = admin_request_paths(&operation.scenario)?;
+    let status_requests = operation
+        .requests
+        .iter()
+        .filter(|request| request.method == "GET" && request.path == status_path)
+        .collect::<Vec<_>>();
+    let status_request_ids = status_requests
+        .iter()
+        .map(|request| {
+            request
+                .request_id
+                .as_deref()
+                .filter(|request_id| !request_id.trim().is_empty())
+                .context("admin status request lacks a response request ID")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
     ensure!(
-        samples
-            .iter()
-            .all(|sample| sample.operation_id == operation.operation_id),
-        "admin operation progress contains a different operation ID"
+        status_request_ids.len() == status_requests.len(),
+        "admin status requests must have unique response request IDs"
     );
     ensure!(
-        samples
-            .iter()
-            .all(|sample| sample.observed_at_ms > 0 && !sample.state.trim().is_empty()),
-        "admin operation progress lacks observation time or state"
-    );
-    ensure!(
-        samples.windows(2).all(|pair| {
-            pair[0].observed_at_ms <= pair[1].observed_at_ms
-                && optional_counter_nondecreasing(pair[0].objects_moved, pair[1].objects_moved)
-                && optional_counter_nondecreasing(pair[0].versions_moved, pair[1].versions_moved)
-                && optional_counter_nondecreasing(pair[0].bytes_moved, pair[1].bytes_moved)
+        samples.iter().all(|sample| {
+            sample.operation_id == operation.operation_id && sample.attempt == operation.attempt
         }),
-        "admin operation progress timestamps or counters are not monotonic"
+        "admin operation progress identity differs from the operation attempt"
+    );
+    ensure!(
+        samples.iter().all(|sample| {
+            attempt_window.contains(sample.observed_at_ms)
+                && sample.observed_at_ms >= start_observed_at_ms
+        }),
+        "admin operation progress falls outside the current operation/attempt window"
+    );
+    let states = samples
+        .iter()
+        .map(|sample| parse_progress_state(&operation.scenario, sample))
+        .collect::<Result<Vec<_>>>()?;
+    let mut used_status_request_ids = BTreeSet::new();
+    for (index, (sample, state)) in samples.iter().zip(&states).enumerate() {
+        let source = status_requests
+            .get(index)
+            .context("admin progress sample count exceeds the status GET response set")?;
+        ensure!(
+            !sample.status_request_id.trim().is_empty()
+                && used_status_request_ids.insert(sample.status_request_id.as_str()),
+            "admin progress sample lacks a unique status request ID"
+        );
+        let matches = status_requests
+            .iter()
+            .filter(|request| {
+                request.request_id.as_deref() == Some(sample.status_request_id.as_str())
+                    && (200..300).contains(&request.status)
+                    && request.observed_at_ms == sample.observed_at_ms
+            })
+            .count();
+        ensure!(
+            matches == 1
+                && source.request_id.as_deref() == Some(sample.status_request_id.as_str())
+                && source.observed_at_ms == sample.observed_at_ms,
+            "admin progress sample is not sequence-bound to one successful status GET response"
+        );
+        match operation.scenario.as_str() {
+            ADMIN_DECOMMISSION_SCENARIO => {
+                let status = parse_status_response::<DecommissionPoolStatus>(source)?;
+                let projection = project_decommission_status(
+                    &status,
+                    operation
+                        .target_pool_id
+                        .context("decommission progress lacks a target pool")?,
+                    operation
+                        .target_pool_expression
+                        .as_deref()
+                        .context("decommission progress lacks a target expression")?,
+                    &operation.operation_id,
+                )?;
+                ensure!(
+                    sample.state.eq_ignore_ascii_case(&projection.state)
+                        && sample.completed == projection.completed
+                        && sample.failed == projection.failed
+                        && sample.canceled_or_stopped == projection.canceled
+                        && sample.objects_moved == Some(projection.objects_moved)
+                        && sample.versions_moved.is_none()
+                        && sample.bytes_moved == Some(projection.bytes_moved),
+                    "decommission progress sample is not derived from its RustFS status response"
+                );
+            }
+            ADMIN_REBALANCE_SCENARIO => {
+                let status = parse_status_response::<RebalanceStatus>(source)?;
+                let projection =
+                    project_rebalance_status(&status, &operation.pools_before.pools, false)?;
+                ensure!(
+                    status.id == operation.operation_id
+                        && sample.state.eq_ignore_ascii_case(projection.state)
+                        && sample.completed == projection.completed
+                        && sample.failed == projection.failed
+                        && sample.canceled_or_stopped == projection.stopped
+                        && sample.objects_moved == Some(projection.objects_moved)
+                        && sample.versions_moved == Some(projection.versions_moved)
+                        && sample.bytes_moved == Some(projection.bytes_moved),
+                    "rebalance progress sample is not derived from its RustFS status response"
+                );
+            }
+            other => bail!("unsupported admin operation scenario {other:?}"),
+        }
+        ensure!(
+            !state.terminal || index + 1 == samples.len(),
+            "admin terminal progress sample must be the final sample"
+        );
+    }
+    ensure!(
+        used_status_request_ids == status_request_ids,
+        "admin progress samples do not cover the exact status GET response set"
     );
     ensure!(
         samples
-            .iter()
-            .all(|sample| !sample.failed && !sample.canceled_or_stopped),
-        "failed/canceled/stopped admin progress cannot pass"
+            .windows(2)
+            .zip(states.windows(2))
+            .all(|(pair, state_pair)| {
+                pair[0].observed_at_ms <= pair[1].observed_at_ms
+                    && state_pair[0].rank <= state_pair[1].rank
+                    && optional_counter_nondecreasing(pair[0].objects_moved, pair[1].objects_moved)
+                    && optional_counter_nondecreasing(
+                        pair[0].versions_moved,
+                        pair[1].versions_moved,
+                    )
+                    && optional_counter_nondecreasing(pair[0].bytes_moved, pair[1].bytes_moved)
+            }),
+        "admin operation progress state, timestamps, or counters regressed"
     );
     let terminal = samples.last().expect("non-empty checked above");
+    let terminal_state = states.last().expect("non-empty checked above");
     ensure!(
-        terminal.completed
+        terminal_state.terminal
+            && terminal.observed_at_ms == terminal_status_observed_at_ms
             && terminal
                 .state
-                .eq_ignore_ascii_case(&operation.terminal_state),
-        "admin operation progress does not end in the claimed terminal state"
+                .eq_ignore_ascii_case(&operation.terminal_state)
+            && terminal.completed == operation.completed
+            && terminal.failed == operation.failed
+            && terminal.canceled_or_stopped == operation.canceled_or_stopped,
+        "admin operation terminal progress does not match the terminal status observation"
     );
+    ensure!(
+        terminal.objects_moved == operation.objects_moved
+            && terminal.versions_moved == operation.versions_moved
+            && terminal.bytes_moved == operation.bytes_moved,
+        "admin operation terminal progress counters do not match operation evidence"
+    );
+    if operation.scenario == ADMIN_REBALANCE_SCENARIO {
+        ensure!(
+            terminal.objects_moved.is_some_and(|value| value > 0)
+                || terminal.versions_moved.is_some_and(|value| value > 0)
+                || terminal.bytes_moved.is_some_and(|value| value > 0),
+            "rebalance terminal progress lacks a positive movement signal"
+        );
+    }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValidatedProgressState {
+    rank: u8,
+    terminal: bool,
+}
+
+fn parse_progress_state(
+    scenario: &str,
+    sample: &AdminOperationProgressSample,
+) -> Result<ValidatedProgressState> {
+    ensure!(
+        !sample.failed && !sample.canceled_or_stopped,
+        "failed/canceled/stopped admin progress cannot pass"
+    );
+    let state = sample.state.to_ascii_lowercase();
+    let parsed = match (scenario, state.as_str()) {
+        (ADMIN_DECOMMISSION_SCENARIO, "queued") => ValidatedProgressState {
+            rank: 0,
+            terminal: false,
+        },
+        (ADMIN_DECOMMISSION_SCENARIO, "running") => ValidatedProgressState {
+            rank: 1,
+            terminal: false,
+        },
+        (ADMIN_DECOMMISSION_SCENARIO, "complete") => ValidatedProgressState {
+            rank: 2,
+            terminal: true,
+        },
+        (ADMIN_REBALANCE_SCENARIO, "started") => ValidatedProgressState {
+            rank: 0,
+            terminal: false,
+        },
+        (ADMIN_REBALANCE_SCENARIO, "completed") => ValidatedProgressState {
+            rank: 1,
+            terminal: true,
+        },
+        (ADMIN_DECOMMISSION_SCENARIO | ADMIN_REBALANCE_SCENARIO, _) => {
+            bail!(
+                "unknown admin progress state {:?} for {scenario}",
+                sample.state
+            )
+        }
+        _ => bail!("unsupported admin operation scenario {scenario:?}"),
+    };
+    ensure!(
+        sample.completed == parsed.terminal,
+        "admin progress completion flag does not match its state"
+    );
+    match scenario {
+        ADMIN_DECOMMISSION_SCENARIO => ensure!(
+            sample.versions_moved.is_none(),
+            "decommission progress must not report a rebalance version counter"
+        ),
+        ADMIN_REBALANCE_SCENARIO => ensure!(
+            sample.objects_moved.is_some()
+                && sample.versions_moved.is_some()
+                && sample.bytes_moved.is_some(),
+            "rebalance progress requires complete movement counters"
+        ),
+        _ => unreachable!("scenario checked above"),
+    }
+    Ok(parsed)
 }
 
 fn optional_counter_nondecreasing(before: Option<u64>, after: Option<u64>) -> bool {
@@ -987,10 +2301,18 @@ fn optional_counter_nondecreasing(before: Option<u64>, after: Option<u64>) -> bo
 
 pub fn validate_admin_topology_artifacts(
     scenario: &str,
+    expected_attempt: &AdminAttemptIdentity,
+    attempt_window: AdminAttemptWindow,
     proof: &AdminTopologyProof,
     operation: &AdminOperationEvidence,
 ) -> Result<()> {
+    attempt_window.validate()?;
     let _ = AdminTopologyPlan::for_scenario(scenario)?;
+    validate_attempt_identity(expected_attempt)?;
+    ensure!(
+        expected_attempt.case_name == expected_case_name(scenario)?,
+        "expected admin attempt caseName does not match the scenario"
+    );
     ensure!(
         proof.scenario == scenario,
         "admin topology proof scenario mismatch"
@@ -999,12 +2321,14 @@ pub fn validate_admin_topology_artifacts(
         operation.scenario == scenario,
         "admin operation evidence scenario mismatch"
     );
-    proof.require_satisfied()?;
-    operation.require_success()?;
     ensure!(
-        operation.pools_before == proof.runtime_pools,
-        "admin operation before topology does not match the preflight proof"
+        proof.attempt == *expected_attempt && operation.attempt == *expected_attempt,
+        "admin topology artifacts do not belong to the current run/case/Tenant attempt"
     );
+    proof.require_satisfied()?;
+    operation.require_success(attempt_window)?;
+    validate_pre_start_snapshot(proof, &operation.pools_before, &operation.requests)?;
+    validate_post_operation_snapshot(proof, &operation.pools_after, &operation.requests)?;
     if scenario == ADMIN_DECOMMISSION_SCENARIO {
         ensure!(
             operation.target_pool_id == proof.target_pool_id,
@@ -1020,11 +2344,331 @@ pub fn validate_admin_topology_artifacts(
 
 #[cfg(test)]
 mod tests {
+    use axum::{Router, routing::get};
+
     use super::*;
+
+    const TEST_RUN_ID: &str = "run-admin-1";
+    const TEST_WORKLOAD_MAX_BYTES: u64 = 100;
+
+    fn attempt_window() -> AdminAttemptWindow {
+        AdminAttemptWindow {
+            started_at_ms: 50,
+            evaluated_at_ms: 300,
+        }
+    }
+
+    fn case_name(scenario: &str) -> &'static str {
+        expected_case_name(scenario).unwrap()
+    }
+
+    fn context(scenario: &str) -> AdminTopologyBuildContext {
+        AdminTopologyBuildContext::new(TEST_RUN_ID, case_name(scenario), TEST_WORKLOAD_MAX_BYTES)
+    }
+
+    fn attempt(scenario: &str) -> AdminAttemptIdentity {
+        AdminAttemptIdentity {
+            run_id: TEST_RUN_ID.to_string(),
+            case_name: case_name(scenario).to_string(),
+            tenant_uid: "tenant-uid".to_string(),
+        }
+    }
+
+    fn pool_expression(pool_name: &str) -> String {
+        format!(
+            "http://fault-tenant-{pool_name}-{{0...3}}.fault-tenant-hl.fault-ns.svc.cluster.local:9000/data/rustfs{{0...0}}"
+        )
+    }
+
+    fn with_json_response<T: Serialize>(
+        mut request: AdminRequestEvidence,
+        value: &T,
+    ) -> AdminRequestEvidence {
+        let body = serde_json::to_string(value).expect("serialize RustFS admin fixture");
+        request.response_sha256 = Some(sha256_hex(body.as_bytes()));
+        request.response_body = Some(body);
+        request
+    }
+
+    fn rebalance_requests() -> Vec<AdminRequestEvidence> {
+        let mut requests = vec![
+            AdminRequestEvidence {
+                method: "POST".to_string(),
+                path: format!("{ADMIN_PREFIX}/rebalance/start"),
+                query: BTreeMap::new(),
+                status: 200,
+                started_at_ms: 95,
+                observed_at_ms: 100,
+                request_id: Some("rebalance-start-request".to_string()),
+                response_sha256: None,
+                response_body: None,
+            },
+            AdminRequestEvidence {
+                method: "GET".to_string(),
+                path: format!("{ADMIN_PREFIX}/rebalance/status"),
+                query: BTreeMap::new(),
+                status: 200,
+                started_at_ms: 195,
+                observed_at_ms: 200,
+                request_id: Some("rebalance-status-request".to_string()),
+                response_sha256: None,
+                response_body: None,
+            },
+        ];
+        requests[1] = with_json_response(
+            requests[1].clone(),
+            &completed_rebalance_status("rebalance-1"),
+        );
+        requests
+    }
+
+    fn rebalance_progress_requests() -> Vec<AdminRequestEvidence> {
+        let mut requests = rebalance_requests();
+        requests[1].request_id = Some("rebalance-status-request-2".to_string());
+        requests.insert(
+            1,
+            AdminRequestEvidence {
+                method: "GET".to_string(),
+                path: format!("{ADMIN_PREFIX}/rebalance/status"),
+                query: BTreeMap::new(),
+                status: 200,
+                started_at_ms: 110,
+                observed_at_ms: 120,
+                request_id: Some("rebalance-status-request-1".to_string()),
+                response_sha256: None,
+                response_body: None,
+            },
+        );
+        let mut started = completed_rebalance_status("rebalance-123");
+        started.pools[0].status = "Started".to_string();
+        started.pools[0].progress = Some(RebalanceProgress {
+            objects: 1,
+            versions: 1,
+            bytes: 10,
+            remaining_buckets: 1,
+        });
+        let mut completed = completed_rebalance_status("rebalance-123");
+        completed.pools[0].progress = Some(RebalanceProgress {
+            objects: 2,
+            versions: 2,
+            bytes: 20,
+            remaining_buckets: 0,
+        });
+        requests[1] = with_json_response(requests[1].clone(), &started);
+        requests[2] = with_json_response(requests[2].clone(), &completed);
+        requests
+    }
+
+    fn decommission_requests(pool_id: usize) -> Vec<AdminRequestEvidence> {
+        let pool_id = pool_id.to_string();
+        let mut requests = vec![
+            AdminRequestEvidence {
+                method: "POST".to_string(),
+                path: format!("{ADMIN_PREFIX}/pools/decommission"),
+                query: BTreeMap::from([
+                    ("by-id".to_string(), "true".to_string()),
+                    ("pool".to_string(), pool_id.clone()),
+                ]),
+                status: 200,
+                started_at_ms: 95,
+                observed_at_ms: 100,
+                request_id: Some("decommission-start-request".to_string()),
+                response_sha256: None,
+                response_body: None,
+            },
+            AdminRequestEvidence {
+                method: "GET".to_string(),
+                path: format!("{ADMIN_PREFIX}/decommission/status"),
+                query: BTreeMap::from([
+                    ("by-id".to_string(), "true".to_string()),
+                    ("pool".to_string(), pool_id.clone()),
+                ]),
+                status: 200,
+                started_at_ms: 195,
+                observed_at_ms: 200,
+                request_id: Some("decommission-status-request".to_string()),
+                response_sha256: None,
+                response_body: None,
+            },
+        ];
+        let status = DecommissionPoolStatus {
+            id: pool_id.parse().expect("pool id"),
+            expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
+            status: "complete".to_string(),
+            pool_status: "decommissioned".to_string(),
+            decommission: Some(DecommissionProgress {
+                start_time: Some("2026-09-05T00:00:00Z".to_string()),
+                complete: true,
+                objects_decommissioned: 1,
+                bytes_decommissioned: 200,
+                ..Default::default()
+            }),
+        };
+        requests[1] = with_json_response(requests[1].clone(), &status);
+        requests
+    }
+
+    fn decommission_progress_requests(pool_id: usize) -> Vec<AdminRequestEvidence> {
+        let mut requests = decommission_requests(pool_id);
+        requests[1].request_id = Some("decommission-status-request-3".to_string());
+        let pool_id = pool_id.to_string();
+        for (index, started_at_ms, observed_at_ms) in
+            [(1, 105, 110), (2, 140, 150)].into_iter().rev()
+        {
+            requests.insert(
+                1,
+                AdminRequestEvidence {
+                    method: "GET".to_string(),
+                    path: format!("{ADMIN_PREFIX}/decommission/status"),
+                    query: BTreeMap::from([
+                        ("by-id".to_string(), "true".to_string()),
+                        ("pool".to_string(), pool_id.clone()),
+                    ]),
+                    status: 200,
+                    started_at_ms,
+                    observed_at_ms,
+                    request_id: Some(format!("decommission-status-request-{index}")),
+                    response_sha256: None,
+                    response_body: None,
+                },
+            );
+        }
+        let statuses = [
+            DecommissionPoolStatus {
+                id: pool_id.parse().expect("pool id"),
+                expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
+                status: "queued".to_string(),
+                pool_status: "decommissioning".to_string(),
+                decommission: Some(DecommissionProgress {
+                    start_time: Some("2026-09-05T00:00:00Z".to_string()),
+                    queued: true,
+                    ..Default::default()
+                }),
+            },
+            DecommissionPoolStatus {
+                id: pool_id.parse().expect("pool id"),
+                expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
+                status: "running".to_string(),
+                pool_status: "decommissioning".to_string(),
+                decommission: Some(DecommissionProgress {
+                    start_time: Some("2026-09-05T00:00:00Z".to_string()),
+                    objects_decommissioned: 1,
+                    bytes_decommissioned: 100,
+                    ..Default::default()
+                }),
+            },
+            DecommissionPoolStatus {
+                id: pool_id.parse().expect("pool id"),
+                expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
+                status: "complete".to_string(),
+                pool_status: "decommissioned".to_string(),
+                decommission: Some(DecommissionProgress {
+                    start_time: Some("2026-09-05T00:00:00Z".to_string()),
+                    complete: true,
+                    objects_decommissioned: 2,
+                    bytes_decommissioned: 200,
+                    ..Default::default()
+                }),
+            },
+        ];
+        for (request, status) in requests.iter_mut().skip(1).zip(&statuses) {
+            *request = with_json_response(request.clone(), status);
+        }
+        requests
+    }
+
+    fn pre_start_snapshot(scenario: &str, pools: Vec<AdminPool>) -> AdminPoolSnapshot {
+        pool_snapshot(scenario, pools, 90)
+    }
+
+    fn post_operation_snapshot(scenario: &str, pools: Vec<AdminPool>) -> AdminPoolSnapshot {
+        pool_snapshot(scenario, pools, 210)
+    }
+
+    fn pool_snapshot(
+        scenario: &str,
+        pools: Vec<AdminPool>,
+        observed_at_ms: u64,
+    ) -> AdminPoolSnapshot {
+        let (tenant_started_at_ms, tenant_observed_at_ms, list_started_at_ms) =
+            if observed_at_ms < 200 {
+                (
+                    observed_at_ms.saturating_sub(10),
+                    observed_at_ms.saturating_sub(5),
+                    observed_at_ms.saturating_sub(4),
+                )
+            } else {
+                (
+                    observed_at_ms.saturating_sub(5),
+                    observed_at_ms.saturating_sub(4),
+                    observed_at_ms.saturating_sub(3),
+                )
+            };
+        AdminPoolSnapshot {
+            attempt: attempt(scenario),
+            tenant_get: KubernetesTenantGetEvidence {
+                namespace: "fault-ns".to_string(),
+                name: "fault-tenant".to_string(),
+                uid: "tenant-uid".to_string(),
+                resource_version: "tenant-rv-1".to_string(),
+                started_at_ms: tenant_started_at_ms,
+                observed_at_ms: tenant_observed_at_ms,
+            },
+            observed_at_ms,
+            request: AdminRequestEvidence {
+                method: "GET".to_string(),
+                path: format!("{ADMIN_PREFIX}/pools/list"),
+                query: BTreeMap::new(),
+                status: 200,
+                started_at_ms: list_started_at_ms,
+                observed_at_ms,
+                request_id: None,
+                response_sha256: None,
+                response_body: None,
+            },
+            pools,
+        }
+    }
+
+    fn completed_rebalance_status(id: &str) -> RebalanceStatus {
+        RebalanceStatus {
+            id: id.to_string(),
+            pools: vec![
+                RebalancePoolStatus {
+                    id: 0,
+                    status: "Completed".to_string(),
+                    stopping: false,
+                    last_error: None,
+                    cleanup_warnings: RebalanceCleanupWarnings::default(),
+                    progress: Some(RebalanceProgress {
+                        objects: 2,
+                        versions: 3,
+                        bytes: 128,
+                        remaining_buckets: 0,
+                    }),
+                },
+                RebalancePoolStatus {
+                    id: 1,
+                    status: "None".to_string(),
+                    stopping: false,
+                    last_error: None,
+                    cleanup_warnings: RebalanceCleanupWarnings::default(),
+                    progress: None,
+                },
+            ],
+            stopped_at: None,
+            stop_propagation: RebalanceStopPropagationStatus::default(),
+        }
+    }
 
     fn tenant() -> Value {
         serde_json::json!({
-            "metadata": {"name": "fault-tenant", "uid": "tenant-uid", "namespace": "fault-ns"},
+            "metadata": {
+                "name": "fault-tenant",
+                "uid": "tenant-uid",
+                "namespace": "fault-ns",
+                "resourceVersion": "tenant-rv-1"
+            },
             "spec": {"pools": [
                 {"name": "primary", "servers": 4, "persistence": {"volumesPerServer": 1}},
                 {"name": "decommission-target", "servers": 4, "persistence": {"volumesPerServer": 1}}
@@ -1036,7 +2680,7 @@ mod tests {
         vec![
             AdminPool {
                 id: 0,
-                expression: "/data/pool0/disk{1...4}".to_string(),
+                expression: pool_expression("primary"),
                 status: "active".to_string(),
                 decommission_status: "none".to_string(),
                 rebalance_status: "none".to_string(),
@@ -1048,7 +2692,7 @@ mod tests {
             },
             AdminPool {
                 id: 1,
-                expression: "/data/pool1/disk{1...4}".to_string(),
+                expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
                 status: "active".to_string(),
                 decommission_status: "none".to_string(),
                 rebalance_status: "none".to_string(),
@@ -1061,19 +2705,427 @@ mod tests {
         ]
     }
 
+    #[tokio::test]
+    async fn adapter_captures_rustfs_admin_x_request_id() {
+        let app = Router::new().route(
+            "/rustfs/admin/v3/pools/list",
+            get(|| async { ([("x-request-id", "rustfs-admin-request-1")], "[]") }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("mock listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("mock address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+        let adapter = RustfsAdminTopologyAdapter::new(&endpoint, "us-east-1", "access", "secret")
+            .expect("adapter");
+
+        let response = adapter.list_pools().await.expect("pool list");
+        assert_eq!(
+            response.request.request_id.as_deref(),
+            Some("rustfs-admin-request-1")
+        );
+        assert_eq!(response.request.response_body.as_deref(), Some("[]"));
+        server.abort();
+    }
+
+    #[test]
+    fn pool_snapshot_derives_tenant_uid_from_fresh_kubernetes_get() {
+        let mut current_tenant = tenant();
+        current_tenant["metadata"]["uid"] = Value::String("fresh-tenant-uid".to_string());
+        current_tenant["metadata"]["resourceVersion"] = Value::String("tenant-rv-2".to_string());
+        let snapshot = AdminPoolSnapshot::from_list(
+            TEST_RUN_ID,
+            case_name(ADMIN_REBALANCE_SCENARIO),
+            &current_tenant,
+            75,
+            80,
+            AdminCall {
+                value: pools(),
+                request: AdminRequestEvidence {
+                    method: "GET".to_string(),
+                    path: format!("{ADMIN_PREFIX}/pools/list"),
+                    query: BTreeMap::new(),
+                    status: 200,
+                    started_at_ms: 85,
+                    observed_at_ms: 90,
+                    request_id: None,
+                    response_sha256: None,
+                    response_body: None,
+                },
+            },
+        )
+        .expect("snapshot derives Tenant identity from the Kubernetes resource");
+
+        assert_eq!(snapshot.attempt.tenant_uid, "fresh-tenant-uid");
+        assert_eq!(snapshot.tenant_get.resource_version, "tenant-rv-2");
+        assert_eq!(snapshot.tenant_get.observed_at_ms, 80);
+
+        assert!(
+            AdminPoolSnapshot::from_list(
+                TEST_RUN_ID,
+                case_name(ADMIN_REBALANCE_SCENARIO),
+                &current_tenant,
+                80,
+                85,
+                AdminCall {
+                    value: pools(),
+                    request: AdminRequestEvidence {
+                        method: "GET".to_string(),
+                        path: format!("{ADMIN_PREFIX}/pools/list"),
+                        query: BTreeMap::new(),
+                        status: 200,
+                        started_at_ms: 85,
+                        observed_at_ms: 90,
+                        request_id: None,
+                        response_sha256: None,
+                        response_body: None,
+                    },
+                },
+            )
+            .is_err(),
+            "Tenant GET completion equal to pools/list start is ambiguous and must fail closed"
+        );
+    }
+
     #[test]
     fn decommission_preflight_binds_exact_pool_and_capacity() {
         let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
-        let proof =
-            AdminTopologyProof::build(&plan, ADMIN_DECOMMISSION_SCENARIO, &tenant(), pools())
-                .expect("proof");
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_DECOMMISSION_SCENARIO),
+        )
+        .expect("proof");
         assert_eq!(proof.target_pool_id, Some(1));
         assert_eq!(
             proof.target_pool_expression.as_deref(),
-            Some("/data/pool1/disk{1...4}")
+            Some(pool_expression(DECOMMISSION_TARGET_POOL_NAME).as_str())
         );
         assert_eq!(proof.remaining_free_bytes, 1_500);
         assert_eq!(proof.target_used_bytes, 200);
+        assert_eq!(proof.required_remaining_free_bytes, 360);
+    }
+
+    #[test]
+    fn preflight_maps_named_pools_by_runtime_cmdline_not_spec_order() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
+        let mut reversed = tenant();
+        reversed["spec"]["pools"].as_array_mut().unwrap().reverse();
+
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &reversed,
+            pools(),
+            &context(ADMIN_DECOMMISSION_SCENARIO),
+        )
+        .expect("name/cmdline binding");
+
+        assert_eq!(proof.target_pool_id, Some(1));
+        assert_eq!(proof.tenant_pools[0].name, DECOMMISSION_TARGET_POOL_NAME);
+        assert_eq!(proof.tenant_pools[0].runtime_pool_id, 1);
+
+        let mut mismatched = pools();
+        mismatched[1].expression = "/data/unowned".to_string();
+        assert!(
+            AdminTopologyProof::build(
+                &plan,
+                ADMIN_DECOMMISSION_SCENARIO,
+                &tenant(),
+                mismatched,
+                &context(ADMIN_DECOMMISSION_SCENARIO),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn decommission_accepts_runtime_target_pool_zero() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
+        let mut runtime = pools();
+        runtime[0].id = 1;
+        runtime[1].id = 0;
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &tenant(),
+            runtime,
+            &context(ADMIN_DECOMMISSION_SCENARIO),
+        )
+        .expect("RustFS may assign the named target runtime pool ID zero");
+        assert_eq!(proof.target_pool_id, Some(0));
+
+        let status = DecommissionPoolStatus {
+            id: 0,
+            expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
+            status: "complete".to_string(),
+            pool_status: "decommissioned".to_string(),
+            decommission: Some(DecommissionProgress {
+                start_time: Some("2026-09-05T00:00:00Z".to_string()),
+                complete: true,
+                objects_decommissioned: 1,
+                bytes_decommissioned: 200,
+                ..Default::default()
+            }),
+        };
+        let survivor = proof
+            .runtime_pools
+            .iter()
+            .find(|pool| pool.id == 1)
+            .cloned()
+            .unwrap();
+        let operation = AdminOperationEvidence::from_decommission(
+            &proof,
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone()),
+            status,
+            decommission_requests(0),
+            post_operation_snapshot(ADMIN_DECOMMISSION_SCENARIO, vec![survivor]),
+        )
+        .expect("operation evidence");
+
+        validate_admin_topology_artifacts(
+            ADMIN_DECOMMISSION_SCENARIO,
+            &attempt(ADMIN_DECOMMISSION_SCENARIO),
+            attempt_window(),
+            &proof,
+            &operation,
+        )
+        .expect("runtime target pool zero is valid when cmdline-bound");
+    }
+
+    #[test]
+    fn decommission_capacity_enforces_130_percent_plus_workload_boundary() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
+        let mut exact = pools();
+        exact[0].total_size = 730;
+        exact[0].current_size = 230;
+        exact[0].used_size = 500;
+        exact[0].used = 500.0 / 730.0;
+        exact[1].current_size = 900;
+        exact[1].used_size = 100;
+        exact[1].used = 0.1;
+        AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &tenant(),
+            exact.clone(),
+            &context(ADMIN_DECOMMISSION_SCENARIO),
+        )
+        .expect("130 percent guard plus 100-byte workload");
+
+        exact[0].current_size = 229;
+        exact[0].used_size = 501;
+        exact[0].used = 501.0 / 730.0;
+        assert!(
+            AdminTopologyProof::build(
+                &plan,
+                ADMIN_DECOMMISSION_SCENARIO,
+                &tenant(),
+                exact,
+                &context(ADMIN_DECOMMISSION_SCENARIO),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pre_start_snapshot_rejects_stale_or_drifted_topology() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_DECOMMISSION_SCENARIO),
+        )
+        .unwrap();
+        let status = DecommissionPoolStatus {
+            id: 1,
+            expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
+            status: "complete".to_string(),
+            pool_status: "decommissioned".to_string(),
+            decommission: Some(DecommissionProgress {
+                start_time: Some("2026-09-05T00:00:00Z".to_string()),
+                complete: true,
+                objects_decommissioned: 1,
+                bytes_decommissioned: 200,
+                ..Default::default()
+            }),
+        };
+
+        let mut stale =
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone());
+        stale.observed_at_ms = 1;
+        stale.request.observed_at_ms = 1;
+        let mut late_requests = decommission_requests(1);
+        late_requests[0].observed_at_ms = ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS + 2;
+        late_requests[1].observed_at_ms = ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS + 3;
+        assert!(
+            AdminOperationEvidence::from_decommission(
+                &proof,
+                stale,
+                status.clone(),
+                late_requests,
+                post_operation_snapshot(
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    vec![proof.runtime_pools[0].clone()],
+                ),
+            )
+            .is_err()
+        );
+
+        let mut wrong_attempt =
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone());
+        wrong_attempt.attempt.tenant_uid = "old-tenant-uid".to_string();
+        assert!(
+            AdminOperationEvidence::from_decommission(
+                &proof,
+                wrong_attempt,
+                status.clone(),
+                decommission_requests(1),
+                post_operation_snapshot(
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    vec![proof.runtime_pools[0].clone()],
+                ),
+            )
+            .is_err()
+        );
+
+        for tenant_drift in ["uid", "name", "resource-version", "at-start"] {
+            let mut drifted =
+                pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone());
+            match tenant_drift {
+                "uid" => drifted.tenant_get.uid = "replacement-tenant-uid".to_string(),
+                "name" => drifted.tenant_get.name = "replacement-tenant".to_string(),
+                "resource-version" => drifted.tenant_get.resource_version.clear(),
+                "at-start" => drifted.tenant_get.observed_at_ms = 100,
+                _ => unreachable!(),
+            }
+            assert!(
+                AdminOperationEvidence::from_decommission(
+                    &proof,
+                    drifted,
+                    status.clone(),
+                    decommission_requests(1),
+                    post_operation_snapshot(
+                        ADMIN_DECOMMISSION_SCENARIO,
+                        vec![proof.runtime_pools[0].clone()],
+                    ),
+                )
+                .is_err(),
+                "pre-start Tenant GET drift {tenant_drift:?} must fail closed"
+            );
+        }
+
+        let mut unhealthy =
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone());
+        unhealthy.pools[0].rebalance_status = "started".to_string();
+        assert!(
+            AdminOperationEvidence::from_decommission(
+                &proof,
+                unhealthy,
+                status.clone(),
+                decommission_requests(1),
+                post_operation_snapshot(
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    vec![proof.runtime_pools[0].clone()],
+                ),
+            )
+            .is_err()
+        );
+
+        let mut list_overlaps_start =
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone());
+        list_overlaps_start.observed_at_ms = 95;
+        list_overlaps_start.request.observed_at_ms = 95;
+        assert!(
+            AdminOperationEvidence::from_decommission(
+                &proof,
+                list_overlaps_start,
+                status.clone(),
+                decommission_requests(1),
+                post_operation_snapshot(
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    vec![proof.runtime_pools[0].clone()],
+                ),
+            )
+            .is_err(),
+            "the pre-start pools/list response must complete before admin start begins"
+        );
+
+        let mut tenant_get_equals_list_start =
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone());
+        tenant_get_equals_list_start.tenant_get.observed_at_ms =
+            tenant_get_equals_list_start.request.started_at_ms;
+        assert!(
+            AdminOperationEvidence::from_decommission(
+                &proof,
+                tenant_get_equals_list_start,
+                status.clone(),
+                decommission_requests(1),
+                post_operation_snapshot(
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    vec![proof.runtime_pools[0].clone()],
+                ),
+            )
+            .is_err(),
+            "pre-start Tenant GET must complete strictly before pools/list starts"
+        );
+
+        let mut insufficient =
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone());
+        insufficient.pools[0].current_size = 100;
+        insufficient.pools[0].used_size = 1_900;
+        insufficient.pools[0].used = 0.95;
+        assert!(
+            AdminOperationEvidence::from_decommission(
+                &proof,
+                insufficient,
+                status.clone(),
+                decommission_requests(1),
+                post_operation_snapshot(
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    vec![proof.runtime_pools[0].clone()],
+                ),
+            )
+            .is_err()
+        );
+
+        let mut replaced =
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone());
+        replaced.pools[0].expression = "/replacement-pool".to_string();
+        assert!(
+            AdminOperationEvidence::from_decommission(
+                &proof,
+                replaced,
+                status.clone(),
+                decommission_requests(1),
+                post_operation_snapshot(
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    vec![proof.runtime_pools[0].clone()],
+                ),
+            )
+            .is_err()
+        );
+
+        assert!(
+            AdminOperationEvidence::from_decommission(
+                &proof,
+                pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone()),
+                status,
+                decommission_requests(1),
+                pre_start_snapshot(
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    vec![proof.runtime_pools[0].clone()],
+                ),
+            )
+            .is_err(),
+            "a copied pre-start list cannot prove post-operation pool health"
+        );
     }
 
     #[test]
@@ -1086,33 +3138,107 @@ mod tests {
                 &plan,
                 ADMIN_DECOMMISSION_SCENARIO,
                 &single,
-                vec![pools()[0].clone()]
+                vec![pools()[0].clone()],
+                &context(ADMIN_DECOMMISSION_SCENARIO),
             )
             .is_err()
         );
 
+        for (field, value) in [
+            ("decommission", "completed"),
+            ("decommission", "idle"),
+            ("rebalance", "complete"),
+            ("rebalance", "idle"),
+        ] {
+            let mut invalid_lifecycle = pools();
+            if field == "decommission" {
+                invalid_lifecycle[0].decommission_status = value.to_string();
+            } else {
+                invalid_lifecycle[0].rebalance_status = value.to_string();
+            }
+            assert!(
+                AdminTopologyProof::build(
+                    &plan,
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    &tenant(),
+                    invalid_lifecycle,
+                    &context(ADMIN_DECOMMISSION_SCENARIO),
+                )
+                .is_err(),
+                "cross-field or unknown {field} state {value:?} must fail closed"
+            );
+        }
+
         let mut insufficient = pools();
         insufficient[0].current_size = 100;
+        insufficient[0].used_size = 1_900;
+        insufficient[0].used = 0.95;
         assert!(
-            AdminTopologyProof::build(&plan, ADMIN_DECOMMISSION_SCENARIO, &tenant(), insufficient)
-                .is_err()
+            AdminTopologyProof::build(
+                &plan,
+                ADMIN_DECOMMISSION_SCENARIO,
+                &tenant(),
+                insufficient,
+                &context(ADMIN_DECOMMISSION_SCENARIO),
+            )
+            .is_err()
+        );
+
+        let mut inconsistent_sizes = pools();
+        inconsistent_sizes[0].used_size = 499;
+        assert!(
+            AdminTopologyProof::build(
+                &plan,
+                ADMIN_DECOMMISSION_SCENARIO,
+                &tenant(),
+                inconsistent_sizes,
+                &context(ADMIN_DECOMMISSION_SCENARIO),
+            )
+            .is_err(),
+            "individually bounded capacities with an inconsistent total must fail closed"
+        );
+
+        let mut inconsistent_ratio = pools();
+        inconsistent_ratio[0].used = 0.4;
+        assert!(
+            AdminTopologyProof::build(
+                &plan,
+                ADMIN_DECOMMISSION_SCENARIO,
+                &tenant(),
+                inconsistent_ratio,
+                &context(ADMIN_DECOMMISSION_SCENARIO),
+            )
+            .is_err(),
+            "a wire used ratio inconsistent with usedSize/totalSize must fail closed"
         );
 
         let mut active = pools();
         active[0].rebalance_status = "Started".to_string();
         assert!(
-            AdminTopologyProof::build(&plan, ADMIN_DECOMMISSION_SCENARIO, &tenant(), active)
-                .is_err()
+            AdminTopologyProof::build(
+                &plan,
+                ADMIN_DECOMMISSION_SCENARIO,
+                &tenant(),
+                active,
+                &context(ADMIN_DECOMMISSION_SCENARIO),
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn artifact_validation_rejects_cancel_and_target_drift() {
         let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
-        let proof =
-            AdminTopologyProof::build(&plan, ADMIN_DECOMMISSION_SCENARIO, &tenant(), pools())
-                .unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_DECOMMISSION_SCENARIO),
+        )
+        .unwrap();
         let mut operation = AdminOperationEvidence {
+            attempt: attempt(ADMIN_DECOMMISSION_SCENARIO),
             scenario: ADMIN_DECOMMISSION_SCENARIO.to_string(),
             operation_id: "decommission:1:2026-09-05T00:00:00Z".to_string(),
             target_pool_id: Some(1),
@@ -1121,58 +3247,239 @@ mod tests {
             completed: true,
             failed: false,
             canceled_or_stopped: false,
-            requests: vec![
-                AdminRequestEvidence {
-                    method: "POST".to_string(),
-                    path: format!("{ADMIN_PREFIX}/pools/decommission"),
-                    query: BTreeMap::from([
-                        ("by-id".to_string(), "true".to_string()),
-                        ("pool".to_string(), "1".to_string()),
-                    ]),
-                    status: 200,
-                    request_id: None,
-                },
-                AdminRequestEvidence {
-                    method: "GET".to_string(),
-                    path: format!("{ADMIN_PREFIX}/decommission/status"),
-                    query: BTreeMap::from([
-                        ("by-id".to_string(), "true".to_string()),
-                        ("pool".to_string(), "1".to_string()),
-                    ]),
-                    status: 200,
-                    request_id: None,
-                },
-            ],
-            pools_before: proof.runtime_pools.clone(),
-            pools_after: vec![proof.runtime_pools[0].clone()],
+            participating_pool_ids: vec![1],
+            objects_moved: Some(1),
+            versions_moved: None,
+            bytes_moved: Some(200),
+            requests: decommission_requests(1),
+            pools_before: pre_start_snapshot(
+                ADMIN_DECOMMISSION_SCENARIO,
+                proof.runtime_pools.clone(),
+            ),
+            pools_after: post_operation_snapshot(
+                ADMIN_DECOMMISSION_SCENARIO,
+                vec![proof.runtime_pools[0].clone()],
+            ),
         };
-        validate_admin_topology_artifacts(ADMIN_DECOMMISSION_SCENARIO, &proof, &operation).unwrap();
+        validate_admin_topology_artifacts(
+            ADMIN_DECOMMISSION_SCENARIO,
+            &attempt(ADMIN_DECOMMISSION_SCENARIO),
+            attempt_window(),
+            &proof,
+            &operation,
+        )
+        .unwrap();
+        let mut zero_movement = operation.clone();
+        zero_movement.objects_moved = Some(0);
+        zero_movement.bytes_moved = Some(0);
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &zero_movement,
+            )
+            .is_err()
+        );
+        let mut contradictory_target = operation.clone();
+        let mut retained_target = proof.runtime_pools[1].clone();
+        retained_target.status = "decommissioned".to_string();
+        retained_target.decommission_status = "failed".to_string();
+        retained_target.decommission = Some(DecommissionProgress {
+            complete: true,
+            failed: true,
+            ..Default::default()
+        });
+        contradictory_target.pools_after.pools.push(retained_target);
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &contradictory_target,
+            )
+            .is_err()
+        );
+        let mut missing_target_state = operation.clone();
+        let mut retained_target = proof.runtime_pools[1].clone();
+        retained_target.status = "decommissioned".to_string();
+        retained_target.decommission_status = "complete".to_string();
+        retained_target.decommission = None;
+        missing_target_state.pools_after.pools.push(retained_target);
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &missing_target_state,
+            )
+            .is_err()
+        );
+        let mut retained_complete = operation.clone();
+        let mut retained_target = proof.runtime_pools[1].clone();
+        retained_target.status = "decommissioned".to_string();
+        retained_target.decommission_status = "complete".to_string();
+        retained_target.decommission = Some(DecommissionProgress {
+            start_time: Some("2026-09-05T00:00:00Z".to_string()),
+            complete: true,
+            objects_decommissioned: 1,
+            bytes_decommissioned: 200,
+            ..Default::default()
+        });
+        retained_complete.pools_after.pools.push(retained_target);
+        validate_admin_topology_artifacts(
+            ADMIN_DECOMMISSION_SCENARIO,
+            &attempt(ADMIN_DECOMMISSION_SCENARIO),
+            attempt_window(),
+            &proof,
+            &retained_complete,
+        )
+        .expect("a retained target may prove the exact completed decommission operation");
+
+        for failed_counter in ["objects", "bytes"] {
+            let mut failed_fragment = retained_complete.clone();
+            let progress = failed_fragment.pools_after.pools[1]
+                .decommission
+                .as_mut()
+                .unwrap();
+            if failed_counter == "objects" {
+                progress.objects_decommissioned_failed = 1;
+            } else {
+                progress.bytes_decommissioned_failed = 1;
+            }
+            assert!(
+                validate_admin_topology_artifacts(
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                    attempt_window(),
+                    &proof,
+                    &failed_fragment,
+                )
+                .is_err(),
+                "retained target {failed_counter} failures must fail closed"
+            );
+        }
+
+        let mut missing_start_time = retained_complete.clone();
+        missing_start_time.pools_after.pools[1]
+            .decommission
+            .as_mut()
+            .unwrap()
+            .start_time = None;
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &missing_start_time,
+            )
+            .is_err(),
+            "a retained completed target must expose the operation start time"
+        );
+        for state in ["failed", "blocked"] {
+            let mut unhealthy = operation.clone();
+            unhealthy.pools_after.pools[0].status = state.to_string();
+            assert!(
+                validate_admin_topology_artifacts(
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                    attempt_window(),
+                    &proof,
+                    &unhealthy,
+                )
+                .is_err(),
+                "surviving pool state {state:?} must fail closed"
+            );
+        }
+        for lifecycle in ["started", "stopping"] {
+            let mut busy = operation.clone();
+            busy.pools_after.pools[0].rebalance_status = lifecycle.to_string();
+            assert!(
+                validate_admin_topology_artifacts(
+                    ADMIN_DECOMMISSION_SCENARIO,
+                    &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                    attempt_window(),
+                    &proof,
+                    &busy,
+                )
+                .is_err(),
+                "surviving pool lifecycle {lifecycle:?} must fail closed"
+            );
+        }
         operation.requests[0]
             .query
             .insert("pool".to_string(), "0".to_string());
         assert!(
-            validate_admin_topology_artifacts(ADMIN_DECOMMISSION_SCENARIO, &proof, &operation)
-                .is_err()
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &operation,
+            )
+            .is_err()
         );
         operation.requests[0]
             .query
             .insert("pool".to_string(), "1".to_string());
         operation.canceled_or_stopped = true;
         assert!(
-            validate_admin_topology_artifacts(ADMIN_DECOMMISSION_SCENARIO, &proof, &operation)
-                .is_err()
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &operation,
+            )
+            .is_err()
         );
         operation.canceled_or_stopped = false;
+        operation.requests.push(AdminRequestEvidence {
+            method: "POST".to_string(),
+            path: format!("{ADMIN_PREFIX}/pools/cancel"),
+            query: BTreeMap::from([
+                ("by-id".to_string(), "true".to_string()),
+                ("pool".to_string(), "1".to_string()),
+            ]),
+            status: 200,
+            started_at_ms: 240,
+            observed_at_ms: 250,
+            request_id: None,
+            response_sha256: None,
+            response_body: None,
+        });
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &operation,
+            )
+            .is_err()
+        );
+        operation.requests.pop();
         operation.target_pool_expression = Some("/wrong".to_string());
         assert!(
-            validate_admin_topology_artifacts(ADMIN_DECOMMISSION_SCENARIO, &proof, &operation)
-                .is_err()
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &operation,
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn progress_requires_one_operation_and_successful_terminal_sample() {
         let operation = AdminOperationEvidence {
+            attempt: attempt(ADMIN_REBALANCE_SCENARIO),
             scenario: ADMIN_REBALANCE_SCENARIO.to_string(),
             operation_id: "rebalance-123".to_string(),
             target_pool_id: None,
@@ -1181,14 +3488,20 @@ mod tests {
             completed: true,
             failed: false,
             canceled_or_stopped: false,
-            requests: Vec::new(),
-            pools_before: Vec::new(),
-            pools_after: Vec::new(),
+            participating_pool_ids: vec![0],
+            objects_moved: Some(2),
+            versions_moved: Some(2),
+            bytes_moved: Some(20),
+            requests: rebalance_progress_requests(),
+            pools_before: pre_start_snapshot(ADMIN_REBALANCE_SCENARIO, pools()),
+            pools_after: post_operation_snapshot(ADMIN_REBALANCE_SCENARIO, pools()),
         };
         let mut samples = vec![
             AdminOperationProgressSample {
+                attempt: attempt(ADMIN_REBALANCE_SCENARIO),
                 operation_id: operation.operation_id.clone(),
-                observed_at_ms: 1,
+                status_request_id: "rebalance-status-request-1".to_string(),
+                observed_at_ms: 120,
                 state: "started".to_string(),
                 completed: false,
                 failed: false,
@@ -1198,8 +3511,10 @@ mod tests {
                 bytes_moved: Some(10),
             },
             AdminOperationProgressSample {
+                attempt: attempt(ADMIN_REBALANCE_SCENARIO),
                 operation_id: operation.operation_id.clone(),
-                observed_at_ms: 2,
+                status_request_id: "rebalance-status-request-2".to_string(),
+                observed_at_ms: 200,
                 state: "completed".to_string(),
                 completed: true,
                 failed: false,
@@ -1209,21 +3524,240 @@ mod tests {
                 bytes_moved: Some(20),
             },
         ];
+        let valid_samples = samples.clone();
 
-        validate_admin_operation_progress(&operation, &samples).expect("terminal progress");
+        validate_admin_operation_progress(&operation, &samples, attempt_window())
+            .expect("terminal progress");
         samples[0].operation_id = "different".to_string();
-        assert!(validate_admin_operation_progress(&operation, &samples).is_err());
+        assert!(validate_admin_operation_progress(&operation, &samples, attempt_window()).is_err());
         samples[0].operation_id.clone_from(&operation.operation_id);
+        samples[0].attempt.run_id = "different-run".to_string();
+        assert!(validate_admin_operation_progress(&operation, &samples, attempt_window()).is_err());
+        samples[0].attempt = operation.attempt.clone();
         samples[1].canceled_or_stopped = true;
-        assert!(validate_admin_operation_progress(&operation, &samples).is_err());
+        assert!(validate_admin_operation_progress(&operation, &samples, attempt_window()).is_err());
+
+        let mut unknown = valid_samples.clone();
+        unknown[0].state = "running".to_string();
+        assert!(validate_admin_operation_progress(&operation, &unknown, attempt_window()).is_err());
+
+        let mut unbound = valid_samples.clone();
+        unbound.insert(
+            1,
+            AdminOperationProgressSample {
+                status_request_id: "unknown-status-request".to_string(),
+                observed_at_ms: 150,
+                state: "started".to_string(),
+                ..unbound[0].clone()
+            },
+        );
+        assert!(validate_admin_operation_progress(&operation, &unbound, attempt_window()).is_err());
+
+        let mut repeated_terminal_operation = operation.clone();
+        repeated_terminal_operation
+            .requests
+            .push(AdminRequestEvidence {
+                method: "GET".to_string(),
+                path: format!("{ADMIN_PREFIX}/rebalance/status"),
+                query: BTreeMap::new(),
+                status: 200,
+                started_at_ms: 205,
+                observed_at_ms: 210,
+                request_id: Some("rebalance-status-request-3".to_string()),
+                response_sha256: None,
+                response_body: None,
+            });
+        let mut repeated_terminal = valid_samples.clone();
+        repeated_terminal.push(AdminOperationProgressSample {
+            status_request_id: "rebalance-status-request-3".to_string(),
+            observed_at_ms: 210,
+            ..repeated_terminal[1].clone()
+        });
+        assert!(
+            validate_admin_operation_progress(
+                &repeated_terminal_operation,
+                &repeated_terminal,
+                attempt_window(),
+            )
+            .is_err(),
+            "a terminal state cannot be followed by another terminal sample"
+        );
+
+        let mut regressed = valid_samples.clone();
+        let mut early_terminal = regressed[1].clone();
+        early_terminal.observed_at_ms = 150;
+        early_terminal.objects_moved = Some(1);
+        early_terminal.versions_moved = Some(1);
+        early_terminal.bytes_moved = Some(10);
+        let mut resumed = regressed[0].clone();
+        resumed.observed_at_ms = 175;
+        regressed.insert(1, early_terminal);
+        regressed.insert(2, resumed);
+        assert!(
+            validate_admin_operation_progress(&operation, &regressed, attempt_window()).is_err()
+        );
+
+        let mut mismatched_terminal = valid_samples.clone();
+        mismatched_terminal[1].observed_at_ms = 199;
+        assert!(
+            validate_admin_operation_progress(&operation, &mismatched_terminal, attempt_window(),)
+                .is_err()
+        );
+
+        let mut outside_attempt = operation.clone();
+        outside_attempt.requests[0].started_at_ms = 49;
+        assert!(
+            validate_admin_operation_progress(&outside_attempt, &valid_samples, attempt_window(),)
+                .is_err()
+        );
+
+        let mut status_before_start = operation.clone();
+        status_before_start.requests.swap(0, 1);
+        assert!(
+            validate_admin_operation_progress(
+                &status_before_start,
+                &valid_samples,
+                attempt_window(),
+            )
+            .is_err()
+        );
+
+        let mut overlapping_requests = operation.clone();
+        overlapping_requests.requests[1].started_at_ms = 99;
+        assert!(
+            validate_admin_operation_progress(
+                &overlapping_requests,
+                &valid_samples,
+                attempt_window(),
+            )
+            .is_err(),
+            "status transport may not overlap the start transport"
+        );
+    }
+
+    #[test]
+    fn decommission_progress_uses_queued_running_complete_state_machine() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_DECOMMISSION_SCENARIO),
+        )
+        .unwrap();
+        let status = DecommissionPoolStatus {
+            id: 1,
+            expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
+            status: "complete".to_string(),
+            pool_status: "decommissioned".to_string(),
+            decommission: Some(DecommissionProgress {
+                start_time: Some("2026-09-05T00:00:00Z".to_string()),
+                complete: true,
+                objects_decommissioned: 2,
+                bytes_decommissioned: 200,
+                ..Default::default()
+            }),
+        };
+        let operation = AdminOperationEvidence::from_decommission(
+            &proof,
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone()),
+            status,
+            decommission_progress_requests(1),
+            post_operation_snapshot(
+                ADMIN_DECOMMISSION_SCENARIO,
+                vec![proof.runtime_pools[0].clone()],
+            ),
+        )
+        .unwrap();
+        let mut samples = [
+            ("queued", false, 110, 0, 0, "decommission-status-request-1"),
+            (
+                "running",
+                false,
+                150,
+                1,
+                100,
+                "decommission-status-request-2",
+            ),
+            (
+                "complete",
+                true,
+                200,
+                2,
+                200,
+                "decommission-status-request-3",
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(state, completed, observed_at_ms, objects_moved, bytes_moved, status_request_id)| {
+                AdminOperationProgressSample {
+                    attempt: attempt(ADMIN_DECOMMISSION_SCENARIO),
+                    operation_id: operation.operation_id.clone(),
+                    status_request_id: status_request_id.to_string(),
+                    observed_at_ms,
+                    state: state.to_string(),
+                    completed,
+                    failed: false,
+                    canceled_or_stopped: false,
+                    objects_moved: Some(objects_moved),
+                    versions_moved: None,
+                    bytes_moved: Some(bytes_moved),
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+
+        validate_admin_operation_progress(&operation, &samples, attempt_window())
+            .expect("valid decommission state progression");
+
+        let mut wrong_terminal_request = operation.clone();
+        wrong_terminal_request.requests.push(AdminRequestEvidence {
+            method: "GET".to_string(),
+            path: format!("{ADMIN_PREFIX}/decommission/status"),
+            query: BTreeMap::from([
+                ("by-id".to_string(), "true".to_string()),
+                ("pool".to_string(), "0".to_string()),
+            ]),
+            status: 200,
+            started_at_ms: 205,
+            observed_at_ms: 210,
+            request_id: Some("wrong-pool-status-request".to_string()),
+            response_sha256: None,
+            response_body: None,
+        });
+        let mut wrong_target_samples = samples.clone();
+        wrong_target_samples.last_mut().unwrap().status_request_id =
+            "wrong-pool-status-request".to_string();
+        wrong_target_samples.last_mut().unwrap().observed_at_ms = 210;
+        assert!(
+            validate_admin_operation_progress(
+                &wrong_terminal_request,
+                &wrong_target_samples,
+                attempt_window(),
+            )
+            .is_err(),
+            "terminal progress cannot bind to a status request for another pool"
+        );
+
+        samples[0].state = "started".to_string();
+        assert!(validate_admin_operation_progress(&operation, &samples, attempt_window()).is_err());
     }
 
     #[test]
     fn rebalance_requires_stable_pool_identity() {
         let plan = AdminTopologyPlan::for_scenario(ADMIN_REBALANCE_SCENARIO).unwrap();
-        let proof =
-            AdminTopologyProof::build(&plan, ADMIN_REBALANCE_SCENARIO, &tenant(), pools()).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_REBALANCE_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_REBALANCE_SCENARIO),
+        )
+        .unwrap();
         let mut operation = AdminOperationEvidence {
+            attempt: attempt(ADMIN_REBALANCE_SCENARIO),
             scenario: ADMIN_REBALANCE_SCENARIO.to_string(),
             operation_id: "rebalance-123".to_string(),
             target_pool_id: None,
@@ -1232,30 +3766,244 @@ mod tests {
             completed: true,
             failed: false,
             canceled_or_stopped: false,
+            participating_pool_ids: vec![0],
+            objects_moved: Some(2),
+            versions_moved: Some(2),
+            bytes_moved: Some(20),
             requests: vec![
                 AdminRequestEvidence {
                     method: "POST".to_string(),
                     path: format!("{ADMIN_PREFIX}/rebalance/start"),
                     query: BTreeMap::new(),
                     status: 200,
-                    request_id: None,
+                    started_at_ms: 95,
+                    observed_at_ms: 100,
+                    request_id: Some("rebalance-start-request".to_string()),
+                    response_sha256: None,
+                    response_body: None,
                 },
                 AdminRequestEvidence {
                     method: "GET".to_string(),
                     path: format!("{ADMIN_PREFIX}/rebalance/status"),
                     query: BTreeMap::new(),
                     status: 200,
-                    request_id: None,
+                    started_at_ms: 195,
+                    observed_at_ms: 200,
+                    request_id: Some("rebalance-status-request".to_string()),
+                    response_sha256: None,
+                    response_body: None,
                 },
             ],
-            pools_before: proof.runtime_pools.clone(),
-            pools_after: proof.runtime_pools.clone(),
+            pools_before: pre_start_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+            pools_after: post_operation_snapshot(
+                ADMIN_REBALANCE_SCENARIO,
+                proof.runtime_pools.clone(),
+            ),
         };
-        validate_admin_topology_artifacts(ADMIN_REBALANCE_SCENARIO, &proof, &operation).unwrap();
-        operation.pools_after[1].expression = "/different".to_string();
+        let mut terminal_status = completed_rebalance_status("rebalance-123");
+        terminal_status.pools[0].progress = Some(RebalanceProgress {
+            objects: 2,
+            versions: 2,
+            bytes: 20,
+            remaining_buckets: 0,
+        });
+        operation.requests[1] = with_json_response(operation.requests[1].clone(), &terminal_status);
+        validate_admin_topology_artifacts(
+            ADMIN_REBALANCE_SCENARIO,
+            &attempt(ADMIN_REBALANCE_SCENARIO),
+            attempt_window(),
+            &proof,
+            &operation,
+        )
+        .unwrap();
+
+        let mut false_single_target = operation.clone();
+        false_single_target.target_pool_id = Some(0);
         assert!(
-            validate_admin_topology_artifacts(ADMIN_REBALANCE_SCENARIO, &proof, &operation)
-                .is_err()
+            validate_admin_topology_artifacts(
+                ADMIN_REBALANCE_SCENARIO,
+                &attempt(ADMIN_REBALANCE_SCENARIO),
+                attempt_window(),
+                &proof,
+                &false_single_target,
+            )
+            .is_err()
+        );
+
+        for observed_at_ms in [199, 200] {
+            let mut not_after_terminal = operation.clone();
+            not_after_terminal.pools_after.observed_at_ms = observed_at_ms;
+            not_after_terminal.pools_after.request.observed_at_ms = observed_at_ms;
+            assert!(
+                validate_admin_topology_artifacts(
+                    ADMIN_REBALANCE_SCENARIO,
+                    &attempt(ADMIN_REBALANCE_SCENARIO),
+                    attempt_window(),
+                    &proof,
+                    &not_after_terminal,
+                )
+                .is_err(),
+                "post-operation snapshot at {observed_at_ms} must be strictly after terminal status"
+            );
+        }
+        let mut wrong_after_attempt = operation.clone();
+        wrong_after_attempt.pools_after.attempt.tenant_uid = "old-tenant-uid".to_string();
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_REBALANCE_SCENARIO,
+                &attempt(ADMIN_REBALANCE_SCENARIO),
+                attempt_window(),
+                &proof,
+                &wrong_after_attempt,
+            )
+            .is_err()
+        );
+        let mut failed_after_list = operation.clone();
+        failed_after_list.pools_after.request.status = 500;
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_REBALANCE_SCENARIO,
+                &attempt(ADMIN_REBALANCE_SCENARIO),
+                attempt_window(),
+                &proof,
+                &failed_after_list,
+            )
+            .is_err()
+        );
+        let mut tenant_get_not_after_terminal = operation.clone();
+        tenant_get_not_after_terminal
+            .pools_after
+            .tenant_get
+            .started_at_ms = 200;
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_REBALANCE_SCENARIO,
+                &attempt(ADMIN_REBALANCE_SCENARIO),
+                attempt_window(),
+                &proof,
+                &tenant_get_not_after_terminal,
+            )
+            .is_err(),
+            "post-operation Tenant GET must begin strictly after terminal status completes"
+        );
+        let mut tenant_get_equals_list_start = operation.clone();
+        tenant_get_equals_list_start
+            .pools_after
+            .tenant_get
+            .observed_at_ms = tenant_get_equals_list_start
+            .pools_after
+            .request
+            .started_at_ms;
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_REBALANCE_SCENARIO,
+                &attempt(ADMIN_REBALANCE_SCENARIO),
+                attempt_window(),
+                &proof,
+                &tenant_get_equals_list_start,
+            )
+            .is_err(),
+            "post-operation Tenant GET must complete strictly before pools/list starts"
+        );
+        for state in ["failed", "blocked"] {
+            let mut unhealthy = operation.clone();
+            unhealthy.pools_after.pools[1].status = state.to_string();
+            assert!(
+                validate_admin_topology_artifacts(
+                    ADMIN_REBALANCE_SCENARIO,
+                    &attempt(ADMIN_REBALANCE_SCENARIO),
+                    attempt_window(),
+                    &proof,
+                    &unhealthy,
+                )
+                .is_err(),
+                "post-rebalance pool state {state:?} must fail closed"
+            );
+        }
+        for lifecycle in ["started", "stopping"] {
+            let mut busy = operation.clone();
+            busy.pools_after.pools[1].rebalance_status = lifecycle.to_string();
+            assert!(
+                validate_admin_topology_artifacts(
+                    ADMIN_REBALANCE_SCENARIO,
+                    &attempt(ADMIN_REBALANCE_SCENARIO),
+                    attempt_window(),
+                    &proof,
+                    &busy,
+                )
+                .is_err(),
+                "post-rebalance pool lifecycle {lifecycle:?} must fail closed"
+            );
+        }
+        let mut completed_without_info = operation.clone();
+        completed_without_info.pools_after.pools[1].decommission_status = "complete".to_string();
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_REBALANCE_SCENARIO,
+                &attempt(ADMIN_REBALANCE_SCENARIO),
+                attempt_window(),
+                &proof,
+                &completed_without_info,
+            )
+            .is_err(),
+            "an active idle pool cannot claim completed decommission without operation info"
+        );
+        for (field, value) in [("total", 0), ("current", 2_001), ("used", 2_001)] {
+            let mut invalid_capacity = operation.clone();
+            match field {
+                "total" => invalid_capacity.pools_after.pools[0].total_size = value,
+                "current" => invalid_capacity.pools_after.pools[0].current_size = value,
+                "used" => invalid_capacity.pools_after.pools[0].used_size = value,
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_admin_topology_artifacts(
+                    ADMIN_REBALANCE_SCENARIO,
+                    &attempt(ADMIN_REBALANCE_SCENARIO),
+                    attempt_window(),
+                    &proof,
+                    &invalid_capacity,
+                )
+                .is_err(),
+                "invalid post-rebalance {field} capacity must fail closed"
+            );
+        }
+        let mut inconsistent_sizes = operation.clone();
+        inconsistent_sizes.pools_after.pools[0].used_size = 499;
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_REBALANCE_SCENARIO,
+                &attempt(ADMIN_REBALANCE_SCENARIO),
+                attempt_window(),
+                &proof,
+                &inconsistent_sizes,
+            )
+            .is_err(),
+            "post-operation capacity parts cannot contradict the reported total"
+        );
+        let mut inconsistent_ratio = operation.clone();
+        inconsistent_ratio.pools_after.pools[0].used = 0.4;
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_REBALANCE_SCENARIO,
+                &attempt(ADMIN_REBALANCE_SCENARIO),
+                attempt_window(),
+                &proof,
+                &inconsistent_ratio,
+            )
+            .is_err(),
+            "post-operation used ratio must match usedSize/totalSize"
+        );
+        operation.pools_after.pools[1].expression = "/different".to_string();
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_REBALANCE_SCENARIO,
+                &attempt(ADMIN_REBALANCE_SCENARIO),
+                attempt_window(),
+                &proof,
+                &operation,
+            )
+            .is_err()
         );
     }
 
@@ -1268,21 +4016,34 @@ mod tests {
         assert_eq!(decommission.decommission.unwrap().objects_decommissioned, 3);
 
         let rebalance: RebalanceStatus = serde_json::from_str(
-            r#"{"id":"rebalance-1","pools":[{"id":0,"status":"Completed","cleanupWarnings":{"count":0},"progress":{"objects":2,"versions":3,"bytes":128,"remainingBuckets":0}}]}"#,
+            r#"{"id":"rebalance-1","pools":[{"id":0,"status":"Completed","cleanupWarnings":{"count":0},"progress":{"objects":2,"versions":3,"bytes":128,"remainingBuckets":7}}]}"#,
         ).unwrap();
         assert_eq!(rebalance.id, "rebalance-1");
         assert_eq!(rebalance.pools[0].progress.as_ref().unwrap().versions, 3);
+        assert_eq!(
+            rebalance.pools[0]
+                .progress
+                .as_ref()
+                .unwrap()
+                .remaining_buckets,
+            7
+        );
     }
 
     #[test]
-    fn decommission_terminal_builder_rejects_failed_moves() {
+    fn decommission_terminal_builder_rejects_failed_moves_or_blocked_pool() {
         let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
-        let proof =
-            AdminTopologyProof::build(&plan, ADMIN_DECOMMISSION_SCENARIO, &tenant(), pools())
-                .unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_DECOMMISSION_SCENARIO),
+        )
+        .unwrap();
         let status = DecommissionPoolStatus {
             id: 1,
-            expression: "/data/pool1/disk{1...4}".to_string(),
+            expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
             status: "complete".to_string(),
             pool_status: "decommissioned".to_string(),
             decommission: Some(DecommissionProgress {
@@ -1294,20 +4055,170 @@ mod tests {
         };
         let evidence = AdminOperationEvidence::from_decommission(
             &proof,
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone()),
             status,
-            vec![],
-            vec![proof.runtime_pools[0].clone()],
+            decommission_requests(1),
+            post_operation_snapshot(
+                ADMIN_DECOMMISSION_SCENARIO,
+                vec![proof.runtime_pools[0].clone()],
+            ),
         )
         .unwrap();
         assert!(!evidence.completed);
-        assert!(evidence.require_success().is_err());
+        assert!(evidence.require_success(attempt_window()).is_err());
+
+        let blocked = DecommissionPoolStatus {
+            id: 1,
+            expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
+            status: "complete".to_string(),
+            pool_status: "blocked".to_string(),
+            decommission: Some(DecommissionProgress {
+                start_time: Some("2026-09-05T00:00:00Z".to_string()),
+                complete: true,
+                objects_decommissioned: 1,
+                bytes_decommissioned: 200,
+                ..Default::default()
+            }),
+        };
+        let evidence = AdminOperationEvidence::from_decommission(
+            &proof,
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone()),
+            blocked,
+            decommission_requests(1),
+            post_operation_snapshot(
+                ADMIN_DECOMMISSION_SCENARIO,
+                vec![proof.runtime_pools[0].clone()],
+            ),
+        )
+        .unwrap();
+        assert!(!evidence.completed);
+        assert!(evidence.require_success(attempt_window()).is_err());
+    }
+
+    #[test]
+    fn rebalance_accepts_completed_participant_and_none_nonparticipant() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_REBALANCE_SCENARIO).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_REBALANCE_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_REBALANCE_SCENARIO),
+        )
+        .unwrap();
+        let start = RebalanceStart {
+            id: "rebalance-1".to_string(),
+        };
+
+        let mut status = completed_rebalance_status(&start.id);
+        status.pools[0].progress.as_mut().unwrap().remaining_buckets = 7;
+        let evidence = AdminOperationEvidence::from_rebalance(
+            &proof,
+            pre_start_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+            &start,
+            status,
+            rebalance_requests(),
+            post_operation_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+        )
+        .expect("real RustFS mixed terminal status");
+
+        assert_eq!(evidence.participating_pool_ids, vec![0]);
+        assert_eq!(evidence.bytes_moved, Some(128));
+        evidence
+            .require_success(attempt_window())
+            .expect("successful rebalance");
+    }
+
+    #[test]
+    fn rebalance_rejects_zero_movement_extra_or_duplicate_pool_status() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_REBALANCE_SCENARIO).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_REBALANCE_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_REBALANCE_SCENARIO),
+        )
+        .unwrap();
+        let start = RebalanceStart {
+            id: "rebalance-1".to_string(),
+        };
+        let mut no_movement = completed_rebalance_status(&start.id);
+        no_movement.pools[0].progress = Some(RebalanceProgress::default());
+        let evidence = AdminOperationEvidence::from_rebalance(
+            &proof,
+            pre_start_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+            &start,
+            no_movement,
+            rebalance_requests(),
+            post_operation_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+        )
+        .expect("status remains representable");
+        assert!(!evidence.completed);
+        assert!(evidence.require_success(attempt_window()).is_err());
+
+        let mut extra = completed_rebalance_status(&start.id);
+        extra.pools.push(RebalancePoolStatus {
+            id: 2,
+            status: "None".to_string(),
+            stopping: false,
+            last_error: None,
+            cleanup_warnings: RebalanceCleanupWarnings::default(),
+            progress: None,
+        });
+        assert!(
+            AdminOperationEvidence::from_rebalance(
+                &proof,
+                pre_start_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+                &start,
+                extra,
+                rebalance_requests(),
+                post_operation_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+            )
+            .is_err()
+        );
+
+        for pool_index in [0, 1] {
+            let mut cross_spelled = completed_rebalance_status(&start.id);
+            cross_spelled.pools[pool_index].status = "Complete".to_string();
+            let evidence = AdminOperationEvidence::from_rebalance(
+                &proof,
+                pre_start_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+                &start,
+                cross_spelled,
+                rebalance_requests(),
+                post_operation_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+            )
+            .expect("unknown wire status remains representable as failed evidence");
+            assert!(evidence.require_success(attempt_window()).is_err());
+        }
+
+        let mut duplicate = completed_rebalance_status(&start.id);
+        duplicate.pools[1].id = 0;
+        assert!(
+            AdminOperationEvidence::from_rebalance(
+                &proof,
+                pre_start_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+                &start,
+                duplicate,
+                rebalance_requests(),
+                post_operation_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn rebalance_terminal_builder_fails_closed_on_cleanup_warning() {
         let plan = AdminTopologyPlan::for_scenario(ADMIN_REBALANCE_SCENARIO).unwrap();
-        let proof =
-            AdminTopologyProof::build(&plan, ADMIN_REBALANCE_SCENARIO, &tenant(), pools()).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_REBALANCE_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_REBALANCE_SCENARIO),
+        )
+        .unwrap();
         let start = RebalanceStart {
             id: "rebalance-1".to_string(),
         };
@@ -1317,6 +4228,7 @@ mod tests {
                 RebalancePoolStatus {
                     id: 0,
                     status: "Completed".to_string(),
+                    stopping: false,
                     last_error: None,
                     cleanup_warnings: RebalanceCleanupWarnings {
                         count: 1,
@@ -1327,22 +4239,25 @@ mod tests {
                 RebalancePoolStatus {
                     id: 1,
                     status: "Completed".to_string(),
+                    stopping: false,
                     last_error: None,
                     cleanup_warnings: RebalanceCleanupWarnings::default(),
                     progress: None,
                 },
             ],
             stopped_at: None,
+            stop_propagation: RebalanceStopPropagationStatus::default(),
         };
         let evidence = AdminOperationEvidence::from_rebalance(
             &proof,
+            pre_start_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
             &start,
             status,
-            vec![],
-            proof.runtime_pools.clone(),
+            rebalance_requests(),
+            post_operation_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
         )
         .unwrap();
         assert!(evidence.failed);
-        assert!(evidence.require_success().is_err());
+        assert!(evidence.require_success(attempt_window()).is_err());
     }
 }

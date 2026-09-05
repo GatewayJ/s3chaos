@@ -147,11 +147,17 @@ impl RustfsAdminTransport {
             .await
             .context("send RustFS admin request")?;
         let status = response.status().as_u16();
-        let request_id = response
-            .headers()
-            .get("x-amz-request-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
+        let request_id = ["x-amz-request-id", "x-request-id"]
+            .into_iter()
+            .find_map(|name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            });
         let body = response
             .bytes()
             .await

@@ -456,11 +456,17 @@ Reporting only projects this typed checker result into failure-summary fields.
   `rc` subprocess or putting scenario policy in the IAM-oriented protocol port.
 
 - [ ] PARTIAL: Add fail-closed decommission/rebalance evidence contracts.
-  Meaning: preflight binds the fresh Tenant pools to exact runtime pool IDs and
-  expressions, checks capacity, health, and mutual exclusion, then operation
-  evidence requires identity, successful terminal state, monotonic progress,
-  and before/after topology. Failed, canceled, stopped, mismatched, or incomplete
-  evidence cannot pass.
+  Meaning: preflight binds named pools and the fresh Tenant UID's endpoint sets
+  to exact runtime pool IDs/cmdlines without array-order inference; it checks
+  health, mutual exclusion, and the decommission 130% capacity guard plus a
+  bounded workload budget. Timestamped pool lists bound to the same attempt
+  must repeat those checks immediately before the start request and prove the
+  post-terminal health/topology observation.
+  Operation/progress evidence is bound to the current run, case, Tenant UID,
+  and attempt time window and requires a successful terminal state, monotonic
+  scenario-specific state transitions, and before/after topology. Failed,
+  canceled, stopped, mismatched, zero-movement, or incomplete evidence cannot
+  pass.
 
 - [ ] BLOCKED: Keep `admin-decommission` and `admin-rebalance` Planned until the
   runner supports scenario-owned operation phases.
