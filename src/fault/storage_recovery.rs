@@ -342,7 +342,7 @@ impl FreshVolumeReplacementProof {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StaleMutationKind {
     Overwrite,
@@ -365,6 +365,7 @@ pub struct CommittedMutationEvidence {
 pub struct DiskAbsenceObservation {
     pub observation_id: String,
     pub detachment_operation_id: String,
+    pub persistent_volume: String,
     pub persistent_volume_uid: String,
     pub canonical_device: String,
     pub filesystem_uuid: String,
@@ -397,6 +398,77 @@ pub struct DiskPresenceEvent {
     pub cursor: String,
     pub observed_at_ms: u64,
     pub state: DiskPresenceState,
+    pub raw_evidence: RawDiskStateEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "kebab-case")]
+pub enum RawDiskStateResponse {
+    KubernetesController {
+        observed_at_ms: u64,
+        persistent_volume: String,
+        persistent_volume_uid: String,
+        raw_response_sha256: String,
+        raw_response_body: String,
+    },
+    HostDevice {
+        argv: Vec<String>,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        observed_at_ms: u64,
+        canonical_device: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KubernetesListMetadata {
+    pub resource_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubernetesObjectMetadata {
+    pub uid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KubernetesVolumeAttachmentSource {
+    pub persistent_volume_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubernetesVolumeAttachmentSpec {
+    pub source: KubernetesVolumeAttachmentSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubernetesVolumeAttachmentStatus {
+    pub attached: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubernetesVolumeAttachment {
+    pub metadata: KubernetesObjectMetadata,
+    pub spec: KubernetesVolumeAttachmentSpec,
+    pub status: KubernetesVolumeAttachmentStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KubernetesVolumeAttachmentList {
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: KubernetesListMetadata,
+    pub items: Vec<KubernetesVolumeAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawDiskStateEvidence {
+    pub response_sha256: String,
+    pub response_body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,6 +477,7 @@ pub struct RustfsDiskAbsenceWatchResponse {
     pub observation_id: String,
     pub detachment_operation_id: String,
     pub source: DiskAbsenceWatchSource,
+    pub persistent_volume: String,
     pub persistent_volume_uid: String,
     pub canonical_device: String,
     pub filesystem_uuid: String,
@@ -416,7 +489,9 @@ pub struct RustfsDiskAbsenceWatchResponse {
     pub start_cursor: String,
     pub end_cursor: String,
     pub initial_state: DiskPresenceState,
+    pub initial_evidence: RawDiskStateEvidence,
     pub events: Vec<DiskPresenceEvent>,
+    pub final_evidence: RawDiskStateEvidence,
     pub closed_normally: bool,
 }
 
@@ -439,6 +514,7 @@ pub enum StaleDiskLifecycleAction {
 pub struct RustfsStaleDiskOperationReceipt {
     pub operation_id: String,
     pub action: StaleDiskLifecycleAction,
+    pub persistent_volume: String,
     pub persistent_volume_uid: String,
     pub canonical_device: String,
     pub filesystem_uuid: String,
@@ -447,7 +523,8 @@ pub struct RustfsStaleDiskOperationReceipt {
     pub host_storage_proof_sha256: String,
     pub started_at_ms: u64,
     pub completed_at_ms: u64,
-    pub succeeded: bool,
+    pub controller_result_evidence: RawDiskStateEvidence,
+    pub host_result_evidence: RawDiskStateEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,16 +544,180 @@ pub struct StaleDiskLifecycleEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostReturnCheckerEvidence {
-    pub observed_at_ms: u64,
     pub response_sha256: String,
     pub response_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostReturnVersionCheck {
+    pub object_key: String,
+    pub version_id: String,
+    pub kind: StaleMutationKind,
+    pub expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RustfsPostReturnCheckerReceipt {
+    pub bucket: String,
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+    pub history_snapshot_sha256: String,
+    pub checked_versions: Vec<PostReturnVersionCheck>,
+    pub checker_report_sha256: String,
+    pub checker_report_body: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawDiskStateExpectation<'a> {
+    source: DiskAbsenceWatchSource,
+    state: DiskPresenceState,
+    observed_at_ms: u64,
+    cursor: &'a str,
+    persistent_volume: &'a str,
+    persistent_volume_uid: &'a str,
+    canonical_device: &'a str,
+}
+
+impl RawDiskStateEvidence {
+    fn cursor(&self) -> Result<String> {
+        let response = serde_json::from_str::<RawDiskStateResponse>(&self.response_body)
+            .context("decode raw disk-state response")?;
+        Ok(match response {
+            RawDiskStateResponse::KubernetesController {
+                raw_response_body, ..
+            } => {
+                serde_json::from_str::<KubernetesVolumeAttachmentList>(&raw_response_body)
+                    .context("decode raw Kubernetes VolumeAttachmentList")?
+                    .metadata
+                    .resource_version
+            }
+            RawDiskStateResponse::HostDevice { .. } => self.response_sha256.clone(),
+        })
+    }
+
+    fn validate(&self, expectation: RawDiskStateExpectation<'_>) -> Result<()> {
+        let RawDiskStateExpectation {
+            source,
+            state,
+            observed_at_ms,
+            cursor,
+            persistent_volume,
+            persistent_volume_uid,
+            canonical_device,
+        } = expectation;
+        validate_sha256("raw disk-state response", &self.response_sha256)?;
+        ensure!(
+            self.response_sha256 == sha256_bytes(self.response_body.as_bytes()),
+            "raw disk-state response digest does not match its captured body"
+        );
+        let response = serde_json::from_str::<RawDiskStateResponse>(&self.response_body)
+            .context("decode raw disk-state response")?;
+        match (source, response) {
+            (
+                DiskAbsenceWatchSource::KubernetesController,
+                RawDiskStateResponse::KubernetesController {
+                    observed_at_ms: raw_observed_at_ms,
+                    persistent_volume: raw_persistent_volume,
+                    persistent_volume_uid: raw_persistent_volume_uid,
+                    raw_response_sha256,
+                    raw_response_body,
+                },
+            ) => {
+                validate_sha256("raw Kubernetes response", &raw_response_sha256)?;
+                ensure!(
+                    raw_response_sha256 == sha256_bytes(raw_response_body.as_bytes()),
+                    "raw Kubernetes response digest does not match its captured body"
+                );
+                let list =
+                    serde_json::from_str::<KubernetesVolumeAttachmentList>(&raw_response_body)
+                        .context("decode raw Kubernetes VolumeAttachmentList")?;
+                let matching_attachments = list
+                    .items
+                    .iter()
+                    .filter(|item| item.spec.source.persistent_volume_name == persistent_volume)
+                    .collect::<Vec<_>>();
+                let attachment_count_matches = match state {
+                    DiskPresenceState::Present => {
+                        matches!(matching_attachments.as_slice(), [attachment] if attachment.status.attached)
+                    }
+                    DiskPresenceState::Absent => matching_attachments.is_empty(),
+                };
+                ensure!(
+                    list.api_version == "storage.k8s.io/v1"
+                        && list.kind == "VolumeAttachmentList"
+                        && raw_observed_at_ms == observed_at_ms
+                        && raw_persistent_volume == persistent_volume
+                        && raw_persistent_volume_uid == persistent_volume_uid
+                        && !list.metadata.resource_version.trim().is_empty()
+                        && list.metadata.resource_version == cursor
+                        && list
+                            .items
+                            .iter()
+                            .all(|item| !item.metadata.uid.trim().is_empty())
+                        && list
+                            .items
+                            .iter()
+                            .map(|item| item.metadata.uid.as_str())
+                            .collect::<BTreeSet<_>>()
+                            .len()
+                            == list.items.len()
+                        && attachment_count_matches,
+                    "raw Kubernetes VolumeAttachment list does not prove the claimed disk state"
+                );
+            }
+            (
+                DiskAbsenceWatchSource::HostDevice,
+                RawDiskStateResponse::HostDevice {
+                    argv,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    observed_at_ms: raw_observed_at_ms,
+                    canonical_device: raw_canonical_device,
+                },
+            ) => {
+                let expected_argv = vec![
+                    "findmnt".to_string(),
+                    "-rn".to_string(),
+                    "-o".to_string(),
+                    "SOURCE".to_string(),
+                    "--source".to_string(),
+                    canonical_device.to_string(),
+                ];
+                let command_result_matches = match state {
+                    DiskPresenceState::Present => {
+                        exit_code == 0
+                            && stdout.trim() == canonical_device
+                            && stderr.trim().is_empty()
+                    }
+                    DiskPresenceState::Absent => {
+                        exit_code == 1 && stdout.trim().is_empty() && stderr.trim().is_empty()
+                    }
+                };
+                ensure!(
+                    cursor == self.response_sha256
+                        && raw_observed_at_ms == observed_at_ms
+                        && raw_canonical_device == canonical_device
+                        && argv == expected_argv
+                        && command_result_matches,
+                    "raw host findmnt result does not prove the claimed disk state"
+                );
+            }
+            _ => anyhow::bail!("raw disk-state evidence source does not match its observer"),
+        }
+        Ok(())
+    }
 }
 
 impl DiskAbsenceObservation {
     fn validate_captured_watches(
         &self,
+        detach_started_at_ms: u64,
         detached_at_ms: u64,
         mutation_window_ended_at_ms: u64,
+        reattach_started_at_ms: u64,
     ) -> Result<()> {
         for (expected_source, evidence) in [
             (
@@ -500,6 +741,7 @@ impl DiskAbsenceObservation {
                 response.observation_id == self.observation_id
                     && response.detachment_operation_id == self.detachment_operation_id
                     && response.source == expected_source
+                    && response.persistent_volume == self.persistent_volume
                     && response.persistent_volume_uid == self.persistent_volume_uid
                     && response.canonical_device == self.canonical_device
                     && response.filesystem_uuid == self.filesystem_uuid
@@ -515,35 +757,56 @@ impl DiskAbsenceObservation {
                     && !response.end_cursor.trim().is_empty()
                     && response.start_cursor != response.end_cursor
                     && response.closed_normally
-                    && response.watch_started_at_ms <= detached_at_ms
+                    && response.watch_started_at_ms <= detach_started_at_ms
                     && response.watch_ended_at_ms >= mutation_window_ended_at_ms
+                    && response.watch_ended_at_ms < reattach_started_at_ms
                     && response.watch_started_at_ms < response.watch_ended_at_ms,
-                "disk-absence watch lacks a continuous cursor interval spanning mutations"
+                "disk-absence watch lacks a non-overlapping cursor interval from detach through mutations"
             );
-            let mut state = response.initial_state;
-            let mut previous_at_ms = response.watch_started_at_ms;
-            let mut observed_absence_by_detach = state == DiskPresenceState::Absent;
-            for event in &response.events {
-                ensure!(
-                    !event.cursor.trim().is_empty()
-                        && event.observed_at_ms >= previous_at_ms
-                        && event.observed_at_ms <= response.watch_ended_at_ms,
-                    "disk-absence watch events are not ordered inside the captured interval"
-                );
-                state = event.state;
-                previous_at_ms = event.observed_at_ms;
-                if event.observed_at_ms <= detached_at_ms && state == DiskPresenceState::Absent {
-                    observed_absence_by_detach = true;
-                }
-                ensure!(
-                    event.observed_at_ms <= detached_at_ms || state == DiskPresenceState::Absent,
-                    "disk became present during the mutation window"
-                );
-            }
+            response
+                .initial_evidence
+                .validate(RawDiskStateExpectation {
+                    source: expected_source,
+                    state: response.initial_state,
+                    observed_at_ms: response.watch_started_at_ms,
+                    cursor: &response.start_cursor,
+                    persistent_volume: &response.persistent_volume,
+                    persistent_volume_uid: &response.persistent_volume_uid,
+                    canonical_device: &response.canonical_device,
+                })?;
+            let [absence_event] = response.events.as_slice() else {
+                anyhow::bail!(
+                    "disk-absence watch must contain one authoritative present-to-absent transition"
+                )
+            };
             ensure!(
-                observed_absence_by_detach && state == DiskPresenceState::Absent,
-                "disk-absence watch never observed and maintained the detached state"
+                response.initial_state == DiskPresenceState::Present
+                    && absence_event.state == DiskPresenceState::Absent
+                    && !absence_event.cursor.trim().is_empty()
+                    && absence_event.observed_at_ms >= detach_started_at_ms
+                    && absence_event.observed_at_ms <= detached_at_ms,
+                "disk-absence watch does not prove one detach-time present-to-absent transition"
             );
+            absence_event
+                .raw_evidence
+                .validate(RawDiskStateExpectation {
+                    source: expected_source,
+                    state: absence_event.state,
+                    observed_at_ms: absence_event.observed_at_ms,
+                    cursor: &absence_event.cursor,
+                    persistent_volume: &response.persistent_volume,
+                    persistent_volume_uid: &response.persistent_volume_uid,
+                    canonical_device: &response.canonical_device,
+                })?;
+            response.final_evidence.validate(RawDiskStateExpectation {
+                source: expected_source,
+                state: DiskPresenceState::Absent,
+                observed_at_ms: response.watch_ended_at_ms,
+                cursor: &response.end_cursor,
+                persistent_volume: &response.persistent_volume,
+                persistent_volume_uid: &response.persistent_volume_uid,
+                canonical_device: &response.canonical_device,
+            })?;
         }
         Ok(())
     }
@@ -566,24 +829,97 @@ impl PostReturnCheckerEvidence {
         &self,
         identity: &StorageRecoveryArtifactIdentity,
         returned_generation_observed_at_ms: u64,
-        minimum_committed_versions: usize,
+        committed_mutations: &[CommittedMutationEvidence],
+        history: &[OperationRecord],
     ) -> Result<()> {
         validate_sha256("post-return checker response", &self.response_sha256)?;
         ensure!(
             self.response_sha256 == sha256_bytes(self.response_body.as_bytes()),
             "post-return checker digest does not match its captured response body"
         );
-        let report = serde_json::from_str::<CheckerReport>(&self.response_body)
+        let receipt = serde_json::from_str::<RustfsPostReturnCheckerReceipt>(&self.response_body)
+            .context("decode captured post-return checker receipt")?;
+        validate_sha256(
+            "post-return history snapshot",
+            &receipt.history_snapshot_sha256,
+        )?;
+        validate_sha256("post-return checker report", &receipt.checker_report_sha256)?;
+        ensure!(
+            receipt.bucket == identity.bucket
+                && receipt.started_at_ms > returned_generation_observed_at_ms
+                && receipt.started_at_ms < receipt.completed_at_ms
+                && history
+                    .iter()
+                    .map(|record| record.ended_at_ms)
+                    .max()
+                    .is_some_and(|last_operation_at_ms| {
+                        last_operation_at_ms < receipt.started_at_ms
+                    })
+                && receipt.history_snapshot_sha256 == operation_history_sha256(history)?
+                && receipt.checker_report_sha256
+                    == sha256_bytes(receipt.checker_report_body.as_bytes()),
+            "post-return checker receipt is not bound to this bucket, history snapshot, and post-return interval"
+        );
+        let report = serde_json::from_str::<CheckerReport>(&receipt.checker_report_body)
             .context("decode captured post-return checker report")?;
+        let history_by_id = history
+            .iter()
+            .map(|record| (record.id.as_str(), record))
+            .collect::<HashMap<_, _>>();
+        let mut expected_version_checks = committed_mutations
+            .iter()
+            .map(|mutation| {
+                let record = history_by_id
+                    .get(mutation.operation_id.as_str())
+                    .copied()
+                    .context("post-return checker mutation is absent from its history snapshot")?;
+                Ok(PostReturnVersionCheck {
+                    object_key: mutation.object_key.clone(),
+                    version_id: mutation.version_id.clone(),
+                    kind: mutation.kind,
+                    expected_sha256: match mutation.kind {
+                        StaleMutationKind::Overwrite => record.value_sha256.clone(),
+                        StaleMutationKind::DeleteMarker => None,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        expected_version_checks.sort();
+        let mut checked_versions = receipt.checked_versions.clone();
+        checked_versions.sort();
+        ensure!(
+            checked_versions.windows(2).all(|pair| pair[0] != pair[1])
+                && checked_versions == expected_version_checks,
+            "post-return checker did not consume the exact stale-window version and delete-marker identities"
+        );
+        let expected_committed_versions = history
+            .iter()
+            .filter(|record| {
+                record_matches_identity(record, identity)
+                    && matches!(
+                        record.kind,
+                        OperationKind::Put
+                            | OperationKind::CompleteMultipartUpload
+                            | OperationKind::Delete
+                    )
+                    && record.outcome == OperationOutcome::Ok
+                    && record
+                        .http_status
+                        .is_some_and(|status| (200..300).contains(&status))
+                    && record
+                        .version_id
+                        .as_deref()
+                        .is_some_and(|version_id| !version_id.is_empty() && version_id != "null")
+            })
+            .count();
         report.require_success()?;
         ensure!(
-            self.observed_at_ms > returned_generation_observed_at_ms
-                && report.scenario == identity.scenario
+            report.scenario == identity.scenario
                 && report.run_id == identity.run_id
                 && report.tenant_recovered
                 && report.versioning_expected
                 && report.expected_live_objects == report.verified_live_objects
-                && report.expected_committed_versions >= minimum_committed_versions
+                && report.expected_committed_versions == expected_committed_versions
                 && report.verified_committed_versions == report.expected_committed_versions
                 && report.committed_writes_missing_version_id_count == 0
                 && report.missing_committed_objects.is_empty()
@@ -701,7 +1037,7 @@ impl StaleDiskReturnProof {
                 && self.detachment_operation_id != self.reattachment_operation_id,
             "stale-disk proof requires distinct detach and reattach operation identities"
         );
-        self.validate_lifecycle_evidence()?;
+        let (detach_receipt, reattach_receipt) = self.validate_lifecycle_evidence()?;
         ensure!(
             !self.absence_observations.is_empty(),
             "stale-disk proof has no runtime absence observations"
@@ -717,6 +1053,7 @@ impl StaleDiskReturnProof {
             );
             ensure!(
                 observation.detachment_operation_id == self.detachment_operation_id
+                    && observation.persistent_volume == self.detached_generation.persistent_volume
                     && observation.persistent_volume_uid
                         == self.detached_generation.persistent_volume_uid
                     && observation.canonical_device == self.detached_generation.canonical_device
@@ -736,8 +1073,12 @@ impl StaleDiskReturnProof {
                     && observation.watch_ended_at_ms > observation.watch_started_at_ms,
                 "stale-disk absence watch does not continuously prove controller and node absence across the mutation window"
             );
-            observation
-                .validate_captured_watches(self.detached_at_ms, self.mutation_window_ended_at_ms)?;
+            observation.validate_captured_watches(
+                detach_receipt.started_at_ms,
+                self.detached_at_ms,
+                self.mutation_window_ended_at_ms,
+                reattach_receipt.started_at_ms,
+            )?;
         }
         ensure!(
             !self.committed_mutations.is_empty(),
@@ -843,28 +1184,64 @@ impl StaleDiskReturnProof {
         self.post_return_checker.validate(
             &self.identity,
             self.returned_generation.observed_at_ms,
-            self.committed_mutations.len(),
+            &self.committed_mutations,
+            history,
         )?;
         Ok(())
     }
 
-    fn validate_lifecycle_evidence(&self) -> Result<()> {
+    fn validate_lifecycle_evidence(
+        &self,
+    ) -> Result<(
+        RustfsStaleDiskOperationReceipt,
+        RustfsStaleDiskOperationReceipt,
+    )> {
         let detach = self.lifecycle_evidence.detach.receipt()?;
         let reattach = self.lifecycle_evidence.reattach.receipt()?;
         for receipt in [&detach, &reattach] {
             ensure!(
-                receipt.persistent_volume_uid == self.detached_generation.persistent_volume_uid
+                receipt.persistent_volume == self.detached_generation.persistent_volume
+                    && receipt.persistent_volume_uid
+                        == self.detached_generation.persistent_volume_uid
                     && receipt.canonical_device == self.detached_generation.canonical_device
                     && receipt.filesystem_uuid == self.detached_generation.filesystem_uuid
                     && receipt.rustfs_drive_uuid == self.detached_generation.rustfs_drive_uuid
                     && receipt.target_proof_sha256 == self.detached_generation.target_proof_sha256
                     && receipt.host_storage_proof_sha256
                         == self.detached_generation.host_storage_proof_sha256
-                    && receipt.succeeded
                     && receipt.started_at_ms > 0
                     && receipt.started_at_ms < receipt.completed_at_ms,
                 "stale-disk lifecycle receipt is not bound to the detached storage generation"
             );
+        }
+        for (receipt, state) in [
+            (&detach, DiskPresenceState::Absent),
+            (&reattach, DiskPresenceState::Present),
+        ] {
+            let controller_cursor = receipt.controller_result_evidence.cursor()?;
+            receipt
+                .controller_result_evidence
+                .validate(RawDiskStateExpectation {
+                    source: DiskAbsenceWatchSource::KubernetesController,
+                    state,
+                    observed_at_ms: receipt.completed_at_ms,
+                    cursor: &controller_cursor,
+                    persistent_volume: &receipt.persistent_volume,
+                    persistent_volume_uid: &receipt.persistent_volume_uid,
+                    canonical_device: &receipt.canonical_device,
+                })?;
+            let host_cursor = receipt.host_result_evidence.cursor()?;
+            receipt
+                .host_result_evidence
+                .validate(RawDiskStateExpectation {
+                    source: DiskAbsenceWatchSource::HostDevice,
+                    state,
+                    observed_at_ms: receipt.completed_at_ms,
+                    cursor: &host_cursor,
+                    persistent_volume: &receipt.persistent_volume,
+                    persistent_volume_uid: &receipt.persistent_volume_uid,
+                    canonical_device: &receipt.canonical_device,
+                })?;
         }
         ensure!(
             detach.operation_id == self.detachment_operation_id
@@ -877,7 +1254,7 @@ impl StaleDiskReturnProof {
                 && reattach.completed_at_ms == self.returned_at_ms,
             "captured detach and reattach receipts do not bound the mutation window"
         );
-        Ok(())
+        Ok((detach, reattach))
     }
 }
 
@@ -1299,6 +1676,13 @@ impl ShardMutationProof {
         let matching_topologies = proof
             .faults
             .iter()
+            .filter(|fault| {
+                fault.kind == "rustfs-on-disk-bitrot"
+                    && fault.backend == "host"
+                    && fault.target_kind == "rustfs-shard"
+                    && fault.selection_kind == "fixed-targets"
+                    && fault.selection_value == 1
+            })
             .filter_map(|fault| fault.erasure_set.as_ref())
             .filter(|topology| {
                 topology.required
@@ -1906,6 +2290,7 @@ impl ForceReadThroughProof {
                     && !mapping.api_revision.trim().is_empty()
                     && mapping.target_proof_sha256 == self.target_proof_sha256
                     && mapping.observed_at_ms > 0
+                    && mapping.observed_at_ms >= runtime.target_proof.generated_at_ms
                     && mapping.observed_at_ms < self.fault_active_from_ms
                     && self.fault_active_from_ms - mapping.observed_at_ms
                         <= STORAGE_OBSERVATION_MAX_AGE_MS,
@@ -2490,9 +2875,19 @@ impl ForceReadThroughProof {
 }
 
 /// Complete evidence chain required to prove one on-disk bitrot recovery attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CorruptionWindowProbe {
+    pub operation_id: String,
+    pub object_key: String,
+    pub version_id: String,
+    pub expected_sha256: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BitrotRecoveryCaseEvidence<'a> {
     pub mutation: &'a ShardMutationProof,
+    pub corruption_probe: &'a CorruptionWindowProbe,
     pub heal: &'a HealSummary,
     pub heal_samples: &'a [HealProgressSample],
     pub force_read: &'a ForceReadThroughProof,
@@ -2506,6 +2901,7 @@ pub struct BitrotRecoveryCaseEvidence<'a> {
 pub fn validate_bitrot_recovery_case(evidence: &BitrotRecoveryCaseEvidence<'_>) -> Result<()> {
     let BitrotRecoveryCaseEvidence {
         mutation,
+        corruption_probe,
         heal,
         heal_samples,
         force_read,
@@ -2536,6 +2932,13 @@ pub fn validate_bitrot_recovery_case(evidence: &BitrotRecoveryCaseEvidence<'_>) 
         }
     };
     heal.validate_progress(heal_samples, expected_heal_target)?;
+    validate_bitrot_object_evidence(
+        mutation,
+        corruption_probe,
+        heal.started_at_ms,
+        force_read,
+        history,
+    )?;
     validate_bitrot_target_proof_phases(
         &mutation.volume.target_proof_sha256,
         mutation_target_proof.generated_at_ms,
@@ -2560,6 +2963,69 @@ pub fn validate_bitrot_recovery_case(evidence: &BitrotRecoveryCaseEvidence<'_>) 
         host_receipt.rollback_pwrite_started_at_ms,
         mutation.rollback.observed_at_ms,
     )?;
+    Ok(())
+}
+
+fn validate_bitrot_object_evidence(
+    mutation: &ShardMutationProof,
+    corruption_probe: &CorruptionWindowProbe,
+    heal_started_at_ms: u64,
+    force_read: &ForceReadThroughProof,
+    history: &[OperationRecord],
+) -> Result<()> {
+    validate_sha256(
+        "corruption-window expected object",
+        &corruption_probe.expected_sha256,
+    )?;
+    ensure!(
+        !corruption_probe.operation_id.trim().is_empty()
+            && corruption_probe.object_key == mutation.object_key
+            && corruption_probe.version_id == mutation.version_id
+            && corruption_probe.expected_sha256 == mutation.expected_object_sha256,
+        "corruption-window probe does not target the mutated object version"
+    );
+    let matching_records = history
+        .iter()
+        .filter(|record| record.id == corruption_probe.operation_id)
+        .collect::<Vec<_>>();
+    let [record] = matching_records.as_slice() else {
+        anyhow::bail!("corruption-window probe must match one workload history record")
+    };
+    let clean_read = record.outcome == OperationOutcome::Ok
+        && record
+            .http_status
+            .is_some_and(|status| (200..300).contains(&status))
+        && record.value_sha256.as_deref() == Some(corruption_probe.expected_sha256.as_str())
+        && record.error.is_none();
+    let clean_rejection = record.outcome == OperationOutcome::Failed
+        && record
+            .http_status
+            .is_some_and(|status| (500..600).contains(&status))
+        && record.value_sha256.is_none()
+        && record
+            .error
+            .as_deref()
+            .is_some_and(|error| !error.trim().is_empty());
+    ensure!(
+        record_matches_identity(record, &mutation.identity)
+            && record.kind == OperationKind::Get
+            && record.key.as_deref() == Some(mutation.object_key.as_str())
+            && record.version_id.as_deref() == Some(mutation.version_id.as_str())
+            && valid_operation_interval(record)
+            && record.started_at_ms > mutation.mutated_at_ms
+            && record.ended_at_ms < heal_started_at_ms
+            && (clean_read || clean_rejection),
+        "corruption-window GET neither returned the committed bytes nor rejected the damaged shard cleanly"
+    );
+    ensure!(
+        force_read.probes.iter().any(|probe| {
+            probe.object_key == mutation.object_key
+                && probe.version_id == mutation.version_id
+                && probe.expected_sha256 == mutation.expected_object_sha256
+                && probe.observed_sha256 == mutation.expected_object_sha256
+        }),
+        "post-heal exact-quorum reads do not include the mutated object version"
+    );
     Ok(())
 }
 
@@ -3371,6 +3837,10 @@ fn inventory_entries_sha256(entries: &[ShardInventoryEntry]) -> Result<String> {
     Ok(sha256_bytes(&encoded))
 }
 
+fn operation_history_sha256(history: &[OperationRecord]) -> Result<String> {
+    Ok(sha256_bytes(&serde_json::to_vec(history)?))
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -3453,6 +3923,11 @@ mod tests {
     }
 
     fn mutation_target_proof_body(volume: &StorageVolumeIdentity) -> String {
+        let target_index = volume
+            .pod
+            .strip_prefix("rustfs-")
+            .and_then(|index| index.parse::<usize>().ok())
+            .expect("indexed RustFS Pod name");
         let shape = ErasureSetShape {
             pool_index: volume.pool_index,
             set_index: volume.set_index,
@@ -3468,7 +3943,7 @@ mod tests {
                 .map(|index| ErasureSetMember {
                     pod_name: format!("rustfs-{index}"),
                     server_endpoint: format!("http://rustfs-{index}:9000"),
-                    shard_ids: vec![if index == 0 {
+                    shard_ids: vec![if index == target_index {
                         volume.rustfs_drive_uuid.clone()
                     } else {
                         format!("drive-{index}")
@@ -3548,6 +4023,134 @@ mod tests {
         .expect("mutation target proof")
     }
 
+    fn rebind_mutation_target_proof(proof: &mut ShardMutationProof, body: String) {
+        let sha256 = sha256_bytes(body.as_bytes());
+        proof.mutation_target_proof_body = body;
+        proof.volume.target_proof_sha256 = sha256.clone();
+        proof.path_containment.target_proof_sha256 = sha256.clone();
+        proof.rollback.target_proof_sha256 = sha256.clone();
+        let evidence = proof
+            .host_mutation_evidence
+            .as_mut()
+            .expect("host mutation evidence");
+        let mut receipt = serde_json::from_str::<ShardMutationHostReceipt>(&evidence.response_body)
+            .expect("host mutation receipt");
+        receipt.target_proof_sha256 = sha256;
+        evidence.response_body = serde_json::to_string(&receipt).expect("host mutation receipt");
+        evidence.response_sha256 = sha256_bytes(evidence.response_body.as_bytes());
+    }
+
+    fn bitrot_mutation_proof(
+        mut volume: StorageVolumeIdentity,
+        object_key: &str,
+        version_id: &str,
+        mapped_at_ms: u64,
+        mutated_at_ms: u64,
+        rollback_pwrite_started_at_ms: u64,
+        rollback_observed_at_ms: u64,
+    ) -> ShardMutationProof {
+        let target_proof_body = mutation_target_proof_body(&volume);
+        let target_proof_sha256 = sha256_bytes(target_proof_body.as_bytes());
+        volume.target_proof_sha256 = target_proof_sha256.clone();
+        let shard_path = format!("{}/.rustfs/shard", volume.mount_path);
+        let mapping_response = serde_json::to_string(&RustfsShardMutationMappingResponse {
+            bucket: "bucket-1".to_string(),
+            object_key: object_key.to_string(),
+            version_id: version_id.to_string(),
+            object_sha256: HASH_A.to_string(),
+            drive_uuid: volume.rustfs_drive_uuid.clone(),
+            shard_path: shard_path.clone(),
+            shard_device_id: "259:0".to_string(),
+            shard_inode: 42,
+            shard_size_bytes: 8192,
+        })
+        .expect("shard mapping response");
+        let path_response = serde_json::to_string(&Openat2PathResolutionReceipt {
+            method: ShardPathResolutionMethod::Openat2BeneathNoSymlinksNoXdev,
+            requested_path: shard_path.clone(),
+            canonical_mount_path: volume.mount_path.clone(),
+            mount_canonical_device: volume.canonical_device.clone(),
+            mount_filesystem_uuid: volume.filesystem_uuid.clone(),
+            resolved_path: shard_path.clone(),
+            mount_device_id: "259:0".to_string(),
+            returned_fd_device_id: "259:0".to_string(),
+            returned_fd_inode: 42,
+        })
+        .expect("openat2 path receipt");
+        let host_mutation_response = serde_json::to_string(&ShardMutationHostReceipt {
+            shard_path: shard_path.clone(),
+            shard_device_id: "259:0".to_string(),
+            shard_inode: 42,
+            shard_size_bytes: 8192,
+            byte_offset: 4096,
+            byte_length: 1,
+            original_sha256: HASH_A.to_string(),
+            mutated_sha256: HASH_B.to_string(),
+            rollback_sha256: HASH_A.to_string(),
+            original_observed_at_ms: mapped_at_ms,
+            pwrite_completed_at_ms: mutated_at_ms,
+            mutation_fsync_completed_at_ms: mutated_at_ms,
+            mutation_fstat_observed_at_ms: mutated_at_ms,
+            mutated_readback_at_ms: mutated_at_ms,
+            rollback_pwrite_started_at_ms,
+            rollback_pwrite_completed_at_ms: rollback_pwrite_started_at_ms,
+            rollback_fsync_completed_at_ms: rollback_pwrite_started_at_ms,
+            rollback_fstat_observed_at_ms: rollback_observed_at_ms,
+            rollback_readback_at_ms: rollback_observed_at_ms,
+            pwrite_bytes: 1,
+            rollback_pwrite_bytes: 1,
+            mutation_fsync_succeeded: true,
+            rollback_fsync_succeeded: true,
+            target_proof_sha256: target_proof_sha256.clone(),
+            host_storage_proof_sha256: volume.host_storage_proof_sha256.clone(),
+        })
+        .expect("host mutation receipt");
+        ShardMutationProof {
+            schema_version: STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
+            identity: identity("on-disk-bitrot"),
+            mapping_source: ShardMappingSource::RustfsDiagnosticApi,
+            mapping_api_revision: "v1".to_string(),
+            mapping_response_sha256: sha256_bytes(mapping_response.as_bytes()),
+            mapping_response_body: mapping_response,
+            object_key: object_key.to_string(),
+            version_id: version_id.to_string(),
+            expected_object_sha256: HASH_A.to_string(),
+            volume: volume.clone(),
+            mutation_target_proof_body: target_proof_body,
+            shard_path: shard_path.clone(),
+            shard_device_id: "259:0".to_string(),
+            shard_inode: 42,
+            shard_size_bytes: 8192,
+            path_containment: ShardPathContainmentProof {
+                observed_at_ms: mapped_at_ms,
+                resolver_evidence_sha256: sha256_bytes(path_response.as_bytes()),
+                resolver_response_body: path_response,
+                target_proof_sha256: target_proof_sha256.clone(),
+                host_storage_proof_sha256: volume.host_storage_proof_sha256.clone(),
+            },
+            byte_offset: 4096,
+            byte_length: 1,
+            original_sha256: HASH_A.to_string(),
+            mutated_sha256: HASH_B.to_string(),
+            host_mutation_evidence: Some(ShardMutationHostEvidence {
+                response_sha256: sha256_bytes(host_mutation_response.as_bytes()),
+                response_body: host_mutation_response,
+            }),
+            rollback: ShardRollbackObservation {
+                shard_path,
+                shard_device_id: "259:0".to_string(),
+                shard_inode: 42,
+                shard_size_bytes: 8192,
+                observed_sha256: HASH_A.to_string(),
+                observed_at_ms: rollback_observed_at_ms,
+                target_proof_sha256,
+                host_storage_proof_sha256: volume.host_storage_proof_sha256,
+            },
+            mapped_at_ms,
+            mutated_at_ms,
+        }
+    }
+
     fn empty_observation(
         replacement: &StorageVolumeIdentity,
         observed_at_ms: u64,
@@ -3575,6 +4178,74 @@ mod tests {
         }
     }
 
+    fn raw_disk_state_evidence(
+        generation: &StorageVolumeIdentity,
+        source: DiskAbsenceWatchSource,
+        state: DiskPresenceState,
+        observed_at_ms: u64,
+        controller_resource_version: &str,
+    ) -> RawDiskStateEvidence {
+        let response = match source {
+            DiskAbsenceWatchSource::KubernetesController => {
+                let raw_response_body = serde_json::to_string(&KubernetesVolumeAttachmentList {
+                    api_version: "storage.k8s.io/v1".to_string(),
+                    kind: "VolumeAttachmentList".to_string(),
+                    metadata: KubernetesListMetadata {
+                        resource_version: controller_resource_version.to_string(),
+                    },
+                    items: match state {
+                        DiskPresenceState::Present => vec![KubernetesVolumeAttachment {
+                            metadata: KubernetesObjectMetadata {
+                                uid: "attachment-uid".to_string(),
+                            },
+                            spec: KubernetesVolumeAttachmentSpec {
+                                source: KubernetesVolumeAttachmentSource {
+                                    persistent_volume_name: generation.persistent_volume.clone(),
+                                },
+                            },
+                            status: KubernetesVolumeAttachmentStatus { attached: true },
+                        }],
+                        DiskPresenceState::Absent => Vec::new(),
+                    },
+                })
+                .expect("raw Kubernetes VolumeAttachmentList");
+                RawDiskStateResponse::KubernetesController {
+                    observed_at_ms,
+                    persistent_volume: generation.persistent_volume.clone(),
+                    persistent_volume_uid: generation.persistent_volume_uid.clone(),
+                    raw_response_sha256: sha256_bytes(raw_response_body.as_bytes()),
+                    raw_response_body,
+                }
+            }
+            DiskAbsenceWatchSource::HostDevice => RawDiskStateResponse::HostDevice {
+                argv: vec![
+                    "findmnt".to_string(),
+                    "-rn".to_string(),
+                    "-o".to_string(),
+                    "SOURCE".to_string(),
+                    "--source".to_string(),
+                    generation.canonical_device.clone(),
+                ],
+                exit_code: match state {
+                    DiskPresenceState::Present => 0,
+                    DiskPresenceState::Absent => 1,
+                },
+                stdout: match state {
+                    DiskPresenceState::Present => generation.canonical_device.clone(),
+                    DiskPresenceState::Absent => String::new(),
+                },
+                stderr: String::new(),
+                observed_at_ms,
+                canonical_device: generation.canonical_device.clone(),
+            },
+        };
+        let response_body = serde_json::to_string(&response).expect("raw disk-state response");
+        RawDiskStateEvidence {
+            response_sha256: sha256_bytes(response_body.as_bytes()),
+            response_body,
+        }
+    }
+
     fn absence_observation(
         generation: &StorageVolumeIdentity,
         observation_id: &str,
@@ -3585,10 +4256,36 @@ mod tests {
                 DiskAbsenceWatchSource::KubernetesController => "controller",
                 DiskAbsenceWatchSource::HostDevice => "host-device",
             };
+            let initial_evidence = raw_disk_state_evidence(
+                generation,
+                source,
+                DiskPresenceState::Present,
+                watch_started_at_ms,
+                &format!("{source_name}-rv-1"),
+            );
+            let absence_evidence = raw_disk_state_evidence(
+                generation,
+                source,
+                DiskPresenceState::Absent,
+                200,
+                &format!("{source_name}-rv-detached"),
+            );
+            let final_evidence = raw_disk_state_evidence(
+                generation,
+                source,
+                DiskPresenceState::Absent,
+                400,
+                &format!("{source_name}-rv-2"),
+            );
+            let cursor = |evidence: &RawDiskStateEvidence, controller: &str| match source {
+                DiskAbsenceWatchSource::KubernetesController => controller.to_string(),
+                DiskAbsenceWatchSource::HostDevice => evidence.response_sha256.clone(),
+            };
             let response = serde_json::to_string(&RustfsDiskAbsenceWatchResponse {
                 observation_id: observation_id.to_string(),
                 detachment_operation_id: "detach-1".to_string(),
                 source,
+                persistent_volume: generation.persistent_volume.clone(),
                 persistent_volume_uid: generation.persistent_volume_uid.clone(),
                 canonical_device: generation.canonical_device.clone(),
                 filesystem_uuid: generation.filesystem_uuid.clone(),
@@ -3597,14 +4294,17 @@ mod tests {
                 host_storage_proof_sha256: generation.host_storage_proof_sha256.clone(),
                 watch_started_at_ms,
                 watch_ended_at_ms: 400,
-                start_cursor: format!("{source_name}-rv-1"),
-                end_cursor: format!("{source_name}-rv-2"),
+                start_cursor: cursor(&initial_evidence, &format!("{source_name}-rv-1")),
+                end_cursor: cursor(&final_evidence, &format!("{source_name}-rv-2")),
                 initial_state: DiskPresenceState::Present,
+                initial_evidence,
                 events: vec![DiskPresenceEvent {
-                    cursor: format!("{source_name}-rv-detached"),
+                    cursor: cursor(&absence_evidence, &format!("{source_name}-rv-detached")),
                     observed_at_ms: 200,
                     state: DiskPresenceState::Absent,
+                    raw_evidence: absence_evidence,
                 }],
+                final_evidence,
                 closed_normally: true,
             })
             .expect("disk-absence watch response");
@@ -3616,6 +4316,7 @@ mod tests {
         DiskAbsenceObservation {
             observation_id: observation_id.to_string(),
             detachment_operation_id: "detach-1".to_string(),
+            persistent_volume: generation.persistent_volume.clone(),
             persistent_volume_uid: generation.persistent_volume_uid.clone(),
             canonical_device: generation.canonical_device.clone(),
             filesystem_uuid: generation.filesystem_uuid.clone(),
@@ -3629,6 +4330,47 @@ mod tests {
         }
     }
 
+    fn set_absence_watch_end(
+        observation: &mut DiskAbsenceObservation,
+        generation: &StorageVolumeIdentity,
+        watch_ended_at_ms: u64,
+    ) {
+        observation.watch_ended_at_ms = watch_ended_at_ms;
+        for (source, evidence, resource_version) in [
+            (
+                DiskAbsenceWatchSource::KubernetesController,
+                &mut observation.controller_watch_evidence,
+                "controller-rv-final",
+            ),
+            (
+                DiskAbsenceWatchSource::HostDevice,
+                &mut observation.node_watch_evidence,
+                "unused-host-rv",
+            ),
+        ] {
+            let mut response =
+                serde_json::from_str::<RustfsDiskAbsenceWatchResponse>(&evidence.response_body)
+                    .expect("disk-absence watch response");
+            response.watch_ended_at_ms = watch_ended_at_ms;
+            response.final_evidence = raw_disk_state_evidence(
+                generation,
+                source,
+                DiskPresenceState::Absent,
+                watch_ended_at_ms,
+                resource_version,
+            );
+            response.end_cursor = match source {
+                DiskAbsenceWatchSource::KubernetesController => resource_version.to_string(),
+                DiskAbsenceWatchSource::HostDevice => {
+                    response.final_evidence.response_sha256.clone()
+                }
+            };
+            evidence.response_body =
+                serde_json::to_string(&response).expect("disk-absence watch response");
+            evidence.response_sha256 = sha256_bytes(evidence.response_body.as_bytes());
+        }
+    }
+
     fn stale_disk_lifecycle_evidence(
         generation: &StorageVolumeIdentity,
     ) -> StaleDiskLifecycleEvidence {
@@ -3636,9 +4378,14 @@ mod tests {
                          action: StaleDiskLifecycleAction,
                          started_at_ms: u64,
                          completed_at_ms: u64| {
+            let state = match action {
+                StaleDiskLifecycleAction::Detach => DiskPresenceState::Absent,
+                StaleDiskLifecycleAction::Reattach => DiskPresenceState::Present,
+            };
             let response = serde_json::to_string(&RustfsStaleDiskOperationReceipt {
                 operation_id: operation_id.to_string(),
                 action,
+                persistent_volume: generation.persistent_volume.clone(),
                 persistent_volume_uid: generation.persistent_volume_uid.clone(),
                 canonical_device: generation.canonical_device.clone(),
                 filesystem_uuid: generation.filesystem_uuid.clone(),
@@ -3647,7 +4394,20 @@ mod tests {
                 host_storage_proof_sha256: generation.host_storage_proof_sha256.clone(),
                 started_at_ms,
                 completed_at_ms,
-                succeeded: true,
+                controller_result_evidence: raw_disk_state_evidence(
+                    generation,
+                    DiskAbsenceWatchSource::KubernetesController,
+                    state,
+                    completed_at_ms,
+                    &format!("{operation_id}-rv"),
+                ),
+                host_result_evidence: raw_disk_state_evidence(
+                    generation,
+                    DiskAbsenceWatchSource::HostDevice,
+                    state,
+                    completed_at_ms,
+                    "unused-host-cursor",
+                ),
             })
             .expect("stale-disk operation receipt");
             StaleDiskOperationEvidence {
@@ -3661,7 +4421,44 @@ mod tests {
         }
     }
 
-    fn post_return_checker(expected_versions: usize) -> PostReturnCheckerEvidence {
+    fn post_return_checker(history: &[OperationRecord]) -> PostReturnCheckerEvidence {
+        let checked_versions = history
+            .iter()
+            .filter(|record| record.ended_at_ms <= 400)
+            .filter_map(|record| {
+                let kind = match record.kind {
+                    OperationKind::Put | OperationKind::CompleteMultipartUpload => {
+                        StaleMutationKind::Overwrite
+                    }
+                    OperationKind::Delete => StaleMutationKind::DeleteMarker,
+                    _ => return None,
+                };
+                Some(PostReturnVersionCheck {
+                    object_key: record.key.clone().expect("versioned object key"),
+                    version_id: record.version_id.clone().expect("version id"),
+                    kind,
+                    expected_sha256: match kind {
+                        StaleMutationKind::Overwrite => record.value_sha256.clone(),
+                        StaleMutationKind::DeleteMarker => None,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        let expected_versions = history
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.kind,
+                    OperationKind::Put
+                        | OperationKind::CompleteMultipartUpload
+                        | OperationKind::Delete
+                ) && record.outcome == OperationOutcome::Ok
+                    && record
+                        .version_id
+                        .as_deref()
+                        .is_some_and(|version_id| !version_id.is_empty() && version_id != "null")
+            })
+            .count();
         let report = CheckerReport {
             scenario: "stale-disk-return-detect".to_string(),
             run_id: "run-1".to_string(),
@@ -3700,9 +4497,19 @@ mod tests {
             tenant_recovered: true,
             passed: true,
         };
-        let response_body = serde_json::to_string(&report).expect("post-return checker report");
+        let checker_report_body =
+            serde_json::to_string(&report).expect("post-return checker report");
+        let response_body = serde_json::to_string(&RustfsPostReturnCheckerReceipt {
+            bucket: "bucket-1".to_string(),
+            started_at_ms: 560,
+            completed_at_ms: 580,
+            history_snapshot_sha256: operation_history_sha256(history).expect("history snapshot"),
+            checked_versions,
+            checker_report_sha256: sha256_bytes(checker_report_body.as_bytes()),
+            checker_report_body,
+        })
+        .expect("post-return checker receipt");
         PostReturnCheckerEvidence {
-            observed_at_ms: 550,
             response_sha256: sha256_bytes(response_body.as_bytes()),
             response_body,
         }
@@ -3795,7 +4602,7 @@ mod tests {
                         absence_observation_id: "absence-watch".to_string(),
                     },
                 ],
-                post_return_checker: post_return_checker(2),
+                post_return_checker: post_return_checker(&history),
             },
             &history,
         )
@@ -4008,7 +4815,7 @@ mod tests {
                         absence_observation_id: "absence-watch".to_string(),
                     },
                 ],
-                post_return_checker: post_return_checker(3),
+                post_return_checker: post_return_checker(&history),
             },
             &history,
         )
@@ -4078,15 +4885,22 @@ mod tests {
         );
 
         let mut rolled_back_after_return = proof.clone();
-        let mut checker = serde_json::from_str::<CheckerReport>(
+        let mut checker_receipt = serde_json::from_str::<RustfsPostReturnCheckerReceipt>(
             &rolled_back_after_return.post_return_checker.response_body,
         )
-        .expect("post-return checker report");
+        .expect("post-return checker receipt");
+        let mut checker =
+            serde_json::from_str::<CheckerReport>(&checker_receipt.checker_report_body)
+                .expect("post-return checker report");
         checker
             .resurrected_deleted_objects
             .push("key-b".to_string());
-        rolled_back_after_return.post_return_checker.response_body =
+        checker_receipt.checker_report_body =
             serde_json::to_string(&checker).expect("post-return checker report");
+        checker_receipt.checker_report_sha256 =
+            sha256_bytes(checker_receipt.checker_report_body.as_bytes());
+        rolled_back_after_return.post_return_checker.response_body =
+            serde_json::to_string(&checker_receipt).expect("post-return checker receipt");
         rolled_back_after_return.post_return_checker.response_sha256 = sha256_bytes(
             rolled_back_after_return
                 .post_return_checker
@@ -4098,6 +4912,13 @@ mod tests {
                 .validate_against_history(&history)
                 .is_err(),
             "a self-consistent report cannot hide delete-marker resurrection after stale return"
+        );
+
+        let mut replayed_checker = proof.clone();
+        replayed_checker.post_return_checker = post_return_checker(&history[..1]);
+        assert!(
+            replayed_checker.validate_against_history(&history).is_err(),
+            "a clean checker receipt for an earlier history universe cannot be replayed after return"
         );
 
         let mut forged_detach = proof.clone();
@@ -4118,6 +4939,40 @@ mod tests {
         assert!(
             forged_detach.validate_against_history(&history).is_err(),
             "serialized timestamps cannot replace the captured detach receipt"
+        );
+
+        let mut overlapping_watch = proof.clone();
+        set_absence_watch_end(
+            &mut overlapping_watch.absence_observations[0],
+            &proof.detached_generation,
+            425,
+        );
+        assert!(
+            overlapping_watch
+                .validate_against_history(&history)
+                .is_err(),
+            "absence watch cannot overlap or equal reattach start"
+        );
+
+        let mut initially_absent = proof.clone();
+        let controller = &mut initially_absent.absence_observations[0].controller_watch_evidence;
+        let mut controller_response =
+            serde_json::from_str::<RustfsDiskAbsenceWatchResponse>(&controller.response_body)
+                .expect("controller watch response");
+        controller_response.initial_state = DiskPresenceState::Absent;
+        controller_response.initial_evidence = raw_disk_state_evidence(
+            &proof.detached_generation,
+            DiskAbsenceWatchSource::KubernetesController,
+            DiskPresenceState::Absent,
+            controller_response.watch_started_at_ms,
+            &controller_response.start_cursor,
+        );
+        controller.response_body =
+            serde_json::to_string(&controller_response).expect("controller watch response");
+        controller.response_sha256 = sha256_bytes(controller.response_body.as_bytes());
+        assert!(
+            initially_absent.validate_against_history(&history).is_err(),
+            "a watch that starts absent cannot prove the detach transition"
         );
 
         let mut scaled_proof = proof.clone();
@@ -4155,8 +5010,7 @@ mod tests {
                     absence_observation_id: "absence-watch".to_string(),
                 });
         }
-        scaled_proof.post_return_checker =
-            post_return_checker(scaled_proof.committed_mutations.len());
+        scaled_proof.post_return_checker = post_return_checker(&scaled_history);
         scaled_proof
             .validate_against_history(&scaled_history)
             .expect("large stale-return histories are indexed once");
@@ -4185,7 +5039,7 @@ mod tests {
                     acknowledged_at_ms: 300,
                     absence_observation_id: "absence-watch".to_string(),
                 }],
-                post_return_checker: post_return_checker(1),
+                post_return_checker: post_return_checker(&history[..1]),
             },
             &history[..1],
         )
@@ -4201,6 +5055,13 @@ mod tests {
             cursor: "controller-rv-reattached".to_string(),
             observed_at_ms: 300,
             state: DiskPresenceState::Present,
+            raw_evidence: raw_disk_state_evidence(
+                &volume("old", 100),
+                DiskAbsenceWatchSource::KubernetesController,
+                DiskPresenceState::Present,
+                300,
+                "controller-rv-reattached",
+            ),
         });
         reconnected.controller_watch_evidence.response_body =
             serde_json::to_string(&reconnected_response).expect("controller watch response");
@@ -4264,7 +5125,7 @@ mod tests {
                             absence_observation_id: "absence-watch".to_string(),
                         },
                     ],
-                    post_return_checker: post_return_checker(2),
+                    post_return_checker: post_return_checker(&history),
                 },
                 &history,
             )
@@ -4386,6 +5247,107 @@ mod tests {
         proof
             .validate_against_history(&history)
             .expect("valid bitrot proof");
+
+        let mut unauthorized_target = proof.clone();
+        let mut unauthorized_body = serde_json::from_str::<serde_json::Value>(
+            &unauthorized_target.mutation_target_proof_body,
+        )
+        .expect("mutation target proof");
+        unauthorized_body["faults"][0]["selectionValue"] = serde_json::json!(0);
+        rebind_mutation_target_proof(
+            &mut unauthorized_target,
+            serde_json::to_string(&unauthorized_body).expect("mutation target proof"),
+        );
+        assert!(
+            unauthorized_target
+                .validate_against_history(&history)
+                .is_err(),
+            "an unrelated or zero-target fault topology cannot authorize host shard mutation"
+        );
+
+        let corruption_probe = CorruptionWindowProbe {
+            operation_id: "bitrot-corruption-read".to_string(),
+            object_key: proof.object_key.clone(),
+            version_id: proof.version_id.clone(),
+            expected_sha256: proof.expected_object_sha256.clone(),
+        };
+        let mut corruption_history = history.clone();
+        corruption_history.push(history_record(
+            &corruption_probe.operation_id,
+            "on-disk-bitrot",
+            OperationKind::Get,
+            &proof.object_key,
+            &proof.version_id,
+            Some(HASH_A),
+            205,
+        ));
+        let force_read = ForceReadThroughProof {
+            schema_version: STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
+            identity: identity("on-disk-bitrot"),
+            shape: ErasureSetShape {
+                pool_index: 0,
+                set_index: 0,
+                server_count: 8,
+                volumes_per_server: 1,
+                total_shards: 8,
+                payload_data_shards: 4,
+                payload_parity_shards: 4,
+            },
+            persisted_version_class: PersistedVersionClass::DataObject,
+            all_shard_ids: Vec::new(),
+            repaired_shard_id: proof.volume.rustfs_drive_uuid.clone(),
+            target_proof_sha256: HASH_C.to_string(),
+            fault_evidence_sha256: HASH_C.to_string(),
+            fault_evidence_body: None,
+            unavailable_shards: Vec::new(),
+            fault_active_from_ms: 230,
+            fault_active_until_ms: 240,
+            probes: vec![ForcedReadProbe {
+                operation_id: "post-heal-read".to_string(),
+                object_key: proof.object_key.clone(),
+                version_id: proof.version_id.clone(),
+                expected_sha256: HASH_A.to_string(),
+                observed_sha256: HASH_A.to_string(),
+                http_status: 200,
+                observed_at_ms: 235,
+                mapping_observation_id: "post-heal-mapping".to_string(),
+                active_fault_snapshot_id: HASH_C.to_string(),
+            }],
+        };
+        validate_bitrot_object_evidence(
+            &proof,
+            &corruption_probe,
+            210,
+            &force_read,
+            &corruption_history,
+        )
+        .expect("same mutated version is checked before and after heal");
+        let mut corrupted_read_history = corruption_history.clone();
+        corrupted_read_history[1].value_sha256 = Some(HASH_B.to_string());
+        assert!(
+            validate_bitrot_object_evidence(
+                &proof,
+                &corruption_probe,
+                210,
+                &force_read,
+                &corrupted_read_history,
+            )
+            .is_err(),
+            "successful corrupt bytes during the mutation window must fail the case"
+        );
+        let mut unrelated_force_read = force_read.clone();
+        unrelated_force_read.probes[0].object_key = "another-object".to_string();
+        assert!(
+            validate_bitrot_object_evidence(
+                &proof,
+                &corruption_probe,
+                210,
+                &unrelated_force_read,
+                &corruption_history,
+            )
+            .is_err(),
+            "post-heal force-read must cover the mutated object version"
+        );
 
         let early_rollback_receipt = proof.host_receipt().expect("host mutation receipt");
         assert!(
@@ -5000,6 +5962,182 @@ mod tests {
             )
             .expect("valid forced read");
 
+        {
+            let mut bitrot_target = serde_json::from_str::<serde_json::Value>(&target_proof_body)
+                .expect("force-read target proof");
+            bitrot_target["scenario"] = serde_json::json!("on-disk-bitrot");
+            bitrot_target["caseName"] = serde_json::json!("case-on-disk-bitrot");
+            let bitrot_target_body =
+                serde_json::to_string(&bitrot_target).expect("bitrot force-read target proof");
+            let bitrot_target_sha256 = sha256_bytes(bitrot_target_body.as_bytes());
+
+            let mut bitrot_force_read = proof.clone();
+            bitrot_force_read.identity = identity("on-disk-bitrot");
+            bitrot_force_read.target_proof_sha256 = bitrot_target_sha256.clone();
+            let mut bitrot_fault = serde_json::from_str::<StorageFaultEvidenceResponse>(
+                bitrot_force_read
+                    .fault_evidence_body
+                    .as_deref()
+                    .expect("force-read fault evidence"),
+            )
+            .expect("force-read fault evidence");
+            bitrot_fault.scenario = "on-disk-bitrot".to_string();
+            for snapshot in bitrot_fault
+                .active_snapshots
+                .iter_mut()
+                .chain(bitrot_fault.workload_snapshots.iter_mut())
+            {
+                *snapshot
+                    .chaos_status
+                    .as_mut()
+                    .expect("IOChaos resource")
+                    .pointer_mut("/metadata/labels/rustfs-fault-test~1scenario")
+                    .expect("scenario label") = serde_json::json!("on-disk-bitrot");
+            }
+            let bitrot_snapshot_id = sha256_bytes(
+                &serde_json::to_vec(&bitrot_fault.active_snapshots[0])
+                    .expect("bitrot active snapshot"),
+            );
+            let bitrot_fault_body =
+                serde_json::to_string(&bitrot_fault).expect("bitrot fault evidence");
+            let bitrot_fault_sha256 = sha256_bytes(bitrot_fault_body.as_bytes());
+            bitrot_force_read.fault_evidence_sha256 = bitrot_fault_sha256.clone();
+            bitrot_force_read.fault_evidence_body = Some(bitrot_fault_body);
+            for shard in &mut bitrot_force_read.unavailable_shards {
+                shard.target_proof_sha256 = bitrot_target_sha256.clone();
+                shard.fault_evidence_sha256 = bitrot_fault_sha256.clone();
+                shard.active_snapshot_id = bitrot_snapshot_id.clone();
+            }
+            for probe in &mut bitrot_force_read.probes {
+                probe.active_fault_snapshot_id = bitrot_snapshot_id.clone();
+            }
+            let bitrot_runtime = ForceReadRuntimeEvidenceContract::from_artifacts(
+                &bitrot_target_body,
+                &bitrot_fault_sha256,
+                ForceReadRuntimeParameters {
+                    chaos_namespace: "chaos-mesh".to_string(),
+                    action: IoChaosAction::Fault { errno: 5 },
+                    methods: vec!["READ".to_string()],
+                    io_sampling_percent: 100,
+                    duration_seconds: 60,
+                },
+            )
+            .expect("bitrot force-read runtime evidence");
+
+            let mut bitrot_history = history.clone();
+            for record in &mut bitrot_history {
+                record.scenario = "on-disk-bitrot".to_string();
+            }
+            bitrot_history.push(history_record(
+                "bitrot-corruption-read",
+                "on-disk-bitrot",
+                OperationKind::Get,
+                "key",
+                "version-1",
+                Some(HASH_A),
+                278,
+            ));
+            let mut bitrot_mappings = mapping_observations.clone();
+            for mapping in &mut bitrot_mappings {
+                mapping.identity = identity("on-disk-bitrot");
+                mapping.target_proof_sha256 = bitrot_target_sha256.clone();
+            }
+
+            let mut mutation_volume = volume("bitrot", 260);
+            mutation_volume.pod = "rustfs-7".to_string();
+            mutation_volume.pod_uid = "uid-rustfs-7".to_string();
+            mutation_volume.volume_name = "data".to_string();
+            mutation_volume.persistent_volume_claim = "data-rustfs-7".to_string();
+            mutation_volume.persistent_volume_claim_uid = "pvc-uid-7".to_string();
+            mutation_volume.persistent_volume = "pv-7".to_string();
+            mutation_volume.persistent_volume_uid = "pv-uid-7".to_string();
+            mutation_volume.node = "node-7".to_string();
+            mutation_volume.node_uid = "node-uid-7".to_string();
+            mutation_volume.canonical_device = "/dev/mapper/data-7".to_string();
+            mutation_volume.filesystem_uuid = "fs-7".to_string();
+            mutation_volume.rustfs_drive_uuid = "drive-7".to_string();
+            let mutation =
+                bitrot_mutation_proof(mutation_volume, "key", "version-1", 270, 275, 410, 420);
+            let corruption_probe = CorruptionWindowProbe {
+                operation_id: "bitrot-corruption-read".to_string(),
+                object_key: "key".to_string(),
+                version_id: "version-1".to_string(),
+                expected_sha256: HASH_A.to_string(),
+            };
+            let observer = HealObserverIdentity::AdminOperation {
+                operation_id: "bitrot-heal-1".to_string(),
+            };
+            let status_body = serde_json::to_string(&RustfsHealStatusResponse {
+                observer: observer.clone(),
+                observed_at_ms: 285,
+                state: HealProgressState::Completed,
+                scanned: 1,
+                repaired: 1,
+                failed: 0,
+                cluster_definitive: true,
+                target_drive_uuid: Some("drive-7".to_string()),
+                pool_index: 0,
+                set_index: 0,
+            })
+            .expect("bitrot heal status response");
+            let heal_samples = vec![HealProgressSample {
+                schema_version: STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
+                identity: identity("on-disk-bitrot"),
+                observer: observer.clone(),
+                observed_at_ms: 285,
+                state: HealProgressState::Completed,
+                scanned: 1,
+                repaired: 1,
+                failed: 0,
+                status_evidence: Some(HealStatusEvidence {
+                    api_revision: "v1".to_string(),
+                    response_sha256: sha256_bytes(status_body.as_bytes()),
+                    response_body: status_body,
+                }),
+            }];
+            let heal = HealSummary {
+                schema_version: STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
+                identity: identity("on-disk-bitrot"),
+                case: StorageRecoveryCase::OnDiskBitrotAdminDeep,
+                observer,
+                mode: HealMode::AdminDeep,
+                target_drive_uuid: Some("drive-7".to_string()),
+                pool_index: 0,
+                set_index: 0,
+                cluster_definitive: true,
+                started_at_ms: 280,
+                completed_at_ms: 285,
+                scanned: 1,
+                repaired: 1,
+                failed: 0,
+                state: HealProgressState::Completed,
+            };
+            let evidence = BitrotRecoveryCaseEvidence {
+                mutation: &mutation,
+                corruption_probe: &corruption_probe,
+                heal: &heal,
+                heal_samples: &heal_samples,
+                force_read: &bitrot_force_read,
+                membership: &membership,
+                runtime: &bitrot_runtime,
+                history: &bitrot_history,
+                mappings: &bitrot_mappings,
+            };
+            validate_bitrot_recovery_case(&evidence)
+                .expect("complete bitrot recovery evidence chain");
+
+            let mut corrupted_history = bitrot_history.clone();
+            corrupted_history[2].value_sha256 = Some(HASH_B.to_string());
+            let corrupted_evidence = BitrotRecoveryCaseEvidence {
+                history: &corrupted_history,
+                ..evidence
+            };
+            assert!(
+                validate_bitrot_recovery_case(&corrupted_evidence).is_err(),
+                "the aggregate case must reject a successful corrupted read"
+            );
+        }
+
         let mut boundary_mapping = mapping_observations.clone();
         boundary_mapping[0].observed_at_ms = proof.fault_active_from_ms;
         assert!(
@@ -5013,6 +6151,21 @@ mod tests {
                 )
                 .is_err(),
             "a mapping captured at fault activation is not proven pre-fault evidence"
+        );
+
+        let mut pre_target_mapping = mapping_observations.clone();
+        pre_target_mapping[0].observed_at_ms = 289;
+        assert!(
+            proof
+                .validate_against_runtime(
+                    &membership,
+                    &runtime_contract,
+                    "drive-7",
+                    &history,
+                    &pre_target_mapping,
+                )
+                .is_err(),
+            "version mapping cannot precede the post-heal target proof it references"
         );
 
         let mut incomplete_target_proof =
@@ -5527,7 +6680,7 @@ mod tests {
 
     #[test]
     fn dangling_cleanup_cannot_remove_committed_fragments() {
-        let (stale_return, mut history) = stale_return_fixture();
+        let (mut stale_return, mut history) = stale_return_fixture();
         let committed = ShardInventoryEntry {
             fragment_id: "fragment-committed".to_string(),
             bucket: "bucket-1".to_string(),
@@ -5580,6 +6733,7 @@ mod tests {
             520,
         ));
         history.push(ack_lost);
+        stale_return.post_return_checker = post_return_checker(&history);
         let inventory = |snapshot_id: &str,
                          cursor: &str,
                          observed_at_ms: u64,
@@ -6047,9 +7201,11 @@ mod tests {
             .expect("ACK-loss history record");
         ambiguous.outcome = OperationOutcome::Failed;
         ambiguous.http_status = Some(500);
+        let mut server_error_stale_return = stale_return.clone();
+        server_error_stale_return.post_return_checker = post_return_checker(&server_error);
         proof
             .validate_against_stale_return(
-                &stale_return,
+                &server_error_stale_return,
                 &before_inventory,
                 &after_inventory,
                 &server_error,
