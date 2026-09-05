@@ -1,0 +1,45 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-fault-smoke
+budgets:
+  maxDuration: 3h
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 1200
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: optional
+artifacts:
+  required: strict
+workloadProfiles:
+  smoke:
+    objects: 600
+    concurrency: 30
+scenarios:
+  - name: io-eio
+    faultDuration: 8m
+    percent: 20
+    workloadProfile: smoke
+  - name: pod-kill-one
+    faultDuration: 8m
+    workloadProfile: smoke
+  - name: io-read-mistake
+    faultDuration: 8m
+    percent: 20
+    workloadProfile: smoke
+  - name: disk-full
+    faultDuration: 8m
+    percent: 100
+    workloadProfile: smoke
+  - name: network-delay
+    faultDuration: 8m
+    workloadProfile: smoke
+    params:
+      kind: networkDelay
+      latency: 200ms
+      jitter: 50ms
+      correlationPercent: 25
+  - name: pod-crash-versioned-hot
+    faultDuration: 8m
+    workloadProfile: smoke

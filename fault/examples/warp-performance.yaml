@@ -1,0 +1,23 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-fault-warp-performance
+budgets:
+  maxDuration: 1h
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 1200
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: optional
+artifacts:
+  required: strict
+workloadProfiles:
+  performance:
+    objects: 2400
+    concurrency: 60
+scenarios:
+  - name: warp-under-chaos
+    faultDuration: 15m
+    percent: 20
+    workloadProfile: performance

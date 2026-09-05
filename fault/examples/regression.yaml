@@ -1,0 +1,73 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-fault-regression
+budgets:
+  maxDuration: 6h
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 6000
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: optional
+artifacts:
+  required: strict
+workloadProfiles:
+  regression:
+    objects: 2400
+    concurrency: 60
+scenarios:
+  - name: io-latency
+    faultDuration: 15m
+    percent: 20
+    workloadProfile: regression
+    params:
+      kind: ioLatency
+      delay: 250ms
+      methods:
+        - read
+        - write
+  - name: network-partition-one
+    faultDuration: 15m
+    workloadProfile: regression
+  - name: network-partition-write-quorum-loss
+    faultDuration: 15m
+    workloadProfile: regression
+  - name: network-loss
+    faultDuration: 15m
+    workloadProfile: regression
+    params:
+      kind: networkLoss
+      lossPercent: 25
+      correlationPercent: 25
+  - name: network-corrupt
+    faultDuration: 15m
+    workloadProfile: regression
+    params:
+      kind: networkCorrupt
+      corruptPercent: 5
+      correlationPercent: 25
+  - name: network-duplicate
+    faultDuration: 15m
+    workloadProfile: regression
+    params:
+      kind: networkDuplicate
+      duplicatePercent: 10
+      correlationPercent: 25
+  - name: pod-failure
+    faultDuration: 15m
+    workloadProfile: regression
+  - name: stress-cpu
+    faultDuration: 15m
+    workloadProfile: regression
+    params:
+      kind: stressCpu
+      workers: 1
+      load: 80
+  - name: stress-memory
+    faultDuration: 15m
+    workloadProfile: regression
+    params:
+      kind: stressMemory
+      workers: 1
+      size: 512MiB
