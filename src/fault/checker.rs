@@ -469,8 +469,35 @@ pub(crate) fn validate_checker_audit_against_history(
         }),
         "checker audit suffix identity or timing does not match its report"
     );
+    ensure!(
+        suffix.iter().all(|record| {
+            matches!(
+                record.kind,
+                OperationKind::Get | OperationKind::List | OperationKind::ListVersions
+            )
+        }),
+        "checker audit suffix contains a mutating or unrelated operation"
+    );
 
     let model = object_model(prefix);
+    let historical_read_anomalies = successful_read_anomalies(prefix);
+    ensure!(
+        historical_read_anomalies.corrupted_reads.is_empty()
+            && historical_read_anomalies.visible_deleted_objects.is_empty()
+            && historical_read_anomalies
+                .unknown_writes_materialized
+                .is_empty()
+            && historical_read_anomalies
+                .unknown_write_value_conflicts
+                .is_empty(),
+        "authenticated history prefix contains a successful-read correctness anomaly"
+    );
+    let historical_list_warnings = list_history_warnings(prefix);
+    ensure!(
+        report.list_history_warning_count == historical_list_warnings.total_count
+            && report.list_history_warnings == historical_list_warnings.samples,
+        "checker list-history warning summary does not match authenticated history"
+    );
     ensure!(
         report.committed_puts == model.committed_writes,
         "checker committed_puts does not match its authenticated history prefix"
@@ -635,14 +662,55 @@ fn validate_versioned_checker_suffix(
         .listed_versions
         .as_ref()
         .context("checker ListObjectVersions has no captured entries")?;
-    let mut latest_counts = BTreeMap::<&str, usize>::new();
-    for entry in listed_versions.iter().filter(|entry| entry.is_latest) {
-        *latest_counts.entry(entry.key.as_str()).or_default() += 1;
+    let mut listed_data_versions = BTreeSet::<(&str, &str)>::new();
+    let mut listed_delete_markers = BTreeSet::<(&str, &str)>::new();
+    let mut actual_latest = BTreeMap::<&str, &ListedVersionEntry>::new();
+    for entry in listed_versions {
+        if let Some(version_id) = entry.version_id.as_deref() {
+            if entry.is_delete_marker {
+                listed_delete_markers.insert((entry.key.as_str(), version_id));
+            } else {
+                listed_data_versions.insert((entry.key.as_str(), version_id));
+            }
+        }
+        if entry.is_latest {
+            ensure!(
+                actual_latest.insert(entry.key.as_str(), entry).is_none(),
+                "ListObjectVersions returned multiple latest entries for {}",
+                entry.key
+            );
+        }
+    }
+    let mut expected_latest = BTreeMap::<String, ListedVersionEntry>::new();
+    for entry in checker_expected_version_listing(prefix)
+        .into_iter()
+        .filter(|entry| entry.is_latest)
+    {
+        ensure!(
+            expected_latest.insert(entry.key.clone(), entry).is_none(),
+            "authenticated history produced multiple expected latest entries"
+        );
     }
     ensure!(
-        latest_counts.values().all(|count| *count == 1),
-        "ListObjectVersions returned multiple latest entries for one key"
+        actual_latest.keys().copied().collect::<BTreeSet<_>>()
+            == expected_latest.keys().map(String::as_str).collect(),
+        "ListObjectVersions latest-key set does not match authenticated history"
     );
+    for (key, expected) in &expected_latest {
+        let actual = actual_latest[key.as_str()];
+        if tolerated.contains(key.as_str()) {
+            ensure!(
+                actual.is_delete_marker,
+                "tolerated ambiguous delete {key} is not the unique latest delete marker"
+            );
+        } else {
+            ensure!(
+                actual.version_id == expected.version_id
+                    && actual.is_delete_marker == expected.is_delete_marker,
+                "latest version for {key} does not match authenticated history"
+            );
+        }
+    }
 
     let lineage = committed_version_lineage(prefix);
     ensure!(
@@ -687,6 +755,7 @@ fn validate_versioned_checker_suffix(
             == expected_version_gets.keys().copied().collect(),
         "checker committed-version GET coverage does not match authenticated history"
     );
+    let mut expected_data_version_audits = Vec::with_capacity(expected_version_gets.len());
     for (identity, expected) in expected_version_gets {
         let record = actual_version_gets[&identity];
         ensure!(
@@ -699,36 +768,50 @@ fn validate_versioned_checker_suffix(
             expected.version_id
         );
         ensure!(
-            listed_versions.iter().any(|entry| {
-                entry.key == expected.key
-                    && entry.version_id.as_deref() == Some(expected.version_id.as_str())
-                    && !entry.is_delete_marker
-            }),
+            listed_data_versions.contains(&(expected.key.as_str(), expected.version_id.as_str())),
             "ListObjectVersions omitted committed version {}@{}",
             expected.key,
             expected.version_id
         );
+        expected_data_version_audits.push(CheckerDataVersionAudit {
+            key: expected.key.clone(),
+            version_id: expected.version_id.clone(),
+            expected_sha256: expected.sha256.clone(),
+            observed_sha256: record.value_sha256.clone(),
+            outcome: record.outcome,
+            http_status: record.http_status,
+        });
     }
+    expected_data_version_audits
+        .sort_by(|left, right| (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id)));
+    let audit = report
+        .audit
+        .as_ref()
+        .context("versioned checker has no audit")?;
+    ensure!(
+        audit.data_version_checks == expected_data_version_audits,
+        "checker data-version audit summary does not match authenticated history"
+    );
+    let mut expected_delete_marker_audits = Vec::with_capacity(lineage.delete_markers.len());
     for marker in &lineage.delete_markers {
         ensure!(
-            listed_versions.iter().any(|entry| {
-                entry.key == marker.key
-                    && entry.version_id.as_deref() == Some(marker.version_id.as_str())
-                    && entry.is_delete_marker
-            }),
+            listed_delete_markers.contains(&(marker.key.as_str(), marker.version_id.as_str())),
             "ListObjectVersions omitted committed delete marker {}@{}",
             marker.key,
             marker.version_id
         );
+        expected_delete_marker_audits.push(CheckerDeleteMarkerAudit {
+            key: marker.key.clone(),
+            version_id: marker.version_id.clone(),
+            visible_in_list_object_versions: true,
+        });
     }
-    for key in tolerated {
-        ensure!(
-            listed_versions
-                .iter()
-                .any(|entry| { entry.key == *key && entry.is_latest && entry.is_delete_marker }),
-            "tolerated ambiguous delete {key} has no authenticated latest delete marker"
-        );
-    }
+    expected_delete_marker_audits
+        .sort_by(|left, right| (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id)));
+    ensure!(
+        audit.delete_marker_checks == expected_delete_marker_audits,
+        "checker delete-marker audit summary does not match authenticated history"
+    );
     Ok(())
 }
 
@@ -986,9 +1069,12 @@ pub async fn check_s3_history(
                     .extend(multipart_lineage);
                 report.missing_committed_delete_markers =
                     missing_committed_delete_markers(&lineage.delete_markers, &entries);
-                evaluate_deleted_latest_versions(
+                evaluate_latest_version_lineage(
                     &mut report,
-                    &model.deleted,
+                    &model,
+                    expected_latest_versions
+                        .as_ref()
+                        .expect("versioning enabled above"),
                     version_latest_by_key
                         .as_ref()
                         .expect("latest version map was just captured"),
@@ -1492,6 +1578,42 @@ fn latest_version_entries(
     (latest, conflicts)
 }
 
+fn evaluate_latest_version_lineage(
+    report: &mut CheckerReport,
+    model: &ObjectModel,
+    expected: &BTreeMap<String, ListedVersionEntry>,
+    actual: &BTreeMap<String, ObjectVersionEntry>,
+) {
+    for (key, expected_entry) in expected {
+        if model.ambiguous_delete_pending.contains(key) {
+            continue;
+        }
+        match actual.get(key) {
+            Some(actual_entry)
+                if actual_entry.version_id == expected_entry.version_id
+                    && actual_entry.is_delete_marker == expected_entry.is_delete_marker => {}
+            Some(actual_entry) => report.delete_marker_lineage_incomplete.push(format!(
+                "{key}: latest version {:?} deleteMarker={} does not match expected {:?} deleteMarker={}",
+                actual_entry.version_id,
+                actual_entry.is_delete_marker,
+                expected_entry.version_id,
+                expected_entry.is_delete_marker
+            )),
+            None => report
+                .delete_marker_lineage_incomplete
+                .push(format!("{key}: ListObjectVersions has no unique latest entry")),
+        }
+    }
+    for key in actual.keys() {
+        if !expected.contains_key(key) && !model.ambiguous_delete_pending.contains(key) {
+            report.delete_marker_lineage_incomplete.push(format!(
+                "{key}: ListObjectVersions returned an unexpected latest entry"
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
 fn evaluate_deleted_latest_versions(
     report: &mut CheckerReport,
     deleted: &BTreeSet<String>,
@@ -6160,6 +6282,138 @@ mod tests {
     }
 
     #[test]
+    fn latest_version_lineage_requires_expected_identity_and_presence() {
+        let expected = BTreeMap::from([(
+            "key".to_string(),
+            ListedVersionEntry {
+                key: "key".to_string(),
+                version_id: Some("version-1".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        )]);
+        let model = ObjectModel::default();
+
+        let mut missing = empty_report();
+        super::evaluate_latest_version_lineage(&mut missing, &model, &expected, &BTreeMap::new());
+        assert_eq!(missing.delete_marker_lineage_incomplete.len(), 1);
+
+        let wrong = BTreeMap::from([(
+            "key".to_string(),
+            ObjectVersionEntry {
+                key: "key".to_string(),
+                version_id: Some("version-0".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        )]);
+        let mut mismatched = empty_report();
+        super::evaluate_latest_version_lineage(&mut mismatched, &model, &expected, &wrong);
+        assert_eq!(mismatched.delete_marker_lineage_incomplete.len(), 1);
+
+        let matching = BTreeMap::from([(
+            "key".to_string(),
+            ObjectVersionEntry {
+                key: "key".to_string(),
+                version_id: Some("version-1".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        )]);
+        let mut clean = empty_report();
+        super::evaluate_latest_version_lineage(&mut clean, &model, &expected, &matching);
+        assert!(clean.delete_marker_lineage_incomplete.is_empty());
+    }
+
+    #[test]
+    fn versioned_audit_validation_scales_to_large_lineage() {
+        const VERSION_COUNT: usize = 20_000;
+        let mut prefix = Vec::with_capacity(VERSION_COUNT);
+        let mut suffix = Vec::with_capacity(VERSION_COUNT + 1);
+        let mut listed_versions = Vec::with_capacity(VERSION_COUNT);
+        let mut data_version_checks = Vec::with_capacity(VERSION_COUNT);
+        for index in 0..VERSION_COUNT {
+            let key = format!("fault-test/run-1/key-{index:05}");
+            let version_id = format!("version-{index:05}");
+            let hash = format!("hash-{index:05}");
+            let mut put = record(
+                &format!("put-{index:05}"),
+                OperationKind::Put,
+                &key,
+                &hash,
+                OperationOutcome::Ok,
+            );
+            put.version_id = Some(version_id.clone());
+            prefix.push(put);
+
+            let mut get = record(
+                &format!("get-{index:05}"),
+                OperationKind::Get,
+                &key,
+                &hash,
+                OperationOutcome::Ok,
+            );
+            get.version_id = Some(version_id.clone());
+            suffix.push(get);
+            listed_versions.push(ListedVersionEntry {
+                key: key.clone(),
+                version_id: Some(version_id.clone()),
+                is_latest: true,
+                is_delete_marker: false,
+            });
+            data_version_checks.push(super::CheckerDataVersionAudit {
+                key,
+                version_id,
+                expected_sha256: hash.clone(),
+                observed_sha256: Some(hash),
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+            });
+        }
+        let mut version_list = record(
+            "list-versions",
+            OperationKind::ListVersions,
+            "fault-test/run-1/",
+            "",
+            OperationOutcome::Ok,
+        );
+        version_list.value_sha256 = None;
+        version_list.size_bytes = Some(VERSION_COUNT);
+        version_list.listed_versions = Some(listed_versions);
+        suffix.push(version_list);
+        data_version_checks.sort_by(|left, right| {
+            (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id))
+        });
+
+        let mut report = empty_report();
+        report.versioning_expected = true;
+        report.expected_committed_versions = VERSION_COUNT;
+        report.verified_committed_versions = VERSION_COUNT;
+        report.audit = Some(CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            history_prefix_record_count: prefix.len(),
+            history_prefix_sha256: String::new(),
+            history_suffix_record_count: suffix.len(),
+            history_suffix_sha256: String::new(),
+            suffix_operations: Vec::new(),
+            data_version_checks,
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: Some(true),
+        });
+
+        super::validate_versioned_checker_suffix(
+            &report,
+            &prefix,
+            &suffix,
+            &BTreeSet::new(),
+            "fault-test/run-1/",
+        )
+        .expect("large version lineage must validate without quadratic scans");
+    }
+
+    #[test]
     fn checker_audit_binds_exact_history_prefix_serialization() {
         let records = vec![record(
             "op-1",
@@ -6376,6 +6630,30 @@ mod tests {
         report.require_success().expect("locally consistent report");
         validate_checker_audit_against_history(&report, &history)
             .expect("history-authenticated ambiguous delete");
+
+        let mut corrupted_read = record(
+            "historical-corrupt-get",
+            OperationKind::Get,
+            "key",
+            "wrong-hash",
+            OperationOutcome::Ok,
+        );
+        corrupted_read.run_id = Some("run-1".to_string());
+        corrupted_read.started_at_ms = 3;
+        corrupted_read.ended_at_ms = 4;
+        let mut corrupt_prefix = prefix.clone();
+        corrupt_prefix.push(corrupted_read);
+        let mut corrupt_history = corrupt_prefix.clone();
+        corrupt_history.extend(suffix.clone());
+        let mut forged_clean = report.clone();
+        let forged_audit = forged_clean.audit.as_mut().expect("checker audit");
+        forged_audit.history_prefix_record_count = corrupt_prefix.len();
+        forged_audit.history_prefix_sha256 =
+            checker_history_records_sha256(&corrupt_prefix).expect("corrupt prefix digest");
+        assert!(
+            validate_checker_audit_against_history(&forged_clean, &corrupt_history).is_err(),
+            "an authenticated historical corrupt read cannot be omitted from a clean report"
+        );
 
         history[2].outcome = OperationOutcome::Ok;
         history[2].http_status = Some(200);

@@ -1884,9 +1884,17 @@ fn validate_checker_report(
         !report.operation_cohorts.is_empty(),
         "{name} must include operation_cohorts derived from history.jsonl"
     );
-    if report.audit.is_some() {
-        checker::validate_checker_audit_against_history(report, history)
-            .with_context(|| format!("{name} audit does not match history.jsonl"))?;
+    checker::validate_checker_audit_against_history(report, history)
+        .with_context(|| format!("{name} audit does not match history.jsonl"))?;
+    if name == "checker-report.json" {
+        let audit = report
+            .audit
+            .as_ref()
+            .context("checker-report.json has no history-bound audit")?;
+        ensure!(
+            audit.history_prefix_record_count + audit.history_suffix_record_count == history.len(),
+            "checker-report.json audit does not cover the terminal history.jsonl record"
+        );
     }
     Ok(())
 }
@@ -3197,7 +3205,7 @@ mod tests {
         validate_target_proof, validate_write_quorum_runtime_evidence,
     };
     use crate::fault::{
-        checker::{RecoveryStabilityClassification, RecoveryStabilityReport},
+        checker::{self, RecoveryStabilityClassification, RecoveryStabilityReport},
         config::FaultTestConfig,
         history::{OperationOutcome, OperationRecord},
         host_storage::{
@@ -3248,8 +3256,59 @@ mod tests {
         assert_eq!(report.scenario, "io-eio");
         assert_eq!(
             report.validation_summary_tsv_row(),
-            "io-eio\t42\t0\t2\t1\t7\t0\t0\t0\t0\ttrue"
+            "io-eio\t42\t0\t2\t1\t1\t0\t0\t0\t0\ttrue"
         );
+    }
+
+    #[test]
+    fn successful_artifact_validation_requires_history_bound_checker_audits() {
+        for name in ["checker-pre-recommit-report.json", "checker-report.json"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_success_artifacts(dir.path(), "io-eio");
+            let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+            let path = case_dir.join(name);
+            let mut report: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).expect("checker report"))
+                    .expect("checker JSON");
+            report
+                .as_object_mut()
+                .expect("checker object")
+                .remove("audit");
+            write_json(&case_dir, name, &report);
+
+            let error = validate_fault_artifacts(&success_options(dir.path()))
+                .expect_err("a successful current report cannot omit its audit");
+            assert!(format!("{error:#}").contains("history-bound audit"));
+        }
+    }
+
+    #[test]
+    fn final_checker_audit_must_cover_terminal_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("history.jsonl");
+        let current = fs::read_to_string(&path).expect("history");
+        let appended = json!({
+            "id": "op-000004",
+            "scenario": "io-eio",
+            "run_id": "run-00000000-0000-4000-8000-000000000001",
+            "kind": "put",
+            "bucket": "bucket",
+            "key": "late-key",
+            "value_sha256": "late-sha",
+            "size_bytes": 1,
+            "started_at_ms": 16,
+            "ended_at_ms": 17,
+            "outcome": "ok",
+            "http_status": 200,
+            "error": null
+        });
+        fs::write(&path, format!("{current}{appended}\n")).expect("append history mutation");
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("final checker cannot ignore a later history mutation");
+        assert!(format!("{error:#}").contains("terminal history.jsonl record"));
     }
 
     #[test]
@@ -3331,11 +3390,9 @@ mod tests {
             let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
             let path = case_dir.join(name);
             if name == "history.jsonl" {
-                let mut record: serde_json::Value =
-                    serde_json::from_str(fs::read_to_string(&path).expect("history").trim())
-                        .expect("record");
-                record["run_id"] = json!("run-old");
-                fs::write(&path, format!("{record}\n")).expect("write history");
+                rewrite_first_history_record(&path, |record| {
+                    record["run_id"] = json!("run-old");
+                });
             } else {
                 let mut artifact: serde_json::Value =
                     serde_json::from_str(&fs::read_to_string(&path).expect("artifact"))
@@ -3373,11 +3430,9 @@ mod tests {
             let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
             let path = case_dir.join(name);
             if name == "history.jsonl" {
-                let mut record: serde_json::Value =
-                    serde_json::from_str(fs::read_to_string(&path).expect("history").trim())
-                        .expect("record");
-                record.as_object_mut().expect("object").remove("run_id");
-                fs::write(&path, format!("{record}\n")).expect("write history");
+                rewrite_first_history_record(&path, |record| {
+                    record.as_object_mut().expect("object").remove("run_id");
+                });
             } else {
                 let mut artifact: serde_json::Value =
                     serde_json::from_str(&fs::read_to_string(&path).expect("artifact"))
@@ -3391,7 +3446,13 @@ mod tests {
                 write_json(&case_dir, name, &artifact);
             }
             let options = success_options(dir.path());
-            validate_fault_artifacts(&options).expect("legacy additive field may be absent");
+            if name == "history.jsonl" {
+                let legacy = validate_fault_artifacts(&options)
+                    .expect_err("history identity removal invalidates the checker audit");
+                assert!(format!("{legacy:#}").contains("audit"));
+            } else {
+                validate_fault_artifacts(&options).expect("legacy additive field may be absent");
+            }
             let strict = validate_fault_artifacts_for_planned_attempt_and_write_report(
                 &options,
                 "run-00000000-0000-4000-8000-000000000001",
@@ -3423,7 +3484,8 @@ mod tests {
         let path = case_dir.join("history.jsonl");
         let current = fs::read_to_string(&path).expect("history");
         let mut other: serde_json::Value =
-            serde_json::from_str(current.trim()).expect("operation record");
+            serde_json::from_str(current.lines().next().expect("history record"))
+                .expect("operation record");
         other["id"] = json!("op-000002");
         other["run_id"] = json!("run-old");
         fs::write(&path, format!("{current}{other}\n")).expect("mixed history");
@@ -6312,25 +6374,72 @@ mod tests {
         workload_plan["scenario"] = json!(scenario);
         workload_plan["run_id"] = json!(run_id);
         write_json(&case_dir, "workload-plan.json", &workload_plan);
+        let history_prefix = vec![
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000001",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "put",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "sha",
+                "size_bytes": 1,
+                "started_at_ms": 1,
+                "ended_at_ms": 2,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "pre_fault",
+                "fault_window_relation": "before_fault"
+            }))
+            .expect("history PUT"),
+        ];
+        let history_suffix = vec![
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000002",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "get",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "sha",
+                "size_bytes": 1,
+                "started_at_ms": 11,
+                "ended_at_ms": 12,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null
+            }))
+            .expect("checker GET"),
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000003",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "list",
+                "bucket": "bucket",
+                "key": format!("fault-test/{run_id}/"),
+                "value_sha256": null,
+                "size_bytes": 1,
+                "listed_keys": ["key"],
+                "started_at_ms": 13,
+                "ended_at_ms": 14,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null
+            }))
+            .expect("checker LIST"),
+        ];
+        let mut history = history_prefix.clone();
+        history.extend(history_suffix.clone());
         fs::write(
             case_dir.join("history.jsonl"),
             format!(
                 "{}\n",
-                json!({
-                    "id": "op-000001",
-                    "scenario": scenario,
-                    "run_id": run_id,
-                    "kind": "put",
-                    "bucket": "bucket",
-                    "key": "key",
-                    "value_sha256": "sha",
-                    "size_bytes": 1,
-                    "started_at_ms": 1,
-                    "ended_at_ms": 2,
-                    "outcome": "ok",
-                    "http_status": 200,
-                    "error": null
-                })
+                history
+                    .iter()
+                    .map(|record| serde_json::to_string(record).expect("history record"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ),
         )
         .expect("history");
@@ -6369,9 +6478,9 @@ mod tests {
         let checker = json!({
             "scenario": scenario,
             "run_id": run_id,
-            "committed_puts": 7,
-            "expected_live_objects": 7,
-            "verified_live_objects": 7,
+            "committed_puts": 1,
+            "expected_live_objects": 1,
+            "verified_live_objects": 1,
             "missing_committed_objects": [],
             "unavailable_committed_objects": [],
             "unknown_committed_read_failures": [],
@@ -6379,13 +6488,26 @@ mod tests {
             "successful_corrupted_reads": [],
             "unexpected_visible_deleted_objects": [],
             "unknown_writes_materialized": [],
-            "operation_cohorts": {"pre_fault": 12, "fault_active": 8, "post_recovery": 4},
-            "fault_window_relations": {"during_fault": 8, "after_fault": 4},
+            "operation_cohorts": {"pre_fault": 1},
+            "fault_window_relations": {"before_fault": 1},
             "list_history_warning_count": 0,
             "final_list_warning_count": 0,
             "list_history_warnings": [],
             "list_warnings": [],
-            "final_listed_objects": 7,
+            "final_listed_objects": 1,
+            "audit": {
+                "bucket": "bucket",
+                "started_at_ms": 10,
+                "completed_at_ms": 15,
+                "history_prefix_record_count": history_prefix.len(),
+                "history_prefix_sha256": checker::checker_history_records_sha256(&history_prefix).expect("checker prefix digest"),
+                "history_suffix_record_count": history_suffix.len(),
+                "history_suffix_sha256": checker::checker_history_records_sha256(&history_suffix).expect("checker suffix digest"),
+                "suffix_operations": checker::checker_operation_audits(&history_suffix),
+                "data_version_checks": [],
+                "delete_marker_checks": [],
+                "list_object_versions_completed": null
+            },
             "tenant_recovered": true,
             "passed": true
         });
@@ -6427,6 +6549,21 @@ mod tests {
             serde_json::to_string_pretty(value).expect("json"),
         )
         .expect("write json");
+    }
+
+    fn rewrite_first_history_record(
+        path: &std::path::Path,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let current = fs::read_to_string(path).expect("history");
+        let mut records = current.lines().map(str::to_string).collect::<Vec<_>>();
+        let mut first = serde_json::from_str::<serde_json::Value>(
+            records.first().expect("first history record"),
+        )
+        .expect("history record");
+        mutate(&mut first);
+        records[0] = first.to_string();
+        fs::write(path, format!("{}\n", records.join("\n"))).expect("rewrite history");
     }
 
     fn rewrite_run_spec_versioning(case_dir: &std::path::Path, versioning: bool) {
