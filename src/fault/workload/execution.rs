@@ -27,6 +27,7 @@ use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep as async_sleep;
@@ -304,7 +305,10 @@ pub(in crate::fault) async fn run_mixed_workload(
     let mutation_locks = (0..request.prefilled.len())
         .map(|_| AsyncMutex::new(()))
         .collect::<Vec<_>>();
-    let tasks = (0..count).map(|offset| execute_mixed_operation(request, offset, &mutation_locks));
+    let next_mutation_sequence = AtomicU64::new(1);
+    let tasks = (0..count).map(|offset| {
+        execute_mixed_operation(request, offset, &mutation_locks, &next_mutation_sequence)
+    });
     let results = stream::iter(tasks)
         .buffer_unordered(plan.concurrency)
         .collect::<Vec<_>>()
@@ -314,13 +318,11 @@ pub(in crate::fault) async fn run_mixed_workload(
     for result in results {
         completed.push(result?);
     }
-    // Preserve completion order for recovery retries. Same-key mutations are
-    // serialized above, so this is their observed real-time order; sorting by
-    // plan index first could replay two ambiguous hot-key overwrites backwards.
-    let unconfirmed_puts = completed
-        .iter()
-        .flat_map(|result| result.unconfirmed_puts.iter().cloned())
-        .collect();
+    // Same-key mutations are serialized above, so completion order is their
+    // observed real-time order. Only the final mutation of a key can remain a
+    // recommit candidate: replaying an earlier ambiguous PUT after a later
+    // overwrite or DELETE would manufacture a new latest value after recovery.
+    let unconfirmed_puts = final_unconfirmed_puts(&completed);
     completed.sort_by_key(|result| result.index);
 
     let mut summary = WorkloadSummary::new(plan, scenario, run_id);
@@ -339,6 +341,7 @@ async fn execute_mixed_operation(
     request: &MixedWorkloadRequest<'_>,
     offset: usize,
     mutation_locks: &[AsyncMutex<()>],
+    next_mutation_sequence: &AtomicU64,
 ) -> Result<MixedTaskResult> {
     let MixedWorkloadRequest {
         s3,
@@ -383,7 +386,9 @@ async fn execute_mixed_operation(
         WorkloadOperation::Put => {
             let object = ObjectSpec::prepare_seeded(run_id, index, size_bytes, seed);
             let spec = object.spec.clone();
+            result.mutation_sequence = Some(next_mutation_sequence.fetch_add(1, Ordering::Relaxed));
             let verified = s3.put_and_verify_object(&object, history).await?;
+            result.mutation_key = Some(spec.key.clone());
             result.puts.push(verified.write_outcome);
             if let Some(get_outcome) = verified.verify_get_outcome {
                 result.gets.push(get_outcome);
@@ -395,7 +400,9 @@ async fn execute_mixed_operation(
         WorkloadOperation::Overwrite => {
             let object = existing.prepare_overwrite(index as u64 + 1);
             let spec = object.spec.clone();
+            result.mutation_sequence = Some(next_mutation_sequence.fetch_add(1, Ordering::Relaxed));
             let verified = s3.put_and_verify_object(&object, history).await?;
+            result.mutation_key = Some(spec.key.clone());
             result.puts.push(verified.write_outcome);
             if let Some(get_outcome) = verified.verify_get_outcome {
                 result.gets.push(get_outcome);
@@ -429,6 +436,8 @@ async fn execute_mixed_operation(
             result.lists.push(outcome);
         }
         WorkloadOperation::Delete => {
+            result.mutation_key = Some(existing.key.clone());
+            result.mutation_sequence = Some(next_mutation_sequence.fetch_add(1, Ordering::Relaxed));
             let (delete_outcome, verify_get) =
                 s3.delete_and_verify_absent(&existing.key, history).await?;
             result.deletes.push(delete_outcome);
@@ -450,6 +459,8 @@ async fn execute_mixed_operation(
                     (object.spec, outcome)
                 }
             };
+            result.mutation_key = Some(spec.key.clone());
+            result.mutation_sequence = Some(next_mutation_sequence.fetch_add(1, Ordering::Relaxed));
             result.multipart_completes.push(complete_outcome);
             if complete_outcome == OperationOutcome::Ok {
                 result
@@ -466,6 +477,25 @@ async fn execute_mixed_operation(
         }
     }
     Ok(result)
+}
+
+fn final_unconfirmed_puts(completed: &[MixedTaskResult]) -> Vec<ObjectSpec> {
+    let mut pending = BTreeMap::<String, ObjectSpec>::new();
+    let mut mutations = completed
+        .iter()
+        .filter_map(|result| Some((result.mutation_sequence?, result)))
+        .collect::<Vec<_>>();
+    mutations.sort_by_key(|(sequence, _)| *sequence);
+    for (_, result) in mutations {
+        let Some(key) = &result.mutation_key else {
+            continue;
+        };
+        pending.remove(key);
+        if let Some(object) = result.unconfirmed_puts.last() {
+            pending.insert(key.clone(), object.clone());
+        }
+    }
+    pending.into_values().collect()
 }
 
 /// Decide whether the GET at `index` runs as a ranged read, and derive a
@@ -723,9 +753,11 @@ impl RecommitAttempt {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MixedTaskResult {
     index: usize,
+    mutation_key: Option<String>,
+    mutation_sequence: Option<u64>,
     puts: Vec<OperationOutcome>,
     gets: Vec<OperationOutcome>,
     deletes: Vec<OperationOutcome>,
@@ -739,6 +771,8 @@ impl MixedTaskResult {
     fn new(index: usize) -> Self {
         Self {
             index,
+            mutation_key: None,
+            mutation_sequence: None,
             puts: Vec::new(),
             gets: Vec::new(),
             deletes: Vec::new(),
@@ -1193,6 +1227,45 @@ mod tests {
                 .filter(|objects| objects[0].key == other.key)
                 .count(),
             1
+        );
+    }
+    #[test]
+    fn recommit_candidates_follow_the_final_same_key_mutation() {
+        let first = ObjectSpec::prepare_seeded("run", 1, 1024, 42).spec;
+        let latest = first.prepare_overwrite(2).spec;
+
+        let mut ambiguous_first = MixedTaskResult::new(0);
+        ambiguous_first.mutation_key = Some(first.key.clone());
+        ambiguous_first.mutation_sequence = Some(10);
+        ambiguous_first.unconfirmed_puts.push(first.clone());
+
+        let mut later_delete = MixedTaskResult::new(1);
+        later_delete.mutation_key = Some(first.key.clone());
+        later_delete.mutation_sequence = Some(20);
+        assert!(
+            final_unconfirmed_puts(&[ambiguous_first.clone(), later_delete]).is_empty(),
+            "a later DELETE must suppress an earlier ambiguous PUT"
+        );
+
+        let mut later_committed_overwrite = MixedTaskResult::new(2);
+        later_committed_overwrite.mutation_key = Some(first.key.clone());
+        later_committed_overwrite.mutation_sequence = Some(30);
+        assert!(
+            final_unconfirmed_puts(&[ambiguous_first.clone(), later_committed_overwrite,])
+                .is_empty(),
+            "a later committed overwrite must suppress an earlier ambiguous PUT"
+        );
+
+        let mut later_ambiguous_overwrite = MixedTaskResult::new(3);
+        later_ambiguous_overwrite.mutation_key = Some(first.key.clone());
+        later_ambiguous_overwrite.mutation_sequence = Some(40);
+        later_ambiguous_overwrite
+            .unconfirmed_puts
+            .push(latest.clone());
+        assert_eq!(
+            final_unconfirmed_puts(&[later_ambiguous_overwrite, ambiguous_first]),
+            vec![latest],
+            "only the final ambiguous write remains eligible, independent of task collection order"
         );
     }
     #[tokio::test]

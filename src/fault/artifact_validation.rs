@@ -747,6 +747,7 @@ fn validate_fault_artifacts_with_identity(
         "checker-pre-recommit-report.json",
         &prechecker,
         options.expected_workload_versioning,
+        &history,
     )?;
     let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
     validate_checker_identity("checker-report.json", &checker, &metadata)?;
@@ -754,6 +755,7 @@ fn validate_fault_artifacts_with_identity(
         "checker-report.json",
         &checker,
         options.expected_workload_versioning,
+        &history,
     )?;
 
     let recommit =
@@ -1867,6 +1869,7 @@ fn validate_checker_report(
     name: &str,
     report: &CheckerReport,
     expected_versioning: bool,
+    history: &[OperationRecord],
 ) -> Result<()> {
     report
         .require_success()
@@ -1881,6 +1884,10 @@ fn validate_checker_report(
         !report.operation_cohorts.is_empty(),
         "{name} must include operation_cohorts derived from history.jsonl"
     );
+    if report.audit.is_some() {
+        checker::validate_checker_audit_against_history(report, history)
+            .with_context(|| format!("{name} audit does not match history.jsonl"))?;
+    }
     Ok(())
 }
 
