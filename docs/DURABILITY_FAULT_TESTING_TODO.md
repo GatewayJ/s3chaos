@@ -420,8 +420,11 @@ Reporting only projects this typed checker result into failure-summary fields.
 - [x] DONE: Add `quorum-p-io-fault` and `quorum-p-plus-one-io-fault`.
   Meaning: these target exactly P and P+1 volumes in one erasure set with
   same-set proof. Payload and metadata are explicit typed cases, producing four
-  suite attempts. P verifies readable, uncorrupted recovery behavior; P+1 also
-  requires PUT, DELETE, and multipart completion to receive no success ACK.
+  suite attempts. P verifies the complete stable typed read cohort remains
+  readable with intact hashes. At payload P+1, PUT and multipart completion
+  must receive no success ACK while DELETE may still succeed through metadata
+  quorum; at metadata P+1, PUT, DELETE, and multipart completion must all
+  receive no success ACK.
   Live qualification evidence is still required before release gating.
 
 ### 9. Fix Heal-Family Oracle Blind Spots

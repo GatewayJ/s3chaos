@@ -932,7 +932,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             "artifact must bind every candidate and selected Pod/container/PVC/PV/mount to exactly one RustFS drive UUID in the same set",
             "artifact must prove the complete non-target drive set",
         ],
-        validation: "writes past quorum are rejected cleanly, prior committed versions remain readable after recovery, and no successful read returns corrupt bytes",
+        validation: "payload P+1 requires PUT and multipart completion to fail cleanly while DELETE may still succeed through metadata quorum; metadata P+1 requires PUT, DELETE, and multipart completion to fail cleanly; prior committed versions remain readable after recovery and no successful read returns corrupt bytes",
         observability: "runtime topology and volume binding proof, actual IOChaos controller targets at activation and after workload, workload history, checker reports, RustFS logs",
         conflict_domain: "fresh Tenant with topology-owned volume selection; must not share erasure-set targeting with other active faults",
     },

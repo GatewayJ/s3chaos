@@ -57,7 +57,13 @@ use crate::fault::{
         FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunFaultSpec,
         FaultRunSpec, FaultRunTargetSpec,
     },
-    workload::{WorkloadPlan, execution::require_typed_quorum_read_survival},
+    workload::{
+        WorkloadPlan,
+        execution::{
+            TypedQuorumReadCohortSource, TypedQuorumReadExpectation,
+            require_typed_quorum_read_survival,
+        },
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -611,6 +617,14 @@ fn validate_fault_artifacts_with_identity(
             && json_spec.metadata.run_id == metadata.run_id,
         "run-spec metadata does not match the selected case and run-metadata.json run identity"
     );
+    ensure!(
+        json_spec.workload.plan == workload_plan
+            && json_spec.workload.seed == workload_plan.seed
+            && json_spec.workload.object_count == workload_plan.object_count
+            && json_spec.workload.concurrency == workload_plan.concurrency
+            && json_spec.workload.operation_mix == workload_plan.operation_mix,
+        "run-spec workload fields and workload-plan.json do not identify the same deterministic workload"
+    );
 
     let preflight_summary =
         read_json::<PreflightSummary>(required(&artifacts, "preflight-summary.json")?)?;
@@ -810,22 +824,30 @@ fn validate_fault_artifacts_with_identity(
         let workload_started_at_ms = evidence
             .workload_started_at_ms
             .context("fault-evidence.json workload_started_at_ms is required")?;
+        let fault_active_at_ms = evidence
+            .fault_active_at_ms
+            .context("fault-evidence.json fault_active_at_ms is required")?;
         let workload_ended_at_ms = evidence
             .workload_ended_at_ms
             .context("fault-evidence.json workload_ended_at_ms is required")?;
         if options.scenario == scenarios::QUORUM_P_IO_FAULT_SCENARIO {
             require_typed_quorum_read_survival(
                 &history,
-                &metadata.scenario,
-                &json_spec.metadata.bucket,
-                json_spec
-                    .faults
-                    .first()
-                    .context("runtime quorum run-spec has no fault")?
-                    .parameters
-                    .quorum_case()?,
-                workload_started_at_ms,
-                workload_ended_at_ms,
+                &TypedQuorumReadExpectation {
+                    scenario: &metadata.scenario,
+                    run_id: &metadata.run_id,
+                    bucket: &json_spec.metadata.bucket,
+                    class: json_spec
+                        .faults
+                        .first()
+                        .context("runtime quorum run-spec has no fault")?
+                        .parameters
+                        .quorum_case()?,
+                    workload_plan: &workload_plan,
+                    cohort_source: TypedQuorumReadCohortSource::ArtifactHistory,
+                    fault_active_at_ms,
+                    workload_started_at_ms,
+                },
             )?;
         } else if options.scenario == scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO {
             summary.require_typed_write_quorum_loss_effect(
@@ -1370,6 +1392,14 @@ fn validate_target_proof(
                     fault.name
                 )
             })?;
+            proof
+                .validate_volume_quorum_bindings(volume_quorum)
+                .with_context(|| {
+                    format!(
+                        "target-proof.json fault {} volume quorum candidates do not match resolvedPods",
+                        fault.name
+                    )
+                })?;
             let class = spec_fault.parameters.quorum_case()?;
             ensure!(
                 volume_quorum.boundary.class == class
@@ -1738,6 +1768,12 @@ fn validate_fixed_volume_runtime_evidence(
             .as_ref()
             .context("runtime quorum target proof has no volume bindings")?;
         quorum.validate(shape, membership)?;
+        proof.validate_volume_quorum_bindings(quorum)?;
+        let fault_apply_started_at_ms = evidence
+            .fault_apply_started_at_ms
+            .context("fault-evidence.json fault_apply_started_at_ms is required")?;
+        require_fresh_runtime_observation(erasure_set.observed_at_ms, fault_apply_started_at_ms)
+            .context("runtime volume quorum topology was stale at fault apply")?;
         Some(quorum)
     } else {
         None
@@ -3271,9 +3307,11 @@ impl WorkloadSummaryArtifact {
                 ("PUT", &self.puts),
                 ("CompleteMultipartUpload", &self.multipart_completes),
             ])?,
-            QuorumCaseClass::Metadata => {
-                self.require_rejected_write_mutations(&[("DELETE", &self.deletes)])?
-            }
+            QuorumCaseClass::Metadata => self.require_rejected_write_mutations(&[
+                ("PUT", &self.puts),
+                ("DELETE", &self.deletes),
+                ("CompleteMultipartUpload", &self.multipart_completes),
+            ])?,
         }
         self.require_write_mutation_history_matches(
             history,
@@ -4227,6 +4265,50 @@ mod tests {
         validate_run_spec(&run_spec, &options).expect("semantic run spec");
         validate_target_proof(&proof, &run_spec, &options).expect("runtime quorum target proof");
 
+        for field in ["pod_uid", "container_id", "mount_path", "pvc", "pv"] {
+            let mut tampered = proof.clone();
+            let candidate = tampered.faults[0]
+                .erasure_set
+                .as_mut()
+                .and_then(|erasure| erasure.volume_quorum.as_mut())
+                .and_then(|quorum| quorum.candidates.first_mut())
+                .expect("first volume quorum candidate");
+            match field {
+                "pod_uid" => candidate.pod_uid = "replacement-uid".to_string(),
+                "container_id" => candidate.container_id = "containerd://replacement".to_string(),
+                "mount_path" => candidate.mount_path = "/data/replacement".to_string(),
+                "pvc" => candidate.persistent_volume_claim = "replacement-pvc".to_string(),
+                "pv" => candidate.persistent_volume = "replacement-pv".to_string(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_target_proof(&tampered, &run_spec, &options).is_err(),
+                "runtime quorum candidate {field} must match resolvedPods exactly"
+            );
+        }
+
+        let evidence_at = |fault_apply_started_at_ms| {
+            serde_json::from_value::<FaultEvidenceArtifact>(json!({
+                "injected": true,
+                "active_during_workload": true,
+                "recovered": true,
+                "require_client_disruption": false,
+                "client_disruptions": 0,
+                "pods_before": [],
+                "pods_after": [],
+                "active_snapshots": [],
+                "workload_snapshots": [],
+                "fault_apply_started_at_ms": fault_apply_started_at_ms
+            }))
+            .expect("fault evidence")
+        };
+        let stale = validate_fixed_volume_runtime_evidence(&evidence_at(5_101), &proof, &run_spec)
+            .expect_err("topology older than five seconds must be rejected");
+        assert!(format!("{stale:#}").contains("maximum is 5000ms"));
+        let future = validate_fixed_volume_runtime_evidence(&evidence_at(99), &proof, &run_spec)
+            .expect_err("future topology observation must be rejected");
+        assert!(format!("{future:#}").contains("must precede fault application"));
+
         let mut wrong_boundary = run_spec;
         wrong_boundary.faults[0].selection.value = 0;
         assert!(validate_target_proof(&proof, &wrong_boundary, &options).is_err());
@@ -5033,14 +5115,14 @@ mod tests {
         );
 
         let metadata = summary(
-            json!({"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}),
+            json!({"ok": 0, "not_found": 0, "failed": 1, "timeout": 0, "unknown": 0}),
             json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 1}),
-            json!({"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}),
+            json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0}),
         );
         let metadata_history = vec![
-            record("put-2", "put", "ok"),
+            record("put-2", "put", "failed"),
             record("delete-2", "delete", "unknown"),
-            record("mpu-2", "complete_multipart_upload", "ok"),
+            record("mpu-2", "complete_multipart_upload", "timeout"),
         ];
         metadata
             .require_typed_write_quorum_loss_effect(
@@ -5051,18 +5133,27 @@ mod tests {
                 10,
                 11,
             )
-            .expect("metadata quorum loss may retain payload write quorum");
+            .expect("metadata quorum loss also crosses payload write quorum");
+
+        let metadata_with_payload_ack = summary(
+            json!({"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}),
+            json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 1}),
+            json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0}),
+        );
+        let mut metadata_history_with_payload_ack = metadata_history.clone();
+        metadata_history_with_payload_ack[0].outcome = OperationOutcome::Ok;
         assert!(
-            metadata
+            metadata_with_payload_ack
                 .require_typed_write_quorum_loss_effect(
-                    &metadata_history,
+                    &metadata_history_with_payload_ack,
                     QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
                     "bucket",
-                    QuorumCaseClass::Payload,
+                    QuorumCaseClass::Metadata,
                     10,
                     11,
                 )
-                .is_err()
+                .is_err(),
+            "metadata P+1 also loses payload write quorum"
         );
 
         let mut tampered_history = payload_history;

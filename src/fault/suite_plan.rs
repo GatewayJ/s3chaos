@@ -1217,6 +1217,52 @@ scenarios:
     }
 
     #[test]
+    fn metadata_quorum_suite_keeps_explicit_operation_mix_override() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-quorum
+scenarios:
+  - name: quorum-p-io-fault
+    params:
+      kind: quorumIo
+      class: metadata
+    workload:
+      operationWeights:
+        put: 3
+        overwrite: 1
+        get: 2
+        list: 1
+        delete: 2
+        multipart: 1
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let attempt_dir = PathBuf::from("target/fault-tests/quorum/attempt-1");
+
+        let config = scenario_config(&base, &suite, &suite.scenarios[0], 1, 1, &attempt_dir)
+            .expect("scenario config");
+
+        assert_eq!(config.workload_directory_marker_percent, 100);
+        assert_eq!(
+            config.workload_operation_mix,
+            WorkloadOperationMix {
+                put: 3,
+                overwrite: 1,
+                get: 2,
+                list: 1,
+                delete: 2,
+                multipart: 1,
+            }
+        );
+    }
+
+    #[test]
     fn scenario_config_applies_suite_overrides_and_unique_artifacts() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
             r#"

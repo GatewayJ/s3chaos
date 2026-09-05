@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub const RUNTIME_TOPOLOGY_MAX_AGE_MS: u64 = 5_000;
+pub const MAX_ERASURE_SET_SHARDS: u32 = 16;
 
 pub fn require_fresh_runtime_observation(
     observed_at_ms: u64,
@@ -441,8 +442,8 @@ impl QuorumRequirements {
 
     fn payload(total_shards: u32, payload_parity_shards: u32) -> Result<Self> {
         ensure!(
-            (2..=16).contains(&total_shards),
-            "erasure set must contain between 2 and 16 shards"
+            (2..=MAX_ERASURE_SET_SHARDS).contains(&total_shards),
+            "erasure set must contain between 2 and {MAX_ERASURE_SET_SHARDS} shards"
         );
         ensure!(
             payload_parity_shards <= total_shards / 2,
@@ -454,8 +455,8 @@ impl QuorumRequirements {
 
     fn metadata(total_shards: u32) -> Result<Self> {
         ensure!(
-            (2..=16).contains(&total_shards),
-            "erasure set must contain between 2 and 16 shards"
+            (2..=MAX_ERASURE_SET_SHARDS).contains(&total_shards),
+            "erasure set must contain between 2 and {MAX_ERASURE_SET_SHARDS} shards"
         );
         Self::from_geometry(total_shards, total_shards / 2)
     }

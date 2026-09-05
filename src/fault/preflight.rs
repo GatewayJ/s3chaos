@@ -532,8 +532,8 @@ impl TargetProof {
     pub fn with_volume_quorum_proven(mut self, quorum: QuorumVolumeTargetProof) -> Result<Self> {
         let erasure_set = self
             .faults
-            .iter_mut()
-            .find_map(|fault| fault.erasure_set.as_mut())
+            .iter()
+            .find_map(|fault| fault.erasure_set.as_ref())
             .context("target proof does not contain erasure-set evidence")?;
         let shape = erasure_set
             .shape
@@ -544,20 +544,12 @@ impl TargetProof {
             .as_ref()
             .context("target proof erasure-set membership is unresolved")?;
         quorum.validate(shape, membership)?;
-        let proof_pods = self
-            .resolved_pods
-            .iter()
-            .map(|pod| (pod.name.as_str(), pod.uid.as_str()))
-            .collect::<BTreeSet<_>>();
-        let binding_pods = quorum
-            .candidates
-            .iter()
-            .map(|binding| (binding.pod_name.as_str(), binding.pod_uid.as_str()))
-            .collect::<BTreeSet<_>>();
-        anyhow::ensure!(
-            proof_pods == binding_pods,
-            "volume quorum bindings do not cover the exact resolved Pod identities"
-        );
+        self.validate_volume_quorum_bindings(&quorum)?;
+        let erasure_set = self
+            .faults
+            .iter_mut()
+            .find_map(|fault| fault.erasure_set.as_mut())
+            .context("target proof does not contain erasure-set evidence")?;
         erasure_set.volume_quorum = Some(quorum);
         for requirement in &mut self.requirements {
             if requirement.name == "volume_quorum_bindings" {
@@ -576,6 +568,77 @@ impl TargetProof {
             TargetProofStatus::Satisfied
         };
         Ok(self)
+    }
+
+    pub(crate) fn validate_volume_quorum_bindings(
+        &self,
+        quorum: &QuorumVolumeTargetProof,
+    ) -> Result<()> {
+        let volume_path = self
+            .faults
+            .iter()
+            .find(|fault| fault.selection_kind == "runtime-quorum")
+            .and_then(|fault| fault.volume_path.as_deref())
+            .context("volume quorum target proof has no runtime-quorum volume path")?;
+        anyhow::ensure!(
+            quorum.candidates.len() == self.resolved_pods.len(),
+            "volume quorum bindings do not cover every resolved Pod"
+        );
+        for binding in &quorum.candidates {
+            anyhow::ensure!(
+                binding.mount_path == volume_path,
+                "volume quorum binding for Pod {:?} does not use the fault target mount path",
+                binding.pod_name
+            );
+            let matches = self
+                .resolved_pods
+                .iter()
+                .filter(|pod| pod.name == binding.pod_name)
+                .collect::<Vec<_>>();
+            let [pod] = matches.as_slice() else {
+                anyhow::bail!(
+                    "volume quorum binding for Pod {:?} must match exactly one resolved Pod",
+                    binding.pod_name
+                )
+            };
+            anyhow::ensure!(
+                pod.uid == binding.pod_uid
+                    && pod.rustfs_container_id.as_deref() == Some(binding.container_id.as_str()),
+                "volume quorum binding for Pod {:?} does not match its resolved Pod UID/container ID",
+                binding.pod_name
+            );
+            let mounts = pod
+                .volume_mounts
+                .iter()
+                .filter(|mount| {
+                    mount.container_name == "rustfs"
+                        && mount.mount_path == binding.mount_path
+                        && mount.persistent_volume_claim.as_deref()
+                            == Some(binding.persistent_volume_claim.as_str())
+                })
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                mounts.len() == 1,
+                "volume quorum binding for Pod {:?} does not match exactly one resolved RustFS mount/PVC",
+                binding.pod_name
+            );
+            let claims = pod
+                .persistent_volume_claims
+                .iter()
+                .filter(|claim| {
+                    claim.name == binding.persistent_volume_claim
+                        && claim.volume_name.as_deref() == Some(binding.persistent_volume.as_str())
+                        && claim.persistent_volume.as_ref().map(|pv| pv.name.as_str())
+                            == Some(binding.persistent_volume.as_str())
+                })
+                .count();
+            anyhow::ensure!(
+                claims == 1,
+                "volume quorum binding for Pod {:?} does not match exactly one resolved PVC/PV",
+                binding.pod_name
+            );
+        }
+        Ok(())
     }
 
     pub fn preflight_check(&self) -> PreflightCheck {

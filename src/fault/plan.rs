@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crate::fault::{
     config::{DEFAULT_RUSTFS_VOLUME_PATH, FaultTestConfig, validate_rustfs_volume_path},
-    quorum::{ErasureSetShape, QuorumCaseClass, QuorumVolumeBoundary},
+    quorum::{ErasureSetShape, MAX_ERASURE_SET_SHARDS, QuorumCaseClass, QuorumVolumeBoundary},
     scenarios::{
         DISK_FULL_SCENARIO, DM_FLAKEY_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend,
         FaultParameterSchema, FaultScenario, FaultScenarioSpec, IO_EIO_SCENARIO,
@@ -776,7 +776,7 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
             // availability is proved at preflight and actual selection is
             // proved at runtime, so the typed selector can cover that full
             // supported width without an unrelated eight-target cutoff.
-            FaultSelection::FixedTargets(count) => (1..=16).contains(&count),
+            FaultSelection::FixedTargets(count) => (1..=MAX_ERASURE_SET_SHARDS).contains(&count),
             FaultSelection::RuntimeQuorum(_) => kind == FaultKind::RustfsVolumeIoError,
         },
         // NetworkPartition has its own fixed-count renderer. The cap is a

@@ -15,7 +15,8 @@
 use crate::fault::shutdown::RunDeadline;
 use crate::fault::{
     history::{
-        ByteRange, DurabilityCohort, OperationKind, OperationOutcome, OperationRecord, Recorder,
+        ByteRange, DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome,
+        OperationRecord, PayloadRef, Recorder,
     },
     quorum::QuorumCaseClass,
     workload::{
@@ -27,7 +28,7 @@ use crate::framework::{artifacts::ArtifactCollector, command::CommandSpec};
 use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 use tokio::time::sleep as async_sleep;
 
@@ -186,6 +187,55 @@ async fn verify_prefill_object(
     )
 }
 
+pub(in crate::fault) async fn probe_typed_quorum_read_cohort(
+    s3: &S3WorkloadClient,
+    history: &Recorder,
+    prefilled: &[ObjectSpec],
+    class: QuorumCaseClass,
+    concurrency: usize,
+) -> Result<()> {
+    let expected_key = |key: &str| match class {
+        QuorumCaseClass::Payload => !key.ends_with('/'),
+        QuorumCaseClass::Metadata => key.ends_with('/'),
+    };
+    let cohort = prefilled
+        .iter()
+        .filter(|object| expected_key(&object.key))
+        .collect::<Vec<_>>();
+    ensure!(
+        !cohort.is_empty(),
+        "quorum P {class:?} read cohort is empty"
+    );
+
+    stream::iter(cohort)
+        .map(|object| async move {
+            let get = s3.get_object_result(&object.key, history).await?;
+            ensure!(
+                get.outcome == OperationOutcome::Ok,
+                "quorum P {class:?} probe failed for key {}: {:?}",
+                object.key,
+                get.outcome
+            );
+            let body = get.body.as_deref().with_context(|| {
+                format!("quorum P {class:?} probe returned no body for key {}", object.key)
+            })?;
+            ensure!(
+                object.matches_body(body),
+                "quorum P {class:?} probe returned mismatched bytes for key {}: expected size={} sha256={}, got size={} sha256={}",
+                object.key,
+                object.size_bytes,
+                object.sha256,
+                body.len(),
+                sha256_hex(body)
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .buffer_unordered(concurrency.max(1))
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(())
+}
+
 pub(in crate::fault) async fn stage_write_quorum_multipart_uploads(
     s3: &S3WorkloadClient,
     history: &Recorder,
@@ -272,31 +322,253 @@ fn multipart_workload_indices(plan: &WorkloadPlan, start_index: usize, count: us
         .collect()
 }
 
+pub(in crate::fault) struct TypedQuorumReadExpectation<'a> {
+    pub(in crate::fault) scenario: &'a str,
+    pub(in crate::fault) run_id: &'a str,
+    pub(in crate::fault) bucket: &'a str,
+    pub(in crate::fault) class: QuorumCaseClass,
+    pub(in crate::fault) workload_plan: &'a WorkloadPlan,
+    pub(in crate::fault) cohort_source: TypedQuorumReadCohortSource<'a>,
+    pub(in crate::fault) fault_active_at_ms: u64,
+    pub(in crate::fault) workload_started_at_ms: u64,
+}
+
+pub(in crate::fault) enum TypedQuorumReadCohortSource<'a> {
+    RuntimePrefilled(&'a [ObjectSpec]),
+    ArtifactHistory,
+}
+
+struct ExpectedQuorumRead {
+    key: String,
+    size_bytes: usize,
+    payload_ref: PayloadRef,
+    trusted_sha256: Option<String>,
+}
+
+#[derive(Default)]
+struct QuorumReadObservations<'a> {
+    put: Option<&'a OperationRecord>,
+    put_count: usize,
+    verification: Option<&'a OperationRecord>,
+    verification_count: usize,
+    probe: Option<&'a OperationRecord>,
+    probe_count: usize,
+}
+
+fn expected_quorum_reads(
+    expected: &TypedQuorumReadExpectation<'_>,
+) -> Result<Vec<ExpectedQuorumRead>> {
+    let count = expected.workload_plan.object_count / 2;
+    ensure!(
+        count > 0,
+        "quorum P {:?} read cohort is empty",
+        expected.class
+    );
+    let runtime_prefilled = match expected.cohort_source {
+        TypedQuorumReadCohortSource::RuntimePrefilled(objects) => {
+            ensure!(
+                objects.len() == count,
+                "quorum P runtime prefill cohort must contain exactly {count} objects, got {}",
+                objects.len()
+            );
+            Some(objects)
+        }
+        TypedQuorumReadCohortSource::ArtifactHistory => None,
+    };
+    let empty_sha256 = (expected.class == QuorumCaseClass::Metadata).then(|| sha256_hex(&[]));
+
+    (0..count)
+        .map(|index| {
+            let (key, size_bytes) = match expected.class {
+                QuorumCaseClass::Payload => (
+                    ObjectSpec::seeded_key(expected.run_id, index),
+                    expected.workload_plan.size_at(index),
+                ),
+                QuorumCaseClass::Metadata => {
+                    (ObjectSpec::directory_marker_key(expected.run_id, index), 0)
+                }
+            };
+            let payload_ref = PayloadRef {
+                seed: expected.workload_plan.seed,
+                index,
+            };
+            let trusted_sha256 = if let Some(objects) = runtime_prefilled {
+                let object = &objects[index];
+                ensure!(
+                    object.key == key
+                        && object.size_bytes == size_bytes
+                        && object.seed == payload_ref.seed
+                        && object.index == payload_ref.index,
+                    "quorum P runtime prefill object {index} does not match the typed workload plan"
+                );
+                Some(object.sha256.clone())
+            } else {
+                empty_sha256.clone()
+            };
+            Ok(ExpectedQuorumRead {
+                key,
+                size_bytes,
+                payload_ref,
+                trusted_sha256,
+            })
+        })
+        .collect()
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(in crate::fault) fn require_typed_quorum_read_survival(
     records: &[OperationRecord],
-    scenario: &str,
-    bucket: &str,
-    class: QuorumCaseClass,
-    workload_started_at_ms: u64,
-    workload_ended_at_ms: u64,
+    expected: &TypedQuorumReadExpectation<'_>,
 ) -> Result<()> {
-    let expected_key = |key: &str| match class {
+    ensure!(
+        expected.fault_active_at_ms <= expected.workload_started_at_ms,
+        "quorum P read window precedes fault activation"
+    );
+    let cohort = expected_quorum_reads(expected)?;
+    let mut by_key = HashMap::with_capacity(cohort.len());
+    for (index, object) in cohort.iter().enumerate() {
+        ensure!(
+            by_key.insert(object.key.as_str(), index).is_none(),
+            "quorum P typed workload plan contains duplicate key {:?}",
+            object.key
+        );
+    }
+    let mut observations = (0..cohort.len())
+        .map(|_| QuorumReadObservations::default())
+        .collect::<Vec<_>>();
+    let expected_key = |key: &str| match expected.class {
         QuorumCaseClass::Payload => !key.ends_with('/'),
         QuorumCaseClass::Metadata => key.ends_with('/'),
     };
+    let mut typed_probes = 0usize;
+    for record in records {
+        if record.scenario != expected.scenario
+            || record.run_id.as_deref() != Some(expected.run_id)
+            || record.bucket != expected.bucket
+        {
+            continue;
+        }
+        let Some(key) = record.key.as_deref() else {
+            continue;
+        };
+        let is_active_probe_window = record.durability_cohort
+            == Some(DurabilityCohort::FaultActive)
+            && record.fault_window_relation == Some(FaultWindowRelation::DuringFault)
+            && record.kind == OperationKind::Get
+            && record.started_at_ms >= expected.fault_active_at_ms
+            && record.ended_at_ms <= expected.workload_started_at_ms;
+        if is_active_probe_window && expected_key(key) {
+            typed_probes += 1;
+        }
+        let Some(index) = by_key.get(key).copied() else {
+            continue;
+        };
+        let observation = &mut observations[index];
+        if record.durability_cohort == Some(DurabilityCohort::PreFault)
+            && matches!(
+                record.fault_window_relation,
+                None | Some(FaultWindowRelation::BeforeFault)
+            )
+            && record.outcome == OperationOutcome::Ok
+        {
+            match record.kind {
+                OperationKind::Put => {
+                    observation.put_count += 1;
+                    observation.put.get_or_insert(record);
+                }
+                OperationKind::Get => {
+                    observation.verification_count += 1;
+                    observation.verification.get_or_insert(record);
+                }
+                _ => {}
+            }
+        }
+        if is_active_probe_window {
+            observation.probe_count += 1;
+            observation.probe.get_or_insert(record);
+        }
+    }
+
+    for (object, observation) in cohort.iter().zip(&observations) {
+        let Some(prefill_put) = observation.put.filter(|_| observation.put_count == 1) else {
+            bail!(
+                "quorum P cohort key {:?} requires exactly one deterministic pre-fault PUT, got {}",
+                object.key,
+                observation.put_count
+            )
+        };
+        ensure!(
+            prefill_put.size_bytes == Some(object.size_bytes)
+                && prefill_put.payload_ref == Some(object.payload_ref)
+                && prefill_put.started_at_ms <= prefill_put.ended_at_ms
+                && prefill_put.ended_at_ms <= expected.fault_active_at_ms
+                && object
+                    .trusted_sha256
+                    .as_deref()
+                    .is_none_or(|sha256| prefill_put.value_sha256.as_deref() == Some(sha256)),
+            "quorum P cohort key {:?} pre-fault PUT does not match the typed workload plan",
+            object.key
+        );
+        let committed_sha256 = prefill_put
+            .value_sha256
+            .as_deref()
+            .filter(|value| is_sha256(value))
+            .with_context(|| {
+                format!(
+                    "quorum P cohort key {:?} pre-fault PUT has no valid SHA-256",
+                    object.key
+                )
+            })?;
+        let Some(verification) = observation
+            .verification
+            .filter(|_| observation.verification_count == 1)
+        else {
+            bail!(
+                "quorum P cohort key {:?} requires exactly one successful pre-fault verification GET, got {}",
+                object.key,
+                observation.verification_count
+            )
+        };
+        ensure!(
+            verification.range.is_none()
+                && verification.value_sha256.as_deref() == Some(committed_sha256)
+                && verification.size_bytes == Some(object.size_bytes)
+                && verification.started_at_ms >= prefill_put.ended_at_ms
+                && verification.started_at_ms <= verification.ended_at_ms
+                && verification.ended_at_ms <= expected.fault_active_at_ms,
+            "quorum P cohort key {:?} pre-fault verification GET does not match the committed PUT",
+            object.key
+        );
+        let Some(probe) = observation.probe.filter(|_| observation.probe_count == 1) else {
+            bail!(
+                "quorum P cohort key {:?} requires exactly one fault-active probe before mixed workload, got {}",
+                object.key,
+                observation.probe_count
+            )
+        };
+        ensure!(
+            probe.outcome == OperationOutcome::Ok
+                && probe.range.is_none()
+                && probe.value_sha256.as_deref() == Some(committed_sha256)
+                && probe.size_bytes == Some(object.size_bytes)
+                && probe.started_at_ms >= expected.fault_active_at_ms
+                && probe.started_at_ms <= probe.ended_at_ms
+                && probe.ended_at_ms <= expected.workload_started_at_ms,
+            "quorum P cohort key {:?} fault-active probe does not match the committed PUT",
+            object.key
+        );
+    }
     ensure!(
-        records.iter().any(|record| {
-            record.scenario == scenario
-                && record.bucket == bucket
-                && record.durability_cohort == Some(DurabilityCohort::FaultActive)
-                && record.kind == OperationKind::Get
-                && record.outcome == OperationOutcome::Ok
-                && record.started_at_ms >= workload_started_at_ms
-                && record.ended_at_ms <= workload_ended_at_ms
-                && record.started_at_ms <= record.ended_at_ms
-                && record.key.as_deref().is_some_and(expected_key)
-        }),
-        "quorum P workload did not record a successful fault-active {class:?} GET inside the workload window"
+        typed_probes == cohort.len(),
+        "quorum P requires one dedicated pre-workload probe per stable {:?} cohort object: expected {}, got {typed_probes}",
+        expected.class,
+        cohort.len()
     );
     Ok(())
 }
@@ -922,9 +1194,11 @@ impl WorkloadSummary {
                 ("PUT", &self.puts),
                 ("CompleteMultipartUpload", &self.multipart_completes),
             ]),
-            QuorumCaseClass::Metadata => {
-                self.require_rejected_write_mutations(&[("DELETE", &self.deletes)])
-            }
+            QuorumCaseClass::Metadata => self.require_rejected_write_mutations(&[
+                ("PUT", &self.puts),
+                ("DELETE", &self.deletes),
+                ("CompleteMultipartUpload", &self.multipart_completes),
+            ]),
         }
     }
 
@@ -1194,17 +1468,21 @@ mod tests {
 
         let mut metadata =
             WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2), "io-eio", "run-1");
-        metadata.puts.record(OperationOutcome::Ok);
+        metadata.puts.record(OperationOutcome::Failed);
         metadata.deletes.record(OperationOutcome::Unknown);
-        metadata.multipart_completes.record(OperationOutcome::Ok);
+        metadata
+            .multipart_completes
+            .record(OperationOutcome::Timeout);
         assert!(
             metadata
                 .require_typed_write_quorum_loss_effect(QuorumCaseClass::Metadata)
                 .is_ok()
         );
+
+        metadata.puts.record(OperationOutcome::Ok);
         assert!(
             metadata
-                .require_typed_write_quorum_loss_effect(QuorumCaseClass::Payload)
+                .require_typed_write_quorum_loss_effect(QuorumCaseClass::Metadata)
                 .is_err()
         );
     }
@@ -1214,62 +1492,243 @@ mod tests {
         assert_eq!(multipart_workload_indices(&plan, 12, 12), vec![17, 23]);
     }
     #[test]
-    fn quorum_p_read_oracle_requires_a_typed_successful_fault_active_get() {
-        let record = |key: &str| {
+    fn quorum_p_read_oracle_requires_the_complete_stable_typed_cohort() {
+        let run_id = "run-1";
+        let plan = WorkloadPlan::seeded(42, 4, 2);
+        let expected_objects = (0..plan.object_count / 2)
+            .map(|index| ObjectSpec::prepare_directory_marker(run_id, index, plan.seed).spec)
+            .collect::<Vec<_>>();
+        let expectation = TypedQuorumReadExpectation {
+            scenario: "quorum-p-io-fault",
+            run_id,
+            bucket: "bucket",
+            class: QuorumCaseClass::Metadata,
+            workload_plan: &plan,
+            cohort_source: TypedQuorumReadCohortSource::ArtifactHistory,
+            fault_active_at_ms: 100,
+            workload_started_at_ms: 130,
+        };
+        let record = |id: &str,
+                      kind: &str,
+                      object: &ObjectSpec,
+                      cohort: &str,
+                      started_at_ms: u64,
+                      ended_at_ms: u64| {
             serde_json::from_value::<OperationRecord>(json!({
-                "id": format!("get-{key}"),
+                "id": id,
                 "scenario": "quorum-p-io-fault",
-                "kind": "get",
+                "run_id": run_id,
+                "kind": kind,
                 "bucket": "bucket",
-                "key": key,
-                "value_sha256": "abc",
-                "size_bytes": 0,
+                "key": object.key,
+                "value_sha256": object.sha256,
+                "size_bytes": object.size_bytes,
                 "version_id": null,
-                "started_at_ms": 110,
-                "ended_at_ms": 120,
+                "payload_ref": {
+                    "seed": object.seed,
+                    "index": object.index
+                },
+                "started_at_ms": started_at_ms,
+                "ended_at_ms": ended_at_ms,
                 "outcome": "ok",
                 "http_status": 200,
                 "error": null,
-                "durability_cohort": "fault_active",
-                "fault_window_relation": "during_fault"
+                "durability_cohort": cohort,
+                "fault_window_relation": if cohort == "pre_fault" { "before_fault" } else { "during_fault" }
             }))
-            .expect("GET record")
+            .expect("operation record")
         };
-        let marker = record("prefix/directory/");
+        let mut records = Vec::new();
+        for (index, object) in expected_objects.iter().enumerate() {
+            records.push(record(
+                &format!("put-{index}"),
+                "put",
+                object,
+                "pre_fault",
+                10 + index as u64 * 10,
+                11 + index as u64 * 10,
+            ));
+            records.push(record(
+                &format!("verify-{index}"),
+                "get",
+                object,
+                "pre_fault",
+                12 + index as u64 * 10,
+                13 + index as u64 * 10,
+            ));
+            records.push(record(
+                &format!("probe-{index}"),
+                "get",
+                object,
+                "fault_active",
+                100 + index as u64 * 10,
+                101 + index as u64 * 10,
+            ));
+        }
 
+        assert!(require_typed_quorum_read_survival(&records, &expectation).is_ok());
+
+        let mut missing_probe = records.clone();
+        missing_probe.retain(|record| record.id != "probe-1");
+        assert!(require_typed_quorum_read_survival(&missing_probe, &expectation).is_err());
+
+        let mut wrong_hash = records.clone();
+        wrong_hash
+            .iter_mut()
+            .find(|record| record.id == "probe-1")
+            .expect("second probe")
+            .value_sha256 = Some("wrong-hash".to_string());
+        assert!(require_typed_quorum_read_survival(&wrong_hash, &expectation).is_err());
+
+        let mut missing_entire_object = records.clone();
+        missing_entire_object.retain(|record| !record.id.ends_with("-1"));
         assert!(
-            require_typed_quorum_read_survival(
-                std::slice::from_ref(&marker),
-                "quorum-p-io-fault",
-                "bucket",
-                QuorumCaseClass::Metadata,
-                100,
-                130,
-            )
-            .is_ok()
+            require_typed_quorum_read_survival(&missing_entire_object, &expectation).is_err(),
+            "removing a complete PUT+verification+probe group must not shrink the expected cohort"
+        );
+
+        let mut wrong_payload_ref = records.clone();
+        wrong_payload_ref
+            .iter_mut()
+            .find(|record| record.id == "put-1")
+            .expect("second PUT")
+            .payload_ref = Some(PayloadRef {
+            seed: plan.seed,
+            index: 0,
+        });
+        assert!(
+            require_typed_quorum_read_survival(&wrong_payload_ref, &expectation).is_err(),
+            "artifact validation must bind every key to its deterministic payload identity"
+        );
+
+        let mut wrong_runtime_cohort = expected_objects.clone();
+        wrong_runtime_cohort[1].key = ObjectSpec::directory_marker_key(run_id, 99);
+        let wrong_runtime_expectation = TypedQuorumReadExpectation {
+            cohort_source: TypedQuorumReadCohortSource::RuntimePrefilled(&wrong_runtime_cohort),
+            ..expectation
+        };
+        assert!(
+            require_typed_quorum_read_survival(&records, &wrong_runtime_expectation).is_err(),
+            "runtime validation must reject a prefilled cohort that drifts from the plan"
+        );
+
+        let pre_fault_only = records
+            .iter()
+            .filter(|record| record.durability_cohort == Some(DurabilityCohort::PreFault))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            require_typed_quorum_read_survival(&pre_fault_only, &expectation).is_err(),
+            "pre-fault verification GETs must not masquerade as fault-active probes"
+        );
+
+        let mut forged_fault_active_time = records;
+        let forged_probe = forged_fault_active_time
+            .iter_mut()
+            .find(|record| record.id == "probe-1")
+            .expect("second probe");
+        forged_probe.started_at_ms = 90;
+        forged_probe.ended_at_ms = 91;
+        assert_eq!(
+            forged_probe.durability_cohort,
+            Some(DurabilityCohort::FaultActive)
+        );
+        assert_eq!(
+            forged_probe.fault_window_relation,
+            Some(FaultWindowRelation::DuringFault)
         );
         assert!(
-            require_typed_quorum_read_survival(
-                std::slice::from_ref(&marker),
-                "quorum-p-io-fault",
-                "bucket",
-                QuorumCaseClass::Payload,
-                100,
-                130,
-            )
-            .is_err()
+            require_typed_quorum_read_survival(&forged_fault_active_time, &expectation).is_err(),
+            "fault-active labels must not override a probe timestamp before fault activation"
         );
-        assert!(
-            require_typed_quorum_read_survival(
-                &[record("prefix/object")],
-                "quorum-p-io-fault",
-                "bucket",
-                QuorumCaseClass::Payload,
+    }
+    #[test]
+    fn quorum_p_read_oracle_indexes_the_default_scale_without_payload_generation() {
+        let run_id = "scale-run";
+        let plan = WorkloadPlan::seeded(42, 40_000, 16);
+        let committed_sha256 = "a".repeat(64);
+        let expectation = TypedQuorumReadExpectation {
+            scenario: "quorum-p-io-fault",
+            run_id,
+            bucket: "bucket",
+            class: QuorumCaseClass::Payload,
+            workload_plan: &plan,
+            cohort_source: TypedQuorumReadCohortSource::ArtifactHistory,
+            fault_active_at_ms: 100,
+            workload_started_at_ms: 130,
+        };
+        let record = |id: String,
+                      kind: OperationKind,
+                      key: String,
+                      size_bytes: usize,
+                      payload_ref: Option<PayloadRef>,
+                      cohort: DurabilityCohort,
+                      relation: FaultWindowRelation,
+                      started_at_ms: u64,
+                      ended_at_ms: u64| OperationRecord {
+            id,
+            scenario: "quorum-p-io-fault".to_string(),
+            run_id: Some(run_id.to_string()),
+            kind,
+            bucket: "bucket".to_string(),
+            key: Some(key),
+            value_sha256: Some(committed_sha256.clone()),
+            size_bytes: Some(size_bytes),
+            version_id: None,
+            listed_keys: None,
+            payload_ref,
+            range: None,
+            started_at_ms,
+            ended_at_ms,
+            outcome: OperationOutcome::Ok,
+            http_status: Some(200),
+            error: None,
+            durability_cohort: Some(cohort),
+            fault_window_relation: Some(relation),
+        };
+        let mut records = Vec::with_capacity(60_000);
+        for index in 0..20_000 {
+            let key = ObjectSpec::seeded_key(run_id, index);
+            let size_bytes = plan.size_at(index);
+            records.push(record(
+                format!("put-{index}"),
+                OperationKind::Put,
+                key.clone(),
+                size_bytes,
+                Some(PayloadRef {
+                    seed: plan.seed,
+                    index,
+                }),
+                DurabilityCohort::PreFault,
+                FaultWindowRelation::BeforeFault,
+                10,
+                11,
+            ));
+            records.push(record(
+                format!("verify-{index}"),
+                OperationKind::Get,
+                key.clone(),
+                size_bytes,
+                None,
+                DurabilityCohort::PreFault,
+                FaultWindowRelation::BeforeFault,
+                12,
+                13,
+            ));
+            records.push(record(
+                format!("probe-{index}"),
+                OperationKind::Get,
+                key,
+                size_bytes,
+                None,
+                DurabilityCohort::FaultActive,
+                FaultWindowRelation::DuringFault,
                 100,
-                130,
-            )
-            .is_ok()
-        );
+                101,
+            ));
+        }
+
+        assert!(require_typed_quorum_read_survival(&records, &expectation).is_ok());
     }
     #[tokio::test]
     async fn multipart_staging_and_cleanup_drain_siblings_after_errors() {

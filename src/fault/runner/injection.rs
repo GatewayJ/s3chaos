@@ -40,7 +40,8 @@ use super::{
 };
 use crate::fault::backends::runtime::apply_fault;
 use crate::fault::workload::execution::{
-    MixedWorkloadRequest, MixedWorkloadResult, require_typed_quorum_read_survival,
+    MixedWorkloadRequest, MixedWorkloadResult, TypedQuorumReadCohortSource,
+    TypedQuorumReadExpectation, probe_typed_quorum_read_cohort, require_typed_quorum_read_survival,
     run_mixed_workload, run_warp_mixed,
 };
 
@@ -242,6 +243,45 @@ impl FaultRun<'_> {
 
         self.run_warp_workload(endpoint, port_forward, fault)
             .await?;
+        history.set_durability_cohort(DurabilityCohort::FaultActive);
+        if plan.scenario == QUORUM_P_IO_FAULT_SCENARIO {
+            let class = plan.fault().parameters().quorum_case()?;
+            events.record(
+                "quorum-read-probe",
+                RunEventStatus::Started,
+                "reading the complete stable typed cohort at the P boundary",
+                Some(serde_json::json!({
+                    "class": class,
+                    "objects": prefilled.len(),
+                })),
+            )?;
+            if let Err(error) = self
+                .deadline
+                .run(probe_typed_quorum_read_cohort(
+                    s3,
+                    history,
+                    prefilled,
+                    class,
+                    workload_plan.concurrency,
+                ))
+                .await
+            {
+                self.record_failure(
+                    "quorum-read-probe",
+                    "workload_or_product",
+                    &error,
+                    None,
+                    Some((fault, "quorum-read-probe-failed")),
+                )?;
+                return Err(error);
+            }
+            events.record(
+                "quorum-read-probe",
+                RunEventStatus::Succeeded,
+                "every stable typed cohort object remained readable with the committed hash",
+                Some(serde_json::json!({ "class": class })),
+            )?;
+        }
         events.record(
             "mixed-workload",
             RunEventStatus::Started,
@@ -252,7 +292,6 @@ impl FaultRun<'_> {
             })),
         )?;
         let workload_started_at_ms = now_ms();
-        history.set_durability_cohort(DurabilityCohort::FaultActive);
         let workload = match run_mixed_workload(&MixedWorkloadRequest {
             s3,
             history,
@@ -296,8 +335,9 @@ impl FaultRun<'_> {
         let require_client_disruption = self.require_workload_impact(
             &workload,
             fault,
+            prefilled,
+            active.fault_active_at_ms,
             workload_started_at_ms,
-            workload_ended_at_ms,
         )?;
         events.record(
             "fault-snapshot-after-workload",
@@ -591,8 +631,9 @@ impl FaultRun<'_> {
         &self,
         workload: &MixedWorkloadResult,
         fault: &AppliedFault,
+        prefilled: &[crate::fault::workload::ObjectSpec],
+        fault_active_at_ms: u64,
         workload_started_at_ms: u64,
-        workload_ended_at_ms: u64,
     ) -> Result<bool> {
         let config = self.config;
         let plan = self.plan;
@@ -613,11 +654,16 @@ impl FaultRun<'_> {
                 } else if plan.scenario == QUORUM_P_IO_FAULT_SCENARIO {
                     require_typed_quorum_read_survival(
                         &self.context.history.records(),
-                        &plan.scenario,
-                        &self.context.bucket,
-                        plan.fault().parameters().quorum_case()?,
-                        workload_started_at_ms,
-                        workload_ended_at_ms,
+                        &TypedQuorumReadExpectation {
+                            scenario: &plan.scenario,
+                            run_id: &self.context.run_id,
+                            bucket: &self.context.bucket,
+                            class: plan.fault().parameters().quorum_case()?,
+                            workload_plan: &self.context.workload_plan,
+                            cohort_source: TypedQuorumReadCohortSource::RuntimePrefilled(prefilled),
+                            fault_active_at_ms,
+                            workload_started_at_ms,
+                        },
                     )
                 } else {
                     Ok(())

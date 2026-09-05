@@ -70,9 +70,10 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
     run_scenario_with_config(config).await
 }
 
-pub async fn run_scenario_with_config(config: FaultTestConfig) -> Result<()> {
+pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()> {
+    scenarios::apply_catalog_defaults(&mut config)?;
     let reference_root = config.cluster.artifacts_dir.clone();
-    run_scenario_with_config_and_reference_root(
+    run_prepared_scenario_with_config_and_reference_root(
         config,
         reference_root,
         fault_run_id(),
@@ -81,13 +82,12 @@ pub async fn run_scenario_with_config(config: FaultTestConfig) -> Result<()> {
     .await
 }
 
-pub(crate) async fn run_scenario_with_config_and_reference_root(
-    mut config: FaultTestConfig,
+pub(crate) async fn run_prepared_scenario_with_config_and_reference_root(
+    config: FaultTestConfig,
     reference_root: impl Into<PathBuf>,
     run_id: String,
     deadline: RunDeadline,
 ) -> Result<()> {
-    scenarios::apply_catalog_defaults(&mut config)?;
     let scenario = FaultScenario::from_config(&config)?;
     let spec = scenarios::scenario_spec(&scenario.name)?;
     let plan = FaultPlan::from_scenario_with_options(
