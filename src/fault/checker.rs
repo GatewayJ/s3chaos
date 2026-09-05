@@ -16,7 +16,7 @@ use anyhow::{Result, anyhow, ensure};
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep as async_sleep, timeout};
 
 use crate::fault::{
@@ -30,6 +30,37 @@ mod read_failure;
 pub use read_failure::CommittedReadFailure;
 
 const MAX_WARNING_SAMPLES: usize = 50;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckerAudit {
+    pub bucket: String,
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+    pub history_prefix_record_count: usize,
+    pub history_prefix_sha256: String,
+    pub data_version_checks: Vec<CheckerDataVersionAudit>,
+    pub delete_marker_checks: Vec<CheckerDeleteMarkerAudit>,
+    /// `None` means versioning was not part of this checker run. Otherwise the
+    /// value records whether ListObjectVersions returned a complete response.
+    pub list_object_versions_completed: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckerDataVersionAudit {
+    pub key: String,
+    pub version_id: String,
+    pub expected_sha256: String,
+    pub observed_sha256: Option<String>,
+    pub outcome: OperationOutcome,
+    pub http_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckerDeleteMarkerAudit {
+    pub key: String,
+    pub version_id: String,
+    pub visible_in_list_object_versions: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckerReport {
@@ -88,6 +119,8 @@ pub struct CheckerReport {
     pub operation_cohorts: BTreeMap<String, usize>,
     #[serde(default)]
     pub fault_window_relations: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<CheckerAudit>,
     pub tenant_recovered: bool,
     pub passed: bool,
 }
@@ -233,6 +266,13 @@ impl CheckerReport {
     }
 }
 
+/// Hash the immutable history prefix consumed by a checker run. Keeping this
+/// helper beside the producer makes validators use the exact serialization
+/// contract rather than a separately reconstructed projection.
+pub(crate) fn checker_history_prefix_sha256(records: &[OperationRecord]) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(records)?))
+}
+
 pub async fn check_s3_history(
     s3: &S3WorkloadClient,
     recorder: &Recorder,
@@ -241,6 +281,8 @@ pub async fn check_s3_history(
     expect_versioning: bool,
 ) -> Result<CheckerReport> {
     let initial_records = recorder.records();
+    let checker_started_at_ms = now_ms();
+    let history_prefix_sha256 = checker_history_prefix_sha256(&initial_records)?;
     let model = object_model(&initial_records);
     let read_anomalies = successful_read_anomalies(&initial_records);
     let list_history_warnings = list_history_warnings(&initial_records);
@@ -284,9 +326,13 @@ pub async fn check_s3_history(
         tolerated_ambiguous_deletes: Vec::new(),
         operation_cohorts: operation_cohort_counts(&initial_records),
         fault_window_relations: fault_window_relation_counts(&initial_records),
+        audit: None,
         tenant_recovered,
         passed: false,
     };
+    let mut data_version_checks = Vec::new();
+    let mut delete_marker_checks = Vec::new();
+    let mut list_object_versions_completed = None;
 
     let final_keys = model
         .live
@@ -376,11 +422,15 @@ pub async fn check_s3_history(
         .buffer_unordered(concurrency);
         while let Some(result) = version_results.next().await {
             let (version, get) = result?;
+            data_version_checks.push(checker_data_version_audit(&version, &get));
             evaluate_committed_version_get(&mut report, &version, get);
         }
 
         match s3.list_object_versions(&prefix, recorder).await? {
             Some(entries) => {
+                list_object_versions_completed = Some(true);
+                delete_marker_checks =
+                    checker_delete_marker_audits(&lineage.delete_markers, Some(entries.as_slice()));
                 let (missing_versions, multipart_lineage) =
                     missing_committed_version_entries(&lineage.versions, &entries);
                 report.missing_committed_versions.extend(missing_versions);
@@ -406,7 +456,11 @@ pub async fn check_s3_history(
                 report.unknown_writes_materialized.extend(materialized);
                 report.unknown_write_value_conflicts.extend(conflicts);
             }
-            None => record_version_list_unavailable(&mut final_list_warnings, &prefix),
+            None => {
+                list_object_versions_completed = Some(false);
+                delete_marker_checks = checker_delete_marker_audits(&lineage.delete_markers, None);
+                record_version_list_unavailable(&mut final_list_warnings, &prefix);
+            }
         }
     }
 
@@ -456,6 +510,10 @@ pub async fn check_s3_history(
     sort_dedup(&mut report.delete_marker_lineage_incomplete);
     sort_dedup(&mut report.multipart_upload_lineage_incomplete);
     report.tolerated_ambiguous_deletes.sort();
+    data_version_checks
+        .sort_by(|left, right| (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id)));
+    delete_marker_checks
+        .sort_by(|left, right| (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id)));
     report.passed = report.tenant_recovered
         && report.missing_committed_objects.is_empty()
         && report.unavailable_committed_objects.is_empty()
@@ -474,6 +532,16 @@ pub async fn check_s3_history(
         && report.resurrected_deleted_objects.is_empty()
         && report.delete_marker_lineage_incomplete.is_empty()
         && report.multipart_upload_lineage_incomplete.is_empty();
+    report.audit = Some(CheckerAudit {
+        bucket: s3.bucket().to_string(),
+        started_at_ms: checker_started_at_ms,
+        completed_at_ms: now_ms(),
+        history_prefix_record_count: initial_records.len(),
+        history_prefix_sha256,
+        data_version_checks,
+        delete_marker_checks,
+        list_object_versions_completed,
+    });
 
     Ok(report)
 }
@@ -793,6 +861,41 @@ fn evaluate_committed_version_get(
     }
 }
 
+fn checker_data_version_audit(
+    version: &CommittedVersion,
+    get: &GetObjectResult,
+) -> CheckerDataVersionAudit {
+    CheckerDataVersionAudit {
+        key: version.key.clone(),
+        version_id: version.version_id.clone(),
+        expected_sha256: version.sha256.clone(),
+        observed_sha256: get.body.as_deref().map(sha256_hex),
+        outcome: get.outcome,
+        http_status: get.http_status,
+    }
+}
+
+fn checker_delete_marker_audits(
+    committed: &[CommittedDeleteMarker],
+    entries: Option<&[ObjectVersionEntry]>,
+) -> Vec<CheckerDeleteMarkerAudit> {
+    let visible = entries
+        .unwrap_or_default()
+        .iter()
+        .filter(|entry| entry.is_delete_marker)
+        .filter_map(|entry| Some((entry.key.as_str(), entry.version_id.as_deref()?)))
+        .collect::<BTreeSet<_>>();
+    committed
+        .iter()
+        .map(|marker| CheckerDeleteMarkerAudit {
+            key: marker.key.clone(),
+            version_id: marker.version_id.clone(),
+            visible_in_list_object_versions: visible
+                .contains(&(marker.key.as_str(), marker.version_id.as_str())),
+        })
+        .collect()
+}
+
 fn missing_committed_version_entries(
     committed: &[CommittedVersion],
     entries: &[ObjectVersionEntry],
@@ -989,6 +1092,13 @@ fn record_version_list_unavailable(warnings: &mut WarningSummary, prefix: &str) 
 fn sort_dedup(values: &mut Vec<String>) {
     values.sort();
     values.dedup();
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -2603,18 +2713,19 @@ fn record_object(record: &OperationRecord) -> Option<(String, ExpectedObject)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AmbiguousWriteAttempt, CheckerReport, ExpectedObject, RecoveryStabilityClassification,
-        RecoveryStabilityReport, WarningSummary, evaluate_committed_get, evaluate_final_get,
-        evaluate_recovery_reread_get, finish_recovery_stability_report,
-        immediate_still_unavailable_keys, is_recovery_tail_read_failure, list_history_warnings,
-        object_model, recovery_tail_candidate_keys, successful_read_anomalies,
-        validate_recovery_key_sets,
+        AmbiguousWriteAttempt, CheckerReport, CommittedDeleteMarker, CommittedVersion,
+        ExpectedObject, RecoveryStabilityClassification, RecoveryStabilityReport, WarningSummary,
+        checker_data_version_audit, checker_delete_marker_audits, checker_history_prefix_sha256,
+        evaluate_committed_get, evaluate_final_get, evaluate_recovery_reread_get,
+        finish_recovery_stability_report, immediate_still_unavailable_keys,
+        is_recovery_tail_read_failure, list_history_warnings, object_model,
+        recovery_tail_candidate_keys, successful_read_anomalies, validate_recovery_key_sets,
     };
     use crate::fault::history::{
         ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
     };
     use crate::fault::workload::seeded_bytes;
-    use crate::fault::workload::{GetObjectResult, sha256_hex};
+    use crate::fault::workload::{GetObjectResult, ObjectVersionEntry, sha256_hex};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn record(
@@ -5260,6 +5371,83 @@ mod tests {
     }
 
     #[test]
+    fn checker_audit_binds_exact_history_prefix_serialization() {
+        let records = vec![record(
+            "op-1",
+            OperationKind::Put,
+            "key",
+            "hash",
+            OperationOutcome::Ok,
+        )];
+        let expected = sha256_hex(&serde_json::to_vec(&records).expect("serialize history"));
+
+        assert_eq!(
+            checker_history_prefix_sha256(&records).expect("hash history"),
+            expected
+        );
+
+        let mut changed = records;
+        changed[0].ended_at_ms += 1;
+        assert_ne!(
+            checker_history_prefix_sha256(&changed).expect("hash changed history"),
+            expected,
+            "the audit digest must bind the complete operation record"
+        );
+    }
+
+    #[test]
+    fn checker_audit_keeps_data_gets_and_delete_marker_visibility_separate() {
+        let actual_body = b"actual-value".to_vec();
+        let version = CommittedVersion {
+            key: "key".to_string(),
+            version_id: "version-1".to_string(),
+            sha256: "expected-hash".to_string(),
+            size_bytes: actual_body.len(),
+            kind: OperationKind::Put,
+        };
+        let get = GetObjectResult {
+            outcome: OperationOutcome::Ok,
+            http_status: Some(200),
+            error: None,
+            body: Some(actual_body.clone()),
+        };
+
+        let data_audit = checker_data_version_audit(&version, &get);
+        assert_eq!(data_audit.key, "key");
+        assert_eq!(data_audit.version_id, "version-1");
+        assert_eq!(data_audit.expected_sha256, "expected-hash");
+        assert_eq!(data_audit.observed_sha256, Some(sha256_hex(&actual_body)));
+        assert_eq!(data_audit.outcome, OperationOutcome::Ok);
+        assert_eq!(data_audit.http_status, Some(200));
+
+        let markers = vec![
+            CommittedDeleteMarker {
+                key: "key".to_string(),
+                version_id: "delete-1".to_string(),
+            },
+            CommittedDeleteMarker {
+                key: "other".to_string(),
+                version_id: "delete-2".to_string(),
+            },
+        ];
+        let entries = vec![ObjectVersionEntry {
+            key: "key".to_string(),
+            version_id: Some("delete-1".to_string()),
+            is_latest: true,
+            is_delete_marker: true,
+        }];
+        let marker_audits = checker_delete_marker_audits(&markers, Some(&entries));
+        assert!(marker_audits[0].visible_in_list_object_versions);
+        assert!(!marker_audits[1].visible_in_list_object_versions);
+        assert!(
+            checker_delete_marker_audits(&markers, None)
+                .iter()
+                .all(|audit| !audit.visible_in_list_object_versions),
+            "an unavailable ListObjectVersions response cannot prove visibility"
+        );
+    }
+
+    #[test]
     fn report_requires_clean_correctness_verdict() {
         let report = CheckerReport {
             scenario: "io-eio".to_string(),
@@ -5296,11 +5484,17 @@ mod tests {
             tolerated_ambiguous_deletes: Vec::new(),
             operation_cohorts: BTreeMap::new(),
             fault_window_relations: BTreeMap::new(),
+            audit: None,
             tenant_recovered: true,
             passed: true,
         };
 
         assert!(report.require_success().is_ok());
+        let legacy_body = serde_json::to_value(&report).expect("serialize checker report");
+        assert!(legacy_body.get("audit").is_none());
+        let legacy_report = serde_json::from_value::<CheckerReport>(legacy_body)
+            .expect("deserialize checker report without audit");
+        assert_eq!(legacy_report.audit, None);
     }
 
     fn empty_report() -> CheckerReport {
@@ -5339,6 +5533,7 @@ mod tests {
             tolerated_ambiguous_deletes: Vec::new(),
             operation_cohorts: BTreeMap::new(),
             fault_window_relations: BTreeMap::new(),
+            audit: None,
             tenant_recovered: true,
             passed: false,
         }

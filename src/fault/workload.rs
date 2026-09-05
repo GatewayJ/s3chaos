@@ -633,6 +633,10 @@ impl S3WorkloadClient {
         })
     }
 
+    pub(crate) fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
     pub(crate) fn for_quiet_mutation(&self, deadline: Instant) -> Self {
         let mut client = self.clone();
         client.client = Client::from_conf(
