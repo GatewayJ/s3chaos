@@ -24,7 +24,11 @@ use super::FaultRun;
 use crate::fault::workload::execution::{MixedWorkloadResult, recommit_unconfirmed_objects};
 
 impl FaultRun<'_> {
-    pub(super) async fn verify_recovered(&self, s3: &S3WorkloadClient) -> Result<()> {
+    pub(super) async fn verify_recovered(
+        &self,
+        s3: &S3WorkloadClient,
+        workload: &mut MixedWorkloadResult,
+    ) -> Result<()> {
         let config = self.config;
         let collector = self.collector;
         let scenario = self.scenario;
@@ -32,6 +36,12 @@ impl FaultRun<'_> {
         let workload_plan = &self.context.workload_plan;
         let events = &self.context.events;
         let history = &self.context.history;
+        workload.seal_recommit_candidates(s3, history)?;
+        collector.write_text(
+            scenario.case_name,
+            "workload-summary.json",
+            &serde_json::to_string_pretty(&workload.summary)?,
+        )?;
         events.record(
             "checker-pre-recommit",
             RunEventStatus::Started,

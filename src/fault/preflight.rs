@@ -28,7 +28,7 @@ use crate::fault::{
 };
 
 const PREFLIGHT_SUMMARY_SCHEMA_VERSION: u8 = 1;
-const TARGET_PROOF_SCHEMA_VERSION: u8 = 2;
+pub(crate) const TARGET_PROOF_SCHEMA_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -173,6 +173,8 @@ pub struct TargetVolumeMountProof {
 #[serde(rename_all = "camelCase")]
 pub struct TargetPersistentVolumeClaimProof {
     pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -185,6 +187,8 @@ pub struct TargetPersistentVolumeClaimProof {
 #[serde(rename_all = "camelCase")]
 pub struct TargetPersistentVolumeProof {
     pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1009,10 +1013,12 @@ mod tests {
             .with_ready(true)
             .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
                 name: "data-rustfs-0".to_string(),
+                uid: "pvc-uid-0".to_string(),
                 volume_name: Some("pv-csi".to_string()),
                 storage_class: Some("fast-csi".to_string()),
                 persistent_volume: Some(TargetPersistentVolumeProof {
                     name: "pv-csi".to_string(),
+                    uid: "pv-uid-0".to_string(),
                     source: Some("csi".to_string()),
                     required_node_affinity: None,
                     node: None,
@@ -1044,10 +1050,12 @@ mod tests {
             }])
             .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
                 name: "data-rustfs-0".to_string(),
+                uid: "pvc-uid-0".to_string(),
                 volume_name: Some("pv-a".to_string()),
                 storage_class: Some("fast-csi".to_string()),
                 persistent_volume: Some(TargetPersistentVolumeProof {
                     name: "pv-a".to_string(),
+                    uid: "pv-uid-0".to_string(),
                     source: Some(source.to_string()),
                     required_node_affinity: affinity,
                     node: None,

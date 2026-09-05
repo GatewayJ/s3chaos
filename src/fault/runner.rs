@@ -185,7 +185,9 @@ async fn run_fault_case(
             .await?;
         let mut evidence =
             run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
-        deadline.run(run.verify_recovered(&prepared.s3)).await?;
+        deadline
+            .run(run.verify_recovered(&prepared.s3, &mut workload.workload))
+            .await?;
         deadline
             .run(run.recommit(&prepared.s3, &mut workload.workload))
             .await?;
