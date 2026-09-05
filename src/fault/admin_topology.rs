@@ -515,6 +515,8 @@ impl AdminEndpointIdentity {
     fn require_same_live_target(&self, current: &Self) -> Result<()> {
         self.validate()?;
         current.validate()?;
+        let bound_tenant = self.tenant_receipt()?;
+        let current_tenant = current.tenant_receipt()?;
         ensure!(
             self.kubernetes_context == current.kubernetes_context
                 && self.cluster_uid == current.cluster_uid
@@ -525,10 +527,18 @@ impl AdminEndpointIdentity {
                 && self.tenant_name == current.tenant_name
                 && self.tenant_uid == current.tenant_uid
                 && self.local_endpoint == current.local_endpoint
-                && self.remote_port == current.remote_port,
+                && self.remote_port == current.remote_port
+                && bound_tenant.pointer("/spec/pools") == current_tenant.pointer("/spec/pools")
+                && bound_tenant.pointer("/spec/tls") == current_tenant.pointer("/spec/tls"),
             "admin port-forward live Kubernetes target drifted after endpoint binding"
         );
         Ok(())
+    }
+
+    fn tenant_receipt(&self) -> Result<Value> {
+        self.validate()?;
+        serde_json::from_str(&self.tenant_response_body)
+            .context("decode authenticated admin endpoint Tenant GET receipt")
     }
 }
 
@@ -590,6 +600,16 @@ impl AdminRuntimeBinding {
                 && self.response_sha256 == sha256_hex(self.response_body.as_bytes())
                 && deployment_id_from_info(&self.response_body)? == self.target.deployment_id,
             "RustFS deployment binding is incomplete or inconsistent with its captured admin info response"
+        );
+        Ok(())
+    }
+
+    fn require_same_runtime(&self, current: &Self) -> Result<()> {
+        self.validate()?;
+        current.validate()?;
+        ensure!(
+            self.target == current.target && self.observed_at_ms <= current.started_at_ms,
+            "RustFS deployment changed before a destructive admin request"
         );
         Ok(())
     }
@@ -671,6 +691,12 @@ impl KubernetesTenantGetEvidence {
             "Kubernetes Tenant GET identity fields do not match its captured response"
         );
         Ok(())
+    }
+
+    fn tenant_receipt(&self) -> Result<Value> {
+        self.validate()?;
+        serde_json::from_str(&self.response_body)
+            .context("decode authenticated Kubernetes Tenant GET receipt")
     }
 }
 
@@ -850,13 +876,24 @@ impl RustfsAdminTopologyAdapter {
         probe_runtime_binding(&self.transport, self.runtime.target.endpoint.clone()).await
     }
 
+    async fn ensure_request_target(&self, method: &Method) -> Result<()> {
+        self.ensure_port_forward_target()?;
+        if *method != Method::GET {
+            let current =
+                probe_runtime_binding(&self.transport, self.runtime.target.endpoint.clone())
+                    .await?;
+            self.runtime.require_same_runtime(&current)?;
+        }
+        Ok(())
+    }
+
     async fn json<T: for<'de> Deserialize<'de>>(
         &self,
         method: Method,
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<AdminCall<T>> {
-        self.ensure_port_forward_target()?;
+        self.ensure_request_target(&method).await?;
         let started_at_ms = now_ms();
         let response = self
             .transport
@@ -884,7 +921,7 @@ impl RustfsAdminTopologyAdapter {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<AdminCall<()>> {
-        self.ensure_port_forward_target()?;
+        self.ensure_request_target(&method).await?;
         let started_at_ms = now_ms();
         let response = self
             .transport
@@ -1112,32 +1149,22 @@ impl AdminTopologyProof {
             AdminTopologyPlan::for_scenario(scenario)? == *plan,
             "admin topology plan does not match scenario {scenario}"
         );
-        let tenant_name = required_string(tenant, "/metadata/name")?;
-        let tenant_uid = required_string(tenant, "/metadata/uid")?;
-        let namespace = required_string(tenant, "/metadata/namespace")?;
         validate_build_context(scenario, context)?;
+        let receipt_tenant = context.runtime.target.endpoint.tenant_receipt()?;
+        ensure!(
+            tenant == &receipt_tenant,
+            "Tenant topology input does not match the authenticated raw Tenant GET receipt"
+        );
+        let (tenant_name, tenant_uid, namespace, tenant_pools) = tenant_pool_proofs_from_receipt(
+            &receipt_tenant,
+            &context.cluster_domain,
+            &runtime_pools,
+        )?;
         context.runtime.target.endpoint.validate_for_tenant(
             &namespace,
             &tenant_name,
             &tenant_uid,
         )?;
-        let tenant_pools = tenant
-            .pointer("/spec/pools")
-            .and_then(Value::as_array)
-            .context("Tenant spec.pools must be an array")?
-            .iter()
-            .map(|pool| {
-                tenant_pool_proof(
-                    pool,
-                    &tenant_name,
-                    &tenant_uid,
-                    &namespace,
-                    tenant,
-                    &context.cluster_domain,
-                    &runtime_pools,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
         validate_runtime_pools(&tenant_pools, &runtime_pools)?;
         let mutually_exclusive = true;
         let target_pool_id = plan
@@ -1197,6 +1224,8 @@ impl AdminTopologyProof {
             &self.tenant,
             &self.attempt.tenant_uid,
         )?;
+        let receipt_tenant = self.runtime.target.endpoint.tenant_receipt()?;
+        validate_tenant_receipt_against_proof(self, &receipt_tenant)?;
         for pool in &self.tenant_pools {
             ensure!(
                 pool.tenant_uid == self.attempt.tenant_uid,
@@ -1291,6 +1320,59 @@ fn expected_case_name(scenario: &str) -> Result<&'static str> {
         ADMIN_REBALANCE_SCENARIO => Ok(ADMIN_REBALANCE_CASE_NAME),
         other => bail!("scenario {other:?} is not an admin topology case"),
     }
+}
+
+fn tenant_pool_proofs_from_receipt(
+    tenant: &Value,
+    cluster_domain: &str,
+    runtime_pools: &[AdminPool],
+) -> Result<(String, String, String, Vec<TenantPoolProof>)> {
+    let tenant_name = required_string(tenant, "/metadata/name")?;
+    let tenant_uid = required_string(tenant, "/metadata/uid")?;
+    let namespace = required_string(tenant, "/metadata/namespace")?;
+    let pools = tenant
+        .pointer("/spec/pools")
+        .and_then(Value::as_array)
+        .context("authenticated Tenant GET receipt spec.pools must be an array")?
+        .iter()
+        .map(|pool| {
+            tenant_pool_proof(
+                pool,
+                &tenant_name,
+                &tenant_uid,
+                &namespace,
+                tenant,
+                cluster_domain,
+                runtime_pools,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((tenant_name, tenant_uid, namespace, pools))
+}
+
+fn validate_tenant_receipt_against_proof(proof: &AdminTopologyProof, tenant: &Value) -> Result<()> {
+    let cluster_domains = proof
+        .tenant_pools
+        .iter()
+        .map(|pool| pool.cluster_domain.as_str())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        cluster_domains.len() == 1,
+        "Tenant pool proofs do not use one cluster domain"
+    );
+    let cluster_domain = *cluster_domains
+        .first()
+        .context("admin topology proof contains no Tenant pool")?;
+    let (receipt_name, receipt_uid, receipt_namespace, receipt_pools) =
+        tenant_pool_proofs_from_receipt(tenant, cluster_domain, &proof.runtime_pools)?;
+    ensure!(
+        receipt_name == proof.tenant
+            && receipt_uid == proof.attempt.tenant_uid
+            && receipt_namespace == proof.namespace
+            && receipt_pools == proof.tenant_pools,
+        "admin topology proof does not match its authenticated raw Tenant GET receipt"
+    );
+    Ok(())
 }
 
 fn tenant_pool_proof(
@@ -1590,6 +1672,7 @@ fn validate_pre_start_snapshot(
             && snapshot.tenant_get.uid == proof.attempt.tenant_uid,
         "pre-start Kubernetes Tenant GET does not match the proven Tenant identity"
     );
+    validate_tenant_receipt_against_proof(proof, &snapshot.tenant_get.tenant_receipt()?)?;
     validate_runtime_pools(&proof.tenant_pools, &snapshot.pools)?;
     let capacity = topology_capacity(
         proof.target_pool_id,
@@ -1638,6 +1721,7 @@ fn validate_post_operation_snapshot(
             && snapshot.tenant_get.uid == proof.attempt.tenant_uid,
         "post-operation Kubernetes Tenant GET does not match the proven Tenant identity"
     );
+    validate_tenant_receipt_against_proof(proof, &snapshot.tenant_get.tenant_receipt()?)?;
     validate_pool_wire_invariants("after", &snapshot.pools)?;
     let (_, _, terminal_status_observed_at_ms) =
         validate_start_before_status(operation_requests, &proof.scenario, proof.target_pool_id)?;
@@ -2944,7 +3028,14 @@ pub fn validate_admin_topology_artifacts(
 
 #[cfg(test)]
 mod tests {
-    use axum::{Router, routing::get};
+    use axum::{
+        Router,
+        routing::{get, post},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     use super::*;
 
@@ -3108,6 +3199,19 @@ mod tests {
             workload_max_bytes: TEST_WORKLOAD_MAX_BYTES,
             runtime: runtime_binding(60, 70),
         }
+    }
+
+    fn context_with_tenant(scenario: &str, tenant: &Value) -> AdminTopologyBuildContext {
+        let mut context = context(scenario);
+        let body = serde_json::to_string(tenant).expect("serialize Tenant receipt");
+        let endpoint = &mut context.runtime.target.endpoint;
+        endpoint.tenant_name = required_string(tenant, "/metadata/name").expect("Tenant name");
+        endpoint.tenant_uid = required_string(tenant, "/metadata/uid").expect("Tenant UID");
+        endpoint.tenant_resource_version =
+            required_string(tenant, "/metadata/resourceVersion").expect("Tenant resourceVersion");
+        endpoint.tenant_response_sha256 = sha256_hex(body.as_bytes());
+        endpoint.tenant_response_body = body;
+        context
     }
 
     #[test]
@@ -3570,6 +3674,84 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn destructive_admin_request_requires_fresh_stable_runtime() {
+        let info_calls = Arc::new(AtomicUsize::new(0));
+        let destructive_calls = Arc::new(AtomicUsize::new(0));
+        let runtime_drifted = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/rustfs/admin/v3/info",
+                get({
+                    let info_calls = info_calls.clone();
+                    let runtime_drifted = runtime_drifted.clone();
+                    move || {
+                        info_calls.fetch_add(1, Ordering::SeqCst);
+                        let drifted = runtime_drifted.load(Ordering::SeqCst);
+                        async move {
+                            if drifted {
+                                r#"{"info":{"deploymentID":"replacement-deployment"}}"#
+                            } else {
+                                r#"{"info":{"deploymentID":"deployment-1"}}"#
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/rustfs/admin/v3/rebalance/start",
+                post({
+                    let destructive_calls = destructive_calls.clone();
+                    move || {
+                        destructive_calls.fetch_add(1, Ordering::SeqCst);
+                        async { r#"{"id":"rebalance-1"}"# }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("mock listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("mock address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+        let mut endpoint_identity = endpoint_identity();
+        let local_port = reqwest::Url::parse(&endpoint)
+            .expect("mock endpoint")
+            .port()
+            .expect("mock port");
+        endpoint_identity.port_forward_command = format!(
+            "kubectl --context kind-admin-test -n fault-ns port-forward svc/fault-tenant-io {local_port}:9000"
+        );
+        endpoint_identity.local_endpoint = endpoint;
+        let adapter = RustfsAdminTopologyAdapter::connect_for_test(
+            endpoint_identity,
+            "us-east-1",
+            "access",
+            "secret",
+        )
+        .await
+        .expect("adapter");
+
+        let started = adapter
+            .start_rebalance()
+            .await
+            .expect("stable deployment permits destructive request");
+        assert_eq!(started.value.id, "rebalance-1");
+        assert_eq!(info_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(destructive_calls.load(Ordering::SeqCst), 1);
+
+        runtime_drifted.store(true, Ordering::SeqCst);
+        let error = adapter
+            .start_rebalance()
+            .await
+            .expect_err("deployment drift must block a destructive request");
+        assert!(error.to_string().contains("RustFS deployment changed"));
+        assert_eq!(info_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(destructive_calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     #[test]
     fn pool_snapshot_derives_tenant_uid_from_fresh_kubernetes_get() {
         let mut current_tenant = tenant();
@@ -3679,6 +3861,29 @@ mod tests {
     }
 
     #[test]
+    fn live_target_allows_status_updates_but_rejects_tenant_topology_drift() {
+        let bound = endpoint_identity();
+        let mut current = bound.clone();
+        let mut current_tenant = current.tenant_receipt().expect("Tenant receipt");
+        current_tenant["metadata"]["resourceVersion"] = serde_json::json!("tenant-rv-2");
+        current.tenant_resource_version = "tenant-rv-2".to_string();
+        current.tenant_response_body = serde_json::to_string(&current_tenant).expect("Tenant JSON");
+        current.tenant_response_sha256 = sha256_hex(current.tenant_response_body.as_bytes());
+        bound
+            .require_same_live_target(&current)
+            .expect("status-only resourceVersion change");
+
+        current_tenant["spec"]["pools"][0]["servers"] = serde_json::json!(8);
+        current.tenant_response_body =
+            serde_json::to_string(&current_tenant).expect("drifted Tenant JSON");
+        current.tenant_response_sha256 = sha256_hex(current.tenant_response_body.as_bytes());
+        assert!(
+            bound.require_same_live_target(&current).is_err(),
+            "same-UID Tenant pool drift must invalidate the live target"
+        );
+    }
+
+    #[test]
     fn decommission_preflight_binds_exact_pool_and_capacity() {
         let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
         let proof = AdminTopologyProof::build(
@@ -3710,7 +3915,7 @@ mod tests {
             ADMIN_DECOMMISSION_SCENARIO,
             &reversed,
             pools(),
-            &context(ADMIN_DECOMMISSION_SCENARIO),
+            &context_with_tenant(ADMIN_DECOMMISSION_SCENARIO, &reversed),
         )
         .expect("name/cmdline binding");
 
@@ -3729,6 +3934,79 @@ mod tests {
                 &context(ADMIN_DECOMMISSION_SCENARIO),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn topology_rejects_same_uid_spec_not_proven_by_tenant_receipt() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
+        let authenticated = tenant();
+        let context = context_with_tenant(ADMIN_DECOMMISSION_SCENARIO, &authenticated);
+        let mut drifts = Vec::new();
+
+        let mut pool_drift = authenticated.clone();
+        pool_drift["spec"]["pools"][0]["servers"] = serde_json::json!(8);
+        drifts.push(("pool shape", pool_drift));
+
+        let mut tls_drift = authenticated.clone();
+        tls_drift["spec"]["tls"]["enableInternodeHttps"] = serde_json::json!(true);
+        drifts.push(("internode TLS", tls_drift));
+
+        let mut path_drift = authenticated.clone();
+        path_drift["spec"]["pools"][0]["persistence"]["path"] = serde_json::json!("/forged");
+        drifts.push(("pool path", path_drift));
+
+        for (name, drifted) in drifts {
+            let error = AdminTopologyProof::build(
+                &plan,
+                ADMIN_DECOMMISSION_SCENARIO,
+                &drifted,
+                pools(),
+                &context,
+            )
+            .expect_err("an unreceipted same-UID Tenant spec must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("authenticated raw Tenant GET receipt"),
+                "unexpected {name} drift error: {error:#}"
+            );
+        }
+
+        let mut forged = AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &authenticated,
+            pools(),
+            &context,
+        )
+        .expect("receipt-bound proof");
+        let primary = forged
+            .tenant_pools
+            .iter_mut()
+            .find(|pool| pool.name == "primary")
+            .expect("primary pool");
+        primary.data_path = "/forged".to_string();
+        let (_, expression) = expected_pool_endpoint_set(
+            &forged.tenant,
+            &primary.name,
+            &forged.namespace,
+            &primary.internode_scheme,
+            &primary.cluster_domain,
+            &primary.data_path,
+            (primary.servers, primary.volumes_per_server),
+        )
+        .expect("forged endpoint");
+        primary.expected_endpoint_set = expression.clone();
+        forged
+            .runtime_pools
+            .iter_mut()
+            .find(|pool| pool.id == primary.runtime_pool_id)
+            .expect("primary runtime pool")
+            .expression = expression;
+        assert!(
+            forged.require_satisfied().is_err(),
+            "a self-consistent proof projection must not override its raw Tenant receipt"
         );
     }
 
@@ -3884,7 +4162,15 @@ mod tests {
             .is_err()
         );
 
-        for tenant_drift in ["uid", "name", "resource-version", "at-start"] {
+        for tenant_drift in [
+            "uid",
+            "name",
+            "resource-version",
+            "at-start",
+            "spec-pools",
+            "spec-tls",
+            "spec-path",
+        ] {
             let mut drifted =
                 pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone());
             match tenant_drift {
@@ -3892,7 +4178,25 @@ mod tests {
                 "name" => drifted.tenant_get.name = "replacement-tenant".to_string(),
                 "resource-version" => drifted.tenant_get.resource_version.clear(),
                 "at-start" => drifted.tenant_get.observed_at_ms = 100,
-                _ => unreachable!(),
+                spec_drift => {
+                    let mut receipt = tenant();
+                    match spec_drift {
+                        "spec-pools" => {
+                            receipt["spec"]["pools"][0]["servers"] = serde_json::json!(8)
+                        }
+                        "spec-tls" => {
+                            receipt["spec"]["tls"]["enableInternodeHttps"] = serde_json::json!(true)
+                        }
+                        "spec-path" => {
+                            receipt["spec"]["pools"][0]["persistence"]["path"] =
+                                serde_json::json!("/forged")
+                        }
+                        _ => unreachable!(),
+                    }
+                    let body = serde_json::to_string(&receipt).expect("drifted Tenant receipt");
+                    drifted.tenant_get.response_sha256 = sha256_hex(body.as_bytes());
+                    drifted.tenant_get.response_body = body;
+                }
             }
             assert!(
                 AdminOperationEvidence::from_decommission(

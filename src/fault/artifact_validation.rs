@@ -3414,6 +3414,12 @@ mod tests {
                 "name": "fault-tenant",
                 "uid": "tenant-uid",
                 "resourceVersion": "tenant-rv-1"
+            },
+            "spec": {
+                "pools": [
+                    {"name": "primary", "servers": 4, "persistence": {"volumesPerServer": 1}},
+                    {"name": "decommission-target", "servers": 4, "persistence": {"volumesPerServer": 1}}
+                ]
             }
         }))
         .expect("endpoint Tenant GET body");
@@ -3470,6 +3476,12 @@ mod tests {
                 "name": "fault-tenant",
                 "uid": "tenant-uid",
                 "resourceVersion": "tenant-rv-1"
+            },
+            "spec": {
+                "pools": [
+                    {"name": "primary", "servers": 4, "persistence": {"volumesPerServer": 1}},
+                    {"name": "decommission-target", "servers": 4, "persistence": {"volumesPerServer": 1}}
+                ]
             }
         }))
         .expect("Tenant GET body");
@@ -3480,6 +3492,12 @@ mod tests {
                 "name": "fault-tenant",
                 "uid": "tenant-uid",
                 "resourceVersion": "tenant-rv-2"
+            },
+            "spec": {
+                "pools": [
+                    {"name": "primary", "servers": 4, "persistence": {"volumesPerServer": 1}},
+                    {"name": "decommission-target", "servers": 4, "persistence": {"volumesPerServer": 1}}
+                ]
             }
         }))
         .expect("Tenant GET body");
@@ -3650,6 +3668,40 @@ mod tests {
             dir.path(),
         )
         .expect("valid admin evidence");
+        let proof_path = dir.path().join("admin-topology-proof.json");
+        let valid_proof = serde_json::from_slice::<Value>(
+            &fs::read(&proof_path).expect("topology proof artifact"),
+        )
+        .expect("topology proof JSON");
+        let mut same_uid_spec_drift = valid_proof.clone();
+        let mut drifted_receipt = serde_json::from_str::<Value>(
+            same_uid_spec_drift["runtime"]["target"]["endpoint"]["tenantResponseBody"]
+                .as_str()
+                .expect("Tenant receipt body"),
+        )
+        .expect("Tenant receipt JSON");
+        drifted_receipt["spec"]["pools"][0]["persistence"]["path"] = json!("/forged");
+        let drifted_body = serde_json::to_string(&drifted_receipt).expect("drifted Tenant receipt");
+        same_uid_spec_drift["runtime"]["target"]["endpoint"]["tenantResponseSha256"] =
+            json!(hex::encode(Sha256::digest(drifted_body.as_bytes())));
+        same_uid_spec_drift["runtime"]["target"]["endpoint"]["tenantResponseBody"] =
+            json!(drifted_body);
+        write_json(
+            dir.path(),
+            "admin-topology-proof.json",
+            &same_uid_spec_drift,
+        );
+        assert!(
+            validate_admin_topology_artifact_files(
+                "admin-decommission",
+                &attempt,
+                attempt_window,
+                dir.path(),
+            )
+            .is_err(),
+            "same-UID Tenant spec drift must not override the authenticated topology receipt"
+        );
+        write_json(dir.path(), "admin-topology-proof.json", &valid_proof);
         let mut incomplete_operation_cycle = valid_workload_plan.clone();
         incomplete_operation_cycle["object_count"] = json!(2);
         incomplete_operation_cycle["total_payload_bytes"] = json!(200);
