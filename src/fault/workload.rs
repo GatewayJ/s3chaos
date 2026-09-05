@@ -1287,7 +1287,7 @@ impl S3WorkloadClient {
             .outcome)
     }
 
-    async fn complete_staged_multipart_object_record(
+    pub(crate) async fn complete_staged_multipart_object_record(
         &self,
         staged: &StagedMultipartUpload,
         recorder: &Recorder,

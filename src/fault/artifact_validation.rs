@@ -24,6 +24,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::fault::{
+    acknowledged_mutation::AcknowledgedMutationKind,
     backends::chaos_mesh::{
         NetworkPartitionEvidenceContract, VolumeTargetEvidenceContract, iochaos_record_pod_id,
         validate_fixed_volume_snapshot, validate_network_partition_snapshot,
@@ -52,10 +53,12 @@ use crate::fault::{
     },
     quorum::require_fresh_runtime_observation,
     reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
-    scenarios::{self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario},
+    scenarios::{
+        self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario, acknowledged_mutation_kind,
+    },
     spec::{
-        FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunFaultSpec,
-        FaultRunSpec, FaultRunTargetSpec,
+        FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunAckTriggerSpec, FaultRunArtifactSpec,
+        FaultRunFaultSpec, FaultRunSpec, FaultRunTargetSpec,
     },
     workload::WorkloadPlan,
 };
@@ -162,6 +165,7 @@ fn validate_failed_attempt_disruption_evidence(
     attempt_started_at_ms: u64,
     evaluated_at_ms: u64,
 ) -> Result<FailedAttemptDisruptionEvidence> {
+    let ack_mutation = acknowledged_mutation_kind(scenario);
     ensure!(
         attempt_run_id
             .strip_prefix("run-")
@@ -202,15 +206,28 @@ fn validate_failed_attempt_disruption_evidence(
             && evidence.run_id.as_deref() == Some(attempt_run_id),
         "fault-evidence.json identity does not match the planned attempt"
     );
-    ensure!(
-        evidence.injected && evidence.active_during_workload && evidence.recovered,
-        "fault-evidence.json does not prove a completed fault lifecycle"
-    );
-    ensure!(
-        !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
-        "fault-evidence.json does not prove fault activity during the workload"
-    );
-    validate_fault_window_evidence(&evidence)?;
+    if ack_mutation.is_some() {
+        ensure!(
+            evidence.injected
+                && !evidence.active_during_workload
+                && evidence.recovered
+                && evidence.client_disruptions == 0
+                && !evidence.active_snapshots.is_empty()
+                && evidence.workload_snapshots.is_empty(),
+            "fault-evidence.json does not prove a completed ACK-triggered quiet lifecycle"
+        );
+        validate_ack_fault_window_evidence(&evidence)?;
+    } else {
+        ensure!(
+            evidence.injected && evidence.active_during_workload && evidence.recovered,
+            "fault-evidence.json does not prove a completed fault lifecycle"
+        );
+        ensure!(
+            !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
+            "fault-evidence.json does not prove fault activity during the workload"
+        );
+        validate_fault_window_evidence(&evidence)?;
+    }
     ensure!(
         evidence
             .fault_apply_started_at_ms
@@ -221,13 +238,6 @@ fn validate_failed_attempt_disruption_evidence(
         "fault-evidence.json timestamps are outside the current attempt window"
     );
 
-    let workload_path = bound_case_artifact(&case_dir, "workload-summary.json")?;
-    let workload = read_json::<WorkloadSummaryArtifact>(&workload_path)?;
-    ensure!(
-        workload.scenario.as_deref() == Some(scenario)
-            && workload.run_id.as_deref() == Some(attempt_run_id),
-        "workload-summary.json identity does not match the planned attempt"
-    );
     let workload_plan =
         read_json::<ArtifactIdentity>(&bound_case_artifact(&case_dir, "workload-plan.json")?)?;
     ensure!(
@@ -235,11 +245,23 @@ fn validate_failed_attempt_disruption_evidence(
             && workload_plan.run_id.as_deref() == Some(attempt_run_id),
         "workload-plan.json identity does not match the planned attempt"
     );
-    let disrupted = workload.disrupted()?;
-    ensure!(
-        disrupted == evidence.client_disruptions,
-        "fault-evidence.json client_disruptions does not match workload-summary.json"
-    );
+    let disrupted = if ack_mutation.is_some() {
+        0
+    } else {
+        let workload_path = bound_case_artifact(&case_dir, "workload-summary.json")?;
+        let workload = read_json::<WorkloadSummaryArtifact>(&workload_path)?;
+        ensure!(
+            workload.scenario.as_deref() == Some(scenario)
+                && workload.run_id.as_deref() == Some(attempt_run_id),
+            "workload-summary.json identity does not match the planned attempt"
+        );
+        let disrupted = workload.disrupted()?;
+        ensure!(
+            disrupted == evidence.client_disruptions,
+            "fault-evidence.json client_disruptions does not match workload-summary.json"
+        );
+        disrupted
+    };
 
     let events_path = bound_case_artifact(&case_dir, "run-events.jsonl")?;
     let events = read_jsonl::<RunEvent>(&events_path)?;
@@ -252,6 +274,25 @@ fn validate_failed_attempt_disruption_evidence(
             }),
         "run-events.jsonl identity or timestamps do not match the planned attempt"
     );
+    if let Some(expected_mutation) = ack_mutation {
+        let full_run_spec = read_json::<FaultRunSpec>(&run_spec_path)?;
+        let history =
+            read_jsonl::<OperationRecord>(&bound_case_artifact(&case_dir, "history.jsonl")?)?;
+        validate_ack_triggered_dm_artifacts(
+            AckArtifactValidationContext {
+                root: &case_dir,
+                case_name,
+                events: &events,
+                evidence: &evidence,
+                history: &history,
+                scenario,
+                run_id: attempt_run_id,
+                bucket: &full_run_spec.metadata.bucket,
+                run_spec: &full_run_spec,
+            },
+            expected_mutation,
+        )?;
+    }
     ensure!(
         has_event(&events, "run", RunEventStatus::Started)
             && (has_event(&events, "run", RunEventStatus::Failed)
@@ -504,13 +545,18 @@ fn validate_fault_artifacts_with_identity(
     identity: ArtifactIdentityPolicy<'_>,
 ) -> Result<ArtifactValidationReport> {
     let scenario_spec = scenarios::scenario_spec(&options.scenario)?;
+    let ack_mutation = acknowledged_mutation_kind(&options.scenario);
     validate_conditional_recovery_stability_artifact(
         &options.artifact_root,
         scenario_spec.case_name,
         &options.scenario,
         identity.planned_run_id(),
     )?;
-    let artifacts = locate_required_artifacts(&options.artifact_root, scenario_spec.case_name)?;
+    let artifacts = locate_required_artifacts(
+        &options.artifact_root,
+        scenario_spec.case_name,
+        &options.scenario,
+    )?;
 
     let metadata_path = required(&artifacts, "run-metadata.json")?;
     ensure_json_field_present(
@@ -667,14 +713,29 @@ fn validate_fault_artifacts_with_identity(
         &metadata,
         identity,
     )?;
-    ensure!(
-        evidence.injected && evidence.active_during_workload && evidence.recovered,
-        "fault-evidence.json must record injected=true, active_during_workload=true, recovered=true"
-    );
-    ensure!(
-        !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
-        "fault-evidence.json must include active and workload fault snapshots"
-    );
+    if ack_mutation.is_some() {
+        ensure!(
+            evidence.injected && !evidence.active_during_workload && evidence.recovered,
+            "ACK-triggered fault-evidence.json must record injected=true, active_during_workload=false, recovered=true"
+        );
+        ensure!(
+            !evidence.active_snapshots.is_empty() && evidence.workload_snapshots.is_empty(),
+            "ACK-triggered fault-evidence.json must include an active snapshot and no under-fault workload snapshot"
+        );
+        ensure!(
+            evidence.client_disruptions == 0 && !evidence.require_client_disruption,
+            "ACK-triggered quiet mutation cannot claim or require client disruptions"
+        );
+    } else {
+        ensure!(
+            evidence.injected && evidence.active_during_workload && evidence.recovered,
+            "fault-evidence.json must record injected=true, active_during_workload=true, recovered=true"
+        );
+        ensure!(
+            !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
+            "fault-evidence.json must include active and workload fault snapshots"
+        );
+    }
     ensure!(
         evidence.require_client_disruption == metadata.require_client_disruption,
         "fault-evidence.json require_client_disruption {} does not match run-metadata.json {}",
@@ -727,7 +788,11 @@ fn validate_fault_artifacts_with_identity(
     if fixed_volume_fault(&json_spec).is_some() {
         validate_fixed_volume_runtime_evidence(&evidence, &target_proof, &json_spec)?;
     }
-    validate_fault_window_evidence(&evidence)?;
+    if ack_mutation.is_some() {
+        validate_ack_fault_window_evidence(&evidence)?;
+    } else {
+        validate_fault_window_evidence(&evidence)?;
+    }
     if options.scenario == DM_FLAKEY_VERSIONED_HOT_SCENARIO {
         validate_dm_crash_artifacts(
             &options.artifact_root,
@@ -737,6 +802,22 @@ fn validate_fault_artifacts_with_identity(
             &metadata.scenario,
             &metadata.run_id,
             &json_spec.metadata.bucket,
+        )?;
+    }
+    if let Some(expected_mutation) = ack_mutation {
+        validate_ack_triggered_dm_artifacts(
+            AckArtifactValidationContext {
+                root: &options.artifact_root,
+                case_name: scenario_spec.case_name,
+                events: &events,
+                evidence: &evidence,
+                history: &history,
+                scenario: &metadata.scenario,
+                run_id: &metadata.run_id,
+                bucket: &json_spec.metadata.bucket,
+                run_spec: &json_spec,
+            },
+            expected_mutation,
         )?;
     }
 
@@ -755,6 +836,18 @@ fn validate_fault_artifacts_with_identity(
         &checker,
         options.expected_workload_versioning,
     )?;
+
+    if ack_mutation.is_some() {
+        return Ok(ArtifactValidationReport {
+            scenario: options.scenario.clone(),
+            case_name: scenario_spec.case_name.to_string(),
+            seed: workload_plan.seed,
+            client_disruptions: 0,
+            recommitted: 0,
+            committed: checker.committed_puts,
+            required_artifacts: json_spec.artifacts.required.clone(),
+        });
+    }
 
     let recommit =
         read_json::<RecommitReportArtifact>(required(&artifacts, "recommit-report.json")?)?;
@@ -890,7 +983,7 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
         spec.artifacts.event_stream == "run-events.jsonl",
         "run-spec artifacts.event_stream must be run-events.jsonl"
     );
-    for required in FaultRunArtifactSpec::required_names() {
+    for required in FaultRunArtifactSpec::required_names_for_scenario(&spec.scenario.name) {
         ensure!(
             spec.artifacts.required.contains(&required),
             "run-spec artifacts.required is missing {required}"
@@ -960,6 +1053,29 @@ fn validate_run_spec_catalog_contract(
         "run-spec scenario contract does not match catalog scenario {:?}",
         options.scenario
     );
+    let expected_ack = acknowledged_mutation_kind(&options.scenario);
+    ensure!(
+        spec.scenario
+            .ack_trigger
+            .as_ref()
+            .map(|trigger| trigger.mutation)
+            == expected_ack,
+        "run-spec ACK trigger does not match the catalog scenario"
+    );
+    if let Some(trigger) = &spec.scenario.ack_trigger {
+        ensure!(
+            trigger.operation_timeout_ms > 0 && trigger.max_ack_to_fault_ms > 0,
+            "run-spec ACK trigger timeouts must be greater than zero"
+        );
+        ensure!(
+            !spec.recovery.recommit_unconfirmed_writes
+                && !spec.artifacts.required.iter().any(|name| matches!(
+                    name.as_str(),
+                    "workload-summary.json" | "recommit-report.json"
+                )),
+            "ACK-triggered run-spec must disable recommit and omit mixed-workload artifacts"
+        );
+    }
     let artifact_fault = spec
         .faults
         .first()
@@ -989,6 +1105,7 @@ fn validate_run_spec_catalog_contract(
     let expected_mode = match plan.workload_mode {
         FaultWorkloadMode::S3Mixed => "s3-mixed",
         FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
+        FaultWorkloadMode::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
     };
     ensure!(
         spec.workload.mode == expected_mode,
@@ -1576,15 +1693,33 @@ fn validate_host_storage_artifacts(
             && recovery_snapshot.observed_at_ms <= recovery_ended_at_ms,
         "host-storage post-cleanup observation is outside the recorded recovery window"
     );
+    let fault_delete_started = evidence
+        .fault_delete_started_at_ms
+        .context("missing fault delete start")?;
+    if spec.scenario.ack_trigger.is_some() {
+        let [snapshot] = evidence.active_snapshots.as_slice() else {
+            bail!("device-mapper active evidence requires exactly one fault snapshot");
+        };
+        ensure!(
+            evidence.workload_snapshots.is_empty(),
+            "ACK-triggered device-mapper evidence cannot contain an under-fault workload snapshot"
+        );
+        validate_dm_fault_snapshot(
+            snapshot,
+            "active",
+            proof,
+            fault_active_at_ms,
+            fault_delete_started,
+        )?;
+        return Ok(());
+    }
+
     let workload_started = evidence
         .workload_started_at_ms
         .context("missing workload start")?;
     let workload_ended = evidence
         .workload_ended_at_ms
         .context("missing workload end")?;
-    let fault_delete_started = evidence
-        .fault_delete_started_at_ms
-        .context("missing fault delete start")?;
     for (stage, snapshots, start, end) in [
         (
             "active",
@@ -1602,24 +1737,35 @@ fn validate_host_storage_artifacts(
         let [snapshot] = snapshots.as_slice() else {
             bail!("device-mapper {stage} evidence requires exactly one fault snapshot");
         };
-        ensure!(
-            snapshot.get("stage").and_then(Value::as_str) == Some(stage)
-                && snapshot.get("resource_kind").and_then(Value::as_str) == Some("device-mapper"),
-            "device-mapper {stage} snapshot metadata is inconsistent"
-        );
-        let dm_snapshot: DmStatusSnapshot = serde_json::from_value(
-            snapshot
-                .get("dm_status")
-                .context("device-mapper snapshot lacks dm_status")?
-                .clone(),
-        )
-        .with_context(|| format!("parse {stage} device-mapper snapshot"))?;
-        dm_snapshot.validate_proof(proof, stage, &proof.tables.fault_table)?;
-        ensure!(
-            dm_snapshot.observed_at_ms >= start && dm_snapshot.observed_at_ms <= end,
-            "device-mapper {stage} observation is outside its recorded fault window"
-        );
+        validate_dm_fault_snapshot(snapshot, stage, proof, start, end)?;
     }
+    Ok(())
+}
+
+fn validate_dm_fault_snapshot(
+    snapshot: &Value,
+    stage: &str,
+    proof: &HostStorageMutationProof,
+    start: u64,
+    end: u64,
+) -> Result<()> {
+    ensure!(
+        snapshot.get("stage").and_then(Value::as_str) == Some(stage)
+            && snapshot.get("resource_kind").and_then(Value::as_str) == Some("device-mapper"),
+        "device-mapper {stage} snapshot metadata is inconsistent"
+    );
+    let dm_snapshot: DmStatusSnapshot = serde_json::from_value(
+        snapshot
+            .get("dm_status")
+            .context("device-mapper snapshot lacks dm_status")?
+            .clone(),
+    )
+    .with_context(|| format!("parse {stage} device-mapper snapshot"))?;
+    dm_snapshot.validate_proof(proof, stage, &proof.tables.fault_table)?;
+    ensure!(
+        dm_snapshot.observed_at_ms >= start && dm_snapshot.observed_at_ms <= end,
+        "device-mapper {stage} observation is outside its recorded fault window"
+    );
     Ok(())
 }
 
@@ -1998,6 +2144,307 @@ fn validate_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Result<()
     Ok(())
 }
 
+fn validate_ack_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Result<()> {
+    let apply_started = evidence
+        .fault_apply_started_at_ms
+        .context("ACK-triggered fault-evidence.json fault_apply_started_at_ms is required")?;
+    let active = evidence
+        .fault_active_at_ms
+        .context("ACK-triggered fault-evidence.json fault_active_at_ms is required")?;
+    let delete_started = evidence
+        .fault_delete_started_at_ms
+        .context("ACK-triggered fault-evidence.json fault_delete_started_at_ms is required")?;
+    let recovery_started = evidence
+        .recovery_started_at_ms
+        .context("ACK-triggered fault-evidence.json recovery_started_at_ms is required")?;
+    let recovery_ended = evidence
+        .recovery_ended_at_ms
+        .context("ACK-triggered fault-evidence.json recovery_ended_at_ms is required")?;
+    ensure!(
+        evidence.workload_started_at_ms.is_none() && evidence.workload_ended_at_ms.is_none(),
+        "ACK-triggered quiet mutation must not claim an under-fault workload window"
+    );
+    ensure!(
+        apply_started <= active
+            && active <= delete_started
+            && delete_started <= recovery_started
+            && recovery_started <= recovery_ended,
+        "ACK-triggered fault-evidence.json lifecycle timestamps are not monotonic"
+    );
+    Ok(())
+}
+
+struct AckArtifactValidationContext<'a> {
+    root: &'a Path,
+    case_name: &'a str,
+    events: &'a [RunEvent],
+    evidence: &'a FaultEvidenceArtifact,
+    history: &'a [OperationRecord],
+    scenario: &'a str,
+    run_id: &'a str,
+    bucket: &'a str,
+    run_spec: &'a FaultRunSpec,
+}
+
+fn validate_ack_triggered_dm_artifacts(
+    context: AckArtifactValidationContext<'_>,
+    expected_mutation: AcknowledgedMutationKind,
+) -> Result<()> {
+    let AckArtifactValidationContext {
+        root,
+        case_name,
+        events,
+        evidence,
+        history,
+        scenario,
+        run_id,
+        bucket,
+        run_spec,
+    } = context;
+    ensure!(
+        events.iter().any(|event| {
+            event.stage == "ack-trigger"
+                && event.status == RunEventStatus::Succeeded
+                && event.scenario == scenario
+                && event.run_id == run_id
+        }) && events.iter().any(|event| {
+            event.stage == "crash-recovery-boundary"
+                && event.status == RunEventStatus::Succeeded
+                && event.scenario == scenario
+                && event.run_id == run_id
+        }),
+        "run-events.jsonl lacks a successful ACK trigger or crash-recovery boundary"
+    );
+    let ack = read_json::<AckTriggeredCrashEvidenceArtifact>(&locate_artifact(
+        root,
+        case_name,
+        "ack-to-fault-evidence.json",
+    )?)?;
+    let planned = run_spec
+        .scenario
+        .ack_trigger
+        .as_ref()
+        .context("run-spec lacks the ACK trigger contract")?;
+    validate_ack_trigger_contract(
+        &ack,
+        planned,
+        expected_mutation,
+        scenario,
+        run_id,
+        evidence.fault_apply_started_at_ms,
+    )?;
+    ensure!(
+        evidence.fault_active_at_ms == Some(ack.fault_activated_at_ms),
+        "ACK activation timestamp does not match fault-evidence.json"
+    );
+
+    let trigger = history
+        .iter()
+        .find(|record| record.id == ack.trigger_operation_id)
+        .context("history.jsonl lacks the declared ACK trigger operation")?;
+    ensure!(
+        trigger.scenario == scenario
+            && trigger.run_id.as_deref() == Some(run_id)
+            && trigger.bucket == bucket
+            && trigger.kind == ack_operation_kind(expected_mutation)
+            && trigger.key.as_deref() == Some(ack.trigger_key.as_str())
+            && trigger.version_id.as_deref() == Some(ack.trigger_version_id.as_str())
+            && trigger.outcome == OperationOutcome::Ok
+            && trigger.durability_cohort == Some(DurabilityCohort::PreFault)
+            && trigger.fault_window_relation.is_none()
+            && trigger
+                .http_status
+                .is_some_and(|status| (200..300).contains(&status))
+            && trigger.ended_at_ms == ack.trigger_acknowledged_at_ms,
+        "ack-to-fault-evidence.json trigger identity does not match an eligible committed history record"
+    );
+    if expected_mutation == AcknowledgedMutationKind::ZeroBytePut {
+        ensure!(
+            trigger.size_bytes == Some(0),
+            "zero-byte ACK trigger history record is not empty"
+        );
+    }
+    validate_ack_quiet_gap(history, trigger, ack.crash_boundary_started_at_ms)?;
+    validate_ack_mutation_shape(history, trigger, expected_mutation)?;
+
+    let boundary = read_json::<DmCrashBoundaryArtifact>(&locate_artifact(
+        root,
+        case_name,
+        "dm-crash-boundary.json",
+    )?)?;
+    ensure!(
+        boundary.scenario == scenario
+            && boundary.run_id == run_id
+            && boundary.started_at_ms == ack.crash_boundary_started_at_ms
+            && boundary.completed_at_ms >= boundary.started_at_ms
+            && boundary.filesystem_unmounted
+            && !boundary.mount_before.canonical_source.is_empty()
+            && !boundary.mount_before.filesystem.is_empty()
+            && !boundary.mount_before.options.is_empty()
+            && boundary
+                .fault
+                .table
+                .split_whitespace()
+                .any(|field| field == "drop_writes")
+            && evidence
+                .fault_delete_started_at_ms
+                .is_some_and(|started| started >= boundary.completed_at_ms),
+        "dm-crash-boundary.json does not match the ACK-triggered drop_writes boundary"
+    );
+    if let Some(replacement_uid) = &boundary.replacement_pod_uid {
+        ensure!(
+            replacement_uid != &boundary.old_pod_uid,
+            "dm-crash-boundary.json replacement Pod UID must differ from the deleted Pod UID"
+        );
+    }
+    let recovered = read_json::<DmCrashRecoveryArtifact>(&locate_artifact(
+        root,
+        case_name,
+        "dm-crash-recovered.json",
+    )?)?;
+    ensure!(
+        recovered.scenario == scenario
+            && recovered.run_id == run_id
+            && recovered.recovered_at_ms >= boundary.completed_at_ms
+            && recovered.taint_removed
+            && !recovered.mount.source.is_empty()
+            && !recovered.mount.canonical_source.is_empty()
+            && !recovered.mount.filesystem.is_empty()
+            && recovered.mount.canonical_source == boundary.mount_before.canonical_source
+            && recovered.mount.filesystem == boundary.mount_before.filesystem
+            && recovered.mount.options == boundary.mount_before.options
+            && normalize_dm_table(&recovered.fault.table)
+                == normalize_dm_table(&recovered.expected_table)
+            && drop_writes_table_matches_recovery(&boundary.fault.table, &recovered.expected_table)
+            && !recovered
+                .fault
+                .table
+                .split_whitespace()
+                .any(|field| field == "drop_writes"),
+        "dm-crash-recovered.json does not prove recovery of the ACK-triggered fault"
+    );
+    let before = evidence
+        .pods_before
+        .iter()
+        .find(|pod| pod.uid == boundary.old_pod_uid)
+        .context("fault-evidence.json lacks the ACK-triggered DM target Pod UID")?;
+    ensure!(
+        evidence
+            .pods_after
+            .iter()
+            .any(|pod| pod.name == before.name && pod.uid != before.uid),
+        "fault-evidence.json does not prove replacement of the ACK-triggered DM target Pod"
+    );
+    Ok(())
+}
+
+fn validate_ack_trigger_contract(
+    ack: &AckTriggeredCrashEvidenceArtifact,
+    planned: &FaultRunAckTriggerSpec,
+    expected_mutation: AcknowledgedMutationKind,
+    scenario: &str,
+    run_id: &str,
+    fault_apply_started_at_ms: Option<u64>,
+) -> Result<()> {
+    ensure!(
+        ack.scenario == scenario
+            && ack.run_id == run_id
+            && ack.trigger_kind == expected_mutation
+            && planned.mutation == expected_mutation
+            && ack.max_ack_to_fault_ms == planned.max_ack_to_fault_ms
+            && !ack.trigger_operation_id.is_empty()
+            && !ack.trigger_key.is_empty()
+            && !ack.trigger_version_id.is_empty()
+            && ack.trigger_version_id != "null"
+            && fault_apply_started_at_ms.is_some_and(|started| {
+                ack.trigger_acknowledged_at_ms <= started && started <= ack.fault_activated_at_ms
+            })
+            && ack.fault_activated_at_ms <= ack.crash_boundary_started_at_ms
+            && ack.ack_to_fault_ms
+                == ack
+                    .fault_activated_at_ms
+                    .saturating_sub(ack.trigger_acknowledged_at_ms)
+            && ack.ack_to_fault_ms <= ack.max_ack_to_fault_ms
+            && ack.ack_to_crash_boundary_ms
+                == ack
+                    .crash_boundary_started_at_ms
+                    .saturating_sub(ack.trigger_acknowledged_at_ms),
+        "ack-to-fault-evidence.json does not prove the planned mutation ACK preceded bounded fault application and activation"
+    );
+    Ok(())
+}
+
+fn validate_ack_quiet_gap(
+    history: &[OperationRecord],
+    trigger: &OperationRecord,
+    crash_boundary_started_at_ms: u64,
+) -> Result<()> {
+    ensure!(
+        trigger.ended_at_ms <= crash_boundary_started_at_ms
+            && history.iter().all(|record| {
+                record.id == trigger.id
+                    || record.ended_at_ms <= trigger.started_at_ms
+                    || record.started_at_ms >= crash_boundary_started_at_ms
+            }),
+        "S3 traffic overlapped the quiet trigger or occurred before its crash boundary"
+    );
+    Ok(())
+}
+
+fn ack_operation_kind(kind: AcknowledgedMutationKind) -> OperationKind {
+    match kind {
+        AcknowledgedMutationKind::Put
+        | AcknowledgedMutationKind::Overwrite
+        | AcknowledgedMutationKind::ZeroBytePut => OperationKind::Put,
+        AcknowledgedMutationKind::DeleteMarker => OperationKind::Delete,
+        AcknowledgedMutationKind::MultipartComplete => OperationKind::CompleteMultipartUpload,
+    }
+}
+
+fn validate_ack_mutation_shape(
+    history: &[OperationRecord],
+    trigger: &OperationRecord,
+    kind: AcknowledgedMutationKind,
+) -> Result<()> {
+    let prior_puts = history
+        .iter()
+        .filter(|record| {
+            record.id != trigger.id
+                && record.key == trigger.key
+                && record.kind == OperationKind::Put
+                && record.outcome == OperationOutcome::Ok
+                && record.ended_at_ms <= trigger.started_at_ms
+        })
+        .count();
+    match kind {
+        AcknowledgedMutationKind::Put | AcknowledgedMutationKind::ZeroBytePut => ensure!(
+            prior_puts == 0,
+            "create-style ACK trigger unexpectedly has a prior object version"
+        ),
+        AcknowledgedMutationKind::Overwrite | AcknowledgedMutationKind::DeleteMarker => ensure!(
+            prior_puts == 1,
+            "overwrite/delete-marker ACK trigger must have exactly one baseline version"
+        ),
+        AcknowledgedMutationKind::MultipartComplete => {
+            ensure!(
+                history.iter().any(|record| {
+                    record.key == trigger.key
+                        && record.kind == OperationKind::CreateMultipartUpload
+                        && record.outcome == OperationOutcome::Ok
+                        && record.ended_at_ms <= trigger.started_at_ms
+                }) && history.iter().any(|record| {
+                    record.key == trigger.key
+                        && record.kind == OperationKind::UploadPart
+                        && record.outcome == OperationOutcome::Ok
+                        && record.ended_at_ms <= trigger.started_at_ms
+                }),
+                "multipart ACK trigger lacks successfully staged upload evidence"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_dm_crash_artifacts(
     root: &Path,
     case_name: &str,
@@ -2201,9 +2648,13 @@ fn normalize_dm_table(table: &str) -> String {
     table.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn locate_required_artifacts(root: &Path, case_name: &str) -> Result<BTreeMap<String, PathBuf>> {
+fn locate_required_artifacts(
+    root: &Path,
+    case_name: &str,
+    scenario: &str,
+) -> Result<BTreeMap<String, PathBuf>> {
     let mut artifacts = BTreeMap::new();
-    for name in FaultRunArtifactSpec::required_names() {
+    for name in FaultRunArtifactSpec::required_names_for_scenario(scenario) {
         let path = locate_artifact(root, case_name, &name)
             .with_context(|| format!("locate required artifact {name} under {}", root.display()))?;
         artifacts.insert(name, path);
@@ -3011,6 +3462,22 @@ struct CrashWindowEvidenceArtifact {
     trigger_key: String,
     trigger_version_id: String,
     trigger_acknowledged_at_ms: u64,
+    ack_to_crash_boundary_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AckTriggeredCrashEvidenceArtifact {
+    scenario: String,
+    run_id: String,
+    trigger_operation_id: String,
+    trigger_kind: AcknowledgedMutationKind,
+    trigger_key: String,
+    trigger_version_id: String,
+    trigger_acknowledged_at_ms: u64,
+    fault_activated_at_ms: u64,
+    ack_to_fault_ms: u64,
+    max_ack_to_fault_ms: u64,
+    crash_boundary_started_at_ms: u64,
     ack_to_crash_boundary_ms: u64,
 }
 
@@ -4311,6 +4778,26 @@ mod tests {
         validate_host_storage_artifacts(&host_proof, &cleanup, &target_proof, &run_spec, &evidence)
             .expect("valid host-storage artifacts");
 
+        let mut ack_spec = run_spec.clone();
+        ack_spec.scenario.ack_trigger = Some(crate::fault::spec::FaultRunAckTriggerSpec {
+            mutation: crate::fault::acknowledged_mutation::AcknowledgedMutationKind::Put,
+            operation_timeout_ms: 30_000,
+            max_ack_to_fault_ms: 5_000,
+        });
+        let mut ack_evidence = evidence.clone();
+        ack_evidence.active_during_workload = false;
+        ack_evidence.workload_started_at_ms = None;
+        ack_evidence.workload_ended_at_ms = None;
+        ack_evidence.workload_snapshots.clear();
+        validate_host_storage_artifacts(
+            &host_proof,
+            &cleanup,
+            &target_proof,
+            &ack_spec,
+            &ack_evidence,
+        )
+        .expect("valid ACK-triggered host-storage artifacts");
+
         for workload in [false, true] {
             for replacement in [vec![], vec![json!({})], vec![json!({}), json!({})]] {
                 let mut broken = evidence.clone();
@@ -4680,6 +5167,251 @@ mod tests {
         let report = fs::read_to_string(report_path).expect("report");
         assert!(report.contains("\"status\": \"passed\""));
         assert!(report.contains("\"schema_version\": 1"));
+    }
+
+    #[test]
+    fn validates_all_ack_triggered_mutation_shapes() {
+        use crate::fault::acknowledged_mutation::AcknowledgedMutationKind;
+        use crate::fault::history::OperationKind;
+
+        let record = |id: &str,
+                      kind: OperationKind,
+                      key: &str,
+                      size_bytes: Option<usize>,
+                      started_at_ms: u64,
+                      ended_at_ms: u64| {
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": id,
+                "scenario": "ack-case",
+                "run_id": "run-1",
+                "kind": kind,
+                "bucket": "bucket",
+                "key": key,
+                "value_sha256": null,
+                "size_bytes": size_bytes,
+                "version_id": if matches!(kind, OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload) { Some("version-1") } else { None },
+                "started_at_ms": started_at_ms,
+                "ended_at_ms": ended_at_ms,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null
+            }))
+            .expect("operation record")
+        };
+        let put = record("op-1", OperationKind::Put, "create", Some(4), 10, 11);
+        super::validate_ack_mutation_shape(
+            std::slice::from_ref(&put),
+            &put,
+            AcknowledgedMutationKind::Put,
+        )
+        .expect("create PUT shape");
+
+        let zero = record("op-1", OperationKind::Put, "empty", Some(0), 10, 11);
+        super::validate_ack_mutation_shape(
+            std::slice::from_ref(&zero),
+            &zero,
+            AcknowledgedMutationKind::ZeroBytePut,
+        )
+        .expect("zero-byte PUT shape");
+
+        let baseline = record("op-1", OperationKind::Put, "existing", Some(4), 1, 2);
+        let overwrite = record("op-2", OperationKind::Put, "existing", Some(4), 10, 11);
+        let overwrite_history = vec![baseline.clone(), overwrite.clone()];
+        super::validate_ack_mutation_shape(
+            &overwrite_history,
+            &overwrite,
+            AcknowledgedMutationKind::Overwrite,
+        )
+        .expect("overwrite shape");
+
+        let delete = record("op-2", OperationKind::Delete, "existing", None, 10, 11);
+        let delete_history = vec![baseline, delete.clone()];
+        super::validate_ack_mutation_shape(
+            &delete_history,
+            &delete,
+            AcknowledgedMutationKind::DeleteMarker,
+        )
+        .expect("delete-marker shape");
+
+        let create_mpu = record(
+            "op-1",
+            OperationKind::CreateMultipartUpload,
+            "multipart",
+            None,
+            1,
+            2,
+        );
+        let upload_part = record(
+            "op-2",
+            OperationKind::UploadPart,
+            "multipart",
+            Some(8 * 1024 * 1024),
+            3,
+            4,
+        );
+        let complete = record(
+            "op-3",
+            OperationKind::CompleteMultipartUpload,
+            "multipart",
+            Some(8 * 1024 * 1024),
+            10,
+            11,
+        );
+        let multipart_history = vec![create_mpu, upload_part, complete.clone()];
+        super::validate_ack_mutation_shape(
+            &multipart_history,
+            &complete,
+            AcknowledgedMutationKind::MultipartComplete,
+        )
+        .expect("multipart completion shape");
+
+        assert!(
+            super::validate_ack_mutation_shape(
+                &overwrite_history,
+                &overwrite,
+                AcknowledgedMutationKind::Put,
+            )
+            .is_err(),
+            "create PUT must reject an existing baseline"
+        );
+        let incomplete_multipart_history = vec![multipart_history[0].clone(), complete.clone()];
+        assert!(
+            super::validate_ack_mutation_shape(
+                &incomplete_multipart_history,
+                &complete,
+                AcknowledgedMutationKind::MultipartComplete,
+            )
+            .is_err(),
+            "multipart completion must require both staging operations"
+        );
+    }
+
+    #[test]
+    fn ack_trigger_contract_rejects_pre_ack_or_late_fault_activation() {
+        use crate::fault::{
+            acknowledged_mutation::AcknowledgedMutationKind, spec::FaultRunAckTriggerSpec,
+        };
+
+        let planned = FaultRunAckTriggerSpec {
+            mutation: AcknowledgedMutationKind::Put,
+            operation_timeout_ms: 30_000,
+            max_ack_to_fault_ms: 5,
+        };
+        let valid = super::AckTriggeredCrashEvidenceArtifact {
+            scenario: "dm-drop-writes-after-ack-put".to_string(),
+            run_id: "run-1".to_string(),
+            trigger_operation_id: "op-1".to_string(),
+            trigger_kind: AcknowledgedMutationKind::Put,
+            trigger_key: "key".to_string(),
+            trigger_version_id: "version-1".to_string(),
+            trigger_acknowledged_at_ms: 100,
+            fault_activated_at_ms: 105,
+            ack_to_fault_ms: 5,
+            max_ack_to_fault_ms: 5,
+            crash_boundary_started_at_ms: 110,
+            ack_to_crash_boundary_ms: 10,
+        };
+        super::validate_ack_trigger_contract(
+            &valid,
+            &planned,
+            AcknowledgedMutationKind::Put,
+            "dm-drop-writes-after-ack-put",
+            "run-1",
+            Some(101),
+        )
+        .expect("valid trigger contract");
+
+        let mut pre_ack = valid.clone();
+        pre_ack.fault_activated_at_ms = 99;
+        pre_ack.ack_to_fault_ms = 0;
+        assert!(
+            super::validate_ack_trigger_contract(
+                &pre_ack,
+                &planned,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+            )
+            .is_err()
+        );
+
+        let mut late = valid.clone();
+        late.fault_activated_at_ms = 106;
+        late.ack_to_fault_ms = 6;
+        assert!(
+            super::validate_ack_trigger_contract(
+                &late,
+                &planned,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+            )
+            .is_err()
+        );
+
+        let mut false_interval = valid.clone();
+        false_interval.ack_to_fault_ms = 4;
+        assert!(
+            super::validate_ack_trigger_contract(
+                &false_interval,
+                &planned,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+            )
+            .is_err()
+        );
+
+        assert!(
+            super::validate_ack_trigger_contract(
+                &valid,
+                &planned,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(99),
+            )
+            .is_err(),
+            "starting fault application before the ACK must be rejected"
+        );
+    }
+
+    #[test]
+    fn ack_trigger_contract_rejects_s3_traffic_before_crash_boundary() {
+        use crate::fault::history::OperationKind;
+
+        let record = |id: &str, started_at_ms: u64| {
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": id,
+                "scenario": "ack-case",
+                "run_id": "run-1",
+                "kind": OperationKind::Put,
+                "bucket": "bucket",
+                "key": id,
+                "value_sha256": "abc",
+                "size_bytes": 4,
+                "version_id": id,
+                "started_at_ms": started_at_ms,
+                "ended_at_ms": started_at_ms + 1,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null
+            }))
+            .expect("operation record")
+        };
+        let trigger = record("op-1", 90);
+        let recovery_read = record("op-2", 121);
+        super::validate_ack_quiet_gap(&[trigger.clone(), recovery_read], &trigger, 120)
+            .expect("quiet gap");
+
+        let extra = record("op-2", 115);
+        assert!(
+            super::validate_ack_quiet_gap(&[trigger.clone(), extra], &trigger, 120).is_err(),
+            "traffic after the ACK must invalidate the quiet crash window"
+        );
     }
 
     #[test]

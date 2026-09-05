@@ -28,7 +28,7 @@ use tokio::time::Instant;
 
 use crate::fault::{
     history::{OperationKind, OperationOutcome, OperationRecord, Recorder},
-    workload::{ObjectSpec, S3WorkloadClient},
+    workload::{ObjectSpec, S3WorkloadClient, StagedMultipartUpload},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,13 +37,14 @@ pub enum AcknowledgedMutationKind {
     Put,
     Overwrite,
     DeleteMarker,
+    ZeroBytePut,
     MultipartComplete,
 }
 
 impl AcknowledgedMutationKind {
     fn operation_kind(self) -> OperationKind {
         match self {
-            Self::Put | Self::Overwrite => OperationKind::Put,
+            Self::Put | Self::Overwrite | Self::ZeroBytePut => OperationKind::Put,
             Self::DeleteMarker => OperationKind::Delete,
             Self::MultipartComplete => OperationKind::CompleteMultipartUpload,
         }
@@ -53,17 +54,19 @@ impl AcknowledgedMutationKind {
 /// A single mutation with no concurrent traffic, post-ACK verification read,
 /// or retry. Avoiding activity after the ACK prevents the calibration workload
 /// from accidentally flushing the metadata whose loss it is meant to detect.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct QuietMutationWorkload {
     mutation: QuietMutation,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum QuietMutation {
     Put(ObjectSpec),
     Overwrite { object: ObjectSpec, variant: u64 },
     DeleteMarker { key: String },
+    ZeroBytePut(ObjectSpec),
     MultipartComplete(ObjectSpec),
+    StagedMultipartComplete(StagedMultipartUpload),
 }
 
 impl QuietMutationWorkload {
@@ -97,13 +100,46 @@ impl QuietMutationWorkload {
         }
     }
 
+    pub(crate) fn zero_byte_put(object: ObjectSpec) -> std::result::Result<Self, TriggerError> {
+        if object.size_bytes != 0 {
+            return Err(TriggerError::InvalidConfiguration {
+                detail: "quiet zero-byte PUT must use an empty payload".to_string(),
+            });
+        }
+        Ok(Self {
+            mutation: QuietMutation::ZeroBytePut(object),
+        })
+    }
+
+    pub(crate) fn staged_multipart_complete(staged: StagedMultipartUpload) -> Self {
+        Self {
+            mutation: QuietMutation::StagedMultipartComplete(staged),
+        }
+    }
+
     pub fn kind(&self) -> AcknowledgedMutationKind {
         match self.mutation {
             QuietMutation::Put(_) => AcknowledgedMutationKind::Put,
             QuietMutation::Overwrite { .. } => AcknowledgedMutationKind::Overwrite,
             QuietMutation::DeleteMarker { .. } => AcknowledgedMutationKind::DeleteMarker,
-            QuietMutation::MultipartComplete(_) => AcknowledgedMutationKind::MultipartComplete,
+            QuietMutation::ZeroBytePut(_) => AcknowledgedMutationKind::ZeroBytePut,
+            QuietMutation::MultipartComplete(_) | QuietMutation::StagedMultipartComplete(_) => {
+                AcknowledgedMutationKind::MultipartComplete
+            }
         }
+    }
+
+    pub(crate) async fn cleanup(
+        self,
+        client: &S3WorkloadClient,
+        recorder: &Recorder,
+    ) -> Result<()> {
+        if let QuietMutation::StagedMultipartComplete(staged) = self.mutation {
+            client
+                .abort_staged_multipart_object(&staged, recorder)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn execute(
@@ -123,10 +159,25 @@ impl QuietMutationWorkload {
             QuietMutation::DeleteMarker { key } => {
                 client.delete_marker_record(&key, recorder).await
             }
+            QuietMutation::ZeroBytePut(object) => client
+                .put_object_record(&object.prepare(), recorder)
+                .await
+                .map(Some),
             QuietMutation::MultipartComplete(object) => {
                 client
                     .complete_multipart_object_record(&object.prepare(), recorder)
                     .await
+            }
+            QuietMutation::StagedMultipartComplete(staged) => {
+                let result = client
+                    .complete_staged_multipart_object_record(&staged, recorder)
+                    .await;
+                if !matches!(&result, Ok(record) if record.outcome == OperationOutcome::Ok) {
+                    client
+                        .abort_staged_multipart_object(&staged, recorder)
+                        .await?;
+                }
+                result.map(Some)
             }
         }
     }
@@ -281,6 +332,12 @@ impl AcknowledgedMutation {
             return Err(TriggerError::InvalidAcknowledgement {
                 operation_id: record.id,
                 detail: "committed mutation does not identify a versioned object".to_string(),
+            });
+        }
+        if kind == AcknowledgedMutationKind::ZeroBytePut && record.size_bytes != Some(0) {
+            return Err(TriggerError::InvalidAcknowledgement {
+                operation_id: record.id,
+                detail: "zero-byte PUT ACK does not identify an empty payload".to_string(),
             });
         }
 
@@ -942,6 +999,17 @@ mod tests {
             assert_eq!(acknowledged.trigger_version_id, version_id);
             assert_eq!(acknowledged.trigger_acknowledged_at_ms, 110);
         }
+
+        let mut zero_byte = record(
+            OperationKind::Put,
+            OperationOutcome::Ok,
+            Some("empty"),
+            Some("zero-version"),
+            100,
+            110,
+        );
+        zero_byte.size_bytes = Some(0);
+        assert!(qualify(AcknowledgedMutationKind::ZeroBytePut, zero_byte).is_ok());
     }
 
     #[test]
@@ -978,18 +1046,38 @@ mod tests {
     #[test]
     fn quiet_workload_declares_one_semantic_mutation() {
         let object = crate::fault::workload::ObjectSpec::prepare_seeded("run", 7, 4096, 42).spec;
+        let empty = crate::fault::workload::ObjectSpec::prepare_seeded("run", 8, 0, 42).spec;
         let cases = [
             QuietMutationWorkload::put(object.clone()),
             QuietMutationWorkload::overwrite(object.clone(), 2),
             QuietMutationWorkload::delete_marker(object.key.clone()).expect("delete marker"),
+            QuietMutationWorkload::zero_byte_put(empty).expect("zero byte"),
             QuietMutationWorkload::multipart_complete(object.clone()),
         ];
 
         assert_eq!(cases[0].kind(), AcknowledgedMutationKind::Put);
         assert_eq!(cases[1].kind(), AcknowledgedMutationKind::Overwrite);
         assert_eq!(cases[2].kind(), AcknowledgedMutationKind::DeleteMarker);
-        assert_eq!(cases[3].kind(), AcknowledgedMutationKind::MultipartComplete);
+        assert_eq!(cases[3].kind(), AcknowledgedMutationKind::ZeroBytePut);
+        assert_eq!(cases[4].kind(), AcknowledgedMutationKind::MultipartComplete);
         assert!(QuietMutationWorkload::delete_marker("").is_err());
+        assert!(QuietMutationWorkload::zero_byte_put(object).is_err());
+    }
+
+    #[test]
+    fn zero_byte_trigger_rejects_nonempty_ack_records() {
+        let record = record(
+            OperationKind::Put,
+            OperationOutcome::Ok,
+            Some("key"),
+            Some("version"),
+            100,
+            110,
+        );
+        assert!(matches!(
+            qualify(AcknowledgedMutationKind::ZeroBytePut, record),
+            Err(TriggerError::InvalidAcknowledgement { .. })
+        ));
     }
 
     #[test]
