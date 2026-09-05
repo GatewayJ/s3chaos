@@ -19,13 +19,17 @@
 //! and stale-generation workflows only after RustFS supplies a stable mapping
 //! hook and the adapter can populate these proofs from observed identities.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::fault::{
+    backends::chaos_mesh::{
+        IoChaosAction, IoChaosRuntimeContract, VolumeTargetEvidenceContract,
+        validate_fixed_volume_snapshot,
+    },
     history::{
         DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome, OperationRecord,
     },
@@ -241,7 +245,7 @@ impl EmptyVolumeObservation {
             response.scan_started_at_ms > 0
                 && response.scan_started_at_ms < response.scan_completed_at_ms
                 && response.scan_completed_at_ms == self.observed_at_ms
-                && self.observed_at_ms <= replacement.observed_at_ms,
+                && self.observed_at_ms < replacement.observed_at_ms,
             "empty-volume observation must precede the replacement identity observation"
         );
         ensure!(
@@ -734,6 +738,7 @@ impl ShardMutationProof {
             self.schema_version
         );
         self.identity.validate()?;
+        validate_immutable_version_history(history, &self.identity)?;
         ensure!(
             self.identity.scenario == "on-disk-bitrot",
             "shard mutation proof is bound to the wrong scenario"
@@ -1269,6 +1274,32 @@ pub struct ForceReadThroughProof {
     pub probes: Vec<ForcedReadProbe>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForceReadTargetIdentity {
+    pub pod_name: String,
+    pub pod_uid: String,
+    pub rustfs_container_id: String,
+    pub persistent_volume_claim_uid: String,
+    pub persistent_volume_uid: String,
+    pub mount_path: String,
+    pub drive_uuid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForceReadRuntimeEvidenceContract {
+    pub verified_target_proof_sha256: String,
+    pub verified_fault_evidence_sha256: String,
+    pub chaos_namespace: String,
+    pub target_namespace: String,
+    pub tenant: String,
+    pub volume_path: String,
+    pub action: IoChaosAction,
+    pub methods: Vec<String>,
+    pub io_sampling_percent: u8,
+    pub duration_seconds: u64,
+    pub targets: Vec<ForceReadTargetIdentity>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StorageFaultPodIdentity {
@@ -1293,6 +1324,10 @@ struct StorageFaultEvidenceResponse {
     active_during_workload: bool,
     pods_at_fault_activation: Vec<StorageFaultPodIdentity>,
     pods_at_workload_snapshot: Vec<StorageFaultPodIdentity>,
+    fixed_volume_targets_at_fault_activation: Vec<String>,
+    fixed_volume_targets_at_workload_snapshot: Vec<String>,
+    fixed_volume_containers_at_fault_activation: BTreeMap<String, String>,
+    fixed_volume_containers_at_workload_snapshot: BTreeMap<String, String>,
     active_snapshots: Vec<StorageFaultStatusSnapshot>,
     workload_snapshots: Vec<StorageFaultStatusSnapshot>,
     fault_active_at_ms: Option<u64>,
@@ -1305,8 +1340,7 @@ impl ForceReadThroughProof {
     pub fn validate_against_runtime(
         &self,
         membership: &ErasureSetMembership,
-        target_selected_pods: &[String],
-        fault_selected_pods: &[String],
+        runtime: &ForceReadRuntimeEvidenceContract,
         expected_repaired_shard_id: &str,
         history: &[OperationRecord],
         mapping_observations: &[VersionShardMappingObservation],
@@ -1317,6 +1351,7 @@ impl ForceReadThroughProof {
             self.schema_version
         );
         self.identity.validate()?;
+        validate_immutable_version_history(history, &self.identity)?;
         ensure!(
             matches!(
                 self.identity.scenario.as_str(),
@@ -1329,7 +1364,7 @@ impl ForceReadThroughProof {
         validate_sha256("target proof", &self.target_proof_sha256)?;
         validate_sha256("fault evidence", &self.fault_evidence_sha256)?;
         let (evidence_pods, evidence_snapshot_id, evidence_resource_id) =
-            self.validate_fault_evidence()?;
+            self.validate_fault_evidence(runtime)?;
         ensure!(
             self.persisted_version_class == PersistedVersionClass::DataObject,
             "force-read heal proof requires a data-bearing object version"
@@ -1399,7 +1434,7 @@ impl ForceReadThroughProof {
                     && !mapping.api_revision.trim().is_empty()
                     && mapping.target_proof_sha256 == self.target_proof_sha256
                     && mapping.observed_at_ms > 0
-                    && mapping.observed_at_ms <= self.fault_active_from_ms
+                    && mapping.observed_at_ms < self.fault_active_from_ms
                     && self.fault_active_from_ms - mapping.observed_at_ms
                         <= STORAGE_OBSERVATION_MAX_AGE_MS,
                 "version-shard mapping is not a fresh pre-fault RustFS diagnostic observation"
@@ -1427,16 +1462,13 @@ impl ForceReadThroughProof {
             mappings_by_id.insert(mapping.observation_id.as_str(), (mapping, response));
         }
         let mut snapshot_ids = BTreeSet::new();
-        let target_pods = target_selected_pods
+        let target_pods = runtime
+            .targets
             .iter()
-            .cloned()
+            .map(|target| target.pod_name.clone())
             .collect::<BTreeSet<_>>();
-        let reported_evidence_pods = fault_selected_pods.iter().cloned().collect::<BTreeSet<_>>();
         ensure!(
-            target_pods.len() == target_selected_pods.len()
-                && reported_evidence_pods.len() == fault_selected_pods.len()
-                && target_pods == evidence_pods
-                && reported_evidence_pods == evidence_pods,
+            target_pods.len() == runtime.targets.len() && target_pods == evidence_pods,
             "target proof and active fault evidence select different Pods"
         );
         let selected_membership_shards = membership
@@ -1466,9 +1498,15 @@ impl ForceReadThroughProof {
                     "unavailable shard observation must match exactly one erasure-set member Pod"
                 )
             };
+            let runtime_target = runtime
+                .targets
+                .iter()
+                .find(|target| target.pod_name == observation.pod_name)
+                .context("unavailable shard lacks a validated runtime target identity")?;
             ensure!(
                 !observation.pod_name.trim().is_empty()
                     && member.shard_ids.contains(&observation.drive_uuid)
+                    && runtime_target.drive_uuid == observation.drive_uuid
                     && observation.pool_index == self.shape.pool_index
                     && observation.set_index == self.shape.set_index
                     && observation.fault_resource_id == evidence_resource_id
@@ -1597,7 +1635,26 @@ impl ForceReadThroughProof {
         Ok(())
     }
 
-    fn validate_fault_evidence(&self) -> Result<(BTreeSet<String>, String, String)> {
+    fn validate_fault_evidence(
+        &self,
+        runtime: &ForceReadRuntimeEvidenceContract,
+    ) -> Result<(BTreeSet<String>, String, String)> {
+        validate_sha256(
+            "verified force-read target proof",
+            &runtime.verified_target_proof_sha256,
+        )?;
+        ensure!(
+            runtime.verified_target_proof_sha256 == self.target_proof_sha256,
+            "force-read proof is not bound to the target evidence validated by the outer artifact contract"
+        );
+        validate_sha256(
+            "verified force-read fault evidence",
+            &runtime.verified_fault_evidence_sha256,
+        )?;
+        ensure!(
+            runtime.verified_fault_evidence_sha256 == self.fault_evidence_sha256,
+            "force-read proof is not bound to the fault evidence validated by the outer artifact contract"
+        );
         let body = self
             .fault_evidence_body
             .as_deref()
@@ -1639,9 +1696,44 @@ impl ForceReadThroughProof {
             unique_storage_fault_pods("activation", &evidence.pods_at_fault_activation)?;
         let workload_pods =
             unique_storage_fault_pods("workload", &evidence.pods_at_workload_snapshot)?;
+        let expected_pods = runtime
+            .targets
+            .iter()
+            .map(|target| {
+                for (field, value) in [
+                    ("Pod name", target.pod_name.as_str()),
+                    ("Pod UID", target.pod_uid.as_str()),
+                    ("RustFS container ID", target.rustfs_container_id.as_str()),
+                    ("PVC UID", target.persistent_volume_claim_uid.as_str()),
+                    ("PV UID", target.persistent_volume_uid.as_str()),
+                    ("drive UUID", target.drive_uuid.as_str()),
+                ] {
+                    ensure!(
+                        !value.trim().is_empty(),
+                        "force-read target {field} is empty"
+                    );
+                }
+                ensure!(
+                    target.mount_path == runtime.volume_path,
+                    "force-read target mount path differs from the IOChaos volume path"
+                );
+                Ok((target.pod_name.clone(), target.pod_uid.as_str()))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
         ensure!(
-            !active_pods.is_empty() && active_pods == workload_pods,
-            "force-read selected Pod identities changed while the fault was active"
+            !active_pods.is_empty() && active_pods == workload_pods && active_pods == expected_pods,
+            "force-read selected Pod identities changed or differ from the validated target proof"
+        );
+        let expected_containers = runtime
+            .targets
+            .iter()
+            .map(|target| (target.pod_name.clone(), target.rustfs_container_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        ensure!(
+            expected_containers.len() == runtime.targets.len()
+                && evidence.fixed_volume_containers_at_fault_activation == expected_containers
+                && evidence.fixed_volume_containers_at_workload_snapshot == expected_containers,
+            "force-read RustFS container identities changed or differ from the validated target proof"
         );
         let [active_snapshot] = evidence.active_snapshots.as_slice() else {
             anyhow::bail!("force-read fault evidence must contain one active snapshot")
@@ -1653,7 +1745,9 @@ impl ForceReadThroughProof {
             active_snapshot.stage == "active"
                 && workload_snapshot.stage == "after-workload"
                 && active_snapshot.resource_kind == workload_snapshot.resource_kind
-                && active_snapshot.resource_name == workload_snapshot.resource_name,
+                && active_snapshot.resource_name == workload_snapshot.resource_name
+                && active_snapshot.dm_status.is_none()
+                && workload_snapshot.dm_status.is_none(),
             "force-read fault snapshots do not identify one resource across the active window"
         );
         let resource_kind = active_snapshot
@@ -1670,9 +1764,79 @@ impl ForceReadThroughProof {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .context("force-read IOChaos snapshot lacks a resource name")?;
-        validate_active_iochaos_snapshot(active_snapshot, name)?;
-        validate_active_iochaos_snapshot(workload_snapshot, name)?;
-        let resource_id = format!("{resource_kind}/{name}");
+        let active_resource = active_snapshot
+            .chaos_status
+            .as_ref()
+            .context("force-read active snapshot lacks its IOChaos resource")?;
+        let workload_resource = workload_snapshot
+            .chaos_status
+            .as_ref()
+            .context("force-read workload snapshot lacks its IOChaos resource")?;
+        let active_uid = active_resource
+            .pointer("/metadata/uid")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .context("force-read active IOChaos resource lacks a UID")?;
+        ensure!(
+            active_resource
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                == Some(name)
+                && workload_resource
+                    .pointer("/metadata/name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(name)
+                && workload_resource
+                    .pointer("/metadata/uid")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(active_uid),
+            "force-read snapshots do not capture the same IOChaos resource name and UID"
+        );
+        let candidate_pod_ids = runtime
+            .targets
+            .iter()
+            .map(|target| format!("{}/{}", runtime.target_namespace, target.pod_name))
+            .collect::<BTreeSet<_>>();
+        let iochaos_runtime = IoChaosRuntimeContract {
+            action: runtime.action.clone(),
+            methods: runtime.methods.clone(),
+            io_sampling_percent: runtime.io_sampling_percent,
+            duration_seconds: runtime.duration_seconds,
+        };
+        let contract = VolumeTargetEvidenceContract {
+            chaos_namespace: &runtime.chaos_namespace,
+            target_namespace: &runtime.target_namespace,
+            tenant: &runtime.tenant,
+            run_id: &self.identity.run_id,
+            scenario: &self.identity.scenario,
+            volume_path: &runtime.volume_path,
+            expected_targets: u32::try_from(runtime.targets.len())?,
+            candidate_pod_ids: &candidate_pod_ids,
+            runtime: &iochaos_runtime,
+        };
+        let active_targets = validate_fixed_volume_snapshot(active_resource, &contract)?;
+        let workload_targets = validate_fixed_volume_snapshot(workload_resource, &contract)?;
+        let persisted_active_targets = evidence
+            .fixed_volume_targets_at_fault_activation
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let persisted_workload_targets = evidence
+            .fixed_volume_targets_at_workload_snapshot
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            persisted_active_targets.len()
+                == evidence.fixed_volume_targets_at_fault_activation.len()
+                && persisted_workload_targets.len()
+                    == evidence.fixed_volume_targets_at_workload_snapshot.len()
+                && active_targets == persisted_active_targets
+                && workload_targets == persisted_workload_targets
+                && active_targets == workload_targets,
+            "force-read persisted IOChaos targets differ from the controller injection records"
+        );
+        let resource_id = format!("{resource_kind}/{name}/{active_uid}");
         let snapshot_id = sha256_bytes(&serde_json::to_vec(active_snapshot)?);
         Ok((
             active_pods.keys().cloned().collect(),
@@ -1682,47 +1846,84 @@ impl ForceReadThroughProof {
     }
 }
 
-fn validate_active_iochaos_snapshot(
-    snapshot: &StorageFaultStatusSnapshot,
-    expected_name: &str,
+/// Complete evidence chain required to prove one on-disk bitrot recovery attempt.
+#[derive(Debug, Clone, Copy)]
+pub struct BitrotRecoveryCaseEvidence<'a> {
+    pub mutation: &'a ShardMutationProof,
+    pub heal: &'a HealSummary,
+    pub heal_samples: &'a [HealProgressSample],
+    pub force_read: &'a ForceReadThroughProof,
+    pub membership: &'a ErasureSetMembership,
+    pub runtime: &'a ForceReadRuntimeEvidenceContract,
+    pub history: &'a [OperationRecord],
+    pub mappings: &'a [VersionShardMappingObservation],
+}
+
+/// Validates the full mutation, heal, forced-read, and rollback chain as one unit.
+pub fn validate_bitrot_recovery_case(evidence: &BitrotRecoveryCaseEvidence<'_>) -> Result<()> {
+    let BitrotRecoveryCaseEvidence {
+        mutation,
+        heal,
+        heal_samples,
+        force_read,
+        membership,
+        runtime,
+        history,
+        mappings,
+    } = evidence;
+    mutation.validate_against_history(history)?;
+    ensure!(
+        mutation.identity.scenario == "on-disk-bitrot"
+            && heal.identity == mutation.identity
+            && force_read.identity == mutation.identity,
+        "bitrot mutation, heal, and forced-read evidence do not share one attempt identity"
+    );
+    let expected_heal_target = match heal.mode {
+        HealMode::AutomaticScanner => None,
+        HealMode::AdminDeep => Some((
+            mutation.volume.rustfs_drive_uuid.as_str(),
+            mutation.volume.pool_index,
+            mutation.volume.set_index,
+        )),
+        HealMode::AutomaticReplacement => {
+            anyhow::bail!("bitrot recovery cannot use automatic replacement heal mode")
+        }
+    };
+    heal.validate_progress(heal_samples, expected_heal_target)?;
+    force_read.validate_against_runtime(
+        membership,
+        runtime,
+        &mutation.volume.rustfs_drive_uuid,
+        history,
+        mappings,
+    )?;
+    validate_bitrot_recovery_order(
+        mutation.mutated_at_ms,
+        heal.started_at_ms,
+        heal.completed_at_ms,
+        force_read.fault_active_from_ms,
+        force_read.fault_active_until_ms,
+        mutation.rollback.observed_at_ms,
+    )?;
+    Ok(())
+}
+
+fn validate_bitrot_recovery_order(
+    mutated_at_ms: u64,
+    heal_started_at_ms: u64,
+    heal_completed_at_ms: u64,
+    force_read_started_at_ms: u64,
+    force_read_completed_at_ms: u64,
+    rollback_observed_at_ms: u64,
 ) -> Result<()> {
     ensure!(
-        snapshot.dm_status.is_none(),
-        "force-read IOChaos snapshot unexpectedly contains device-mapper status"
+        mutated_at_ms < heal_started_at_ms
+            && heal_started_at_ms < heal_completed_at_ms
+            && heal_completed_at_ms < force_read_started_at_ms
+            && force_read_started_at_ms < force_read_completed_at_ms
+            && force_read_completed_at_ms < rollback_observed_at_ms,
+        "bitrot success requires mutation readback, RustFS heal, exact-quorum reads, then host rollback in strict order"
     );
-    let resource = snapshot
-        .chaos_status
-        .as_ref()
-        .context("force-read IOChaos snapshot lacks the captured resource")?;
-    ensure!(
-        resource
-            .pointer("/metadata/name")
-            .and_then(serde_json::Value::as_str)
-            == Some(expected_name)
-            && resource
-                .pointer("/status/experiment/desiredPhase")
-                .and_then(serde_json::Value::as_str)
-                == Some("Run"),
-        "force-read IOChaos snapshot does not identify the active resource"
-    );
-    let conditions = resource
-        .pointer("/status/conditions")
-        .and_then(serde_json::Value::as_array)
-        .context("force-read IOChaos snapshot lacks status conditions")?;
-    for (condition_type, expected_status) in [
-        ("Selected", "True"),
-        ("AllInjected", "True"),
-        ("AllRecovered", "False"),
-    ] {
-        ensure!(
-            conditions.iter().any(|condition| {
-                condition.get("type").and_then(serde_json::Value::as_str) == Some(condition_type)
-                    && condition.get("status").and_then(serde_json::Value::as_str)
-                        == Some(expected_status)
-            }),
-            "force-read IOChaos snapshot lacks active {condition_type}={expected_status} status"
-        );
-    }
     Ok(())
 }
 
@@ -1789,6 +1990,9 @@ pub struct RustfsShardInventoryResponse {
     pub bucket: String,
     pub drive_uuid: String,
     pub filesystem_uuid: String,
+    pub snapshot_id: String,
+    pub scan_started_at_ms: u64,
+    pub scan_completed_at_ms: u64,
     pub start_cursor: Option<String>,
     pub end_cursor: String,
     pub exhausted: bool,
@@ -1893,6 +2097,9 @@ impl ShardInventorySnapshot {
             response.bucket == self.identity.bucket
                 && response.drive_uuid == self.volume.rustfs_drive_uuid
                 && response.filesystem_uuid == self.volume.filesystem_uuid
+                && response.snapshot_id == self.receipt.snapshot_id
+                && response.scan_started_at_ms == self.receipt.started_at_ms
+                && response.scan_completed_at_ms == self.receipt.completed_at_ms
                 && response.start_cursor.is_none()
                 && !response.end_cursor.trim().is_empty()
                 && response.exhausted
@@ -1934,10 +2141,31 @@ pub struct DanglingCleanupProof {
     pub after_inventory_snapshot_id: String,
     pub after_inventory_sha256: String,
     pub cleanup_operation_id: String,
+    pub cleanup_evidence: Option<DanglingCleanupEvidence>,
     pub writes_quiesced_at_ms: u64,
     pub started_at_ms: u64,
     pub completed_at_ms: u64,
     pub classified_versions: Vec<ClassifiedVersionFragments>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DanglingCleanupEvidence {
+    pub response_sha256: String,
+    pub response_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RustfsDanglingCleanupResponse {
+    pub operation_id: String,
+    pub bucket: String,
+    pub drive_uuid: String,
+    pub filesystem_uuid: String,
+    pub before_inventory_snapshot_id: String,
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+    pub removed_fragment_ids: Vec<String>,
 }
 
 impl DanglingCleanupProof {
@@ -1954,6 +2182,7 @@ impl DanglingCleanupProof {
             self.schema_version
         );
         self.identity.validate()?;
+        validate_immutable_version_history(history, &self.identity)?;
         ensure!(
             self.identity.scenario == "stale-disk-return-detect",
             "dangling-cleanup proof is bound to the wrong scenario"
@@ -1969,6 +2198,27 @@ impl DanglingCleanupProof {
             !self.cleanup_operation_id.trim().is_empty(),
             "dangling-cleanup operation id is empty"
         );
+        let cleanup_evidence = self
+            .cleanup_evidence
+            .as_ref()
+            .context("dangling-cleanup proof lacks a captured RustFS cleanup response")?;
+        validate_sha256(
+            "dangling-cleanup response",
+            &cleanup_evidence.response_sha256,
+        )?;
+        ensure!(
+            cleanup_evidence.response_sha256
+                == sha256_bytes(cleanup_evidence.response_body.as_bytes()),
+            "dangling-cleanup response digest does not match its captured body"
+        );
+        let cleanup_response =
+            serde_json::from_str::<RustfsDanglingCleanupResponse>(&cleanup_evidence.response_body)
+                .context("decode captured RustFS dangling-cleanup response")?;
+        validate_unique_nonempty(
+            "cleanup removed fragment id",
+            &cleanup_response.removed_fragment_ids,
+            true,
+        )?;
         before_inventory.validate()?;
         after_inventory.validate()?;
         let before_response = before_inventory.response()?;
@@ -1989,6 +2239,17 @@ impl DanglingCleanupProof {
                 && before_inventory.receipt.snapshot_id != after_inventory.receipt.snapshot_id
                 && before_response.end_cursor != after_response.end_cursor,
             "dangling-cleanup proof does not reference two distinct complete inventory receipts"
+        );
+        ensure!(
+            cleanup_response.operation_id == self.cleanup_operation_id
+                && cleanup_response.bucket == self.identity.bucket
+                && cleanup_response.drive_uuid == self.returned_generation.rustfs_drive_uuid
+                && cleanup_response.filesystem_uuid == self.returned_generation.filesystem_uuid
+                && cleanup_response.before_inventory_snapshot_id
+                    == self.before_inventory_snapshot_id
+                && cleanup_response.started_at_ms == self.started_at_ms
+                && cleanup_response.completed_at_ms == self.completed_at_ms,
+            "dangling-cleanup identity and interval are not derived from its captured RustFS response"
         );
         validate_sha256(
             "pre-cleanup inventory reference",
@@ -2035,6 +2296,21 @@ impl DanglingCleanupProof {
             !self.classified_versions.is_empty(),
             "dangling-cleanup validation requires fragment classifications"
         );
+        let mut history_by_id = HashMap::with_capacity(history.len());
+        for record in history {
+            ensure!(
+                history_by_id.insert(record.id.as_str(), record).is_none(),
+                "workload history contains a duplicate operation id"
+            );
+        }
+        let mut inventory_versions_by_object =
+            HashMap::<(&str, &str), BTreeSet<&str>>::with_capacity(before_response.entries.len());
+        for entry in &before_response.entries {
+            inventory_versions_by_object
+                .entry((entry.object_key.as_str(), entry.object_sha256.as_str()))
+                .or_default()
+                .insert(entry.version_id.as_str());
+        }
         let mut classified_fragment_ids = BTreeSet::new();
         let mut classified_versions = BTreeSet::new();
         let mut classification_evidence_ids = BTreeSet::new();
@@ -2092,15 +2368,10 @@ impl DanglingCleanupProof {
                         !operation_id.trim().is_empty(),
                         "classified operation id is empty"
                     );
-                    let matches = history
-                        .iter()
-                        .filter(|record| record.id == operation_id)
-                        .collect::<Vec<_>>();
-                    let [record] = matches.as_slice() else {
-                        anyhow::bail!(
-                            "classified version must match exactly one workload history operation"
-                        )
-                    };
+                    let record = history_by_id
+                        .get(operation_id)
+                        .copied()
+                        .context("classified version lacks its workload history operation")?;
                     ensure!(
                         record_matches_identity(record, &self.identity)
                             && is_object_commit(record.kind)
@@ -2110,7 +2381,7 @@ impl DanglingCleanupProof {
                             && record.ended_at_ms <= self.writes_quiesced_at_ms,
                         "classified version is not bound to the matching pre-cleanup PUT or multipart completion"
                     );
-                    Some(*record)
+                    Some(record)
                 }
                 None => None,
             };
@@ -2161,15 +2432,10 @@ impl DanglingCleanupProof {
                         .as_deref()
                         .is_none_or(|version_id| version_id == "null")
                     {
-                        let possible_versions = before_response
-                            .entries
-                            .iter()
-                            .filter(|entry| {
-                                entry.object_key == version.object_key
-                                    && entry.object_sha256 == object_sha256
-                            })
-                            .map(|entry| entry.version_id.as_str())
-                            .collect::<BTreeSet<_>>();
+                        let possible_versions = inventory_versions_by_object
+                            .get(&(version.object_key.as_str(), object_sha256))
+                            .cloned()
+                            .unwrap_or_default();
                         ensure!(
                             possible_versions.len() == 1
                                 && possible_versions.contains(version.version_id.as_str()),
@@ -2277,6 +2543,20 @@ impl DanglingCleanupProof {
                 .all(|entry| before.get(&entry.fragment_id) == Some(&entry)),
             "dangling cleanup changed or introduced a fragment instead of only removing one"
         );
+        let removed_fragment_ids = before
+            .keys()
+            .filter(|fragment_id| !after.contains_key(*fragment_id))
+            .map(|fragment_id| (*fragment_id).clone())
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            cleanup_response
+                .removed_fragment_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                == removed_fragment_ids,
+            "post-cleanup inventory delta does not match the captured RustFS cleanup response"
+        );
         let mut removed_dangling = false;
         for version in &self.classified_versions {
             let protected = version.recoverability != FragmentRecoverability::UncommittedDangling;
@@ -2333,6 +2613,52 @@ fn write_may_have_committed(record: &OperationRecord) -> bool {
         OperationOutcome::Failed => record.http_status.is_none_or(ambiguous_http_status),
         OperationOutcome::NotFound => false,
     }
+}
+
+fn validate_immutable_version_history(
+    history: &[OperationRecord],
+    identity: &StorageRecoveryArtifactIdentity,
+) -> Result<()> {
+    let mut versions = BTreeMap::<(String, String), String>::new();
+    for record in history.iter().filter(|record| {
+        record_matches_identity(record, identity)
+            && is_object_commit(record.kind)
+            && record.outcome == OperationOutcome::Ok
+            && record
+                .http_status
+                .is_some_and(|status| (200..300).contains(&status))
+    }) {
+        let Some(version_id) = record
+            .version_id
+            .as_deref()
+            .filter(|version_id| *version_id != "null")
+        else {
+            continue;
+        };
+        ensure!(
+            valid_operation_interval(record),
+            "successful versioned write has an invalid operation interval"
+        );
+        let key = record
+            .key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .context("successful versioned write lacks an object key")?;
+        let hash = record
+            .value_sha256
+            .as_deref()
+            .context("successful versioned write lacks a content hash")?;
+        validate_sha256("successful versioned write", hash)?;
+        if let Some(previous) =
+            versions.insert((key.to_string(), version_id.to_string()), hash.to_string())
+        {
+            ensure!(
+                previous == hash,
+                "one immutable object version identity has conflicting committed content hashes"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn record_matches_identity(
@@ -2600,6 +2926,38 @@ mod tests {
         .expect("valid replacement");
 
         assert_eq!(proof.replacement.rustfs_drive_uuid, "drive-new");
+
+        assert!(
+            FreshVolumeReplacementProof::prove(
+                identity("fresh-volume-replacement"),
+                volume("old", 100),
+                replacement.clone(),
+                empty_observation(&replacement, replacement.observed_at_ms),
+            )
+            .is_err(),
+            "an equal scan-completion and replacement timestamp cannot prove causal order"
+        );
+
+        let mut mismatched_scan_receipt = empty_observation(&replacement, 200);
+        let mut mismatched_scan_response = serde_json::from_str::<EmptyVolumeScanResponse>(
+            &mismatched_scan_receipt.scan_response_body,
+        )
+        .expect("empty-volume scan response");
+        mismatched_scan_response.scan_completed_at_ms = 199;
+        mismatched_scan_receipt.scan_response_body =
+            serde_json::to_string(&mismatched_scan_response).expect("empty-volume scan response");
+        mismatched_scan_receipt.scan_response_sha256 =
+            sha256_bytes(mismatched_scan_receipt.scan_response_body.as_bytes());
+        assert!(
+            FreshVolumeReplacementProof::prove(
+                identity("fresh-volume-replacement"),
+                volume("old", 100),
+                replacement.clone(),
+                mismatched_scan_receipt,
+            )
+            .is_err(),
+            "the raw empty-volume scan interval must match its persisted receipt"
+        );
 
         let mut reused = volume("old", 300);
         reused.pod_uid = "pod-new".to_string();
@@ -2994,6 +3352,17 @@ mod tests {
             .validate_against_history(&history)
             .expect("valid bitrot proof");
 
+        validate_bitrot_recovery_order(201, 210, 220, 230, 240, 250)
+            .expect("valid end-to-end bitrot recovery order");
+        assert!(
+            validate_bitrot_recovery_order(201, 210, 220, 230, 240, 240).is_err(),
+            "host rollback cannot overlap the forced-read proof"
+        );
+        assert!(
+            validate_bitrot_recovery_order(201, 210, 210, 230, 240, 250).is_err(),
+            "heal completion must be observed strictly after heal start"
+        );
+
         let mut inverted_commit = history.clone();
         inverted_commit[0].started_at_ms = 91;
         assert!(
@@ -3068,7 +3437,7 @@ mod tests {
             "bitrot/key",
             "version-1",
             Some(HASH_B),
-            95,
+            250,
         ));
         assert!(
             proof
@@ -3299,21 +3668,80 @@ mod tests {
             target_proof_sha256: HASH_A.to_string(),
             observed_at_ms: 299,
         }];
+        let runtime_targets = selected_pods
+            .iter()
+            .enumerate()
+            .map(|(index, name)| ForceReadTargetIdentity {
+                pod_name: name.clone(),
+                pod_uid: format!("uid-{name}"),
+                rustfs_container_id: format!("containerd://{name}"),
+                persistent_volume_claim_uid: format!("pvc-uid-{index}"),
+                persistent_volume_uid: format!("pv-uid-{index}"),
+                mount_path: "/data0".to_string(),
+                drive_uuid: format!("drive-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let controller_targets = selected_pods
+            .iter()
+            .map(|name| format!("fault-run/{name}/rustfs"))
+            .collect::<Vec<_>>();
+        let controller_records = controller_targets
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "selectorKey": ".",
+                    "phase": "Injected",
+                    "injectedCount": 1
+                })
+            })
+            .collect::<Vec<_>>();
+        let iochaos_resource = serde_json::json!({
+            "apiVersion": "chaos-mesh.org/v1alpha1",
+            "kind": "IOChaos",
+            "metadata": {
+                "name": "force-read-fault",
+                "namespace": "chaos-mesh",
+                "uid": "iochaos-uid",
+                "labels": {
+                    "rustfs-fault-test/run-id": "run-1",
+                    "rustfs-fault-test/scenario": "fresh-volume-replacement",
+                    "app.kubernetes.io/managed-by": "s3chaos"
+                }
+            },
+            "spec": {
+                "mode": "fixed",
+                "value": "4",
+                "selector": {
+                    "namespaces": ["fault-run"],
+                    "labelSelectors": {"rustfs.tenant": "rustfs"}
+                },
+                "volumePath": "/data0",
+                "path": "/data0/**/*",
+                "containerNames": ["rustfs"],
+                "percent": 100,
+                "duration": "60s",
+                "methods": ["READ"],
+                "action": "fault",
+                "errno": 5
+            },
+            "status": {
+                "conditions": [
+                    {"type": "Selected", "status": "True"},
+                    {"type": "AllInjected", "status": "True"},
+                    {"type": "AllRecovered", "status": "False"}
+                ],
+                "experiment": {
+                    "desiredPhase": "Run",
+                    "containerRecords": controller_records
+                }
+            }
+        });
         let active_snapshot = StorageFaultStatusSnapshot {
             stage: "active".to_string(),
             resource_kind: Some("iochaos".to_string()),
             resource_name: Some("force-read-fault".to_string()),
-            chaos_status: Some(serde_json::json!({
-                "metadata": {"name": "force-read-fault"},
-                "status": {
-                    "conditions": [
-                        {"type": "Selected", "status": "True"},
-                        {"type": "AllInjected", "status": "True"},
-                        {"type": "AllRecovered", "status": "False"}
-                    ],
-                    "experiment": {"desiredPhase": "Run"}
-                }
-            })),
+            chaos_status: Some(iochaos_resource),
             dm_status: None,
         };
         let workload_snapshot = StorageFaultStatusSnapshot {
@@ -3341,6 +3769,16 @@ mod tests {
                     uid: format!("uid-{name}"),
                 })
                 .collect(),
+            fixed_volume_targets_at_fault_activation: controller_targets.clone(),
+            fixed_volume_targets_at_workload_snapshot: controller_targets,
+            fixed_volume_containers_at_fault_activation: runtime_targets
+                .iter()
+                .map(|target| (target.pod_name.clone(), target.rustfs_container_id.clone()))
+                .collect(),
+            fixed_volume_containers_at_workload_snapshot: runtime_targets
+                .iter()
+                .map(|target| (target.pod_name.clone(), target.rustfs_container_id.clone()))
+                .collect(),
             active_snapshots: vec![active_snapshot],
             workload_snapshots: vec![workload_snapshot],
             fault_active_at_ms: Some(300),
@@ -3350,6 +3788,19 @@ mod tests {
         })
         .expect("fault evidence");
         let fault_evidence_sha256 = sha256_bytes(fault_evidence_body.as_bytes());
+        let runtime_contract = ForceReadRuntimeEvidenceContract {
+            verified_target_proof_sha256: HASH_A.to_string(),
+            verified_fault_evidence_sha256: fault_evidence_sha256.clone(),
+            chaos_namespace: "chaos-mesh".to_string(),
+            target_namespace: "fault-run".to_string(),
+            tenant: "rustfs".to_string(),
+            volume_path: "/data0".to_string(),
+            action: IoChaosAction::Fault { errno: 5 },
+            methods: vec!["READ".to_string()],
+            io_sampling_percent: 100,
+            duration_seconds: 60,
+            targets: runtime_targets,
+        };
         let proof = ForceReadThroughProof {
             schema_version: STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
             identity: identity("fresh-volume-replacement"),
@@ -3366,7 +3817,7 @@ mod tests {
                     drive_uuid: format!("drive-{index}"),
                     pool_index: 0,
                     set_index: 0,
-                    fault_resource_id: "iochaos/force-read-fault".to_string(),
+                    fault_resource_id: "iochaos/force-read-fault/iochaos-uid".to_string(),
                     active_snapshot_id: fault_snapshot_id.clone(),
                     target_proof_sha256: HASH_A.to_string(),
                     fault_evidence_sha256: fault_evidence_sha256.clone(),
@@ -3391,13 +3842,42 @@ mod tests {
         proof
             .validate_against_runtime(
                 &membership,
-                &selected_pods,
-                &selected_pods,
+                &runtime_contract,
                 "drive-7",
                 &history,
                 &mapping_observations,
             )
             .expect("valid forced read");
+
+        let mut boundary_mapping = mapping_observations.clone();
+        boundary_mapping[0].observed_at_ms = proof.fault_active_from_ms;
+        assert!(
+            proof
+                .validate_against_runtime(
+                    &membership,
+                    &runtime_contract,
+                    "drive-7",
+                    &history,
+                    &boundary_mapping,
+                )
+                .is_err(),
+            "a mapping captured at fault activation is not proven pre-fault evidence"
+        );
+
+        let mut unrelated_target_proof = runtime_contract.clone();
+        unrelated_target_proof.verified_target_proof_sha256 = HASH_B.to_string();
+        assert!(
+            proof
+                .validate_against_runtime(
+                    &membership,
+                    &unrelated_target_proof,
+                    "drive-7",
+                    &history,
+                    &mapping_observations,
+                )
+                .is_err(),
+            "runtime identities must come from the outer-validated target proof"
+        );
 
         let mut missing_fault_receipt = proof.clone();
         missing_fault_receipt.fault_evidence_body = None;
@@ -3405,8 +3885,7 @@ mod tests {
             missing_fault_receipt
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &history,
                     &mapping_observations,
@@ -3434,6 +3913,9 @@ mod tests {
         let body = serde_json::to_string(&raw).expect("fault evidence");
         inactive_fault.fault_evidence_sha256 = sha256_bytes(body.as_bytes());
         inactive_fault.fault_evidence_body = Some(body);
+        let mut inactive_runtime = runtime_contract.clone();
+        inactive_runtime.verified_fault_evidence_sha256 =
+            inactive_fault.fault_evidence_sha256.clone();
         for shard in &mut inactive_fault.unavailable_shards {
             shard.fault_evidence_sha256 = inactive_fault.fault_evidence_sha256.clone();
             shard.active_snapshot_id = inactive_snapshot_id.clone();
@@ -3443,8 +3925,7 @@ mod tests {
             inactive_fault
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &inactive_runtime,
                     "drive-7",
                     &history,
                     &mapping_observations,
@@ -3466,8 +3947,7 @@ mod tests {
             proof
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &history,
                     &wrong_mapping,
@@ -3490,8 +3970,7 @@ mod tests {
             proof
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &history,
                     &wrong_bucket_mapping,
@@ -3508,7 +3987,7 @@ mod tests {
             "key",
             "version-1",
             Some(HASH_B),
-            260,
+            450,
         );
         conflicting.durability_cohort = Some(DurabilityCohort::PreFault);
         conflicting.fault_window_relation = None;
@@ -3517,8 +3996,7 @@ mod tests {
             proof
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &conflicting_commits,
                     &mapping_observations,
@@ -3535,8 +4013,7 @@ mod tests {
             proof
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &contradictory_commit_window,
                     &mapping_observations,
@@ -3551,8 +4028,7 @@ mod tests {
             proof
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &inverted_commit_interval,
                     &mapping_observations,
@@ -3567,8 +4043,7 @@ mod tests {
             proof
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &inverted_probe_interval,
                     &mapping_observations,
@@ -3585,8 +4060,7 @@ mod tests {
             proof
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &contradictory_probe_window,
                     &mapping_observations,
@@ -3604,8 +4078,7 @@ mod tests {
             swapped_pod_drives
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &history,
                     &mapping_observations,
@@ -3620,8 +4093,7 @@ mod tests {
             too_many_online
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &history,
                     &mapping_observations,
@@ -3635,8 +4107,7 @@ mod tests {
             repaired_offline
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &history,
                     &mapping_observations,
@@ -3644,13 +4115,13 @@ mod tests {
                 .is_err()
         );
 
-        let wrong_evidence_pods = vec!["rustfs-4".to_string()];
+        let mut wrong_runtime_targets = runtime_contract.clone();
+        wrong_runtime_targets.targets[0].pod_name = "rustfs-4".to_string();
         assert!(
             proof
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &wrong_evidence_pods,
+                    &wrong_runtime_targets,
                     "drive-7",
                     &history,
                     &mapping_observations,
@@ -3667,8 +4138,7 @@ mod tests {
             self_consistent_wrong_value
                 .validate_against_runtime(
                     &membership,
-                    &selected_pods,
-                    &selected_pods,
+                    &runtime_contract,
                     "drive-7",
                     &wrong_history,
                     &mapping_observations,
@@ -3740,6 +4210,9 @@ mod tests {
                 bucket: "bucket-1".to_string(),
                 drive_uuid: stale_return.returned_generation.rustfs_drive_uuid.clone(),
                 filesystem_uuid: stale_return.returned_generation.filesystem_uuid.clone(),
+                snapshot_id: snapshot_id.to_string(),
+                scan_started_at_ms: observed_at_ms - 5,
+                scan_completed_at_ms: observed_at_ms,
                 start_cursor: None,
                 end_cursor: cursor.to_string(),
                 exhausted: true,
@@ -3775,6 +4248,17 @@ mod tests {
             710,
             vec![committed.clone(), unknown.clone()],
         );
+        let cleanup_response = serde_json::to_string(&RustfsDanglingCleanupResponse {
+            operation_id: "cleanup-1".to_string(),
+            bucket: "bucket-1".to_string(),
+            drive_uuid: stale_return.returned_generation.rustfs_drive_uuid.clone(),
+            filesystem_uuid: stale_return.returned_generation.filesystem_uuid.clone(),
+            before_inventory_snapshot_id: before_inventory.receipt.snapshot_id.clone(),
+            started_at_ms: 600,
+            completed_at_ms: 700,
+            removed_fragment_ids: vec![dangling.fragment_id.clone()],
+        })
+        .expect("cleanup response");
         let proof = DanglingCleanupProof {
             schema_version: STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
             identity: identity("stale-disk-return-detect"),
@@ -3784,6 +4268,10 @@ mod tests {
             after_inventory_snapshot_id: after_inventory.receipt.snapshot_id.clone(),
             after_inventory_sha256: after_inventory.entries_sha256.clone(),
             cleanup_operation_id: "cleanup-1".to_string(),
+            cleanup_evidence: Some(DanglingCleanupEvidence {
+                response_sha256: sha256_bytes(cleanup_response.as_bytes()),
+                response_body: cleanup_response,
+            }),
             writes_quiesced_at_ms: 540,
             started_at_ms: 600,
             completed_at_ms: 700,
@@ -3822,6 +4310,85 @@ mod tests {
                 &history,
             )
             .expect("committed and recoverable-unknown fragments retained");
+
+        let mut no_cleanup_response = proof.clone();
+        no_cleanup_response.cleanup_evidence = None;
+        assert!(
+            no_cleanup_response
+                .validate_against_stale_return(
+                    &stale_return,
+                    &before_inventory,
+                    &after_inventory,
+                    &history,
+                )
+                .is_err(),
+            "local cleanup fields cannot substitute for the captured RustFS response"
+        );
+
+        let mut wrong_cleanup_operation = proof.clone();
+        let cleanup_evidence = wrong_cleanup_operation
+            .cleanup_evidence
+            .as_mut()
+            .expect("cleanup evidence");
+        let mut cleanup_response =
+            serde_json::from_str::<RustfsDanglingCleanupResponse>(&cleanup_evidence.response_body)
+                .expect("cleanup response");
+        cleanup_response.operation_id = "cleanup-foreign".to_string();
+        cleanup_evidence.response_body =
+            serde_json::to_string(&cleanup_response).expect("cleanup response");
+        cleanup_evidence.response_sha256 = sha256_bytes(cleanup_evidence.response_body.as_bytes());
+        assert!(
+            wrong_cleanup_operation
+                .validate_against_stale_return(
+                    &stale_return,
+                    &before_inventory,
+                    &after_inventory,
+                    &history,
+                )
+                .is_err(),
+            "the cleanup operation ID must come from the captured RustFS response"
+        );
+
+        let mut mismatched_scan_time = before_inventory.clone();
+        let mut scan_response = mismatched_scan_time.response().expect("inventory response");
+        scan_response.scan_completed_at_ms -= 1;
+        mismatched_scan_time.receipt.response_body =
+            serde_json::to_string(&scan_response).expect("inventory response");
+        mismatched_scan_time.receipt.response_sha256 =
+            sha256_bytes(mismatched_scan_time.receipt.response_body.as_bytes());
+        assert!(
+            proof
+                .validate_against_stale_return(
+                    &stale_return,
+                    &mismatched_scan_time,
+                    &after_inventory,
+                    &history,
+                )
+                .is_err(),
+            "the raw inventory scan interval must match its persisted receipt"
+        );
+
+        let mut cross_boundary_conflict = history.clone();
+        cross_boundary_conflict.push(history_record(
+            "put-conflict-after-cleanup",
+            "stale-disk-return-detect",
+            OperationKind::Put,
+            "key",
+            "version-1",
+            Some(HASH_B),
+            720,
+        ));
+        assert!(
+            proof
+                .validate_against_stale_return(
+                    &stale_return,
+                    &before_inventory,
+                    &after_inventory,
+                    &cross_boundary_conflict,
+                )
+                .is_err(),
+            "immutable-version conflicts outside the cleanup window must still fail closed"
+        );
 
         let rejects_order = |candidate: &DanglingCleanupProof,
                              before: &ShardInventorySnapshot,
@@ -3977,6 +4544,16 @@ mod tests {
         let mut missing = proof.clone();
         missing.after_inventory_snapshot_id = missing_after.receipt.snapshot_id.clone();
         missing.after_inventory_sha256 = missing_after.entries_sha256.clone();
+        let cleanup_evidence = missing.cleanup_evidence.as_mut().expect("cleanup evidence");
+        let mut cleanup_response =
+            serde_json::from_str::<RustfsDanglingCleanupResponse>(&cleanup_evidence.response_body)
+                .expect("cleanup response");
+        cleanup_response
+            .removed_fragment_ids
+            .push(unknown.fragment_id.clone());
+        cleanup_evidence.response_body =
+            serde_json::to_string(&cleanup_response).expect("cleanup response");
+        cleanup_evidence.response_sha256 = sha256_bytes(cleanup_evidence.response_body.as_bytes());
         let error = missing
             .validate_against_stale_return(
                 &stale_return,
