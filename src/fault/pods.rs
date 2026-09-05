@@ -148,7 +148,7 @@ fn target_pod_proof(
     let metadata = pod.get("metadata")?;
     let name = metadata.get("name")?.as_str()?.to_string();
     let uid = metadata.get("uid")?.as_str()?.to_string();
-    let mut proof = TargetResolvedPodProof::new(name, uid);
+    let mut proof = TargetResolvedPodProof::new(name, uid).with_ready(pod_is_ready(pod));
     if let Some(node) = pod.pointer("/spec/nodeName").and_then(Value::as_str) {
         proof = proof.with_node(node);
     }
@@ -160,6 +160,19 @@ fn target_pod_proof(
         _ => Vec::new(),
     };
     Some(proof.with_persistent_volume_claims(claims))
+}
+
+fn pod_is_ready(pod: &Value) -> bool {
+    pod.pointer("/metadata/deletionTimestamp").is_none()
+        && pod
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|condition| {
+                condition.get("type").and_then(Value::as_str) == Some("Ready")
+                    && condition.get("status").and_then(Value::as_str) == Some("True")
+            })
 }
 
 fn persistent_volume_claim_names(pod: &Value) -> Vec<String> {
@@ -387,7 +400,8 @@ mod tests {
                     "name": "data",
                     "persistentVolumeClaim": {"claimName": "data-rustfs-0"}
                 }]
-            }
+            },
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
         });
         let pvc_list = json!({
             "items": [{
@@ -423,6 +437,7 @@ mod tests {
         let proof = target_pod_proof(&pod, Some(&pvcs), Some(&pvs)).expect("proof");
 
         assert_eq!(persistent_volume_claim_names(&pod), vec!["data-rustfs-0"]);
+        assert!(proof.ready);
         assert_eq!(proof.node.as_deref(), Some("node-a"));
         assert_eq!(proof.persistent_volume_claims.len(), 1);
         let claim = &proof.persistent_volume_claims[0];

@@ -248,6 +248,15 @@ impl FaultScenarioSpec {
     pub fn requires_chaos_mesh(self) -> bool {
         !self.crds.is_empty()
     }
+
+    pub fn requires_erasure_set_proof(self) -> bool {
+        matches!(
+            self.scenario,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+                | QUORUM_P_IO_FAULT_SCENARIO
+                | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        )
+    }
 }
 
 fn versioned_hot_mutation_mix(object_count: usize) -> WorkloadOperationMix {
@@ -359,7 +368,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     FaultScenarioSpec {
         scenario: NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
         case_name: "fault_network_partition_write_quorum_loss_preserves_committed_state",
-        description: "Partition two of the four RustFS Pods from all peers at once (half the drives on the reference single-set topology, where data == parity), driving the cluster below write quorum while read quorum can survive, and verify committed state is fully intact after the partition heals.",
+        description: "Partition two of the four RustFS Pods from all peers at once after a bounded-age RustFS admin runtime snapshot proves their server/drive membership in one symmetric erasure set, driving the cluster below write quorum while read quorum can survive, and verify committed state is intact after heal.",
         priority: FaultPriority::P1,
         backend: FaultBackend::ChaosMeshNetworkChaos,
         status: FaultScenarioStatus::Executable,
@@ -372,12 +381,12 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/network-partition-write-quorum",
         ci_phase: "faults",
-        target: "exactly two RustFS Pods selected by tenant label, fully isolated from the remaining peers (and each other); on the reference 4-server single-pool tenant this removes exactly half the drives of the single erasure set, so write quorum (data+1) is unreachable during the fault",
+        target: "exactly two RustFS Pods selected by tenant label, fully isolated from the remaining peers (and each other); actual injected source records at activation and after workload must identify servers whose runtime drive membership crosses the write-quorum boundary while retaining read quorum",
         target_proof: &[
-            "live target proof must establish the reference single-erasure-set topology before fault activation",
+            "live target proof must bind Tenant geometry and unique Ready Pod identities to bounded-age RustFS admin runtime set/parity and server/drive data before fault activation",
             "the selected target set must contain exactly two RustFS Pods",
         ],
-        validation: "the runner preflight proves the tenant matches a reference single-erasure-set topology (4 servers, 4 or 8 drives, data == parity) so the two-Pod partition provably breaks write quorum; writes during the outage fail cleanly instead of half-committing; successful reads never return wrong hashes; after the partition heals every committed object and version is re-readable with intact content (post-return zero-loss), and Tenant recovers Ready",
+        validation: "the runner stages multipart uploads before the fault, binds Tenant server/volume width and unique Ready Pod identities to RustFS admin runtime set/parity and drive-membership data fetched by a signed request no more than five seconds before fault apply, then proves the actual two-Pod partition leaves read quorum but not write quorum at activation and after workload; every PUT, DELETE, and staged multipart completion during the outage is recorded in history and must fail, time out, or remain unknown; 404 is not quorum-loss evidence; successful reads never return wrong hashes; after heal every committed object and version is re-readable with intact content (post-return zero-loss), and Tenant recovers Ready",
         observability: "history.jsonl, workload-summary.json, checker-report.json, checker-pre-recommit-report.json, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
         conflict_domain: "run-scoped NetworkChaos resource; must not overlap with PodChaos or IOChaos in the same Tenant",
     },
@@ -1031,7 +1040,8 @@ mod tests {
     use super::{
         DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultParameterSchema, FaultScenario, FaultScenarioStatus,
         FaultScenarioWorkloadProfile, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO,
-        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
+        POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
         apply_catalog_defaults, executable_scenario_catalog,
         expected_workload_versioning_for_scenario, scenario_catalog, scenario_catalog_json,
         scenario_spec,
@@ -1235,6 +1245,24 @@ mod tests {
         assert_eq!(
             scenario_spec(IO_EIO_SCENARIO).expect("io eio").param_schema,
             FaultParameterSchema::None
+        );
+    }
+
+    #[test]
+    fn catalog_explicitly_identifies_erasure_set_proof_scenarios() {
+        let requiring_proof = scenario_catalog()
+            .iter()
+            .filter(|scenario| scenario.requires_erasure_set_proof())
+            .map(|scenario| scenario.scenario)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            requiring_proof,
+            vec![
+                NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+                QUORUM_P_IO_FAULT_SCENARIO,
+                QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+            ]
         );
     }
 

@@ -27,6 +27,7 @@ pub mod history;
 pub mod plan;
 pub mod pods;
 pub mod preflight;
+pub mod quorum;
 pub mod reporting;
 pub mod runner;
 pub mod scenarios;

@@ -33,11 +33,11 @@ use crate::fault::{
 pub const DEFAULT_RUSTFS_DATA_VOLUME: &str = DEFAULT_RUSTFS_VOLUME_PATH;
 
 /// Pod count the write-quorum-loss partition isolates. Meaningful only on the
-/// reference tenant topology (4 servers x 2 volumes = 8 drives, EC 4+4):
-/// isolating 2 of 4 servers removes 4 of 8 drives, so write quorum
-/// (data + 1 = 5) is unreachable while read quorum (data = 4) can still be
-/// served by the surviving half. The runner preflight rejects other
-/// topologies instead of letting the count silently lose that meaning.
+/// runtime-proven tenant topology (4 symmetric servers in one erasure set):
+/// isolating 2 of 4 servers removes half the drives, so the data+1 write quorum
+/// is unreachable while the data read quorum can still be served by the
+/// surviving half. The runner preflight derives exact shard counts and rejects
+/// other topologies instead of letting the count silently lose that meaning.
 pub const WRITE_QUORUM_LOSS_PARTITION_TARGETS: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +125,20 @@ pub enum FaultSelection {
 }
 
 impl FaultSelection {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Percent(_) => "percent",
+            Self::FixedTargets(_) => "fixed-targets",
+        }
+    }
+
+    pub fn value(self) -> u32 {
+        match self {
+            Self::Percent(percent) => u32::from(percent),
+            Self::FixedTargets(count) => count,
+        }
+    }
+
     pub fn summary(self) -> String {
         match self {
             Self::Percent(percent) => format!("{percent}%"),
@@ -812,12 +826,9 @@ impl FaultPlan {
                 FaultKind::RustfsServerNetworkPartition,
                 spec.backend,
                 FaultTarget::RustfsServerPeerNetwork,
-                // Two of the reference topology's four servers: isolating them
-                // removes half the drives, which breaks write quorum (EC 4+4
-                // needs data+1 = 5 writable shards) while read quorum (4) can
-                // still be met by the surviving half. The runner preflight
-                // rejects topologies where this count does not carry that
-                // meaning.
+                // The runtime proof verifies that two of the four symmetric
+                // servers remove enough shards to break write quorum while
+                // preserving read quorum; other layouts fail closed.
                 FaultSelection::FixedTargets(WRITE_QUORUM_LOSS_PARTITION_TARGETS),
                 scenario.duration,
             )?,

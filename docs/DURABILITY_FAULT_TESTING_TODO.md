@@ -289,23 +289,25 @@ guardrails when implementing the ordered TODO below.
 
 ### 4. Add Per-Version-Type Quorum Math
 
-- [ ] TODO: Add a quorum table by version/object type.
-  Meaning: normal data object loss thresholds are not the same as delete marker
-  or size-0 object thresholds. Delete markers and size-0 versions use roughly
-  `n/2` parity behavior in RustFS, so a naive P+1 target can green-pass the bug
-  class. The catalog must know which threshold applies to PUT, MPU complete,
-  delete marker, and size-0 object tests.
+- [ ] PARTIAL: Add a quorum table by version/object type.
+  Meaning: the pure model separates PUT/MPU commit, delete-marker commit, and
+  persisted data/delete-marker/zero-length metadata geometry. The future
+  executable scenarios still need to bind each workload operation to the
+  corresponding table entry.
 
-- [ ] TODO: Record RustFS erasure-set shape in target proof.
-  Meaning: quorum scenarios must prove erasure-set id, total shards, data width,
-  parity width, target volumes, target nodes, and non-target coverage before
-  injection.
+- [ ] PARTIAL: Record RustFS erasure-set shape in target proof.
+  Meaning: the current network-quorum case now binds Tenant geometry and unique
+  Ready Pod identities to RustFS admin runtime set/parity and server/drive UUID
+  membership, and records a bounded-age snapshot before fault apply. Future
+  volume-quorum scenarios must still prove exact target volumes, target nodes,
+  and non-target coverage.
 
-- [ ] BLOCKED: Keep quorum scenarios non-executable until same-erasure-set proof
-  exists.
-  Meaning: random Pod, node, or volume selection cannot establish that P or P+1
-  shards in one erasure set were affected, so it cannot prove the intended
-  quorum boundary.
+- [ ] BLOCKED: Keep volume-quorum scenarios non-executable until exact
+  same-erasure-set volume proof exists.
+  Meaning: the network-quorum case now validates the actual injected Pod set
+  against its single-set server/drive membership at activation and after the
+  workload, but random volume or node selection still cannot establish that P
+  or P+1 shards in one erasure set were affected.
 
 ### 5. Implement Volume-Kind Fixed Targeting
 

@@ -16,12 +16,14 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::fault::{
+    backends::chaos_mesh::{NetworkPartitionEvidenceContract, validate_network_partition_snapshot},
     checker::RecoveryStabilityReport,
     checker::{CheckerReport, RecoveryStabilityClassification},
     config::{
@@ -31,15 +33,17 @@ use crate::fault::{
     },
     events::{RunEvent, RunEventStatus},
     history::{DurabilityCohort, OperationKind, OperationOutcome, OperationRecord},
+    plan::{FaultPlan, FaultPlanOptions, FaultWorkloadMode},
     preflight::{PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus},
+    quorum::require_fresh_runtime_observation,
     reporting::{
         AvailabilityStatus, DataCorrectnessStatus, FailureClassification, FailurePhase,
         FailureSeverity, FailureVerdict, ResponsibilityDomain,
     },
-    scenarios::{self, DM_FLAKEY_VERSIONED_HOT_SCENARIO},
+    scenarios::{self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario},
     spec::{
-        FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec,
-        FaultRunTargetSpec,
+        FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunFaultSpec,
+        FaultRunSpec, FaultRunTargetSpec,
     },
     workload::WorkloadPlan,
 };
@@ -330,6 +334,9 @@ pub fn validate_fault_artifacts(
         evidence.require_client_disruption,
         metadata.require_client_disruption
     );
+    if options.scenario == scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+        validate_write_quorum_runtime_evidence(&evidence, &target_proof, &json_spec)?;
+    }
     validate_fault_window_evidence(&evidence)?;
     if options.scenario == DM_FLAKEY_VERSIONED_HOT_SCENARIO {
         validate_dm_crash_artifacts(
@@ -383,6 +390,20 @@ pub fn validate_fault_artifacts(
         summary.exercised_all_operation_families(),
         "workload-summary.json did not exercise every required S3 operation family"
     );
+    if options.scenario == scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+        let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
+        summary.require_write_quorum_loss_effect(
+            &history,
+            &metadata.scenario,
+            &json_spec.metadata.bucket,
+            evidence
+                .workload_started_at_ms
+                .context("fault-evidence.json workload_started_at_ms is required")?,
+            evidence
+                .workload_ended_at_ms
+                .context("fault-evidence.json workload_ended_at_ms is required")?,
+        )?;
+    }
 
     Ok(ArtifactValidationReport {
         scenario: options.scenario.clone(),
@@ -412,6 +433,7 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
         spec.scenario.name,
         options.scenario
     );
+    validate_run_spec_catalog_contract(spec, options)?;
     ensure!(
         spec.workload.object_count == options.expected_workload_objects,
         "run-spec workload.object_count {} does not match expected {}",
@@ -494,6 +516,70 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
     Ok(())
 }
 
+fn validate_run_spec_catalog_contract(
+    spec: &FaultRunSpec,
+    options: &ArtifactValidationOptions,
+) -> Result<()> {
+    let catalog = scenarios::scenario_spec(&options.scenario)?;
+    ensure!(
+        spec.scenario.case_name == catalog.case_name
+            && spec.scenario.priority == catalog.priority.as_str()
+            && spec.scenario.isolation == catalog.isolation.as_str()
+            && spec.scenario.impact_policy == catalog.impact_policy.as_str()
+            && spec.scenario.boundary == catalog.boundary
+            && spec.scenario.validation == catalog.validation,
+        "run-spec scenario contract does not match catalog scenario {:?}",
+        options.scenario
+    );
+    let artifact_fault = spec
+        .faults
+        .first()
+        .context("run-spec must contain a fault before catalog validation")?;
+    let percent = if artifact_fault.selection.kind == "percent" {
+        u8::try_from(artifact_fault.selection.value)
+            .context("run-spec percent selection exceeds u8")?
+    } else {
+        1
+    };
+    let scenario = FaultScenario {
+        name: options.scenario.clone(),
+        case_name: catalog.case_name,
+        duration: Duration::from_secs(artifact_fault.fault_duration_seconds),
+        percent,
+        object_count: spec.workload.object_count,
+    };
+    let plan = FaultPlan::from_scenario_with_options(
+        &scenario,
+        catalog,
+        FaultPlanOptions {
+            rustfs_volume_path: options.expected_rustfs_volume_path.clone(),
+            scenario_parameters: artifact_fault.parameters.clone(),
+        },
+    )
+    .context("rebuild canonical fault plan for artifact validation")?;
+    let expected_mode = match plan.workload_mode {
+        FaultWorkloadMode::S3Mixed => "s3-mixed",
+        FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
+    };
+    ensure!(
+        spec.workload.mode == expected_mode,
+        "run-spec workload mode {:?} does not match canonical plan {expected_mode:?}",
+        spec.workload.mode
+    );
+    let expected_faults = plan
+        .faults()
+        .iter()
+        .enumerate()
+        .map(|(index, fault)| FaultRunFaultSpec::from_fault(index, &scenario, catalog, fault))
+        .collect::<Vec<_>>();
+    ensure!(
+        spec.faults == expected_faults,
+        "run-spec faults do not match the catalog's canonical fault plan: actual={:?} expected={expected_faults:?}",
+        spec.faults
+    );
+    Ok(())
+}
+
 fn validate_preflight_summary(
     summary: &PreflightSummary,
     options: &ArtifactValidationOptions,
@@ -538,7 +624,7 @@ fn validate_target_proof(
     options: &ArtifactValidationOptions,
 ) -> Result<()> {
     ensure!(
-        proof.schema_version == 1,
+        (1..=2).contains(&proof.schema_version),
         "target-proof.json schema_version {} is unsupported",
         proof.schema_version
     );
@@ -565,6 +651,10 @@ fn validate_target_proof(
         spec.metadata.run_id
     );
     ensure!(
+        proof.namespace == spec.cluster.namespace && proof.tenant == spec.cluster.tenant,
+        "target-proof.json namespace/tenant does not match run-spec cluster scope"
+    );
+    ensure!(
         proof.faults.len() == spec.faults.len(),
         "target-proof.json faults length {} does not match run-spec faults length {}",
         proof.faults.len(),
@@ -581,6 +671,60 @@ fn validate_target_proof(
             .all(|requirement| requirement.status == PreflightStatus::Passed),
         "target-proof.json includes failed target requirements"
     );
+    if spec
+        .faults
+        .iter()
+        .any(|fault| fault.erasure_set_proof_required)
+    {
+        ensure!(
+            proof.schema_version >= 2,
+            "target-proof.json schema v2 is required for erasure-set evidence"
+        );
+    }
+    if proof.schema_version >= 2 {
+        for (proof_fault, spec_fault) in proof.faults.iter().zip(&spec.faults) {
+            ensure!(
+                proof_fault.name == spec_fault.name
+                    && proof_fault.kind == spec_fault.kind
+                    && proof_fault.backend == spec_fault.backend,
+                "target-proof.json fault identity does not match run-spec fault {}",
+                spec_fault.name
+            );
+            ensure!(
+                proof_fault.target_kind == spec_fault.target.kind
+                    && proof_fault.volume_path == spec_fault.target.path
+                    && proof_fault.conflict_domain == spec_fault.conflict_domain,
+                "target-proof.json fault {} target does not match run-spec",
+                spec_fault.name
+            );
+            ensure!(
+                proof_fault.selection_kind == spec_fault.selection.kind
+                    && proof_fault.selection_value == spec_fault.selection.value,
+                "target-proof.json fault {} selection does not match run-spec",
+                spec_fault.name
+            );
+            ensure!(
+                proof_fault.erasure_set.is_some() == spec_fault.erasure_set_proof_required,
+                "target-proof.json fault {} erasure-set evidence does not match run-spec requirements",
+                spec_fault.name
+            );
+            let requires_pod_selector = spec_fault.target.kind != "dedicated-block-device";
+            ensure!(
+                proof_fault.pod_selector.is_some() == requires_pod_selector,
+                "target-proof.json fault {} selector evidence does not match run-spec target",
+                spec_fault.name
+            );
+            if let Some(selector) = &proof_fault.pod_selector {
+                ensure!(
+                    selector.namespace == spec.cluster.namespace
+                        && selector.tenant == spec.cluster.tenant
+                        && selector.selector == format!("rustfs.tenant={}", spec.cluster.tenant),
+                    "target-proof.json fault {} selector scope does not match run-spec",
+                    spec_fault.name
+                );
+            }
+        }
+    }
     if proof
         .faults
         .iter()
@@ -610,6 +754,259 @@ fn validate_target_proof(
             "target-proof.json volume targets must include pod PVC/PV/node/device-or-path bindings"
         );
     }
+    for (fault, spec_fault) in proof.faults.iter().zip(&spec.faults) {
+        let Some(erasure_set) = &fault.erasure_set else {
+            continue;
+        };
+        ensure!(
+            erasure_set.required && erasure_set.resolved,
+            "target-proof.json fault {} requires unresolved erasure-set evidence",
+            fault.name
+        );
+        if proof.schema_version == 1 {
+            continue;
+        }
+        ensure!(
+            erasure_set.source.as_deref() == Some("rustfs-admin-server-info")
+                && erasure_set
+                    .deployment_id
+                    .as_deref()
+                    .is_some_and(|deployment_id| !deployment_id.trim().is_empty()),
+            "target-proof.json fault {} is missing its RustFS runtime source",
+            fault.name
+        );
+        let shape = erasure_set.shape.as_ref().with_context(|| {
+            format!(
+                "target-proof.json fault {} resolved erasure-set evidence without a shape",
+                fault.name
+            )
+        })?;
+        shape.validate().with_context(|| {
+            format!(
+                "target-proof.json fault {} has an invalid erasure-set shape",
+                fault.name
+            )
+        })?;
+        let health = erasure_set.health.with_context(|| {
+            format!(
+                "target-proof.json fault {} resolved erasure-set evidence without drive health",
+                fault.name
+            )
+        })?;
+        health
+            .require_all_online(shape.total_shards)
+            .with_context(|| {
+                format!(
+                    "target-proof.json fault {} runtime erasure set was not fully online",
+                    fault.name
+                )
+            })?;
+        let resolved_identities = unique_pod_identities(
+            "target-proof.json resolved_pods",
+            proof
+                .resolved_pods
+                .iter()
+                .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+        )?;
+        ensure!(
+            erasure_set.observed_at_ms > 0 && erasure_set.observed_at_ms <= proof.generated_at_ms,
+            "target-proof.json fault {} has an invalid topology observation timestamp",
+            fault.name
+        );
+        ensure!(
+            resolved_identities.len() == usize::try_from(shape.server_count)?
+                && proof.resolved_pods.iter().all(|pod| pod.ready),
+            "target-proof.json fault {} runtime shape requires exactly {} Ready resolved pods",
+            fault.name,
+            shape.server_count
+        );
+        let membership = erasure_set.membership.as_ref().with_context(|| {
+            format!(
+                "target-proof.json fault {} resolved erasure-set evidence without server/drive membership",
+                fault.name
+            )
+        })?;
+        membership.validate(shape).with_context(|| {
+            format!(
+                "target-proof.json fault {} has invalid server/drive membership",
+                fault.name
+            )
+        })?;
+        let resolved_pod_names = resolved_identities
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<BTreeSet<_>>();
+        let membership_pod_names = membership
+            .members
+            .iter()
+            .map(|member| member.pod_name.as_str())
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            membership_pod_names == resolved_pod_names,
+            "target-proof.json fault {} server/drive membership does not match resolved_pods",
+            fault.name
+        );
+        if spec_fault.target.kind == "rustfs-server-peer-network" {
+            ensure!(
+                spec_fault.selection.kind == "fixed-targets",
+                "target-proof.json fault {} quorum partition requires fixed targets",
+                fault.name
+            );
+            shape
+                .require_server_partition_boundary(spec_fault.selection.value)
+                .with_context(|| {
+                    format!(
+                        "target-proof.json fault {} does not establish the declared read/write quorum boundary",
+                        fault.name
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
+fn unique_pod_identities<'a>(
+    label: &str,
+    identities: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<BTreeSet<(String, String)>> {
+    let mut names = BTreeSet::new();
+    let mut uids = BTreeSet::new();
+    let mut pairs = BTreeSet::new();
+    let mut count = 0_usize;
+    for (name, uid) in identities {
+        count += 1;
+        ensure!(
+            !name.trim().is_empty() && !uid.trim().is_empty(),
+            "{label} contains an empty Pod name or UID"
+        );
+        names.insert(name.to_string());
+        uids.insert(uid.to_string());
+        pairs.insert((name.to_string(), uid.to_string()));
+    }
+    ensure!(
+        names.len() == count && uids.len() == count && pairs.len() == count,
+        "{label} requires unique Pod names, UIDs, and identity pairs"
+    );
+    Ok(pairs)
+}
+
+fn validate_write_quorum_runtime_evidence(
+    evidence: &FaultEvidenceArtifact,
+    proof: &TargetProof,
+    spec: &FaultRunSpec,
+) -> Result<()> {
+    let spec_fault = spec
+        .faults
+        .first()
+        .context("write-quorum-loss run-spec has no fault")?;
+    let erasure_set = proof
+        .faults
+        .iter()
+        .find_map(|fault| fault.erasure_set.as_ref())
+        .context("target-proof.json has no runtime erasure-set evidence")?;
+    let shape = erasure_set
+        .shape
+        .as_ref()
+        .context("target-proof.json runtime erasure-set evidence has no shape")?;
+    let membership = erasure_set
+        .membership
+        .as_ref()
+        .context("target-proof.json runtime erasure-set evidence has no server/drive membership")?;
+    let apply_started_at_ms = evidence
+        .fault_apply_started_at_ms
+        .context("fault-evidence.json fault_apply_started_at_ms is required")?;
+    require_fresh_runtime_observation(erasure_set.observed_at_ms, apply_started_at_ms)
+        .context("target-proof.json runtime erasure-set observation was stale at fault apply")?;
+
+    let proved_identities = unique_pod_identities(
+        "target-proof.json resolved_pods",
+        proof
+            .resolved_pods
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    let active_identities = unique_pod_identities(
+        "fault-evidence.json pods_at_fault_activation",
+        evidence
+            .pods_at_fault_activation
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    let workload_identities = unique_pod_identities(
+        "fault-evidence.json pods_at_workload_snapshot",
+        evidence
+            .pods_at_workload_snapshot
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    ensure!(
+        !active_identities.is_empty() && active_identities == proved_identities,
+        "fault-evidence.json Pod identities at activation do not match target-proof.json"
+    );
+    ensure!(
+        workload_identities == proved_identities,
+        "fault-evidence.json Pod identities after workload do not match target-proof.json"
+    );
+    let candidate_pod_ids = active_identities
+        .iter()
+        .map(|(name, _)| format!("{}/{name}", spec.cluster.namespace))
+        .collect::<BTreeSet<_>>();
+    let contract = NetworkPartitionEvidenceContract {
+        chaos_namespace: &spec.cluster.chaos_namespace,
+        target_namespace: &spec.cluster.namespace,
+        tenant: &spec.cluster.tenant,
+        run_id: &spec.metadata.run_id,
+        scenario: &spec.scenario.name,
+        expected_source_targets: spec_fault.selection.value,
+        candidate_pod_ids: &candidate_pod_ids,
+    };
+    let mut selected_targets = None;
+    for (stage, snapshots) in [
+        ("active", &evidence.active_snapshots),
+        ("after-workload", &evidence.workload_snapshots),
+    ] {
+        ensure!(
+            snapshots.len() == 1,
+            "fault-evidence.json {stage} stage must contain exactly one NetworkChaos snapshot"
+        );
+        let snapshot = &snapshots[0];
+        ensure!(
+            snapshot.get("stage").and_then(Value::as_str) == Some(stage)
+                && snapshot.get("resource_kind").and_then(Value::as_str) == Some("networkchaos"),
+            "fault-evidence.json {stage} snapshot metadata is invalid"
+        );
+        let resource = snapshot
+            .get("chaos_status")
+            .context("fault-evidence.json NetworkChaos snapshot has no resource object")?;
+        ensure!(
+            snapshot.get("resource_name").and_then(Value::as_str)
+                == resource.pointer("/metadata/name").and_then(Value::as_str),
+            "fault-evidence.json NetworkChaos snapshot resource name is inconsistent"
+        );
+        let current_targets = validate_network_partition_snapshot(resource, &contract)
+            .with_context(|| format!("validate {stage} NetworkChaos runtime evidence"))?;
+        if let Some(expected_targets) = &selected_targets {
+            ensure!(
+                expected_targets == &current_targets,
+                "NetworkChaos selected source targets changed across workload snapshots"
+            );
+        } else {
+            selected_targets = Some(current_targets);
+        }
+    }
+    let selected_targets = selected_targets.context("no NetworkChaos source targets observed")?;
+    let namespace_prefix = format!("{}/", spec.cluster.namespace);
+    let selected_pods = selected_targets
+        .iter()
+        .map(|target| {
+            target.strip_prefix(&namespace_prefix).with_context(|| {
+                format!("NetworkChaos selected target {target:?} is outside the run namespace")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    membership
+        .require_selected_boundary(shape, selected_pods)
+        .context("actual NetworkChaos source targets do not cross the write-quorum boundary")?;
     Ok(())
 }
 
@@ -1598,6 +1995,10 @@ struct FaultEvidenceArtifact {
     require_client_disruption: bool,
     client_disruptions: usize,
     pods_before: Vec<PodIdentityArtifact>,
+    #[serde(default)]
+    pods_at_fault_activation: Vec<PodIdentityArtifact>,
+    #[serde(default)]
+    pods_at_workload_snapshot: Vec<PodIdentityArtifact>,
     pods_after: Vec<PodIdentityArtifact>,
     active_snapshots: Vec<Value>,
     workload_snapshots: Vec<Value>,
@@ -1745,9 +2146,68 @@ impl WorkloadSummaryArtifact {
             && self.multipart_completes.total() > 0
             && self.multipart_aborts.total() > 0
     }
+
+    fn require_write_quorum_loss_effect(
+        &self,
+        history: &[OperationRecord],
+        scenario: &str,
+        bucket: &str,
+        workload_started_at_ms: u64,
+        workload_ended_at_ms: u64,
+    ) -> Result<()> {
+        ensure!(
+            self.puts.total() > 0
+                && self.deletes.total() > 0
+                && self.multipart_completes.total() > 0,
+            "workload-summary.json did not exercise every committing mutation family"
+        );
+        for (kind, counts) in [
+            ("PUT", &self.puts),
+            ("DELETE", &self.deletes),
+            ("CompleteMultipartUpload", &self.multipart_completes),
+        ] {
+            ensure!(
+                counts.ok == 0 && counts.not_found == 0 && counts.disrupted() > 0,
+                "write-quorum-loss {kind} outcomes must all be failed, timed out, or unknown: {counts:?}"
+            );
+        }
+        for (kind, summary_counts) in [
+            (OperationKind::Put, &self.puts),
+            (OperationKind::Delete, &self.deletes),
+            (
+                OperationKind::CompleteMultipartUpload,
+                &self.multipart_completes,
+            ),
+        ] {
+            let mut history_counts = OutcomeCountsArtifact::default();
+            for record in history.iter().filter(|record| {
+                record.scenario == scenario
+                    && record.durability_cohort == Some(DurabilityCohort::FaultActive)
+                    && record.kind == kind
+            }) {
+                ensure!(
+                    record.bucket == bucket,
+                    "fault_active history.jsonl {kind:?} record belongs to unexpected bucket {:?}",
+                    record.bucket
+                );
+                ensure!(
+                    record.started_at_ms >= workload_started_at_ms
+                        && record.ended_at_ms <= workload_ended_at_ms
+                        && record.started_at_ms <= record.ended_at_ms,
+                    "fault_active history.jsonl {kind:?} record falls outside the workload window"
+                );
+                history_counts.record(record.outcome);
+            }
+            ensure!(
+                &history_counts == summary_counts,
+                "workload-summary.json {kind:?} outcomes do not match fault_active history.jsonl records"
+            );
+        }
+        Ok(())
+    }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
 struct OutcomeCountsArtifact {
     ok: usize,
     not_found: usize,
@@ -1757,24 +2217,46 @@ struct OutcomeCountsArtifact {
 }
 
 impl OutcomeCountsArtifact {
+    fn record(&mut self, outcome: OperationOutcome) {
+        match outcome {
+            OperationOutcome::Ok => self.ok += 1,
+            OperationOutcome::NotFound => self.not_found += 1,
+            OperationOutcome::Failed => self.failed += 1,
+            OperationOutcome::Timeout => self.timeout += 1,
+            OperationOutcome::Unknown => self.unknown += 1,
+        }
+    }
+
     fn total(&self) -> usize {
         self.ok + self.not_found + self.failed + self.timeout + self.unknown
+    }
+
+    fn disrupted(&self) -> usize {
+        self.failed + self.timeout + self.unknown
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactValidationOptions, FailureSummaryArtifact, recursive_find,
-        validate_fault_artifacts, validate_fault_artifacts_and_write_report,
+        ArtifactValidationOptions, FailureSummaryArtifact, FaultEvidenceArtifact,
+        OutcomeCountsArtifact, WorkloadSummaryArtifact, recursive_find, validate_fault_artifacts,
+        validate_fault_artifacts_and_write_report, validate_run_spec, validate_target_proof,
+        validate_write_quorum_runtime_evidence,
     };
     use crate::fault::{
         checker::{RecoveryStabilityClassification, RecoveryStabilityReport},
+        config::FaultTestConfig,
+        history::{OperationOutcome, OperationRecord},
+        plan::FaultPlan,
+        preflight::{TargetProof, TargetResolvedPodProof},
+        quorum::{ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape},
         reporting::{
             AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity,
             FailureVerdict, ResponsibilityDomain,
         },
-        spec::{FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec},
+        scenarios::{FaultScenario, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, scenario_spec},
+        spec::{FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec},
         workload::WorkloadPlan,
     };
     use serde_json::json;
@@ -1802,6 +2284,353 @@ mod tests {
         assert_eq!(
             report.validation_summary_tsv_row(),
             "io-eio\t42\t0\t2\t1\t7\t0\t0\t0\t0\ttrue"
+        );
+    }
+
+    #[test]
+    fn target_proof_v2_binds_runtime_shape_to_typed_run_spec_requirement() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO.to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario(&scenario, catalog).expect("plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let run_spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+        let proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs((0..4).map(|index| {
+                TargetResolvedPodProof::new(format!("rustfs-{index}"), format!("uid-{index}"))
+                    .with_node(format!("node-{index}"))
+                    .with_ready(true)
+            }))
+            .with_erasure_set_topology_proven(
+                ErasureSetShape::from_runtime_single_set(4, 2, &[1], &[8], 4)
+                    .expect("runtime shape"),
+                ErasureSetHealth::from_runtime(8, 8, 0, 0).expect("runtime health"),
+                ErasureSetMembership::from_runtime(
+                    &ErasureSetShape::from_runtime_single_set(4, 2, &[1], &[8], 4)
+                        .expect("runtime shape"),
+                    (0..4)
+                        .map(|index| ErasureSetMember {
+                            pod_name: format!("rustfs-{index}"),
+                            server_endpoint: format!("http://rustfs-{index}.rustfs:9000"),
+                            shard_ids: vec![format!("drive-{index}-a"), format!("drive-{index}-b")],
+                        })
+                        .collect(),
+                )
+                .expect("runtime membership"),
+                "deployment-1",
+                1,
+            )
+            .expect("valid runtime proof");
+        let options = ArtifactValidationOptions {
+            scenario: NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO.to_string(),
+            artifact_root: std::path::PathBuf::from("unused"),
+            expected_workload_objects: scenario.object_count,
+            expected_workload_concurrency: config.workload.concurrency,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: config.expected_rustfs_pod_count,
+            expected_stable_window_seconds: config.rustfs_pod_stable_window.as_secs(),
+            expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
+            expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
+        };
+
+        validate_run_spec(&run_spec, &options).expect("canonical run spec");
+        validate_target_proof(&proof, &run_spec, &options).expect("valid v2 proof");
+
+        let mut jointly_downgraded_spec = run_spec.clone();
+        jointly_downgraded_spec.faults[0].erasure_set_proof_required = false;
+        assert!(validate_run_spec(&jointly_downgraded_spec, &options).is_err());
+
+        let mut jointly_drifted_spec = run_spec.clone();
+        jointly_drifted_spec.faults[0].target.kind = "rustfs-server-pod".to_string();
+        jointly_drifted_spec.faults[0].selection.value = 1;
+        assert!(validate_run_spec(&jointly_drifted_spec, &options).is_err());
+
+        let mut downgraded = proof.clone();
+        downgraded.schema_version = 1;
+        assert!(validate_target_proof(&downgraded, &run_spec, &options).is_err());
+
+        let mut wrong_selection = proof.clone();
+        wrong_selection.faults[0].selection_value = 1;
+        assert!(validate_target_proof(&wrong_selection, &run_spec, &options).is_err());
+
+        let mut wrong_scope = proof.clone();
+        wrong_scope.faults[0]
+            .pod_selector
+            .as_mut()
+            .expect("selector")
+            .tenant = "other-tenant".to_string();
+        assert!(validate_target_proof(&wrong_scope, &run_spec, &options).is_err());
+
+        let mut missing = proof.clone();
+        missing.faults[0].erasure_set = None;
+        assert!(validate_target_proof(&missing, &run_spec, &options).is_err());
+
+        let mut duplicate_pod = proof.clone();
+        duplicate_pod.resolved_pods[2].name = duplicate_pod.resolved_pods[0].name.clone();
+        duplicate_pod.resolved_pods[2].uid = duplicate_pod.resolved_pods[0].uid.clone();
+        assert!(validate_target_proof(&duplicate_pod, &run_spec, &options).is_err());
+
+        let namespace = &run_spec.cluster.namespace;
+        let tenant = &run_spec.cluster.tenant;
+        let chaos_namespace = &run_spec.cluster.chaos_namespace;
+        let pod_id = |index| format!("{namespace}/rustfs-{index}");
+        let records = vec![
+            json!({"id": pod_id(0), "selectorKey": ".", "phase": "Injected", "injectedCount": 1}),
+            json!({"id": pod_id(1), "selectorKey": ".", "phase": "Injected", "injectedCount": 1}),
+            json!({"id": pod_id(0), "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1}),
+            json!({"id": pod_id(1), "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1}),
+            json!({"id": pod_id(2), "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1}),
+            json!({"id": pod_id(3), "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1}),
+        ];
+        let resource = json!({
+            "apiVersion": "chaos-mesh.org/v1alpha1",
+            "kind": "NetworkChaos",
+            "metadata": {
+                "name": "quorum-partition",
+                "namespace": chaos_namespace,
+                "labels": {
+                    "rustfs-fault-test/run-id": run_spec.metadata.run_id,
+                    "rustfs-fault-test/scenario": run_spec.scenario.name,
+                    "app.kubernetes.io/managed-by": "s3chaos"
+                }
+            },
+            "spec": {
+                "action": "partition",
+                "mode": "fixed",
+                "value": "2",
+                "selector": {
+                    "namespaces": [namespace],
+                    "labelSelectors": {"rustfs.tenant": tenant}
+                },
+                "direction": "both",
+                "target": {
+                    "mode": "all",
+                    "selector": {
+                        "namespaces": [namespace],
+                        "labelSelectors": {"rustfs.tenant": tenant}
+                    }
+                }
+            },
+            "status": {
+                "conditions": [
+                    {"type": "Selected", "status": "True"},
+                    {"type": "AllInjected", "status": "True"},
+                    {"type": "AllRecovered", "status": "False"}
+                ],
+                "experiment": {"desiredPhase": "Run", "containerRecords": records}
+            }
+        });
+        let snapshot = |stage| {
+            json!({
+                "stage": stage,
+                "resource_kind": "networkchaos",
+                "resource_name": "quorum-partition",
+                "chaos_status": resource
+            })
+        };
+        let mut evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
+            "injected": true,
+            "active_during_workload": true,
+            "recovered": true,
+            "require_client_disruption": true,
+            "client_disruptions": 1,
+            "pods_before": [],
+            "pods_at_fault_activation": (0..4).map(|index| json!({
+                "name": format!("rustfs-{index}"),
+                "uid": format!("uid-{index}")
+            })).collect::<Vec<_>>(),
+            "pods_at_workload_snapshot": (0..4).map(|index| json!({
+                "name": format!("rustfs-{index}"),
+                "uid": format!("uid-{index}")
+            })).collect::<Vec<_>>(),
+            "pods_after": [],
+            "active_snapshots": [snapshot("active")],
+            "workload_snapshots": [snapshot("after-workload")],
+            "fault_apply_started_at_ms": 2
+        }))
+        .expect("fault evidence");
+        validate_write_quorum_runtime_evidence(&evidence, &proof, &run_spec)
+            .expect("runtime selection proof");
+        evidence.pods_at_fault_activation[0].uid = "replacement-uid".to_string();
+        assert!(validate_write_quorum_runtime_evidence(&evidence, &proof, &run_spec).is_err());
+        evidence.pods_at_fault_activation[0].uid = "uid-0".to_string();
+        evidence.pods_at_workload_snapshot[0].uid = "replacement-uid".to_string();
+        assert!(validate_write_quorum_runtime_evidence(&evidence, &proof, &run_spec).is_err());
+        evidence.pods_at_workload_snapshot[0].uid = "uid-0".to_string();
+        evidence.fault_apply_started_at_ms = Some(6_002);
+        assert!(validate_write_quorum_runtime_evidence(&evidence, &proof, &run_spec).is_err());
+
+        let mut tampered = proof;
+        let shape = tampered.faults[0]
+            .erasure_set
+            .as_mut()
+            .and_then(|erasure| erasure.shape.as_mut())
+            .expect("shape");
+        shape.payload_data_shards = 7;
+        shape.payload_parity_shards = 1;
+        assert!(validate_target_proof(&tampered, &run_spec, &options).is_err());
+    }
+
+    #[test]
+    fn workload_summary_rejects_acknowledged_mutation_during_write_quorum_loss() {
+        let summary: WorkloadSummaryArtifact = serde_json::from_value(json!({
+            "seed": 42,
+            "object_count": 3,
+            "concurrency": 1,
+            "recommitted_after_recovery": 0,
+            "puts": {"ok": 0, "not_found": 0, "failed": 1, "timeout": 0, "unknown": 0},
+            "gets": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+            "deletes": {"ok": 0, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
+            "lists": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+            "multipart_completes": {"ok": 0, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 1},
+            "multipart_aborts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}
+        }))
+        .expect("summary");
+        let record = |id: &str, kind: &str, outcome: &str| {
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": id,
+                "scenario": NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+                "kind": kind,
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": null,
+                "size_bytes": null,
+                "started_at_ms": 10,
+                "ended_at_ms": 11,
+                "outcome": outcome,
+                "http_status": null,
+                "error": null,
+                "durability_cohort": "fault_active"
+            }))
+            .expect("history record")
+        };
+        let mut history = vec![
+            record("put-1", "put", "failed"),
+            record("delete-1", "delete", "timeout"),
+            record("mpu-1", "complete_multipart_upload", "unknown"),
+        ];
+        summary
+            .require_write_quorum_loss_effect(
+                &history,
+                NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+                "bucket",
+                10,
+                11,
+            )
+            .expect("rejected mutations prove write-quorum loss");
+        for family in 0..3 {
+            for replace in [true, false] {
+                let mut invalid_history = history.clone();
+                let mut counts = [
+                    OutcomeCountsArtifact::default(),
+                    OutcomeCountsArtifact::default(),
+                    OutcomeCountsArtifact::default(),
+                ];
+                if replace {
+                    invalid_history[family].outcome = OperationOutcome::NotFound;
+                } else {
+                    let mut extra = invalid_history[family].clone();
+                    extra.id = "extra-404".to_string();
+                    extra.outcome = OperationOutcome::NotFound;
+                    invalid_history.push(extra);
+                }
+                for record in &invalid_history {
+                    let index = match record.kind {
+                        crate::fault::history::OperationKind::Put => 0,
+                        crate::fault::history::OperationKind::Delete => 1,
+                        _ => 2,
+                    };
+                    counts[index].record(record.outcome);
+                }
+                let [puts, deletes, multipart_completes] = counts;
+                let invalid = WorkloadSummaryArtifact {
+                    puts,
+                    deletes,
+                    multipart_completes,
+                    gets: OutcomeCountsArtifact::default(),
+                    lists: OutcomeCountsArtifact::default(),
+                    multipart_aborts: OutcomeCountsArtifact::default(),
+                    seed: 42,
+                    object_count: 3,
+                    concurrency: 1,
+                    recommitted_after_recovery: 0,
+                };
+                let error = invalid
+                    .require_write_quorum_loss_effect(
+                        &invalid_history,
+                        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+                        "bucket",
+                        10,
+                        11,
+                    )
+                    .expect_err("404 is not quorum-loss evidence even when history matches");
+                assert!(error.to_string().contains("outcomes must all"), "{error}");
+            }
+        }
+        history[0].bucket = "foreign-bucket".to_string();
+        assert!(
+            summary
+                .require_write_quorum_loss_effect(
+                    &history,
+                    NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+                    "bucket",
+                    10,
+                    11,
+                )
+                .is_err()
+        );
+        history[0].bucket = "bucket".to_string();
+        history[0].outcome = OperationOutcome::Ok;
+        assert!(
+            summary
+                .require_write_quorum_loss_effect(
+                    &history,
+                    NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+                    "bucket",
+                    10,
+                    11,
+                )
+                .is_err()
+        );
+
+        let read_only_disruption: WorkloadSummaryArtifact = serde_json::from_value(json!({
+            "seed": 42,
+            "object_count": 3,
+            "concurrency": 1,
+            "recommitted_after_recovery": 0,
+            "puts": {"ok": 0, "not_found": 1, "failed": 0, "timeout": 0, "unknown": 0},
+            "gets": {"ok": 0, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
+            "deletes": {"ok": 0, "not_found": 1, "failed": 0, "timeout": 0, "unknown": 0},
+            "lists": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+            "multipart_completes": {"ok": 0, "not_found": 1, "failed": 0, "timeout": 0, "unknown": 0},
+            "multipart_aborts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}
+        }))
+        .expect("read-only disruption summary");
+        let history = vec![
+            record("put-2", "put", "not_found"),
+            record("delete-2", "delete", "not_found"),
+            record("mpu-2", "complete_multipart_upload", "not_found"),
+        ];
+        assert!(
+            read_only_disruption
+                .require_write_quorum_loss_effect(
+                    &history,
+                    NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+                    "bucket",
+                    10,
+                    11,
+                )
+                .is_err()
         );
     }
 
@@ -3237,7 +4066,7 @@ mod tests {
                 "isolation": "fresh-tenant",
                 "impact_policy": "client-disruption-required",
                 "boundary": "rustfs-workload/fault-injection",
-                "validation": "clean checker"
+                "validation": "prefill succeeds before injection, mixed PUT/GET workload runs while IOChaos is active, committed PUTs are GET+sha256 verified after recovery, and successful GETs cannot return corrupt bytes"
             },
             "workload": {
                 "mode": "s3-mixed",
@@ -3256,16 +4085,16 @@ mod tests {
                 "recommit_unconfirmed_writes": true
             },
             "faults": [{
-                "name": "io-eio-00-rustfs-volume-io-error",
-                "kind": "rustfs-volume-io-error",
+                "name": "io-eio-00-rustfs_volume_io_error",
+                "kind": "rustfs_volume_io_error",
                 "backend": "chaos-mesh-io-chaos",
                 "target": {"kind": "rustfs-volume", "path": "/data/rustfs0"},
                 "target_proof": {"required": true, "artifact": "target-proof.json"},
                 "selection": {"kind": "percent", "value": 20},
-                "target_proof_requirements": ["test fixture proves selected target"],
+                "target_proof_requirements": ["run artifacts must include the selected Kubernetes object or host device identity before the fault is activated"],
                 "fault_duration_seconds": 60,
-                "observability": "chaos",
-                "conflict_domain": "run-scoped IOChaos"
+                "observability": "history.jsonl, workload-summary.json, checker-report.json, chaos-manifest.yaml, chaos-describe*.txt, Kubernetes snapshot artifacts",
+                "conflict_domain": "fresh Tenant/PVC/PV fixture and run-scoped IOChaos cleanup"
             }],
             "artifacts": {
                 "required": FaultRunArtifactSpec::required_names(),
@@ -3339,8 +4168,8 @@ mod tests {
                     }]
                 }],
                 "faults": [{
-                    "name": "io-eio-00-rustfs-volume-io-error",
-                    "kind": "rustfs-volume-io-error",
+                    "name": "io-eio-00-rustfs_volume_io_error",
+                    "kind": "rustfs_volume_io_error",
                     "backend": "chaos-mesh-io-chaos",
                     "targetKind": "rustfs-volume",
                     "targetSummary": "one RustFS volume at /data/rustfs0",

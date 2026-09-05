@@ -57,6 +57,10 @@ pub(crate) struct FaultEvidence {
     pub(crate) client_disruptions: usize,
     pub(crate) workload_plan: WorkloadPlan,
     pub(crate) pods_before: Vec<PodIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pods_at_fault_activation: Vec<PodIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pods_at_workload_snapshot: Vec<PodIdentity>,
     pub(crate) pods_after: Vec<PodIdentity>,
     pub(crate) active_snapshots: Vec<FaultStatusSnapshot>,
     pub(crate) workload_snapshots: Vec<FaultStatusSnapshot>,

@@ -48,6 +48,13 @@ pub struct PreparedObject {
     body: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StagedMultipartUpload {
+    pub(crate) spec: ObjectSpec,
+    upload_id: String,
+    completed_parts: Vec<CompletedPart>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadSizeClass {
     pub size_bytes: usize,
@@ -1201,101 +1208,155 @@ impl S3WorkloadClient {
         object: &PreparedObject,
         recorder: &Recorder,
     ) -> Result<Option<OperationRecord>> {
+        let Some(staged) = self.try_stage_multipart_object(object, recorder).await? else {
+            return Ok(None);
+        };
+        let result = self
+            .complete_staged_multipart_object_record(&staged, recorder)
+            .await;
+        if self.mutation_deadline.is_some()
+            && !matches!(&result, Ok(record) if record.outcome == OperationOutcome::Ok)
+        {
+            self.abort_staged_multipart_object(&staged, recorder)
+                .await?;
+        }
+        result.map(Some)
+    }
+
+    pub(crate) async fn stage_multipart_object(
+        &self,
+        object: &PreparedObject,
+        recorder: &Recorder,
+    ) -> Result<StagedMultipartUpload> {
+        self.try_stage_multipart_object(object, recorder)
+            .await?
+            .context("multipart upload could not be staged before fault activation")
+    }
+
+    async fn try_stage_multipart_object(
+        &self,
+        object: &PreparedObject,
+        recorder: &Recorder,
+    ) -> Result<Option<StagedMultipartUpload>> {
         let Some(upload_id) = self
             .create_multipart_upload(&object.spec.key, recorder)
             .await?
         else {
             return Ok(None);
         };
-        let result = async {
-            let mut completed_parts = Vec::new();
+        let mut staged = StagedMultipartUpload {
+            spec: object.spec.clone(),
+            upload_id,
+            completed_parts: Vec::new(),
+        };
+        let result: Result<bool> = async {
             for (index, chunk) in object.body.chunks(5 * 1024 * 1024).enumerate() {
-                let part_number = (index + 1) as i32;
-                match self
-                    .upload_part(&object.spec.key, &upload_id, part_number, chunk, recorder)
-                    .await?
-                {
-                    Some(part) => completed_parts.push(part),
-                    None => {
-                        return Ok(None);
-                    }
-                }
-            }
-
-            let record = recorder.begin(
-                OperationKind::CompleteMultipartUpload,
-                self.bucket.clone(),
-                Some(object.spec.key.clone()),
-                Some(object.spec.sha256.clone()),
-                Some(object.spec.size_bytes),
-            );
-            let upload = CompletedMultipartUpload::builder()
-                .set_parts(Some(completed_parts))
-                .build();
-            let result = self
-                .mutation_request(
-                    self.client
-                        .complete_multipart_upload()
-                        .bucket(&self.bucket)
-                        .key(&object.spec.key)
-                        .upload_id(&upload_id)
-                        .multipart_upload(upload)
-                        .send(),
-                )
-                .await;
-
-            match result {
-                Ok(Ok(output)) => {
-                    let mut record = record;
-                    record.version_id = output.version_id().map(str::to_string);
-                    recorder
-                        .finish(record, OperationOutcome::Ok, Some(200), None)
-                        .map(Some)
-                }
-                Ok(Err(error)) => {
-                    let outcome = classify_sdk_error(&error);
-                    recorder
-                        .finish(
-                            record,
-                            outcome,
-                            sdk_error_status(&error),
-                            Some(format!("complete multipart upload failed: {error}")),
-                        )
-                        .map(Some)
-                }
-                Err(_) => recorder
-                    .finish(
-                        record,
-                        OperationOutcome::Timeout,
-                        None,
-                        Some("complete multipart upload timed out".to_string()),
+                let Some(part) = self
+                    .upload_part(
+                        &staged.spec.key,
+                        &staged.upload_id,
+                        (index + 1) as i32,
+                        chunk,
+                        recorder,
                     )
-                    .map(Some),
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                staged.completed_parts.push(part);
             }
+            Ok(true)
         }
         .await;
-        let cleanup_required = if self.mutation_deadline.is_some() {
-            !matches!(&result, Ok(Some(record)) if record.outcome == OperationOutcome::Ok)
-        } else {
-            matches!(&result, Ok(None))
-        };
-        if cleanup_required {
-            // Cleanup uses its own request timeout after the mutation deadline.
-            let cleanup = self
-                .abort_multipart_upload(&object.spec.key, &upload_id, recorder)
-                .await;
-            if self.mutation_deadline.is_some() {
-                let outcome = cleanup?;
-                ensure!(
-                    matches!(outcome, OperationOutcome::Ok | OperationOutcome::NotFound),
-                    "quiet multipart cleanup for key {} upload {} ended with {:?}",
-                    object.spec.key,
-                    upload_id,
-                    outcome
-                );
-            }
+        if !matches!(result, Ok(true)) {
+            self.abort_staged_multipart_object(&staged, recorder)
+                .await?;
+            return result.map(|_| None);
         }
-        result
+        Ok(Some(staged))
+    }
+
+    pub(crate) async fn complete_staged_multipart_object(
+        &self,
+        staged: &StagedMultipartUpload,
+        recorder: &Recorder,
+    ) -> Result<OperationOutcome> {
+        Ok(self
+            .complete_staged_multipart_object_record(staged, recorder)
+            .await?
+            .outcome)
+    }
+
+    async fn complete_staged_multipart_object_record(
+        &self,
+        staged: &StagedMultipartUpload,
+        recorder: &Recorder,
+    ) -> Result<OperationRecord> {
+        let record = recorder.begin(
+            OperationKind::CompleteMultipartUpload,
+            self.bucket.clone(),
+            Some(staged.spec.key.clone()),
+            Some(staged.spec.sha256.clone()),
+            Some(staged.spec.size_bytes),
+        );
+        let upload = CompletedMultipartUpload::builder()
+            .set_parts(Some(staged.completed_parts.clone()))
+            .build();
+        let result = self
+            .mutation_request(
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(&staged.spec.key)
+                    .upload_id(&staged.upload_id)
+                    .multipart_upload(upload)
+                    .send(),
+            )
+            .await;
+        match result {
+            Ok(Ok(output)) => {
+                let mut record = record;
+                record.version_id = output.version_id().map(str::to_string);
+                recorder.finish(record, OperationOutcome::Ok, Some(200), None)
+            }
+            Ok(Err(error)) => recorder.finish(
+                record,
+                classify_sdk_error(&error),
+                sdk_error_status(&error),
+                Some(format!("complete multipart upload failed: {error}")),
+            ),
+            Err(_) => recorder.finish(
+                record,
+                OperationOutcome::Timeout,
+                None,
+                Some("complete multipart upload timed out".to_string()),
+            ),
+        }
+    }
+
+    pub(crate) async fn abort_staged_multipart_object(
+        &self,
+        staged: &StagedMultipartUpload,
+        recorder: &Recorder,
+    ) -> Result<()> {
+        // Cleanup keeps its request timeout even after a quiet mutation expires.
+        let outcome = self
+            .abort_multipart_upload(&staged.spec.key, &staged.upload_id, recorder)
+            .await
+            .with_context(|| {
+                format!(
+                    "multipart cleanup for key {} upload {}",
+                    staged.spec.key, staged.upload_id
+                )
+            })?;
+        ensure!(
+            matches!(outcome, OperationOutcome::Ok | OperationOutcome::NotFound),
+            "multipart cleanup for key {} upload {} ended with {:?}",
+            staged.spec.key,
+            staged.upload_id,
+            outcome
+        );
+        Ok(())
     }
 
     pub async fn abort_multipart_object(
