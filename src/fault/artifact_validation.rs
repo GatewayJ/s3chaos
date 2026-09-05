@@ -3568,10 +3568,12 @@ mod tests {
                 .with_ready(true)
                 .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
                     name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-0".to_string(),
                     volume_name: Some("pv-csi".to_string()),
                     storage_class: Some("fast-csi".to_string()),
                     persistent_volume: Some(TargetPersistentVolumeProof {
                         name: "pv-csi".to_string(),
+                        uid: "pv-uid-0".to_string(),
                         source: Some("csi".to_string()),
                         required_node_affinity: None,
                         node: None,
@@ -3647,10 +3649,12 @@ mod tests {
                     }])
                     .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
                         name: format!("data-{index}"),
+                        uid: format!("pvc-uid-{index}"),
                         volume_name: Some(format!("pv-{index}")),
                         storage_class: Some("fast-csi".to_string()),
                         persistent_volume: Some(TargetPersistentVolumeProof {
                             name: format!("pv-{index}"),
+                            uid: format!("pv-uid-{index}"),
                             source: Some("local".to_string()),
                             required_node_affinity: Some(TargetNodeAffinityProof {
                                 well_formed: true,
@@ -4155,10 +4159,12 @@ mod tests {
                 .with_node("worker-a")
                 .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
                     name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-0".to_string(),
                     volume_name: Some("pv-a".to_string()),
                     storage_class: Some("rustfs-fault-dm".to_string()),
                     persistent_volume: Some(TargetPersistentVolumeProof {
                         name: "pv-a".to_string(),
+                        uid: "pv-uid-0".to_string(),
                         source: Some("local".to_string()),
                         required_node_affinity: None,
                         node: Some("storage-host-a".to_string()),

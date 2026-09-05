@@ -348,6 +348,11 @@ fn target_pvc_proof(
     pvs: &BTreeMap<String, Value>,
 ) -> TargetPersistentVolumeClaimProof {
     let pvc = pvcs.get(claim);
+    let uid = pvc
+        .and_then(|value| value.pointer("/metadata/uid"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let volume_name = pvc
         .and_then(|value| value.pointer("/spec/volumeName"))
         .and_then(Value::as_str)
@@ -362,6 +367,7 @@ fn target_pvc_proof(
 
     TargetPersistentVolumeClaimProof {
         name: claim.to_string(),
+        uid,
         volume_name,
         storage_class,
         persistent_volume,
@@ -372,6 +378,11 @@ fn target_pv_proof(name: &str, pv: &Value) -> TargetPersistentVolumeProof {
     let required_node_affinity = pv_required_node_affinity(pv);
     TargetPersistentVolumeProof {
         name: name.to_string(),
+        uid: pv
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         source: pv_source(pv).map(str::to_string),
         node: required_node_affinity
             .as_ref()
@@ -674,7 +685,7 @@ mod tests {
         });
         let pvc_list = json!({
             "items": [{
-                "metadata": {"name": "data-rustfs-0"},
+                "metadata": {"name": "data-rustfs-0", "uid": "pvc-uid-a"},
                 "spec": {
                     "volumeName": "pv-a",
                     "storageClassName": "fast-local"
@@ -683,7 +694,7 @@ mod tests {
         });
         let pv_list = json!({
             "items": [{
-                "metadata": {"name": "pv-a"},
+                "metadata": {"name": "pv-a", "uid": "pv-uid-a"},
                 "spec": {
                     "local": {"path": "/mnt/rustfs0"},
                     "nodeAffinity": {
@@ -715,8 +726,10 @@ mod tests {
         assert_eq!(proof.node.as_deref(), Some("node-a"));
         assert_eq!(proof.persistent_volume_claims.len(), 1);
         let claim = &proof.persistent_volume_claims[0];
+        assert_eq!(claim.uid, "pvc-uid-a");
         assert_eq!(claim.volume_name.as_deref(), Some("pv-a"));
         let pv = claim.persistent_volume.as_ref().expect("pv");
+        assert_eq!(pv.uid, "pv-uid-a");
         assert_eq!(pv.source.as_deref(), Some("local"));
         assert_eq!(pv.node, None, "multi-value affinity has no singleton node");
         assert_eq!(
@@ -757,13 +770,13 @@ mod tests {
         });
         let pvc_list = json!({
             "items": [{
-                "metadata": {"name": "logs-rustfs-0"},
+                "metadata": {"name": "logs-rustfs-0", "uid": "pvc-uid-logs"},
                 "spec": {"volumeName": "pv-logs", "storageClassName": "fast-csi"}
             }]
         });
         let pv_list = json!({
             "items": [{
-                "metadata": {"name": "pv-logs"},
+                "metadata": {"name": "pv-logs", "uid": "pv-uid-logs"},
                 "spec": {"csi": {"volumeHandle": "logs-handle"}}
             }]
         });
