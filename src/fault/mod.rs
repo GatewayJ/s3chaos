@@ -34,6 +34,7 @@ pub mod runner;
 pub mod scenarios;
 pub mod shutdown;
 pub mod spec;
+pub mod storage_recovery;
 pub mod suite;
 pub mod suite_plan;
 pub mod suite_runner;

@@ -83,11 +83,14 @@ Runnable scenario families (18 executable entries): I/O faults (`io-eio`,
 `network-delay/loss/corrupt/duplicate`), pod faults (`pod-kill-one`,
 `pod-failure`, `pod-crash-versioned-hot`), stress (`stress-cpu`,
 `stress-memory`), and the `warp-under-chaos` benchmark campaign. A further
-eight catalog entries are roadmap placeholders with status `Planned`
-(`quorum-p-*-io-fault`, `fresh-volume-replacement`, all `admin-*` operations,
-`on-disk-bitrot`, `long-run-chaos-campaign`): they appear in
+seven catalog entries are roadmap placeholders with status `Planned`
+(`quorum-p-*-io-fault`, `fresh-volume-replacement`, admin decommission and
+rebalance, `on-disk-bitrot`, `stale-disk-return-detect`): they appear in
 `cargo run --bin s3chaos -- fault-catalog-json` but are filtered out of
 `make fault-list` and rejected by preflight and suite validation.
+Heal is a recovery mode of replacement and bitrot rather than a standalone
+healthy-cluster scenario. Long-running campaigns remain suite orchestration,
+not a fault backend or scenario family.
 The ordered durability work queue and its safety prerequisites remain in
 [`docs/DURABILITY_FAULT_TESTING_TODO.md`](docs/DURABILITY_FAULT_TESTING_TODO.md).
 
