@@ -32,7 +32,7 @@ use crate::fault::{
     },
     checker::{
         CheckerDataVersionAudit, CheckerDeleteMarkerAudit, CheckerReport,
-        checker_history_prefix_sha256,
+        checker_history_records_sha256,
     },
     history::{
         DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome, OperationRecord,
@@ -188,10 +188,9 @@ impl StorageVolumeIdentity {
             );
         }
         ensure!(
-            self.mount_path.starts_with('/')
-                && self.mount_path != "/"
+            is_normalized_absolute_path(&self.mount_path)
                 && !self.mount_path.chars().any(char::is_whitespace)
-                && !self.mount_path.split('/').any(|part| part == ".."),
+                && self.mount_path != "/",
             "storage identity mount path must be an absolute normalized non-root path without whitespace"
         );
         ensure!(
@@ -255,6 +254,7 @@ pub struct HostExecutionIdentity {
 #[serde(rename_all = "camelCase")]
 pub struct HostTargetRuntimeResponse {
     pub target_container_id: String,
+    pub cri_container_id: String,
     pub container_pid: u32,
     pub inspect_argv: Vec<String>,
     pub inspect_exit_code: i32,
@@ -303,6 +303,8 @@ impl HostExecutionIdentity {
             .context("decode captured host helper Pod")?;
         let runtime = serde_json::from_str::<HostTargetRuntimeResponse>(&self.target_runtime_body)
             .context("decode captured target runtime identity")?;
+        let (container_runtime, cri_container_id) =
+            split_kubernetes_container_id(&self.target_container_id)?;
         let inspect = serde_json::from_str::<serde_json::Value>(&runtime.inspect_stdout_body)
             .context("decode captured target container inspect response")?;
         fn string_at<'a>(value: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
@@ -324,11 +326,13 @@ impl HostExecutionIdentity {
                 && string_at(&helper, "/spec/nodeName") == Some(self.node.as_str())
                 && string_at(&helper, "/status/phase") == Some("Running")
                 && runtime.target_container_id == self.target_container_id
+                && container_runtime == "containerd"
+                && runtime.cri_container_id == cri_container_id
                 && runtime.container_pid > 0
-                && runtime.inspect_argv == ["crictl", "inspect", self.target_container_id.as_str()]
+                && runtime.inspect_argv == ["crictl", "inspect", cri_container_id]
                 && runtime.inspect_exit_code == 0
                 && runtime.inspect_stderr.trim().is_empty()
-                && string_at(&inspect, "/status/id") == Some(self.target_container_id.as_str())
+                && string_at(&inspect, "/status/id") == Some(cri_container_id)
                 && inspect
                     .pointer("/info/pid")
                     .and_then(serde_json::Value::as_u64)
@@ -648,6 +652,30 @@ pub struct PostReturnCheckerEvidence {
     pub response_body: String,
 }
 
+#[derive(Debug, Clone)]
+struct ValidatedDiskAbsenceWatch {
+    sample_times_ms: Vec<u64>,
+    first_absent_index: usize,
+    poll_interval_ms: u64,
+}
+
+impl ValidatedDiskAbsenceWatch {
+    fn proves_absent_at(&self, acknowledged_at_ms: u64) -> bool {
+        let after_index = self
+            .sample_times_ms
+            .partition_point(|observed_at_ms| *observed_at_ms < acknowledged_at_ms);
+        if after_index == 0 || after_index >= self.sample_times_ms.len() {
+            return false;
+        }
+        let before_index = after_index - 1;
+        before_index >= self.first_absent_index
+            && self.sample_times_ms[before_index] <= acknowledged_at_ms
+            && acknowledged_at_ms <= self.sample_times_ms[after_index]
+            && self.sample_times_ms[after_index] - self.sample_times_ms[before_index]
+                <= self.poll_interval_ms
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RawDiskStateExpectation<'a> {
     state: DiskPresenceState,
@@ -898,7 +926,7 @@ impl DiskAbsenceObservation {
         detached_at_ms: u64,
         mutation_window_ended_at_ms: u64,
         reattach_started_at_ms: u64,
-    ) -> Result<()> {
+    ) -> Result<ValidatedDiskAbsenceWatch> {
         self.kubernetes_binding_evidence
             .validate(generation, self.watch_started_at_ms)?;
         let evidence = &self.host_watch_evidence;
@@ -973,24 +1001,15 @@ impl DiskAbsenceObservation {
                 && last.state == DiskPresenceState::Absent,
             "host disk watch does not prove one bounded present-to-absent interval without reconnect"
         );
-        Ok(())
-    }
-
-    fn proves_absent_at(&self, acknowledged_at_ms: u64) -> Result<bool> {
-        let response = serde_json::from_str::<RustfsDiskAbsenceWatchResponse>(
-            &self.host_watch_evidence.response_body,
-        )
-        .context("decode captured disk-absence watch response")?;
-        Ok(response.samples.windows(2).any(|samples| {
-            let [before, after] = samples else {
-                return false;
-            };
-            before.state == DiskPresenceState::Absent
-                && after.state == DiskPresenceState::Absent
-                && before.observed_at_ms <= acknowledged_at_ms
-                && acknowledged_at_ms <= after.observed_at_ms
-                && after.observed_at_ms - before.observed_at_ms <= response.poll_interval_ms
-        }))
+        Ok(ValidatedDiskAbsenceWatch {
+            sample_times_ms: response
+                .samples
+                .iter()
+                .map(|sample| sample.observed_at_ms)
+                .collect(),
+            first_absent_index: first_absent,
+            poll_interval_ms: response.poll_interval_ms,
+        })
     }
 }
 
@@ -1026,21 +1045,41 @@ impl PostReturnCheckerEvidence {
             .as_ref()
             .context("post-return CheckerReport lacks its producer-native audit")?;
         validate_sha256("post-return history prefix", &audit.history_prefix_sha256)?;
+        validate_sha256("post-return checker suffix", &audit.history_suffix_sha256)?;
         ensure!(
             audit.bucket == identity.bucket
                 && audit.started_at_ms > returned_generation_observed_at_ms
                 && audit.started_at_ms <= audit.completed_at_ms
                 && audit.history_prefix_record_count > 0
-                && audit.history_prefix_record_count == history.len(),
+                && audit.history_prefix_record_count < history.len(),
             "post-return checker audit is not bound to this bucket and post-return interval"
         );
         let history_prefix = &history[..audit.history_prefix_record_count];
+        let history_suffix = &history[audit.history_prefix_record_count..];
         ensure!(
             history_prefix
                 .iter()
                 .all(|record| record.ended_at_ms <= audit.started_at_ms)
-                && audit.history_prefix_sha256 == checker_history_prefix_sha256(history_prefix)?,
-            "post-return checker audit does not bind the complete quiesced history consumed by the checker"
+                && audit.history_prefix_sha256 == checker_history_records_sha256(history_prefix)?
+                && audit.history_suffix_record_count == history_suffix.len()
+                && audit.history_suffix_sha256 == checker_history_records_sha256(history_suffix)?
+                && history_suffix.iter().all(|record| {
+                    record_matches_identity(record, identity)
+                        && matches!(
+                            record.kind,
+                            OperationKind::Get | OperationKind::List | OperationKind::ListVersions
+                        )
+                        && valid_operation_interval(record)
+                        && record.started_at_ms >= audit.started_at_ms
+                        && record.ended_at_ms <= audit.completed_at_ms
+                })
+                && history_suffix
+                    .iter()
+                    .any(|record| record.kind == OperationKind::List)
+                && history_suffix
+                    .iter()
+                    .any(|record| record.kind == OperationKind::ListVersions),
+            "post-return checker audit does not bind a complete read-only checker suffix over quiesced history"
         );
         let prefix_operation_ids = history_prefix
             .iter()
@@ -1102,6 +1141,35 @@ impl PostReturnCheckerEvidence {
         expected_delete_checks.sort_by(|left, right| {
             (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id))
         });
+        let mut recorded_version_gets = BTreeMap::new();
+        for record in history_suffix
+            .iter()
+            .filter(|record| record.kind == OperationKind::Get && record.version_id.is_some())
+        {
+            *recorded_version_gets
+                .entry((
+                    record.key.clone(),
+                    record.version_id.clone(),
+                    record.value_sha256.clone(),
+                    operation_outcome_rank(record.outcome),
+                    record.http_status,
+                ))
+                .or_insert(0usize) += 1;
+        }
+        for check in &audit.data_version_checks {
+            let recorded = recorded_version_gets.get_mut(&(
+                Some(check.key.clone()),
+                Some(check.version_id.clone()),
+                check.observed_sha256.clone(),
+                operation_outcome_rank(check.outcome),
+                check.http_status,
+            ));
+            ensure!(
+                recorded.as_deref().is_some_and(|count| *count > 0),
+                "post-return checker data-version audit lacks one exact recorded GET"
+            );
+            *recorded.expect("count checked above") -= 1;
+        }
         report.require_success()?;
         ensure!(
             report.scenario == identity.scenario
@@ -1239,9 +1307,7 @@ impl StaleDiskReturnProof {
         for observation in &self.absence_observations {
             ensure!(
                 !observation.observation_id.trim().is_empty()
-                    && absence_by_id
-                        .insert(observation.observation_id.as_str(), observation)
-                        .is_none(),
+                    && !absence_by_id.contains_key(observation.observation_id.as_str()),
                 "stale-disk proof has an empty or duplicate absence observation id"
             );
             ensure!(
@@ -1266,13 +1332,17 @@ impl StaleDiskReturnProof {
                     && observation.watch_ended_at_ms > observation.watch_started_at_ms,
                 "stale-disk absence watch does not cover the bounded host observation window"
             );
-            observation.validate_captured_watches(
+            let validated_watch = observation.validate_captured_watches(
                 &self.detached_generation,
                 detach_receipt.started_at_ms,
                 self.detached_at_ms,
                 self.mutation_window_ended_at_ms,
                 reattach_receipt.started_at_ms,
             )?;
+            absence_by_id.insert(
+                observation.observation_id.as_str(),
+                (observation, validated_watch),
+            );
         }
         ensure!(
             !self.committed_mutations.is_empty(),
@@ -1303,7 +1373,7 @@ impl StaleDiskReturnProof {
                     && mutation.acknowledged_at_ms <= self.mutation_window_ended_at_ms,
                 "stale-disk mutation ACK falls outside the disk-absence window"
             );
-            let absence = absence_by_id
+            let (absence, validated_watch) = absence_by_id
                 .get(mutation.absence_observation_id.as_str())
                 .ok_or_else(|| {
                     anyhow::anyhow!("stale-disk mutation references an unknown absence observation")
@@ -1311,7 +1381,7 @@ impl StaleDiskReturnProof {
             ensure!(
                 absence.watch_started_at_ms <= mutation.acknowledged_at_ms
                     && absence.watch_ended_at_ms >= mutation.acknowledged_at_ms
-                    && absence.proves_absent_at(mutation.acknowledged_at_ms)?,
+                    && validated_watch.proves_absent_at(mutation.acknowledged_at_ms),
                 "stale-disk mutation ACK is not bracketed by bounded target-node absence samples"
             );
             let record = history_by_id
@@ -4184,6 +4254,16 @@ fn heal_state_rank(state: HealProgressState) -> u8 {
     }
 }
 
+fn operation_outcome_rank(outcome: OperationOutcome) -> u8 {
+    match outcome {
+        OperationOutcome::Ok => 0,
+        OperationOutcome::NotFound => 1,
+        OperationOutcome::Failed => 2,
+        OperationOutcome::Timeout => 3,
+        OperationOutcome::Unknown => 4,
+    }
+}
+
 fn validate_unique_nonempty(label: &str, values: &[String], require_nonempty: bool) -> Result<()> {
     if require_nonempty {
         ensure!(!values.is_empty(), "{label} list is empty");
@@ -4209,6 +4289,27 @@ fn validate_sha256(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_normalized_absolute_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path
+            .split('/')
+            .skip(1)
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+fn split_kubernetes_container_id(value: &str) -> Result<(&str, &str)> {
+    let (runtime, container_id) = value
+        .split_once("://")
+        .context("Kubernetes container ID lacks its runtime scheme")?;
+    ensure!(
+        !runtime.is_empty()
+            && container_id.len() == 64
+            && container_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Kubernetes container ID must contain a runtime and a 64-hex CRI ID"
+    );
+    Ok((runtime, container_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4227,7 +4328,7 @@ mod tests {
             tenant: "rustfs".to_string(),
             pod: "rustfs-0".to_string(),
             pod_uid: format!("pod-{generation}"),
-            rustfs_container_id: format!("containerd://rustfs-{generation}"),
+            rustfs_container_id: format!("containerd://{}", sha256_bytes(generation.as_bytes())),
             volume_name: "data-0".to_string(),
             persistent_volume_claim: "data-0-rustfs-0".to_string(),
             persistent_volume_claim_uid: format!("pvc-{generation}"),
@@ -4262,7 +4363,7 @@ mod tests {
         observed_at_ms: u64,
     ) -> StorageVolumeIdentity {
         volume.pod_uid = "pod-returned".to_string();
-        volume.rustfs_container_id = "containerd://rustfs-returned".to_string();
+        volume.rustfs_container_id = format!("containerd://{HASH_C}");
         volume.target_mount_namespace_id = "mnt:[4026533999]".to_string();
         volume.target_proof_sha256 = HASH_C.to_string();
         volume.host_storage_proof_sha256 = HASH_A.to_string();
@@ -4271,6 +4372,8 @@ mod tests {
     }
 
     fn host_execution(volume: &StorageVolumeIdentity) -> HostExecutionIdentity {
+        let (_, cri_container_id) =
+            split_kubernetes_container_id(&volume.rustfs_container_id).expect("container ID");
         let helper_pod = format!("s3chaos-host-helper-{}", volume.node);
         let helper_pod_uid = format!("helper-uid-{}", volume.node_uid);
         let helper_pod_body = serde_json::to_string(&serde_json::json!({
@@ -4287,17 +4390,18 @@ mod tests {
         }))
         .expect("host helper Pod");
         let inspect_stdout_body = serde_json::to_string(&serde_json::json!({
-            "status": {"id": volume.rustfs_container_id},
+            "status": {"id": cri_container_id},
             "info": {"pid": 4242}
         }))
         .expect("container inspect response");
         let runtime_body = serde_json::to_string(&HostTargetRuntimeResponse {
             target_container_id: volume.rustfs_container_id.clone(),
+            cri_container_id: cri_container_id.to_string(),
             container_pid: 4242,
             inspect_argv: vec![
                 "crictl".to_string(),
                 "inspect".to_string(),
-                volume.rustfs_container_id.clone(),
+                cri_container_id.to_string(),
             ],
             inspect_exit_code: 0,
             inspect_stdout_sha256: sha256_bytes(inspect_stdout_body.as_bytes()),
@@ -4928,7 +5032,13 @@ mod tests {
     }
 
     fn post_return_checker(history: &[OperationRecord]) -> PostReturnCheckerEvidence {
-        let mut data_version_checks = history
+        let prefix_record_count = history
+            .iter()
+            .position(|record| record.id.starts_with("checker-"))
+            .unwrap_or(history.len());
+        let history_prefix = &history[..prefix_record_count];
+        let history_suffix = &history[prefix_record_count..];
+        let mut data_version_checks = history_prefix
             .iter()
             .filter(|record| {
                 matches!(
@@ -4951,7 +5061,7 @@ mod tests {
         data_version_checks.sort_by(|left, right| {
             (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id))
         });
-        let mut delete_marker_checks = history
+        let mut delete_marker_checks = history_prefix
             .iter()
             .filter(|record| {
                 record.kind == OperationKind::Delete && record.outcome == OperationOutcome::Ok
@@ -5005,9 +5115,12 @@ mod tests {
                 bucket: "bucket-1".to_string(),
                 started_at_ms: 560,
                 completed_at_ms: 580,
-                history_prefix_record_count: history.len(),
-                history_prefix_sha256: checker_history_prefix_sha256(history)
+                history_prefix_record_count: prefix_record_count,
+                history_prefix_sha256: checker_history_records_sha256(history_prefix)
                     .expect("history snapshot"),
+                history_suffix_record_count: history_suffix.len(),
+                history_suffix_sha256: checker_history_records_sha256(history_suffix)
+                    .expect("checker suffix"),
                 data_version_checks,
                 delete_marker_checks,
                 list_object_versions_completed: Some(true),
@@ -5020,6 +5133,58 @@ mod tests {
             response_sha256: sha256_bytes(response_body.as_bytes()),
             response_body,
         }
+    }
+
+    fn append_post_return_checker_suffix(history: &mut Vec<OperationRecord>) {
+        let data_versions = history
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.kind,
+                    OperationKind::Put | OperationKind::CompleteMultipartUpload
+                ) && record.outcome == OperationOutcome::Ok
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for (index, version) in data_versions.into_iter().enumerate() {
+            let mut get = history_record(
+                &format!("checker-version-get-{index}"),
+                "stale-disk-return-detect",
+                OperationKind::Get,
+                version.key.as_deref().expect("data-version key"),
+                version.version_id.as_deref().expect("data-version id"),
+                version.value_sha256.as_deref(),
+                570,
+            );
+            get.durability_cohort = Some(DurabilityCohort::PostRecovery);
+            get.fault_window_relation = Some(FaultWindowRelation::AfterFault);
+            history.push(get);
+        }
+        for (id, kind, ended_at_ms) in [
+            ("checker-list-versions", OperationKind::ListVersions, 575),
+            ("checker-list", OperationKind::List, 578),
+        ] {
+            let mut record = history_record(
+                id,
+                "stale-disk-return-detect",
+                kind,
+                "fault-test/run-1/",
+                "",
+                None,
+                ended_at_ms,
+            );
+            record.durability_cohort = Some(DurabilityCohort::PostRecovery);
+            record.fault_window_relation = Some(FaultWindowRelation::AfterFault);
+            history.push(record);
+        }
+    }
+
+    fn checker_prefix_record_count(evidence: &PostReturnCheckerEvidence) -> usize {
+        serde_json::from_str::<CheckerReport>(&evidence.response_body)
+            .expect("checker report")
+            .audit
+            .expect("checker audit")
+            .history_prefix_record_count
     }
 
     fn history_record(
@@ -5057,7 +5222,7 @@ mod tests {
     fn stale_return_fixture() -> (StaleDiskReturnProof, Vec<OperationRecord>) {
         let original = volume("old", 100);
         let returned = returned_runtime(original.clone(), 500);
-        let history = vec![
+        let mut history = vec![
             history_record(
                 "stale-put",
                 "stale-disk-return-detect",
@@ -5077,6 +5242,7 @@ mod tests {
                 350,
             ),
         ];
+        append_post_return_checker_suffix(&mut history);
         let proof = StaleDiskReturnProof::prove(
             identity("stale-disk-return-detect"),
             original.clone(),
@@ -5250,7 +5416,7 @@ mod tests {
         let original = volume("old", 100);
         let returned = returned_runtime(original.clone(), 500);
         let absence = vec![absence_observation(&original, "absence-watch", 190)];
-        let history = vec![
+        let mut history = vec![
             history_record(
                 "put-1",
                 "stale-disk-return-detect",
@@ -5279,6 +5445,7 @@ mod tests {
                 350,
             ),
         ];
+        append_post_return_checker_suffix(&mut history);
 
         let proof = StaleDiskReturnProof::prove(
             identity("stale-disk-return-detect"),
@@ -5328,7 +5495,7 @@ mod tests {
         swapped_return_runtime.returned_generation.pod_uid = "unrelated-pod".to_string();
         swapped_return_runtime
             .returned_generation
-            .rustfs_container_id = "containerd://unrelated".to_string();
+            .rustfs_container_id = format!("containerd://{HASH_B}");
         assert!(
             swapped_return_runtime
                 .validate_against_history(&history)
@@ -5423,7 +5590,9 @@ mod tests {
         );
 
         let mut replayed_checker = proof.clone();
-        replayed_checker.post_return_checker = post_return_checker(&history[..1]);
+        let mut earlier_history = vec![history[0].clone()];
+        append_post_return_checker_suffix(&mut earlier_history);
+        replayed_checker.post_return_checker = post_return_checker(&earlier_history);
         assert!(
             replayed_checker.validate_against_history(&history).is_err(),
             "a clean checker receipt for an earlier history universe cannot be replayed after return"
@@ -5444,8 +5613,23 @@ mod tests {
                 value_sha256,
                 600 + index,
             ));
+            let mut forged_checker = proof.clone();
+            let mut report = serde_json::from_str::<CheckerReport>(
+                &forged_checker.post_return_checker.response_body,
+            )
+            .expect("checker report");
+            let audit = report.audit.as_mut().expect("checker audit");
+            audit.completed_at_ms = 610;
+            let suffix = &history_with_suffix[audit.history_prefix_record_count..];
+            audit.history_suffix_record_count = suffix.len();
+            audit.history_suffix_sha256 =
+                checker_history_records_sha256(suffix).expect("checker suffix");
+            forged_checker.post_return_checker.response_body =
+                serde_json::to_string(&report).expect("checker report");
+            forged_checker.post_return_checker.response_sha256 =
+                sha256_bytes(forged_checker.post_return_checker.response_body.as_bytes());
             assert!(
-                proof
+                forged_checker
                     .validate_against_history(&history_with_suffix)
                     .is_err(),
                 "post-return checker must reject any PUT, DELETE, or MPU suffix outside its quiesced history"
@@ -5604,6 +5788,8 @@ mod tests {
 
         let mut scaled_proof = proof.clone();
         let mut scaled_history = history.clone();
+        let prefix_record_count = checker_prefix_record_count(&proof.post_return_checker);
+        scaled_history.truncate(prefix_record_count);
         for index in 0..10_000 {
             let operation_id = format!("scaled-mutation-{index}");
             let object_key = format!("scaled-key-{index}");
@@ -5637,6 +5823,7 @@ mod tests {
                     absence_observation_id: "absence-watch".to_string(),
                 });
         }
+        append_post_return_checker_suffix(&mut scaled_history);
         scaled_proof.post_return_checker = post_return_checker(&scaled_history);
         scaled_proof
             .validate_against_history(&scaled_history)
@@ -5694,7 +5881,7 @@ mod tests {
             serde_json::to_string(&reconnected_response).expect("host watch response");
         reconnected.host_watch_evidence.response_sha256 =
             sha256_bytes(reconnected.host_watch_evidence.response_body.as_bytes());
-        let history = vec![
+        let mut history = vec![
             history_record(
                 "put-1",
                 "stale-disk-return-detect",
@@ -5714,6 +5901,7 @@ mod tests {
                 350,
             ),
         ];
+        append_post_return_checker_suffix(&mut history);
         let original = volume("old", 100);
         let mut returned = original.clone();
         returned.observed_at_ms = 500;
@@ -5754,6 +5942,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn absence_watch_ack_lookup_scales_with_long_fault_windows() {
+        const SAMPLE_COUNT: usize = 72_001;
+        const MUTATION_COUNT: usize = 40_000;
+        let watch = ValidatedDiskAbsenceWatch {
+            sample_times_ms: (0..SAMPLE_COUNT)
+                .map(|index| u64::try_from(index).expect("sample index") * 100)
+                .collect(),
+            first_absent_index: 1,
+            poll_interval_ms: 100,
+        };
+        for index in 1..=MUTATION_COUNT {
+            let acknowledged_at_ms = u64::try_from(index).expect("mutation index") * 100 + 50;
+            assert!(watch.proves_absent_at(acknowledged_at_ms));
+        }
+        assert!(!watch.proves_absent_at(50));
+        assert!(!watch.proves_absent_at(u64::try_from(SAMPLE_COUNT).expect("sample count") * 100));
+    }
+
+    #[test]
+    fn host_runtime_identity_requires_normalized_paths_and_bare_cri_ids() {
+        for path in ["/data0/", "/data0/.", "/data0//shard", "/data0/../other"] {
+            assert!(!is_normalized_absolute_path(path));
+        }
+        assert!(is_normalized_absolute_path("/data0/shard"));
+
+        let kubernetes_id = format!("containerd://{HASH_A}");
+        assert_eq!(
+            split_kubernetes_container_id(&kubernetes_id).expect("containerd ID"),
+            ("containerd", HASH_A)
+        );
+        assert!(split_kubernetes_container_id("containerd://not-a-cri-id").is_err());
+        assert!(split_kubernetes_container_id(HASH_A).is_err());
     }
 
     #[test]
@@ -6333,7 +6556,10 @@ mod tests {
                 serde_json::json!({
                     "name": format!("rustfs-{index}"),
                     "uid": format!("uid-rustfs-{index}"),
-                    "rustfsContainerId": format!("containerd://rustfs-{index}"),
+                    "rustfsContainerId": format!(
+                        "containerd://{}",
+                        sha256_bytes(format!("rustfs-{index}").as_bytes())
+                    ),
                     "ready": true,
                     "node": format!("node-{index}"),
                     "nodeLabels": {"kubernetes.io/hostname": format!("node-{index}")},
@@ -6550,11 +6776,21 @@ mod tests {
             fixed_volume_targets_at_workload_snapshot: controller_targets,
             fixed_volume_containers_at_fault_activation: selected_pods
                 .iter()
-                .map(|name| (name.clone(), format!("containerd://{name}")))
+                .map(|name| {
+                    (
+                        name.clone(),
+                        format!("containerd://{}", sha256_bytes(name.as_bytes())),
+                    )
+                })
                 .collect(),
             fixed_volume_containers_at_workload_snapshot: selected_pods
                 .iter()
-                .map(|name| (name.clone(), format!("containerd://{name}")))
+                .map(|name| {
+                    (
+                        name.clone(),
+                        format!("containerd://{}", sha256_bytes(name.as_bytes())),
+                    )
+                })
                 .collect(),
             active_snapshots: vec![active_snapshot],
             workload_snapshots: vec![workload_snapshot],
@@ -6709,7 +6945,8 @@ mod tests {
             let mut mutation_volume = volume("bitrot", 260);
             mutation_volume.pod = "rustfs-7".to_string();
             mutation_volume.pod_uid = "uid-rustfs-7".to_string();
-            mutation_volume.rustfs_container_id = "containerd://rustfs-7".to_string();
+            mutation_volume.rustfs_container_id =
+                format!("containerd://{}", sha256_bytes(b"rustfs-7"));
             mutation_volume.volume_name = "data".to_string();
             mutation_volume.persistent_volume_claim = "data-rustfs-7".to_string();
             mutation_volume.persistent_volume_claim_uid = "pvc-uid-7".to_string();
@@ -6940,7 +7177,10 @@ mod tests {
                     serde_json::json!({
                         "name": format!("rustfs-{index}"),
                         "uid": format!("uid-rustfs-{index}"),
-                        "rustfsContainerId": format!("containerd://rustfs-{index}"),
+                        "rustfsContainerId": format!(
+                            "containerd://{}",
+                            sha256_bytes(format!("rustfs-{index}").as_bytes())
+                        ),
                         "ready": true,
                         "node": format!("node-{index}"),
                         "nodeLabels": {"kubernetes.io/hostname": format!("node-{index}")},
@@ -7341,6 +7581,9 @@ mod tests {
     #[test]
     fn dangling_cleanup_cannot_remove_committed_fragments() {
         let (mut stale_return, mut history) = stale_return_fixture();
+        history.truncate(checker_prefix_record_count(
+            &stale_return.post_return_checker,
+        ));
         let committed = ShardInventoryEntry {
             fragment_id: "fragment-committed".to_string(),
             bucket: "bucket-1".to_string(),
@@ -7393,6 +7636,7 @@ mod tests {
             520,
         ));
         history.push(ack_lost);
+        append_post_return_checker_suffix(&mut history);
         stale_return.post_return_checker = post_return_checker(&history);
         let inventory = |snapshot_id: &str,
                          cursor: &str,

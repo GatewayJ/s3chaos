@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,6 +38,8 @@ pub struct CheckerAudit {
     pub completed_at_ms: u64,
     pub history_prefix_record_count: usize,
     pub history_prefix_sha256: String,
+    pub history_suffix_record_count: usize,
+    pub history_suffix_sha256: String,
     pub data_version_checks: Vec<CheckerDataVersionAudit>,
     pub delete_marker_checks: Vec<CheckerDeleteMarkerAudit>,
     /// `None` means versioning was not part of this checker run. Otherwise the
@@ -266,10 +268,10 @@ impl CheckerReport {
     }
 }
 
-/// Hash the immutable history prefix consumed by a checker run. Keeping this
-/// helper beside the producer makes validators use the exact serialization
-/// contract rather than a separately reconstructed projection.
-pub(crate) fn checker_history_prefix_sha256(records: &[OperationRecord]) -> Result<String> {
+/// Hash an exact checker history slice. Keeping this helper beside the
+/// producer makes validators use the same serialization contract rather than
+/// a separately reconstructed projection.
+pub(crate) fn checker_history_records_sha256(records: &[OperationRecord]) -> Result<String> {
     Ok(sha256_hex(&serde_json::to_vec(records)?))
 }
 
@@ -282,7 +284,7 @@ pub async fn check_s3_history(
 ) -> Result<CheckerReport> {
     let initial_records = recorder.records();
     let checker_started_at_ms = now_ms();
-    let history_prefix_sha256 = checker_history_prefix_sha256(&initial_records)?;
+    let history_prefix_sha256 = checker_history_records_sha256(&initial_records)?;
     let model = object_model(&initial_records);
     let read_anomalies = successful_read_anomalies(&initial_records);
     let list_history_warnings = list_history_warnings(&initial_records);
@@ -532,12 +534,18 @@ pub async fn check_s3_history(
         && report.resurrected_deleted_objects.is_empty()
         && report.delete_marker_lineage_incomplete.is_empty()
         && report.multipart_upload_lineage_incomplete.is_empty();
+    let checker_records = recorder.records();
+    let checker_suffix = checker_records
+        .get(initial_records.len()..)
+        .context("checker history shrank while producing its audit")?;
     report.audit = Some(CheckerAudit {
         bucket: s3.bucket().to_string(),
         started_at_ms: checker_started_at_ms,
         completed_at_ms: now_ms(),
         history_prefix_record_count: initial_records.len(),
         history_prefix_sha256,
+        history_suffix_record_count: checker_suffix.len(),
+        history_suffix_sha256: checker_history_records_sha256(checker_suffix)?,
         data_version_checks,
         delete_marker_checks,
         list_object_versions_completed,
@@ -2715,7 +2723,7 @@ mod tests {
     use super::{
         AmbiguousWriteAttempt, CheckerReport, CommittedDeleteMarker, CommittedVersion,
         ExpectedObject, RecoveryStabilityClassification, RecoveryStabilityReport, WarningSummary,
-        checker_data_version_audit, checker_delete_marker_audits, checker_history_prefix_sha256,
+        checker_data_version_audit, checker_delete_marker_audits, checker_history_records_sha256,
         evaluate_committed_get, evaluate_final_get, evaluate_recovery_reread_get,
         finish_recovery_stability_report, immediate_still_unavailable_keys,
         is_recovery_tail_read_failure, list_history_warnings, object_model,
@@ -5382,14 +5390,14 @@ mod tests {
         let expected = sha256_hex(&serde_json::to_vec(&records).expect("serialize history"));
 
         assert_eq!(
-            checker_history_prefix_sha256(&records).expect("hash history"),
+            checker_history_records_sha256(&records).expect("hash history"),
             expected
         );
 
         let mut changed = records;
         changed[0].ended_at_ms += 1;
         assert_ne!(
-            checker_history_prefix_sha256(&changed).expect("hash changed history"),
+            checker_history_records_sha256(&changed).expect("hash changed history"),
             expected,
             "the audit digest must bind the complete operation record"
         );
