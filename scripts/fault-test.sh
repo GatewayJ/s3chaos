@@ -38,6 +38,8 @@ FAULT_TENANT="${RUSTFS_FAULT_TEST_TENANT:-fault-test-tenant}"
 CHAOS_NAMESPACE="${RUSTFS_FAULT_TEST_CHAOS_NAMESPACE:-chaos-mesh}"
 ACTIVE_PID=""
 ACTIVE_ARTIFACTS=""
+ACTIVE_HOST_MUTATION_STATE_FILE=""
+ACTIVE_HOST_MUTATION_STATE_TOKEN=""
 FAULT_TEST_BINARY=""
 FAULT_CATALOG_JSON=""
 
@@ -285,17 +287,38 @@ validate_runtime_env_contract() {
 
 validate_dm_env_contract() {
   local scenario="$1"
+  local dm_opt_in
   require_nonempty_env RUSTFS_FAULT_TEST_DM_NAME
   require_nonempty_env RUSTFS_FAULT_TEST_DM_NODE
   require_nonempty_env RUSTFS_FAULT_TEST_DM_MOUNT_PATH
+  require_nonempty_env RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE
+  require_nonempty_env RUSTFS_FAULT_TEST_DM_OBSERVER_POD
+  require_nonempty_env RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST
   if [[ "$scenario" == "dm-flakey" ]]; then
     require_nonempty_env RUSTFS_FAULT_TEST_DM_FAULT_TABLE
   fi
 
   require_safe_dm_name RUSTFS_FAULT_TEST_DM_NAME "$RUSTFS_FAULT_TEST_DM_NAME"
   require_safe_node_name RUSTFS_FAULT_TEST_DM_NODE "$RUSTFS_FAULT_TEST_DM_NODE"
+  require_safe_node_name RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE"
+  require_safe_node_name RUSTFS_FAULT_TEST_DM_OBSERVER_POD "$RUSTFS_FAULT_TEST_DM_OBSERVER_POD"
   require_absolute_non_root_path RUSTFS_FAULT_TEST_DM_MOUNT_PATH "$RUSTFS_FAULT_TEST_DM_MOUNT_PATH"
+  require_absolute_non_root_path RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST "$RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST"
+  require_safe_node_name RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST "$RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST"
   require_safe_image_ref RUSTFS_FAULT_TEST_DM_HELPER_IMAGE "${RUSTFS_FAULT_TEST_DM_HELPER_IMAGE:-rancher/mirrored-library-busybox:1.37.0}"
+
+  dm_opt_in="$(printf '%s' "$RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE" | tr '[:upper:]' '[:lower:]')"
+  [[ "$dm_opt_in" == "1" || "$dm_opt_in" == "true" || "$dm_opt_in" == "yes" ]] \
+    || die "RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE must explicitly enable device-mapper mutation"
+  [[ "$RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST" == "$RUSTFS_FAULT_TEST_DM_NODE" ]] \
+    || die "RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST must exactly match RUSTFS_FAULT_TEST_DM_NODE"
+  [[ "$RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST" == "/dev/mapper/$RUSTFS_FAULT_TEST_DM_NAME" ]] \
+    || die "RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST must exactly match /dev/mapper/$RUSTFS_FAULT_TEST_DM_NAME"
+  [[ "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE" != "$FAULT_NAMESPACE" ]] \
+    || die "the read-only DM observer must be outside the disposable fault Tenant namespace"
 }
 
 require_namespace_ownership() {
@@ -513,6 +536,9 @@ preflight() {
   done
   if scenario_requires_static_storage "$scenario"; then
     validate_dm_env_contract "$scenario"
+    kubectl_cluster -n "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE" \
+      get pod "$RUSTFS_FAULT_TEST_DM_OBSERVER_POD" >/dev/null \
+      || die "$scenario requires the configured pre-provisioned host observer Pod"
     kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 || die "$scenario requires a pre-created owned fault namespace with privileged Pod Security"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] || die "$scenario requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
   fi
@@ -532,26 +558,101 @@ cleanup_managed_chaos() {
     -l "$MANAGER_SELECTOR" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
 }
 
-terminate_process_tree() {
-  local parent="$1"
+signal_process_tree() {
+  local parent="$1" signal="$2"
   local child
   for child in $(pgrep -P "$parent" 2>/dev/null || true); do
-    terminate_process_tree "$child"
+    signal_process_tree "$child" "$signal"
   done
-  kill -TERM "$parent" 2>/dev/null || true
+  kill -"$signal" "$parent" 2>/dev/null || true
+}
+
+terminate_process_tree() {
+  local parent="$1" state_file="$2" state_token="$3" grace_seconds="${4:-60}"
+  local child deadline descendants=false
+  for child in $(pgrep -P "$parent" 2>/dev/null || true); do
+    descendants=true
+    signal_process_tree "$child" TERM
+  done
+  if [[ "$descendants" == "false" ]]; then
+    kill -TERM "$parent" 2>/dev/null || true
+  fi
+
+  deadline=$((SECONDS + grace_seconds))
+  while kill -0 "$parent" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 1
+  done
+  if kill -0 "$parent" 2>/dev/null; then
+    if host_storage_mutation_active "$parent" "$state_file" "$state_token"; then
+      echo "warning: device-mapper host-storage mutation may still be active after ${grace_seconds}s; refusing to send SIGKILL because it could interrupt rollback" >&2
+      echo "warning: waiting for the fault process to restore or quarantine the target; preserve its proof artifacts for scoped manual recovery if it cannot finish" >&2
+      while kill -0 "$parent" 2>/dev/null; do
+        if ! host_storage_mutation_active "$parent" "$state_file" "$state_token"; then
+          echo "warning: host-storage mutation is no longer active but the fault process is still running; escalating to KILL" >&2
+          signal_process_tree "$parent" KILL
+          break
+        fi
+        sleep 1
+      done
+    else
+      echo "warning: fault process did not finish graceful recovery within ${grace_seconds}s; escalating to KILL" >&2
+      signal_process_tree "$parent" KILL
+    fi
+  fi
+}
+
+process_descends_from() {
+  local process="$1" ancestor="$2" parent
+  [[ "$process" =~ ^[1-9][0-9]*$ && "$ancestor" =~ ^[1-9][0-9]*$ ]] || return 1
+  while (( process > 1 )); do
+    [[ "$process" == "$ancestor" ]] && return 0
+    parent="$(ps -o ppid= -p "$process" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$parent" =~ ^[1-9][0-9]*$ && "$parent" != "$process" ]] || return 1
+    process="$parent"
+  done
+  return 1
+}
+
+host_storage_mutation_active() {
+  local parent="$1" state_file="$2" state_token="$3" owner phase token schema
+  [[ -n "$state_file" && -n "$state_token" && -f "$state_file" ]] || return 1
+  schema="$(jq -r '.schemaVersion // empty' "$state_file" 2>/dev/null)" || return 1
+  token="$(jq -r '.token // empty' "$state_file" 2>/dev/null)" || return 1
+  owner="$(jq -r '.ownerPid // empty' "$state_file" 2>/dev/null)" || return 1
+  phase="$(jq -r '.phase // empty' "$state_file" 2>/dev/null)" || return 1
+  [[ "$schema" == "1" && "$token" == "$state_token" ]] || return 1
+  [[ "$phase" == "active" || "$phase" == "rollback" ]] || return 1
+  kill -0 "$owner" 2>/dev/null || return 1
+  process_descends_from "$owner" "$parent"
+}
+
+prepare_host_mutation_state() {
+  local root="$1"
+  root="$(cd "$root" && pwd -P)"
+  ACTIVE_HOST_MUTATION_STATE_TOKEN="fault-$$-${BASHPID}-${RANDOM}-$(date +%s)"
+  ACTIVE_HOST_MUTATION_STATE_FILE="$root/.host-mutation-${ACTIVE_HOST_MUTATION_STATE_TOKEN}.json"
+}
+
+cleanup_host_mutation_state() {
+  if [[ -n "$ACTIVE_HOST_MUTATION_STATE_FILE" && -e "$ACTIVE_HOST_MUTATION_STATE_FILE" ]]; then
+    echo "warning: preserving unresolved host mutation state at $ACTIVE_HOST_MUTATION_STATE_FILE; verify device recovery before removing it" >&2
+  fi
+  ACTIVE_HOST_MUTATION_STATE_FILE=""
+  ACTIVE_HOST_MUTATION_STATE_TOKEN=""
 }
 
 handle_signal() {
-  cleanup_managed_chaos
   if [[ -n "$ACTIVE_PID" ]]; then
-    terminate_process_tree "$ACTIVE_PID"
+    terminate_process_tree "$ACTIVE_PID" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN"
   fi
+  cleanup_managed_chaos
   if [[ -n "$ACTIVE_ARTIFACTS" ]]; then
     touch "$ACTIVE_ARTIFACTS/interrupted"
     echo 130 >"$ACTIVE_ARTIFACTS/exit-code"
     capture_cluster_snapshot "$ACTIVE_ARTIFACTS" interrupted
     capture_fault_logs "$ACTIVE_ARTIFACTS"
   fi
+  cleanup_host_mutation_state
   exit 130
 }
 
@@ -813,6 +914,7 @@ run_scenario() {
     require_chaos=true
   fi
   capture_cluster_snapshot "$artifacts" before
+  prepare_host_mutation_state "$artifacts"
 
   echo "starting scenario=$scenario artifacts=$artifacts"
   (
@@ -826,6 +928,8 @@ run_scenario() {
     RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS="$RUSTFS_POD_STABLE_WINDOW_SECONDS" \
     RUSTFS_FAULT_TEST_DURATION_SECONDS="${RUSTFS_FAULT_TEST_DURATION_SECONDS:-7200}" \
     RUSTFS_FAULT_TEST_ARTIFACTS="$artifacts" \
+    RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_FILE="$ACTIVE_HOST_MUTATION_STATE_FILE" \
+    RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_TOKEN="$ACTIVE_HOST_MUTATION_STATE_TOKEN" \
     "$FAULT_TEST_BINARY" fault-run \
       >"$artifacts/test.log" 2>&1
     echo "$?" >"$artifacts/test-exit-code.tmp"
@@ -862,8 +966,8 @@ run_scenario() {
         || warn_artifact_write_failed "health-watch.jsonl" "$artifacts/health-watch.jsonl"
       if [[ "$will_abort" == "true" ]]; then
         touch "$artifacts/health-guard-failed"
+        terminate_process_tree "$test_pid" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN"
         cleanup_managed_chaos
-        terminate_process_tree "$test_pid"
         break
       fi
     fi
@@ -871,6 +975,7 @@ run_scenario() {
   done
 
   wait "$test_pid" 2>/dev/null || true
+  cleanup_host_mutation_state
   ACTIVE_PID=""
   ACTIVE_ARTIFACTS=""
   rc=125
@@ -913,6 +1018,7 @@ run_one() {
   require_supported_scenario "$scenario"
   run_root="$(new_run_root)"
   initialize_summary "$run_root"
+  run_root="$(cd "$run_root" && pwd -P)"
   prepare_fault_binary "$scenario" "$run_root"
   run_scenario "$scenario" "$run_root"
   echo "run artifacts: $run_root"
@@ -948,6 +1054,7 @@ run_suite() {
   [[ -f "$suite" ]] || die "suite yaml file not found: $suite"
   run_root="$(new_run_root)"
   mkdir -p "$run_root"
+  run_root="$(cd "$run_root" && pwd -P)"
   suite_plan="$run_root/suite-plan-preview.json"
   preflight_suite "$suite" "$suite_plan"
   build_fault_binary "$run_root" "fault-suite-run"
@@ -964,6 +1071,7 @@ run_suite() {
   fi
   max_duration_seconds="$(suite_max_duration_seconds "$suite_plan")"
   capture_cluster_snapshot "$run_root" before
+  prepare_host_mutation_state "$run_root"
 
   echo "starting suite=$suite artifacts=$run_root"
   ACTIVE_ARTIFACTS="$run_root"
@@ -971,6 +1079,8 @@ run_suite() {
     set +e
     RUSTFS_FAULT_TEST_DESTRUCTIVE=1 \
     RUSTFS_FAULT_TEST_ARTIFACTS="$run_root" \
+    RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_FILE="$ACTIVE_HOST_MUTATION_STATE_FILE" \
+    RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_TOKEN="$ACTIVE_HOST_MUTATION_STATE_TOKEN" \
     "$FAULT_TEST_BINARY" fault-suite-run "$suite" \
       >"$run_root/suite.log" 2>&1
     echo "$?" >"$run_root/suite-exit-code.tmp"
@@ -989,8 +1099,8 @@ run_suite() {
       write_suite_budget_watch_event "$run_root/health-watch.jsonl" "$current_time" "$suite_name" "$health_checks" "$elapsed" "$max_duration_seconds" \
         || warn_artifact_write_failed "health-watch.jsonl" "$run_root/health-watch.jsonl"
       touch "$run_root/suite-budget-failed"
+      terminate_process_tree "$ACTIVE_PID" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN"
       cleanup_managed_chaos
-      terminate_process_tree "$ACTIVE_PID"
       break
     fi
 
@@ -1018,8 +1128,8 @@ run_suite() {
         || warn_artifact_write_failed "health-watch.jsonl" "$run_root/health-watch.jsonl"
       if [[ "$will_abort" == "true" ]]; then
         touch "$run_root/health-guard-failed"
+        terminate_process_tree "$ACTIVE_PID" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN"
         cleanup_managed_chaos
-        terminate_process_tree "$ACTIVE_PID"
         break
       fi
     fi
@@ -1027,6 +1137,7 @@ run_suite() {
   done
 
   wait "$ACTIVE_PID" 2>/dev/null || true
+  cleanup_host_mutation_state
   ACTIVE_PID=""
   ACTIVE_ARTIFACTS=""
   rc=125
@@ -1062,6 +1173,10 @@ cleanup() {
   fi
   echo "managed fault-test resources cleaned; external StorageClasses, PVs, and host devices were not changed"
 }
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
 
 trap handle_signal INT TERM HUP
 

@@ -109,6 +109,14 @@ pub struct FaultTestConfig {
     pub dm_fault_table: Option<String>,
     pub dm_recovery_table: Option<String>,
     pub dm_helper_image: String,
+    pub dm_observer_pod: Option<String>,
+    pub dm_observer_namespace: Option<String>,
+    pub device_mapper_destructive_enabled: bool,
+    pub host_mutation_allowed_nodes: Vec<String>,
+    pub host_mutation_allowed_devices: Vec<String>,
+    pub host_mutation_allowed_persistent_volumes: Vec<String>,
+    pub host_mutation_state_file: Option<PathBuf>,
+    pub host_mutation_state_token: Option<String>,
     pub warp_duration: Duration,
     pub chaos_namespace: String,
 }
@@ -309,6 +317,36 @@ impl FaultTestConfig {
                 &get_env,
                 "RUSTFS_FAULT_TEST_DM_HELPER_IMAGE",
                 DEFAULT_DM_HELPER_IMAGE,
+            ),
+            dm_observer_pod: env_optional(&get_env, "RUSTFS_FAULT_TEST_DM_OBSERVER_POD"),
+            dm_observer_namespace: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE",
+            ),
+            device_mapper_destructive_enabled: env_bool(
+                &get_env,
+                "RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE",
+            )?,
+            host_mutation_allowed_nodes: env_list(
+                &get_env,
+                "RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST",
+            ),
+            host_mutation_allowed_devices: env_list(
+                &get_env,
+                "RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST",
+            ),
+            host_mutation_allowed_persistent_volumes: env_list(
+                &get_env,
+                "RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST",
+            ),
+            host_mutation_state_file: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_FILE",
+            )
+            .map(PathBuf::from),
+            host_mutation_state_token: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_TOKEN",
             ),
             warp_duration: Duration::from_secs(env_u64(
                 &get_env,
@@ -538,6 +576,21 @@ where
         .collect()
 }
 
+fn env_list<F>(get_env: &F, name: &str) -> Vec<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_optional(get_env, name)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn ensure_valid_env_name(source: &str, name: &str) -> Result<()> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -633,6 +686,14 @@ mod tests {
         assert!(config.dm_mount_path.is_none());
         assert!(config.dm_fault_table.is_none());
         assert!(config.dm_recovery_table.is_none());
+        assert!(config.dm_observer_pod.is_none());
+        assert!(config.dm_observer_namespace.is_none());
+        assert!(!config.device_mapper_destructive_enabled);
+        assert!(config.host_mutation_allowed_nodes.is_empty());
+        assert!(config.host_mutation_allowed_devices.is_empty());
+        assert!(config.host_mutation_allowed_persistent_volumes.is_empty());
+        assert!(config.host_mutation_state_file.is_none());
+        assert!(config.host_mutation_state_token.is_none());
         assert_eq!(
             config.dm_helper_image,
             "rancher/mirrored-library-busybox:1.37.0"
@@ -712,6 +773,22 @@ mod tests {
                 }
                 "RUSTFS_FAULT_TEST_WARP_DURATION_SECONDS" => Some("30".to_string()),
                 "RUSTFS_FAULT_TEST_DM_HELPER_IMAGE" => Some("busybox:test".to_string()),
+                "RUSTFS_FAULT_TEST_DM_OBSERVER_POD" => {
+                    Some("rustfs-fault-host-observer".to_string())
+                }
+                "RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE" => {
+                    Some("rustfs-fault-observers".to_string())
+                }
+                "RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE" => Some("true".to_string()),
+                "RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST" => Some("worker-a".to_string()),
+                "RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST" => {
+                    Some("/dev/mapper/rustfs-test".to_string())
+                }
+                "RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST" => Some("pv-worker-a".to_string()),
+                "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_FILE" => {
+                    Some("/tmp/s3chaos-host-mutation.json".to_string())
+                }
+                "RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_TOKEN" => Some("run-token-1".to_string()),
                 _ => None,
             },
             "production-test-cluster".to_string(),
@@ -766,6 +843,32 @@ mod tests {
         );
         assert_eq!(config.warp_duration, std::time::Duration::from_secs(30));
         assert_eq!(config.dm_helper_image, "busybox:test");
+        assert_eq!(
+            config.dm_observer_pod.as_deref(),
+            Some("rustfs-fault-host-observer")
+        );
+        assert_eq!(
+            config.dm_observer_namespace.as_deref(),
+            Some("rustfs-fault-observers")
+        );
+        assert!(config.device_mapper_destructive_enabled);
+        assert_eq!(config.host_mutation_allowed_nodes, ["worker-a"]);
+        assert_eq!(
+            config.host_mutation_allowed_devices,
+            ["/dev/mapper/rustfs-test"]
+        );
+        assert_eq!(
+            config.host_mutation_allowed_persistent_volumes,
+            ["pv-worker-a"]
+        );
+        assert_eq!(
+            config.host_mutation_state_file.as_deref(),
+            Some(std::path::Path::new("/tmp/s3chaos-host-mutation.json"))
+        );
+        assert_eq!(
+            config.host_mutation_state_token.as_deref(),
+            Some("run-token-1")
+        );
     }
 
     #[test]

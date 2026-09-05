@@ -141,6 +141,50 @@ kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \
 The device-mapper scenario preflight requires exactly four `Available` or
 `Bound` `100Gi` PVs in the selected static StorageClass.
 
+Create a long-lived read-only host observer outside the disposable fault
+Tenant namespace. Preflight only executes `findmnt`, `readlink`, and `dmsetup
+table` through this Pod; it never creates a helper Pod or changes host/storage
+state. Replace `<dm-node-name>` before applying:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rustfs-fault-observers
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dm-observer
+  namespace: rustfs-fault-observers
+  labels:
+    app.kubernetes.io/managed-by: s3chaos
+    rustfs.com/fault-host-observer: "true"
+spec:
+  nodeName: <dm-node-name>
+  restartPolicy: Never
+  containers:
+    - name: host-tools
+      image: rancher/mirrored-library-busybox:1.37.0
+      command: ["sh", "-c", "trap : TERM INT; while :; do sleep 3600 & wait $!; done"]
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: host-root
+          mountPath: /host
+          readOnly: true
+  volumes:
+    - name: host-root
+      hostPath:
+        path: /
+        type: Directory
+```
+
+The observer is intentionally separate from the fault namespace because the
+runner recreates that namespace for dedicated-storage scenarios. Its
+privileged access is still security-sensitive; dedicate it to the lab and
+remove it after testing.
+
 ## dm-flakey Run
 
 Required variables on the machine that runs the s3chaos command:
@@ -152,10 +196,18 @@ export RUSTFS_FAULT_TEST_DM_NAME=rustfs-fault-dm
 export RUSTFS_FAULT_TEST_DM_NODE='<dm-node-name>'
 export RUSTFS_FAULT_TEST_DM_MOUNT_PATH=/data/rustfs/rustfs-fault-lab/volume
 export RUSTFS_FAULT_TEST_DM_FAULT_TABLE='0 <sectors> flakey <backing-device> 0 1 15'
+export RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE=rustfs-fault-observers
+export RUSTFS_FAULT_TEST_DM_OBSERVER_POD=dm-observer
+export RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE=1
+export RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST='<dm-node-name>'
+export RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST=/dev/mapper/rustfs-fault-dm
+export RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST='<exact-target-pv-name>'
 ```
 
-Use the `SECTORS` and `BACKING` values from the DM node host-storage setup for
-`<sectors>` and `<backing-device>`. `RUSTFS_FAULT_TEST_DM_FAULT_TABLE` is
+Copy the length and backing-device fields from `sudo dmsetup table "$DM_NAME"`
+on the DM node into `<sectors>` and `<backing-device>`. Preserve the reported
+device identifier exactly (typically `major:minor`); an equivalent `/dev/loopN`
+path does not satisfy the exact table contract. `RUSTFS_FAULT_TEST_DM_FAULT_TABLE` is
 required only by the legacy `dm-flakey` EIO scenario. The
 `dm-flakey-versioned-hot` crash proxy ignores it and derives a fail-closed
 `drop_writes` table from the live, single-segment linear table.
@@ -200,7 +252,22 @@ Its recovery boundary is intentionally owned by the host backend:
 The adapter refuses multi-segment or non-linear recovery tables, refuses to
 overwrite a pre-existing crash-containment taint, and keeps the node tainted if
 storage cannot be remounted. A configured recovery-table override must exactly
-match the table observed before crash injection.
+match the table observed before crash injection. Immediately before mutation,
+`host-storage-proof.json` binds the exact node, logical/canonical device, PV,
+PVC, Pod UID, mounted filesystem, recovery-table hash, quarantine rule, and
+post-cleanup requirements. Apply re-observes the same target and fails closed if
+it changed. Successful recovery writes `host-storage-post-cleanup.json` only
+after the recovery table, mapper-backed mount, and absent quarantine are
+observed.
+
+Activation, after-workload, and recovery snapshots bind the mapper name,
+canonical device, suspension state, table, and observation time to that proof.
+Missing snapshots or drift invalidate the run. If rollback fails, the adapter
+attempts to suspend the mapper with `--noflush --nolockfs` and verifies that
+I/O remains suspended. `NoSchedule` only prevents new scheduling; it does not
+stop an existing Pod. The helper and unresolved mutation marker remain for
+manual recovery even if the scheduling taint succeeds. The wrapper preserves
+that marker after the process exits; only verified recovery clears it.
 
 The Rust test reads the original `dmsetup table` as the recovery table when
 `RUSTFS_FAULT_TEST_DM_RECOVERY_TABLE` is unset. On normal failure paths it
@@ -222,6 +289,8 @@ export RUSTFS_FAULT_TEST_EXPECTED_CONTEXT='<run-context>'
 export RUSTFS_FAULT_TEST_NAMESPACE='<run-namespace>'
 export RUSTFS_FAULT_TEST_TENANT='<run-tenant>'
 make fault-cleanup
+kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \
+  delete namespace "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE"
 kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \
   delete pv -l rustfs.com/fault-storage=dm-flakey
 kubectl --context "$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT" \

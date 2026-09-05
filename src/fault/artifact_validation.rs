@@ -27,6 +27,7 @@ use crate::fault::{
         NetworkPartitionEvidenceContract, VolumeTargetEvidenceContract, iochaos_record_pod_id,
         validate_fixed_volume_snapshot, validate_network_partition_snapshot,
     },
+    backends::host::DmStatusSnapshot,
     checker::RecoveryStabilityReport,
     checker::{CheckerReport, RecoveryStabilityClassification},
     config::{
@@ -36,6 +37,10 @@ use crate::fault::{
     },
     events::{RunEvent, RunEventStatus},
     history::{DurabilityCohort, OperationKind, OperationOutcome, OperationRecord},
+    host_storage::{
+        HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT, HostStorageMutationProof,
+        HostStoragePostCleanupObservation, normalized_dm_table_sha256,
+    },
     plan::{
         FaultInjection, FaultKind, FaultPlan, FaultPlanOptions, FaultSelection, FaultTarget,
         FaultWorkloadMode,
@@ -347,6 +352,46 @@ pub fn validate_fault_artifacts(
     if options.scenario == scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
         validate_write_quorum_runtime_evidence(&evidence, &target_proof, &json_spec)?;
     }
+    if json_spec
+        .faults
+        .iter()
+        .any(|fault| fault.backend == "device-mapper")
+    {
+        let proof_path = locate_artifact(
+            &options.artifact_root,
+            scenario_spec.case_name,
+            HOST_STORAGE_PROOF_ARTIFACT,
+        )?;
+        let cleanup_path = locate_artifact(
+            &options.artifact_root,
+            scenario_spec.case_name,
+            HOST_STORAGE_CLEANUP_ARTIFACT,
+        )?;
+        let host_proof = read_json::<HostStorageMutationProof>(&proof_path)?;
+        let cleanup = read_json::<HostStoragePostCleanupObservation>(&cleanup_path)?;
+        validate_host_storage_artifacts(
+            &host_proof,
+            &cleanup,
+            &target_proof,
+            &json_spec,
+            &evidence,
+        )?;
+        ensure!(
+            preflight_summary.phases.iter().any(|phase| {
+                phase.name == "host-storage-mutation-proof"
+                    && phase.status == PreflightStatus::Passed
+            }),
+            "preflight-summary.json lacks a passed host-storage mutation proof phase"
+        );
+        ensure!(
+            has_event(
+                &events,
+                "host-storage-mutation-preflight",
+                RunEventStatus::Succeeded,
+            ),
+            "run-events.jsonl lacks a successful host-storage mutation preflight"
+        );
+    }
     if fixed_volume_fault(&json_spec).is_some() {
         validate_fixed_volume_runtime_evidence(&evidence, &target_proof, &json_spec)?;
     }
@@ -425,7 +470,7 @@ pub fn validate_fault_artifacts(
         client_disruptions: evidence.client_disruptions,
         recommitted: recommit.committed,
         committed: checker.committed_puts,
-        required_artifacts: FaultRunArtifactSpec::required_names(),
+        required_artifacts: json_spec.artifacts.required.clone(),
     })
 }
 
@@ -492,6 +537,20 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
         ensure!(
             spec.artifacts.required.contains(&required),
             "run-spec artifacts.required is missing {required}"
+        );
+    }
+    let requires_host_storage_proof = spec
+        .faults
+        .iter()
+        .any(|fault| fault.backend == "device-mapper");
+    for conditional in [HOST_STORAGE_PROOF_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT] {
+        ensure!(
+            spec.artifacts
+                .required
+                .iter()
+                .any(|name| name == conditional)
+                == requires_host_storage_proof,
+            "run-spec artifacts.required host-storage contract does not match its fault backends"
         );
     }
     ensure!(
@@ -741,7 +800,7 @@ fn validate_target_proof(
     if proof
         .faults
         .iter()
-        .any(|fault| fault.pod_selector.is_some())
+        .any(|fault| fault.pod_selector.is_some() || fault.host_target.is_some())
     {
         ensure!(
             !proof.resolved_pods.is_empty()
@@ -751,17 +810,21 @@ fn validate_target_proof(
                         .as_ref()
                         .is_none_or(|selector| selector.exact_pods_resolved)
                 }),
-            "target-proof.json selector targets must include resolved current pods"
+            "target-proof.json runtime targets must include resolved current pods"
         );
         ensure!(
             proof
                 .resolved_pods
                 .iter()
                 .all(|pod| pod.node.as_deref().is_some_and(|node| !node.is_empty())),
-            "target-proof.json selector targets must include target pod nodes"
+            "target-proof.json runtime targets must include target pod nodes"
         );
     }
-    if proof.faults.iter().any(|fault| fault.volume_path.is_some()) {
+    if proof
+        .faults
+        .iter()
+        .any(|fault| fault.volume_path.is_some() || fault.host_target.is_some())
+    {
         ensure!(
             proof.resolved_pods.iter().all(target_pod_has_bound_volume),
             "target-proof.json volume targets must include pod PVC/PV/node/device-or-path bindings"
@@ -1036,6 +1099,170 @@ fn validate_write_quorum_runtime_evidence(
     membership
         .require_selected_boundary(shape, selected_pods)
         .context("actual NetworkChaos source targets do not cross the write-quorum boundary")?;
+    Ok(())
+}
+
+fn validate_host_storage_artifacts(
+    proof: &HostStorageMutationProof,
+    cleanup: &HostStoragePostCleanupObservation,
+    target_proof: &TargetProof,
+    spec: &FaultRunSpec,
+    evidence: &FaultEvidenceArtifact,
+) -> Result<()> {
+    proof
+        .validate()
+        .context("validate host-storage-proof.json")?;
+    let host_faults = spec
+        .faults
+        .iter()
+        .filter(|fault| fault.backend == "device-mapper")
+        .collect::<Vec<_>>();
+    ensure!(
+        host_faults.len() == 1,
+        "host-storage proof requires exactly one device-mapper fault"
+    );
+    let fault = host_faults[0];
+    ensure!(
+        proof.scenario == spec.scenario.name
+            && proof.fault_name == fault.name
+            && proof.fault_kind == fault.kind
+            && proof.run_id == spec.metadata.run_id
+            && proof.context == spec.cluster.context
+            && proof.namespace == spec.cluster.namespace
+            && proof.tenant == spec.cluster.tenant,
+        "host-storage-proof.json identity or cluster scope does not match run-spec.json"
+    );
+    let target_fault = target_proof
+        .faults
+        .iter()
+        .find(|candidate| candidate.name == fault.name)
+        .context("target-proof.json lacks the device-mapper fault")?;
+    let host_target = target_fault
+        .host_target
+        .as_ref()
+        .context("target-proof.json device-mapper fault lacks a host target")?;
+    ensure!(
+        host_target.node == proof.target.node
+            && host_target.mapper_name == proof.target.mapper_name
+            && host_target.mount_path == proof.target.persistent_volume_path,
+        "host-storage-proof.json target does not match target-proof.json host target"
+    );
+    let pod = target_proof
+        .resolved_pods
+        .iter()
+        .find(|pod| pod.name == proof.target.pod && pod.uid == proof.target.pod_uid)
+        .context("target-proof.json lacks the host-storage target Pod identity")?;
+    ensure!(
+        pod.node.as_deref() == Some(proof.target.node.as_str()),
+        "host-storage target Pod node does not match target-proof.json"
+    );
+    let proven_hostname = proof
+        .target
+        .node_labels
+        .get("kubernetes.io/hostname")
+        .context("host-storage proof lacks the proven Node hostname label")?;
+    ensure!(
+        pod.persistent_volume_claims.iter().any(|claim| {
+            claim.name == proof.target.persistent_volume_claim
+                && claim.volume_name.as_deref() == Some(proof.target.persistent_volume.as_str())
+                && claim.persistent_volume.as_ref().is_some_and(|pv| {
+                    pv.name == proof.target.persistent_volume
+                        && pv.node.as_deref() == Some(proven_hostname.as_str())
+                        && pv.device_or_path.as_deref()
+                            == Some(proof.target.persistent_volume_path.as_str())
+                })
+        }),
+        "host-storage target PVC/PV/path does not match target-proof.json"
+    );
+    let fault_apply_started_at_ms = evidence
+        .fault_apply_started_at_ms
+        .context("fault-evidence.json lacks fault_apply_started_at_ms")?;
+    let fault_active_at_ms = evidence
+        .fault_active_at_ms
+        .context("fault-evidence.json lacks fault_active_at_ms")?;
+    proof
+        .require_generated_during_apply(fault_apply_started_at_ms, fault_active_at_ms)
+        .context("host-storage proof was not freshly regenerated during fault apply")?;
+    proof
+        .validate_post_cleanup(cleanup)
+        .context("validate host-storage-post-cleanup.json")?;
+    let recovery_snapshot = evidence
+        .dm_recovery_snapshot
+        .as_ref()
+        .context("fault-evidence.json lacks dm_recovery_snapshot")?;
+    let recovery_table = recovery_snapshot
+        .get("table")
+        .and_then(Value::as_str)
+        .context("fault-evidence.json dm_recovery_snapshot lacks table")?;
+    let recovery_table_sha256 = normalized_dm_table_sha256(recovery_table)
+        .context("validate fault-evidence.json dm_recovery_snapshot table")?;
+    ensure!(
+        recovery_table_sha256 == proof.tables.recovery_table_sha256
+            && recovery_table_sha256 == proof.recovery.rollback.recovery_table_sha256
+            && recovery_table_sha256 == cleanup.recovery_table_sha256
+            && proof.tables.recovery_table == proof.recovery.rollback.recovery_table,
+        "device-mapper recovery table/hash is not cross-bound across proof, rollback, cleanup, and fault evidence"
+    );
+    let recovery_snapshot: DmStatusSnapshot = serde_json::from_value(recovery_snapshot.clone())
+        .context("parse device-mapper recovery snapshot")?;
+    recovery_snapshot.validate_proof(proof, "recovered", &proof.tables.recovery_table)?;
+    let recovery_started_at_ms = evidence
+        .recovery_started_at_ms
+        .context("fault-evidence.json lacks recovery_started_at_ms")?;
+    let recovery_ended_at_ms = evidence
+        .recovery_ended_at_ms
+        .context("fault-evidence.json lacks recovery_ended_at_ms")?;
+    ensure!(
+        cleanup.observed_at_ms >= recovery_started_at_ms
+            && cleanup.observed_at_ms <= recovery_ended_at_ms
+            && recovery_snapshot.observed_at_ms >= recovery_started_at_ms
+            && recovery_snapshot.observed_at_ms <= recovery_ended_at_ms,
+        "host-storage post-cleanup observation is outside the recorded recovery window"
+    );
+    let workload_started = evidence
+        .workload_started_at_ms
+        .context("missing workload start")?;
+    let workload_ended = evidence
+        .workload_ended_at_ms
+        .context("missing workload end")?;
+    let fault_delete_started = evidence
+        .fault_delete_started_at_ms
+        .context("missing fault delete start")?;
+    for (stage, snapshots, start, end) in [
+        (
+            "active",
+            &evidence.active_snapshots,
+            fault_active_at_ms,
+            workload_started,
+        ),
+        (
+            "after-workload",
+            &evidence.workload_snapshots,
+            workload_ended,
+            fault_delete_started,
+        ),
+    ] {
+        let [snapshot] = snapshots.as_slice() else {
+            bail!("device-mapper {stage} evidence requires exactly one fault snapshot");
+        };
+        ensure!(
+            snapshot.get("stage").and_then(Value::as_str) == Some(stage)
+                && snapshot.get("resource_kind").and_then(Value::as_str) == Some("device-mapper"),
+            "device-mapper {stage} snapshot metadata is inconsistent"
+        );
+        let dm_snapshot: DmStatusSnapshot = serde_json::from_value(
+            snapshot
+                .get("dm_status")
+                .context("device-mapper snapshot lacks dm_status")?
+                .clone(),
+        )
+        .with_context(|| format!("parse {stage} device-mapper snapshot"))?;
+        dm_snapshot.validate_proof(proof, stage, &proof.tables.fault_table)?;
+        ensure!(
+            dm_snapshot.observed_at_ms >= start && dm_snapshot.observed_at_ms <= end,
+            "device-mapper {stage} observation is outside its recorded fault window"
+        );
+    }
     Ok(())
 }
 
@@ -2241,6 +2468,8 @@ struct FaultEvidenceArtifact {
     active_snapshots: Vec<Value>,
     workload_snapshots: Vec<Value>,
     #[serde(default)]
+    dm_recovery_snapshot: Option<Value>,
+    #[serde(default)]
     fault_apply_started_at_ms: Option<u64>,
     #[serde(default)]
     fault_active_at_ms: Option<u64>,
@@ -2480,12 +2709,18 @@ mod tests {
         ArtifactValidationOptions, FailureSummaryArtifact, FaultEvidenceArtifact,
         OutcomeCountsArtifact, WorkloadSummaryArtifact, recursive_find, validate_fault_artifacts,
         validate_fault_artifacts_and_write_report, validate_fixed_volume_runtime_evidence,
-        validate_run_spec, validate_target_proof, validate_write_quorum_runtime_evidence,
+        validate_host_storage_artifacts, validate_run_spec, validate_target_proof,
+        validate_write_quorum_runtime_evidence,
     };
     use crate::fault::{
         checker::{RecoveryStabilityClassification, RecoveryStabilityReport},
         config::FaultTestConfig,
         history::{OperationOutcome, OperationRecord},
+        host_storage::{
+            HostStorageAllowlist, HostStorageMutationIntent, HostStorageMutationProof,
+            HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
+            HostStoragePostCleanupObservation, HostStorageTargetObservation,
+        },
         plan::{FaultInjection, FaultKind, FaultPlan, FaultSelection, FaultTarget},
         preflight::{
             TargetNodeAffinityProof, TargetNodeSelectorRequirementProof,
@@ -2498,7 +2733,10 @@ mod tests {
             AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity,
             FailureVerdict, ResponsibilityDomain,
         },
-        scenarios::{FaultScenario, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, scenario_spec},
+        scenarios::{
+            DM_FLAKEY_SCENARIO, FaultScenario, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+            scenario_spec,
+        },
         spec::{FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec},
         workload::WorkloadPlan,
     };
@@ -3102,6 +3340,388 @@ mod tests {
         shape.payload_data_shards = 7;
         shape.payload_parity_shards = 1;
         assert!(validate_target_proof(&tampered, &run_spec, &options).is_err());
+    }
+
+    #[test]
+    fn host_storage_artifacts_bind_allowlisted_target_and_cleanup_observation() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "rustfs-fault-dm");
+        config.scenario = DM_FLAKEY_SCENARIO.to_string();
+        config.dm_name = Some("rustfs-fault-dm".to_string());
+        config.dm_node = Some("worker-a".to_string());
+        config.dm_mount_path = Some("/data/rustfs-fault/dm-volume".to_string());
+        config.dm_fault_table = Some("0 1024 flakey /dev/loop0 0 1 15".to_string());
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario(&scenario, catalog).expect("plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let run_spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+        assert!(
+            run_spec
+                .artifacts
+                .required
+                .contains(&"host-storage-proof.json".to_string())
+                && run_spec
+                    .artifacts
+                    .required
+                    .contains(&"host-storage-post-cleanup.json".to_string())
+        );
+        let target_proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs([TargetResolvedPodProof::new("rustfs-0", "uid-0")
+                .with_node("worker-a")
+                .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
+                    name: "data-rustfs-0".to_string(),
+                    volume_name: Some("pv-a".to_string()),
+                    storage_class: Some("rustfs-fault-dm".to_string()),
+                    persistent_volume: Some(TargetPersistentVolumeProof {
+                        name: "pv-a".to_string(),
+                        source: Some("local".to_string()),
+                        required_node_affinity: None,
+                        node: Some("storage-host-a".to_string()),
+                        device_or_path: Some("/data/rustfs-fault/dm-volume".to_string()),
+                    }),
+                }])]);
+        let host_proof = HostStorageMutationProof::prove_device_mapper(
+            HostStorageMutationIntent {
+                scenario: scenario.name.clone(),
+                fault_name: run_spec.faults[0].name.clone(),
+                fault_kind: run_spec.faults[0].kind.clone(),
+                run_id: "run-1".to_string(),
+                context: config.cluster.context.clone(),
+                namespace: config.cluster.test_namespace.clone(),
+                tenant: config.cluster.tenant_name.clone(),
+                observer_namespace: "rustfs-fault-observers".to_string(),
+                observer_pod: "observer-worker-a".to_string(),
+                backend_specific_destructive_opt_in: true,
+                allowlist: HostStorageAllowlist {
+                    nodes: vec!["worker-a".to_string()],
+                    devices: vec!["/dev/mapper/rustfs-fault-dm".to_string()],
+                    persistent_volumes: vec!["pv-a".to_string()],
+                },
+                fault_table: Some("0 1024 flakey /dev/loop0 0 1 15".to_string()),
+            },
+            HostStorageTargetObservation {
+                node: "worker-a".to_string(),
+                node_uid: "node-uid-a".to_string(),
+                node_labels: BTreeMap::from([(
+                    "kubernetes.io/hostname".to_string(),
+                    "storage-host-a".to_string(),
+                )]),
+                pod: "rustfs-0".to_string(),
+                pod_uid: "uid-0".to_string(),
+                volume_name: "data".to_string(),
+                persistent_volume_claim: "data-rustfs-0".to_string(),
+                persistent_volume_claim_uid: "pvc-uid-0".to_string(),
+                persistent_volume_claim_phase: "Bound".to_string(),
+                persistent_volume: "pv-a".to_string(),
+                persistent_volume_uid: "pv-uid-a".to_string(),
+                persistent_volume_phase: "Bound".to_string(),
+                persistent_volume_claim_ref: HostStoragePersistentVolumeClaimRef {
+                    namespace: "rustfs-fault-test".to_string(),
+                    name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-0".to_string(),
+                },
+                node_selector: HostStorageNodeSelector {
+                    key: "kubernetes.io/hostname".to_string(),
+                    operator: "In".to_string(),
+                    values: vec!["storage-host-a".to_string()],
+                },
+                container_mount_path: "/data/rustfs0".to_string(),
+                persistent_volume_path: "/data/rustfs-fault/dm-volume".to_string(),
+                mapper_name: "rustfs-fault-dm".to_string(),
+                logical_device: "/dev/mapper/rustfs-fault-dm".to_string(),
+                canonical_device: "/dev/dm-0".to_string(),
+                mount_source: "/dev/mapper/rustfs-fault-dm".to_string(),
+                mount_canonical_source: "/dev/dm-0".to_string(),
+                filesystem: "ext4".to_string(),
+                recovery_table: "0 1024 linear /dev/loop0 0".to_string(),
+                observed_at_ms: 151,
+            },
+        )
+        .expect("host proof");
+        let cleanup = HostStoragePostCleanupObservation {
+            schema_version: 1,
+            scenario: scenario.name.clone(),
+            fault_name: run_spec.faults[0].name.clone(),
+            run_id: "run-1".to_string(),
+            observed_at_ms: 300,
+            node: "worker-a".to_string(),
+            persistent_volume: "pv-a".to_string(),
+            mapper_name: "rustfs-fault-dm".to_string(),
+            logical_device: "/dev/mapper/rustfs-fault-dm".to_string(),
+            canonical_device: "/dev/dm-0".to_string(),
+            mount_canonical_source: "/dev/dm-0".to_string(),
+            filesystem_mounted: true,
+            node_quarantined: false,
+            recovery_table_sha256: host_proof.target.recovery_table_sha256.clone(),
+        };
+        let recovery_snapshot = json!({
+            "stage": "recovered",
+            "mapper_name": "rustfs-fault-dm",
+            "canonical_device": "/dev/dm-0",
+            "suspended": false,
+            "observed_at_ms": 299,
+            "helper_pod": "rustfs-fault-dm-helper-run1",
+            "mapping": {
+                "node": "worker-a",
+                "node_uid": "node-uid-a",
+                "node_labels": {"kubernetes.io/hostname": "storage-host-a"},
+                "pod": "rustfs-0",
+                "pod_uid": "uid-0",
+                "volume_name": "data",
+                "pvc": "data-rustfs-0",
+                "pvc_uid": "pvc-uid-0",
+                "pvc_phase": "Bound",
+                "pv": "pv-a",
+                "pv_uid": "pv-uid-a",
+                "pv_phase": "Bound",
+                "pv_claim_ref": {
+                    "namespace": "rustfs-fault-test",
+                    "name": "data-rustfs-0",
+                    "uid": "pvc-uid-0"
+                },
+                "node_selector": {
+                    "key": "kubernetes.io/hostname",
+                    "operator": "In",
+                    "values": ["storage-host-a"]
+                },
+                "container_mount_path": "/data/rustfs0",
+                "mount_path": "/data/rustfs-fault/dm-volume"
+            },
+            "table": "0 1024 linear /dev/loop0 0",
+            "status": "0 1024 linear"
+        });
+        let mut evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
+            "injected": true,
+            "active_during_workload": true,
+            "recovered": true,
+            "require_client_disruption": true,
+            "client_disruptions": 1,
+            "pods_before": [],
+            "pods_after": [],
+            "active_snapshots": [{}],
+            "workload_snapshots": [{}],
+            "fault_apply_started_at_ms": 150,
+            "fault_active_at_ms": 160,
+            "workload_started_at_ms": 170,
+            "workload_ended_at_ms": 190,
+            "fault_delete_started_at_ms": 200,
+            "recovery_started_at_ms": 201,
+            "dm_recovery_snapshot": recovery_snapshot,
+            "recovery_ended_at_ms": 400
+        }))
+        .expect("evidence");
+
+        let active_snapshot = |stage, timestamp| {
+            let mut dm = evidence
+                .dm_recovery_snapshot
+                .clone()
+                .expect("recovery snapshot");
+            dm["stage"] = json!(stage);
+            dm["table"] = json!(host_proof.tables.fault_table);
+            dm["observed_at_ms"] = json!(timestamp);
+            json!({"stage": stage, "resource_kind": "device-mapper", "dm_status": dm})
+        };
+        evidence.active_snapshots = vec![active_snapshot("active", 161)];
+        evidence.workload_snapshots = vec![active_snapshot("after-workload", 195)];
+        validate_host_storage_artifacts(&host_proof, &cleanup, &target_proof, &run_spec, &evidence)
+            .expect("valid host-storage artifacts");
+
+        for workload in [false, true] {
+            for replacement in [vec![], vec![json!({})], vec![json!({}), json!({})]] {
+                let mut broken = evidence.clone();
+                if workload {
+                    broken.workload_snapshots = replacement;
+                } else {
+                    broken.active_snapshots = replacement;
+                }
+                assert!(
+                    validate_host_storage_artifacts(
+                        &host_proof,
+                        &cleanup,
+                        &target_proof,
+                        &run_spec,
+                        &broken
+                    )
+                    .is_err()
+                );
+            }
+            for (pointer, value) in [
+                ("/stage", json!("recovered")),
+                ("/resource_kind", json!("iochaos")),
+                ("/dm_status/stage", json!("recovered")),
+                ("/dm_status/helper_pod", json!("other-run-helper")),
+                ("/dm_status/mapper_name", json!("other-mapper")),
+                ("/dm_status/canonical_device", json!("/dev/dm-9")),
+                ("/dm_status/suspended", json!(true)),
+                ("/dm_status/table", json!(host_proof.tables.recovery_table)),
+                ("/dm_status/mapping/node_uid", json!("replaced-node")),
+                ("/dm_status/mapping/pv_uid", json!("replaced-pv")),
+                ("/dm_status/mapping/pvc_uid", json!("replaced-pvc")),
+                ("/dm_status/mapping/pod_uid", json!("replaced-pod")),
+                ("/dm_status/observed_at_ms", json!(159)),
+                ("/dm_status/observed_at_ms", json!(201)),
+            ] {
+                let mut broken = evidence.clone();
+                let snapshots = if workload {
+                    &mut broken.workload_snapshots
+                } else {
+                    &mut broken.active_snapshots
+                };
+                *snapshots[0].pointer_mut(pointer).expect("tampered field") = value;
+                assert!(
+                    validate_host_storage_artifacts(
+                        &host_proof,
+                        &cleanup,
+                        &target_proof,
+                        &run_spec,
+                        &broken
+                    )
+                    .is_err(),
+                    "must reject {pointer} drift at workload={workload}"
+                );
+            }
+        }
+
+        let mut tampered_topology = target_proof.clone();
+        tampered_topology.resolved_pods[0].persistent_volume_claims[0]
+            .persistent_volume
+            .as_mut()
+            .expect("target PV")
+            .node = Some("worker-a".to_string());
+        assert!(
+            validate_host_storage_artifacts(
+                &host_proof,
+                &cleanup,
+                &tampered_topology,
+                &run_spec,
+                &evidence,
+            )
+            .is_err(),
+            "target-proof PV topology must match the proven hostname label, not Node metadata.name"
+        );
+
+        let mut tampered_proof = host_proof.clone();
+        tampered_proof.allowlist.persistent_volumes = vec!["pv-b".to_string()];
+        assert!(
+            validate_host_storage_artifacts(
+                &tampered_proof,
+                &cleanup,
+                &target_proof,
+                &run_spec,
+                &evidence,
+            )
+            .is_err()
+        );
+
+        let mut recreated_pvc_proof = host_proof.clone();
+        recreated_pvc_proof.target.persistent_volume_claim_uid = "pvc-uid-new".to_string();
+        recreated_pvc_proof.target.persistent_volume_claim_ref.uid = "pvc-uid-new".to_string();
+        assert!(
+            validate_host_storage_artifacts(
+                &recreated_pvc_proof,
+                &cleanup,
+                &target_proof,
+                &run_spec,
+                &evidence,
+            )
+            .is_err(),
+            "recovery evidence must reject a coordinated same-name PVC recreation"
+        );
+
+        let mut tampered_cleanup = cleanup.clone();
+        tampered_cleanup.recovery_table_sha256 = "0".repeat(64);
+        assert!(
+            validate_host_storage_artifacts(
+                &host_proof,
+                &tampered_cleanup,
+                &target_proof,
+                &run_spec,
+                &evidence,
+            )
+            .is_err()
+        );
+
+        let redirected_proof = HostStorageMutationProof::prove_device_mapper(
+            HostStorageMutationIntent {
+                scenario: scenario.name.clone(),
+                fault_name: run_spec.faults[0].name.clone(),
+                fault_kind: run_spec.faults[0].kind.clone(),
+                run_id: "run-1".to_string(),
+                context: config.cluster.context.clone(),
+                namespace: config.cluster.test_namespace.clone(),
+                tenant: config.cluster.tenant_name.clone(),
+                observer_namespace: "rustfs-fault-observers".to_string(),
+                observer_pod: "observer-worker-a".to_string(),
+                backend_specific_destructive_opt_in: true,
+                allowlist: HostStorageAllowlist {
+                    nodes: vec!["worker-a".to_string()],
+                    devices: vec!["/dev/mapper/rustfs-fault-dm".to_string()],
+                    persistent_volumes: vec!["pv-a".to_string()],
+                },
+                fault_table: Some("0 1024 flakey /dev/sda 0 1 15".to_string()),
+            },
+            HostStorageTargetObservation {
+                node: "worker-a".to_string(),
+                node_uid: "node-uid-a".to_string(),
+                node_labels: BTreeMap::from([(
+                    "kubernetes.io/hostname".to_string(),
+                    "storage-host-a".to_string(),
+                )]),
+                pod: "rustfs-0".to_string(),
+                pod_uid: "uid-0".to_string(),
+                volume_name: "data".to_string(),
+                persistent_volume_claim: "data-rustfs-0".to_string(),
+                persistent_volume_claim_uid: "pvc-uid-0".to_string(),
+                persistent_volume_claim_phase: "Bound".to_string(),
+                persistent_volume: "pv-a".to_string(),
+                persistent_volume_uid: "pv-uid-a".to_string(),
+                persistent_volume_phase: "Bound".to_string(),
+                persistent_volume_claim_ref: HostStoragePersistentVolumeClaimRef {
+                    namespace: "rustfs-fault-test".to_string(),
+                    name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-0".to_string(),
+                },
+                node_selector: HostStorageNodeSelector {
+                    key: "kubernetes.io/hostname".to_string(),
+                    operator: "In".to_string(),
+                    values: vec!["storage-host-a".to_string()],
+                },
+                container_mount_path: "/data/rustfs0".to_string(),
+                persistent_volume_path: "/data/rustfs-fault/dm-volume".to_string(),
+                mapper_name: "rustfs-fault-dm".to_string(),
+                logical_device: "/dev/mapper/rustfs-fault-dm".to_string(),
+                canonical_device: "/dev/dm-0".to_string(),
+                mount_source: "/dev/mapper/rustfs-fault-dm".to_string(),
+                mount_canonical_source: "/dev/dm-0".to_string(),
+                filesystem: "ext4".to_string(),
+                recovery_table: "0 1024 linear /dev/sda 0".to_string(),
+                observed_at_ms: 151,
+            },
+        )
+        .expect("internally consistent redirected proof");
+        let mut coordinated_cleanup = cleanup;
+        coordinated_cleanup.recovery_table_sha256 =
+            redirected_proof.target.recovery_table_sha256.clone();
+        assert!(
+            validate_host_storage_artifacts(
+                &redirected_proof,
+                &coordinated_cleanup,
+                &target_proof,
+                &run_spec,
+                &evidence,
+            )
+            .is_err(),
+            "independent recovery snapshot must reject coordinated proof/cleanup tampering"
+        );
     }
 
     #[test]

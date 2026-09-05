@@ -170,12 +170,14 @@ mod tests {
     use crate::fault::{
         backends::host::{DmStatusSnapshot, DmVolumeMapping},
         config::FaultTestConfig,
+        host_storage::{HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef},
         reporting::FaultStatusSnapshot,
     };
     use crate::framework::artifacts::ArtifactCollector;
     use anyhow::{Result, anyhow};
     use std::{
         cell::RefCell,
+        collections::BTreeMap,
         rc::Rc,
         time::{Duration, Instant},
     };
@@ -255,13 +257,38 @@ mod tests {
     fn recording_dm_snapshot(stage: &str, helper_pod: &str) -> DmStatusSnapshot {
         DmStatusSnapshot {
             stage: stage.to_string(),
+            mapper_name: "rustfs-fault-dm".to_string(),
+            canonical_device: "/dev/dm-0".to_string(),
+            suspended: false,
+            observed_at_ms: 1,
             helper_pod: helper_pod.to_string(),
             mapping: DmVolumeMapping {
                 node: "node-a".to_string(),
+                node_uid: "node-uid-a".to_string(),
+                node_labels: BTreeMap::from([(
+                    "kubernetes.io/hostname".to_string(),
+                    "node-a".to_string(),
+                )]),
                 pod: "rustfs-0".to_string(),
                 pod_uid: "pod-uid-a".to_string(),
+                volume_name: "data".to_string(),
                 pvc: "data-rustfs-0".to_string(),
+                pvc_uid: "pvc-uid-a".to_string(),
+                pvc_phase: "Bound".to_string(),
                 pv: "pv-a".to_string(),
+                pv_uid: "pv-uid-a".to_string(),
+                pv_phase: "Bound".to_string(),
+                pv_claim_ref: HostStoragePersistentVolumeClaimRef {
+                    namespace: "rustfs-fault-test".to_string(),
+                    name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-a".to_string(),
+                },
+                node_selector: HostStorageNodeSelector {
+                    key: "kubernetes.io/hostname".to_string(),
+                    operator: "In".to_string(),
+                    values: vec!["node-a".to_string()],
+                },
+                container_mount_path: "/data/rustfs0".to_string(),
                 mount_path: "/data/rustfs0".to_string(),
             },
             table: "0 2048 flakey /dev/sda 0 1 1".to_string(),

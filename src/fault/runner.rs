@@ -31,6 +31,7 @@ use crate::{
         history::{
             ByteRange, DurabilityCohort, OperationKind, OperationOutcome, OperationRecord, Recorder,
         },
+        host_storage::{HOST_STORAGE_PROOF_ARTIFACT, HostStorageMutationProof},
         plan::{FaultInjection, FaultKind, FaultPlan, FaultPlanOptions, FaultSelection},
         pods::{
             fixed_volume_container_ids, rustfs_pod_identities, rustfs_target_inventory,
@@ -787,6 +788,73 @@ async fn run_fault_case(
                 observation.observed_at_ms,
             )?;
         }
+        let host_storage_required = plan
+            .faults()
+            .iter()
+            .any(|fault| fault.backend() == FaultBackend::DeviceMapper);
+        if host_storage_required {
+            events.record(
+                "host-storage-mutation-preflight",
+                RunEventStatus::Started,
+                "reading host/storage identities and validating destructive policy",
+                None,
+            )?;
+        }
+        let host_storage_proof = match preflight_host_storage_mutation(config, scenario, plan, &run_id)
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                preflight_phases.push(PreflightPhase::new(
+                    "host-storage-mutation-proof",
+                    vec![PreflightCheck::failed(
+                        "host_storage_mutation_proof",
+                        error.to_string(),
+                        crate::fault::reporting::ResponsibilityDomain::Environment,
+                    )],
+                ));
+                write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+                events
+                    .record(
+                        "host-storage-mutation-preflight",
+                        RunEventStatus::Failed,
+                        error.to_string(),
+                        None,
+                    )
+                    .ok();
+                write_failure_summary(
+                    collector,
+                    scenario.case_name,
+                    FailureSummary::new(
+                        &scenario.name,
+                        "host-storage-mutation-preflight",
+                        "preflight_failed",
+                        error.to_string(),
+                    )?,
+                )?;
+                return Err(error);
+            }
+        };
+        if let Some(proof) = &host_storage_proof {
+            collector.write_text(
+                scenario.case_name,
+                HOST_STORAGE_PROOF_ARTIFACT,
+                &serde_json::to_string_pretty(proof)?,
+            )?;
+            preflight_phases.push(PreflightPhase::new(
+                "host-storage-mutation-proof",
+                vec![PreflightCheck::passed(
+                    "host_storage_mutation_proof",
+                    "exact host node/device/PV allowlists and recovery contract are proven",
+                    crate::fault::reporting::ResponsibilityDomain::Harness,
+                )],
+            ));
+            events.record(
+                "host-storage-mutation-preflight",
+                RunEventStatus::Succeeded,
+                "side-effect-free host/storage mutation proof is satisfied",
+                None,
+            )?;
+        }
         collector.write_text(
             scenario.case_name,
             "target-proof.json",
@@ -858,7 +926,37 @@ async fn run_fault_case(
             )?;
             return Err(error);
         }
-        let mut fault = match AppliedFaults::apply(config, collector, scenario, plan, &run_id) {
+        if let Some(proof) = &host_storage_proof
+            && let Err(error) = proof.require_fresh_at(fault_apply_started_at_ms)
+        {
+            events
+                .record(
+                    "fault-apply",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    None,
+                )
+                .ok();
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "fault-apply",
+                    "preflight_failed",
+                    error.to_string(),
+                )?,
+            )?;
+            return Err(error);
+        }
+        let mut fault = match AppliedFaults::apply(
+            config,
+            collector,
+            scenario,
+            plan,
+            &run_id,
+            host_storage_proof.as_ref(),
+        ) {
             Ok(fault) => fault,
             Err(error) => {
                 events
@@ -1576,6 +1674,8 @@ async fn run_fault_case(
             None,
         )?;
         let fault_delete_started_at_ms = history.mark_fault_ended_now();
+        // Host-storage cleanup observations are emitted by delete.
+        let recovery_started_at_ms = now_ms();
         let fault_delete_started_at = Instant::now();
         if let Err(error) = fault.delete(cluster.timeout) {
             let finalizer_recovery = match fault.recover_delete_timeout(
@@ -1646,7 +1746,6 @@ async fn run_fault_case(
             "waiting for Tenant readiness after fault removal",
             None,
         )?;
-        let recovery_started_at_ms = now_ms();
         history.set_durability_cohort(DurabilityCohort::PostRecovery);
         if let Err(error) = wait_for_ready_tenant(cluster).await {
             events
@@ -2278,6 +2377,7 @@ fn plan_requires_volume_bindings(plan: &FaultPlan) -> bool {
         matches!(
             fault.target(),
             crate::fault::plan::FaultTarget::RustfsVolume { .. }
+                | crate::fault::plan::FaultTarget::DedicatedBlockDevice
         )
     })
 }
@@ -2296,6 +2396,36 @@ fn require_fault_backends(config: &FaultTestConfig, plan: &FaultPlan) -> Result<
     // Runtime erasure geometry is read after the fixture and S3 access path are
     // ready; neither exists yet during this static backend preflight.
     Ok(())
+}
+
+fn preflight_host_storage_mutation(
+    config: &FaultTestConfig,
+    scenario: &FaultScenario,
+    plan: &FaultPlan,
+    run_id: &str,
+) -> Result<Option<HostStorageMutationProof>> {
+    let host_faults = plan
+        .faults()
+        .iter()
+        .enumerate()
+        .filter(|(_, fault)| fault.backend() == FaultBackend::DeviceMapper)
+        .collect::<Vec<_>>();
+    ensure!(
+        host_faults.len() <= 1,
+        "host-storage mutation preflight supports exactly one device-mapper target per run"
+    );
+    let Some((index, injection)) = host_faults.first().copied() else {
+        return Ok(None);
+    };
+    let fault_name = format!("{}-{index:02}-{}", scenario.name, injection.kind().as_str());
+    host::preflight_mutation(&host::HostStoragePreflightRequest {
+        config,
+        scenario,
+        injection,
+        run_id,
+        fault_name: &fault_name,
+    })
+    .map(Some)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2843,6 +2973,7 @@ impl AppliedFaults {
         scenario: &FaultScenario,
         plan: &FaultPlan,
         run_id: &str,
+        host_storage_proof: Option<&HostStorageMutationProof>,
     ) -> Result<Self> {
         ensure!(
             !plan.faults().is_empty(),
@@ -2855,15 +2986,16 @@ impl AppliedFaults {
         for (index, injection) in plan.faults().iter().enumerate() {
             let manifest_name = chaos_manifest_artifact_name(total, index, injection);
             let resource_name_suffix = chaos_resource_name_suffix(total, index);
-            items.push(apply_fault_backend(
+            items.push(apply_fault_backend(&FaultApplyRequest {
                 config,
                 collector,
                 scenario,
                 injection,
                 run_id,
-                &manifest_name,
-                &resource_name_suffix,
-            )?);
+                manifest_name: &manifest_name,
+                resource_name_suffix: &resource_name_suffix,
+                host_storage_proof,
+            })?);
         }
 
         Ok(Self::new(items))
@@ -2903,31 +3035,14 @@ impl AppliedFaults {
     }
 }
 
-fn apply_fault_backend(
-    config: &FaultTestConfig,
-    collector: &ArtifactCollector,
-    scenario: &FaultScenario,
-    injection: &FaultInjection,
-    run_id: &str,
-    manifest_name: &str,
-    resource_name_suffix: &str,
-) -> Result<AppliedFault> {
-    let request = FaultApplyRequest {
-        config,
-        collector,
-        scenario,
-        injection,
-        run_id,
-        manifest_name,
-        resource_name_suffix,
-    };
-    match injection.backend() {
-        FaultBackend::DeviceMapper => apply_host_fault_backend(&request),
+fn apply_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
+    match request.injection.backend() {
+        FaultBackend::DeviceMapper => apply_host_fault_backend(request),
         FaultBackend::ChaosMeshIoChaos
         | FaultBackend::ChaosMeshPodChaos
         | FaultBackend::ChaosMeshNetworkChaos
         | FaultBackend::ChaosMeshStressChaos
-        | FaultBackend::MinioWarpWithChaos => apply_chaos_mesh_fault_backend(&request),
+        | FaultBackend::MinioWarpWithChaos => apply_chaos_mesh_fault_backend(request),
         FaultBackend::PlannedReliabilityWorkflow => {
             bail!("planned reliability workflow scenarios are catalog-only and cannot execute yet")
         }
@@ -2942,6 +3057,7 @@ struct FaultApplyRequest<'a> {
     run_id: &'a str,
     manifest_name: &'a str,
     resource_name_suffix: &'a str,
+    host_storage_proof: Option<&'a HostStorageMutationProof>,
 }
 
 fn apply_chaos_mesh_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
@@ -2973,6 +3089,9 @@ fn apply_chaos_mesh_fault_backend(request: &FaultApplyRequest<'_>) -> Result<App
 }
 
 fn apply_host_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
+    let host_storage_proof = request
+        .host_storage_proof
+        .context("device-mapper fault lacks a host-storage mutation proof")?;
     Ok(Box::new(DmFlakeyFaultHandle {
         guard: Box::new(host::apply_fault(&host::FaultApplyRequest {
             config: request.config,
@@ -2980,6 +3099,7 @@ fn apply_host_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFa
             scenario: request.scenario,
             injection: request.injection,
             run_id: request.run_id,
+            host_storage_proof,
         })?),
     }))
 }
@@ -3122,7 +3242,10 @@ impl FaultLifecyclePort for DmFlakeyFaultHandle {
             resource_kind: Some("device-mapper".to_string()),
             resource_name: None,
             chaos_status: None,
-            dm_status: Some(self.guard.snapshot(stage)?),
+            dm_status: Some(match stage {
+                "active" | "after-workload" => self.guard.ensure_active(stage)?,
+                _ => self.guard.snapshot(stage)?,
+            }),
         })
     }
 

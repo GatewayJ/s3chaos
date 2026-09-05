@@ -347,16 +347,25 @@ guardrails when implementing the ordered TODO below.
   non-target nodes, and non-fault tenants remain hard stops. Existing scenarios
   should keep current behavior.
 
-- [ ] TODO: Add host/storage mutation preflight.
-  Meaning: before PV replacement, bitrot, stale disk, or dm mutation execution,
-  preflight must prove node/device/PV allowlist match, explicit backend-specific
-  destructive opt-in, rollback or quarantine command, and post-cleanup
-  observation.
+- [x] DONE: Add host/storage mutation preflight.
+  Meaning: executable device-mapper scenarios now require exact singleton
+  node/device/PV allowlists, a separate device-mapper destructive opt-in, and a
+  typed rollback/quarantine/post-cleanup contract. The proof persists canonical
+  fault/recovery tables and executable rollback commands; apply re-observes the
+  full Pod UID/PVC/PV/node/mount/table chain before loading the proven table.
+  Signal cancellation unwinds the guard. Activation and workload snapshots
+  prove the same active mapper and fault table; successful recovery binds its
+  snapshot to `host-storage-post-cleanup.json`. Failed rollback attempts to
+  suspend the mapper and retains the helper and mutation marker for manual
+  recovery; a scheduling taint alone cannot prove storage containment. PV
+  replacement, bitrot, and stale-disk flows remain non-executable catalog
+  entries and must use the same domain proof when their adapters are implemented.
 
-- [ ] TODO: Make host/storage mutation preflight side-effect free.
-  Meaning: the preflight PR may read Kubernetes/host metadata and write proof
-  artifacts, but it must not mutate disks, PV contents, storage objects, or power
-  state.
+- [x] DONE: Make host/storage mutation preflight side-effect free.
+  Meaning: host preflight reads Kubernetes metadata and fixed read-only host
+  commands through a pre-provisioned observer Pod, then writes only the proof
+  artifact. It does not create the observer or mutate disks, PV/PVC objects,
+  object data, or power state.
 
 ### 7. Wire Precise Final Checker Classifications
 

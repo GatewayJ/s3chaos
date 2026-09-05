@@ -627,9 +627,12 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         boundary: "rustfs-workload/block-device-fault",
         ci_phase: "faults",
         target: "one dedicated Linux block-device-backed PV used only by the e2e Tenant",
-        target_proof: DEFAULT_TARGET_PROOF,
+        target_proof: &[
+            "host-storage proof must bind exact node/device/PV allowlists to the live Pod/PVC/PV/mount/mapper identities before mutation",
+            "host-storage proof must record the device-mapper rollback, node-quarantine, and post-cleanup observation contract",
+        ],
         validation: "committed objects remain readable after the device fault is removed, and successful reads never return corrupt bytes",
-        observability: "history.jsonl, checker-report.json, dmsetup table/status, kernel logs, PV mapping, events, RustFS logs",
+        observability: "host-storage-proof.json, host-storage-post-cleanup.json, history.jsonl, checker-report.json, dmsetup table/status, kernel logs, PV mapping, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {
@@ -650,13 +653,14 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         ci_phase: "faults",
         target: "one dedicated Linux block-device-backed PV used only by the e2e Tenant, with versioned S3 mutations concentrated on hot keys",
         target_proof: &[
+            "host-storage proof must bind exact node/device/PV allowlists and rollback/quarantine/post-cleanup contracts before mutation",
             "dmsetup table/status must prove an always-down flakey drop_writes table on the dedicated mapped device",
             "the owning Pod must be force-deleted while drop_writes remains active and the filesystem must be unmounted before the healthy table is restored",
             "the mapped filesystem must be remounted and the owning Pod identity must change before recovery verification",
             "run-spec workload.versioning must be true and workload.hotspot must be present",
         ],
         validation: "the crash window contains at least one versioned mutation acknowledged while drop_writes is active; after forced Pod loss, unmount, healthy-table restore and remount, all committed object versions are re-read by versionId, delete markers remain latest, and successful reads never return corrupt bytes; because only one EC volume is lost this is a negative-control proxy, not quorum-loss proof",
-        observability: "run-spec.json/yaml, workload-plan.json, history.jsonl, crash-window-evidence.json, dm-crash-boundary.json, dm-crash-recovered.json, checker-report.json, dmsetup table/status, mount identity, Pod UID transition, events, RustFS logs",
+        observability: "run-spec.json/yaml, host-storage-proof.json, host-storage-post-cleanup.json, workload-plan.json, history.jsonl, crash-window-evidence.json, dm-crash-boundary.json, dm-crash-recovered.json, checker-report.json, dmsetup table/status, mount identity, Pod UID transition, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {
