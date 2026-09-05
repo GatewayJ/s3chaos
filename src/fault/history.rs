@@ -105,6 +105,14 @@ pub struct ByteRange {
     pub length: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ListedVersionEntry {
+    pub key: String,
+    pub version_id: Option<String>,
+    pub is_latest: bool,
+    pub is_delete_marker: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub id: String,
@@ -120,6 +128,8 @@ pub struct OperationRecord {
     pub version_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listed_keys: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listed_versions: Option<Vec<ListedVersionEntry>>,
     /// Set on committed writes whose body came from the seeded generator;
     /// absent for multipart bodies and legacy artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,6 +221,7 @@ impl Recorder {
             size_bytes,
             version_id: None,
             listed_keys: None,
+            listed_versions: None,
             payload_ref: None,
             range: None,
             started_at_ms,

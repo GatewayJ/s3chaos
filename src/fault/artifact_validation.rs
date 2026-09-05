@@ -1881,28 +1881,6 @@ fn validate_checker_report(
         !report.operation_cohorts.is_empty(),
         "{name} must include operation_cohorts derived from history.jsonl"
     );
-    ensure!(
-        report.missing_committed_objects.is_empty()
-            && report.unavailable_committed_objects.is_empty()
-            && report.unknown_committed_read_failures.is_empty()
-            && report.hash_mismatches.is_empty()
-            && report.successful_corrupted_reads.is_empty()
-            && report.unexpected_visible_deleted_objects.is_empty()
-            && report.unknown_writes_materialized.is_empty()
-            && report.unknown_write_value_conflicts.is_empty()
-            && report.final_list_warning_count == 0
-            && report.list_warnings.is_empty()
-            && report.committed_writes_missing_version_id_count == 0
-            && report.missing_committed_versions.is_empty()
-            && report.unavailable_committed_versions.is_empty()
-            && report.version_hash_mismatches.is_empty()
-            && report.missing_committed_delete_markers.is_empty()
-            && report.resurrected_deleted_objects.is_empty()
-            && report.delete_marker_lineage_incomplete.is_empty()
-            && report.multipart_upload_lineage_incomplete.is_empty()
-            && report.tenant_recovered,
-        "{name} contains a non-clean checker verdict"
-    );
     Ok(())
 }
 
@@ -5598,11 +5576,7 @@ mod tests {
 
         let error = validate_fault_artifacts(&options).expect_err("ambiguous evidence mismatch");
 
-        assert!(
-            error
-                .to_string()
-                .contains("contains a non-clean checker verdict")
-        );
+        assert!(error.to_string().contains("did not pass"));
     }
 
     #[test]

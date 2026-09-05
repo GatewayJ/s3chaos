@@ -878,6 +878,7 @@ mod tests {
             size_bytes: None,
             version_id: version_id.map(str::to_string),
             listed_keys: None,
+            listed_versions: None,
             payload_ref: None,
             range: None,
             started_at_ms,

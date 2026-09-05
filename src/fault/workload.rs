@@ -30,7 +30,8 @@ use std::{future::Future, time::Duration};
 use tokio::time::{Instant, timeout};
 
 use crate::fault::history::{
-    ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef, Recorder,
+    ByteRange, ListedVersionEntry, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
+    Recorder,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1755,6 +1756,17 @@ impl S3WorkloadClient {
 
         let mut record = record;
         record.size_bytes = Some(entries.len());
+        record.listed_versions = Some(
+            entries
+                .iter()
+                .map(|entry| ListedVersionEntry {
+                    key: entry.key.clone(),
+                    version_id: entry.version_id.clone(),
+                    is_latest: entry.is_latest,
+                    is_delete_marker: entry.is_delete_marker,
+                })
+                .collect(),
+        );
         recorder.finish(record, OperationOutcome::Ok, Some(200), None)?;
         Ok(Some(entries))
     }

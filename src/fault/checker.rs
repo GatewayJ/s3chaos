@@ -20,7 +20,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep as async_sleep, timeout};
 
 use crate::fault::{
-    history::{ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef, Recorder},
+    history::{
+        ByteRange, ListedVersionEntry, OperationKind, OperationOutcome, OperationRecord,
+        PayloadRef, Recorder,
+    },
     workload::{
         GetObjectResult, ObjectSpec, ObjectVersionEntry, S3WorkloadClient, seeded_bytes, sha256_hex,
     },
@@ -55,6 +58,12 @@ pub struct CheckerOperationAudit {
     pub key: Option<String>,
     pub version_id: Option<String>,
     pub observed_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listed_keys: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listed_versions: Option<Vec<ListedVersionEntry>>,
     pub outcome: OperationOutcome,
     pub http_status: Option<u16>,
     pub error: Option<String>,
@@ -267,13 +276,38 @@ impl RecoveryStabilityReport {
 impl CheckerReport {
     pub fn require_success(&self) -> Result<()> {
         ensure!(
-            self.passed,
+            self.passed && self.success_predicate(),
             "fault checker failed for scenario {} run {}: {}",
             self.scenario,
             self.run_id,
             serde_json::to_string_pretty(self)?
         );
         Ok(())
+    }
+
+    fn success_predicate(&self) -> bool {
+        self.tenant_recovered
+            && self.missing_committed_objects.is_empty()
+            && self.unavailable_committed_objects.is_empty()
+            && self.unknown_committed_read_failures.is_empty()
+            && self.hash_mismatches.is_empty()
+            && self.successful_corrupted_reads.is_empty()
+            && self.unexpected_visible_deleted_objects.is_empty()
+            && self.unknown_writes_materialized.is_empty()
+            && self.unknown_write_value_conflicts.is_empty()
+            && self.expected_live_objects == self.verified_live_objects
+            && self.final_list_warning_count == 0
+            && self.list_warnings.is_empty()
+            && self.committed_writes_missing_version_id_count == 0
+            && self.committed_writes_missing_version_id.is_empty()
+            && self.expected_committed_versions == self.verified_committed_versions
+            && self.missing_committed_versions.is_empty()
+            && self.unavailable_committed_versions.is_empty()
+            && self.version_hash_mismatches.is_empty()
+            && self.missing_committed_delete_markers.is_empty()
+            && self.resurrected_deleted_objects.is_empty()
+            && self.delete_marker_lineage_incomplete.is_empty()
+            && self.multipart_upload_lineage_incomplete.is_empty()
     }
 
     pub(crate) fn failure_classification(&self) -> RecoveryStabilityClassification {
@@ -297,9 +331,73 @@ pub(crate) fn checker_operation_audits(records: &[OperationRecord]) -> Vec<Check
             key: record.key.clone(),
             version_id: record.version_id.clone(),
             observed_sha256: record.value_sha256.clone(),
+            size_bytes: record.size_bytes,
+            listed_keys: record.listed_keys.clone(),
+            listed_versions: record.listed_versions.clone(),
             outcome: record.outcome,
             http_status: record.http_status,
             error: record.error.clone(),
+        })
+        .collect()
+}
+
+pub(crate) fn checker_expected_current_get_keys(records: &[OperationRecord]) -> BTreeSet<String> {
+    let model = object_model(records);
+    model
+        .live
+        .keys()
+        .chain(model.unknown_writes.keys())
+        .chain(
+            model
+                .deleted
+                .iter()
+                .filter(|key| !model.unknown_writes.contains_key(*key)),
+        )
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn checker_expected_live_keys(records: &[OperationRecord]) -> BTreeSet<String> {
+    object_model(records).live.into_keys().collect()
+}
+
+pub(crate) fn checker_expected_version_listing(
+    records: &[OperationRecord],
+) -> BTreeSet<ListedVersionEntry> {
+    let mut versions = Vec::new();
+    let mut latest_by_key = BTreeMap::new();
+    for record in records.iter().filter(|record| {
+        matches!(
+            record.kind,
+            OperationKind::Put | OperationKind::CompleteMultipartUpload | OperationKind::Delete
+        ) && record.outcome == OperationOutcome::Ok
+    }) {
+        let (Some(key), Some(version_id)) = (record.key.as_ref(), record.version_id.as_deref())
+        else {
+            continue;
+        };
+        if version_id.is_empty() || version_id == "null" {
+            continue;
+        }
+        let is_delete_marker = record.kind == OperationKind::Delete;
+        versions.push(ListedVersionEntry {
+            key: key.clone(),
+            version_id: Some(version_id.to_string()),
+            is_latest: false,
+            is_delete_marker,
+        });
+        latest_by_key.insert(key.clone(), (version_id.to_string(), is_delete_marker));
+    }
+    versions
+        .into_iter()
+        .map(|mut entry| {
+            entry.is_latest = latest_by_key.get(&entry.key).is_some_and(
+                |(latest_version_id, latest_is_delete_marker)| {
+                    entry.version_id.as_deref() == Some(latest_version_id.as_str())
+                        && entry.is_delete_marker == *latest_is_delete_marker
+                },
+            );
+            entry
         })
         .collect()
 }
@@ -545,24 +643,7 @@ pub async fn check_s3_history(
         .sort_by(|left, right| (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id)));
     delete_marker_checks
         .sort_by(|left, right| (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id)));
-    report.passed = report.tenant_recovered
-        && report.missing_committed_objects.is_empty()
-        && report.unavailable_committed_objects.is_empty()
-        && report.unknown_committed_read_failures.is_empty()
-        && report.hash_mismatches.is_empty()
-        && report.successful_corrupted_reads.is_empty()
-        && report.unexpected_visible_deleted_objects.is_empty()
-        && report.unknown_writes_materialized.is_empty()
-        && report.unknown_write_value_conflicts.is_empty()
-        && report.final_list_warning_count == 0
-        && report.committed_writes_missing_version_id_count == 0
-        && report.missing_committed_versions.is_empty()
-        && report.unavailable_committed_versions.is_empty()
-        && report.version_hash_mismatches.is_empty()
-        && report.missing_committed_delete_markers.is_empty()
-        && report.resurrected_deleted_objects.is_empty()
-        && report.delete_marker_lineage_incomplete.is_empty()
-        && report.multipart_upload_lineage_incomplete.is_empty();
+    report.passed = report.success_predicate();
     let checker_records = recorder.records();
     let checker_suffix = checker_records
         .get(initial_records.len()..)
@@ -2791,6 +2872,7 @@ mod tests {
             http_status: Some(200),
             error: None,
             listed_keys: None,
+            listed_versions: None,
             durability_cohort: None,
             fault_window_relation: None,
         }
@@ -2830,6 +2912,7 @@ mod tests {
             size_bytes: Some(keys.len()),
             version_id: None,
             listed_keys: Some(keys.iter().map(|key| key.to_string()).collect()),
+            listed_versions: None,
             payload_ref: None,
             range: None,
             started_at_ms,
@@ -5533,6 +5616,24 @@ mod tests {
         let legacy_report = serde_json::from_value::<CheckerReport>(legacy_body)
             .expect("deserialize checker report without audit");
         assert_eq!(legacy_report.audit, None);
+
+        let mut forged_materialized_write = report.clone();
+        forged_materialized_write
+            .unknown_writes_materialized
+            .push("key: ambiguous write became visible".to_string());
+        assert!(
+            forged_materialized_write.require_success().is_err(),
+            "passed=true cannot hide a materialized ambiguous write"
+        );
+
+        let mut forged_incomplete_multipart = report;
+        forged_incomplete_multipart
+            .multipart_upload_lineage_incomplete
+            .push("mpu: missing committed version id".to_string());
+        assert!(
+            forged_incomplete_multipart.require_success().is_err(),
+            "passed=true cannot hide incomplete multipart lineage"
+        );
     }
 
     fn empty_report() -> CheckerReport {
