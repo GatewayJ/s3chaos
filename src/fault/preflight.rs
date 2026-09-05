@@ -41,6 +41,8 @@ pub enum PreflightStatus {
 #[serde(rename_all = "camelCase")]
 pub struct PreflightSummary {
     pub schema_version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub status: PreflightStatus,
     pub scenario_set: Vec<String>,
     pub checked_at_ms: u64,
@@ -257,6 +259,7 @@ impl PreflightSummary {
     pub fn single_run(
         config: &FaultTestConfig,
         scenario: &str,
+        run_id: &str,
         phases: Vec<PreflightPhase>,
     ) -> Self {
         let status = if phases
@@ -270,6 +273,7 @@ impl PreflightSummary {
 
         Self {
             schema_version: PREFLIGHT_SUMMARY_SCHEMA_VERSION,
+            run_id: Some(run_id.to_string()),
             status,
             scenario_set: vec![scenario.to_string()],
             checked_at_ms: now_ms(),

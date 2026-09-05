@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -26,11 +26,14 @@ use crate::fault::{
         FaultTarget, FaultWorkloadMode,
     },
     reporting::FailureSeverity,
-    scenarios::{FaultScenario, FaultScenarioSpec, apply_catalog_defaults, scenario_spec},
+    scenarios::{
+        FaultDetectorContract, FaultScenario, FaultScenarioSpec, apply_catalog_defaults,
+        scenario_spec,
+    },
     spec::FaultRunArtifactSpec,
     suite::{
-        ResolvedFaultSuite, ResolvedFaultSuiteScenario, ResolvedFaultSuiteWorkloadOverride,
-        resolve_fault_suite_yaml,
+        FaultExpectedFailure, ResolvedFaultSuite, ResolvedFaultSuiteScenario,
+        ResolvedFaultSuiteWorkloadOverride, resolve_fault_suite_yaml,
     },
     workload::{WorkloadHotspot, WorkloadOperationMix, WorkloadPlan, WorkloadSizeClass},
 };
@@ -38,7 +41,7 @@ use crate::fault::{
 pub const FAULT_SUITE_PLAN_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
 pub const FAULT_SUITE_PLAN_KIND: &str = "FaultSuitePlan";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlan {
     #[serde(rename = "apiVersion")]
@@ -57,7 +60,7 @@ pub struct FaultSuitePlan {
     pub attempts: Vec<FaultSuitePlanAttempt>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanCluster {
     pub context: String,
@@ -69,7 +72,7 @@ pub struct FaultSuitePlanCluster {
     pub use_cluster_ip: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanBudgets {
     pub stop_on_first_failure: bool,
@@ -85,10 +88,12 @@ pub struct FaultSuitePlanBudgets {
     pub minimum_required_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanAttempt {
     pub index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub scenario: String,
     pub case_name: String,
     pub repetition: usize,
@@ -97,6 +102,10 @@ pub struct FaultSuitePlanAttempt {
     pub impact_policy: String,
     pub expected_backend: String,
     pub catalog_target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector: Option<FaultDetectorContract>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_failure: Option<FaultExpectedFailure>,
     pub fault_duration_seconds: u64,
     pub workload: FaultSuitePlanWorkload,
     pub faults: Vec<FaultSuitePlanFault>,
@@ -108,7 +117,7 @@ pub struct FaultSuitePlanAttempt {
     pub budget: FaultSuitePlanBudgetImpact,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanWorkload {
     pub mode: String,
@@ -128,14 +137,14 @@ pub struct FaultSuitePlanWorkload {
     pub seed: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanPayloadClass {
     pub size_bytes: usize,
     pub object_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanFault {
     pub name: String,
@@ -151,7 +160,7 @@ pub struct FaultSuitePlanFault {
     pub conflict_domain: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanTarget {
     pub kind: String,
@@ -160,14 +169,14 @@ pub struct FaultSuitePlanTarget {
     pub path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanTargetProof {
     pub required: bool,
     pub artifact: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanSelection {
     pub kind: String,
@@ -175,7 +184,7 @@ pub struct FaultSuitePlanSelection {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanArtifacts {
     pub attempt_dir: String,
@@ -184,7 +193,7 @@ pub struct FaultSuitePlanArtifacts {
     pub event_stream: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaultSuitePlanBudgetImpact {
     pub fault_duration_seconds: u64,
@@ -212,6 +221,7 @@ pub(crate) struct FaultSuiteExpandedAttempt {
 
 struct FaultSuitePlanAttemptInput<'a> {
     index: usize,
+    run_id: String,
     scenario: &'a ResolvedFaultSuiteScenario,
     repetition: usize,
     config: &'a FaultTestConfig,
@@ -233,6 +243,8 @@ pub(crate) fn build_fault_suite_plan_expansion(
     run_id: String,
 ) -> Result<FaultSuitePlanExpansion> {
     validate_suite_runtime_contract(&suite, &base_config)?;
+    base_config.cluster.artifacts_dir = std::path::absolute(&base_config.cluster.artifacts_dir)
+        .context("resolve suite artifact root")?;
     if base_config.workload_seed.is_none() {
         base_config.workload_seed = Some(generated_suite_seed());
     }
@@ -305,6 +317,7 @@ pub(crate) fn build_fault_suite_plan_expansion(
             };
             let plan = FaultSuitePlanAttempt::from_attempt(FaultSuitePlanAttemptInput {
                 index: attempt_index,
+                run_id: fault_run_id(),
                 scenario,
                 repetition,
                 config: &config,
@@ -355,7 +368,62 @@ pub(crate) fn build_fault_suite_plan_expansion(
 
 impl FaultSuitePlan {
     pub fn to_json(&self) -> Result<String> {
+        self.validate_current_contract()?;
         Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    fn validate_current_contract(&self) -> Result<()> {
+        ensure!(
+            self.api_version == FAULT_SUITE_PLAN_API_VERSION && self.kind == FAULT_SUITE_PLAN_KIND,
+            "fault suite plan apiVersion/kind is unsupported"
+        );
+        let mut run_ids = BTreeSet::new();
+        for attempt in &self.attempts {
+            let run_id = attempt.run_id.as_deref().with_context(|| {
+                format!(
+                    "current fault suite plan attempt {} ({}) is missing runId",
+                    attempt.index, attempt.scenario
+                )
+            })?;
+            ensure!(
+                parse_fault_run_id(run_id).is_some(),
+                "current fault suite plan attempt {} ({}) has invalid runId {:?}",
+                attempt.index,
+                attempt.scenario,
+                run_id
+            );
+            ensure!(
+                run_ids.insert(run_id),
+                "current fault suite plan contains duplicate attempt runId {:?}",
+                run_id
+            );
+            attempt
+                .detector
+                .as_ref()
+                .with_context(|| {
+                    format!(
+                        "current fault suite plan attempt {} ({}) is missing detector contract",
+                        attempt.index, attempt.scenario
+                    )
+                })?
+                .validate()
+                .with_context(|| {
+                    format!(
+                        "current fault suite plan attempt {} ({}) has invalid detector contract",
+                        attempt.index, attempt.scenario
+                    )
+                })?;
+            let catalog = scenario_spec(&attempt.scenario)?;
+            ensure!(
+                attempt.detector.as_ref() == Some(&catalog.detector.contract()),
+                "current fault suite plan detector contract does not match scenario {}",
+                attempt.scenario
+            );
+            if let Some(expected) = &attempt.expected_failure {
+                expected.validate(&attempt.scenario)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -408,6 +476,7 @@ impl FaultSuitePlanAttempt {
 
         Ok(Self {
             index: input.index,
+            run_id: Some(input.run_id),
             scenario: input.scenario.name.clone(),
             case_name: input.spec.case_name.to_string(),
             repetition: input.repetition,
@@ -416,6 +485,8 @@ impl FaultSuitePlanAttempt {
             impact_policy: input.spec.impact_policy.as_str().to_string(),
             expected_backend: input.spec.backend.as_str().to_string(),
             catalog_target: input.spec.target.to_string(),
+            detector: Some(input.spec.detector.contract()),
+            expected_failure: input.scenario.expected_failure.clone(),
             fault_duration_seconds: input.config.duration.as_secs(),
             workload: FaultSuitePlanWorkload {
                 mode: workload_mode_name(input.fault_plan.workload_mode).to_string(),
@@ -667,6 +738,14 @@ pub(crate) fn suite_run_id() -> String {
     format!("suite-{}", Uuid::new_v4())
 }
 
+pub(crate) fn fault_run_id() -> String {
+    format!("run-{}", Uuid::new_v4())
+}
+
+fn parse_fault_run_id(value: &str) -> Option<Uuid> {
+    Uuid::parse_str(value.strip_prefix("run-")?).ok()
+}
+
 fn generated_suite_seed() -> u64 {
     let bytes = *Uuid::new_v4().as_bytes();
     u64::from_le_bytes(
@@ -706,11 +785,17 @@ mod tests {
             .expect("resolved suite template");
         let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
         base.workload_seed = Some(100);
-        base.cluster.artifacts_dir = PathBuf::from("target/fault-tests/artifacts");
+        base.cluster.artifacts_dir = PathBuf::from("/fixture/fault-tests/artifacts");
 
         let expansion = build_fault_suite_plan_expansion(suite, base, "suite-fixed".to_string())
             .expect("suite plan expansion");
-        let plan = serde_json::to_value(&expansion.plan).expect("plan json");
+        let mut plan = serde_json::to_value(&expansion.plan).expect("plan json");
+        for attempt in plan["attempts"].as_array_mut().expect("plan attempts") {
+            attempt
+                .as_object_mut()
+                .expect("plan attempt")
+                .remove("runId");
+        }
         let required_artifacts = json!([
             "run-spec.yaml",
             "run-spec.json",
@@ -759,7 +844,6 @@ mod tests {
         let target_proof = json!([
             "run artifacts must include the selected Kubernetes object or host device identity before the fault is activated"
         ]);
-
         assert_eq!(
             plan,
             json!({
@@ -768,7 +852,7 @@ mod tests {
                 "suite": "rustfs-smoke",
                 "runId": "suite-fixed",
                 "suiteSeed": 100,
-                "artifactRoot": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed",
+                "artifactRoot": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed",
                 "cluster": {
                     "context": "real-cluster",
                     "namespace": "rustfs-fault-test",
@@ -806,6 +890,11 @@ mod tests {
                         "impactPolicy": "client-disruption-required",
                         "expectedBackend": "chaos-mesh-io-chaos",
                         "catalogTarget": "one RustFS container data volume selected by tenant label and configured RustFS volume path",
+                        "detector": {
+                            "revision": 1,
+                            "qualification": "gate-candidate",
+                            "detects": ["data-shard-loss", "silent-data-corruption"]
+                        },
                         "faultDurationSeconds": 600,
                         "workload": {
                             "mode": "s3-mixed",
@@ -853,8 +942,8 @@ mod tests {
                         "crds": ["iochaos.chaos-mesh.org"],
                         "requiredTools": [],
                         "artifacts": {
-                            "attemptDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1",
-                            "caseDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1/fault_io_eio_preserves_committed_objects",
+                            "attemptDir": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1",
+                            "caseDir": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1/fault_io_eio_preserves_committed_objects",
                             "required": required_artifacts.clone(),
                             "eventStream": "run-events.jsonl"
                         },
@@ -877,6 +966,11 @@ mod tests {
                         "impactPolicy": "client-disruption-optional",
                         "expectedBackend": "chaos-mesh-network-chaos",
                         "catalogTarget": "one RustFS Pod selected by tenant label with delayed peer traffic inside the e2e namespace",
+                        "detector": {
+                            "revision": 1,
+                            "qualification": "gate-candidate",
+                            "detects": ["silent-data-corruption", "recovery-availability-regression"]
+                        },
                         "faultDurationSeconds": 480,
                         "workload": {
                             "mode": "s3-mixed",
@@ -926,8 +1020,8 @@ mod tests {
                         "crds": ["networkchaos.chaos-mesh.org"],
                         "requiredTools": [],
                         "artifacts": {
-                            "attemptDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1",
-                            "caseDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1/fault_network_delay_preserves_object_model",
+                            "attemptDir": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1",
+                            "caseDir": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1/fault_network_delay_preserves_object_model",
                             "required": required_artifacts,
                             "eventStream": "run-events.jsonl"
                         },
@@ -945,13 +1039,137 @@ mod tests {
         );
         assert_eq!(
             expansion.attempts[0].config.cluster.artifacts_dir,
-            PathBuf::from("target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1")
+            PathBuf::from("/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1")
         );
         assert_eq!(
             expansion.attempts[1].config.cluster.artifacts_dir,
             PathBuf::from(
-                "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1"
+                "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1"
             )
+        );
+    }
+
+    #[test]
+    fn suite_plan_preserves_expected_failure_and_detector_contracts() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: vulnerable-mode-calibration
+scenarios:
+  - name: io-eio
+    expectedFailure:
+      classification: data_corruption
+      severity: fail_correctness
+      responsibilityDomain: product
+      evidenceRefs:
+        - checker-report.json
+        - fault-evidence.json
+        - run-events.jsonl
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+
+        let expansion = build_fault_suite_plan_expansion(suite, base, "suite-fixed".to_string())
+            .expect("suite plan expansion");
+        let attempt = &expansion.plan.attempts[0];
+
+        assert!(
+            attempt
+                .run_id
+                .as_deref()
+                .and_then(super::parse_fault_run_id)
+                .is_some()
+        );
+        assert!(
+            expansion.plan.attempts[1..]
+                .iter()
+                .all(|other| other.run_id != attempt.run_id)
+        );
+        assert_eq!(
+            attempt.detector.as_ref(),
+            Some(&expansion.suite.scenarios[0].detector)
+        );
+        assert_eq!(
+            attempt.expected_failure,
+            expansion.suite.scenarios[0].expected_failure
+        );
+        let json = serde_json::to_value(attempt).expect("attempt json");
+        assert_eq!(json["runId"], attempt.run_id.as_deref().expect("run id"));
+        assert_eq!(json["expectedFailure"]["classification"], "data_corruption");
+        assert_eq!(
+            json["expectedFailure"]["evidenceRefs"],
+            json!([
+                "checker-report.json",
+                "fault-evidence.json",
+                "run-events.jsonl"
+            ])
+        );
+        assert_eq!(json["detector"]["detects"][0], "data-shard-loss");
+        let encoded = expansion.plan.to_json().expect("plan json");
+        let decoded = serde_json::from_str::<super::FaultSuitePlan>(&encoded).expect("plan decode");
+        assert_eq!(decoded, expansion.plan);
+        let mut changed = decoded.clone();
+        changed.attempts[0]
+            .detector
+            .as_mut()
+            .expect("detector")
+            .detects
+            .clear();
+        changed.attempts[0]
+            .detector
+            .as_mut()
+            .expect("detector")
+            .detects
+            .push(crate::fault::scenarios::DurabilityBugFamily::CommitMetadataLoss);
+        assert!(
+            changed
+                .to_json()
+                .unwrap_err()
+                .to_string()
+                .contains("does not match scenario")
+        );
+
+        let mut legacy = serde_json::to_value(&decoded).expect("legacy plan json");
+        for attempt in legacy["attempts"]
+            .as_array_mut()
+            .expect("legacy plan attempts")
+        {
+            attempt
+                .as_object_mut()
+                .expect("legacy plan attempt")
+                .remove("detector");
+            attempt
+                .as_object_mut()
+                .expect("legacy plan attempt")
+                .remove("runId");
+        }
+        let legacy = serde_json::from_value::<super::FaultSuitePlan>(legacy)
+            .expect("legacy v1alpha1 plan without detector must remain readable");
+        assert!(
+            legacy
+                .attempts
+                .iter()
+                .all(|attempt| attempt.detector.is_none())
+        );
+        assert!(
+            legacy
+                .attempts
+                .iter()
+                .all(|attempt| attempt.run_id.is_none())
+        );
+        assert!(
+            legacy.validate_current_contract().is_err(),
+            "new plan validation must still require detector contracts"
+        );
+        assert!(
+            legacy.to_json().is_err(),
+            "new plan writer must not emit a detector-less plan"
         );
     }
 
@@ -983,7 +1201,7 @@ scenarios:
             multipart: 1,
         };
         let attempt_dir =
-            PathBuf::from("target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1");
+            PathBuf::from("/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1");
 
         let config = scenario_config(&base, &suite, &suite.scenarios[0], 1, 1, &attempt_dir)
             .expect("scenario config");

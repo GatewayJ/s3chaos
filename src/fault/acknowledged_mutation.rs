@@ -868,6 +868,7 @@ mod tests {
         ended_at_ms: u64,
     ) -> OperationRecord {
         OperationRecord {
+            run_id: None,
             id: "op-000042".to_string(),
             scenario: "ack-trigger-test".to_string(),
             kind,

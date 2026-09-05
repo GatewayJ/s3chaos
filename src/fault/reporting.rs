@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -51,6 +51,7 @@ pub(crate) struct PodIdentity {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct FaultEvidence {
     pub(crate) scenario: String,
+    pub(crate) run_id: String,
     pub(crate) backend: String,
     pub(crate) target: String,
     pub(crate) injected: bool,
@@ -236,8 +237,9 @@ pub enum AvailabilityStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FailureClassification {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClassification {
     RecoveryTailReadLatency,
     CommittedObjectUnavailable,
     CommittedVersionMissing,
@@ -312,7 +314,7 @@ impl FailureClassification {
             .find(|classification| classification.as_str() == name)
     }
 
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::RecoveryTailReadLatency => "recovery_tail_read_latency",
             Self::CommittedObjectUnavailable => "committed_object_unavailable",
@@ -348,7 +350,7 @@ impl FailureClassification {
         }
     }
 
-    pub(crate) const fn is_s3_model(self) -> bool {
+    pub const fn is_s3_model(self) -> bool {
         matches!(
             self,
             Self::RecoveryTailReadLatency
@@ -367,7 +369,7 @@ impl FailureClassification {
         )
     }
 
-    const fn responsibility_domain(self) -> ResponsibilityDomain {
+    pub const fn responsibility_domain(self) -> ResponsibilityDomain {
         match self {
             Self::RecoveryTailReadLatency
             | Self::CommittedObjectUnavailable
@@ -399,6 +401,42 @@ impl FailureClassification {
             | Self::EnvironmentOrWorkload
             | Self::WorkloadOrProduct
             | Self::NoSignal => ResponsibilityDomain::Unknown,
+        }
+    }
+
+    pub const fn severity(self) -> FailureSeverity {
+        match self {
+            Self::RecoveryTailReadLatency => FailureSeverity::Degraded,
+            Self::CommittedObjectUnavailable
+            | Self::CommittedVersionUnavailable
+            | Self::ListUnavailableOrUnknown => FailureSeverity::FailAvailability,
+            Self::CommittedVersionMissing
+            | Self::VersionHashMismatch
+            | Self::DeleteMarkerMissing
+            | Self::DeletedObjectResurrected
+            | Self::DataCorruption => FailureSeverity::FailCorrectness,
+            Self::HarnessError
+            | Self::TestHarness
+            | Self::TestOrEnvironment
+            | Self::EnvironmentOrFaultBackend => FailureSeverity::Infra,
+            Self::AmbiguousWriteMaterialized
+            | Self::DeleteMarkerLineageIncomplete
+            | Self::VersionIdMissingOnCommittedWrite
+            | Self::MultipartUploadLineageIncomplete
+            | Self::WorkloadExecutionError
+            | Self::ArtifactValidationFailed
+            | Self::CheckerExecutionError
+            | Self::PreflightFailed
+            | Self::HealthGuardFailed
+            | Self::FaultBackendUnavailable
+            | Self::FaultNotActive
+            | Self::FaultNotRecovered
+            | Self::Unknown
+            | Self::CheckerOrEnvironment
+            | Self::ProductOrEnvironment
+            | Self::EnvironmentOrWorkload
+            | Self::WorkloadOrProduct
+            | Self::NoSignal => FailureSeverity::NeedsInvestigation,
         }
     }
 }
@@ -459,6 +497,8 @@ pub(crate) struct FailureSummary {
     #[serde(default = "legacy_failure_summary_schema_version")]
     schema_version: u8,
     scenario: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     case_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -497,6 +537,23 @@ pub(crate) struct FailureSummary {
 }
 
 impl FailureSummary {
+    pub(crate) fn validate_classification_projection(&self) -> Result<()> {
+        let classification = FailureClassification::from_name(&self.classification)
+            .context("failure-summary.json has an unknown classification")?;
+        let details = FailureClassificationDetails::from_classification(classification);
+        ensure!(
+            self.severity == details.severity
+                && self.data_correctness == details.data_correctness
+                && self.availability == details.availability
+                && self.data_loss == details.data_loss
+                && self.corruption == details.corruption
+                && self.recovered_within_window == details.recovered_within_window,
+            "failure-summary.json outcome fields contradict classification {}",
+            self.classification
+        );
+        Ok(())
+    }
+
     pub(crate) fn new(
         scenario: impl Into<String>,
         stage: impl Into<String>,
@@ -543,6 +600,7 @@ impl FailureSummary {
         let projection = FailureV2Projection::from_classification(classification);
         Self {
             schema_version: FAILURE_SUMMARY_SCHEMA_VERSION,
+            run_id: None,
             scenario: scenario.into(),
             case_name: None,
             observed_at_ms: Some(now_ms()),
@@ -566,6 +624,11 @@ impl FailureSummary {
             recovered_within_seconds: None,
             message: message.into(),
         }
+    }
+
+    pub(crate) fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
     }
 
     fn with_case_name(mut self, case_name: &str) -> Self {
@@ -785,7 +848,7 @@ impl FailureClassificationDetails {
     fn from_classification(classification: FailureClassification) -> Self {
         match classification {
             FailureClassification::RecoveryTailReadLatency => Self {
-                severity: FailureSeverity::Degraded,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Passed,
                 availability: AvailabilityStatus::RecoveredAfterTailLatency,
                 data_loss: Some(false),
@@ -793,7 +856,7 @@ impl FailureClassificationDetails {
                 recovered_within_window: Some(true),
             },
             FailureClassification::CommittedObjectUnavailable => Self {
-                severity: FailureSeverity::FailAvailability,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::CommittedObjectUnavailable,
                 data_loss: None,
@@ -837,7 +900,7 @@ impl FailureClassificationDetails {
                 recovered_within_window: None,
             },
             FailureClassification::ListUnavailableOrUnknown => Self {
-                severity: FailureSeverity::FailAvailability,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::ListUnavailableOrUnknown,
                 data_loss: None,
@@ -845,7 +908,7 @@ impl FailureClassificationDetails {
                 recovered_within_window: Some(false),
             },
             FailureClassification::DataCorruption => Self {
-                severity: FailureSeverity::FailCorrectness,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Failed,
                 availability: AvailabilityStatus::Unknown,
                 data_loss: None,
@@ -853,7 +916,7 @@ impl FailureClassificationDetails {
                 recovered_within_window: None,
             },
             FailureClassification::AmbiguousWriteMaterialized => Self {
-                severity: FailureSeverity::NeedsInvestigation,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::Unknown,
                 data_loss: None,
@@ -864,7 +927,7 @@ impl FailureClassificationDetails {
             | FailureClassification::TestHarness
             | FailureClassification::TestOrEnvironment
             | FailureClassification::EnvironmentOrFaultBackend => Self {
-                severity: FailureSeverity::Infra,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::Unknown,
                 data_loss: None,
@@ -885,7 +948,7 @@ impl FailureClassificationDetails {
             | FailureClassification::EnvironmentOrWorkload
             | FailureClassification::WorkloadOrProduct
             | FailureClassification::NoSignal => Self {
-                severity: FailureSeverity::NeedsInvestigation,
+                severity: classification.severity(),
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::Unknown,
                 data_loss: None,

@@ -230,10 +230,11 @@ guardrails when implementing the ordered TODO below.
 
 ### 2. Add Detector Calibration Before New Destructive Scenarios
 
-- [ ] TODO: Add catalog metadata for detector calibration.
-  Meaning: every durability scenario that can be used as a green gate must
-  declare what bug family it detects, for example
-  `detects=[commit-metadata-loss]` or `detects=[data-shard-loss]`.
+- [x] DONE: Add catalog metadata for detector calibration.
+  Meaning: every catalog scenario declares typed `detects` bug families and is
+  explicitly qualified as a `gate-candidate` or `diagnostic-only` detector.
+  Catalog validation rejects empty or duplicate families. `gate-candidate`
+  does not mean calibrated; the live calibration ladder remains required.
 
 - [ ] TODO: Implement the durability-mode calibration ladder.
   Meaning: run each detector against RustFS modes/images where the expected
@@ -247,11 +248,13 @@ guardrails when implementing the ordered TODO below.
   classification, and artifact validation. Missing signal is `no_signal` or
   harness/backend failure, not PASS.
 
-- [ ] TODO: Add explicit expected-failure semantics for diagnostic suites.
-  Meaning: P+1/quorum and vulnerable-mode calibration may legitimately exit
-  non-zero. The catalog and suite summary need expected classification,
-  severity, responsibility domain, and evidence refs before those runs can count
-  as passing gates.
+- [x] DONE: Add explicit expected-failure semantics for diagnostic suites.
+  Meaning: a suite scenario may declare a typed product classification,
+  severity, responsibility domain, and required evidence refs. The suite
+  summary accepts the non-zero attempt only when its validated failure summary
+  matches every field and all required evidence exists. Success, `no_signal`,
+  missing summaries, infra/backend failures, and missing evidence remain suite
+  failures.
 
 ### 3. Correct The Soft-Power-Loss Fault Model
 
@@ -416,8 +419,9 @@ Reporting only projects this typed checker result into failure-summary fields.
 
 - [ ] TODO: Add `quorum-p-io-fault` and `quorum-p-plus-one-io-fault`.
   Meaning: these target exactly P and P+1 volumes in one erasure set with
-  same-set proof. P is expected to survive; P+1 is release-candidate or
-  diagnostic until expected-failure semantics exist.
+  same-set proof. P is expected to survive; P+1 may be a release candidate or
+  an explicitly expected-failure diagnostic, but both still require executable
+  targeting and live calibration evidence.
 
 ### 9. Fix Heal-Family Oracle Blind Spots
 

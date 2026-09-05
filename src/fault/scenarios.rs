@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, ensure};
-use serde::Serialize;
+use anyhow::{Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::fault::{
@@ -203,6 +203,105 @@ pub enum FaultImpactPolicy {
     ClientDisruptionOptional,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DurabilityBugFamily {
+    CommitMetadataLoss,
+    DataShardLoss,
+    SilentDataCorruption,
+    VersionLineageLoss,
+    QuorumViolation,
+    RecoveryAvailabilityRegression,
+    HealRegression,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DetectorQualification {
+    GateCandidate,
+    DiagnosticOnly,
+}
+
+pub const FAULT_DETECTOR_CONTRACT_REVISION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FaultDetectorSpec {
+    pub qualification: DetectorQualification,
+    pub detects: &'static [DurabilityBugFamily],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaultDetectorContract {
+    pub revision: u8,
+    pub qualification: DetectorQualification,
+    pub detects: Vec<DurabilityBugFamily>,
+}
+
+impl FaultDetectorContract {
+    pub fn validate(&self) -> Result<()> {
+        match self.revision {
+            1 => self.validate_revision_1(),
+            revision => {
+                bail!("fault detector revision {revision} is unsupported; supported revisions: 1")
+            }
+        }
+    }
+
+    fn validate_revision_1(&self) -> Result<()> {
+        ensure!(
+            !self.detects.is_empty(),
+            "fault detector must declare at least one durability bug family"
+        );
+        ensure!(
+            self.detects.windows(2).all(|pair| pair[0] < pair[1]),
+            "fault detector bug families must be a sorted unique canonical set"
+        );
+        Ok(())
+    }
+}
+
+impl FaultDetectorSpec {
+    const fn gate_candidate(detects: &'static [DurabilityBugFamily]) -> Self {
+        Self {
+            qualification: DetectorQualification::GateCandidate,
+            detects,
+        }
+    }
+
+    const fn diagnostic_only(detects: &'static [DurabilityBugFamily]) -> Self {
+        Self {
+            qualification: DetectorQualification::DiagnosticOnly,
+            detects,
+        }
+    }
+
+    fn validate(self, scenario: &str) -> Result<()> {
+        ensure!(
+            !self.detects.is_empty(),
+            "fault scenario {scenario} detector must declare at least one durability bug family"
+        );
+        let mut normalized = self.detects.to_vec();
+        normalized.sort();
+        normalized.dedup();
+        ensure!(
+            normalized.len() == self.detects.len(),
+            "fault scenario {scenario} detector contains duplicate durability bug families"
+        );
+        Ok(())
+    }
+
+    pub fn contract(self) -> FaultDetectorContract {
+        let mut detects = self.detects.to_vec();
+        detects.sort();
+        detects.dedup();
+        FaultDetectorContract {
+            revision: FAULT_DETECTOR_CONTRACT_REVISION,
+            qualification: self.qualification,
+            detects,
+        }
+    }
+}
+
 impl FaultImpactPolicy {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -225,6 +324,7 @@ pub struct FaultScenarioSpec {
     pub backend: FaultBackend,
     pub status: FaultScenarioStatus,
     pub workload_profile: FaultScenarioWorkloadProfile,
+    pub detector: FaultDetectorSpec,
     pub isolation: FaultIsolation,
     pub crds: &'static [&'static str],
     pub required_tools: &'static [&'static str],
@@ -301,6 +401,10 @@ fn versioned_hot_payload_distribution() -> WorkloadPayloadDistribution {
 pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     FaultScenarioSpec {
         scenario: IO_EIO_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
         case_name: "fault_io_eio_preserves_committed_objects",
         description: "Inject Chaos Mesh IOChaos EIO into one RustFS data volume and verify committed S3 objects remain readable with matching hashes after recovery.",
         priority: FaultPriority::P0,
@@ -323,6 +427,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: POD_KILL_ONE_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
         case_name: "fault_pod_kill_one_preserves_committed_objects",
         description: "Inject Chaos Mesh PodChaos against one RustFS Pod and verify StatefulSet recovery preserves committed S3 objects.",
         priority: FaultPriority::P0,
@@ -345,6 +453,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: NETWORK_PARTITION_ONE_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
         case_name: "fault_network_partition_one_preserves_committed_objects",
         description: "Inject Chaos Mesh NetworkChaos that partitions one RustFS Pod from its peers and verify recovery does not lose or corrupt committed objects.",
         priority: FaultPriority::P1,
@@ -367,6 +479,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::QuorumViolation,
+            DurabilityBugFamily::CommitMetadataLoss,
+        ]),
         case_name: "fault_network_partition_write_quorum_loss_preserves_committed_state",
         description: "Partition two of the four RustFS Pods from all peers at once after a bounded-age RustFS admin runtime snapshot proves their server/drive membership in one symmetric erasure set, driving the cluster below write quorum while read quorum can survive, and verify committed state is intact after heal.",
         priority: FaultPriority::P1,
@@ -392,6 +508,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: NETWORK_DELAY_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
         case_name: "fault_network_delay_preserves_object_model",
         description: "Inject NetworkChaos delay into one RustFS Pod peer path and verify the S3 object model remains explainable.",
         priority: FaultPriority::P1,
@@ -414,6 +534,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: NETWORK_LOSS_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
         case_name: "fault_network_loss_preserves_object_model",
         description: "Inject NetworkChaos packet loss into one RustFS Pod peer path and verify object-model correctness after recovery.",
         priority: FaultPriority::P1,
@@ -436,6 +560,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: NETWORK_CORRUPT_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[DurabilityBugFamily::SilentDataCorruption]),
         case_name: "fault_network_corrupt_preserves_object_model",
         description: "Inject NetworkChaos packet corruption into one RustFS Pod peer path and verify successful S3 reads never return corrupt bytes.",
         priority: FaultPriority::P1,
@@ -458,6 +583,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: NETWORK_DUPLICATE_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[DurabilityBugFamily::SilentDataCorruption]),
         case_name: "fault_network_duplicate_preserves_object_model",
         description: "Inject NetworkChaos packet duplication into one RustFS Pod peer path and verify object-model correctness after recovery.",
         priority: FaultPriority::P1,
@@ -480,6 +606,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: IO_READ_MISTAKE_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[DurabilityBugFamily::SilentDataCorruption]),
         case_name: "fault_io_read_mistake_rejects_corrupt_reads",
         description: "Inject Chaos Mesh IOChaos mistake on RustFS read paths and verify RustFS never returns corrupt object bytes as successful S3 reads.",
         priority: FaultPriority::P1,
@@ -502,6 +629,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: IO_LATENCY_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
         case_name: "fault_io_latency_preserves_object_model",
         description: "Inject Chaos Mesh IOChaos latency on RustFS data paths and verify delayed storage does not corrupt the S3 object model.",
         priority: FaultPriority::P1,
@@ -524,6 +655,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: DISK_FULL_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::DataShardLoss,
+        ]),
         case_name: "fault_disk_full_preserves_committed_objects",
         description: "Inject ENOSPC on writes to one RustFS data volume and verify committed objects survive storage pressure and recovery.",
         priority: FaultPriority::P1,
@@ -546,6 +681,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: POD_FAILURE_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
         case_name: "fault_pod_failure_preserves_object_model",
         description: "Inject Chaos Mesh PodChaos pod-failure against one RustFS Pod and verify object-model correctness after recovery.",
         priority: FaultPriority::P1,
@@ -568,6 +707,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: STRESS_CPU_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
         case_name: "fault_stress_cpu_preserves_object_model",
         description: "Inject Chaos Mesh CPU StressChaos into one RustFS Pod and verify object-model correctness under resource pressure.",
         priority: FaultPriority::P1,
@@ -590,6 +733,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: STRESS_MEMORY_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
         case_name: "fault_stress_memory_preserves_object_model",
         description: "Inject Chaos Mesh memory StressChaos into one RustFS Pod and verify object-model correctness under memory pressure.",
         priority: FaultPriority::P1,
@@ -612,6 +759,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: DM_FLAKEY_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
         case_name: "fault_dm_flakey_preserves_committed_objects",
         description: "Use a device-mapper flakey or error target for a dedicated test volume and verify RustFS handles block-device instability without data corruption.",
         priority: FaultPriority::P3,
@@ -637,6 +788,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: DM_FLAKEY_VERSIONED_HOT_SCENARIO,
+        detector: FaultDetectorSpec::diagnostic_only(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::VersionLineageLoss,
+        ]),
         case_name: "fault_dm_flakey_versioned_hot_preserves_version_lineage",
         description: "Exercise a single-volume soft-power-loss durability proxy: silently drop block writes, crash the owning Pod, unmount to discard cached state, restore and remount the device, then verify versioned hot-key lineage after recovery.",
         priority: FaultPriority::P1,
@@ -665,6 +820,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: POD_CRASH_VERSIONED_HOT_SCENARIO,
+        detector: FaultDetectorSpec::diagnostic_only(&[
+            DurabilityBugFamily::VersionLineageLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
         case_name: "fault_pod_crash_versioned_hot_preserves_version_lineage",
         description: "Negative-control recovery test: kill one RustFS Pod while forcing versioned hot-key overwrite/delete/MPU checks; single-Pod loss stays within EC redundancy, so a green run validates recovery plumbing but is not physical-durability evidence.",
         priority: FaultPriority::P1,
@@ -691,6 +850,9 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: WARP_UNDER_CHAOS_SCENARIO,
+        detector: FaultDetectorSpec::diagnostic_only(&[
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
         case_name: "fault_warp_under_chaos_reports_performance_separately",
         description: "Run MinIO Warp during a selected chaos scenario while keeping performance output separate from the correctness verdict.",
         priority: FaultPriority::P3,
@@ -713,6 +875,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: QUORUM_P_IO_FAULT_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
         case_name: "fault_quorum_p_io_fault_preserves_read_quorum",
         description: "Planned quorum-targeted reliability flow: inject storage faults into exactly P volumes of one RustFS erasure set and verify reads survive at read quorum.",
         priority: FaultPriority::P0,
@@ -738,6 +904,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::QuorumViolation,
+            DurabilityBugFamily::CommitMetadataLoss,
+        ]),
         case_name: "fault_quorum_p_plus_one_io_fault_rejects_past_write_quorum",
         description: "Planned quorum-targeted reliability flow: inject storage faults into exactly P+1 volumes of one RustFS erasure set and verify writes fail cleanly past quorum.",
         priority: FaultPriority::P0,
@@ -763,6 +933,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: FRESH_VOLUME_REPLACEMENT_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::HealRegression,
+        ]),
         case_name: "fault_fresh_volume_replacement_heals_empty_disk",
         description: "Planned fresh-volume replacement flow: replace one RustFS volume with an empty disk and verify format plus data heal converges without corruption.",
         priority: FaultPriority::P0,
@@ -788,6 +962,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: ADMIN_HEAL_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::HealRegression,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
         case_name: "fault_admin_heal_converges_without_corruption",
         description: "Planned admin operation flow: drive RustFS heal while workload/checker verdicts remain owned by the fault-test harness.",
         priority: FaultPriority::P1,
@@ -813,6 +991,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: ADMIN_DECOMMISSION_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::HealRegression,
+        ]),
         case_name: "fault_admin_decommission_preserves_object_model",
         description: "Planned admin operation flow: decommission a pool or target set under continuous workload after a multi-pool Tenant shape exists.",
         priority: FaultPriority::P1,
@@ -838,6 +1020,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: ADMIN_REBALANCE_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::HealRegression,
+        ]),
         case_name: "fault_admin_rebalance_preserves_object_model",
         description: "Planned admin operation flow: run RustFS rebalance under continuous workload after the topology adapter can prove the target scope.",
         priority: FaultPriority::P1,
@@ -863,6 +1049,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: ON_DISK_BITROT_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::SilentDataCorruption,
+            DurabilityBugFamily::HealRegression,
+        ]),
         case_name: "fault_on_disk_bitrot_is_rejected_and_healed",
         description: "Planned on-disk bitrot flow: flip bytes inside a shard file on the host volume and verify the read path rejects corruption before heal repairs it.",
         priority: FaultPriority::P0,
@@ -888,6 +1078,12 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     },
     FaultScenarioSpec {
         scenario: LONG_RUN_CHAOS_CAMPAIGN_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::VersionLineageLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
         case_name: "fault_long_run_chaos_campaign_detects_leaks",
         description: "Planned long-run campaign mode: repeat fault rounds under one continuous workload with periodic full verification and process trend gates.",
         priority: FaultPriority::P2,
@@ -1010,6 +1206,9 @@ pub fn executable_scenario_catalog() -> impl Iterator<Item = &'static FaultScena
 }
 
 pub fn scenario_catalog_json() -> Result<String> {
+    for spec in scenario_catalog() {
+        spec.detector.validate(spec.scenario)?;
+    }
     Ok(serde_json::to_string_pretty(scenario_catalog())?)
 }
 
@@ -1026,7 +1225,7 @@ pub fn expected_workload_versioning_for_scenario(scenario: &str, env_value: bool
 }
 
 pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
-    FAULT_SCENARIO_CATALOG
+    let spec = FAULT_SCENARIO_CATALOG
         .iter()
         .find(|scenario| scenario.scenario == name)
         .ok_or_else(|| {
@@ -1036,17 +1235,20 @@ pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
                 .collect::<Vec<_>>()
                 .join(", ");
             anyhow::anyhow!("unsupported fault scenario {name:?}; catalog contains: {supported}")
-        })
+        })?;
+    spec.detector.validate(spec.scenario)?;
+    Ok(spec)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultParameterSchema, FaultScenario, FaultScenarioStatus,
+        DM_FLAKEY_VERSIONED_HOT_SCENARIO, DetectorQualification, DurabilityBugFamily,
+        FaultDetectorContract, FaultParameterSchema, FaultScenario, FaultScenarioStatus,
         FaultScenarioWorkloadProfile, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO,
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
         POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
-        apply_catalog_defaults, executable_scenario_catalog,
+        WARP_UNDER_CHAOS_SCENARIO, apply_catalog_defaults, executable_scenario_catalog,
         expected_workload_versioning_for_scenario, scenario_catalog, scenario_catalog_json,
         scenario_spec,
     };
@@ -1279,6 +1481,10 @@ mod tests {
             assert!(names.insert(scenario.scenario));
             assert!(case_names.insert(scenario.case_name));
             assert!(!scenario.description.is_empty());
+            scenario
+                .detector
+                .validate(scenario.scenario)
+                .expect("valid detector contract");
             assert_eq!(
                 scenario.percent_supported,
                 scenario.backend.accepts_percent()
@@ -1294,6 +1500,48 @@ mod tests {
     }
 
     #[test]
+    fn catalog_marks_negative_controls_as_diagnostic_only() {
+        for name in [
+            DM_FLAKEY_VERSIONED_HOT_SCENARIO,
+            POD_CRASH_VERSIONED_HOT_SCENARIO,
+            WARP_UNDER_CHAOS_SCENARIO,
+        ] {
+            let detector = scenario_spec(name).expect("scenario").detector;
+            assert_eq!(
+                detector.qualification,
+                DetectorQualification::DiagnosticOnly
+            );
+            assert!(!detector.detects.is_empty());
+        }
+        assert!(
+            scenario_spec(DM_FLAKEY_VERSIONED_HOT_SCENARIO)
+                .expect("scenario")
+                .detector
+                .detects
+                .contains(&DurabilityBugFamily::CommitMetadataLoss)
+        );
+    }
+
+    #[test]
+    fn detector_contract_keeps_revision_one_and_rejects_unknown_revisions() {
+        let revision_one = FaultDetectorContract {
+            revision: 1,
+            qualification: DetectorQualification::GateCandidate,
+            detects: vec![DurabilityBugFamily::SilentDataCorruption],
+        };
+        revision_one
+            .validate()
+            .expect("revision 1 remains supported");
+
+        let unknown = FaultDetectorContract {
+            revision: 2,
+            ..revision_one
+        };
+        let error = unknown.validate().expect_err("unknown revision");
+        assert!(error.to_string().contains("supported revisions: 1"));
+    }
+
+    #[test]
     fn catalog_exports_machine_readable_json() {
         let json = scenario_catalog_json().expect("catalog json");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
@@ -1306,5 +1554,7 @@ mod tests {
         assert!(json.contains("\"target_proof\""));
         assert!(json.contains("\"crds\""));
         assert!(json.contains("\"impact_policy\""));
+        assert!(json.contains("\"qualification\": \"gate-candidate\""));
+        assert!(json.contains("\"data-shard-loss\""));
     }
 }

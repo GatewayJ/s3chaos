@@ -47,13 +47,15 @@ use crate::{
         },
         reporting::{
             FailureSummary, FaultEvidence, FaultStatusSnapshot, PodIdentity, RunMetadata,
-            write_checker_error, write_failure_summary, write_failure_summary_if_absent,
+            write_checker_error, write_failure_summary as persist_failure_summary,
+            write_failure_summary_if_absent,
         },
         scenarios::{
             self, FaultBackend, FaultIsolation, FaultScenario, FaultScenarioSpec,
             NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
         },
         spec::FaultRunSpec,
+        suite_plan::fault_run_id,
         workload::{
             ObjectSpec, S3WorkloadClient, StagedMultipartUpload, WorkloadOperation, WorkloadPlan,
             sha256_hex, wait_for_s3_endpoint,
@@ -99,12 +101,13 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
 
 pub async fn run_scenario_with_config(config: FaultTestConfig) -> Result<()> {
     let reference_root = config.cluster.artifacts_dir.clone();
-    run_scenario_with_config_and_reference_root(config, reference_root).await
+    run_scenario_with_config_and_reference_root(config, reference_root, fault_run_id()).await
 }
 
 pub(crate) async fn run_scenario_with_config_and_reference_root(
     mut config: FaultTestConfig,
     reference_root: impl Into<PathBuf>,
+    run_id: String,
 ) -> Result<()> {
     scenarios::apply_catalog_defaults(&mut config)?;
     let scenario = FaultScenario::from_config(&config)?;
@@ -124,13 +127,14 @@ pub(crate) async fn run_scenario_with_config_and_reference_root(
 
     let collector =
         ArtifactCollector::with_reference_root(&config.cluster.artifacts_dir, reference_root)?;
-    let result = run_fault_case(&config, &collector, &scenario, &plan).await;
+    let result = run_fault_case(&config, &collector, &scenario, &plan, &run_id).await;
 
     if let Err(error) = &result {
         write_failure_summary_if_absent(
             &collector,
             scenario.case_name,
-            FailureSummary::new(&scenario.name, "scenario", "unknown", error.to_string())?,
+            FailureSummary::new(&scenario.name, "scenario", "unknown", error.to_string())?
+                .with_run_id(&run_id),
         )
         .ok();
         match collector.collect_kubernetes_snapshot_with_diagnosis(
@@ -159,6 +163,7 @@ async fn run_fault_case(
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
     plan: &FaultPlan,
+    planned_run_id: &str,
 ) -> Result<()> {
     let FaultRunContext {
         spec,
@@ -167,7 +172,11 @@ async fn run_fault_case(
         bucket,
         events,
         history,
-    } = initialize_fault_run(config, collector, scenario, plan)?;
+    } = initialize_fault_run(config, collector, scenario, plan, planned_run_id)?;
+    let write_failure_summary =
+        |collector: &ArtifactCollector, case_name: &str, summary: FailureSummary| {
+            persist_failure_summary(collector, case_name, summary.with_run_id(&run_id))
+        };
     let mut run_completion =
         events.completion_guard("run", "fault run failed before successful completion");
     let mut preflight_phases = Vec::new();
@@ -187,7 +196,7 @@ async fn run_fault_case(
                 crate::fault::reporting::ResponsibilityDomain::FaultBackend,
             )],
         ));
-        write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+        write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases).ok();
         events
             .record(
                 "fault-backend-preflight",
@@ -216,7 +225,7 @@ async fn run_fault_case(
             crate::fault::reporting::ResponsibilityDomain::FaultBackend,
         )],
     ));
-    write_preflight_summary(collector, scenario, config, &preflight_phases)?;
+    write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases)?;
     events.record(
         "fault-backend-preflight",
         RunEventStatus::Succeeded,
@@ -238,7 +247,7 @@ async fn run_fault_case(
                 crate::fault::reporting::ResponsibilityDomain::FaultBackend,
             )],
         ));
-        write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+        write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases).ok();
         events
             .record(
                 "fault-backend-pre-cleanup",
@@ -267,7 +276,7 @@ async fn run_fault_case(
             crate::fault::reporting::ResponsibilityDomain::FaultBackend,
         )],
     ));
-    write_preflight_summary(collector, scenario, config, &preflight_phases)?;
+    write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases)?;
     events.record(
         "fault-backend-pre-cleanup",
         RunEventStatus::Succeeded,
@@ -697,7 +706,8 @@ async fn run_fault_case(
                             crate::fault::reporting::ResponsibilityDomain::Harness,
                         )],
                     ));
-                    write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+                    write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases)
+                        .ok();
                     events
                         .record(
                             "target-preflight",
@@ -751,7 +761,7 @@ async fn run_fault_case(
                             crate::fault::reporting::ResponsibilityDomain::Environment,
                         )],
                     ));
-                    write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+                    write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases).ok();
                     events
                         .record(
                             "write-quorum-loss-topology-proof",
@@ -812,7 +822,7 @@ async fn run_fault_case(
                         crate::fault::reporting::ResponsibilityDomain::Environment,
                     )],
                 ));
-                write_preflight_summary(collector, scenario, config, &preflight_phases).ok();
+                write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases).ok();
                 events
                     .record(
                         "host-storage-mutation-preflight",
@@ -864,7 +874,7 @@ async fn run_fault_case(
             "target-proof",
             vec![target_proof.preflight_check()],
         ));
-        write_preflight_summary(collector, scenario, config, &preflight_phases)?;
+        write_preflight_summary(collector, scenario, config, &run_id, &preflight_phases)?;
         if let Err(error) = target_proof.require_satisfied() {
             events
                 .record(
@@ -1293,6 +1303,7 @@ async fn run_fault_case(
         let mut workload = match run_mixed_workload(
             &s3,
             &history,
+            &scenario.name,
             &run_id,
             &workload_plan,
             &prefilled,
@@ -1856,6 +1867,7 @@ async fn run_fault_case(
         let recovery_ended_at_ms = now_ms();
         let recovered_evidence = FaultEvidence {
             scenario: scenario.name.clone(),
+            run_id: run_id.clone(),
             backend: plan.backend_summary(),
             target: plan.target_summary(),
             injected: true,
@@ -1930,7 +1942,8 @@ async fn run_fault_case(
                 let recovery_stability_report = checker::RecoveryStabilityReport::harness_error(
                     message.clone(),
                     config.recovery_stability_reread,
-                );
+                )
+                .with_identity(&scenario.name, &run_id);
                 collector.write_text(
                     scenario.case_name,
                     "recovery-stability-report.json",
@@ -2018,6 +2031,7 @@ async fn run_fault_case(
                         message,
                         config.recovery_stability_reread,
                     )
+                    .with_identity(&scenario.name, &run_id)
                 }
             };
             collector.write_text(
@@ -2156,6 +2170,7 @@ async fn run_fault_case(
         )?;
         let evidence = FaultEvidence {
             scenario: scenario.name.clone(),
+            run_id: run_id.clone(),
             backend: plan.backend_summary(),
             target: plan.target_summary(),
             injected: true,
@@ -2252,7 +2267,8 @@ async fn run_fault_case(
                 "multipart-cleanup",
                 "test_or_environment",
                 format!("{error:#}"),
-            )?,
+            )?
+            .with_run_id(&run_id),
         )
         .ok();
         return match result {
@@ -2279,9 +2295,10 @@ fn initialize_fault_run(
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
     plan: &FaultPlan,
+    run_id: &str,
 ) -> Result<FaultRunContext> {
     let spec = scenarios::scenario_spec(&scenario.name)?;
-    let run_id = format!("run-{}", Uuid::new_v4());
+    let run_id = run_id.to_string();
     let workload_seed = config.workload_seed.unwrap_or_else(generated_seed);
     let workload_plan = WorkloadPlan::seeded_with_profile(
         workload_seed,
@@ -2326,7 +2343,11 @@ fn initialize_fault_run(
     collector.write_text(
         scenario.case_name,
         "workload-plan.json",
-        &serde_json::to_string_pretty(&workload_plan)?,
+        &serde_json::to_string_pretty(&WorkloadPlanArtifact {
+            scenario: &scenario.name,
+            run_id: &run_id,
+            plan: &workload_plan,
+        })?,
     )?;
     events.record(
         "run",
@@ -2361,9 +2382,10 @@ fn write_preflight_summary(
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
     config: &FaultTestConfig,
+    run_id: &str,
     phases: &[PreflightPhase],
 ) -> Result<()> {
-    let summary = PreflightSummary::single_run(config, &scenario.name, phases.to_vec());
+    let summary = PreflightSummary::single_run(config, &scenario.name, run_id, phases.to_vec());
     collector.write_text(
         scenario.case_name,
         "preflight-summary.json",
@@ -4354,6 +4376,7 @@ fn multipart_workload_indices(plan: &WorkloadPlan, start_index: usize, count: us
 async fn run_mixed_workload(
     s3: &S3WorkloadClient,
     history: &Recorder,
+    scenario: &str,
     run_id: &str,
     plan: &WorkloadPlan,
     prefilled: &[ObjectSpec],
@@ -4490,7 +4513,7 @@ async fn run_mixed_workload(
     }
     completed.sort_by_key(|result| result.index);
 
-    let mut summary = WorkloadSummary::new(plan);
+    let mut summary = WorkloadSummary::new(plan, scenario, run_id);
     let mut unconfirmed_puts = Vec::new();
     for result in completed {
         summary.record_all(&result);
@@ -4565,11 +4588,15 @@ async fn recommit_unconfirmed_objects(
         .collect::<Vec<_>>()
         .await;
     attempts.sort_by(|left, right| left.key.cmp(&right.key));
-    RecommitReport::from_attempts(attempts)
+    RecommitReport::from_attempts(attempts).with_identity(&history.scenario(), &history.run_id())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct RecommitReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scenario: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
     attempted: usize,
     committed: usize,
     failed: usize,
@@ -4592,12 +4619,20 @@ impl RecommitReport {
             .filter(|attempt| attempt.is_harness_error())
             .count();
         Self {
+            scenario: None,
+            run_id: None,
             attempted: attempts.len(),
             committed,
             failed,
             harness_errors,
             attempts,
         }
+    }
+
+    fn with_identity(mut self, scenario: &str, run_id: &str) -> Self {
+        self.scenario = Some(scenario.to_string());
+        self.run_id = Some(run_id.to_string());
+        self
     }
 
     fn has_failures(&self) -> bool {
@@ -4826,7 +4861,17 @@ fn crash_window_evidence(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct WorkloadPlanArtifact<'a> {
+    scenario: &'a str,
+    run_id: &'a str,
+    #[serde(flatten)]
+    plan: &'a WorkloadPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct WorkloadSummary {
+    scenario: String,
+    run_id: String,
     seed: u64,
     object_count: usize,
     concurrency: usize,
@@ -4841,8 +4886,10 @@ struct WorkloadSummary {
 }
 
 impl WorkloadSummary {
-    fn new(plan: &WorkloadPlan) -> Self {
+    fn new(plan: &WorkloadPlan, scenario: &str, run_id: &str) -> Self {
         Self {
+            scenario: scenario.to_string(),
+            run_id: run_id.to_string(),
             seed: plan.seed,
             object_count: plan.object_count,
             concurrency: plan.concurrency,
@@ -5436,7 +5483,8 @@ mod tests {
 
     #[test]
     fn workload_summary_counts_disrupted_operations() {
-        let mut summary = WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80));
+        let mut summary =
+            WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80), "io-eio", "run-1");
         summary.puts.record(OperationOutcome::Ok);
         summary.gets.record(OperationOutcome::Timeout);
         summary.gets.record(OperationOutcome::NotFound);
@@ -5454,7 +5502,8 @@ mod tests {
 
     #[test]
     fn workload_summary_requires_every_object_operation_family() {
-        let mut summary = WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80));
+        let mut summary =
+            WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80), "io-eio", "run-1");
         summary.puts.record(OperationOutcome::Ok);
         summary.gets.record(OperationOutcome::Ok);
         summary.deletes.record(OperationOutcome::Ok);
@@ -5470,6 +5519,8 @@ mod tests {
     #[test]
     fn workload_summary_can_require_fault_evidence() {
         let summary = WorkloadSummary {
+            scenario: "io-eio".to_string(),
+            run_id: "run-1".to_string(),
             seed: 42,
             object_count: 40000,
             concurrency: 80,
@@ -5495,7 +5546,8 @@ mod tests {
 
     #[test]
     fn write_quorum_loss_rejects_any_acknowledged_mutation() {
-        let mut summary = WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80));
+        let mut summary =
+            WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80), "io-eio", "run-1");
         summary.puts.record(OperationOutcome::Failed);
         summary.deletes.record(OperationOutcome::Timeout);
         summary
@@ -5506,7 +5558,8 @@ mod tests {
         summary.puts.record(OperationOutcome::Ok);
         assert!(summary.require_write_quorum_loss_effect().is_err());
 
-        let mut read_only_disruption = WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80));
+        let mut read_only_disruption =
+            WorkloadSummary::new(&WorkloadPlan::seeded(42, 40000, 80), "io-eio", "run-1");
         read_only_disruption.puts.record(OperationOutcome::NotFound);
         read_only_disruption
             .deletes
@@ -5525,7 +5578,8 @@ mod tests {
 
     #[test]
     fn write_quorum_loss_rejects_invalid_outcomes_in_each_mutation_family() {
-        let mut baseline = WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2));
+        let mut baseline =
+            WorkloadSummary::new(&WorkloadPlan::seeded(42, 24, 2), "io-eio", "run-1");
         baseline.puts.record(OperationOutcome::Failed);
         baseline.deletes.record(OperationOutcome::Timeout);
         baseline

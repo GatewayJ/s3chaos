@@ -22,7 +22,7 @@ use crate::fault::{
         FaultInjection, FaultInjectionParameters, FaultPlan, FaultSelection, FaultTarget,
         FaultWorkloadMode,
     },
-    scenarios::{FaultScenario, FaultScenarioSpec},
+    scenarios::{FaultDetectorContract, FaultScenario, FaultScenarioSpec},
     workload::WorkloadPlan,
 };
 
@@ -70,6 +70,8 @@ pub struct FaultRunScenarioSpec {
     pub impact_policy: String,
     pub boundary: String,
     pub validation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector: Option<FaultDetectorContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +200,7 @@ impl FaultRunSpec {
                 impact_policy: scenario_spec.impact_policy.as_str().to_string(),
                 boundary: scenario_spec.boundary.to_string(),
                 validation: scenario_spec.validation.to_string(),
+                detector: Some(scenario_spec.detector.contract()),
             },
             workload: FaultRunWorkloadSpec {
                 mode: workload_mode_name(plan.workload_mode).to_string(),
@@ -396,6 +399,10 @@ mod tests {
         assert_eq!(spec.faults[0].target_proof.artifact, "target-proof.json");
         assert_eq!(spec.scenario.priority, "p0");
         assert_eq!(spec.scenario.isolation, "fresh-tenant");
+        assert_eq!(
+            spec.scenario.detector,
+            Some(scenario_spec.detector.contract())
+        );
         assert_eq!(spec.faults[0].backend, "chaos-mesh-io-chaos");
         assert_eq!(spec.recovery.expected_rustfs_pod_count, 4);
         assert_eq!(spec.recovery.recovery_stability_reread_seconds, 60);
@@ -415,6 +422,7 @@ mod tests {
             serde_json::from_str::<FaultRunSpec>(&spec.to_json().expect("json")).expect("json");
         assert_eq!(decoded.api_version, spec.api_version);
         assert_eq!(decoded.scenario.priority, spec.scenario.priority);
+        assert_eq!(decoded.scenario.detector, spec.scenario.detector);
         assert_eq!(decoded.workload.object_count, spec.workload.object_count);
         assert_eq!(
             decoded.workload.plan.size_distribution,
@@ -424,6 +432,7 @@ mod tests {
             serde_yaml_ng::from_str::<FaultRunSpec>(&spec.to_yaml().expect("yaml")).expect("yaml");
         assert_eq!(decoded.api_version, spec.api_version);
         assert_eq!(decoded.scenario.priority, spec.scenario.priority);
+        assert_eq!(decoded.scenario.detector, spec.scenario.detector);
         assert_eq!(decoded.workload.object_count, spec.workload.object_count);
         assert_eq!(
             decoded.workload.plan.size_distribution,

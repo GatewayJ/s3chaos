@@ -21,6 +21,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use uuid::Uuid;
 
 use crate::fault::{
     backends::chaos_mesh::{
@@ -28,8 +29,7 @@ use crate::fault::{
         validate_fixed_volume_snapshot, validate_network_partition_snapshot,
     },
     backends::host::DmStatusSnapshot,
-    checker::RecoveryStabilityReport,
-    checker::{CheckerReport, RecoveryStabilityClassification},
+    checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
     config::{
         DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, DEFAULT_RUSTFS_POD_COUNT,
         DEFAULT_RUSTFS_POD_STABLE_WINDOW_SECONDS, DEFAULT_RUSTFS_VOLUME_PATH,
@@ -53,7 +53,7 @@ use crate::fault::{
     quorum::require_fresh_runtime_observation,
     reporting::{
         AvailabilityStatus, DataCorrectnessStatus, FailureClassification, FailurePhase,
-        FailureSeverity, FailureVerdict, ResponsibilityDomain,
+        FailureSeverity, FailureSummary, FailureVerdict, ResponsibilityDomain,
     },
     scenarios::{self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario},
     spec::{
@@ -108,6 +108,252 @@ pub struct ArtifactValidationFileReport {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ExpectedFailureArtifactReport {
+    pub failure_summary: String,
+    pub summary: FailureSummary,
+    pub client_disruptions: usize,
+}
+
+struct FailedAttemptDisruptionEvidence {
+    client_disruptions: usize,
+    run_failed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ArtifactIdentityPolicy<'a> {
+    LegacyCompatible,
+    PlannedAttempt(&'a str),
+}
+
+impl<'a> ArtifactIdentityPolicy<'a> {
+    fn planned_run_id(self) -> Option<&'a str> {
+        match self {
+            Self::LegacyCompatible => None,
+            Self::PlannedAttempt(run_id) => Some(run_id),
+        }
+    }
+}
+
+pub(crate) fn validate_failed_attempt_disruptions(
+    suite_root: &Path,
+    case_dir: &Path,
+    attempt_run_id: &str,
+    scenario: &str,
+    case_name: &str,
+    attempt_started_at_ms: u64,
+    evaluated_at_ms: u64,
+) -> Result<usize> {
+    Ok(validate_failed_attempt_disruption_evidence(
+        suite_root,
+        case_dir,
+        attempt_run_id,
+        scenario,
+        case_name,
+        attempt_started_at_ms,
+        evaluated_at_ms,
+    )?
+    .client_disruptions)
+}
+
+fn validate_failed_attempt_disruption_evidence(
+    suite_root: &Path,
+    case_dir: &Path,
+    attempt_run_id: &str,
+    scenario: &str,
+    case_name: &str,
+    attempt_started_at_ms: u64,
+    evaluated_at_ms: u64,
+) -> Result<FailedAttemptDisruptionEvidence> {
+    ensure!(
+        attempt_run_id
+            .strip_prefix("run-")
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .is_some(),
+        "failed-attempt safety requires a valid planned attempt runId"
+    );
+    let suite_root = fs::canonicalize(suite_root)
+        .with_context(|| format!("canonicalize suite artifact root {}", suite_root.display()))?;
+    let case_dir = fs::canonicalize(case_dir).with_context(|| {
+        format!(
+            "canonicalize case artifact directory {}",
+            case_dir.display()
+        )
+    })?;
+    ensure!(
+        case_dir.starts_with(&suite_root),
+        "case artifact directory is outside suite artifact root"
+    );
+    ensure!(
+        attempt_started_at_ms <= evaluated_at_ms,
+        "failed-attempt evaluation window is invalid"
+    );
+
+    let run_spec_path = bound_case_artifact(&case_dir, "run-spec.json")?;
+    let run_spec = read_json::<ExpectedFailureRunSpecIdentity>(&run_spec_path)?;
+    ensure!(
+        run_spec.metadata.name == case_name
+            && run_spec.metadata.run_id == attempt_run_id
+            && run_spec.scenario.name == scenario
+            && run_spec.scenario.case_name == case_name,
+        "run-spec.json identity does not match the planned attempt"
+    );
+    let evidence_path = bound_case_artifact(&case_dir, "fault-evidence.json")?;
+    let evidence = read_json::<FaultEvidenceArtifact>(&evidence_path)?;
+    ensure!(
+        evidence.scenario.as_deref() == Some(scenario)
+            && evidence.run_id.as_deref() == Some(attempt_run_id),
+        "fault-evidence.json identity does not match the planned attempt"
+    );
+    ensure!(
+        evidence.injected && evidence.active_during_workload && evidence.recovered,
+        "fault-evidence.json does not prove a completed fault lifecycle"
+    );
+    ensure!(
+        !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
+        "fault-evidence.json does not prove fault activity during the workload"
+    );
+    validate_fault_window_evidence(&evidence)?;
+    ensure!(
+        evidence
+            .fault_apply_started_at_ms
+            .is_some_and(|at| at >= attempt_started_at_ms)
+            && evidence
+                .recovery_ended_at_ms
+                .is_some_and(|at| at <= evaluated_at_ms),
+        "fault-evidence.json timestamps are outside the current attempt window"
+    );
+
+    let workload_path = bound_case_artifact(&case_dir, "workload-summary.json")?;
+    let workload = read_json::<WorkloadSummaryArtifact>(&workload_path)?;
+    ensure!(
+        workload.scenario.as_deref() == Some(scenario)
+            && workload.run_id.as_deref() == Some(attempt_run_id),
+        "workload-summary.json identity does not match the planned attempt"
+    );
+    let workload_plan =
+        read_json::<ArtifactIdentity>(&bound_case_artifact(&case_dir, "workload-plan.json")?)?;
+    ensure!(
+        workload_plan.scenario.as_deref() == Some(scenario)
+            && workload_plan.run_id.as_deref() == Some(attempt_run_id),
+        "workload-plan.json identity does not match the planned attempt"
+    );
+    let disrupted = workload.disrupted()?;
+    ensure!(
+        disrupted == evidence.client_disruptions,
+        "fault-evidence.json client_disruptions does not match workload-summary.json"
+    );
+
+    let events_path = bound_case_artifact(&case_dir, "run-events.jsonl")?;
+    let events = read_jsonl::<RunEvent>(&events_path)?;
+    ensure!(
+        !events.is_empty()
+            && events.iter().all(|event| {
+                event.scenario == scenario
+                    && event.run_id == attempt_run_id
+                    && (attempt_started_at_ms..=evaluated_at_ms).contains(&event.at_ms)
+            }),
+        "run-events.jsonl identity or timestamps do not match the planned attempt"
+    );
+    ensure!(
+        has_event(&events, "run", RunEventStatus::Started)
+            && (has_event(&events, "run", RunEventStatus::Failed)
+                || has_event(&events, "run", RunEventStatus::Succeeded)),
+        "run-events.jsonl is missing current-attempt run start or terminal event"
+    );
+    Ok(FailedAttemptDisruptionEvidence {
+        client_disruptions: disrupted,
+        run_failed: has_event(&events, "run", RunEventStatus::Failed),
+    })
+}
+
+fn bound_case_artifact(case_dir: &Path, name: &str) -> Result<PathBuf> {
+    let path = fs::canonicalize(case_dir.join(name))
+        .with_context(|| format!("canonicalize current-attempt artifact {name}"))?;
+    ensure!(
+        path.parent() == Some(case_dir),
+        "current-attempt artifact {name} does not belong to its planned case directory"
+    );
+    Ok(path)
+}
+
+pub(crate) struct AttemptFailureSummaryReference<'a> {
+    pub observed_attempt_artifacts_dir: &'a str,
+    pub planned_attempt_artifacts_dir: &'a str,
+    pub planned_case_artifacts_dir: &'a str,
+    pub planned_case_name: &'a str,
+    pub failure_summary_ref: &'a str,
+    pub scenario: &'a str,
+    pub run_id: &'a str,
+}
+
+pub(crate) fn validate_attempt_failure_summary_reference(
+    suite_root: &Path,
+    reference: &AttemptFailureSummaryReference<'_>,
+) -> Result<()> {
+    let summary_ref = Path::new(reference.failure_summary_ref);
+    ensure!(
+        !summary_ref.is_absolute()
+            && summary_ref.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            }),
+        "failureSummary must be a relative path without parent traversal"
+    );
+    let suite_root = fs::canonicalize(suite_root)
+        .with_context(|| format!("canonicalize suite artifact root {}", suite_root.display()))?;
+    let canonical_dir = |reference: &str, label: &str| -> Result<PathBuf> {
+        let reference = Path::new(reference);
+        let path = if reference.is_absolute() {
+            reference.to_path_buf()
+        } else {
+            suite_root.join(reference)
+        };
+        fs::canonicalize(&path).with_context(|| format!("canonicalize {label} {}", path.display()))
+    };
+    let observed_attempt_path = canonical_dir(
+        reference.observed_attempt_artifacts_dir,
+        "observed attempt artifact directory",
+    )?;
+    let planned_attempt_path = canonical_dir(
+        reference.planned_attempt_artifacts_dir,
+        "planned attempt artifact directory",
+    )?;
+    let planned_case_path = canonical_dir(
+        reference.planned_case_artifacts_dir,
+        "planned case artifact directory",
+    )?;
+    ensure!(
+        observed_attempt_path == planned_attempt_path
+            && planned_attempt_path.starts_with(&suite_root)
+            && planned_case_path.parent() == Some(planned_attempt_path.as_path())
+            && planned_case_path.file_name().and_then(|name| name.to_str())
+                == Some(reference.planned_case_name),
+        "suite-summary attempt directories do not match the suite plan"
+    );
+    let summary_path = fs::canonicalize(suite_root.join(summary_ref)).with_context(|| {
+        format!(
+            "canonicalize expected-failure proof {}",
+            summary_ref.display()
+        )
+    })?;
+    ensure!(
+        summary_path.file_name().and_then(|name| name.to_str()) == Some("failure-summary.json")
+            && summary_path.parent() == Some(planned_case_path.as_path()),
+        "failureSummary does not belong to the current attempt"
+    );
+    let summary = read_json::<FailureSummaryReferenceIdentity>(&summary_path)?;
+    ensure!(
+        summary.scenario.as_deref() == Some(reference.scenario)
+            && summary.run_id.as_deref() == Some(reference.run_id)
+            && summary.case_name.as_deref() == Some(reference.planned_case_name),
+        "failureSummary identity does not match the current attempt"
+    );
+    Ok(())
+}
+
 impl ArtifactValidationReport {
     pub fn validation_summary_tsv_row(&self) -> String {
         format!(
@@ -120,7 +366,34 @@ impl ArtifactValidationReport {
 pub fn validate_fault_artifacts_and_write_report(
     options: &ArtifactValidationOptions,
 ) -> Result<ArtifactValidationReport> {
-    match validate_fault_artifacts(options) {
+    validate_fault_artifacts_and_write_report_with_identity(
+        options,
+        ArtifactIdentityPolicy::LegacyCompatible,
+    )
+}
+
+pub(crate) fn validate_fault_artifacts_for_planned_attempt_and_write_report(
+    options: &ArtifactValidationOptions,
+    planned_run_id: &str,
+) -> Result<ArtifactValidationReport> {
+    ensure!(
+        planned_run_id
+            .strip_prefix("run-")
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .is_some(),
+        "success artifact validation requires a valid planned attempt runId"
+    );
+    validate_fault_artifacts_and_write_report_with_identity(
+        options,
+        ArtifactIdentityPolicy::PlannedAttempt(planned_run_id),
+    )
+}
+
+fn validate_fault_artifacts_and_write_report_with_identity(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+) -> Result<ArtifactValidationReport> {
+    match validate_fault_artifacts_with_identity(options, identity) {
         Ok(report) => {
             write_artifact_validation_file_report(
                 options,
@@ -226,10 +499,19 @@ impl ArtifactValidationOptions {
 pub fn validate_fault_artifacts(
     options: &ArtifactValidationOptions,
 ) -> Result<ArtifactValidationReport> {
+    validate_fault_artifacts_with_identity(options, ArtifactIdentityPolicy::LegacyCompatible)
+}
+
+fn validate_fault_artifacts_with_identity(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+) -> Result<ArtifactValidationReport> {
     let scenario_spec = scenarios::scenario_spec(&options.scenario)?;
     validate_conditional_recovery_stability_artifact(
         &options.artifact_root,
         scenario_spec.case_name,
+        &options.scenario,
+        identity.planned_run_id(),
     )?;
     let artifacts = locate_required_artifacts(&options.artifact_root, scenario_spec.case_name)?;
 
@@ -252,6 +534,12 @@ pub fn validate_fault_artifacts(
         options.scenario
     );
     ensure_nonempty(&metadata.run_id, "run-metadata.json run_id")?;
+    if let Some(planned_run_id) = identity.planned_run_id() {
+        ensure!(
+            metadata.run_id == planned_run_id,
+            "run-metadata.json run_id does not match the planned attempt"
+        );
+    }
     ensure_nonempty(&metadata.rustfs_image, "run-metadata.json rustfs_image")?;
     ensure_nonempty(&metadata.storage_class, "run-metadata.json storage_class")?;
     ensure_nonempty(&metadata.context, "run-metadata.json context")?;
@@ -275,7 +563,15 @@ pub fn validate_fault_artifacts(
         options.expected_recovery_stability_reread_seconds
     );
 
-    let workload_plan = read_json::<WorkloadPlan>(required(&artifacts, "workload-plan.json")?)?;
+    let workload_plan_path = required(&artifacts, "workload-plan.json")?;
+    let workload_plan = read_json::<WorkloadPlan>(workload_plan_path)?;
+    let workload_plan_identity = read_json::<ArtifactIdentity>(workload_plan_path)?;
+    validate_optional_artifact_identity(
+        "workload-plan.json",
+        &workload_plan_identity,
+        &metadata,
+        identity,
+    )?;
     ensure!(
         workload_plan.object_count == options.expected_workload_objects,
         "workload-plan.json object_count {} does not match expected {}",
@@ -309,6 +605,11 @@ pub fn validate_fault_artifacts(
     );
     validate_run_spec(&json_spec, options)?;
     ensure!(
+        identity.planned_run_id().is_none()
+            || json_spec.scenario.detector.as_ref() == Some(&scenario_spec.detector.contract()),
+        "current-attempt run-spec.json detector contract does not match the scenario"
+    );
+    ensure!(
         json_spec.metadata.name == scenario_spec.case_name
             && json_spec.metadata.run_id == metadata.run_id,
         "run-spec metadata does not match the selected case and run-metadata.json run identity"
@@ -317,16 +618,43 @@ pub fn validate_fault_artifacts(
     let preflight_summary =
         read_json::<PreflightSummary>(required(&artifacts, "preflight-summary.json")?)?;
     validate_preflight_summary(&preflight_summary, options)?;
+    validate_optional_identity_fields(
+        "preflight-summary.json",
+        Some(metadata.scenario.as_str()),
+        preflight_summary.run_id.as_deref(),
+        &metadata,
+        identity,
+    )?;
     let target_proof = read_json::<TargetProof>(required(&artifacts, "target-proof.json")?)?;
     validate_target_proof(&target_proof, &json_spec, options)?;
 
     let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
+    ensure!(
+        events
+            .iter()
+            .all(|event| { event.scenario == options.scenario && event.run_id == metadata.run_id }),
+        "run-events.jsonl identity does not match run-metadata.json"
+    );
     ensure!(
         has_event(&events, "run", RunEventStatus::Started)
             && has_event(&events, "run", RunEventStatus::Succeeded)
             && has_event(&events, "checker-final", RunEventStatus::Succeeded),
         "run-events.jsonl is missing run started, run succeeded, or checker-final succeeded events"
     );
+    let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
+    ensure!(
+        !history.is_empty(),
+        "history.jsonl must contain operation records"
+    );
+    for record in &history {
+        validate_optional_identity_fields(
+            "history.jsonl operation record",
+            Some(record.scenario.as_str()),
+            record.run_id.as_deref(),
+            &metadata,
+            identity,
+        )?;
+    }
 
     let fault_evidence_path = required(&artifacts, "fault-evidence.json")?;
     ensure_json_field_present(
@@ -335,6 +663,13 @@ pub fn validate_fault_artifacts(
         "fault-evidence.json require_client_disruption",
     )?;
     let evidence = read_json::<FaultEvidenceArtifact>(fault_evidence_path)?;
+    validate_optional_identity_fields(
+        "fault-evidence.json",
+        evidence.scenario.as_deref(),
+        evidence.run_id.as_deref(),
+        &metadata,
+        identity,
+    )?;
     ensure!(
         evidence.injected && evidence.active_during_workload && evidence.recovered,
         "fault-evidence.json must record injected=true, active_during_workload=true, recovered=true"
@@ -410,12 +745,14 @@ pub fn validate_fault_artifacts(
 
     let prechecker =
         read_json::<CheckerReport>(required(&artifacts, "checker-pre-recommit-report.json")?)?;
+    validate_checker_identity("checker-pre-recommit-report.json", &prechecker, &metadata)?;
     validate_checker_report(
         "checker-pre-recommit-report.json",
         &prechecker,
         options.expected_workload_versioning,
     )?;
     let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
+    validate_checker_identity("checker-report.json", &checker, &metadata)?;
     validate_checker_report(
         "checker-report.json",
         &checker,
@@ -424,6 +761,13 @@ pub fn validate_fault_artifacts(
 
     let recommit =
         read_json::<RecommitReportArtifact>(required(&artifacts, "recommit-report.json")?)?;
+    validate_optional_identity_fields(
+        "recommit-report.json",
+        recommit.scenario.as_deref(),
+        recommit.run_id.as_deref(),
+        &metadata,
+        identity,
+    )?;
     ensure!(
         recommit.attempted == recommit.committed
             && recommit.failed == 0
@@ -434,6 +778,13 @@ pub fn validate_fault_artifacts(
 
     let summary =
         read_json::<WorkloadSummaryArtifact>(required(&artifacts, "workload-summary.json")?)?;
+    validate_optional_identity_fields(
+        "workload-summary.json",
+        summary.scenario.as_deref(),
+        summary.run_id.as_deref(),
+        &metadata,
+        identity,
+    )?;
     ensure!(
         summary.seed == workload_plan.seed
             && summary.object_count == workload_plan.object_count
@@ -447,6 +798,10 @@ pub fn validate_fault_artifacts(
     ensure!(
         summary.exercised_all_operation_families(),
         "workload-summary.json did not exercise every required S3 operation family"
+    );
+    ensure!(
+        summary.disrupted()? == evidence.client_disruptions,
+        "fault-evidence.json client_disruptions does not match workload-summary.json"
     );
     if options.scenario == scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
         let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
@@ -491,6 +846,11 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
         spec.scenario.name,
         options.scenario
     );
+    if let Some(detector) = &spec.scenario.detector {
+        detector
+            .validate()
+            .context("run-spec scenario detector contract is invalid")?;
+    }
     validate_run_spec_catalog_contract(spec, options)?;
     ensure!(
         spec.workload.object_count == options.expected_workload_objects,
@@ -1549,6 +1909,63 @@ fn validate_checker_report(
     Ok(())
 }
 
+fn validate_checker_identity(
+    name: &str,
+    report: &CheckerReport,
+    metadata: &RunMetadataArtifact,
+) -> Result<()> {
+    ensure!(
+        report.scenario == metadata.scenario && report.run_id == metadata.run_id,
+        "{name} identity does not match run-metadata.json"
+    );
+    Ok(())
+}
+
+fn validate_optional_artifact_identity(
+    name: &str,
+    artifact: &ArtifactIdentity,
+    metadata: &RunMetadataArtifact,
+    policy: ArtifactIdentityPolicy<'_>,
+) -> Result<()> {
+    validate_optional_identity_fields(
+        name,
+        artifact.scenario.as_deref(),
+        artifact.run_id.as_deref(),
+        metadata,
+        policy,
+    )
+}
+
+fn validate_optional_identity_fields(
+    name: &str,
+    scenario: Option<&str>,
+    run_id: Option<&str>,
+    metadata: &RunMetadataArtifact,
+    policy: ArtifactIdentityPolicy<'_>,
+) -> Result<()> {
+    if matches!(policy, ArtifactIdentityPolicy::PlannedAttempt(_)) {
+        ensure!(
+            scenario == Some(metadata.scenario.as_str())
+                && run_id == Some(metadata.run_id.as_str()),
+            "{name} identity is missing or does not match the planned attempt"
+        );
+    } else {
+        if let Some(scenario) = scenario {
+            ensure!(
+                scenario == metadata.scenario,
+                "{name} scenario does not match run-metadata.json"
+            );
+        }
+        if let Some(run_id) = run_id {
+            ensure!(
+                run_id == metadata.run_id,
+                "{name} run_id does not match run-metadata.json"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Result<()> {
     let apply_started = evidence
         .fault_apply_started_at_ms
@@ -1797,7 +2214,12 @@ fn locate_required_artifacts(root: &Path, case_name: &str) -> Result<BTreeMap<St
     Ok(artifacts)
 }
 
-fn validate_conditional_recovery_stability_artifact(root: &Path, case_name: &str) -> Result<()> {
+fn validate_conditional_recovery_stability_artifact(
+    root: &Path,
+    case_name: &str,
+    scenario: &str,
+    planned_run_id: Option<&str>,
+) -> Result<()> {
     let Some(events_path) = optional_artifact(root, case_name, "run-events.jsonl")? else {
         return Ok(());
     };
@@ -1816,7 +2238,24 @@ fn validate_conditional_recovery_stability_artifact(root: &Path, case_name: &str
         .with_context(|| "locate conditional artifact failure-summary.json")?;
     let recovery = read_json::<RecoveryStabilityReport>(&recovery_path)?;
     validate_recovery_stability_report(&recovery)?;
+    if let Some(run_id) = planned_run_id {
+        ensure!(
+            recovery.scenario.as_deref() == Some(scenario)
+                && recovery.run_id.as_deref() == Some(run_id)
+                && events
+                    .iter()
+                    .all(|event| event.scenario == scenario && event.run_id == run_id),
+            "conditional recovery artifacts do not match the planned attempt"
+        );
+    }
     let failure_summary = read_json::<FailureSummaryArtifact>(&failure_summary_path)?;
+    if let Some(run_id) = planned_run_id {
+        ensure!(
+            failure_summary.scenario == scenario
+                && failure_summary.run_id.as_deref() == Some(run_id),
+            "conditional failure-summary.json identity does not match the planned attempt"
+        );
+    }
     ensure!(
         failure_summary.classification == recovery.classification.as_str(),
         "failure-summary.json classification {:?} does not match recovery-stability-report.json classification {:?}",
@@ -1856,6 +2295,289 @@ pub(crate) fn validate_written_failure_summary(root: &Path, path: &Path) -> Resu
     let summary: FailureSummaryArtifact = serde_json::from_str(&raw)
         .with_context(|| format!("parsing just-written failure summary {}", path.display()))?;
     validate_failure_summary_v2_fields(&summary, Some(root), Some(path))
+}
+
+pub(crate) fn validate_expected_failure_artifacts(
+    suite_root: &Path,
+    case_dir: &Path,
+    attempt_run_id: &str,
+    scenario: &str,
+    case_name: &str,
+    attempt_started_at_ms: u64,
+    evaluated_at_ms: u64,
+) -> Result<ExpectedFailureArtifactReport> {
+    ensure!(
+        attempt_run_id
+            .strip_prefix("run-")
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .is_some(),
+        "expected failure requires a valid planned attempt runId"
+    );
+    let suite_root = fs::canonicalize(suite_root)
+        .with_context(|| format!("canonicalize suite artifact root {}", suite_root.display()))?;
+    let case_dir = fs::canonicalize(case_dir).with_context(|| {
+        format!(
+            "canonicalize case artifact directory {}",
+            case_dir.display()
+        )
+    })?;
+    ensure!(
+        case_dir.starts_with(&suite_root),
+        "case artifact directory {} is outside suite artifact root {}",
+        case_dir.display(),
+        suite_root.display()
+    );
+    ensure!(
+        attempt_started_at_ms <= evaluated_at_ms,
+        "expected-failure evaluation window is invalid"
+    );
+
+    let summary_path = bound_case_artifact(&case_dir, "failure-summary.json")?;
+    let summary_raw = fs::read_to_string(&summary_path)
+        .with_context(|| format!("reading JSON artifact {}", summary_path.display()))?;
+    let summary = serde_json::from_str::<FailureSummaryArtifact>(&summary_raw)
+        .with_context(|| format!("parsing JSON artifact {}", summary_path.display()))?;
+    let typed_summary = serde_json::from_str::<FailureSummary>(&summary_raw)
+        .with_context(|| format!("parsing typed failure summary {}", summary_path.display()))?;
+    typed_summary.validate_classification_projection()?;
+    let run_spec = read_json::<ExpectedFailureRunSpecIdentity>(&bound_case_artifact(
+        &case_dir,
+        "run-spec.json",
+    )?)?;
+    ensure!(
+        run_spec.scenario.detector.as_ref()
+            == Some(&scenarios::scenario_spec(scenario)?.detector.contract()),
+        "expected failure run-spec.json detector contract does not match the scenario"
+    );
+    ensure!(
+        summary.schema_version == 2,
+        "expected failure requires failure-summary.json schema_version 2, got {}",
+        summary.schema_version
+    );
+    validate_failure_summary_v2_fields(&summary, Some(&suite_root), Some(&summary_path))?;
+    ensure!(
+        summary.scenario == scenario,
+        "failure-summary.json scenario {:?} does not match current attempt {:?}",
+        summary.scenario,
+        scenario
+    );
+    ensure!(
+        summary.run_id.as_deref() == Some(attempt_run_id),
+        "failure-summary.json run_id {:?} does not match planned attempt {:?}",
+        summary.run_id,
+        attempt_run_id
+    );
+    ensure!(
+        summary.case_name.as_deref() == Some(case_name),
+        "failure-summary.json case_name {:?} does not match current attempt {:?}",
+        summary.case_name,
+        case_name
+    );
+    let observed_at_ms = summary
+        .observed_at_ms
+        .context("expected failure requires failure-summary.json observed_at_ms")?;
+    ensure!(
+        (attempt_started_at_ms..=evaluated_at_ms).contains(&observed_at_ms),
+        "failure-summary.json observed_at_ms {observed_at_ms} is outside current attempt window {attempt_started_at_ms}..={evaluated_at_ms}"
+    );
+    ensure!(
+        summary.phase.is_some(),
+        "expected failure requires failure-summary.json phase"
+    );
+    ensure!(
+        summary.responsibility_domain.is_some(),
+        "expected failure requires failure-summary.json responsibility_domain"
+    );
+    ensure!(
+        summary.s3_model_classification.as_deref() == Some(summary.classification.as_str())
+            && summary.run_failure_reason.is_none(),
+        "expected failure requires a complete product S3-model classification projection"
+    );
+    ensure!(
+        summary.verdict == FailureVerdict::Failed,
+        "expected failure requires failure-summary.json verdict failed"
+    );
+    ensure!(
+        !summary.primary_evidence_refs.is_empty(),
+        "expected failure requires primary evidence refs"
+    );
+
+    let mut referenced = BTreeMap::new();
+    for evidence_ref in &summary.primary_evidence_refs {
+        let relative = Path::new(evidence_ref);
+        ensure!(
+            relative.components().count() > 1,
+            "expected failure requires suite-root-relative evidence refs"
+        );
+        let evidence_path = fs::canonicalize(suite_root.join(relative)).with_context(|| {
+            format!(
+                "canonicalize expected-failure evidence ref {:?}",
+                evidence_ref
+            )
+        })?;
+        ensure!(
+            evidence_path.parent() == Some(case_dir.as_path()),
+            "expected-failure evidence ref {:?} does not belong to current case directory {}",
+            evidence_ref,
+            case_dir.display()
+        );
+        let file_name = evidence_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("expected-failure evidence ref has no UTF-8 file name")?;
+        referenced.insert(file_name.to_string(), evidence_path);
+    }
+
+    referenced
+        .get("fault-evidence.json")
+        .context("expected failure requires fault-evidence.json as primary evidence")?;
+    referenced
+        .get("run-events.jsonl")
+        .context("expected failure requires run-events.jsonl as primary evidence")?;
+
+    let disruption_evidence = validate_failed_attempt_disruption_evidence(
+        &suite_root,
+        &case_dir,
+        attempt_run_id,
+        scenario,
+        case_name,
+        attempt_started_at_ms,
+        evaluated_at_ms,
+    )?;
+    ensure!(
+        disruption_evidence.run_failed,
+        "run-events.jsonl does not prove the current attempt failed"
+    );
+    let events =
+        read_jsonl::<RunEvent>(referenced.get("run-events.jsonl").expect("required events"))?;
+    ensure!(
+        !has_event(&events, "run", RunEventStatus::Succeeded)
+            && events.iter().all(|event| {
+                event.status != RunEventStatus::Failed
+                    || matches!(
+                        event.stage.as_str(),
+                        "run" | "checker-pre-recommit" | "checker-final"
+                    )
+            }),
+        "expected failure contains a conflicting run result or non-checker failure"
+    );
+
+    validate_expected_failure_signal(&summary, &referenced, scenario, attempt_run_id)?;
+
+    Ok(ExpectedFailureArtifactReport {
+        failure_summary: summary_path
+            .strip_prefix(&suite_root)
+            .context("failure-summary.json is outside suite artifact root")?
+            .display()
+            .to_string(),
+        summary: typed_summary,
+        client_disruptions: disruption_evidence.client_disruptions,
+    })
+}
+
+fn validate_expected_failure_signal(
+    summary: &FailureSummaryArtifact,
+    referenced: &BTreeMap<String, PathBuf>,
+    scenario: &str,
+    run_id: &str,
+) -> Result<()> {
+    ensure!(
+        summary.phase == Some(FailurePhase::Checker),
+        "expected product failure must be emitted by the checker phase"
+    );
+    match summary.stage.as_str() {
+        "checker-verdict" => {
+            let report =
+                read_expected_failure_checker(referenced, "checker-report.json", scenario, run_id)?;
+            ensure!(
+                !report.passed,
+                "checker-report.json passed and cannot support an expected failure"
+            );
+            let observed = report.failure_classification();
+            ensure!(
+                observed.as_str() == summary.classification,
+                "checker-report.json supports classification {:?}, not {:?}",
+                observed.as_str(),
+                summary.classification
+            );
+            ensure!(
+                summary.evidence_classifications == [observed.as_str()]
+                    && summary.final_list_warning_count == report.final_list_warning_count
+                    && summary.list_warnings == report.list_warnings
+                    && summary.recovered_within_seconds.is_none(),
+                "failure-summary.json evidence fields do not match checker-report.json"
+            );
+        }
+        "checker-pre-recommit-verdict" => {
+            let checker = read_expected_failure_checker(
+                referenced,
+                "checker-pre-recommit-report.json",
+                scenario,
+                run_id,
+            )?;
+            ensure!(
+                !checker.passed,
+                "checker-pre-recommit-report.json passed and cannot support an expected failure"
+            );
+            let recovery_path = referenced
+                .get("recovery-stability-report.json")
+                .context("pre-recommit expected failure requires recovery-stability-report.json")?;
+            let recovery = read_json::<RecoveryStabilityReport>(recovery_path)?;
+            validate_recovery_stability_report(&recovery)?;
+            ensure!(
+                recovery.scenario.as_deref() == Some(scenario)
+                    && recovery.run_id.as_deref() == Some(run_id),
+                "recovery-stability-report.json identity does not match the planned attempt"
+            );
+            ensure!(
+                recovery.immediate_passed == checker.passed,
+                "recovery-stability-report.json immediate_passed does not match checker-pre-recommit-report.json"
+            );
+            ensure!(
+                recovery.final_list_warning_count == checker.final_list_warning_count
+                    && recovery.list_warnings == checker.list_warnings,
+                "recovery-stability-report.json LIST evidence does not match checker-pre-recommit-report.json"
+            );
+            checker::validate_recovery_key_sets(&recovery, &checker).context(
+                "recovery-stability-report.json key evidence is not bound to checker evidence",
+            )?;
+            let observed = checker::classify_recovery_stability(&recovery, &checker);
+            ensure!(
+                recovery.classification == observed,
+                "recovery-stability-report.json claims classification {:?}, but its checker/recovery evidence classifies as {:?}",
+                recovery.classification.as_str(),
+                observed.as_str()
+            );
+            ensure!(
+                recovery.classification.as_str() == summary.classification,
+                "recovery-stability-report.json supports classification {:?}, not {:?}",
+                recovery.classification.as_str(),
+                summary.classification
+            );
+            validate_recovery_failure_summary_fields(summary, &recovery)?;
+        }
+        stage => bail!(
+            "expected product failure stage {stage:?} has no supported checker evidence contract"
+        ),
+    }
+    Ok(())
+}
+
+fn read_expected_failure_checker(
+    referenced: &BTreeMap<String, PathBuf>,
+    name: &str,
+    scenario: &str,
+    run_id: &str,
+) -> Result<CheckerReport> {
+    let path = referenced
+        .get(name)
+        .with_context(|| format!("expected failure requires {name}"))?;
+    let report = read_json::<CheckerReport>(path)?;
+    ensure!(
+        report.scenario == scenario && report.run_id == run_id,
+        "{name} identity does not match the current attempt"
+    );
+    Ok(report)
 }
 
 fn validate_failure_summary_v2_fields(
@@ -2169,6 +2891,10 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
         report.final_list_warning_count >= report.list_warnings.len(),
         "recovery-stability-report.json final_list_warning_count must cover sampled list_warnings"
     );
+    ensure!(
+        checker::recovery_key_sets_are_consistent(report),
+        "recovery-stability-report.json reread key sets are inconsistent"
+    );
     match report.classification {
         RecoveryStabilityClassification::RecoveryTailReadLatency => {
             ensure!(
@@ -2440,12 +3166,34 @@ struct RunMetadataArtifact {
     recovery_stability_reread_seconds: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct ArtifactIdentity {
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailureSummaryReferenceIdentity {
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    case_name: Option<String>,
+}
+
 fn default_recovery_stability_reread_seconds() -> u64 {
     DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct FaultEvidenceArtifact {
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
     injected: bool,
     active_during_workload: bool,
     recovered: bool,
@@ -2483,6 +3231,26 @@ struct FaultEvidenceArtifact {
     recovery_started_at_ms: Option<u64>,
     #[serde(default)]
     recovery_ended_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedFailureRunSpecIdentity {
+    metadata: ExpectedFailureRunMetadataIdentity,
+    scenario: ExpectedFailureScenarioIdentity,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedFailureRunMetadataIdentity {
+    name: String,
+    run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedFailureScenarioIdentity {
+    name: String,
+    case_name: String,
+    #[serde(default)]
+    detector: Option<scenarios::FaultDetectorContract>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2545,6 +3313,10 @@ struct DmCrashRecoveryArtifact {
 
 #[derive(Debug, Deserialize)]
 struct RecommitReportArtifact {
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
     attempted: usize,
     committed: usize,
     failed: usize,
@@ -2557,6 +3329,8 @@ struct FailureSummaryArtifact {
     #[serde(default)]
     schema_version: u8,
     scenario: String,
+    #[serde(default)]
+    run_id: Option<String>,
     #[serde(default)]
     case_name: Option<String>,
     #[serde(default)]
@@ -2592,6 +3366,10 @@ struct FailureSummaryArtifact {
 
 #[derive(Debug, Deserialize)]
 struct WorkloadSummaryArtifact {
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
     seed: u64,
     object_count: usize,
     concurrency: usize,
@@ -2614,6 +3392,23 @@ impl WorkloadSummaryArtifact {
             && self.multipart_aborts.total() > 0
     }
 
+    fn disrupted(&self) -> Result<usize> {
+        [
+            &self.puts,
+            &self.gets,
+            &self.deletes,
+            &self.lists,
+            &self.multipart_completes,
+            &self.multipart_aborts,
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, counts| {
+            total
+                .checked_add(counts.disrupted()?)
+                .context("workload-summary.json disrupted count overflowed")
+        })
+    }
+
     fn require_write_quorum_loss_effect(
         &self,
         history: &[OperationRecord],
@@ -2634,7 +3429,7 @@ impl WorkloadSummaryArtifact {
             ("CompleteMultipartUpload", &self.multipart_completes),
         ] {
             ensure!(
-                counts.ok == 0 && counts.not_found == 0 && counts.disrupted() > 0,
+                counts.ok == 0 && counts.not_found == 0 && counts.disrupted()? > 0,
                 "write-quorum-loss {kind} outcomes must all be failed, timed out, or unknown: {counts:?}"
             );
         }
@@ -2698,8 +3493,11 @@ impl OutcomeCountsArtifact {
         self.ok + self.not_found + self.failed + self.timeout + self.unknown
     }
 
-    fn disrupted(&self) -> usize {
-        self.failed + self.timeout + self.unknown
+    fn disrupted(&self) -> Result<usize> {
+        self.failed
+            .checked_add(self.timeout)
+            .and_then(|value| value.checked_add(self.unknown))
+            .context("workload-summary.json outcome disrupted count overflowed")
     }
 }
 
@@ -2708,9 +3506,10 @@ mod tests {
     use super::{
         ArtifactValidationOptions, FailureSummaryArtifact, FaultEvidenceArtifact,
         OutcomeCountsArtifact, WorkloadSummaryArtifact, recursive_find, validate_fault_artifacts,
-        validate_fault_artifacts_and_write_report, validate_fixed_volume_runtime_evidence,
-        validate_host_storage_artifacts, validate_run_spec, validate_target_proof,
-        validate_write_quorum_runtime_evidence,
+        validate_fault_artifacts_and_write_report,
+        validate_fault_artifacts_for_planned_attempt_and_write_report,
+        validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts, validate_run_spec,
+        validate_target_proof, validate_write_quorum_runtime_evidence,
     };
     use crate::fault::{
         checker::{RecoveryStabilityClassification, RecoveryStabilityReport},
@@ -2766,6 +3565,283 @@ mod tests {
             report.validation_summary_tsv_row(),
             "io-eio\t42\t0\t2\t1\t7\t0\t0\t0\t0\ttrue"
         );
+    }
+
+    #[test]
+    fn strict_success_validation_rejects_a_copied_attempt_bundle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let options = success_options(dir.path());
+
+        validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &options,
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect("current bundle");
+        let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &options,
+            "run-00000000-0000-4000-8000-000000000002",
+        )
+        .expect_err("copied prior-attempt bundle");
+        assert!(error.to_string().contains("planned attempt"));
+    }
+
+    #[test]
+    fn strict_success_validation_rejects_missing_fault_evidence_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("fault-evidence.json");
+        let mut evidence: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("evidence")).expect("json");
+        evidence.as_object_mut().expect("object").remove("run_id");
+        write_json(&case_dir, "fault-evidence.json", &evidence);
+        let options = success_options(dir.path());
+
+        validate_fault_artifacts(&options).expect("explicit legacy-compatible validation");
+        let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &options,
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect_err("missing current identity");
+        assert!(error.to_string().contains("fault-evidence.json identity"));
+    }
+
+    #[test]
+    fn every_validation_mode_rejects_a_checker_from_another_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("checker-report.json");
+        let mut checker: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("checker")).expect("json");
+        checker["run_id"] = json!("legacy-run");
+        write_json(&case_dir, "checker-report.json", &checker);
+        let options = success_options(dir.path());
+
+        let legacy_error =
+            validate_fault_artifacts(&options).expect_err("legacy mode must reject a conflict");
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("checker-report.json identity")
+        );
+        let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &options,
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect_err("checker from another attempt");
+        assert!(error.to_string().contains("checker-report.json identity"));
+    }
+
+    #[test]
+    fn verdict_artifact_identity_conflicts_are_rejected_in_every_mode() {
+        for name in [
+            "preflight-summary.json",
+            "history.jsonl",
+            "recommit-report.json",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_success_artifacts(dir.path(), "io-eio");
+            let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+            let path = case_dir.join(name);
+            if name == "history.jsonl" {
+                let mut record: serde_json::Value =
+                    serde_json::from_str(fs::read_to_string(&path).expect("history").trim())
+                        .expect("record");
+                record["run_id"] = json!("run-old");
+                fs::write(&path, format!("{record}\n")).expect("write history");
+            } else {
+                let mut artifact: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&path).expect("artifact"))
+                        .expect("json");
+                let key = if name == "preflight-summary.json" {
+                    "runId"
+                } else {
+                    "run_id"
+                };
+                artifact[key] = json!("run-old");
+                write_json(&case_dir, name, &artifact);
+            }
+            let options = success_options(dir.path());
+            let legacy = validate_fault_artifacts(&options)
+                .expect_err("legacy-compatible validation must reject an identity conflict");
+            assert!(format!("{legacy:#}").contains(name), "{legacy:#}");
+            let strict = validate_fault_artifacts_for_planned_attempt_and_write_report(
+                &options,
+                "run-00000000-0000-4000-8000-000000000001",
+            )
+            .expect_err("strict validation must reject an identity conflict");
+            assert!(format!("{strict:#}").contains(name), "{strict:#}");
+        }
+    }
+
+    #[test]
+    fn strict_verdict_artifacts_require_additive_identity_fields() {
+        for name in [
+            "preflight-summary.json",
+            "history.jsonl",
+            "recommit-report.json",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_success_artifacts(dir.path(), "io-eio");
+            let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+            let path = case_dir.join(name);
+            if name == "history.jsonl" {
+                let mut record: serde_json::Value =
+                    serde_json::from_str(fs::read_to_string(&path).expect("history").trim())
+                        .expect("record");
+                record.as_object_mut().expect("object").remove("run_id");
+                fs::write(&path, format!("{record}\n")).expect("write history");
+            } else {
+                let mut artifact: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&path).expect("artifact"))
+                        .expect("json");
+                let key = if name == "preflight-summary.json" {
+                    "runId"
+                } else {
+                    "run_id"
+                };
+                artifact.as_object_mut().expect("object").remove(key);
+                write_json(&case_dir, name, &artifact);
+            }
+            let options = success_options(dir.path());
+            validate_fault_artifacts(&options).expect("legacy additive field may be absent");
+            let strict = validate_fault_artifacts_for_planned_attempt_and_write_report(
+                &options,
+                "run-00000000-0000-4000-8000-000000000001",
+            )
+            .expect_err("strict validation requires current identity");
+            assert!(format!("{strict:#}").contains(name), "{strict:#}");
+        }
+    }
+
+    #[test]
+    fn strict_success_validation_rejects_invalid_history_jsonl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        fs::write(case_dir.join("history.jsonl"), "{}\n").expect("invalid history");
+        let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &success_options(dir.path()),
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect_err("invalid operation record must fail closed");
+        assert!(format!("{error:#}").contains("history.jsonl"));
+    }
+
+    #[test]
+    fn strict_success_validation_rejects_mixed_attempt_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("history.jsonl");
+        let current = fs::read_to_string(&path).expect("history");
+        let mut other: serde_json::Value =
+            serde_json::from_str(current.trim()).expect("operation record");
+        other["id"] = json!("op-000002");
+        other["run_id"] = json!("run-old");
+        fs::write(&path, format!("{current}{other}\n")).expect("mixed history");
+
+        let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &success_options(dir.path()),
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect_err("every operation record must match the planned attempt");
+        assert!(format!("{error:#}").contains("history.jsonl"));
+    }
+
+    #[test]
+    fn accepts_self_contained_detector_contract_after_catalog_evolution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        rewrite_run_spec_detector(
+            &case_dir,
+            json!({
+                "revision": 1,
+                "qualification": "gate-candidate",
+                "detects": ["commit-metadata-loss"]
+            }),
+        );
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        validate_fault_artifacts(&options).expect("self-contained historical detector contract");
+        let error = validate_fault_artifacts_for_planned_attempt_and_write_report(
+            &options,
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect_err("current attempts must match their detector contract");
+        assert!(error.to_string().contains("detector contract"));
+    }
+
+    #[test]
+    fn accepts_legacy_run_spec_without_detector_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        rewrite_run_spec_without_detector(&case_dir);
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        validate_fault_artifacts(&options).expect("legacy run spec");
+        assert!(
+            validate_fault_artifacts_for_planned_attempt_and_write_report(
+                &options,
+                "run-00000000-0000-4000-8000-000000000001",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("detector contract")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_detector_contract_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        rewrite_run_spec_detector(
+            &case_dir,
+            json!({
+                "revision": 2,
+                "qualification": "gate-candidate",
+                "detects": ["data-shard-loss"]
+            }),
+        );
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        let error = validate_fault_artifacts(&options).expect_err("unknown detector revision");
+        assert!(error.to_string().contains("detector contract"));
     }
 
     #[test]
@@ -3797,6 +4873,8 @@ mod tests {
                 }
                 let [puts, deletes, multipart_completes] = counts;
                 let invalid = WorkloadSummaryArtifact {
+                    scenario: None,
+                    run_id: None,
                     puts,
                     deletes,
                     multipart_completes,
@@ -4326,6 +5404,8 @@ mod tests {
         ) in cases
         {
             let recovery = RecoveryStabilityReport {
+                scenario: None,
+                run_id: None,
                 immediate_passed: false,
                 reread_attempted_keys: Vec::new(),
                 reread_recovered_keys: Vec::new(),
@@ -4369,6 +5449,8 @@ mod tests {
     #[test]
     fn rejects_version_timeout_summary_that_claims_data_loss() {
         let recovery = RecoveryStabilityReport {
+            scenario: None,
+            run_id: None,
             immediate_passed: false,
             reread_attempted_keys: Vec::new(),
             reread_recovered_keys: Vec::new(),
@@ -4406,6 +5488,8 @@ mod tests {
         let reports = [
             (
                 RecoveryStabilityReport {
+                    scenario: None,
+                    run_id: None,
                     immediate_passed: false,
                     reread_attempted_keys: vec!["object-key".to_string()],
                     reread_recovered_keys: Vec::new(),
@@ -4428,6 +5512,8 @@ mod tests {
             ),
             (
                 RecoveryStabilityReport {
+                    scenario: None,
+                    run_id: None,
                     immediate_passed: false,
                     reread_attempted_keys: Vec::new(),
                     reread_recovered_keys: Vec::new(),
@@ -4494,6 +5580,8 @@ mod tests {
     #[test]
     fn rejects_precise_classification_with_unrelated_evidence() {
         let recovery = RecoveryStabilityReport {
+            scenario: None,
+            run_id: None,
             immediate_passed: false,
             reread_attempted_keys: Vec::new(),
             reread_recovered_keys: Vec::new(),
@@ -4918,8 +6006,13 @@ mod tests {
             }),
         );
 
-        super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect("valid recovery failure fields");
+        super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect("valid recovery failure fields");
     }
 
     #[test]
@@ -4974,8 +6067,13 @@ mod tests {
             }),
         );
 
-        super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect("valid LIST availability failure fields");
+        super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect("valid LIST availability failure fields");
     }
 
     #[test]
@@ -5025,8 +6123,13 @@ mod tests {
             }),
         );
 
-        super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect("valid ambiguous write failure fields");
+        super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect("valid ambiguous write failure fields");
     }
 
     #[test]
@@ -5078,8 +6181,13 @@ mod tests {
             }),
         );
 
-        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect_err("ambiguous summary with loss fields");
+        let error = super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect_err("ambiguous summary with loss fields");
 
         assert!(error.to_string().contains("without proven corruption"));
     }
@@ -5131,8 +6239,13 @@ mod tests {
             }),
         );
 
-        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect_err("ambiguous report with hard evidence");
+        let error = super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect_err("ambiguous report with hard evidence");
 
         assert!(
             error
@@ -5192,8 +6305,13 @@ mod tests {
             }),
         );
 
-        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect_err("tail latency with ambiguous evidence");
+        let error = super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect_err("tail latency with ambiguous evidence");
 
         assert!(error.to_string().contains("without hard failures"));
     }
@@ -5243,8 +6361,13 @@ mod tests {
             }),
         );
 
-        let error = super::validate_conditional_recovery_stability_artifact(dir.path(), case_name)
-            .expect_err("availability report with data evidence");
+        let error = super::validate_conditional_recovery_stability_artifact(
+            dir.path(),
+            case_name,
+            "io-eio",
+            None,
+        )
+        .expect_err("availability report with data evidence");
 
         assert!(
             error
@@ -5257,6 +6380,7 @@ mod tests {
         FailureSummaryArtifact {
             schema_version: 2,
             scenario: "io-eio".to_string(),
+            run_id: None,
             case_name: Some("fault_io_eio_preserves_committed_objects".to_string()),
             observed_at_ms: None,
             stage: "checker-pre-recommit-verdict".to_string(),
@@ -5285,14 +6409,29 @@ mod tests {
         }
     }
 
+    fn success_options(root: &std::path::Path) -> ArtifactValidationOptions {
+        ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: root.to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_workload_versioning: false,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        }
+    }
+
     fn write_success_artifacts(root: &std::path::Path, scenario: &str) {
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
         let case_dir = root.join("fault_io_eio_preserves_committed_objects");
         fs::create_dir_all(&case_dir).expect("case dir");
         let plan = WorkloadPlan::seeded(42, 12, 4);
         let run_spec = json!({
             "apiVersion": FAULT_RUN_API_VERSION,
             "kind": FAULT_RUN_KIND,
-            "metadata": {"name": "fault_io_eio_preserves_committed_objects", "run_id": "run-1", "bucket": "bucket"},
+            "metadata": {"name": "fault_io_eio_preserves_committed_objects", "run_id": run_id, "bucket": "bucket"},
             "cluster": {
                 "context": "real-cluster",
                 "namespace": "rustfs-fault-test",
@@ -5309,7 +6448,12 @@ mod tests {
                 "isolation": "fresh-tenant",
                 "impact_policy": "client-disruption-required",
                 "boundary": "rustfs-workload/fault-injection",
-                "validation": "prefill succeeds before injection, mixed PUT/GET workload runs while IOChaos is active, committed PUTs are GET+sha256 verified after recovery, and successful GETs cannot return corrupt bytes"
+                "validation": "prefill succeeds before injection, mixed PUT/GET workload runs while IOChaos is active, committed PUTs are GET+sha256 verified after recovery, and successful GETs cannot return corrupt bytes",
+                "detector": {
+                    "revision": 1,
+                    "qualification": "gate-candidate",
+                    "detects": ["data-shard-loss", "silent-data-corruption"]
+                }
             },
             "workload": {
                 "mode": "s3-mixed",
@@ -5353,9 +6497,9 @@ mod tests {
         fs::write(
             case_dir.join("run-events.jsonl"),
             [
-                json!({"at_ms":1,"scenario":scenario,"run_id":"run-1","stage":"run","status":"started","message":"started"}).to_string(),
-                json!({"at_ms":2,"scenario":scenario,"run_id":"run-1","stage":"checker-final","status":"succeeded","message":"checked"}).to_string(),
-                json!({"at_ms":3,"scenario":scenario,"run_id":"run-1","stage":"run","status":"succeeded","message":"done"}).to_string(),
+                json!({"at_ms":1,"scenario":scenario,"run_id":run_id,"stage":"run","status":"started","message":"started"}).to_string(),
+                json!({"at_ms":2,"scenario":scenario,"run_id":run_id,"stage":"checker-final","status":"succeeded","message":"checked"}).to_string(),
+                json!({"at_ms":3,"scenario":scenario,"run_id":run_id,"stage":"run","status":"succeeded","message":"done"}).to_string(),
             ].join("\n"),
         ).expect("write events");
         write_json(
@@ -5363,6 +6507,7 @@ mod tests {
             "preflight-summary.json",
             &json!({
                 "schemaVersion": 1,
+                "runId": run_id,
                 "status": "passed",
                 "scenarioSet": [scenario],
                 "checkedAtMs": 1,
@@ -5392,7 +6537,7 @@ mod tests {
                 "generatedAtMs": 1,
                 "scenario": scenario,
                 "caseName": "fault_io_eio_preserves_committed_objects",
-                "runId": "run-1",
+                "runId": run_id,
                 "namespace": "rustfs-fault-test",
                 "tenant": "fault-test-tenant",
                 "resolvedPods": [{
@@ -5440,7 +6585,7 @@ mod tests {
             &json!({
                 "scenario": scenario,
                 "case_name": "fault_io_eio_preserves_committed_objects",
-                "run_id": "run-1",
+                "run_id": run_id,
                 "bucket": "bucket",
                 "backend": "chaos-mesh-io-chaos",
                 "target": "rustfs-volume",
@@ -5463,18 +6608,44 @@ mod tests {
                 "chaos_namespace": "chaos-mesh"
             }),
         );
-        write_json(&case_dir, "workload-plan.json", &json!(plan));
-        fs::write(case_dir.join("history.jsonl"), "{}\n").expect("history");
+        let mut workload_plan = json!(plan);
+        workload_plan["scenario"] = json!(scenario);
+        workload_plan["run_id"] = json!(run_id);
+        write_json(&case_dir, "workload-plan.json", &workload_plan);
+        fs::write(
+            case_dir.join("history.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "id": "op-000001",
+                    "scenario": scenario,
+                    "run_id": run_id,
+                    "kind": "put",
+                    "bucket": "bucket",
+                    "key": "key",
+                    "value_sha256": "sha",
+                    "size_bytes": 1,
+                    "started_at_ms": 1,
+                    "ended_at_ms": 2,
+                    "outcome": "ok",
+                    "http_status": 200,
+                    "error": null
+                })
+            ),
+        )
+        .expect("history");
         write_json(
             &case_dir,
             "workload-summary.json",
             &json!({
+                "scenario": scenario,
+                "run_id": run_id,
                 "seed": 42,
                 "object_count": 12,
                 "concurrency": 4,
                 "total_payload_bytes": 12582912,
-                "puts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
-                "gets": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "puts": {"ok": 1, "not_found": 0, "failed": 1, "timeout": 0, "unknown": 0},
+                "gets": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
                 "deletes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
                 "lists": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
                 "multipart_completes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
@@ -5486,6 +6657,8 @@ mod tests {
             &case_dir,
             "recommit-report.json",
             &json!({
+                "scenario": scenario,
+                "run_id": run_id,
                 "attempted": 1,
                 "committed": 1,
                 "failed": 0,
@@ -5495,7 +6668,7 @@ mod tests {
         );
         let checker = json!({
             "scenario": scenario,
-            "run_id": "run-1",
+            "run_id": run_id,
             "committed_puts": 7,
             "expected_live_objects": 7,
             "verified_live_objects": 7,
@@ -5523,6 +6696,7 @@ mod tests {
             "fault-evidence.json",
             &json!({
                 "scenario": scenario,
+                "run_id": run_id,
                 "backend": "chaos-mesh-io-chaos",
                 "target": "rustfs-volume",
                 "injected": true,
@@ -5562,6 +6736,47 @@ mod tests {
         )
         .expect("parse run spec");
         spec["workload"]["versioning"] = json!(versioning);
+        fs::write(
+            &json_path,
+            serde_json::to_string_pretty(&spec).expect("json"),
+        )
+        .expect("write run spec json");
+        fs::write(
+            case_dir.join("run-spec.yaml"),
+            serde_yaml_ng::to_string(&spec).expect("yaml"),
+        )
+        .expect("write run spec yaml");
+    }
+
+    fn rewrite_run_spec_detector(case_dir: &std::path::Path, detector: serde_json::Value) {
+        let json_path = case_dir.join("run-spec.json");
+        let mut spec = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(&json_path).expect("read run spec"),
+        )
+        .expect("parse run spec");
+        spec["scenario"]["detector"] = detector;
+        fs::write(
+            &json_path,
+            serde_json::to_string_pretty(&spec).expect("json"),
+        )
+        .expect("write run spec json");
+        fs::write(
+            case_dir.join("run-spec.yaml"),
+            serde_yaml_ng::to_string(&spec).expect("yaml"),
+        )
+        .expect("write run spec yaml");
+    }
+
+    fn rewrite_run_spec_without_detector(case_dir: &std::path::Path) {
+        let json_path = case_dir.join("run-spec.json");
+        let mut spec = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(&json_path).expect("read run spec"),
+        )
+        .expect("parse run spec");
+        spec["scenario"]
+            .as_object_mut()
+            .expect("scenario object")
+            .remove("detector");
         fs::write(
             &json_path,
             serde_json::to_string_pretty(&spec).expect("json"),
