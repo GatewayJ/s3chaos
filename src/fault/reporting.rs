@@ -952,6 +952,49 @@ mod tests {
     use std::{collections::BTreeSet, fs};
 
     #[test]
+    fn final_checker_summary_preserves_list_warning_count_and_samples() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector = ArtifactCollector::new(dir.path());
+        for classification in [
+            RecoveryStabilityClassification::ListUnavailableOrUnknown,
+            RecoveryStabilityClassification::DataCorruption,
+        ] {
+            let case_name = classification.as_str();
+            collector
+                .write_text(case_name, "checker-report.json", "{}")
+                .expect("checker evidence");
+            let warnings = vec!["LIST warning b".to_string(), "LIST warning a".to_string()];
+            write_failure_summary(
+                &collector,
+                case_name,
+                FailureSummary::from_checker(
+                    "io-eio",
+                    "checker-verdict",
+                    classification,
+                    "LIST failed",
+                )
+                .with_list_warnings(3, warnings),
+            )
+            .expect("write summary");
+            let path = collector.case_dir(case_name).join("failure-summary.json");
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).expect("summary")).expect("json");
+            assert_eq!(value["classification"], classification.as_str());
+            assert_eq!(value["final_list_warning_count"], 3);
+            assert_eq!(
+                value["list_warnings"],
+                json!(["LIST warning a", "LIST warning b"])
+            );
+            assert_eq!(
+                value["primary_evidence_refs"],
+                json!([format!("{case_name}/checker-report.json")])
+            );
+            crate::fault::artifact_validation::validate_written_failure_summary(dir.path(), &path)
+                .expect("valid final summary");
+        }
+    }
+
+    #[test]
     fn checker_classification_projects_to_s3_model_fields() {
         let summary = FailureSummary::from_checker(
             "io-eio",

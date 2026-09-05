@@ -1764,6 +1764,10 @@ async fn run_fault_case(
                 "checker-verdict",
                 classification,
                 error.to_string(),
+            )
+            .with_list_warnings(
+                report.final_list_warning_count,
+                report.list_warnings.clone(),
             ),
         )?;
         return Err(error);
