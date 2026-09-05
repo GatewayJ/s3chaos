@@ -3342,6 +3342,24 @@ mod tests {
                 "used": 0.2
             }
         ]);
+        let pools_after = json!([
+            {
+                "id": 0,
+                "cmdline": primary,
+                "status": "active",
+                "decommissionStatus": "none",
+                "rebalanceStatus": "none",
+                "totalSize": 2000,
+                "currentSize": 1300,
+                "usedSize": 700,
+                "used": 0.35
+            }
+        ]);
+        let pools_body = serde_json::to_string(&pools).expect("pools/list response body");
+        let pools_sha256 = hex::encode(Sha256::digest(pools_body.as_bytes()));
+        let pools_after_body =
+            serde_json::to_string(&pools_after).expect("post-operation pools/list response body");
+        let pools_after_sha256 = hex::encode(Sha256::digest(pools_after_body.as_bytes()));
         let terminal_status_body = serde_json::to_string(&json!({
             "id": 1,
             "cmdline": target,
@@ -3441,7 +3459,9 @@ mod tests {
                         "query": {},
                         "status": 200,
                         "startedAtMs": 86,
-                        "observedAtMs": 90
+                        "observedAtMs": 90,
+                        "responseSha256": pools_sha256,
+                        "responseBody": pools_body
                     },
                     "pools": pools
                 },
@@ -3464,21 +3484,11 @@ mod tests {
                         "query": {},
                         "status": 200,
                         "startedAtMs": 207,
-                        "observedAtMs": 210
+                        "observedAtMs": 210,
+                        "responseSha256": pools_after_sha256,
+                        "responseBody": pools_after_body
                     },
-                    "pools": [
-                        {
-                            "id": 0,
-                            "cmdline": primary,
-                            "status": "active",
-                            "decommissionStatus": "none",
-                            "rebalanceStatus": "none",
-                            "totalSize": 2000,
-                            "currentSize": 1300,
-                            "usedSize": 700,
-                            "used": 0.35
-                        }
-                    ]
+                    "pools": pools_after
                 }
             }),
         );
@@ -3516,6 +3526,52 @@ mod tests {
             &fs::read(dir.path().join("admin-operation.json")).expect("operation artifact"),
         )
         .expect("operation artifact JSON");
+        let mut missing_pool_raw = valid_operation.clone();
+        missing_pool_raw["poolsBefore"]["request"]
+            .as_object_mut()
+            .expect("pre-operation pool request")
+            .remove("responseBody");
+        write_json(dir.path(), "admin-operation.json", &missing_pool_raw);
+        assert!(
+            validate_admin_topology_artifact_files(
+                "admin-decommission",
+                &attempt,
+                attempt_window,
+                dir.path(),
+            )
+            .is_err(),
+            "pool snapshot without its raw RustFS response must fail closed"
+        );
+        let mut bad_pool_digest = valid_operation.clone();
+        bad_pool_digest["poolsAfter"]["request"]["responseSha256"] = Value::String("c".repeat(64));
+        write_json(dir.path(), "admin-operation.json", &bad_pool_digest);
+        assert!(
+            validate_admin_topology_artifact_files(
+                "admin-decommission",
+                &attempt,
+                attempt_window,
+                dir.path(),
+            )
+            .is_err(),
+            "pool snapshot with a mismatched response digest must fail closed"
+        );
+        let mut forged_pool_raw = valid_operation.clone();
+        let forged_pool_body = "[]";
+        forged_pool_raw["poolsBefore"]["request"]["responseSha256"] =
+            Value::String(hex::encode(Sha256::digest(forged_pool_body.as_bytes())));
+        forged_pool_raw["poolsBefore"]["request"]["responseBody"] =
+            Value::String(forged_pool_body.to_string());
+        write_json(dir.path(), "admin-operation.json", &forged_pool_raw);
+        assert!(
+            validate_admin_topology_artifact_files(
+                "admin-decommission",
+                &attempt,
+                attempt_window,
+                dir.path(),
+            )
+            .is_err(),
+            "self-consistent pools/list wire tampering must not change snapshot fields"
+        );
         let mut missing_raw = valid_operation.clone();
         missing_raw["requests"][1]
             .as_object_mut()
