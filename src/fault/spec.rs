@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fault::{
     config::{DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, FaultTestConfig},
+    host_storage::{HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT},
     plan::{
         FaultInjection, FaultInjectionParameters, FaultPlan, FaultSelection, FaultTarget,
         FaultWorkloadMode,
@@ -115,8 +116,12 @@ pub struct FaultRunFaultSpec {
     #[serde(default = "default_target_proof_spec")]
     pub target_proof: FaultRunTargetProofSpec,
     pub selection: FaultRunSelectionSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_sampling_percent: Option<u8>,
     #[serde(default)]
     pub target_proof_requirements: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub erasure_set_proof_required: bool,
     pub fault_duration_seconds: u64,
     pub observability: String,
     pub conflict_domain: String,
@@ -164,6 +169,12 @@ impl FaultRunSpec {
         run_id: &str,
         bucket: &str,
     ) -> Self {
+        let mut artifacts = FaultRunArtifactSpec::default();
+        if plan.requires_static_storage() {
+            artifacts.required.extend(
+                [HOST_STORAGE_PROOF_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT].map(str::to_string),
+            );
+        }
         Self {
             api_version: FAULT_RUN_API_VERSION.to_string(),
             kind: FAULT_RUN_KIND.to_string(),
@@ -221,7 +232,7 @@ impl FaultRunSpec {
                     FaultRunFaultSpec::from_fault(index, scenario, scenario_spec, fault)
                 })
                 .collect(),
-            artifacts: FaultRunArtifactSpec::default(),
+            artifacts,
         }
     }
 
@@ -258,7 +269,7 @@ impl FaultRunArtifactSpec {
 }
 
 impl FaultRunFaultSpec {
-    fn from_fault(
+    pub(crate) fn from_fault(
         index: usize,
         scenario: &FaultScenario,
         scenario_spec: &FaultScenarioSpec,
@@ -275,11 +286,19 @@ impl FaultRunFaultSpec {
                 artifact: "target-proof.json".to_string(),
             },
             selection: FaultRunSelectionSpec::from_selection(fault.selection()),
+            io_sampling_percent: match fault.selection() {
+                FaultSelection::FixedTargets(_) => fault
+                    .volume_targeting()
+                    .ok()
+                    .map(|targeting| targeting.io_sampling_percent),
+                FaultSelection::Percent(_) => None,
+            },
             target_proof_requirements: scenario_spec
                 .target_proof
                 .iter()
                 .map(|proof| (*proof).to_string())
                 .collect(),
+            erasure_set_proof_required: scenario_spec.requires_erasure_set_proof(),
             fault_duration_seconds: fault.duration().as_secs(),
             observability: scenario_spec.observability.to_string(),
             conflict_domain: scenario_spec.conflict_domain.to_string(),
@@ -316,15 +335,9 @@ impl FaultRunTargetSpec {
 
 impl FaultRunSelectionSpec {
     fn from_selection(selection: FaultSelection) -> Self {
-        match selection {
-            FaultSelection::Percent(percent) => Self {
-                kind: "percent".to_string(),
-                value: percent as u32,
-            },
-            FaultSelection::FixedTargets(count) => Self {
-                kind: "fixed-targets".to_string(),
-                value: count,
-            },
+        Self {
+            kind: selection.kind().to_string(),
+            value: selection.value(),
         }
     }
 }
@@ -351,7 +364,7 @@ mod tests {
     use crate::fault::{
         config::FaultTestConfig,
         plan::{FaultPlan, FaultPlanOptions},
-        scenarios::{FaultScenario, scenario_spec},
+        scenarios::{FaultScenario, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, scenario_spec},
         workload::WorkloadPlan,
     };
 
@@ -424,6 +437,34 @@ mod tests {
         assert_eq!(
             decoded.workload.plan.size_distribution,
             spec.workload.plan.size_distribution
+        );
+    }
+
+    #[test]
+    fn resolved_spec_marks_erasure_set_proof_as_a_typed_requirement() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO.to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let scenario_spec = scenario_spec(&scenario.name).expect("scenario spec");
+        let plan = FaultPlan::from_scenario(&scenario, scenario_spec).expect("plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+
+        let spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            scenario_spec,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+
+        assert!(spec.faults[0].erasure_set_proof_required);
+        assert!(
+            spec.to_json()
+                .expect("json")
+                .contains("\"erasure_set_proof_required\": true")
         );
     }
 }

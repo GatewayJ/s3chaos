@@ -1084,7 +1084,10 @@ scenarios:
         assert_eq!(fault.selection.value, 35);
         assert_eq!(
             execution.attempts[0].config.cluster.artifacts_dir,
-            PathBuf::from("target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1")
+            std::path::absolute(
+                "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1"
+            )
+            .expect("absolute attempt directory")
         );
     }
 
@@ -1901,6 +1904,128 @@ scenarios:
     }
 
     #[test]
+    fn expected_failure_rejects_contradictory_verdicts_and_cleanup_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.cluster.artifacts_dir = dir.path().to_path_buf();
+        let execution = build_fault_suite_execution_plan(
+            expected_failure_suite(),
+            base,
+            "suite-fixed".to_string(),
+        )
+        .expect("plan");
+        let planned = &execution.plan.attempts[0];
+        let suite_root = Path::new(&execution.plan.artifact_root);
+        let case_dir = Path::new(&planned.artifacts.case_dir);
+        let run_id = planned.run_id.as_deref().expect("run id");
+        let validate = || {
+            validate_expected_failure_artifacts(
+                suite_root,
+                case_dir,
+                run_id,
+                &planned.scenario,
+                &planned.case_name,
+                10,
+                100,
+            )
+        };
+        let valid = write_expected_failure_artifacts(suite_root, planned, 1);
+        validate().expect("valid product failure");
+        for (field, value) in [
+            ("data_correctness", json!("passed")),
+            ("corruption", json!(false)),
+            ("data_loss", json!(true)),
+            ("availability", json!("committed_object_unavailable")),
+            ("recovered_within_window", json!(true)),
+            ("recovered_within_seconds", json!(1)),
+            ("evidence_classifications", json!([])),
+            ("final_list_warning_count", json!(1)),
+            ("list_warnings", json!(["unrelated failure"])),
+        ] {
+            let mut summary = valid.clone();
+            summary[field] = value;
+            write_failure_summary(case_dir, summary);
+            let error = validate().expect_err("contradictory summary must be rejected");
+            assert!(
+                error.to_string().contains("failure-summary.json"),
+                "{field}: {error:#}"
+            );
+        }
+        for (stage, status) in [("multipart-cleanup", "failed"), ("run", "succeeded")] {
+            write_expected_failure_artifacts(suite_root, planned, 1);
+            let path = case_dir.join("run-events.jsonl");
+            let mut events = fs::read_to_string(&path).expect("events");
+            events.push_str(&format!("\n{}\n", json!({"at_ms": 95, "scenario": planned.scenario, "run_id": run_id, "stage": stage, "status": status, "message": "conflicting result"})));
+            fs::write(path, events).expect("write events");
+            assert!(
+                validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("non-checker failure")
+            );
+        }
+        write_expected_failure_artifacts(suite_root, planned, 1);
+        let path = case_dir.join("run-spec.json");
+        let valid_spec: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("spec")).expect("json");
+        for detector in [
+            serde_json::Value::Null,
+            json!({"revision": 1, "qualification": "gate-candidate", "detects": ["recovery-availability-regression"]}),
+        ] {
+            let mut spec = valid_spec.clone();
+            spec["scenario"]["detector"] = detector;
+            fs::write(&path, spec.to_string()).expect("write spec");
+            assert!(
+                validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("detector contract")
+            );
+        }
+    }
+
+    #[test]
+    fn relative_artifact_root_produces_resolvable_attempt_references() {
+        let dir = tempfile::tempdir_in(".").expect("relative tempdir");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.cluster.artifacts_dir = PathBuf::from(dir.path().file_name().expect("relative name"));
+        assert!(base.cluster.artifacts_dir.is_relative());
+        let execution = build_fault_suite_execution_plan(
+            expected_failure_suite(),
+            base,
+            "suite-relative".to_string(),
+        )
+        .expect("plan");
+        let planned = &execution.plan.attempts[0];
+        let suite_root = Path::new(&execution.plan.artifact_root);
+        assert!(suite_root.is_absolute());
+        let summary = write_expected_failure_artifacts(suite_root, planned, 1);
+        let observed = serde_json::from_value::<FailureSummary>(summary).expect("summary");
+        let report = validate_expected_failure(
+            suite_root,
+            planned,
+            planned.expected_failure.as_ref().expect("expected"),
+            Some(&observed),
+            10,
+            100,
+        )
+        .expect("valid relative-root run");
+        crate::fault::artifact_validation::validate_attempt_failure_summary_reference(
+            suite_root,
+            &crate::fault::artifact_validation::AttemptFailureSummaryReference {
+                observed_attempt_artifacts_dir: &planned.artifacts.attempt_dir,
+                planned_attempt_artifacts_dir: &planned.artifacts.attempt_dir,
+                planned_case_artifacts_dir: &planned.artifacts.case_dir,
+                planned_case_name: &planned.case_name,
+                failure_summary_ref: &report.failure_summary,
+                scenario: &planned.scenario,
+                run_id: planned.run_id.as_deref().expect("run id"),
+            },
+        )
+        .expect("console reference resolves without duplicating the root");
+    }
+
+    #[test]
     fn expected_failure_signal_accepts_each_supported_checker_classification() {
         let dir = tempfile::tempdir().expect("tempdir");
         let suite = expected_failure_suite();
@@ -1946,19 +2071,104 @@ scenarios:
                 "list_warnings",
                 json!(["LIST prefix fault-test/ did not complete"]),
             ),
+            (
+                "committed_version_missing",
+                "fail_correctness",
+                "failed",
+                "unknown",
+                "missing_committed_versions",
+                json!(["k@v1"]),
+            ),
+            (
+                "committed_version_unavailable",
+                "fail_availability",
+                "unknown",
+                "committed_version_unavailable",
+                "unavailable_committed_versions",
+                json!(["k@v1: outcome=Timeout"]),
+            ),
+            (
+                "version_hash_mismatch",
+                "fail_correctness",
+                "failed",
+                "unknown",
+                "version_hash_mismatches",
+                json!(["k@v1: hash mismatch"]),
+            ),
+            (
+                "delete_marker_missing",
+                "fail_correctness",
+                "failed",
+                "unknown",
+                "missing_committed_delete_markers",
+                json!(["k@marker"]),
+            ),
+            (
+                "deleted_object_resurrected",
+                "fail_correctness",
+                "failed",
+                "unknown",
+                "resurrected_deleted_objects",
+                json!(["k"]),
+            ),
+            (
+                "delete_marker_lineage_incomplete",
+                "needs_investigation",
+                "unknown",
+                "unknown",
+                "delete_marker_lineage_incomplete",
+                json!(["delete-op"]),
+            ),
+            (
+                "multipart_upload_lineage_incomplete",
+                "needs_investigation",
+                "unknown",
+                "unknown",
+                "multipart_upload_lineage_incomplete",
+                json!(["complete-op"]),
+            ),
+            (
+                "version_id_missing_on_committed_write",
+                "needs_investigation",
+                "unknown",
+                "unknown",
+                "committed_writes_missing_version_id_count",
+                json!(1),
+            ),
         ] {
             let mut summary = write_expected_failure_artifacts(&suite_root, planned, 1);
             summary["classification"] = json!(classification);
+            summary["evidence_classifications"] = json!([classification]);
             summary["s3_model_classification"] = json!(classification);
             summary["severity"] = json!(severity);
             summary["data_correctness"] = json!(correctness);
             summary["availability"] = json!(availability);
-            summary["corruption"] = json!(classification == "data_corruption");
+            summary["corruption"] = json!(matches!(
+                classification,
+                "data_corruption"
+                    | "version_hash_mismatch"
+                    | "delete_marker_missing"
+                    | "deleted_object_resurrected"
+            ));
+            summary["data_loss"] = match classification {
+                "committed_version_missing" => json!(true),
+                "version_hash_mismatch"
+                | "delete_marker_missing"
+                | "deleted_object_resurrected" => json!(false),
+                _ => serde_json::Value::Null,
+            };
             if matches!(
                 classification,
-                "committed_object_unavailable" | "list_unavailable_or_unknown"
+                "committed_object_unavailable"
+                    | "list_unavailable_or_unknown"
+                    | "committed_version_missing"
+                    | "committed_version_unavailable"
             ) {
                 summary["recovered_within_window"] = json!(false);
+            }
+            if classification == "list_unavailable_or_unknown" {
+                summary["final_list_warning_count"] = json!(1);
+                summary["list_warnings"] = value.clone();
             }
             write_failure_summary(case_dir, summary);
 
@@ -2103,6 +2313,7 @@ scenarios:
         ghost_summary["s3_model_classification"] = json!("committed_object_unavailable");
         ghost_summary["severity"] = json!("fail_availability");
         ghost_summary["data_correctness"] = json!("unknown");
+        ghost_summary["data_loss"] = serde_json::Value::Null;
         ghost_summary["availability"] = json!("committed_object_unavailable");
         ghost_summary["recovered_within_window"] = json!(false);
         ghost_summary["recovered_within_seconds"] = serde_json::Value::Null;
@@ -2405,7 +2616,7 @@ scenarios:
             case_dir.join("run-spec.json"),
             serde_json::to_string(&json!({
                 "metadata": {"name": planned.case_name, "run_id": run_id},
-                "scenario": {"name": planned.scenario, "case_name": planned.case_name}
+                "scenario": {"name": planned.scenario, "case_name": planned.case_name, "detector": planned.detector}
             }))
             .expect("run spec json"),
         )
@@ -2510,6 +2721,7 @@ scenarios:
                 evidence_ref("run-events.jsonl")
             ],
             "corruption": true,
+            "evidence_classifications": ["data_corruption"],
             "message": "hash mismatch"
         });
         write_failure_summary(case_dir, summary.clone());

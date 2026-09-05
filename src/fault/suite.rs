@@ -128,7 +128,7 @@ impl FaultExpectedEvidenceRef {
 }
 
 impl FaultExpectedFailure {
-    fn validate(&self, scenario: &str) -> Result<()> {
+    pub(crate) fn validate(&self, scenario: &str) -> Result<()> {
         ensure!(
             self.classification.is_s3_model(),
             "scenario {scenario} expectedFailure.classification must be a product S3-model classification, got {}",
@@ -156,6 +156,17 @@ impl FaultExpectedFailure {
         ensure!(
             unique.len() == self.evidence_refs.len(),
             "scenario {scenario} expectedFailure.evidenceRefs contains duplicates"
+        );
+        let final_checker = unique.contains(&FaultExpectedEvidenceRef::CheckerReport);
+        let recovery = unique.contains(&FaultExpectedEvidenceRef::RecoveryStabilityReport)
+            || unique.contains(&FaultExpectedEvidenceRef::CheckerPreRecommitReport);
+        ensure!(
+            !(final_checker && recovery),
+            "scenario {scenario} expectedFailure.evidenceRefs combines mutually exclusive checker stages"
+        );
+        ensure!(
+            self.classification != FailureClassification::RecoveryTailReadLatency || !final_checker,
+            "scenario {scenario} recovery_tail_read_latency requires pre-recommit recovery evidence"
         );
         Ok(())
     }
@@ -998,6 +1009,48 @@ scenarios:
 
         let error = suite.resolve().expect_err("mismatched severity");
         assert!(error.to_string().contains("does not match classification"));
+    }
+
+    #[test]
+    fn rejects_expected_evidence_that_cannot_be_emitted_together() {
+        for evidence_refs in [
+            vec![
+                FaultExpectedEvidenceRef::CheckerReport,
+                FaultExpectedEvidenceRef::CheckerPreRecommitReport,
+            ],
+            vec![
+                FaultExpectedEvidenceRef::CheckerReport,
+                FaultExpectedEvidenceRef::RecoveryStabilityReport,
+            ],
+        ] {
+            let expected = super::FaultExpectedFailure {
+                classification: FailureClassification::DataCorruption,
+                severity: FailureSeverity::FailCorrectness,
+                responsibility_domain: ResponsibilityDomain::Product,
+                evidence_refs,
+            };
+            assert!(
+                expected
+                    .validate("io-eio")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("mutually exclusive")
+            );
+        }
+        let mut expected = super::FaultExpectedFailure {
+            classification: FailureClassification::RecoveryTailReadLatency,
+            severity: FailureSeverity::Degraded,
+            responsibility_domain: ResponsibilityDomain::Product,
+            evidence_refs: vec![FaultExpectedEvidenceRef::CheckerReport],
+        };
+        assert!(expected.validate("io-eio").is_err());
+        expected.evidence_refs = vec![
+            FaultExpectedEvidenceRef::CheckerPreRecommitReport,
+            FaultExpectedEvidenceRef::RecoveryStabilityReport,
+        ];
+        expected
+            .validate("io-eio")
+            .expect("reachable recovery stage");
     }
 
     #[test]

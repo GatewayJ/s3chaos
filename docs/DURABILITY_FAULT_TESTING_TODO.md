@@ -54,7 +54,12 @@ Status legend:
   classifications come from a closed allowlist; unknown or misspelled values
   are writer errors instead of falling through to `needs_investigation`.
 - S3-model classifications are `recovery_tail_read_latency`,
-  `committed_object_unavailable`, `list_unavailable_or_unknown`,
+  `committed_object_unavailable`, `committed_version_missing`,
+  `committed_version_unavailable`, `version_hash_mismatch`,
+  `delete_marker_missing`, `deleted_object_resurrected`,
+  `delete_marker_lineage_incomplete`,
+  `version_id_missing_on_committed_write`,
+  `multipart_upload_lineage_incomplete`, `list_unavailable_or_unknown`,
   `data_corruption`, and `ambiguous_write_materialized`.
 - Current run-failure reasons are `harness_error`, `test_harness`,
   `workload_execution_error`, `artifact_validation_failed`,
@@ -91,11 +96,10 @@ Status legend:
   evidence, while a completed LIST with wrong content remains correctness
   evidence.
 
-- [ ] PARTIAL: Versioned checker semantics.
+- [x] DONE: Versioned checker semantics.
   Meaning: committed version reads, delete marker checks, resurrection checks,
-  ambiguous writes, and recovery-tail classification exist. Dedicated primary
-  classifications such as `committed_version_missing` and
-  `delete_marker_missing` are not fully wired as final failure-summary outputs.
+  ambiguous writes, recovery-tail classification, and dedicated final
+  classifications are wired through failure-summary output.
 
 - [x] DONE: Read-only artifact console exists.
   Meaning: `fault-console-json` and `fault-console-serve` inspect artifact
@@ -288,38 +292,56 @@ guardrails when implementing the ordered TODO below.
 
 ### 4. Add Per-Version-Type Quorum Math
 
-- [ ] TODO: Add a quorum table by version/object type.
-  Meaning: normal data object loss thresholds are not the same as delete marker
-  or size-0 object thresholds. Delete markers and size-0 versions use roughly
-  `n/2` parity behavior in RustFS, so a naive P+1 target can green-pass the bug
-  class. The catalog must know which threshold applies to PUT, MPU complete,
-  delete marker, and size-0 object tests.
+- [ ] PARTIAL: Add a quorum table by version/object type.
+  Meaning: the pure model separates PUT/MPU commit, delete-marker commit, and
+  persisted data/delete-marker/zero-length metadata geometry. The future
+  executable scenarios still need to bind each workload operation to the
+  corresponding table entry.
 
-- [ ] TODO: Record RustFS erasure-set shape in target proof.
-  Meaning: quorum scenarios must prove erasure-set id, total shards, data width,
-  parity width, target volumes, target nodes, and non-target coverage before
-  injection.
+- [ ] PARTIAL: Record RustFS erasure-set shape in target proof.
+  Meaning: the current network-quorum case now binds Tenant geometry and unique
+  Ready Pod identities to RustFS admin runtime set/parity and server/drive UUID
+  membership, and records a bounded-age snapshot before fault apply. Future
+  volume-quorum scenarios must still prove exact target volumes, target nodes,
+  and non-target coverage.
 
-- [ ] BLOCKED: Keep quorum scenarios non-executable until same-erasure-set proof
-  exists.
-  Meaning: random Pod, node, or volume selection cannot establish that P or P+1
-  shards in one erasure set were affected, so it cannot prove the intended
-  quorum boundary.
+- [ ] BLOCKED: Keep volume-quorum scenarios non-executable until exact
+  same-erasure-set volume proof exists.
+  Meaning: the network-quorum case now validates the actual injected Pod set
+  against its single-set server/drive membership at activation and after the
+  workload, but random volume or node selection still cannot establish that P
+  or P+1 shards in one erasure set were affected.
 
 ### 5. Implement Volume-Kind Fixed Targeting
 
-- [ ] TODO: Allow `FixedTargets(N)` for RustFS volume fault kinds.
-  Meaning: current plan validation rejects fixed target counts for the volume
-  family. Quorum IO and heal force-read scenarios need same-kind multi-volume
-  targeting without introducing a generic composition DSL.
+- [ ] PARTIAL: Allow `FixedTargets(N)` for RustFS volume fault kinds.
+  Meaning: the typed fault and backend layers accept bounded fixed target
+  counts while existing percent-based scenarios retain their one-Pod selector
+  and independent I/O sampling behavior. No executable catalog/config source
+  selects this mode yet, so artifact validation rejects a fixed selection for
+  the current percent-based scenarios. Composite fault plans remain rejected.
 
-- [ ] TODO: Render Chaos Mesh or host volume faults for `FixedTargets(N)`.
-  Meaning: type-checking a target count is not enough; backend renderers must
-  actually target N volumes/pods/devices and record the selected target set.
+- [ ] PARTIAL: Render and prove Chaos Mesh volume faults for `FixedTargets(N)`.
+  Meaning: IOChaos renders `mode: fixed` with the declared count, injects all
+  matching I/O on those selected volumes, and records the controller-selected
+  container targets. Runtime proof binds the exact RustFS container mount path
+  through Pod volume name, PVC, PV, storage source, and supported required Node
+  label constraints; unsupported affinity forms fail closed. Every Pod in the
+  tenant selector must pass preflight before a fixed count can be injected.
+  Activation and workload evidence preserve the selected Pod names, UIDs, and
+  running RustFS container IDs and reject controller record drift. Replacing a
+  container invalidates its mount-namespace proof even when the Pod UID stays
+  unchanged. The proof also validates action,
+  methods, parameters, sampling, and duration. End-to-end execution remains
+  pending a trusted catalog/config selection source. The host DeviceMapper
+  backend remains deliberately single-target because its configuration names
+  one mapper/device.
 
-- [ ] TODO: Keep quorum targeting separate from heterogeneous composition.
-  Meaning: quorum P/P+1 is same-kind multi-target IO faulting. It should not
-  require a generic multi-phase workflow abstraction or raw YAML backend steps.
+- [x] DONE: Keep quorum targeting separate from heterogeneous composition.
+  Meaning: `FixedTargets(N)` changes only the selector of one typed volume
+  injection. It does not introduce a generic multi-phase workflow abstraction,
+  heterogeneous faults, or raw YAML backend steps. P/P+1 volume scenarios stay
+  blocked until exact same-erasure-set volume proof exists.
 
 ### 6. Harden Target-Aware Safety Gates
 
@@ -328,34 +350,53 @@ guardrails when implementing the ordered TODO below.
   non-target nodes, and non-fault tenants remain hard stops. Existing scenarios
   should keep current behavior.
 
-- [ ] TODO: Add host/storage mutation preflight.
-  Meaning: before PV replacement, bitrot, stale disk, or dm mutation execution,
-  preflight must prove node/device/PV allowlist match, explicit backend-specific
-  destructive opt-in, rollback or quarantine command, and post-cleanup
-  observation.
+- [x] DONE: Add host/storage mutation preflight.
+  Meaning: executable device-mapper scenarios now require exact singleton
+  node/device/PV allowlists, a separate device-mapper destructive opt-in, and a
+  typed rollback/quarantine/post-cleanup contract. The proof persists canonical
+  fault/recovery tables and executable rollback commands; apply re-observes the
+  full Pod UID/PVC/PV/node/mount/table chain before loading the proven table.
+  Signal cancellation unwinds the guard. Activation and workload snapshots
+  prove the same active mapper and fault table; successful recovery binds its
+  snapshot to `host-storage-post-cleanup.json`. Failed rollback attempts to
+  suspend the mapper and retains the helper and mutation marker for manual
+  recovery; a scheduling taint alone cannot prove storage containment. PV
+  replacement, bitrot, and stale-disk flows remain non-executable catalog
+  entries and must use the same domain proof when their adapters are implemented.
 
-- [ ] TODO: Make host/storage mutation preflight side-effect free.
-  Meaning: the preflight PR may read Kubernetes/host metadata and write proof
-  artifacts, but it must not mutate disks, PV contents, storage objects, or power
-  state.
+- [x] DONE: Make host/storage mutation preflight side-effect free.
+  Meaning: host preflight reads Kubernetes metadata and fixed read-only host
+  commands through a pre-provisioned observer Pod, then writes only the proof
+  artifact. It does not create the observer or mutate disks, PV/PVC objects,
+  object data, or power state.
 
 ### 7. Wire Precise Final Checker Classifications
 
-- [ ] TODO: Project final checker evidence to product classifications.
+- [x] DONE: Project final checker evidence to product classifications.
   Meaning: final checker failures must map to S3-visible product classes such
   as `committed_version_missing`, `committed_object_unavailable`,
   `delete_marker_missing`, or `version_hash_mismatch`, not generic
   `product_or_environment`.
 
-- [ ] TODO: Split committed version/delete marker/MPU primary classifications.
+- [x] DONE: Split committed version/delete marker/MPU primary classifications.
   Meaning: checker already records many facts; reporting must expose the
   highest-signal one as the primary `s3_model_classification` so #4221-style
   ACK-then-loss is routed to product correctness/availability, not unknown.
 
-- [ ] TODO: Add durability checker goldens.
+- [x] DONE: Add durability checker goldens.
   Meaning: synthetic histories should cover PUT 200 loss, DELETE 204
   resurrection, committed MPU complete loss, missing version id, ambiguous
   materialization, LIST timeout, and completed LIST wrong content.
+
+The checker owns classification precedence. Exact committed-version 404 or
+complete-version-list omission is `committed_version_missing`; exact-version
+timeouts remain `committed_version_unavailable`; version body mismatch is
+`version_hash_mismatch`; missing committed delete markers and visible deleted
+objects are `delete_marker_missing` and `deleted_object_resurrected`. A 2xx
+write response without a version id is incomplete lineage, not proven loss;
+DELETE uses `delete_marker_lineage_incomplete`, while MPU completion uses the
+more specific `multipart_upload_lineage_incomplete`.
+Reporting only projects this typed checker result into failure-summary fields.
 
 ### 8. Add The First Calibrated Destructive Smoke Scenarios
 

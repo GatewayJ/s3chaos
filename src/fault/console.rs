@@ -98,7 +98,7 @@ pub struct ConsoleDetectorView {
     pub detects: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ConsoleExpectedFailureView {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -315,6 +315,8 @@ pub struct ConsoleFailureSummaryView {
     pub data_correctness: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub availability: Option<String>,
+    // Console-root-relative links; raw references retain their artifact contract.
+    pub primary_evidence_artifacts: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub primary_evidence_refs: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -480,7 +482,7 @@ pub fn build_console_snapshot(root: impl AsRef<Path>) -> Result<ConsoleSnapshot>
             &mut warnings,
             "failure-summary.json",
             &artifact_root,
-            "expected-failure attempt is matched but its failure-summary.json proof is missing",
+            "expected-failure attempt is matched but its plan or failure-summary.json proof is missing or inconsistent",
         );
     } else if index.failure_summaries.is_empty()
         && should_warn_missing_failure_summary(suite_summary.as_ref(), &attempts)
@@ -1519,6 +1521,7 @@ fn failure_summary_view(root: &Path, path: &Path, raw: Value) -> ConsoleFailureS
         responsibility_domain: json_string(&raw, "responsibility_domain"),
         data_correctness: json_string(&raw, "data_correctness"),
         availability: json_string(&raw, "availability"),
+        primary_evidence_artifacts: failure_evidence_artifacts(root, path, &raw),
         primary_evidence_refs: json_string_array(&raw, "primary_evidence_refs"),
         evidence_classifications: json_string_array(&raw, "evidence_classifications"),
         final_list_warning_count: json_u64(&raw, "final_list_warning_count"),
@@ -1530,6 +1533,41 @@ fn failure_summary_view(root: &Path, path: &Path, raw: Value) -> ConsoleFailureS
         message: json_string(&raw, "message"),
         raw,
     }
+}
+
+fn failure_evidence_artifacts(root: &Path, summary_path: &Path, raw: &Value) -> Vec<String> {
+    let case_dir = summary_path.parent().unwrap_or(root);
+    let reference_root = case_dir
+        .ancestors()
+        .find(|ancestor| suite_marker_exists(ancestor))
+        .unwrap_or_else(|| case_dir.parent().unwrap_or(root));
+    json_string_array(raw, "primary_evidence_refs")
+        .into_iter()
+        .filter_map(|reference| {
+            let reference = Path::new(&reference);
+            if reference.as_os_str().is_empty()
+                || !reference
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+            {
+                return None;
+            }
+            let base = if reference.components().count() == 1 {
+                case_dir
+            } else {
+                reference_root
+            };
+            let evidence = fs::canonicalize(base.join(reference)).ok()?;
+            if !evidence.starts_with(root)
+                || !evidence.starts_with(base)
+                || !evidence.is_file()
+                || evidence == summary_path
+            {
+                return None;
+            }
+            Some(display_path(root, &evidence))
+        })
+        .collect()
 }
 
 fn runner_failure_view(root: &Path, path: &Path, raw: Value) -> ConsoleRunnerFailureView {
@@ -1953,6 +1991,17 @@ fn expected_failure_attempt_missing_summary(
             || attempt.run_id != planned.run_id
             || attempt.scenario != planned.scenario
             || attempt.repetition != planned.repetition
+            || attempt.status.as_deref() != Some("expected-failure")
+            || attempt.expected_failure_matched != Some(true)
+            || attempt.expected_failure != planned.expected_failure
+            || planned.expected_failure.as_ref().is_none_or(|expected| {
+                expected.classification.is_none()
+                    || attempt.classification != expected.classification
+                    || expected.severity.is_none()
+                    || attempt.severity != expected.severity
+                    || expected.responsibility_domain.is_none()
+                    || attempt.responsibility_domain != expected.responsibility_domain
+            })
         {
             return true;
         }
@@ -2062,6 +2111,8 @@ mod tests {
         ArtifactIndex, ArtifactScanLimits, AttemptFailureSummaryReference, MAX_JSON_ARTIFACT_BYTES,
         build_console_snapshot, validate_attempt_failure_summary_reference,
     };
+    use crate::fault::reporting::{FailureSummary, write_failure_summary};
+    use crate::framework::artifacts::ArtifactCollector;
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2291,6 +2342,7 @@ mod tests {
                     "scenario": "io-eio",
                     "caseName": "case",
                     "repetition": 1,
+                    "expectedFailure": {"classification": "data_corruption", "severity": "fail_correctness", "responsibilityDomain": "product", "evidenceRefs": ["checker-report.json"]},
                     "artifacts": {
                         "attemptDir": attempt_dir,
                         "caseDir": case_dir,
@@ -2301,9 +2353,11 @@ mod tests {
             .expect("suite plan"),
         )
         .expect("write suite plan");
-        let write_suite =
-            |failure_summary: &str, scenario: &str, run_id: &str, artifacts_dir: &Path| {
-                fs::write(
+        let write_suite = |failure_summary: &str,
+                           scenario: &str,
+                           run_id: &str,
+                           artifacts_dir: &Path| {
+            fs::write(
                     dir.path().join("suite-summary.json"),
                     serde_json::to_string(&json!({
                         "suite": "smoke",
@@ -2314,7 +2368,11 @@ mod tests {
                         "runId": run_id,
                         "scenario": scenario,
                         "repetition": 1,
+                    "expectedFailure": {"classification": "data_corruption", "severity": "fail_correctness", "responsibilityDomain": "product", "evidenceRefs": ["checker-report.json"]},
                         "status": "expected-failure",
+                        "classification": "data_corruption",
+                        "severity": "fail_correctness",
+                        "responsibilityDomain": "product",
                             "artifactsDir": artifacts_dir,
                             "expectedFailureMatched": true,
                             "failureSummary": failure_summary
@@ -2323,7 +2381,7 @@ mod tests {
                     .expect("suite summary"),
                 )
                 .expect("write suite summary");
-            };
+        };
         let warns = || {
             build_console_snapshot(dir.path())
                 .expect("snapshot")
@@ -2360,6 +2418,22 @@ mod tests {
             !warns(),
             "a bound current-attempt proof suppresses the warning"
         );
+        let summary_path = dir.path().join("suite-summary.json");
+        let valid: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary_path).expect("summary"))
+                .expect("json");
+        for (field, value) in [
+            ("expectedFailure", serde_json::Value::Null),
+            ("classification", json!("committed_object_unavailable")),
+            ("severity", json!("degraded")),
+            ("responsibilityDomain", json!("harness")),
+            ("expectedFailureMatched", json!(false)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["attempts"][0][field] = value;
+            fs::write(&summary_path, invalid.to_string()).expect("write mismatched result");
+            assert!(warns(), "{field} must match the planned detector result");
+        }
 
         for invalid in [
             "002-io-eio-r1/case/failure-summary.json",
@@ -2535,6 +2609,97 @@ mod tests {
                 && warning.message.contains("suite-a")
                 && warning.message.contains("suite-b")
         }));
+    }
+
+    #[test]
+    fn evidence_links_follow_the_owning_suite_at_every_console_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        for (suite, legacy) in [("suite-a", false), ("suite-b", true)] {
+            let suite_root = dir.path().join(suite);
+            let attempt_root = suite_root.join("001-io-eio-r1");
+            let collector = ArtifactCollector::with_reference_root(&attempt_root, &suite_root)
+                .expect("collector");
+            collector
+                .write_text(case_name, "run-events.jsonl", "")
+                .expect("events");
+            fs::write(suite_root.join("suite-summary.json"), "{}").expect("suite marker");
+            write_failure_summary(
+                &collector,
+                case_name,
+                FailureSummary::new("io-eio", "checker-verdict", "data_corruption", "mismatch")
+                    .expect("summary"),
+            )
+            .expect("write summary");
+            if legacy {
+                let path = collector.case_dir(case_name).join("failure-summary.json");
+                let mut raw: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                raw["primary_evidence_refs"] = json!(["run-events.jsonl"]);
+                fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            }
+        }
+        let snapshot = build_console_snapshot(dir.path()).expect("parent snapshot");
+        assert_eq!(snapshot.attempts.len(), 2);
+        for attempt in &snapshot.attempts {
+            let case = &attempt.cases[0];
+            let failure = case.failure_summary.as_ref().expect("failure");
+            let expected = format!("{}/run-events.jsonl", case.artifact_dir);
+            assert_eq!(failure.primary_evidence_artifacts, vec![expected.clone()]);
+            assert!(dir.path().join(expected).is_file());
+            assert_eq!(
+                serde_json::to_value(failure).unwrap()["primaryEvidenceArtifacts"],
+                json!(failure.primary_evidence_artifacts)
+            );
+            assert_eq!(
+                json!(failure.primary_evidence_refs),
+                failure.raw["primary_evidence_refs"]
+            );
+        }
+        for suite in ["suite-a", "suite-b"] {
+            let suite_root = dir.path().join(suite);
+            let case_root = suite_root.join("001-io-eio-r1").join(case_name);
+            for (root, expected) in [
+                (
+                    suite_root,
+                    format!("001-io-eio-r1/{case_name}/run-events.jsonl"),
+                ),
+                (case_root, "run-events.jsonl".to_string()),
+            ] {
+                let snapshot = build_console_snapshot(&root).expect("focused snapshot");
+                let failure = snapshot.attempts[0].cases[0]
+                    .failure_summary
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(failure.primary_evidence_artifacts, vec![expected]);
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_evidence_links_exclude_invalid_missing_and_self_references() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector = ArtifactCollector::new(dir.path());
+        collector
+            .write_text("case", "run-events.jsonl", "")
+            .unwrap();
+        collector.write_text("case", "failure-summary.json", &json!({
+            "primary_evidence_refs": [
+                "case/run-events.jsonl", "case/failure-summary.json", "failure-summary.json",
+                "case/missing.json", "../outside.json", "/outside.json", ""
+            ]
+        }).to_string()).unwrap();
+        for (root, expected) in [
+            (dir.path().to_path_buf(), "case/run-events.jsonl"),
+            (dir.path().join("case"), "run-events.jsonl"),
+        ] {
+            let snapshot = build_console_snapshot(root).expect("standalone snapshot");
+            let failure = snapshot.attempts[0].cases[0]
+                .failure_summary
+                .as_ref()
+                .unwrap();
+            assert_eq!(failure.primary_evidence_artifacts, vec![expected]);
+        }
     }
 
     #[test]

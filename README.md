@@ -32,6 +32,9 @@ scripts/             Shell entry points invoked by Make targets
 protocol/
   examples/          Ready-to-run suite YAMLs: smoke, full-regression,
                      slow-regression, oidc-keycloak
+fault/
+  examples/          Ready-to-run fault suites: smoke, regression,
+                     device-mapper lab, Warp performance
 console/             Web console assets served by the run console
 ```
 
@@ -64,6 +67,7 @@ make fault-suite-template > suite.yaml            # generate a suite skeleton
 make fault-suite-validate SUITE=suite.yaml        # static suite validation
 make fault-suite-plan SUITE=suite.yaml            # dry-run expansion
 make fault-suite-run SUITE=suite.yaml             # live run (needs a cluster)
+make fault-suite-run SUITE=fault/examples/smoke.yaml
 make fault-console-serve                          # browse run artifacts
 
 # Pin the context, namespace, and tenant recorded in the run's target proof.
@@ -87,13 +91,40 @@ eight catalog entries are roadmap placeholders with status `Planned`
 The ordered durability work queue and its safety prerequisites remain in
 [`docs/DURABILITY_FAULT_TESTING_TODO.md`](docs/DURABILITY_FAULT_TESTING_TODO.md).
 
+Ready-to-run suites under [`fault/examples/`](fault/examples/) keep different
+execution environments and verdicts separate:
+
+| Suite | Scope | Additional requirement |
+| --- | --- | --- |
+| `smoke.yaml` | Six short correctness and recovery checks across I/O, pod, and network faults | Dedicated cluster with Chaos Mesh |
+| `regression.yaml` | Remaining ordinary Chaos Mesh scenarios, including the write-quorum boundary | Reference four-server single-erasure-set topology for `network-partition-write-quorum-loss` |
+| `dm-lab.yaml` | `dm-flakey` and the versioned hot-key soft-power-loss proxy | Prepared dedicated block device and static local PV from `docs/DM_FLAKEY.md` |
+| `warp-performance.yaml` | Performance-only Warp-under-chaos campaign; correctness still comes from the normal checker | `warp` on `PATH`; Warp defaults to 60 seconds |
+
+Warp planning requires a positive `RUSTFS_FAULT_TEST_WARP_DURATION_SECONDS`
+strictly below `faultDuration - RUSTFS_FAULT_TEST_TIMEOUT_SECONDS` to leave
+headroom for post-Warp operations. With this suite's 15-minute fault window and
+the default 300-second timeout, Warp must be shorter than 600 seconds. When
+increasing Warp duration, increase `faultDuration` and the suite's `maxDuration`
+as needed, then run `make fault-suite-plan SUITE=fault/examples/warp-performance.yaml`
+with the intended environment. Static `fault-suite-validate` checks YAML only.
+This headroom is not a runtime guarantee: Warp setup and the correctness workload
+also take time, and the run fails if the fault expires before they finish.
+
+Each suite runs its scenarios sequentially to keep their conflict domains from
+overlapping. Do not run multiple fault suites concurrently against the same
+fault-test namespace. CI validates these YAML contracts only; it never starts a
+destructive suite.
+
 The two `dm-flakey*` scenarios need host preparation beyond the environment
 variables below: a device-mapper flakey table over a dedicated block device,
 a static local PV/storage class, and scenario-specific variables
 (`RUSTFS_FAULT_TEST_DM_NAME`, `RUSTFS_FAULT_TEST_DM_NODE`,
-`RUSTFS_FAULT_TEST_DM_MOUNT_PATH`, plus a fault table name for legacy
-`dm-flakey`). Follow [`docs/DM_FLAKEY.md`](docs/DM_FLAKEY.md) for the complete
-host device, static Local PV, privileged namespace, run, and teardown process.
+`RUSTFS_FAULT_TEST_DM_MOUNT_PATH`, a separate pre-provisioned read-only host
+observer, backend-specific destructive opt-in, exact node/device/PV allowlists,
+plus a fault table name for legacy `dm-flakey`). Follow
+[`docs/DM_FLAKEY.md`](docs/DM_FLAKEY.md) for the complete host device, static
+Local PV, observer, privileged namespace, run, and teardown process.
 There is no Make target that provisions or removes the host devices.
 
 Required environment for non-static scenarios:
@@ -212,8 +243,9 @@ fixtures.
 
 ## CI
 
-- `.github/workflows/ci.yml`: fmt/clippy/tests plus static validation of
-  protocol contracts, all example profiles, and shell lint. No cluster needed.
+- `.github/workflows/ci.yml`: fmt/clippy/tests plus static validation of fault
+  suites, protocol contracts, all example profiles, and shell lint. No cluster
+  needed; fault suites are never executed by CI.
 - `.github/workflows/protocol-live.yml`: live RustFS suites (smoke gate,
   native regression, expiration regression, external OIDC regression) on a
   self-hosted runner. Full live execution is manually dispatchable. Mint is

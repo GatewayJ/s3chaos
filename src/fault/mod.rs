@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod acknowledged_mutation;
 pub mod artifact_validation;
 pub mod backends;
 pub mod checker;
@@ -23,12 +24,15 @@ mod fault_artifacts;
 mod fault_lifecycle;
 pub mod fixture;
 pub mod history;
+pub(crate) mod host_storage;
 pub mod plan;
 pub mod pods;
 pub mod preflight;
+pub mod quorum;
 pub mod reporting;
 pub mod runner;
 pub mod scenarios;
+pub mod shutdown;
 pub mod spec;
 pub mod suite;
 pub mod suite_plan;

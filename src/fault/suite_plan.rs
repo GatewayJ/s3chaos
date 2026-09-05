@@ -243,6 +243,8 @@ pub(crate) fn build_fault_suite_plan_expansion(
     run_id: String,
 ) -> Result<FaultSuitePlanExpansion> {
     validate_suite_runtime_contract(&suite, &base_config)?;
+    base_config.cluster.artifacts_dir = std::path::absolute(&base_config.cluster.artifacts_dir)
+        .context("resolve suite artifact root")?;
     if base_config.workload_seed.is_none() {
         base_config.workload_seed = Some(generated_suite_seed());
     }
@@ -411,6 +413,15 @@ impl FaultSuitePlan {
                         attempt.index, attempt.scenario
                     )
                 })?;
+            let catalog = scenario_spec(&attempt.scenario)?;
+            ensure!(
+                attempt.detector.as_ref() == Some(&catalog.detector.contract()),
+                "current fault suite plan detector contract does not match scenario {}",
+                attempt.scenario
+            );
+            if let Some(expected) = &attempt.expected_failure {
+                expected.validate(&attempt.scenario)?;
+            }
         }
         Ok(())
     }
@@ -774,7 +785,7 @@ mod tests {
             .expect("resolved suite template");
         let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
         base.workload_seed = Some(100);
-        base.cluster.artifacts_dir = PathBuf::from("target/fault-tests/artifacts");
+        base.cluster.artifacts_dir = PathBuf::from("/fixture/fault-tests/artifacts");
 
         let expansion = build_fault_suite_plan_expansion(suite, base, "suite-fixed".to_string())
             .expect("suite plan expansion");
@@ -841,7 +852,7 @@ mod tests {
                 "suite": "rustfs-smoke",
                 "runId": "suite-fixed",
                 "suiteSeed": 100,
-                "artifactRoot": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed",
+                "artifactRoot": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed",
                 "cluster": {
                     "context": "real-cluster",
                     "namespace": "rustfs-fault-test",
@@ -931,8 +942,8 @@ mod tests {
                         "crds": ["iochaos.chaos-mesh.org"],
                         "requiredTools": [],
                         "artifacts": {
-                            "attemptDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1",
-                            "caseDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1/fault_io_eio_preserves_committed_objects",
+                            "attemptDir": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1",
+                            "caseDir": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1/fault_io_eio_preserves_committed_objects",
                             "required": required_artifacts.clone(),
                             "eventStream": "run-events.jsonl"
                         },
@@ -1009,8 +1020,8 @@ mod tests {
                         "crds": ["networkchaos.chaos-mesh.org"],
                         "requiredTools": [],
                         "artifacts": {
-                            "attemptDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1",
-                            "caseDir": "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1/fault_network_delay_preserves_object_model",
+                            "attemptDir": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1",
+                            "caseDir": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1/fault_network_delay_preserves_object_model",
                             "required": required_artifacts,
                             "eventStream": "run-events.jsonl"
                         },
@@ -1028,12 +1039,12 @@ mod tests {
         );
         assert_eq!(
             expansion.attempts[0].config.cluster.artifacts_dir,
-            PathBuf::from("target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1")
+            PathBuf::from("/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1")
         );
         assert_eq!(
             expansion.attempts[1].config.cluster.artifacts_dir,
             PathBuf::from(
-                "target/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1"
+                "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/002-network-delay-r1"
             )
         );
     }
@@ -1103,6 +1114,26 @@ scenarios:
         let encoded = expansion.plan.to_json().expect("plan json");
         let decoded = serde_json::from_str::<super::FaultSuitePlan>(&encoded).expect("plan decode");
         assert_eq!(decoded, expansion.plan);
+        let mut changed = decoded.clone();
+        changed.attempts[0]
+            .detector
+            .as_mut()
+            .expect("detector")
+            .detects
+            .clear();
+        changed.attempts[0]
+            .detector
+            .as_mut()
+            .expect("detector")
+            .detects
+            .push(crate::fault::scenarios::DurabilityBugFamily::CommitMetadataLoss);
+        assert!(
+            changed
+                .to_json()
+                .unwrap_err()
+                .to_string()
+                .contains("does not match scenario")
+        );
 
         let mut legacy = serde_json::to_value(&decoded).expect("legacy plan json");
         for attempt in legacy["attempts"]
@@ -1170,7 +1201,7 @@ scenarios:
             multipart: 1,
         };
         let attempt_dir =
-            PathBuf::from("target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1");
+            PathBuf::from("/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1");
 
         let config = scenario_config(&base, &suite, &suite.scenarios[0], 1, 1, &attempt_dir)
             .expect("scenario config");
@@ -1367,6 +1398,53 @@ scenarios:
     fn attempt_seed_keeps_repetitions_distinct_when_seed_is_fixed() {
         assert_ne!(attempt_seed(Some(42), 1, 1), attempt_seed(Some(42), 2, 1));
         assert_eq!(attempt_seed(None, 1, 1), None);
+    }
+
+    #[test]
+    fn warp_example_rejects_duration_without_post_warp_headroom() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+            "../../fault/examples/warp-performance.yaml"
+        ))
+        .expect("Warp example")
+        .resolve()
+        .expect("resolved Warp example");
+        for (warp_seconds, timeout_seconds, accepted) in [
+            (60, 300, true),
+            (599, 300, true),
+            (600, 300, false),
+            (900, 300, false),
+            (1200, 300, false),
+            (0, 300, false),
+            (60, 900, false),
+            (60, 901, false),
+        ] {
+            let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+            base.warp_duration = Duration::from_secs(warp_seconds);
+            base.cluster.timeout = Duration::from_secs(timeout_seconds);
+            let result = build_fault_suite_plan_expansion(
+                suite.clone(),
+                base,
+                "warp-duration-test".to_string(),
+            );
+            if accepted {
+                assert!(result.is_ok(), "Warp {warp_seconds}s: {result:?}");
+            } else {
+                let error = result.expect_err("invalid Warp duration must fail before execution");
+                assert!(error.to_string().contains("WARP_DURATION_SECONDS"));
+            }
+        }
+        let mut extended_suite = suite;
+        extended_suite.scenarios[0].fault_duration_seconds = Some(1800);
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.warp_duration = Duration::from_secs(1200);
+        assert!(
+            build_fault_suite_plan_expansion(
+                extended_suite,
+                base,
+                "extended-warp-window".to_string()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

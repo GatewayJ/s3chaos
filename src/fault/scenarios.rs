@@ -348,6 +348,15 @@ impl FaultScenarioSpec {
     pub fn requires_chaos_mesh(self) -> bool {
         !self.crds.is_empty()
     }
+
+    pub fn requires_erasure_set_proof(self) -> bool {
+        matches!(
+            self.scenario,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+                | QUORUM_P_IO_FAULT_SCENARIO
+                | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        )
+    }
 }
 
 fn versioned_hot_mutation_mix(object_count: usize) -> WorkloadOperationMix {
@@ -475,7 +484,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::CommitMetadataLoss,
         ]),
         case_name: "fault_network_partition_write_quorum_loss_preserves_committed_state",
-        description: "Partition two of the four RustFS Pods from all peers at once (half the drives on the reference single-set topology, where data == parity), driving the cluster below write quorum while read quorum can survive, and verify committed state is fully intact after the partition heals.",
+        description: "Partition two of the four RustFS Pods from all peers at once after a bounded-age RustFS admin runtime snapshot proves their server/drive membership in one symmetric erasure set, driving the cluster below write quorum while read quorum can survive, and verify committed state is intact after heal.",
         priority: FaultPriority::P1,
         backend: FaultBackend::ChaosMeshNetworkChaos,
         status: FaultScenarioStatus::Executable,
@@ -488,12 +497,12 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/network-partition-write-quorum",
         ci_phase: "faults",
-        target: "exactly two RustFS Pods selected by tenant label, fully isolated from the remaining peers (and each other); on the reference 4-server single-pool tenant this removes exactly half the drives of the single erasure set, so write quorum (data+1) is unreachable during the fault",
+        target: "exactly two RustFS Pods selected by tenant label, fully isolated from the remaining peers (and each other); actual injected source records at activation and after workload must identify servers whose runtime drive membership crosses the write-quorum boundary while retaining read quorum",
         target_proof: &[
-            "live target proof must establish the reference single-erasure-set topology before fault activation",
+            "live target proof must bind Tenant geometry and unique Ready Pod identities to bounded-age RustFS admin runtime set/parity and server/drive data before fault activation",
             "the selected target set must contain exactly two RustFS Pods",
         ],
-        validation: "the runner preflight proves the tenant matches a reference single-erasure-set topology (4 servers, 4 or 8 drives, data == parity) so the two-Pod partition provably breaks write quorum; writes during the outage fail cleanly instead of half-committing; successful reads never return wrong hashes; after the partition heals every committed object and version is re-readable with intact content (post-return zero-loss), and Tenant recovers Ready",
+        validation: "the runner stages multipart uploads before the fault, binds Tenant server/volume width and unique Ready Pod identities to RustFS admin runtime set/parity and drive-membership data fetched by a signed request no more than five seconds before fault apply, then proves the actual two-Pod partition leaves read quorum but not write quorum at activation and after workload; every PUT, DELETE, and staged multipart completion during the outage is recorded in history and must fail, time out, or remain unknown; 404 is not quorum-loss evidence; successful reads never return wrong hashes; after heal every committed object and version is re-readable with intact content (post-return zero-loss), and Tenant recovers Ready",
         observability: "history.jsonl, workload-summary.json, checker-report.json, checker-pre-recommit-report.json, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
         conflict_domain: "run-scoped NetworkChaos resource; must not overlap with PodChaos or IOChaos in the same Tenant",
     },
@@ -769,9 +778,12 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         boundary: "rustfs-workload/block-device-fault",
         ci_phase: "faults",
         target: "one dedicated Linux block-device-backed PV used only by the e2e Tenant",
-        target_proof: DEFAULT_TARGET_PROOF,
+        target_proof: &[
+            "host-storage proof must bind exact node/device/PV allowlists to the live Pod/PVC/PV/mount/mapper identities before mutation",
+            "host-storage proof must record the device-mapper rollback, node-quarantine, and post-cleanup observation contract",
+        ],
         validation: "committed objects remain readable after the device fault is removed, and successful reads never return corrupt bytes",
-        observability: "history.jsonl, checker-report.json, dmsetup table/status, kernel logs, PV mapping, events, RustFS logs",
+        observability: "host-storage-proof.json, host-storage-post-cleanup.json, history.jsonl, checker-report.json, dmsetup table/status, kernel logs, PV mapping, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {
@@ -796,13 +808,14 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         ci_phase: "faults",
         target: "one dedicated Linux block-device-backed PV used only by the e2e Tenant, with versioned S3 mutations concentrated on hot keys",
         target_proof: &[
+            "host-storage proof must bind exact node/device/PV allowlists and rollback/quarantine/post-cleanup contracts before mutation",
             "dmsetup table/status must prove an always-down flakey drop_writes table on the dedicated mapped device",
             "the owning Pod must be force-deleted while drop_writes remains active and the filesystem must be unmounted before the healthy table is restored",
             "the mapped filesystem must be remounted and the owning Pod identity must change before recovery verification",
             "run-spec workload.versioning must be true and workload.hotspot must be present",
         ],
         validation: "the crash window contains at least one versioned mutation acknowledged while drop_writes is active; after forced Pod loss, unmount, healthy-table restore and remount, all committed object versions are re-read by versionId, delete markers remain latest, and successful reads never return corrupt bytes; because only one EC volume is lost this is a negative-control proxy, not quorum-loss proof",
-        observability: "run-spec.json/yaml, workload-plan.json, history.jsonl, crash-window-evidence.json, dm-crash-boundary.json, dm-crash-recovered.json, checker-report.json, dmsetup table/status, mount identity, Pod UID transition, events, RustFS logs",
+        observability: "run-spec.json/yaml, host-storage-proof.json, host-storage-post-cleanup.json, workload-plan.json, history.jsonl, crash-window-evidence.json, dm-crash-boundary.json, dm-crash-recovered.json, checker-report.json, dmsetup table/status, mount identity, Pod UID transition, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {
@@ -1126,6 +1139,21 @@ impl FaultScenario {
             config.duration > Duration::ZERO,
             "RUSTFS_FAULT_TEST_DURATION_SECONDS must be greater than zero"
         );
+        if spec.backend == FaultBackend::MinioWarpWithChaos {
+            // Warp is followed by an S3 access wait and the correctness workload.
+            // Reserve headroom here; the runtime active-state check remains the
+            // authority because setup and workload time depend on the target.
+            ensure!(
+                config.warp_duration > Duration::ZERO
+                    && config
+                        .duration
+                        .checked_sub(config.cluster.timeout)
+                        .is_some_and(|remaining| config.warp_duration < remaining),
+                "RUSTFS_FAULT_TEST_WARP_DURATION_SECONDS must be positive and leave more than RUSTFS_FAULT_TEST_TIMEOUT_SECONDS ({}s) inside the fault duration ({}s) for post-Warp operations; shorten Warp or increase faultDuration",
+                config.cluster.timeout.as_secs(),
+                config.duration.as_secs()
+            );
+        }
         config.workload.validate()?;
         config.workload_operation_mix.validate()?;
         if let Some(payload_distribution) = &config.workload_payload_distribution {
@@ -1218,7 +1246,8 @@ mod tests {
         DM_FLAKEY_VERSIONED_HOT_SCENARIO, DetectorQualification, DurabilityBugFamily,
         FaultDetectorContract, FaultParameterSchema, FaultScenario, FaultScenarioStatus,
         FaultScenarioWorkloadProfile, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO,
-        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
+        POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
         WARP_UNDER_CHAOS_SCENARIO, apply_catalog_defaults, executable_scenario_catalog,
         expected_workload_versioning_for_scenario, scenario_catalog, scenario_catalog_json,
         scenario_spec,
@@ -1243,6 +1272,14 @@ mod tests {
         assert_eq!(scenario.percent, 20);
         assert_eq!(scenario.prefill_count(), 20000);
         assert_eq!(scenario.mixed_workload_count(), 20000);
+    }
+
+    #[test]
+    fn non_warp_scenario_ignores_ambient_warp_duration() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.duration = Duration::from_secs(60);
+        config.warp_duration = Duration::MAX;
+        assert!(FaultScenario::from_config(&config).is_ok());
     }
 
     #[test]
@@ -1414,6 +1451,24 @@ mod tests {
         assert_eq!(
             scenario_spec(IO_EIO_SCENARIO).expect("io eio").param_schema,
             FaultParameterSchema::None
+        );
+    }
+
+    #[test]
+    fn catalog_explicitly_identifies_erasure_set_proof_scenarios() {
+        let requiring_proof = scenario_catalog()
+            .iter()
+            .filter(|scenario| scenario.requires_erasure_set_proof())
+            .map(|scenario| scenario.scenario)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            requiring_proof,
+            vec![
+                NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+                QUORUM_P_IO_FAULT_SCENARIO,
+                QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+            ]
         );
     }
 
