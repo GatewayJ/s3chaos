@@ -287,6 +287,8 @@ pub struct RebalanceStopPropagationStatus {
 #[serde(rename_all = "camelCase")]
 pub struct AdminRequestEvidence {
     pub target: AdminRequestTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_probe: Option<AdminRuntimeBinding>,
     pub method: String,
     pub path: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -528,8 +530,7 @@ impl AdminEndpointIdentity {
                 && self.tenant_uid == current.tenant_uid
                 && self.local_endpoint == current.local_endpoint
                 && self.remote_port == current.remote_port
-                && bound_tenant.pointer("/spec/pools") == current_tenant.pointer("/spec/pools")
-                && bound_tenant.pointer("/spec/tls") == current_tenant.pointer("/spec/tls"),
+                && bound_tenant.pointer("/spec") == current_tenant.pointer("/spec"),
             "admin port-forward live Kubernetes target drifted after endpoint binding"
         );
         Ok(())
@@ -607,9 +608,53 @@ impl AdminRuntimeBinding {
     fn require_same_runtime(&self, current: &Self) -> Result<()> {
         self.validate()?;
         current.validate()?;
+        self.target
+            .endpoint
+            .require_same_live_target(&current.target.endpoint)?;
         ensure!(
-            self.target == current.target && self.observed_at_ms <= current.started_at_ms,
+            self.target.deployment_id == current.target.deployment_id
+                && self.observed_at_ms <= current.started_at_ms,
             "RustFS deployment changed before a destructive admin request"
+        );
+        Ok(())
+    }
+}
+
+impl AdminRequestEvidence {
+    fn validate(&self) -> Result<()> {
+        self.target.endpoint.validate()?;
+        ensure!(
+            !self.target.deployment_id.trim().is_empty()
+                && self.started_at_ms > 0
+                && self.started_at_ms <= self.observed_at_ms,
+            "admin request evidence lacks a deployment or an ordered request interval"
+        );
+        if self.method == Method::GET.as_str() {
+            ensure!(
+                self.runtime_probe.is_none(),
+                "read-only admin request unexpectedly carries a destructive-request runtime probe"
+            );
+        } else {
+            let probe = self
+                .runtime_probe
+                .as_ref()
+                .context("destructive admin request lacks its fresh RustFS runtime probe")?;
+            probe.validate()?;
+            self.target
+                .endpoint
+                .require_same_live_target(&probe.target.endpoint)?;
+            ensure!(
+                probe.target.deployment_id == self.target.deployment_id
+                    && probe.observed_at_ms <= self.started_at_ms,
+                "destructive admin request is not preceded by a matching RustFS runtime probe"
+            );
+        }
+        ensure!(
+            matches!(
+                (&self.response_sha256, &self.response_body),
+                (Some(digest), Some(body)) if digest == &sha256_hex(body.as_bytes())
+            ) || (self.response_sha256.is_none() && self.response_body.is_none()),
+            "admin request response body and digest are incomplete or inconsistent"
         );
         Ok(())
     }
@@ -620,6 +665,11 @@ impl AdminRuntimeBinding {
 pub struct AdminCall<T> {
     pub value: T,
     pub request: AdminRequestEvidence,
+}
+
+struct AdminRequestPreflight {
+    target: AdminRequestTarget,
+    runtime_probe: Option<AdminRuntimeBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -749,6 +799,7 @@ impl AdminPoolSnapshot {
         validate_attempt_identity(&self.attempt)?;
         self.tenant_get.validate()?;
         self.runtime.validate()?;
+        self.request.validate()?;
         self.runtime.target.endpoint.validate_for_tenant(
             &self.tenant_get.namespace,
             &self.tenant_get.name,
@@ -853,9 +904,9 @@ impl RustfsAdminTopologyAdapter {
         Self::connect_bound(endpoint, region, access_key, secret_key, None).await
     }
 
-    fn ensure_port_forward_target(&self) -> Result<()> {
+    fn ensure_port_forward_target(&self) -> Result<AdminEndpointIdentity> {
         let Some(port_forward) = &self.port_forward else {
-            return Ok(());
+            return Ok(self.runtime.target.endpoint.clone());
         };
         let mut port_forward = port_forward
             .lock()
@@ -864,7 +915,8 @@ impl RustfsAdminTopologyAdapter {
         self.runtime
             .target
             .endpoint
-            .require_same_live_target(&current)
+            .require_same_live_target(&current)?;
+        Ok(current)
     }
 
     pub fn runtime_binding(&self) -> &AdminRuntimeBinding {
@@ -872,19 +924,23 @@ impl RustfsAdminTopologyAdapter {
     }
 
     pub async fn probe_runtime_binding(&self) -> Result<AdminRuntimeBinding> {
-        self.ensure_port_forward_target()?;
-        probe_runtime_binding(&self.transport, self.runtime.target.endpoint.clone()).await
+        let endpoint = self.ensure_port_forward_target()?;
+        probe_runtime_binding(&self.transport, endpoint).await
     }
 
-    async fn ensure_request_target(&self, method: &Method) -> Result<()> {
-        self.ensure_port_forward_target()?;
-        if *method != Method::GET {
-            let current =
-                probe_runtime_binding(&self.transport, self.runtime.target.endpoint.clone())
-                    .await?;
+    async fn ensure_request_target(&self, method: &Method) -> Result<AdminRequestPreflight> {
+        let endpoint = self.ensure_port_forward_target()?;
+        let runtime_probe = if *method != Method::GET {
+            let current = probe_runtime_binding(&self.transport, endpoint).await?;
             self.runtime.require_same_runtime(&current)?;
-        }
-        Ok(())
+            Some(current)
+        } else {
+            None
+        };
+        Ok(AdminRequestPreflight {
+            target: self.runtime.target.clone(),
+            runtime_probe,
+        })
     }
 
     async fn json<T: for<'de> Deserialize<'de>>(
@@ -893,7 +949,7 @@ impl RustfsAdminTopologyAdapter {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<AdminCall<T>> {
-        self.ensure_request_target(&method).await?;
+        let preflight = self.ensure_request_target(&method).await?;
         let started_at_ms = now_ms();
         let response = self
             .transport
@@ -902,7 +958,7 @@ impl RustfsAdminTopologyAdapter {
         let observed_at_ms = now_ms();
         require_success(&response, path)?;
         let request = request_evidence(
-            self.runtime.target.clone(),
+            preflight,
             method,
             path,
             query,
@@ -921,7 +977,7 @@ impl RustfsAdminTopologyAdapter {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<AdminCall<()>> {
-        self.ensure_request_target(&method).await?;
+        let preflight = self.ensure_request_target(&method).await?;
         let started_at_ms = now_ms();
         let response = self
             .transport
@@ -932,7 +988,7 @@ impl RustfsAdminTopologyAdapter {
         Ok(AdminCall {
             value: (),
             request: request_evidence(
-                self.runtime.target.clone(),
+                preflight,
                 method,
                 path,
                 query,
@@ -945,7 +1001,7 @@ impl RustfsAdminTopologyAdapter {
 }
 
 fn request_evidence(
-    target: AdminRequestTarget,
+    preflight: AdminRequestPreflight,
     method: Method,
     path: &str,
     query: &[(&str, &str)],
@@ -953,8 +1009,13 @@ fn request_evidence(
     observed_interval_ms: (u64, u64),
     response_body: Option<&[u8]>,
 ) -> AdminRequestEvidence {
+    let AdminRequestPreflight {
+        target,
+        runtime_probe,
+    } = preflight;
     AdminRequestEvidence {
         target,
+        runtime_probe,
         method: method.to_string(),
         path: path.to_string(),
         query: query
@@ -1685,10 +1746,17 @@ fn validate_pre_start_snapshot(
     );
     let (start_started_at_ms, _, _) =
         validate_start_before_status(operation_requests, &proof.scenario, proof.target_pool_id)?;
+    let (start_path, _) = admin_request_paths(&proof.scenario)?;
+    let start_runtime_probe = operation_requests
+        .iter()
+        .find(|request| request.method == "POST" && request.path == start_path)
+        .and_then(|request| request.runtime_probe.as_ref())
+        .context("admin start request lacks its fresh RustFS runtime probe")?;
     ensure!(
         snapshot.runtime.observed_at_ms < snapshot.tenant_get.started_at_ms
             && snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
-            && snapshot.request.observed_at_ms < start_started_at_ms
+            && snapshot.request.observed_at_ms < start_runtime_probe.started_at_ms
+            && start_runtime_probe.observed_at_ms <= start_started_at_ms
             && snapshot.tenant_get.observed_at_ms < start_started_at_ms
             && start_started_at_ms - snapshot.tenant_get.observed_at_ms
                 <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS
@@ -2560,18 +2628,25 @@ fn validate_request_timing(
         !requests.is_empty(),
         "admin operation request transcript is empty"
     );
+    for request in requests {
+        request.validate()?;
+        ensure!(
+            attempt_window.contains(request.started_at_ms)
+                && attempt_window.contains(request.observed_at_ms)
+                && request.runtime_probe.as_ref().is_none_or(|probe| {
+                    attempt_window.contains(probe.started_at_ms)
+                        && attempt_window.contains(probe.observed_at_ms)
+                }),
+            "admin request or runtime-probe interval falls outside the current attempt window"
+        );
+    }
     ensure!(
-        requests.iter().all(|request| request.started_at_ms > 0
-            && request.started_at_ms <= request.observed_at_ms
-            && attempt_window.contains(request.started_at_ms)
-            && attempt_window.contains(request.observed_at_ms)),
-        "admin request interval is inverted or falls outside the current attempt window"
-    );
-    ensure!(
-        requests
-            .windows(2)
-            .all(|pair| pair[0].observed_at_ms <= pair[1].started_at_ms),
-        "admin request transcript intervals overlap or are not ordered"
+        requests.windows(2).all(|pair| pair[0].observed_at_ms
+            <= pair[1]
+                .runtime_probe
+                .as_ref()
+                .map_or(pair[1].started_at_ms, |probe| probe.started_at_ms)),
+        "admin request and runtime-probe transcript intervals overlap or are not ordered"
     );
     Ok(())
 }
@@ -3191,6 +3266,13 @@ mod tests {
         }
     }
 
+    fn mutation_runtime_probe(request_started_at_ms: u64) -> Option<AdminRuntimeBinding> {
+        Some(runtime_binding(
+            request_started_at_ms.saturating_sub(2),
+            request_started_at_ms.saturating_sub(1),
+        ))
+    }
+
     fn context(scenario: &str) -> AdminTopologyBuildContext {
         AdminTopologyBuildContext {
             run_id: TEST_RUN_ID.to_string(),
@@ -3275,6 +3357,7 @@ mod tests {
         let mut requests = vec![
             AdminRequestEvidence {
                 target: request_target(),
+                runtime_probe: mutation_runtime_probe(95),
                 method: "POST".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/start"),
                 query: BTreeMap::new(),
@@ -3287,6 +3370,7 @@ mod tests {
             },
             AdminRequestEvidence {
                 target: request_target(),
+                runtime_probe: None,
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/status"),
                 query: BTreeMap::new(),
@@ -3324,6 +3408,7 @@ mod tests {
             1,
             AdminRequestEvidence {
                 target: request_target(),
+                runtime_probe: None,
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/status"),
                 query: BTreeMap::new(),
@@ -3360,6 +3445,7 @@ mod tests {
         let mut requests = vec![
             AdminRequestEvidence {
                 target: request_target(),
+                runtime_probe: mutation_runtime_probe(95),
                 method: "POST".to_string(),
                 path: format!("{ADMIN_PREFIX}/pools/decommission"),
                 query: BTreeMap::from([
@@ -3375,6 +3461,7 @@ mod tests {
             },
             AdminRequestEvidence {
                 target: request_target(),
+                runtime_probe: None,
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/decommission/status"),
                 query: BTreeMap::from([
@@ -3417,6 +3504,7 @@ mod tests {
                 1,
                 AdminRequestEvidence {
                     target: request_target(),
+                    runtime_probe: None,
                     method: "GET".to_string(),
                     path: format!("{ADMIN_PREFIX}/decommission/status"),
                     query: BTreeMap::from([
@@ -3506,6 +3594,7 @@ mod tests {
         let request = with_json_response(
             AdminRequestEvidence {
                 target: request_target(),
+                runtime_probe: None,
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/pools/list"),
                 query: BTreeMap::new(),
@@ -3738,6 +3827,17 @@ mod tests {
             .await
             .expect("stable deployment permits destructive request");
         assert_eq!(started.value.id, "rebalance-1");
+        let runtime_probe = started
+            .request
+            .runtime_probe
+            .as_ref()
+            .expect("destructive request retains its fresh runtime probe");
+        assert_eq!(runtime_probe.target, started.request.target);
+        assert!(runtime_probe.observed_at_ms <= started.request.started_at_ms);
+        assert_eq!(
+            runtime_probe.response_sha256,
+            sha256_hex(runtime_probe.response_body.as_bytes())
+        );
         assert_eq!(info_calls.load(Ordering::SeqCst), 2);
         assert_eq!(destructive_calls.load(Ordering::SeqCst), 1);
 
@@ -3771,6 +3871,7 @@ mod tests {
                 request: with_json_response(
                     AdminRequestEvidence {
                         target: request_target(),
+                        runtime_probe: None,
                         method: "GET".to_string(),
                         path: format!("{ADMIN_PREFIX}/pools/list"),
                         query: BTreeMap::new(),
@@ -3808,6 +3909,7 @@ mod tests {
                     request: with_json_response(
                         AdminRequestEvidence {
                             target: request_target(),
+                            runtime_probe: None,
                             method: "GET".to_string(),
                             path: format!("{ADMIN_PREFIX}/pools/list"),
                             query: BTreeMap::new(),
@@ -3841,6 +3943,7 @@ mod tests {
                     request: with_json_response(
                         AdminRequestEvidence {
                             target: request_target(),
+                            runtime_probe: None,
                             method: "GET".to_string(),
                             path: format!("{ADMIN_PREFIX}/pools/list"),
                             query: BTreeMap::new(),
@@ -3861,7 +3964,7 @@ mod tests {
     }
 
     #[test]
-    fn live_target_allows_status_updates_but_rejects_tenant_topology_drift() {
+    fn live_target_allows_status_updates_but_rejects_complete_tenant_spec_drift() {
         let bound = endpoint_identity();
         let mut current = bound.clone();
         let mut current_tenant = current.tenant_receipt().expect("Tenant receipt");
@@ -3881,6 +3984,29 @@ mod tests {
             bound.require_same_live_target(&current).is_err(),
             "same-UID Tenant pool drift must invalidate the live target"
         );
+
+        for (field, value) in [
+            ("image", serde_json::json!("rustfs/rustfs:replacement")),
+            (
+                "configuration",
+                serde_json::json!({"name": "replacement-config"}),
+            ),
+            (
+                "env",
+                serde_json::json!([{"name": "RUSTFS_LOG_LEVEL", "value": "debug"}]),
+            ),
+        ] {
+            let mut current = bound.clone();
+            let mut current_tenant = current.tenant_receipt().expect("Tenant receipt");
+            current_tenant["spec"][field] = value;
+            current.tenant_response_body =
+                serde_json::to_string(&current_tenant).expect("drifted Tenant JSON");
+            current.tenant_response_sha256 = sha256_hex(current.tenant_response_body.as_bytes());
+            assert!(
+                bound.require_same_live_target(&current).is_err(),
+                "same-UID Tenant {field} drift must invalidate the live target"
+            );
+        }
     }
 
     #[test]
@@ -4465,6 +4591,49 @@ mod tests {
             &operation,
         )
         .unwrap();
+        let mut missing_runtime_probe = operation.clone();
+        missing_runtime_probe.requests[0].runtime_probe = None;
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &missing_runtime_probe,
+            )
+            .is_err(),
+            "destructive request must retain its fresh RustFS runtime probe"
+        );
+        let mut stale_runtime_probe = operation.clone();
+        stale_runtime_probe.requests[0].runtime_probe = Some(proof.runtime.clone());
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &stale_runtime_probe,
+            )
+            .is_err(),
+            "destructive request runtime probe must be fresher than the pre-start snapshot"
+        );
+        let mut late_runtime_probe = operation.clone();
+        late_runtime_probe.requests[0]
+            .runtime_probe
+            .as_mut()
+            .expect("runtime probe")
+            .observed_at_ms = late_runtime_probe.requests[0].started_at_ms + 1;
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &late_runtime_probe,
+            )
+            .is_err(),
+            "runtime probe must complete before its destructive request starts"
+        );
         let mut zero_movement = operation.clone();
         zero_movement.objects_moved = Some(0);
         zero_movement.bytes_moved = Some(0);
@@ -4646,6 +4815,7 @@ mod tests {
         operation.canceled_or_stopped = false;
         operation.requests.push(AdminRequestEvidence {
             target: request_target(),
+            runtime_probe: mutation_runtime_probe(240),
             method: "POST".to_string(),
             path: format!("{ADMIN_PREFIX}/pools/cancel"),
             query: BTreeMap::from([
@@ -4683,6 +4853,7 @@ mod tests {
             let mut injected_mutation = operation.clone();
             injected_mutation.requests.push(AdminRequestEvidence {
                 target: request_target(),
+                runtime_probe: mutation_runtime_probe(240),
                 method: "POST".to_string(),
                 path,
                 query,
@@ -4800,6 +4971,7 @@ mod tests {
             .requests
             .push(AdminRequestEvidence {
                 target: request_target(),
+                runtime_probe: None,
                 method: "GET".to_string(),
                 path: format!("{ADMIN_PREFIX}/rebalance/status"),
                 query: BTreeMap::new(),
@@ -4958,6 +5130,7 @@ mod tests {
         let mut wrong_terminal_request = operation.clone();
         wrong_terminal_request.requests.push(AdminRequestEvidence {
             target: request_target(),
+            runtime_probe: None,
             method: "GET".to_string(),
             path: format!("{ADMIN_PREFIX}/decommission/status"),
             query: BTreeMap::from([
@@ -5017,6 +5190,7 @@ mod tests {
             requests: vec![
                 AdminRequestEvidence {
                     target: request_target(),
+                    runtime_probe: mutation_runtime_probe(95),
                     method: "POST".to_string(),
                     path: format!("{ADMIN_PREFIX}/rebalance/start"),
                     query: BTreeMap::new(),
@@ -5029,6 +5203,7 @@ mod tests {
                 },
                 AdminRequestEvidence {
                     target: request_target(),
+                    runtime_probe: None,
                     method: "GET".to_string(),
                     path: format!("{ADMIN_PREFIX}/rebalance/status"),
                     query: BTreeMap::new(),

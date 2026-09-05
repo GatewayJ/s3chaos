@@ -3466,6 +3466,10 @@ mod tests {
             "responseSha256": info_sha256,
             "responseBody": info_body
         });
+        let mut runtime_mutation = runtime_before.clone();
+        runtime_mutation["startedAtMs"] = json!(91);
+        runtime_mutation["observedAtMs"] = json!(94);
+        runtime_mutation["requestId"] = json!("admin-info-before-decommission");
         let mut runtime_after = runtime_before.clone();
         runtime_after["startedAtMs"] = json!(201);
         runtime_after["observedAtMs"] = json!(204);
@@ -3550,6 +3554,7 @@ mod tests {
                 "requests": [
                     {
                         "target": request_target,
+                        "runtimeProbe": runtime_mutation,
                         "method": "POST",
                         "path": "/rustfs/admin/v3/pools/decommission",
                         "query": {"pool": "1", "by-id": "true"},
