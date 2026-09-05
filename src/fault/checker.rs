@@ -40,11 +40,24 @@ pub struct CheckerAudit {
     pub history_prefix_sha256: String,
     pub history_suffix_record_count: usize,
     pub history_suffix_sha256: String,
+    pub suffix_operations: Vec<CheckerOperationAudit>,
     pub data_version_checks: Vec<CheckerDataVersionAudit>,
     pub delete_marker_checks: Vec<CheckerDeleteMarkerAudit>,
     /// `None` means versioning was not part of this checker run. Otherwise the
     /// value records whether ListObjectVersions returned a complete response.
     pub list_object_versions_completed: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckerOperationAudit {
+    pub operation_id: String,
+    pub kind: OperationKind,
+    pub key: Option<String>,
+    pub version_id: Option<String>,
+    pub observed_sha256: Option<String>,
+    pub outcome: OperationOutcome,
+    pub http_status: Option<u16>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +286,22 @@ impl CheckerReport {
 /// a separately reconstructed projection.
 pub(crate) fn checker_history_records_sha256(records: &[OperationRecord]) -> Result<String> {
     Ok(sha256_hex(&serde_json::to_vec(records)?))
+}
+
+pub(crate) fn checker_operation_audits(records: &[OperationRecord]) -> Vec<CheckerOperationAudit> {
+    records
+        .iter()
+        .map(|record| CheckerOperationAudit {
+            operation_id: record.id.clone(),
+            kind: record.kind,
+            key: record.key.clone(),
+            version_id: record.version_id.clone(),
+            observed_sha256: record.value_sha256.clone(),
+            outcome: record.outcome,
+            http_status: record.http_status,
+            error: record.error.clone(),
+        })
+        .collect()
 }
 
 pub async fn check_s3_history(
@@ -546,6 +575,7 @@ pub async fn check_s3_history(
         history_prefix_sha256,
         history_suffix_record_count: checker_suffix.len(),
         history_suffix_sha256: checker_history_records_sha256(checker_suffix)?,
+        suffix_operations: checker_operation_audits(checker_suffix),
         data_version_checks,
         delete_marker_checks,
         list_object_versions_completed,

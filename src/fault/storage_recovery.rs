@@ -32,7 +32,7 @@ use crate::fault::{
     },
     checker::{
         CheckerDataVersionAudit, CheckerDeleteMarkerAudit, CheckerReport,
-        checker_history_records_sha256,
+        checker_history_records_sha256, checker_operation_audits,
     },
     history::{
         DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome, OperationRecord,
@@ -1063,6 +1063,7 @@ impl PostReturnCheckerEvidence {
                 && audit.history_prefix_sha256 == checker_history_records_sha256(history_prefix)?
                 && audit.history_suffix_record_count == history_suffix.len()
                 && audit.history_suffix_sha256 == checker_history_records_sha256(history_suffix)?
+                && audit.suffix_operations == checker_operation_audits(history_suffix)
                 && history_suffix.iter().all(|record| {
                     record_matches_identity(record, identity)
                         && matches!(
@@ -1091,6 +1092,52 @@ impl PostReturnCheckerEvidence {
                 .all(|mutation| { prefix_operation_ids.contains(mutation.operation_id.as_str()) }),
             "post-return checker history prefix omits a stale-window mutation"
         );
+        let mut committed_current_state = BTreeMap::<String, Option<String>>::new();
+        let mut pending_ambiguous_deletes = BTreeSet::new();
+        for record in history_prefix.iter().filter(|record| {
+            record_matches_identity(record, identity) && valid_operation_interval(record)
+        }) {
+            let Some(key) = record.key.as_ref() else {
+                continue;
+            };
+            match record.kind {
+                OperationKind::Put | OperationKind::CompleteMultipartUpload
+                    if record.outcome == OperationOutcome::Ok
+                        && record
+                            .http_status
+                            .is_some_and(|status| (200..300).contains(&status)) =>
+                {
+                    committed_current_state.insert(
+                        key.clone(),
+                        Some(
+                            record
+                                .value_sha256
+                                .clone()
+                                .expect("validated committed writes carry a hash"),
+                        ),
+                    );
+                    pending_ambiguous_deletes.remove(key);
+                }
+                OperationKind::Delete
+                    if record.outcome == OperationOutcome::Ok
+                        && record
+                            .http_status
+                            .is_some_and(|status| (200..300).contains(&status)) =>
+                {
+                    committed_current_state.insert(key.clone(), None);
+                    pending_ambiguous_deletes.remove(key);
+                }
+                OperationKind::Delete
+                    if matches!(
+                        record.outcome,
+                        OperationOutcome::Timeout | OperationOutcome::Unknown
+                    ) =>
+                {
+                    pending_ambiguous_deletes.insert(key.clone());
+                }
+                _ => {}
+            }
+        }
         let mut expected_data_checks = Vec::new();
         let mut expected_delete_checks = Vec::new();
         for record in history_prefix.iter().filter(|record| {
@@ -1170,6 +1217,70 @@ impl PostReturnCheckerEvidence {
             );
             *recorded.expect("count checked above") -= 1;
         }
+        ensure!(
+            recorded_version_gets.iter().all(|(key, count)| {
+                *count == 0 || key.3 != operation_outcome_rank(OperationOutcome::Ok)
+            }),
+            "post-return checker suffix contains an unreported successful version GET"
+        );
+        let checker_prefix = format!("fault-test/{}/", identity.run_id);
+        for kind in [OperationKind::ListVersions, OperationKind::List] {
+            let matching = history_suffix
+                .iter()
+                .filter(|record| record.kind == kind)
+                .collect::<Vec<_>>();
+            ensure!(
+                matches!(matching.as_slice(), [record]
+                    if record.key.as_deref() == Some(checker_prefix.as_str())
+                        && record.outcome == OperationOutcome::Ok
+                        && record.http_status.is_some_and(|status| (200..300).contains(&status))
+                        && record.error.is_none()),
+                "post-return checker requires one successful bounded LIST and ListObjectVersions request"
+            );
+        }
+        let mut tolerated_ambiguous_deletes = BTreeSet::new();
+        let mut current_get_counts = BTreeMap::new();
+        for record in history_suffix
+            .iter()
+            .filter(|record| record.kind == OperationKind::Get && record.version_id.is_none())
+        {
+            let key = record
+                .key
+                .as_ref()
+                .context("post-return checker current-object GET lacks a key")?;
+            *current_get_counts.entry(key.clone()).or_insert(0usize) += 1;
+            let clean = match committed_current_state.get(key) {
+                Some(Some(expected_sha256)) => {
+                    if pending_ambiguous_deletes.contains(key)
+                        && record.outcome == OperationOutcome::NotFound
+                        && record.http_status == Some(404)
+                        && record.value_sha256.is_none()
+                    {
+                        tolerated_ambiguous_deletes.insert(key.clone());
+                        true
+                    } else {
+                        record.outcome == OperationOutcome::Ok
+                            && record.http_status == Some(200)
+                            && record.value_sha256.as_ref() == Some(expected_sha256)
+                    }
+                }
+                Some(None) | None => {
+                    record.outcome == OperationOutcome::NotFound
+                        && record.http_status == Some(404)
+                        && record.value_sha256.is_none()
+                }
+            };
+            ensure!(
+                clean && (record.outcome != OperationOutcome::Ok || record.error.is_none()),
+                "post-return checker current-object GET contradicts the committed object model"
+            );
+        }
+        ensure!(
+            committed_current_state
+                .keys()
+                .all(|key| current_get_counts.get(key) == Some(&1)),
+            "post-return checker suffix does not probe every committed current-object key exactly once"
+        );
         report.require_success()?;
         ensure!(
             report.scenario == identity.scenario
@@ -1179,7 +1290,20 @@ impl PostReturnCheckerEvidence {
                 && audit.delete_marker_checks == expected_delete_checks
                 && report.tenant_recovered
                 && report.versioning_expected
+                && report.expected_live_objects
+                    == committed_current_state
+                        .values()
+                        .filter(|value| value.is_some())
+                        .count()
                 && report.expected_live_objects == report.verified_live_objects
+                && report
+                    .tolerated_ambiguous_deletes
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    == tolerated_ambiguous_deletes
+                && report.final_list_warning_count == 0
+                && report.list_warnings.is_empty()
                 && report.expected_committed_versions == expected_data_checks.len()
                 && report.verified_committed_versions == report.expected_committed_versions
                 && report.committed_writes_missing_version_id_count == 0
@@ -5075,13 +5199,18 @@ mod tests {
         delete_marker_checks.sort_by(|left, right| {
             (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id))
         });
+        let current_state = committed_current_state_for_test(history_prefix);
+        let expected_live_objects = current_state
+            .values()
+            .filter(|value| value.is_some())
+            .count();
         let expected_versions = data_version_checks.len();
         let report = CheckerReport {
             scenario: "stale-disk-return-detect".to_string(),
             run_id: "run-1".to_string(),
             committed_puts: expected_versions,
-            expected_live_objects: 1,
-            verified_live_objects: 1,
+            expected_live_objects,
+            verified_live_objects: expected_live_objects,
             missing_committed_objects: Vec::new(),
             unavailable_committed_objects: Vec::new(),
             unknown_committed_read_failures: Vec::new(),
@@ -5095,7 +5224,7 @@ mod tests {
             final_list_warning_count: 0,
             list_history_warnings: Vec::new(),
             list_warnings: Vec::new(),
-            final_listed_objects: Some(1),
+            final_listed_objects: Some(expected_live_objects),
             versioning_expected: true,
             expected_committed_versions: expected_versions,
             verified_committed_versions: expected_versions,
@@ -5121,6 +5250,7 @@ mod tests {
                 history_suffix_record_count: history_suffix.len(),
                 history_suffix_sha256: checker_history_records_sha256(history_suffix)
                     .expect("checker suffix"),
+                suffix_operations: checker_operation_audits(history_suffix),
                 data_version_checks,
                 delete_marker_checks,
                 list_object_versions_completed: Some(true),
@@ -5136,6 +5266,7 @@ mod tests {
     }
 
     fn append_post_return_checker_suffix(history: &mut Vec<OperationRecord>) {
+        let current_state = committed_current_state_for_test(history);
         let data_versions = history
             .iter()
             .filter(|record| {
@@ -5160,6 +5291,26 @@ mod tests {
             get.fault_window_relation = Some(FaultWindowRelation::AfterFault);
             history.push(get);
         }
+        for (index, (key, expected_sha256)) in current_state.into_iter().enumerate() {
+            let mut get = history_record(
+                &format!("checker-current-get-{index}"),
+                "stale-disk-return-detect",
+                OperationKind::Get,
+                &key,
+                "",
+                expected_sha256.as_deref(),
+                572,
+            );
+            get.version_id = None;
+            if expected_sha256.is_none() {
+                get.outcome = OperationOutcome::NotFound;
+                get.http_status = Some(404);
+                get.error = Some("get object failed: NoSuchKey".to_string());
+            }
+            get.durability_cohort = Some(DurabilityCohort::PostRecovery);
+            get.fault_window_relation = Some(FaultWindowRelation::AfterFault);
+            history.push(get);
+        }
         for (id, kind, ended_at_ms) in [
             ("checker-list-versions", OperationKind::ListVersions, 575),
             ("checker-list", OperationKind::List, 578),
@@ -5179,12 +5330,54 @@ mod tests {
         }
     }
 
+    fn committed_current_state_for_test(
+        history: &[OperationRecord],
+    ) -> BTreeMap<String, Option<String>> {
+        let mut state = BTreeMap::new();
+        for record in history.iter().filter(|record| {
+            record.outcome == OperationOutcome::Ok
+                && record
+                    .http_status
+                    .is_some_and(|status| (200..300).contains(&status))
+        }) {
+            let Some(key) = record.key.clone() else {
+                continue;
+            };
+            match record.kind {
+                OperationKind::Put | OperationKind::CompleteMultipartUpload => {
+                    state.insert(key, record.value_sha256.clone());
+                }
+                OperationKind::Delete => {
+                    state.insert(key, None);
+                }
+                _ => {}
+            }
+        }
+        state
+    }
+
     fn checker_prefix_record_count(evidence: &PostReturnCheckerEvidence) -> usize {
         serde_json::from_str::<CheckerReport>(&evidence.response_body)
             .expect("checker report")
             .audit
             .expect("checker audit")
             .history_prefix_record_count
+    }
+
+    fn rebind_checker_suffix(
+        evidence: &mut PostReturnCheckerEvidence,
+        history: &[OperationRecord],
+    ) {
+        let mut report =
+            serde_json::from_str::<CheckerReport>(&evidence.response_body).expect("checker report");
+        let audit = report.audit.as_mut().expect("checker audit");
+        let suffix = &history[audit.history_prefix_record_count..];
+        audit.history_suffix_record_count = suffix.len();
+        audit.history_suffix_sha256 =
+            checker_history_records_sha256(suffix).expect("checker suffix");
+        audit.suffix_operations = checker_operation_audits(suffix);
+        evidence.response_body = serde_json::to_string(&report).expect("checker report");
+        evidence.response_sha256 = sha256_bytes(evidence.response_body.as_bytes());
     }
 
     fn history_record(
@@ -5598,6 +5791,50 @@ mod tests {
             "a clean checker receipt for an earlier history universe cannot be replayed after return"
         );
 
+        let mut failed_version_list_history = history.clone();
+        let failed_version_list = failed_version_list_history
+            .iter_mut()
+            .find(|record| record.id == "checker-list-versions")
+            .expect("checker ListObjectVersions");
+        failed_version_list.outcome = OperationOutcome::Timeout;
+        failed_version_list.http_status = None;
+        failed_version_list.error = Some("list object versions timed out".to_string());
+        let mut forged_clean_version_list = proof.clone();
+        rebind_checker_suffix(
+            &mut forged_clean_version_list.post_return_checker,
+            &failed_version_list_history,
+        );
+        assert!(
+            forged_clean_version_list
+                .validate_against_history(&failed_version_list_history)
+                .is_err(),
+            "a failed ListObjectVersions record cannot be rewrapped as a clean checker report"
+        );
+
+        let mut resurrected_get_history = history.clone();
+        let resurrected_get = resurrected_get_history
+            .iter_mut()
+            .find(|record| {
+                record.id.starts_with("checker-current-get-")
+                    && record.key.as_deref() == Some("key-b")
+            })
+            .expect("checker deleted-key GET");
+        resurrected_get.outcome = OperationOutcome::Ok;
+        resurrected_get.http_status = Some(200);
+        resurrected_get.value_sha256 = Some(HASH_C.to_string());
+        resurrected_get.error = None;
+        let mut forged_clean_resurrection = proof.clone();
+        rebind_checker_suffix(
+            &mut forged_clean_resurrection.post_return_checker,
+            &resurrected_get_history,
+        );
+        assert!(
+            forged_clean_resurrection
+                .validate_against_history(&resurrected_get_history)
+                .is_err(),
+            "a deleted-key GET returning bytes cannot be rewrapped as a clean checker report"
+        );
+
         for (index, kind, value_sha256) in [
             (0, OperationKind::Put, Some(HASH_C)),
             (1, OperationKind::Delete, None),
@@ -5624,6 +5861,7 @@ mod tests {
             audit.history_suffix_record_count = suffix.len();
             audit.history_suffix_sha256 =
                 checker_history_records_sha256(suffix).expect("checker suffix");
+            audit.suffix_operations = checker_operation_audits(suffix);
             forged_checker.post_return_checker.response_body =
                 serde_json::to_string(&report).expect("checker report");
             forged_checker.post_return_checker.response_sha256 =
