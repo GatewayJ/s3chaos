@@ -200,6 +200,8 @@ pub struct DecommissionProgress {
     pub bytes_decommissioned_failed: u64,
     #[serde(default)]
     pub waiting_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_entries: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +231,8 @@ pub struct RebalanceCleanupWarnings {
     pub count: u64,
     #[serde(default, rename = "lastMsg")]
     pub last_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1732,6 +1736,7 @@ fn pool_is_decommissioned_target(
                 && !progress.failed
                 && !progress.canceled
                 && !progress.queued
+                && progress.unresolved_entries.is_empty()
                 && progress.objects_decommissioned_failed == 0
                 && progress.bytes_decommissioned_failed == 0
                 && progress.start_time.as_deref().is_some_and(|start_time| {
@@ -1949,6 +1954,7 @@ impl AdminOperationEvidence {
         let completed = status.pool_status.eq_ignore_ascii_case("decommissioned")
             && progress.complete
             && !progress.queued
+            && progress.unresolved_entries.is_empty()
             && !failed
             && !canceled
             && (progress.objects_decommissioned > 0 || progress.bytes_decommissioned > 0);
@@ -2017,6 +2023,7 @@ impl AdminOperationEvidence {
                 .as_deref()
                 .is_some_and(|error| !error.is_empty())
                 || pool.cleanup_warnings.count > 0
+                || !pool.cleanup_warnings.entries.is_empty()
                 || pool
                     .cleanup_warnings
                     .last_message
@@ -2501,8 +2508,12 @@ fn project_decommission_status(
             "running decommission status response has contradictory flags"
         ),
         "complete" => ensure!(
-            !progress.queued && progress.complete && !failed && !canceled,
-            "terminal decommission status response has failure, cancellation, queue, or failed-fragment evidence"
+            !progress.queued
+                && progress.complete
+                && progress.unresolved_entries.is_empty()
+                && !failed
+                && !canceled,
+            "terminal decommission status response has failure, cancellation, queue, or unresolved-fragment evidence"
         ),
         "failed" | "canceled" => {}
         _ => unreachable!("state allowlist checked above"),
@@ -2576,6 +2587,7 @@ fn project_rebalance_status(
             .as_deref()
             .is_some_and(|error| !error.is_empty())
             || pool.cleanup_warnings.count > 0
+            || !pool.cleanup_warnings.entries.is_empty()
             || pool
                 .cleanup_warnings
                 .last_message
@@ -4277,33 +4289,43 @@ mod tests {
     #[test]
     fn decommission_capacity_enforces_130_percent_plus_workload_boundary() {
         let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
+        let workload = WorkloadPlan::seeded(42, 12, 1);
+        let context = AdminTopologyBuildContext::new(
+            TEST_RUN_ID,
+            case_name(ADMIN_DECOMMISSION_SCENARIO),
+            &workload,
+            runtime_binding(60, 70),
+        )
+        .expect("bounded admin workload context");
         let mut exact = pools();
-        exact[0].total_size = 730;
-        exact[0].current_size = 230;
+        let guarded_target_bytes = exact[1].used_size * RUSTFS_DECOMMISSION_CAPACITY_PERCENT / 100;
+        let exact_remaining = guarded_target_bytes + context.workload_max_bytes;
+        exact[0].total_size = exact_remaining + 500;
+        exact[0].current_size = exact_remaining;
         exact[0].used_size = 500;
-        exact[0].used = 500.0 / 730.0;
-        exact[1].current_size = 900;
-        exact[1].used_size = 100;
-        exact[1].used = 0.1;
-        AdminTopologyProof::build(
+        exact[0].used = exact[0].used_size as f64 / exact[0].total_size as f64;
+        let proof = AdminTopologyProof::build(
             &plan,
             ADMIN_DECOMMISSION_SCENARIO,
             &tenant(),
             exact.clone(),
-            &context(ADMIN_DECOMMISSION_SCENARIO),
+            &context,
         )
-        .expect("130 percent guard plus 100-byte workload");
+        .expect("130 percent guard plus derived workload bound");
+        assert_eq!(proof.workload_max_bytes, context.workload_max_bytes);
+        assert_eq!(proof.required_remaining_free_bytes, exact_remaining);
+        assert_eq!(proof.remaining_free_bytes, exact_remaining);
 
-        exact[0].current_size = 229;
+        exact[0].current_size = exact_remaining - 1;
         exact[0].used_size = 501;
-        exact[0].used = 501.0 / 730.0;
+        exact[0].used = exact[0].used_size as f64 / exact[0].total_size as f64;
         assert!(
             AdminTopologyProof::build(
                 &plan,
                 ADMIN_DECOMMISSION_SCENARIO,
                 &tenant(),
                 exact,
-                &context(ADMIN_DECOMMISSION_SCENARIO),
+                &context,
             )
             .is_err()
         );
@@ -4808,6 +4830,25 @@ mod tests {
             &retained_complete,
         )
         .expect("a retained target may prove the exact completed decommission operation");
+
+        let mut unresolved_target = retained_complete.clone();
+        unresolved_target.pools_after.pools[1]
+            .decommission
+            .as_mut()
+            .expect("retained target progress")
+            .unresolved_entries = vec![serde_json::json!({"bucket": "bucket", "object": "key"})];
+        sync_pool_snapshot_response(&mut unresolved_target.pools_after);
+        assert!(
+            validate_admin_topology_artifacts(
+                ADMIN_DECOMMISSION_SCENARIO,
+                &attempt(ADMIN_DECOMMISSION_SCENARIO),
+                attempt_window(),
+                &proof,
+                &unresolved_target,
+            )
+            .is_err(),
+            "post-operation pools/list must not hide unresolved entries behind a clean terminal status"
+        );
 
         for failed_counter in ["objects", "bytes"] {
             let mut failed_fragment = retained_complete.clone();
@@ -5596,6 +5637,94 @@ mod tests {
     }
 
     #[test]
+    fn decommission_terminal_rejects_unresolved_raw_entries() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_DECOMMISSION_SCENARIO),
+        )
+        .unwrap();
+        let status = DecommissionPoolStatus {
+            id: 1,
+            expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
+            status: "complete".to_string(),
+            pool_status: "decommissioned".to_string(),
+            decommission: Some(DecommissionProgress {
+                start_time: Some("2026-09-05T00:00:00Z".to_string()),
+                complete: true,
+                objects_decommissioned: 1,
+                bytes_decommissioned: 200,
+                ..Default::default()
+            }),
+        };
+        let survivor = vec![proof.runtime_pools[0].clone()];
+        let evidence = AdminOperationEvidence::from_decommission(
+            &proof,
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone()),
+            status.clone(),
+            decommission_requests(1),
+            post_operation_snapshot(ADMIN_DECOMMISSION_SCENARIO, survivor.clone()),
+        )
+        .expect("clean terminal evidence");
+        evidence
+            .require_success(attempt_window())
+            .expect("clean terminal receipt");
+
+        let mut forged_success = evidence.clone();
+        let mut raw_status = serde_json::to_value(&status).expect("decommission status JSON");
+        raw_status["decommissionInfo"]["unresolvedEntries"] =
+            serde_json::json!([{"bucket": "bucket", "object": "key"}]);
+        forged_success.requests[1] =
+            with_json_response(forged_success.requests[1].clone(), &raw_status);
+        assert!(
+            forged_success.require_success(attempt_window()).is_err(),
+            "raw unresolved entries cannot be hidden behind a successful typed summary"
+        );
+
+        let mut unresolved_status = status;
+        unresolved_status
+            .decommission
+            .as_mut()
+            .expect("decommission progress")
+            .unresolved_entries = vec![serde_json::json!({"object": "key"})];
+        let unresolved = AdminOperationEvidence::from_decommission(
+            &proof,
+            pre_start_snapshot(ADMIN_DECOMMISSION_SCENARIO, proof.runtime_pools.clone()),
+            unresolved_status,
+            decommission_requests(1),
+            post_operation_snapshot(ADMIN_DECOMMISSION_SCENARIO, survivor),
+        )
+        .expect("unresolved terminal status remains representable");
+        assert!(!unresolved.completed);
+
+        let running = DecommissionPoolStatus {
+            id: 1,
+            expression: pool_expression(DECOMMISSION_TARGET_POOL_NAME),
+            status: "running".to_string(),
+            pool_status: "decommissioning".to_string(),
+            decommission: Some(DecommissionProgress {
+                start_time: Some("2026-09-05T00:00:00Z".to_string()),
+                objects_decommissioned: 1,
+                unresolved_entries: vec![serde_json::json!({"object": "pending"})],
+                ..Default::default()
+            }),
+        };
+        let projection = project_decommission_status(
+            &running,
+            1,
+            &pool_expression(DECOMMISSION_TARGET_POOL_NAME),
+            "decommission:1:2026-09-05T00:00:00Z",
+        )
+        .expect("running status may still carry unresolved work");
+        assert_eq!(projection.state, "running");
+        assert!(!projection.completed);
+        assert!(!projection.failed);
+    }
+
+    #[test]
     fn decommission_terminal_builder_rejects_failed_moves_or_blocked_pool() {
         let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
         let proof = AdminTopologyProof::build(
@@ -5798,6 +5927,7 @@ mod tests {
                     cleanup_warnings: RebalanceCleanupWarnings {
                         count: 1,
                         last_message: Some("cleanup failed".to_string()),
+                        ..Default::default()
                     },
                     progress: None,
                 },
@@ -5824,5 +5954,60 @@ mod tests {
         .unwrap();
         assert!(evidence.failed);
         assert!(evidence.require_success(attempt_window()).is_err());
+    }
+
+    #[test]
+    fn rebalance_terminal_rejects_raw_cleanup_warning_entries() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_REBALANCE_SCENARIO).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_REBALANCE_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_REBALANCE_SCENARIO),
+        )
+        .unwrap();
+        let start = RebalanceStart {
+            id: "rebalance-1".to_string(),
+        };
+        let status = completed_rebalance_status(&start.id);
+        let evidence = AdminOperationEvidence::from_rebalance(
+            &proof,
+            pre_start_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+            &start,
+            status.clone(),
+            rebalance_requests(),
+            post_operation_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+        )
+        .expect("clean terminal evidence");
+        evidence
+            .require_success(attempt_window())
+            .expect("clean terminal receipt");
+
+        let mut forged_success = evidence.clone();
+        let mut raw_status = serde_json::to_value(&status).expect("rebalance status JSON");
+        raw_status["pools"][0]["cleanupWarnings"]["entries"] =
+            serde_json::json!([{"message": "cleanup incomplete"}]);
+        forged_success.requests[1] =
+            with_json_response(forged_success.requests[1].clone(), &raw_status);
+        assert!(
+            forged_success.require_success(attempt_window()).is_err(),
+            "raw cleanup warning entries cannot be hidden behind zero summary counters"
+        );
+
+        let mut warning_status = status;
+        warning_status.pools[0].cleanup_warnings.entries =
+            vec![serde_json::json!({"message": "cleanup incomplete"})];
+        let warning = AdminOperationEvidence::from_rebalance(
+            &proof,
+            pre_start_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+            &start,
+            warning_status,
+            rebalance_requests(),
+            post_operation_snapshot(ADMIN_REBALANCE_SCENARIO, proof.runtime_pools.clone()),
+        )
+        .expect("warning terminal status remains representable");
+        assert!(warning.failed);
+        assert!(!warning.completed);
     }
 }

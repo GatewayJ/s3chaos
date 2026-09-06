@@ -489,6 +489,12 @@ impl ResolvedFaultSuiteScenario {
             expected_failure.validate(&scenario.name)?;
         }
         let params = scenario.params.clone().unwrap_or_default();
+        ensure!(
+            spec.param_schema != crate::fault::scenarios::FaultParameterSchema::QuorumIo
+                || scenario.params.is_some(),
+            "scenario {} requires explicit params.kind=quorumIo and class=payload|metadata",
+            scenario.name
+        );
         if let Some(params) = &scenario.params {
             params.validate_explicit_for_schema(spec.param_schema)?;
         }
@@ -787,7 +793,7 @@ mod tests {
         reporting::{FailureClassification, FailureSeverity, ResponsibilityDomain},
         scenarios::{
             ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, DetectorQualification,
-            QUORUM_P_IO_FAULT_SCENARIO,
+            FaultScenarioStatus,
         },
     };
 
@@ -1272,11 +1278,14 @@ scenarios:
 
     #[test]
     fn rejects_planned_scenario_names() {
-        for scenario in [
-            QUORUM_P_IO_FAULT_SCENARIO,
-            ADMIN_DECOMMISSION_SCENARIO,
-            ADMIN_REBALANCE_SCENARIO,
-        ] {
+        let planned = crate::fault::scenarios::scenario_catalog()
+            .iter()
+            .filter(|scenario| scenario.status == FaultScenarioStatus::Planned)
+            .map(|scenario| scenario.scenario)
+            .collect::<Vec<_>>();
+        assert!(planned.contains(&ADMIN_DECOMMISSION_SCENARIO));
+        assert!(planned.contains(&ADMIN_REBALANCE_SCENARIO));
+        for scenario in planned {
             let suite = serde_yaml_ng::from_str::<FaultSuite>(&format!(
                 r#"
 apiVersion: rustfs.com/s3chaos/v1alpha1

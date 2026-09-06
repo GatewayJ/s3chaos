@@ -30,7 +30,8 @@ use std::{future::Future, time::Duration};
 use tokio::time::{Instant, timeout};
 
 use crate::fault::history::{
-    ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef, Recorder,
+    ByteRange, ListedVersionEntry, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
+    Recorder,
 };
 
 const S3_WORKLOAD_MUTATION_MAX_ATTEMPTS: u32 = 3;
@@ -59,6 +60,63 @@ pub(crate) struct StagedMultipartUpload {
     pub(crate) spec: ObjectSpec,
     upload_id: String,
     completed_parts: Vec<CompletedPart>,
+}
+
+pub(crate) struct StagedMultipartCleanupGuard {
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl StagedMultipartCleanupGuard {
+    pub(crate) fn new(
+        client: S3WorkloadClient,
+        recorder: Recorder,
+        staged: StagedMultipartUpload,
+    ) -> Self {
+        let key = staged.spec.key.clone();
+        Self::from_cleanup(move || {
+            let thread = std::thread::Builder::new()
+                .name("s3chaos-multipart-cleanup".to_string())
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("build multipart cancellation cleanup runtime")?;
+                    runtime.block_on(client.abort_staged_multipart_object(&staged, &recorder))
+                });
+            match thread {
+                Ok(thread) => match thread.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!(
+                        "warning: failed to abort staged multipart upload for {key} during cancellation: {error:#}"
+                    ),
+                    Err(_) => eprintln!(
+                        "warning: staged multipart cancellation cleanup thread panicked for {key}"
+                    ),
+                },
+                Err(error) => eprintln!(
+                    "warning: failed to start staged multipart cancellation cleanup for {key}: {error}"
+                ),
+            }
+        })
+    }
+
+    fn from_cleanup(cleanup: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            cleanup: Some(Box::new(cleanup)),
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.cleanup = None;
+    }
+}
+
+impl Drop for StagedMultipartCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +220,7 @@ pub struct GetObjectResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWriteResult {
+    pub write_operation_id: String,
     pub write_outcome: OperationOutcome,
     pub verify_get_outcome: Option<OperationOutcome>,
     pub verified: bool,
@@ -177,6 +236,14 @@ impl ObjectSpec {
         format!("fault-test/{run_id}/")
     }
 
+    pub(crate) fn seeded_key(run_id: &str, index: usize) -> String {
+        format!("{}object-{index:06}", Self::key_prefix(run_id))
+    }
+
+    pub(crate) fn directory_marker_key(run_id: &str, index: usize) -> String {
+        format!("{}dir-{index:06}/", Self::key_prefix(run_id))
+    }
+
     pub fn matches_body(&self, body: &[u8]) -> bool {
         body.len() == self.size_bytes && sha256_hex(body) == self.sha256
     }
@@ -187,7 +254,7 @@ impl ObjectSpec {
         size_bytes: usize,
         seed: u64,
     ) -> PreparedObject {
-        let key = format!("{}object-{index:06}", Self::key_prefix(run_id));
+        let key = Self::seeded_key(run_id, index);
         let body = seeded_bytes(seed, index, size_bytes);
         let sha256 = sha256_hex(&body);
 
@@ -211,7 +278,7 @@ impl ObjectSpec {
     /// directory-key delete path, rustfs/backlog#798). Size 0 keeps it off the
     /// erasure-shard and ranged-read paths.
     pub fn prepare_directory_marker(run_id: &str, index: usize, seed: u64) -> PreparedObject {
-        let key = format!("{}dir-{index:06}/", Self::key_prefix(run_id));
+        let key = Self::directory_marker_key(run_id, index);
         let body = Vec::new();
         let sha256 = sha256_hex(&body);
 
@@ -363,11 +430,14 @@ impl WorkloadPlan {
     ///
     /// The bound assumes versioning, charges every configured SDK attempt, adds
     /// a per-request RustFS metadata reserve, and applies the maximum supported
-    /// standard erasure expansion (parity never exceeds data shards). This is
-    /// intentionally stricter than net payload growth: topology operations must
-    /// fail closed instead of exhausting a pool through retries, delete markers,
-    /// multipart staging, shard headers, or version metadata. Prefill is excluded
-    /// because the admin topology snapshot is taken after it completes.
+    /// standard erasure expansion (parity never exceeds data shards). Every PUT,
+    /// overwrite, and completed multipart upload is also reserved as a possible
+    /// sealed recommit candidate: one additional logical PUT, with all configured
+    /// SDK attempts. Deletes cannot become recommit PUTs. This is intentionally
+    /// stricter than net payload growth: topology operations must fail closed
+    /// instead of exhausting a pool through retries, delete markers, multipart
+    /// staging, shard headers, or version metadata. Prefill is excluded because
+    /// the admin topology snapshot is taken after it completes.
     pub(crate) fn mixed_write_upper_bound(
         &self,
         prefilled_count: usize,
@@ -379,23 +449,30 @@ impl WorkloadPlan {
                 .is_some_and(|count| count <= self.object_count),
             "finite mixed workload range exceeds workload object_count"
         );
-        let mut payload_bytes = 0_u64;
-        let mut mutating_requests = 0_u64;
+        let mut original_payload_bytes = 0_u64;
+        let mut original_mutating_requests = 0_u64;
+        let mut recommit_payload_bytes = 0_u64;
+        let mut recommit_put_requests = 0_u64;
         for offset in 0..mixed_count {
             let index = prefilled_count + offset;
             let operation = self.operation_mix.operation_at(offset);
-            let (mutation_bytes, request_count) = match operation {
-                WorkloadOperation::Put => (self.size_at(index) as u64, 1),
+            let (mutation_bytes, request_count, candidate_bytes, candidate_count) = match operation
+            {
+                WorkloadOperation::Put => {
+                    let size = self.size_at(index) as u64;
+                    (size, 1, size, 1)
+                }
                 WorkloadOperation::Overwrite => {
                     ensure!(
                         prefilled_count > 0,
                         "finite mixed workload cannot overwrite without prefilled objects"
                     );
                     let existing = self.existing_object_offset(offset, prefilled_count);
-                    (self.size_at(existing) as u64, 1)
+                    let size = self.size_at(existing) as u64;
+                    (size, 1, size, 1)
                 }
-                WorkloadOperation::Get | WorkloadOperation::List => (0, 0),
-                WorkloadOperation::Delete => (0, 1),
+                WorkloadOperation::Get | WorkloadOperation::List => (0, 0, 0, 0),
+                WorkloadOperation::Delete => (0, 1, 0, 0),
                 WorkloadOperation::Multipart => {
                     let size = self.size_at(index) as u64;
                     let upload_parts = size.max(1).div_ceil(MULTIPART_PART_SIZE_BYTES);
@@ -406,21 +483,33 @@ impl WorkloadPlan {
                         size.checked_add(ABORTED_MULTIPART_FIXTURE_BYTES)
                             .context("finite mixed workload multipart payload overflowed")?,
                         requests,
+                        size,
+                        1,
                     )
                 }
             };
-            payload_bytes = payload_bytes
+            original_payload_bytes = original_payload_bytes
                 .checked_add(mutation_bytes)
                 .context("finite mixed workload write-byte bound overflowed")?;
-            mutating_requests = mutating_requests
+            original_mutating_requests = original_mutating_requests
                 .checked_add(request_count)
                 .context("finite mixed workload request-count bound overflowed")?;
+            recommit_payload_bytes = recommit_payload_bytes
+                .checked_add(candidate_bytes)
+                .context("finite mixed workload recommit-byte bound overflowed")?;
+            recommit_put_requests = recommit_put_requests
+                .checked_add(candidate_count)
+                .context("finite mixed workload recommit-count bound overflowed")?;
         }
         let attempts = u64::from(S3_WORKLOAD_MUTATION_MAX_ATTEMPTS);
-        let retried_payload_bytes = payload_bytes
+        let retried_payload_bytes = original_payload_bytes
+            .checked_add(recommit_payload_bytes)
+            .context("finite mixed workload total payload bound overflowed")?
             .checked_mul(attempts)
             .context("finite mixed workload retry payload bound overflowed")?;
-        let metadata_bytes = mutating_requests
+        let metadata_bytes = original_mutating_requests
+            .checked_add(recommit_put_requests)
+            .context("finite mixed workload total request bound overflowed")?
             .checked_mul(attempts)
             .and_then(|count| count.checked_mul(RUSTFS_METADATA_RESERVE_BYTES_PER_ATTEMPT))
             .context("finite mixed workload metadata bound overflowed")?;
@@ -712,6 +801,10 @@ impl S3WorkloadClient {
             request_timeout,
             mutation_deadline: None,
         })
+    }
+
+    pub(crate) fn bucket(&self) -> &str {
+        &self.bucket
     }
 
     pub(crate) fn for_quiet_mutation(&self, deadline: Instant) -> Self {
@@ -1158,9 +1251,11 @@ impl S3WorkloadClient {
         object: &PreparedObject,
         recorder: &Recorder,
     ) -> Result<VerifiedWriteResult> {
-        let write_outcome = self.put_object(object, recorder).await?;
+        let write_record = self.put_object_record(object, recorder).await?;
+        let write_outcome = write_record.outcome;
         if write_outcome != OperationOutcome::Ok {
             return Ok(VerifiedWriteResult {
+                write_operation_id: write_record.id,
                 write_outcome,
                 verify_get_outcome: None,
                 verified: false,
@@ -1173,6 +1268,7 @@ impl S3WorkloadClient {
             .as_deref()
             .is_some_and(|body| object.spec.matches_body(body));
         Ok(VerifiedWriteResult {
+            write_operation_id: write_record.id,
             write_outcome,
             verify_get_outcome: Some(get.outcome),
             verified,
@@ -1330,6 +1426,8 @@ impl S3WorkloadClient {
             upload_id,
             completed_parts: Vec::new(),
         };
+        let mut cancellation_cleanup =
+            StagedMultipartCleanupGuard::new(self.clone(), recorder.clone(), staged.clone());
         let result: Result<bool> = async {
             for (index, chunk) in object
                 .body
@@ -1354,25 +1452,19 @@ impl S3WorkloadClient {
         }
         .await;
         if !matches!(result, Ok(true)) {
-            self.abort_staged_multipart_object(&staged, recorder)
-                .await?;
+            let cleanup = self.abort_staged_multipart_object(&staged, recorder).await;
+            // The guard remains armed while the async abort is in flight, so
+            // cancellation retries it. A completed attempt is recorded and
+            // reported exactly once, even when the server rejects cleanup.
+            cancellation_cleanup.disarm();
+            cleanup?;
             return result.map(|_| None);
         }
+        cancellation_cleanup.disarm();
         Ok(Some(staged))
     }
 
-    pub(crate) async fn complete_staged_multipart_object(
-        &self,
-        staged: &StagedMultipartUpload,
-        recorder: &Recorder,
-    ) -> Result<OperationOutcome> {
-        Ok(self
-            .complete_staged_multipart_object_record(staged, recorder)
-            .await?
-            .outcome)
-    }
-
-    async fn complete_staged_multipart_object_record(
+    pub(crate) async fn complete_staged_multipart_object_record(
         &self,
         staged: &StagedMultipartUpload,
         recorder: &Recorder,
@@ -1836,6 +1928,17 @@ impl S3WorkloadClient {
 
         let mut record = record;
         record.size_bytes = Some(entries.len());
+        record.listed_versions = Some(
+            entries
+                .iter()
+                .map(|entry| ListedVersionEntry {
+                    key: entry.key.clone(),
+                    version_id: entry.version_id.clone(),
+                    is_latest: entry.is_latest,
+                    is_delete_marker: entry.is_delete_marker,
+                })
+                .collect(),
+        );
         recorder.finish(record, OperationOutcome::Ok, Some(200), None)?;
         Ok(Some(entries))
     }
@@ -1924,9 +2027,9 @@ fn sdk_error_status<E>(error: &SdkError<E>) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ObjectSpec, S3_WORKLOAD_MUTATION_MAX_ATTEMPTS, SplitMix64, WorkloadHotspot,
-        WorkloadOperation, WorkloadOperationMix, WorkloadPayloadClass, WorkloadPayloadDistribution,
-        WorkloadPlan, sha256_hex,
+        ObjectSpec, S3_WORKLOAD_MUTATION_MAX_ATTEMPTS, SplitMix64, StagedMultipartCleanupGuard,
+        WorkloadHotspot, WorkloadOperation, WorkloadOperationMix, WorkloadPayloadClass,
+        WorkloadPayloadDistribution, WorkloadPlan, sha256_hex,
     };
 
     #[tokio::test]
@@ -1969,6 +2072,32 @@ mod tests {
                 .max_attempts(),
             1
         );
+    }
+
+    #[test]
+    fn staged_multipart_cleanup_guard_runs_on_cancellation_and_can_be_disarmed() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            let _guard = StagedMultipartCleanupGuard::from_cleanup(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        {
+            let calls = Arc::clone(&calls);
+            let mut guard = StagedMultipartCleanupGuard::from_cleanup(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            });
+            guard.disarm();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2148,15 +2277,21 @@ mod tests {
         )
         .expect("finite workload plan");
 
-        // Twelve mixed operations contain two complete operation-mix cycles.
-        // Per cycle: 7 KiB of mutation bodies and eight mutating requests
-        // (PUT, overwrite, delete marker, plus five MPU requests). Each is
-        // charged for three SDK attempts, 1 MiB of metadata per request, and
-        // the maximum 2x RustFS standard-erasure expansion.
+        // Per complete cycle the original operations reserve 7 KiB and eight
+        // mutating requests. PUT, overwrite, and completed MPU can each become
+        // a sealed recommit candidate, adding 3 KiB and three logical PUTs.
+        // Every request is charged for three SDK attempts and 1 MiB of metadata,
+        // then the complete bound receives the maximum 2x erasure expansion.
+        assert_eq!(
+            plan.mixed_write_upper_bound(12, 6)
+                .expect("one complete operation cycle"),
+            2 * ((10 * 1024 * 3) + (11 * 3 * 1024 * 1024))
+        );
+        // Twelve mixed operations contain two complete cycles.
         assert_eq!(
             plan.mixed_write_upper_bound(12, 12)
                 .expect("finite write bound"),
-            2 * ((14 * 1024 * 3) + (16 * 3 * 1024 * 1024))
+            2 * ((20 * 1024 * 3) + (22 * 3 * 1024 * 1024))
         );
         assert!(plan.mixed_write_upper_bound(12, 13).is_err());
     }

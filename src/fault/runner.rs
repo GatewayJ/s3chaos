@@ -15,6 +15,7 @@
 use crate::fault::shutdown::RunDeadline;
 use crate::fault::{
     host_storage::HostStorageMutationProof,
+    quorum::QuorumHealthObservation,
     reporting::{FaultStatusSnapshot, PodIdentity},
     workload::ObjectSpec,
 };
@@ -46,6 +47,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod access;
+mod ack;
 mod injection;
 mod recovery;
 mod setup;
@@ -70,9 +72,10 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
     run_scenario_with_config(config).await
 }
 
-pub async fn run_scenario_with_config(config: FaultTestConfig) -> Result<()> {
+pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()> {
+    scenarios::apply_catalog_defaults(&mut config)?;
     let reference_root = config.cluster.artifacts_dir.clone();
-    run_scenario_with_config_and_reference_root(
+    run_prepared_scenario_with_config_and_reference_root(
         config,
         reference_root,
         fault_run_id(),
@@ -81,13 +84,12 @@ pub async fn run_scenario_with_config(config: FaultTestConfig) -> Result<()> {
     .await
 }
 
-pub(crate) async fn run_scenario_with_config_and_reference_root(
-    mut config: FaultTestConfig,
+pub(crate) async fn run_prepared_scenario_with_config_and_reference_root(
+    config: FaultTestConfig,
     reference_root: impl Into<PathBuf>,
     run_id: String,
     deadline: RunDeadline,
 ) -> Result<()> {
-    scenarios::apply_catalog_defaults(&mut config)?;
     let scenario = FaultScenario::from_config(&config)?;
     let spec = scenarios::scenario_spec(&scenario.name)?;
     let plan = FaultPlan::from_scenario_with_options(
@@ -166,34 +168,45 @@ async fn run_fault_case(
         .await?;
     let mut staged_multipart_uploads = BTreeMap::new();
     // Keep the S3 client and access guard alive through cleanup on every exit.
-    let result = async {
-        run.stage_uploads(&prepared.s3, &mut staged_multipart_uploads)
-            .await?;
-        let target = deadline
-            .run(run.prove_target(&prepared.endpoint, &mut preflight_phases))
-            .await?;
-        deadline.check()?;
-        let mut active = run.activate_fault(&target)?;
-        let mut workload = run
-            .exercise_fault(&mut prepared, &target, &active, &staged_multipart_uploads)
-            .await?;
-        deadline.check()?;
-        run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
-        let removal = run.remove_fault(&mut active.fault)?;
-        let recovered = run
-            .recover_access(&mut prepared, &mut staged_multipart_uploads)
-            .await?;
-        let mut evidence =
-            run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
-        deadline.run(run.verify_recovered(&prepared.s3)).await?;
-        deadline
-            .run(run.recommit(&prepared.s3, &mut workload.workload))
-            .await?;
-        deadline
-            .run(run.verify_final(&prepared.s3, &workload.workload, &mut evidence))
-            .await
-    }
-    .await;
+    let result = if scenarios::acknowledged_mutation_kind(&scenario.name).is_some() {
+        run.run_ack_triggered_case(
+            &mut prepared,
+            &mut preflight_phases,
+            &mut staged_multipart_uploads,
+        )
+        .await
+    } else {
+        async {
+            run.stage_uploads(&prepared.s3, &mut staged_multipart_uploads)
+                .await?;
+            let target = deadline
+                .run(run.prove_target(&prepared.endpoint, &mut preflight_phases))
+                .await?;
+            deadline.check()?;
+            let mut active = run.activate_fault(&target)?;
+            let mut workload = run
+                .exercise_fault(&mut prepared, &target, &active, &staged_multipart_uploads)
+                .await?;
+            deadline.check()?;
+            run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
+            let removal = run.remove_fault(&mut active.fault)?;
+            let recovered = run
+                .recover_access(&mut prepared, &mut staged_multipart_uploads)
+                .await?;
+            let mut evidence =
+                run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
+            deadline
+                .run(run.verify_recovered(&prepared.s3, &mut workload.workload))
+                .await?;
+            deadline
+                .run(run.recommit(&prepared.s3, &mut workload.workload))
+                .await?;
+            deadline
+                .run(run.verify_final(&prepared.s3, &workload.workload, &mut evidence))
+                .await
+        }
+        .await
+    };
     let cleanup = cleanup_staged_multipart_uploads(
         &prepared.s3,
         &context.history,
@@ -274,6 +287,7 @@ struct ProvenTarget {
     target_proof: TargetProof,
     topology_observed_at_ms: Option<u64>,
     host_storage_proof: Option<HostStorageMutationProof>,
+    execution_injection: crate::fault::plan::FaultInjection,
 }
 
 struct ActiveFault {
@@ -296,6 +310,8 @@ struct FaultWorkload {
     pods_at_workload_snapshot: Vec<PodIdentity>,
     workload_fixed_volume_targets: BTreeSet<String>,
     workload_fixed_volume_containers: BTreeMap<String, String>,
+    quorum_health_before_workload: Option<QuorumHealthObservation>,
+    quorum_health_after_workload: Option<QuorumHealthObservation>,
 }
 
 struct WorkloadTargetEvidence {

@@ -19,14 +19,20 @@ use std::time::Duration;
 
 use crate::fault::{
     config::{DEFAULT_RUSTFS_VOLUME_PATH, FaultTestConfig, validate_rustfs_volume_path},
+    quorum::{ErasureSetShape, MAX_ERASURE_SET_SHARDS, QuorumCaseClass, QuorumVolumeBoundary},
     scenarios::{
-        DISK_FULL_SCENARIO, DM_FLAKEY_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend,
-        FaultParameterSchema, FaultScenario, FaultScenarioSpec, IO_EIO_SCENARIO,
-        IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, NETWORK_CORRUPT_SCENARIO,
-        NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO, NETWORK_LOSS_SCENARIO,
-        NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
-        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO,
-        STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
+        DISK_FULL_SCENARIO, DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_SCENARIO,
+        DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
+        FaultScenarioSpec, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO,
+        NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO,
+        NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
+        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
+        POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
+        WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
 };
 
@@ -44,6 +50,7 @@ pub const WRITE_QUORUM_LOSS_PARTITION_TARGETS: u32 = 2;
 pub enum FaultWorkloadMode {
     S3Mixed,
     S3MixedWithWarp,
+    AckTriggeredQuietMutation,
 }
 
 impl FaultWorkloadMode {
@@ -122,6 +129,7 @@ impl FaultTarget {
 pub enum FaultSelection {
     Percent(u8),
     FixedTargets(u32),
+    RuntimeQuorum(QuorumVolumeBoundary),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +155,9 @@ impl VolumeFaultTargeting {
                 target_selection: VolumeTargetSelection::FixedTargets(count),
                 io_sampling_percent: 100,
             },
+            FaultSelection::RuntimeQuorum(_) => {
+                unreachable!("runtime quorum selection must be resolved before rendering")
+            }
         }
     }
 }
@@ -156,6 +167,7 @@ impl FaultSelection {
         match self {
             Self::Percent(_) => "percent",
             Self::FixedTargets(_) => "fixed-targets",
+            Self::RuntimeQuorum(_) => "runtime-quorum",
         }
     }
 
@@ -163,6 +175,7 @@ impl FaultSelection {
         match self {
             Self::Percent(percent) => u32::from(percent),
             Self::FixedTargets(count) => count,
+            Self::RuntimeQuorum(boundary) => u32::from(boundary.beyond_read_tolerance),
         }
     }
 
@@ -170,6 +183,18 @@ impl FaultSelection {
         match self {
             Self::Percent(percent) => format!("{percent}%"),
             Self::FixedTargets(count) => format!("{count} target(s)"),
+            Self::RuntimeQuorum(boundary) => format!(
+                "runtime {} read tolerance{}",
+                match boundary.class {
+                    QuorumCaseClass::Payload => "payload",
+                    QuorumCaseClass::Metadata => "metadata",
+                },
+                if boundary.beyond_read_tolerance {
+                    " + 1"
+                } else {
+                    ""
+                }
+            ),
         }
     }
 }
@@ -195,6 +220,9 @@ impl IoMethod {
 pub enum FaultInjectionParameters {
     #[default]
     Default,
+    QuorumIo {
+        class: QuorumCaseClass,
+    },
     IoLatency {
         delay: String,
         methods: Vec<IoMethod>,
@@ -261,6 +289,13 @@ impl FaultInjectionParameters {
             return Ok(());
         }
         let kind = match schema {
+            FaultParameterSchema::QuorumIo => {
+                ensure!(
+                    matches!(self, Self::QuorumIo { .. }),
+                    "quorum IO scenarios require params.kind=quorumIo"
+                );
+                return Ok(());
+            }
             FaultParameterSchema::IoLatency => FaultKind::RustfsVolumeLatency,
             FaultParameterSchema::NetworkDelay => FaultKind::RustfsServerNetworkDelay,
             FaultParameterSchema::NetworkLoss => FaultKind::RustfsServerNetworkLoss,
@@ -283,6 +318,13 @@ impl FaultInjectionParameters {
                     .collect(),
             )),
             other => bail!("expected ioLatency parameters, got {:?}", other),
+        }
+    }
+
+    pub fn quorum_case(&self) -> Result<QuorumCaseClass> {
+        match self {
+            Self::QuorumIo { class } => Ok(*class),
+            other => bail!("expected quorumIo parameters, got {:?}", other),
         }
     }
 
@@ -379,6 +421,7 @@ impl FaultInjectionParameters {
     fn validate_for_kind(&self, kind: FaultKind) -> Result<()> {
         match (kind, self) {
             (_, Self::Default) => Ok(()),
+            (FaultKind::RustfsVolumeIoError, Self::QuorumIo { .. }) => Ok(()),
             (FaultKind::RustfsVolumeLatency, Self::IoLatency { delay, methods }) => {
                 validate_duration_token("params.delay", delay, false, 60_000)?;
                 validate_io_methods(methods)?;
@@ -593,7 +636,11 @@ impl FaultInjection {
         ensure!(duration > Duration::ZERO, "fault duration must be positive");
         let parameters = parameters.resolve_for_kind(kind)?;
         let volume_targeting = matches!(target, FaultTarget::RustfsVolume { .. })
-            .then(|| VolumeFaultTargeting::from_legacy_selection(selection));
+            .then(|| match selection {
+                FaultSelection::RuntimeQuorum(_) => None,
+                other => Some(VolumeFaultTargeting::from_legacy_selection(other)),
+            })
+            .flatten();
 
         Ok(Self {
             kind,
@@ -622,6 +669,12 @@ impl FaultInjection {
         match (&self.target, self.selection) {
             (FaultTarget::RustfsVolume { path }, FaultSelection::FixedTargets(count)) => {
                 format!("{count} RustFS volume target(s) at {path}")
+            }
+            (FaultTarget::RustfsVolume { path }, FaultSelection::RuntimeQuorum(boundary)) => {
+                format!(
+                    "{} at {path}",
+                    FaultSelection::RuntimeQuorum(boundary).summary()
+                )
             }
             _ => self.target.summary(),
         }
@@ -669,6 +722,21 @@ impl FaultInjection {
             ),
         }
     }
+
+    pub fn resolve_runtime_quorum(&self, shape: &ErasureSetShape) -> Result<Self> {
+        let FaultSelection::RuntimeQuorum(boundary) = self.selection else {
+            bail!("fault selection is not a runtime quorum boundary")
+        };
+        let count = boundary.target_count(shape)?;
+        Self::new_with_parameters(
+            self.kind,
+            self.backend,
+            self.target.clone(),
+            FaultSelection::FixedTargets(count),
+            self.duration,
+            self.parameters.clone(),
+        )
+    }
 }
 
 fn fault_kind_accepts_backend(kind: FaultKind, backend: FaultBackend) -> bool {
@@ -709,11 +777,12 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         | FaultKind::RustfsVolumeReadMistake
         | FaultKind::RustfsVolumeEnospc => match selection {
             FaultSelection::Percent(percent) => (1..=100).contains(&percent),
-            // A single IOChaos resource can select a fixed number of RustFS
-            // volume-bearing Pods. Keep the same safety cap as the other
-            // renderer-backed fixed selector; exact candidate availability is
-            // proved at preflight and actual selection is proved at runtime.
-            FaultSelection::FixedTargets(count) => (1..=8).contains(&count),
+            // RustFS supports erasure sets up to 16 shards. Exact candidate
+            // availability is proved at preflight and actual selection is
+            // proved at runtime, so the typed selector can cover that full
+            // supported width without an unrelated eight-target cutoff.
+            FaultSelection::FixedTargets(count) => (1..=MAX_ERASURE_SET_SHARDS).contains(&count),
+            FaultSelection::RuntimeQuorum(_) => kind == FaultKind::RustfsVolumeIoError,
         },
         // NetworkPartition has its own fixed-count renderer. The cap is a
         // sanity bound, and the topology preconditions (which counts actually
@@ -721,6 +790,7 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         FaultKind::RustfsServerNetworkPartition => match selection {
             FaultSelection::FixedTargets(count) => (1..=8).contains(&count),
             FaultSelection::Percent(_) => false,
+            FaultSelection::RuntimeQuorum(_) => false,
         },
         // Every other kind is rendered single-target (`mode: one`) and never
         // reads the count. Accepting FixedTargets(n > 1) here would let a plan
@@ -738,6 +808,7 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         | FaultKind::RustfsBlockDeviceDropWritesCrash => match selection {
             FaultSelection::FixedTargets(count) => count == 1,
             FaultSelection::Percent(_) => false,
+            FaultSelection::RuntimeQuorum(_) => false,
         },
     }
 }
@@ -839,11 +910,14 @@ impl FaultPlan {
             spec.scenario
         );
 
-        let workload_mode = if spec.backend == FaultBackend::MinioWarpWithChaos {
-            FaultWorkloadMode::S3MixedWithWarp
-        } else {
-            FaultWorkloadMode::S3Mixed
-        };
+        let workload_mode =
+            if crate::fault::scenarios::acknowledged_mutation_kind(&scenario.name).is_some() {
+                FaultWorkloadMode::AckTriggeredQuietMutation
+            } else if spec.backend == FaultBackend::MinioWarpWithChaos {
+                FaultWorkloadMode::S3MixedWithWarp
+            } else {
+                FaultWorkloadMode::S3Mixed
+            };
         let fault = match scenario.name.as_str() {
             IO_EIO_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeIoError,
@@ -947,7 +1021,12 @@ impl FaultPlan {
                 FaultSelection::FixedTargets(1),
                 scenario.duration,
             )?,
-            DM_FLAKEY_VERSIONED_HOT_SCENARIO => FaultInjection::new(
+            DM_FLAKEY_VERSIONED_HOT_SCENARIO
+            | DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO
+            | DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO
+            | DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO
+            | DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO
+            | DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsBlockDeviceDropWritesCrash,
                 spec.backend,
                 FaultTarget::DedicatedBlockDevice,
@@ -961,6 +1040,28 @@ impl FaultPlan {
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
             )?,
+            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO => {
+                let parameters = match options.scenario_parameters {
+                    FaultInjectionParameters::Default => FaultInjectionParameters::QuorumIo {
+                        class: QuorumCaseClass::Payload,
+                    },
+                    ref parameters => parameters.clone(),
+                };
+                let class = parameters.quorum_case()?;
+                FaultInjection::new_with_parameters(
+                    FaultKind::RustfsVolumeIoError,
+                    spec.backend,
+                    FaultTarget::RustfsVolume {
+                        path: options.rustfs_volume_path.clone(),
+                    },
+                    FaultSelection::RuntimeQuorum(QuorumVolumeBoundary {
+                        class,
+                        beyond_read_tolerance: scenario.name == QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                    }),
+                    scenario.duration,
+                    parameters,
+                )?
+            }
             other => bail!("scenario {other:?} has no fault plan mapping"),
         };
 
@@ -1060,9 +1161,14 @@ mod tests {
     };
     use crate::fault::{
         config::FaultTestConfig,
+        quorum::{ErasureSetShape, QuorumCaseClass, QuorumVolumeBoundary},
         scenarios::{
-            DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
-            WARP_UNDER_CHAOS_SCENARIO, executable_scenario_catalog, scenario_spec,
+            DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO,
+            FaultBackend, FaultParameterSchema, FaultScenario, WARP_UNDER_CHAOS_SCENARIO,
+            executable_scenario_catalog, scenario_spec,
         },
     };
     use std::time::Duration;
@@ -1121,6 +1227,42 @@ mod tests {
             FaultKind::RustfsBlockDeviceDropWritesCrash
         );
         assert_eq!(plan.required_backends(), vec![FaultBackend::DeviceMapper]);
+    }
+
+    #[test]
+    fn ack_triggered_cases_share_one_typed_backend_plan() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "rustfs-fault-dm");
+        for name in [
+            DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
+        ] {
+            config.scenario = name.to_string();
+            let scenario = FaultScenario::from_config(&config).expect("scenario");
+            let spec = scenario_spec(name).expect("spec");
+            let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan");
+
+            assert_eq!(
+                plan.workload_mode,
+                FaultWorkloadMode::AckTriggeredQuietMutation
+            );
+            assert_eq!(plan.required_backends(), vec![FaultBackend::DeviceMapper]);
+            assert_eq!(
+                plan.faults()[0].kind(),
+                FaultKind::RustfsBlockDeviceDropWritesCrash
+            );
+            assert_eq!(
+                plan.faults()[0].selection(),
+                FaultSelection::FixedTargets(1)
+            );
+            assert_eq!(
+                plan.faults()[0].parameters(),
+                &FaultInjectionParameters::Default,
+                "{name} must not encode its mutation kind in backend parameters"
+            );
+        }
     }
 
     #[test]
@@ -1237,7 +1379,14 @@ mod tests {
             FaultKind::RustfsVolumeReadMistake,
             FaultKind::RustfsVolumeEnospc,
         ] {
-            for (count, ok) in [(1u32, true), (2, true), (8, true), (0, false), (9, false)] {
+            for (count, ok) in [
+                (1u32, true),
+                (2, true),
+                (8, true),
+                (16, true),
+                (0, false),
+                (17, false),
+            ] {
                 let result = FaultInjection::new(
                     kind,
                     FaultBackend::ChaosMeshIoChaos,
@@ -1307,6 +1456,42 @@ mod tests {
             fault.target_summary(),
             "3 RustFS volume target(s) at /data/rustfs0"
         );
+    }
+
+    #[test]
+    fn runtime_quorum_selection_resolves_without_changing_the_semantic_plan() {
+        let boundary = QuorumVolumeBoundary {
+            class: QuorumCaseClass::Metadata,
+            beyond_read_tolerance: true,
+        };
+        let semantic = FaultInjection::new_with_parameters(
+            FaultKind::RustfsVolumeIoError,
+            FaultBackend::ChaosMeshIoChaos,
+            FaultTarget::RustfsVolume {
+                path: DEFAULT_RUSTFS_DATA_VOLUME.to_string(),
+            },
+            FaultSelection::RuntimeQuorum(boundary),
+            Duration::from_secs(60),
+            FaultInjectionParameters::QuorumIo {
+                class: QuorumCaseClass::Metadata,
+            },
+        )
+        .expect("semantic quorum injection");
+        let shape =
+            ErasureSetShape::from_runtime_single_set(8, 1, &[1], &[8], 2).expect("runtime shape");
+
+        let resolved = semantic
+            .resolve_runtime_quorum(&shape)
+            .expect("resolved quorum injection");
+
+        assert_eq!(
+            semantic.selection(),
+            FaultSelection::RuntimeQuorum(boundary)
+        );
+        assert_eq!(resolved.selection(), FaultSelection::FixedTargets(5));
+        assert_eq!(resolved.parameters(), semantic.parameters());
+        assert_eq!(resolved.kind(), semantic.kind());
+        assert_eq!(resolved.target(), semantic.target());
     }
 
     #[test]

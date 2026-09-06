@@ -87,8 +87,10 @@ Status legend:
 
 - [ ] PARTIAL: Durability cohorts and fault-window evidence.
   Meaning: history/checker can report `pre_fault`, `fault_active`,
-  `post_recovery`, and fault-window relations. This is not the same as a true
-  ack-triggered fault executor.
+  `post_recovery`, and fault-window relations. The typed ACK cases additionally
+  bind the exact pre-fault trigger record to ACK, apply, activation, and crash
+  timestamps; remaining planned scenario families still need equivalent
+  scenario-specific evidence contracts.
 
 - [x] DONE: LIST timeout/non-completion is separated from successful LIST
   content errors in checker classification.
@@ -170,15 +172,16 @@ guardrails when implementing the ordered TODO below.
   not implemented yet.
   Meaning: current executable catalog scenarios still mostly cover
   inject-recover-verify faults. The stateful RustFS reliability flows remain in
-  the ordered TODO below: quorum P/P+1, fresh volume replacement, heal recovery,
-  admin decommission/rebalance, on-disk bitrot, stale disk, dangling cleanup,
-  and long-run campaigns.
+  the ordered TODO below: fresh volume replacement, admin
+  decommission/rebalance, on-disk bitrot, stale disk with dangling cleanup,
+  and long-run suite campaigns.
 
 - [ ] PARTIAL: Keep admin operations as scenario-owned product/recovery steps.
   Meaning: decommission/rebalance now have a fault-owned narrow port, typed
   RustFS signed-HTTP adapter, multi-pool Tenant model, and fail-closed evidence
   contracts. They remain scenario workflows rather than generic fault backend
-  behavior. Heal is a recovery mode, not a standalone healthy scenario.
+  behavior. Heal is a recovery strategy for replacement/bitrot, not a
+  standalone healthy-cluster scenario.
 
 ### Console And Reporting Boundary
 
@@ -270,20 +273,27 @@ guardrails when implementing the ordered TODO below.
   exact dirty pages the test is trying to lose. Any crash-like dm path must avoid
   implicit flushes.
 
-- [ ] TODO: Implement true ack-triggered fault execution.
+- [x] DONE: Implement true ack-triggered fault execution.
   Meaning: the runner must wait for an eligible committed operation, record
   `trigger_operation_id`, version id, ACK timestamp, and apply the fault within
-  `maxAckToFaultMs`. Timeout/unknown/interrupted operations must not arm the
-  trigger. The hot DM proxy now records an acknowledged mutation before its
-  forced crash boundary, but the drop-writes table is active before that ACK;
-  the calibrated quiet single-write detector still needs the stricter
-  ACK-then-activate timing contract.
+  `maxAckToFaultMs`. Timeout/unknown/interrupted operations do not arm the
+  trigger. Five typed cases cover create PUT, overwrite, DELETE marker,
+  zero-byte PUT, and pre-staged MPU completion. The older
+  `dm-flakey-versioned-hot` diagnostic deliberately retains its original
+  fault-active hot-workload semantics.
 
-- [ ] TODO: Add a quiet single-write calibration workload.
+- [ ] PARTIAL: Add a quiet single-write calibration workload.
   Meaning: hot workloads can self-defeat metadata-loss tests because later
   fdatasync/journal activity may persist earlier metadata. The first detector
   should use one committed operation, tight ack-to-fault timing, bounded retry,
-  and recorded filesystem commit/writeback parameters.
+  and recorded filesystem commit/writeback parameters. The ACK cases now
+  create only the bucket and case-specific prerequisite version or multipart
+  parts, prove the target, issue exactly one eligible commit, activate
+  `drop_writes`, and send no further S3 request before the crash boundary.
+  Runtime artifacts bind the typed mutation, operation/version identity, ACK
+  and activation timestamps, `maxAckToFaultMs`, and the DM crash/recovery
+  evidence. Recording host filesystem/journal writeback parameters for
+  cross-run calibration remains TODO.
 
 - [x] DONE: Assert a non-empty crash-window cohort.
   Meaning: if no committed operation actually fell inside the requested
@@ -292,36 +302,35 @@ guardrails when implementing the ordered TODO below.
 
 ### 4. Add Per-Version-Type Quorum Math
 
-- [ ] PARTIAL: Add a quorum table by version/object type.
-  Meaning: the pure model separates PUT/MPU commit, delete-marker commit, and
-  persisted data/delete-marker/zero-length metadata geometry. The future
-  executable scenarios still need to bind each workload operation to the
-  corresponding table entry.
+- [x] DONE: Add a quorum table by version/object type.
+  Meaning: the pure model separates payload and persisted metadata quorum
+  geometry. The executable volume-quorum cases bind their typed payload or
+  metadata parameter to that table before deriving P or P+1.
 
-- [ ] PARTIAL: Record RustFS erasure-set shape in target proof.
-  Meaning: the current network-quorum case now binds Tenant geometry and unique
-  Ready Pod identities to RustFS admin runtime set/parity and server/drive UUID
-  membership, and records a bounded-age snapshot before fault apply. Future
-  volume-quorum scenarios must still prove exact target volumes, target nodes,
-  and non-target coverage.
+- [x] DONE: Record RustFS erasure-set shape in target proof.
+  Meaning: network quorum binds Tenant geometry and Ready Pod identities to
+  runtime set/parity and server/drive membership. Volume quorum additionally
+  binds every Pod/container/mount/PVC/PV candidate to its sole drive UUID
+  before apply, then records the actual selected and non-target partition from
+  IOChaos controller evidence.
 
-- [ ] BLOCKED: Keep volume-quorum scenarios non-executable until exact
-  same-erasure-set volume proof exists.
-  Meaning: the network-quorum case now validates the actual injected Pod set
-  against its single-set server/drive membership at activation and after the
-  workload, but random volume or node selection still cannot establish that P
-  or P+1 shards in one erasure set were affected.
+- [x] DONE: Keep volume-quorum scenarios fail-closed on exact same-erasure-set
+  volume proof.
+  Meaning: volume quorum accepts only a fresh single-pool, single-set Tenant
+  with one volume per server. It maps the runtime admin drive UUIDs to complete
+  Kubernetes volume proofs, then validates the actual IOChaos targets and their
+  complement. Unsupported or ambiguous layouts do not inject a fault.
 
 ### 5. Implement Volume-Kind Fixed Targeting
 
-- [ ] PARTIAL: Allow `FixedTargets(N)` for RustFS volume fault kinds.
+- [x] DONE: Allow `FixedTargets(N)` for RustFS volume fault kinds.
   Meaning: the typed fault and backend layers accept bounded fixed target
   counts while existing percent-based scenarios retain their one-Pod selector
-  and independent I/O sampling behavior. No executable catalog/config source
-  selects this mode yet, so artifact validation rejects a fixed selection for
-  the current percent-based scenarios. Composite fault plans remain rejected.
+  and independent I/O sampling behavior. Executable quorum scenarios resolve a
+  semantic P/P+1 selector to this mode only after runtime topology proof.
+  Composite fault plans remain rejected.
 
-- [ ] PARTIAL: Render and prove Chaos Mesh volume faults for `FixedTargets(N)`.
+- [x] DONE: Render and prove Chaos Mesh volume faults for `FixedTargets(N)`.
   Meaning: IOChaos renders `mode: fixed` with the declared count, injects all
   matching I/O on those selected volumes, and records the controller-selected
   container targets. Runtime proof binds the exact RustFS container mount path
@@ -332,23 +341,27 @@ guardrails when implementing the ordered TODO below.
   running RustFS container IDs and reject controller record drift. Replacing a
   container invalidates its mount-namespace proof even when the Pod UID stays
   unchanged. The proof also validates action,
-  methods, parameters, sampling, and duration. End-to-end execution remains
-  pending a trusted catalog/config selection source. The host DeviceMapper
-  backend remains deliberately single-target because its configuration names
-  one mapper/device.
+  methods, parameters, sampling, and duration. Quorum target proof also
+  partitions the complete same-set drive membership into selected and
+  non-target UUIDs. The host DeviceMapper backend remains deliberately
+  single-target because its configuration names one mapper/device.
 
 - [x] DONE: Keep quorum targeting separate from heterogeneous composition.
   Meaning: `FixedTargets(N)` changes only the selector of one typed volume
   injection. It does not introduce a generic multi-phase workflow abstraction,
-  heterogeneous faults, or raw YAML backend steps. P/P+1 volume scenarios stay
-  blocked until exact same-erasure-set volume proof exists.
+  heterogeneous faults, or raw YAML backend steps. P/P+1 remain independent
+  single-fault scenarios whose concrete count is derived at runtime.
 
 ### 6. Harden Target-Aware Safety Gates
 
-- [ ] TODO: Make the health guard target-aware.
-  Meaning: planned target disruption may be allowed, but control plane,
-  non-target nodes, and non-fault tenants remain hard stops. Existing scenarios
-  should keep current behavior.
+- [ ] PARTIAL: Make the health guard target-aware.
+  Meaning: volume quorum proves the exact selected IOChaos targets and complete
+  non-target drive set at activation and after the workload. RustFS admin
+  observations before the read probes/mutations and after the workload require
+  all non-target drives to be healthy, with unchanged deployment, geometry,
+  and drive identities. These are two endpoint guards, not proof of continuous
+  health between samples. Continuous monitoring and post-recovery target-aware
+  guards remain pending.
 
 - [x] DONE: Add host/storage mutation preflight.
   Meaning: executable device-mapper scenarios now require exact singleton
@@ -400,10 +413,16 @@ Reporting only projects this typed checker result into failure-summary fields.
 
 ### 8. Add The First Calibrated Destructive Smoke Scenarios
 
-- [ ] TODO: Add `dm-drop-writes-after-ack`.
-  Meaning: this is the first executable soft-power-loss detector. It should use
-  ack-trigger, quiet single-write calibration, `drop_writes`, strict/relaxed/none
-  calibration, target proof, and precise final checker classification.
+- [x] DONE: Add the typed `dm-drop-writes-after-ack-*` family.
+  Meaning: five independent executable cases cover PUT create, overwrite,
+  DELETE marker, zero-byte PUT, and pre-staged MPU completion. Each uses the
+  ACK trigger, quiet single-write execution, `drop_writes`, target proof, a
+  forced crash boundary, and precise final checker classification.
+
+- [ ] TODO: Add strict/relaxed/none host writeback calibration controls.
+  Meaning: the ACK detectors fail closed on late activation and record the
+  measured window, but cross-host comparisons still need explicit filesystem
+  and journal writeback parameter capture plus controlled calibration modes.
 
 - [x] DONE: Add `dm-flakey-versioned-hot` as a diagnostic single-volume
   soft-power-loss proxy.
@@ -417,34 +436,54 @@ Reporting only projects this typed checker result into failure-summary fields.
   Meaning: it proves versioned workload/checker behavior through process
   disruption, but it must not be described as physical power loss.
 
-- [ ] TODO: Add `quorum-p-io-fault` and `quorum-p-plus-one-io-fault`.
+- [x] DONE: Add `quorum-p-io-fault` and `quorum-p-plus-one-io-fault`.
   Meaning: these target exactly P and P+1 volumes in one erasure set with
-  same-set proof. P is expected to survive; P+1 may be a release candidate or
-  an explicitly expected-failure diagnostic, but both still require executable
-  targeting and live calibration evidence.
+  same-set proof. Payload and metadata are explicit typed cases, producing four
+  suite attempts. P verifies the complete stable typed read cohort remains
+  readable with intact hashes. At both P and P+1, every mutation whose write
+  quorum exceeds the remaining shard count must receive no success ACK.
+  Payload P+1 permits DELETE success only when metadata write quorum remains;
+  for EC2+2 it rejects PUT, DELETE, and multipart completion. EC6+2 payload P
+  still permits writes, while metadata P and P+1 reject all three mutations.
+  Both boundaries stage multipart uploads before injection so completion
+  rejection is observed directly rather than inferred from failed staging.
+  Bounded `/rustfs/admin/v3/info` samples before the probes/workload and after
+  the workload/controller recheck bind the unchanged deployment, geometry,
+  endpoints, Pods, and drive UUIDs and require every non-target drive to be
+  healthy. These two endpoint samples are guards, not continuous-health proof.
+  Live qualification evidence is still required before release gating.
 
 ### 9. Fix Heal-Family Oracle Blind Spots
 
-- [ ] TODO: Add force-read-through-repaired-volume support.
+- [ ] PARTIAL: Add force-read-through-repaired-volume support.
   Meaning: after replacing or corrupting one volume, normal GET can reconstruct
   from other shards and pass even if heal is broken. The scenario must force
   reads through the healed/repaired volume, for example by faulting the other P
-  volumes, before declaring heal success.
+  volumes, before declaring heal success. `ForceReadThroughProof` now rejects
+  any artifact that does not leave exactly read quorum online or excludes the
+  repaired shard; runtime orchestration still depends on executable quorum
+  targeting.
 
-- [ ] TODO: Add `fresh-volume-replacement-heal`.
+- [ ] PARTIAL: Add `fresh-volume-replacement-heal`.
   Meaning: replace one PVC/PV with an empty volume, record original and
   replacement generation, quarantine/restore path, heal progress, and then force
-  proof that the new volume contains the committed versions.
+  proof that the new volume contains the committed versions. The typed
+  generation, pre-adoption emptiness, heal, and forced-read evidence contracts
+  exist; a safe Operator/PVC replacement adapter is still required.
 
-- [ ] TODO: Add `on-disk-bitrot-heal`.
+- [ ] PARTIAL: Add `on-disk-bitrot-heal`.
   Meaning: mutate bytes in one shard on a dedicated host volume, prove exact
   object-to-shard mapping, byte offset, original/mutated hash, rollback path,
-  and verify corrupt bytes are never returned as successful S3 data.
+  and verify corrupt bytes are never returned as successful S3 data. The
+  mutation proof accepts only a versioned RustFS diagnostic mapping and refuses
+  guessed private paths; RustFS does not yet expose that stable hook to S3Chaos.
 
-- [ ] TODO: Add heal observer artifacts.
+- [ ] PARTIAL: Add heal observer artifacts.
   Meaning: `heal-summary.json` and `heal-progress.jsonl` should explain heal
   convergence/non-convergence, but checker/history remain the S3-visible verdict
-  source.
+  source. Typed summary/progress validation now requires monotonic counters and
+  a matching successful terminal sample; the admin/scanner adapters must emit
+  the artifacts during execution.
 
 ### 10. Complete Admin Topology Workflows
 
@@ -459,14 +498,16 @@ Reporting only projects this typed checker result into failure-summary fields.
   Meaning: preflight binds named pools and the fresh Tenant UID's endpoint sets
   to exact runtime pool IDs/cmdlines without array-order inference; it checks
   health, mutual exclusion, and the decommission 130% capacity guard plus a
-  bounded workload budget. Timestamped pool lists bound to the same attempt
+  bounded workload budget, including SDK retries and possible recovery
+  recommits. Timestamped pool lists bound to the same attempt
   must repeat those checks immediately before the start request and prove the
   post-terminal health/topology observation.
   Operation/progress evidence is bound to the current run, case, Tenant UID,
   and attempt time window and requires a successful terminal state, monotonic
   scenario-specific state transitions, and before/after topology. Failed,
   canceled, stopped, mismatched, zero-movement, or incomplete evidence cannot
-  pass.
+  pass. Terminal responses must also have no unresolved decommission entries
+  or rebalance cleanup-warning entries, even if aggregate counters are clear.
 
 - [ ] BLOCKED: Keep `admin-decommission` and `admin-rebalance` Planned until the
   runner supports scenario-owned operation phases.
@@ -480,23 +521,30 @@ Reporting only projects this typed checker result into failure-summary fields.
 
 ### 11. Add Stale Disk, Dangling Cleanup, And Campaign Scenarios
 
-- [ ] TODO: Add disk generation evidence.
+- [x] DONE: Add disk generation evidence contracts.
   Meaning: stale-disk and fresh-volume flows need PV/PVC/node/device generation,
-  mount identity, reattach event, and old/new generation comparison.
+  mount identity, reattach event, and old/new generation comparison. The
+  contracts reject generation reuse for fresh replacement and reject a
+  different generation for stale return.
 
-- [ ] TODO: Add `stale-disk-return-detect`.
+- [ ] PARTIAL: Add `stale-disk-return-detect`.
   Meaning: continue writes/deletes while one disk generation is absent, reattach
   the old generation, and prove latest version id, delete marker latest state,
-  and object hash do not roll back.
+  and object hash do not roll back. The catalog and evidence contracts exist;
+  the detach/reattach runtime adapter remains intentionally blocked.
 
-- [ ] TODO: Add `dangling-cleanup-after-ack-loss`.
+- [ ] PARTIAL: Cover dangling cleanup inside `stale-disk-return-detect`.
   Meaning: record shard inventory before/after dangling cleanup and prove the
-  cleanup actor did not delete recoverable committed fragments.
+  cleanup actor did not delete recoverable committed fragments. This is a
+  recovery phase and oracle of stale-disk return rather than a separate fault
+  family. The proof contract exists; the RustFS inventory/cleanup adapter is
+  still required.
 
 - [ ] TODO: Add `long-run-durability-campaign`.
   Meaning: run repeated calibrated scenarios under continuous workload with
   periodic full verification and fd/RSS/artifact-size trend gates for release
-  qualification.
+  qualification. Implement this as suite orchestration after the component
+  scenarios are executable, not as a planned fault backend.
 
 ### 12. Document Network Faults As A Separate Axis
 
