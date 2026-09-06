@@ -417,6 +417,10 @@ impl Recorder {
         self.state().records.clone()
     }
 
+    pub(crate) fn next_event_sequence(&self) -> u64 {
+        self.state().next_event_sequence
+    }
+
     pub fn scenario(&self) -> String {
         self.state().scenario.clone()
     }
@@ -533,6 +537,32 @@ mod tests {
         assert!(content.contains("\"kind\":\"put\""));
         assert_eq!(recorder.records().len(), 1);
         assert_eq!(recorder.path(), path);
+    }
+
+    #[test]
+    fn next_event_sequence_observes_pending_begin_without_consuming_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder =
+            Recorder::create(dir.path().join("history.jsonl"), "ack", "run-1").expect("recorder");
+
+        assert_eq!(recorder.next_event_sequence(), 1);
+        assert_eq!(recorder.next_event_sequence(), 1);
+        let pending = recorder.begin(
+            OperationKind::Put,
+            "bucket",
+            Some("key".to_string()),
+            Some("hash".to_string()),
+            Some(4),
+        );
+        assert_eq!(pending.started_sequence, Some(1));
+        assert_eq!(recorder.next_event_sequence(), 2);
+        assert_eq!(recorder.next_event_sequence(), 2);
+
+        let completed = recorder
+            .finish(pending, OperationOutcome::Ok, Some(200), None)
+            .expect("finish");
+        assert_eq!(completed.ended_sequence, Some(2));
+        assert_eq!(recorder.next_event_sequence(), 3);
     }
 
     #[test]

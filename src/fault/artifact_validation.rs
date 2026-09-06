@@ -24,6 +24,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::fault::{
+    acknowledged_mutation::AcknowledgedMutationKind,
     backends::chaos_mesh::{
         NetworkPartitionEvidenceContract, VolumeTargetEvidenceContract, iochaos_record_pod_id,
         validate_fixed_volume_snapshot, validate_network_partition_snapshot,
@@ -32,11 +33,11 @@ use crate::fault::{
     config::{
         DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, DEFAULT_RUSTFS_POD_COUNT,
         DEFAULT_RUSTFS_POD_STABLE_WINDOW_SECONDS, DEFAULT_RUSTFS_VOLUME_PATH,
-        DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS,
+        DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS, MAX_ACK_TO_FAULT_MS,
     },
     events::{RunEvent, RunEventStatus},
     history::{
-        DurabilityCohort, OperationKind, OperationOutcome, OperationRecord,
+        DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome, OperationRecord,
         validate_history_phase_boundary, validate_history_scope_and_order,
     },
     host_storage::DmStatusSnapshot,
@@ -58,10 +59,12 @@ use crate::fault::{
         require_fresh_runtime_observation,
     },
     reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
-    scenarios::{self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario},
+    scenarios::{
+        self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario, acknowledged_mutation_kind,
+    },
     spec::{
-        FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunFaultSpec,
-        FaultRunSpec, FaultRunTargetSpec,
+        FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunAckTriggerSpec, FaultRunArtifactSpec,
+        FaultRunFaultSpec, FaultRunSpec, FaultRunTargetSpec,
     },
     workload::{
         WorkloadPlan,
@@ -174,6 +177,7 @@ fn validate_failed_attempt_disruption_evidence(
     attempt_started_at_ms: u64,
     evaluated_at_ms: u64,
 ) -> Result<FailedAttemptDisruptionEvidence> {
+    let ack_mutation = acknowledged_mutation_kind(scenario);
     ensure!(
         attempt_run_id
             .strip_prefix("run-")
@@ -214,15 +218,28 @@ fn validate_failed_attempt_disruption_evidence(
             && evidence.run_id.as_deref() == Some(attempt_run_id),
         "fault-evidence.json identity does not match the planned attempt"
     );
-    ensure!(
-        evidence.injected && evidence.active_during_workload && evidence.recovered,
-        "fault-evidence.json does not prove a completed fault lifecycle"
-    );
-    ensure!(
-        !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
-        "fault-evidence.json does not prove fault activity during the workload"
-    );
-    validate_fault_window_evidence(&evidence)?;
+    if ack_mutation.is_some() {
+        ensure!(
+            evidence.injected
+                && !evidence.active_during_workload
+                && evidence.recovered
+                && evidence.client_disruptions == 0
+                && !evidence.active_snapshots.is_empty()
+                && evidence.workload_snapshots.is_empty(),
+            "fault-evidence.json does not prove a completed ACK-triggered quiet lifecycle"
+        );
+        validate_ack_fault_window_evidence(&evidence)?;
+    } else {
+        ensure!(
+            evidence.injected && evidence.active_during_workload && evidence.recovered,
+            "fault-evidence.json does not prove a completed fault lifecycle"
+        );
+        ensure!(
+            !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
+            "fault-evidence.json does not prove fault activity during the workload"
+        );
+        validate_fault_window_evidence(&evidence)?;
+    }
     ensure!(
         evidence
             .fault_apply_started_at_ms
@@ -233,13 +250,6 @@ fn validate_failed_attempt_disruption_evidence(
         "fault-evidence.json timestamps are outside the current attempt window"
     );
 
-    let workload_path = bound_case_artifact(&case_dir, "workload-summary.json")?;
-    let workload = read_json::<WorkloadSummaryArtifact>(&workload_path)?;
-    ensure!(
-        workload.scenario.as_deref() == Some(scenario)
-            && workload.run_id.as_deref() == Some(attempt_run_id),
-        "workload-summary.json identity does not match the planned attempt"
-    );
     let workload_plan =
         read_json::<ArtifactIdentity>(&bound_case_artifact(&case_dir, "workload-plan.json")?)?;
     ensure!(
@@ -247,11 +257,23 @@ fn validate_failed_attempt_disruption_evidence(
             && workload_plan.run_id.as_deref() == Some(attempt_run_id),
         "workload-plan.json identity does not match the planned attempt"
     );
-    let disrupted = workload.disrupted()?;
-    ensure!(
-        disrupted == evidence.client_disruptions,
-        "fault-evidence.json client_disruptions does not match workload-summary.json"
-    );
+    let disrupted = if ack_mutation.is_some() {
+        0
+    } else {
+        let workload_path = bound_case_artifact(&case_dir, "workload-summary.json")?;
+        let workload = read_json::<WorkloadSummaryArtifact>(&workload_path)?;
+        ensure!(
+            workload.scenario.as_deref() == Some(scenario)
+                && workload.run_id.as_deref() == Some(attempt_run_id),
+            "workload-summary.json identity does not match the planned attempt"
+        );
+        let disrupted = workload.disrupted()?;
+        ensure!(
+            disrupted == evidence.client_disruptions,
+            "fault-evidence.json client_disruptions does not match workload-summary.json"
+        );
+        disrupted
+    };
 
     let events_path = bound_case_artifact(&case_dir, "run-events.jsonl")?;
     let events = read_jsonl::<RunEvent>(&events_path)?;
@@ -264,6 +286,25 @@ fn validate_failed_attempt_disruption_evidence(
             }),
         "run-events.jsonl identity or timestamps do not match the planned attempt"
     );
+    if let Some(expected_mutation) = ack_mutation {
+        let full_run_spec = read_json::<FaultRunSpec>(&run_spec_path)?;
+        let history =
+            read_jsonl::<OperationRecord>(&bound_case_artifact(&case_dir, "history.jsonl")?)?;
+        let _ = validate_ack_triggered_dm_artifacts(
+            AckArtifactValidationContext {
+                root: &case_dir,
+                case_name,
+                events: &events,
+                evidence: &evidence,
+                history: &history,
+                scenario,
+                run_id: attempt_run_id,
+                bucket: &full_run_spec.metadata.bucket,
+                run_spec: &full_run_spec,
+            },
+            expected_mutation,
+        )?;
+    }
     ensure!(
         has_event(&events, "run", RunEventStatus::Started)
             && (has_event(&events, "run", RunEventStatus::Failed)
@@ -516,13 +557,18 @@ fn validate_fault_artifacts_with_identity(
     identity: ArtifactIdentityPolicy<'_>,
 ) -> Result<ArtifactValidationReport> {
     let scenario_spec = scenarios::scenario_spec(&options.scenario)?;
+    let ack_mutation = acknowledged_mutation_kind(&options.scenario);
     validate_conditional_recovery_stability_artifact(
         &options.artifact_root,
         scenario_spec.case_name,
         &options.scenario,
         identity.planned_run_id(),
     )?;
-    let artifacts = locate_required_artifacts(&options.artifact_root, scenario_spec.case_name)?;
+    let artifacts = locate_required_artifacts(
+        &options.artifact_root,
+        scenario_spec.case_name,
+        &options.scenario,
+    )?;
 
     let metadata_path = required(&artifacts, "run-metadata.json")?;
     ensure_json_field_present(
@@ -687,14 +733,29 @@ fn validate_fault_artifacts_with_identity(
         &metadata,
         identity,
     )?;
-    ensure!(
-        evidence.injected && evidence.active_during_workload && evidence.recovered,
-        "fault-evidence.json must record injected=true, active_during_workload=true, recovered=true"
-    );
-    ensure!(
-        !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
-        "fault-evidence.json must include active and workload fault snapshots"
-    );
+    if ack_mutation.is_some() {
+        ensure!(
+            evidence.injected && !evidence.active_during_workload && evidence.recovered,
+            "ACK-triggered fault-evidence.json must record injected=true, active_during_workload=false, recovered=true"
+        );
+        ensure!(
+            !evidence.active_snapshots.is_empty() && evidence.workload_snapshots.is_empty(),
+            "ACK-triggered fault-evidence.json must include an active snapshot and no under-fault workload snapshot"
+        );
+        ensure!(
+            evidence.client_disruptions == 0 && !evidence.require_client_disruption,
+            "ACK-triggered quiet mutation cannot claim or require client disruptions"
+        );
+    } else {
+        ensure!(
+            evidence.injected && evidence.active_during_workload && evidence.recovered,
+            "fault-evidence.json must record injected=true, active_during_workload=true, recovered=true"
+        );
+        ensure!(
+            !evidence.active_snapshots.is_empty() && !evidence.workload_snapshots.is_empty(),
+            "fault-evidence.json must include active and workload fault snapshots"
+        );
+    }
     ensure!(
         evidence.require_client_disruption == metadata.require_client_disruption,
         "fault-evidence.json require_client_disruption {} does not match run-metadata.json {}",
@@ -753,7 +814,11 @@ fn validate_fault_artifacts_with_identity(
     ) {
         validate_volume_quorum_health_evidence(&evidence, &target_proof, &history)?;
     }
-    validate_fault_window_evidence(&evidence)?;
+    if ack_mutation.is_some() {
+        validate_ack_fault_window_evidence(&evidence)?;
+    } else {
+        validate_fault_window_evidence(&evidence)?;
+    }
     if options.scenario == DM_FLAKEY_VERSIONED_HOT_SCENARIO {
         validate_dm_crash_artifacts(
             &options.artifact_root,
@@ -765,6 +830,24 @@ fn validate_fault_artifacts_with_identity(
             &json_spec.metadata.bucket,
         )?;
     }
+    let ack_checker_expectation = if let Some(expected_mutation) = ack_mutation {
+        Some(validate_ack_triggered_dm_artifacts(
+            AckArtifactValidationContext {
+                root: &options.artifact_root,
+                case_name: scenario_spec.case_name,
+                events: &events,
+                evidence: &evidence,
+                history: &history,
+                scenario: &metadata.scenario,
+                run_id: &metadata.run_id,
+                bucket: &json_spec.metadata.bucket,
+                run_spec: &json_spec,
+            },
+            expected_mutation,
+        )?)
+    } else {
+        None
+    };
 
     let prechecker =
         read_json::<CheckerReport>(required(&artifacts, "checker-pre-recommit-report.json")?)?;
@@ -783,6 +866,34 @@ fn validate_fault_artifacts_with_identity(
         options.expected_workload_versioning,
         &history,
     )?;
+    if let Some(expectation) = &ack_checker_expectation {
+        validate_ack_prechecker_boundary(
+            &prechecker,
+            &history,
+            &expectation.trigger_operation_id,
+            evidence.recovery_ended_at_ms,
+        )?;
+        validate_ack_checker_report("checker-pre-recommit-report.json", &prechecker, expectation)?;
+        validate_ack_checker_report("checker-report.json", &checker, expectation)?;
+    }
+
+    if ack_mutation.is_some() {
+        validate_ack_checker_phase_chain(
+            &prechecker,
+            &checker,
+            &json_spec.metadata.bucket,
+            &history,
+        )?;
+        return Ok(ArtifactValidationReport {
+            scenario: options.scenario.clone(),
+            case_name: scenario_spec.case_name.to_string(),
+            seed: workload_plan.seed,
+            client_disruptions: 0,
+            recommitted: 0,
+            committed: checker.committed_puts,
+            required_artifacts: json_spec.artifacts.required.clone(),
+        });
+    }
 
     let recommit =
         read_json::<RecommitReportArtifact>(required(&artifacts, "recommit-report.json")?)?;
@@ -989,7 +1100,7 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
         spec.artifacts.event_stream == "run-events.jsonl",
         "run-spec artifacts.event_stream must be run-events.jsonl"
     );
-    for required in FaultRunArtifactSpec::required_names() {
+    for required in FaultRunArtifactSpec::required_names_for_scenario(&spec.scenario.name) {
         ensure!(
             spec.artifacts.required.contains(&required),
             "run-spec artifacts.required is missing {required}"
@@ -1059,6 +1170,30 @@ fn validate_run_spec_catalog_contract(
         "run-spec scenario contract does not match catalog scenario {:?}",
         options.scenario
     );
+    let expected_ack = acknowledged_mutation_kind(&options.scenario);
+    ensure!(
+        spec.scenario
+            .ack_trigger
+            .as_ref()
+            .map(|trigger| trigger.mutation)
+            == expected_ack,
+        "run-spec ACK trigger does not match the catalog scenario"
+    );
+    if let Some(trigger) = &spec.scenario.ack_trigger {
+        ensure!(
+            trigger.operation_timeout_ms > 0
+                && (1..=MAX_ACK_TO_FAULT_MS).contains(&trigger.max_ack_to_fault_ms),
+            "run-spec ACK trigger requires a positive operation timeout and max_ack_to_fault_ms between 1 and {MAX_ACK_TO_FAULT_MS}"
+        );
+        ensure!(
+            !spec.recovery.recommit_unconfirmed_writes
+                && !spec.artifacts.required.iter().any(|name| matches!(
+                    name.as_str(),
+                    "workload-summary.json" | "recommit-report.json"
+                )),
+            "ACK-triggered run-spec must disable recommit and omit mixed-workload artifacts"
+        );
+    }
     let artifact_fault = spec
         .faults
         .first()
@@ -1088,6 +1223,7 @@ fn validate_run_spec_catalog_contract(
     let expected_mode = match plan.workload_mode {
         FaultWorkloadMode::S3Mixed => "s3-mixed",
         FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
+        FaultWorkloadMode::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
     };
     ensure!(
         spec.workload.mode == expected_mode,
@@ -1716,15 +1852,33 @@ fn validate_host_storage_artifacts(
             && recovery_snapshot.observed_at_ms <= recovery_ended_at_ms,
         "host-storage post-cleanup observation is outside the recorded recovery window"
     );
+    let fault_delete_started = evidence
+        .fault_delete_started_at_ms
+        .context("missing fault delete start")?;
+    if spec.scenario.ack_trigger.is_some() {
+        let [snapshot] = evidence.active_snapshots.as_slice() else {
+            bail!("device-mapper active evidence requires exactly one fault snapshot");
+        };
+        ensure!(
+            evidence.workload_snapshots.is_empty(),
+            "ACK-triggered device-mapper evidence cannot contain an under-fault workload snapshot"
+        );
+        validate_dm_fault_snapshot(
+            snapshot,
+            "active",
+            proof,
+            fault_active_at_ms,
+            fault_delete_started,
+        )?;
+        return Ok(());
+    }
+
     let workload_started = evidence
         .workload_started_at_ms
         .context("missing workload start")?;
     let workload_ended = evidence
         .workload_ended_at_ms
         .context("missing workload end")?;
-    let fault_delete_started = evidence
-        .fault_delete_started_at_ms
-        .context("missing fault delete start")?;
     for (stage, snapshots, start, end) in [
         (
             "active",
@@ -1742,24 +1896,35 @@ fn validate_host_storage_artifacts(
         let [snapshot] = snapshots.as_slice() else {
             bail!("device-mapper {stage} evidence requires exactly one fault snapshot");
         };
-        ensure!(
-            snapshot.get("stage").and_then(Value::as_str) == Some(stage)
-                && snapshot.get("resource_kind").and_then(Value::as_str) == Some("device-mapper"),
-            "device-mapper {stage} snapshot metadata is inconsistent"
-        );
-        let dm_snapshot: DmStatusSnapshot = serde_json::from_value(
-            snapshot
-                .get("dm_status")
-                .context("device-mapper snapshot lacks dm_status")?
-                .clone(),
-        )
-        .with_context(|| format!("parse {stage} device-mapper snapshot"))?;
-        dm_snapshot.validate_proof(proof, stage, &proof.tables.fault_table)?;
-        ensure!(
-            dm_snapshot.observed_at_ms >= start && dm_snapshot.observed_at_ms <= end,
-            "device-mapper {stage} observation is outside its recorded fault window"
-        );
+        validate_dm_fault_snapshot(snapshot, stage, proof, start, end)?;
     }
+    Ok(())
+}
+
+fn validate_dm_fault_snapshot(
+    snapshot: &Value,
+    stage: &str,
+    proof: &HostStorageMutationProof,
+    start: u64,
+    end: u64,
+) -> Result<()> {
+    ensure!(
+        snapshot.get("stage").and_then(Value::as_str) == Some(stage)
+            && snapshot.get("resource_kind").and_then(Value::as_str) == Some("device-mapper"),
+        "device-mapper {stage} snapshot metadata is inconsistent"
+    );
+    let dm_snapshot: DmStatusSnapshot = serde_json::from_value(
+        snapshot
+            .get("dm_status")
+            .context("device-mapper snapshot lacks dm_status")?
+            .clone(),
+    )
+    .with_context(|| format!("parse {stage} device-mapper snapshot"))?;
+    dm_snapshot.validate_proof(proof, stage, &proof.tables.fault_table)?;
+    ensure!(
+        dm_snapshot.observed_at_ms >= start && dm_snapshot.observed_at_ms <= end,
+        "device-mapper {stage} observation is outside its recorded fault window"
+    );
     Ok(())
 }
 
@@ -2588,6 +2753,578 @@ fn validate_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Result<()
     Ok(())
 }
 
+fn validate_ack_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Result<()> {
+    let apply_started = evidence
+        .fault_apply_started_at_ms
+        .context("ACK-triggered fault-evidence.json fault_apply_started_at_ms is required")?;
+    let active = evidence
+        .fault_active_at_ms
+        .context("ACK-triggered fault-evidence.json fault_active_at_ms is required")?;
+    let delete_started = evidence
+        .fault_delete_started_at_ms
+        .context("ACK-triggered fault-evidence.json fault_delete_started_at_ms is required")?;
+    let recovery_started = evidence
+        .recovery_started_at_ms
+        .context("ACK-triggered fault-evidence.json recovery_started_at_ms is required")?;
+    let recovery_ended = evidence
+        .recovery_ended_at_ms
+        .context("ACK-triggered fault-evidence.json recovery_ended_at_ms is required")?;
+    ensure!(
+        evidence.workload_started_at_ms.is_none() && evidence.workload_ended_at_ms.is_none(),
+        "ACK-triggered quiet mutation must not claim an under-fault workload window"
+    );
+    ensure!(
+        apply_started <= active
+            && active <= delete_started
+            && delete_started <= recovery_started
+            && recovery_started <= recovery_ended,
+        "ACK-triggered fault-evidence.json lifecycle timestamps are not monotonic"
+    );
+    Ok(())
+}
+
+struct AckArtifactValidationContext<'a> {
+    root: &'a Path,
+    case_name: &'a str,
+    events: &'a [RunEvent],
+    evidence: &'a FaultEvidenceArtifact,
+    history: &'a [OperationRecord],
+    scenario: &'a str,
+    run_id: &'a str,
+    bucket: &'a str,
+    run_spec: &'a FaultRunSpec,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AckCheckerExpectation {
+    trigger_operation_id: String,
+    trigger_reference: String,
+    trigger_is_delete_marker: bool,
+    committed_version_refs: BTreeSet<String>,
+    committed_delete_marker_refs: BTreeSet<String>,
+}
+
+fn validate_ack_triggered_dm_artifacts(
+    context: AckArtifactValidationContext<'_>,
+    expected_mutation: AcknowledgedMutationKind,
+) -> Result<AckCheckerExpectation> {
+    let AckArtifactValidationContext {
+        root,
+        case_name,
+        events,
+        evidence,
+        history,
+        scenario,
+        run_id,
+        bucket,
+        run_spec,
+    } = context;
+    validate_history_scope_and_order(history, scenario, run_id, bucket)?;
+    ensure!(
+        events.iter().any(|event| {
+            event.stage == "ack-trigger"
+                && event.status == RunEventStatus::Succeeded
+                && event.scenario == scenario
+                && event.run_id == run_id
+        }) && events.iter().any(|event| {
+            event.stage == "crash-recovery-boundary"
+                && event.status == RunEventStatus::Succeeded
+                && event.scenario == scenario
+                && event.run_id == run_id
+        }),
+        "run-events.jsonl lacks a successful ACK trigger or crash-recovery boundary"
+    );
+    let ack = read_json::<AckTriggeredCrashEvidenceArtifact>(&locate_artifact(
+        root,
+        case_name,
+        "ack-to-fault-evidence.json",
+    )?)?;
+    let planned = run_spec
+        .scenario
+        .ack_trigger
+        .as_ref()
+        .context("run-spec lacks the ACK trigger contract")?;
+    let trigger = history
+        .iter()
+        .find(|record| record.id == ack.trigger_operation_id)
+        .context("history.jsonl lacks the declared ACK trigger operation")?;
+    validate_ack_trigger_contract(
+        &ack,
+        planned,
+        expected_mutation,
+        scenario,
+        run_id,
+        evidence.fault_apply_started_at_ms,
+        trigger,
+    )?;
+    ensure!(
+        evidence.fault_active_at_ms == Some(ack.fault_activated_at_ms),
+        "ACK activation timestamp does not match fault-evidence.json"
+    );
+
+    ensure!(
+        trigger.scenario == scenario
+            && trigger.run_id.as_deref() == Some(run_id)
+            && trigger.bucket == bucket
+            && trigger.kind == ack_operation_kind(expected_mutation)
+            && trigger.key.as_deref() == Some(ack.trigger_key.as_str())
+            && trigger.version_id.as_deref() == Some(ack.trigger_version_id.as_str())
+            && trigger.outcome == OperationOutcome::Ok
+            && trigger.durability_cohort == Some(DurabilityCohort::PreFault)
+            && trigger.fault_window_relation.is_none()
+            && trigger
+                .http_status
+                .is_some_and(|status| (200..300).contains(&status))
+            && trigger.ended_at_ms == ack.trigger_acknowledged_at_ms,
+        "ack-to-fault-evidence.json trigger identity does not match an eligible committed history record"
+    );
+    if expected_mutation == AcknowledgedMutationKind::ZeroBytePut {
+        ensure!(
+            trigger.size_bytes == Some(0),
+            "zero-byte ACK trigger history record is not empty"
+        );
+    }
+    validate_ack_quiet_gap(
+        history,
+        trigger,
+        ack.crash_boundary_started_at_ms,
+        ack.crash_boundary_next_sequence,
+    )?;
+    validate_ack_mutation_shape(history, trigger, expected_mutation)?;
+    let checker_expectation = ack_checker_expectation(history, trigger, expected_mutation)?;
+
+    let boundary = read_json::<DmCrashBoundaryArtifact>(&locate_artifact(
+        root,
+        case_name,
+        "dm-crash-boundary.json",
+    )?)?;
+    ensure!(
+        boundary.scenario == scenario
+            && boundary.run_id == run_id
+            && boundary.started_at_ms == ack.crash_boundary_started_at_ms
+            && boundary.completed_at_ms >= boundary.started_at_ms
+            && boundary.filesystem_unmounted
+            && !boundary.mount_before.canonical_source.is_empty()
+            && !boundary.mount_before.filesystem.is_empty()
+            && !boundary.mount_before.options.is_empty()
+            && boundary
+                .fault
+                .table
+                .split_whitespace()
+                .any(|field| field == "drop_writes")
+            && evidence
+                .fault_delete_started_at_ms
+                .is_some_and(|started| started >= boundary.completed_at_ms),
+        "dm-crash-boundary.json does not match the ACK-triggered drop_writes boundary"
+    );
+    if let Some(replacement_uid) = &boundary.replacement_pod_uid {
+        ensure!(
+            replacement_uid != &boundary.old_pod_uid,
+            "dm-crash-boundary.json replacement Pod UID must differ from the deleted Pod UID"
+        );
+    }
+    let recovered = read_json::<DmCrashRecoveryArtifact>(&locate_artifact(
+        root,
+        case_name,
+        "dm-crash-recovered.json",
+    )?)?;
+    ensure!(
+        recovered.scenario == scenario
+            && recovered.run_id == run_id
+            && recovered.recovered_at_ms >= boundary.completed_at_ms
+            && recovered.taint_removed
+            && !recovered.mount.source.is_empty()
+            && !recovered.mount.canonical_source.is_empty()
+            && !recovered.mount.filesystem.is_empty()
+            && recovered.mount.canonical_source == boundary.mount_before.canonical_source
+            && recovered.mount.filesystem == boundary.mount_before.filesystem
+            && recovered.mount.options == boundary.mount_before.options
+            && normalize_dm_table(&recovered.fault.table)
+                == normalize_dm_table(&recovered.expected_table)
+            && drop_writes_table_matches_recovery(&boundary.fault.table, &recovered.expected_table)
+            && !recovered
+                .fault
+                .table
+                .split_whitespace()
+                .any(|field| field == "drop_writes"),
+        "dm-crash-recovered.json does not prove recovery of the ACK-triggered fault"
+    );
+    let host_proof = read_json::<HostStorageMutationProof>(&locate_artifact(
+        root,
+        case_name,
+        HOST_STORAGE_PROOF_ARTIFACT,
+    )?)?;
+    validate_ack_crash_target_identity(&boundary, &host_proof, evidence)?;
+    Ok(checker_expectation)
+}
+
+fn validate_ack_trigger_contract(
+    ack: &AckTriggeredCrashEvidenceArtifact,
+    planned: &FaultRunAckTriggerSpec,
+    expected_mutation: AcknowledgedMutationKind,
+    scenario: &str,
+    run_id: &str,
+    fault_apply_started_at_ms: Option<u64>,
+    trigger: &OperationRecord,
+) -> Result<()> {
+    ensure!(
+        ack.scenario == scenario
+            && ack.run_id == run_id
+            && ack.trigger_kind == expected_mutation
+            && planned.mutation == expected_mutation
+            && planned.operation_timeout_ms > 0
+            && trigger.ended_at_ms == ack.trigger_acknowledged_at_ms
+            && trigger
+                .ended_at_ms
+                .checked_sub(trigger.started_at_ms)
+                .is_some_and(|duration| duration <= planned.operation_timeout_ms)
+            && (1..=MAX_ACK_TO_FAULT_MS).contains(&planned.max_ack_to_fault_ms)
+            && ack.max_ack_to_fault_ms == planned.max_ack_to_fault_ms
+            && !ack.trigger_operation_id.is_empty()
+            && !ack.trigger_key.is_empty()
+            && !ack.trigger_version_id.is_empty()
+            && ack.trigger_version_id != "null"
+            && fault_apply_started_at_ms.is_some_and(|started| {
+                ack.trigger_acknowledged_at_ms <= started && started <= ack.fault_activated_at_ms
+            })
+            && ack.fault_activated_at_ms <= ack.crash_boundary_started_at_ms
+            && ack.ack_to_fault_ms
+                == ack
+                    .fault_activated_at_ms
+                    .saturating_sub(ack.trigger_acknowledged_at_ms)
+            && ack.ack_to_fault_ms <= ack.max_ack_to_fault_ms
+            && ack.ack_to_crash_boundary_ms
+                == ack
+                    .crash_boundary_started_at_ms
+                    .saturating_sub(ack.trigger_acknowledged_at_ms),
+        "ack-to-fault-evidence.json does not prove the planned mutation ACK preceded bounded fault application and activation"
+    );
+    Ok(())
+}
+
+fn ack_checker_expectation(
+    history: &[OperationRecord],
+    trigger: &OperationRecord,
+    mutation: AcknowledgedMutationKind,
+) -> Result<AckCheckerExpectation> {
+    let committed_version_refs = history
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::CompleteMultipartUpload
+            ) && record.outcome == OperationOutcome::Ok
+                && record.value_sha256.is_some()
+                && record.size_bytes.is_some()
+        })
+        .filter_map(operation_version_reference)
+        .collect::<BTreeSet<_>>();
+    let committed_delete_marker_refs = history
+        .iter()
+        .filter(|record| {
+            record.kind == OperationKind::Delete && record.outcome == OperationOutcome::Ok
+        })
+        .filter_map(operation_version_reference)
+        .collect::<BTreeSet<_>>();
+    let trigger_reference = operation_version_reference(trigger)
+        .context("eligible ACK trigger lacks an exact key@version reference")?;
+    let trigger_is_delete_marker = mutation == AcknowledgedMutationKind::DeleteMarker;
+    let expected_set = if trigger_is_delete_marker {
+        &committed_delete_marker_refs
+    } else {
+        &committed_version_refs
+    };
+    ensure!(
+        expected_set.contains(&trigger_reference),
+        "eligible ACK trigger is absent from the history-derived checker expectation"
+    );
+    Ok(AckCheckerExpectation {
+        trigger_operation_id: trigger.id.clone(),
+        trigger_reference,
+        trigger_is_delete_marker,
+        committed_version_refs,
+        committed_delete_marker_refs,
+    })
+}
+
+fn operation_version_reference(record: &OperationRecord) -> Option<String> {
+    let key = record.key.as_deref()?;
+    let version_id = record.version_id.as_deref()?;
+    (!key.is_empty() && !version_id.is_empty() && version_id != "null")
+        .then(|| format!("{key}@{version_id}"))
+}
+
+fn validate_ack_checker_report(
+    name: &str,
+    report: &CheckerReport,
+    expectation: &AckCheckerExpectation,
+) -> Result<()> {
+    let audit = report
+        .audit
+        .as_ref()
+        .context("ACK checker has no history-bound audit")?;
+    let verified_versions = audit
+        .data_version_checks
+        .iter()
+        .filter(|check| {
+            check.outcome == OperationOutcome::Ok
+                && check.http_status == Some(200)
+                && check.observed_sha256.as_deref() == Some(check.expected_sha256.as_str())
+        })
+        .map(|check| format!("{}@{}", check.key, check.version_id))
+        .collect::<BTreeSet<_>>();
+    let verified_delete_markers = audit
+        .delete_marker_checks
+        .iter()
+        .filter(|check| check.visible_in_list_object_versions)
+        .map(|check| format!("{}@{}", check.key, check.version_id))
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        report.versioning_expected
+            && report.expected_committed_versions == expectation.committed_version_refs.len()
+            && report.verified_committed_versions == expectation.committed_version_refs.len()
+            && audit.data_version_checks.len() == verified_versions.len()
+            && verified_versions == expectation.committed_version_refs
+            && audit.list_object_versions_completed == Some(true)
+            && audit.delete_marker_checks.len() == verified_delete_markers.len()
+            && verified_delete_markers == expectation.committed_delete_marker_refs,
+        "{name} exact committed version/delete-marker proof does not match history.jsonl"
+    );
+    let trigger_verified = if expectation.trigger_is_delete_marker {
+        verified_delete_markers.contains(&expectation.trigger_reference)
+    } else {
+        verified_versions.contains(&expectation.trigger_reference)
+    };
+    ensure!(
+        trigger_verified,
+        "{name} does not prove the exact ACK trigger {}",
+        expectation.trigger_reference
+    );
+    Ok(())
+}
+
+fn validate_ack_prechecker_boundary(
+    report: &CheckerReport,
+    history: &[OperationRecord],
+    trigger_operation_id: &str,
+    recovery_ended_at_ms: Option<u64>,
+) -> Result<()> {
+    let recovery_ended_at_ms =
+        recovery_ended_at_ms.context("ACK recovery has no completion timestamp")?;
+    let trigger_index = history
+        .iter()
+        .position(|record| record.id == trigger_operation_id)
+        .context("ACK checker history lacks the trigger operation")?;
+    ensure!(
+        report
+            .audit
+            .as_ref()
+            .is_some_and(
+                |audit| audit.history_prefix_record_count == trigger_index + 1
+                    && audit.started_at_ms >= recovery_ended_at_ms
+            ),
+        "ACK prechecker must start after recovery and its prefix must end exactly at the trigger without intervening S3 traffic"
+    );
+    Ok(())
+}
+
+fn validate_ack_checker_phase_chain(
+    prechecker: &CheckerReport,
+    checker: &CheckerReport,
+    bucket: &str,
+    history: &[OperationRecord],
+) -> Result<()> {
+    let pre = prechecker
+        .audit
+        .as_ref()
+        .context("ACK prechecker has no audit")?;
+    let final_audit = checker
+        .audit
+        .as_ref()
+        .context("ACK final checker has no audit")?;
+    let pre_end = pre
+        .history_prefix_record_count
+        .checked_add(pre.history_suffix_record_count)
+        .context("ACK prechecker history bounds overflow")?;
+    let final_end = final_audit
+        .history_prefix_record_count
+        .checked_add(final_audit.history_suffix_record_count)
+        .context("ACK final checker history bounds overflow")?;
+    validate_history_scope_and_order(history, &prechecker.scenario, &prechecker.run_id, bucket)?;
+    ensure!(
+        pre.bucket == bucket
+            && final_audit.bucket == bucket
+            && prechecker.scenario == checker.scenario
+            && prechecker.run_id == checker.run_id,
+        "ACK checker phases do not match the run target identity"
+    );
+    ensure!(
+        pre.history_suffix_record_count > 0
+            && final_audit.history_suffix_record_count > 0
+            && pre.completed_at_ms <= final_audit.started_at_ms
+            && pre_end == final_audit.history_prefix_record_count
+            && final_end == history.len(),
+        "ACK checker phases must be independent, contiguous, ordered, and terminal without recommit"
+    );
+    let prefix = history
+        .get(..pre_end)
+        .context("ACK prechecker exceeds history bounds")?;
+    let suffix = history
+        .get(pre_end..final_end)
+        .context("ACK final checker exceeds history bounds")?;
+    validate_history_phase_boundary(prefix, suffix, "ACK prechecker/final-checker")
+}
+
+fn validate_ack_crash_target_identity(
+    boundary: &DmCrashBoundaryArtifact,
+    proof: &HostStorageMutationProof,
+    evidence: &FaultEvidenceArtifact,
+) -> Result<()> {
+    ensure!(
+        boundary.old_pod_uid == proof.target.pod_uid
+            && boundary.mount_before.canonical_source == proof.target.mount_canonical_source
+            && boundary.mount_before.filesystem == proof.target.filesystem,
+        "dm-crash-boundary.json is not bound to the host-storage proof target"
+    );
+    ensure!(
+        evidence
+            .pods_before
+            .iter()
+            .any(|pod| pod.name == proof.target.pod && pod.uid == proof.target.pod_uid),
+        "fault-evidence.json lacks the exact host-storage proof target Pod name/UID"
+    );
+    ensure!(
+        evidence.pods_after.iter().any(|pod| {
+            pod.name == proof.target.pod
+                && pod.uid != proof.target.pod_uid
+                && boundary
+                    .replacement_pod_uid
+                    .as_ref()
+                    .is_none_or(|replacement| replacement == &pod.uid)
+        }),
+        "fault-evidence.json does not prove replacement of the host-storage proof target Pod"
+    );
+    Ok(())
+}
+
+fn validate_ack_quiet_gap(
+    history: &[OperationRecord],
+    trigger: &OperationRecord,
+    crash_boundary_started_at_ms: u64,
+    crash_boundary_next_sequence: u64,
+) -> Result<()> {
+    let trigger_start = trigger
+        .started_sequence
+        .context("ACK trigger lacks start sequence")?;
+    let trigger_end = trigger
+        .ended_sequence
+        .context("ACK trigger lacks end sequence")?;
+    ensure!(
+        trigger.ended_at_ms <= crash_boundary_started_at_ms
+            && trigger_end.checked_add(1) == Some(crash_boundary_next_sequence)
+            && history.iter().all(|record| {
+                record.id == trigger.id
+                    || (record.ended_sequence.is_some_and(|end| end < trigger_start)
+                        && record.ended_at_ms <= trigger.started_at_ms)
+                    || (matches!(
+                        record.kind,
+                        OperationKind::Get | OperationKind::List | OperationKind::ListVersions
+                    ) && record.durability_cohort == Some(DurabilityCohort::PostRecovery)
+                        && record.fault_window_relation == Some(FaultWindowRelation::AfterFault)
+                        && record
+                            .started_sequence
+                            .is_some_and(|start| start >= crash_boundary_next_sequence)
+                        && record.started_at_ms >= crash_boundary_started_at_ms)
+            }),
+        "S3 traffic overlapped the quiet trigger or occurred before its crash boundary"
+    );
+    Ok(())
+}
+
+fn ack_operation_kind(kind: AcknowledgedMutationKind) -> OperationKind {
+    match kind {
+        AcknowledgedMutationKind::Put
+        | AcknowledgedMutationKind::Overwrite
+        | AcknowledgedMutationKind::ZeroBytePut => OperationKind::Put,
+        AcknowledgedMutationKind::DeleteMarker => OperationKind::Delete,
+        AcknowledgedMutationKind::MultipartComplete => OperationKind::CompleteMultipartUpload,
+    }
+}
+
+fn validate_ack_mutation_shape(
+    history: &[OperationRecord],
+    trigger: &OperationRecord,
+    kind: AcknowledgedMutationKind,
+) -> Result<()> {
+    let trigger_start = trigger
+        .started_sequence
+        .context("ACK trigger lacks start sequence")?;
+    let prior_mutations = history
+        .iter()
+        .filter(|record| {
+            record.id != trigger.id
+                && record.key == trigger.key
+                && matches!(
+                    record.kind,
+                    OperationKind::Put
+                        | OperationKind::Delete
+                        | OperationKind::CompleteMultipartUpload
+                )
+                && record.outcome == OperationOutcome::Ok
+                && record.ended_sequence.is_some_and(|end| end < trigger_start)
+                && record.ended_at_ms <= trigger.started_at_ms
+        })
+        .collect::<Vec<_>>();
+    match kind {
+        AcknowledgedMutationKind::Put | AcknowledgedMutationKind::ZeroBytePut => ensure!(
+            prior_mutations.is_empty(),
+            "create-style ACK trigger unexpectedly has a prior object version"
+        ),
+        AcknowledgedMutationKind::Overwrite | AcknowledgedMutationKind::DeleteMarker => {
+            ensure!(
+                prior_mutations.len() == 1 && prior_mutations[0].kind == OperationKind::Put,
+                "overwrite/delete-marker ACK trigger must have exactly one baseline PUT"
+            );
+            let baseline = prior_mutations[0];
+            ensure!(
+                baseline
+                    .http_status
+                    .is_some_and(|status| (200..300).contains(&status))
+                    && operation_version_reference(baseline).is_some()
+                    && baseline
+                        .value_sha256
+                        .as_deref()
+                        .is_some_and(|hash| !hash.is_empty())
+                    && baseline.size_bytes.is_some(),
+                "ACK baseline PUT lacks a definite versioned commit with complete payload evidence"
+            );
+        }
+        AcknowledgedMutationKind::MultipartComplete => {
+            ensure!(
+                prior_mutations.is_empty(),
+                "multipart ACK trigger unexpectedly has a prior object version"
+            );
+            ensure!(
+                history.iter().any(|record| {
+                    record.key == trigger.key
+                        && record.kind == OperationKind::CreateMultipartUpload
+                        && record.outcome == OperationOutcome::Ok
+                        && record.ended_sequence.is_some_and(|end| end < trigger_start)
+                        && record.ended_at_ms <= trigger.started_at_ms
+                }) && history.iter().any(|record| {
+                    record.key == trigger.key
+                        && record.kind == OperationKind::UploadPart
+                        && record.outcome == OperationOutcome::Ok
+                        && record.ended_sequence.is_some_and(|end| end < trigger_start)
+                        && record.ended_at_ms <= trigger.started_at_ms
+                }),
+                "multipart ACK trigger lacks successfully staged upload evidence"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_dm_crash_artifacts(
     root: &Path,
     case_name: &str,
@@ -2791,9 +3528,13 @@ fn normalize_dm_table(table: &str) -> String {
     table.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn locate_required_artifacts(root: &Path, case_name: &str) -> Result<BTreeMap<String, PathBuf>> {
+fn locate_required_artifacts(
+    root: &Path,
+    case_name: &str,
+    scenario: &str,
+) -> Result<BTreeMap<String, PathBuf>> {
     let mut artifacts = BTreeMap::new();
-    for name in FaultRunArtifactSpec::required_names() {
+    for name in FaultRunArtifactSpec::required_names_for_scenario(scenario) {
         let path = locate_artifact(root, case_name, &name)
             .with_context(|| format!("locate required artifact {name} under {}", root.display()))?;
         artifacts.insert(name, path);
@@ -3146,7 +3887,352 @@ fn read_expected_failure_checker(
         report.scenario == scenario && report.run_id == run_id,
         "{name} identity does not match the current attempt"
     );
+    if acknowledged_mutation_kind(scenario).is_some() {
+        let case_dir = path.parent().context("ACK checker has no case directory")?;
+        let history =
+            read_jsonl::<OperationRecord>(&bound_case_artifact(case_dir, "history.jsonl")?)?;
+        let ack = read_json::<AckTriggeredCrashEvidenceArtifact>(&bound_case_artifact(
+            case_dir,
+            "ack-to-fault-evidence.json",
+        )?)?;
+        let spec = read_json::<FaultRunSpec>(&bound_case_artifact(case_dir, "run-spec.json")?)?;
+        let evidence = read_json::<FaultEvidenceArtifact>(&bound_case_artifact(
+            case_dir,
+            "fault-evidence.json",
+        )?)?;
+        validate_ack_expected_failure_report(&report, &history, &ack, &spec.metadata.bucket)?;
+        if name == "checker-report.json" {
+            let prechecker = read_json::<CheckerReport>(&bound_case_artifact(
+                case_dir,
+                "checker-pre-recommit-report.json",
+            )?)?;
+            validate_checker_report(
+                "checker-pre-recommit-report.json",
+                &prechecker,
+                true,
+                &history,
+            )?;
+            validate_ack_prechecker_boundary(
+                &prechecker,
+                &history,
+                &ack.trigger_operation_id,
+                evidence.recovery_ended_at_ms,
+            )?;
+            validate_ack_checker_phase_chain(
+                &prechecker,
+                &report,
+                &spec.metadata.bucket,
+                &history,
+            )?;
+        } else {
+            validate_ack_prechecker_boundary(
+                &report,
+                &history,
+                &ack.trigger_operation_id,
+                evidence.recovery_ended_at_ms,
+            )?;
+        }
+    }
     Ok(report)
+}
+
+fn validate_ack_expected_failure_report(
+    report: &CheckerReport,
+    history: &[OperationRecord],
+    ack: &AckTriggeredCrashEvidenceArtifact,
+    bucket: &str,
+) -> Result<()> {
+    validate_history_scope_and_order(history, &ack.scenario, &ack.run_id, bucket)?;
+    let (prefix, suffix) = checker::validate_checker_audit_receipt(report, history)?;
+    let audit = report
+        .audit
+        .as_ref()
+        .context("ACK failure checker has no audit")?;
+    ensure!(
+        report.scenario == ack.scenario
+            && report.run_id == ack.run_id
+            && audit.bucket == bucket
+            && report.versioning_expected
+            && !report.passed,
+        "ACK failure checker does not match the versioned run identity or verdict"
+    );
+    let trigger = prefix
+        .iter()
+        .find(|record| record.id == ack.trigger_operation_id)
+        .context("ACK failure checker prefix lacks the committed trigger")?;
+    ensure!(
+        trigger.kind == ack_operation_kind(ack.trigger_kind)
+            && trigger.key.as_deref() == Some(ack.trigger_key.as_str())
+            && trigger.version_id.as_deref() == Some(ack.trigger_version_id.as_str())
+            && trigger.outcome == OperationOutcome::Ok,
+        "ACK failure checker trigger does not match its authenticated history"
+    );
+    validate_ack_quiet_gap(
+        history,
+        trigger,
+        ack.crash_boundary_started_at_ms,
+        ack.crash_boundary_next_sequence,
+    )?;
+    let protected_history = &prefix[..prefix
+        .iter()
+        .position(|record| record.id == trigger.id)
+        .context("ACK trigger disappeared from its authenticated prefix")?
+        + 1];
+    let data_signal = ack_data_version_failure_signal(report, protected_history, suffix, trigger)?;
+    let current_signal = ack_current_get_failure_signal(report, suffix, trigger)?;
+    let listing_signal =
+        ack_version_listing_failure_signal(report, protected_history, suffix, trigger)?;
+    ensure!(
+        data_signal || current_signal || listing_signal,
+        "ACK failure classification is not supported by the authenticated protected-key observations"
+    );
+    Ok(())
+}
+
+fn ack_data_version_failure_signal(
+    report: &CheckerReport,
+    prefix: &[OperationRecord],
+    suffix: &[OperationRecord],
+    trigger: &OperationRecord,
+) -> Result<bool> {
+    let audit = report
+        .audit
+        .as_ref()
+        .context("ACK failure checker has no audit")?;
+    let mut proven = false;
+    for version in prefix.iter().filter(|record| {
+        record.key == trigger.key
+            && record.outcome == OperationOutcome::Ok
+            && matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::CompleteMultipartUpload
+            )
+    }) {
+        ensure!(
+            version
+                .value_sha256
+                .as_ref()
+                .is_some_and(|hash| !hash.is_empty())
+                && version.size_bytes.is_some()
+                && version
+                    .http_status
+                    .is_some_and(|status| (200..300).contains(&status)),
+            "protected ACK data version lacks a complete committed payload receipt"
+        );
+        let reference = operation_version_reference(version)
+            .context("protected ACK data version has no identity")?;
+        let gets = suffix
+            .iter()
+            .filter(|record| {
+                record.kind == OperationKind::Get
+                    && record.key == version.key
+                    && record.version_id == version.version_id
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            gets.len() == 1 && gets[0].range.is_none(),
+            "ACK failure needs exactly one full GET per protected data version"
+        );
+        let get = gets[0];
+        let checks = audit
+            .data_version_checks
+            .iter()
+            .filter(|check| {
+                Some(check.key.as_str()) == version.key.as_deref()
+                    && Some(check.version_id.as_str()) == version.version_id.as_deref()
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            checks.len() == 1
+                && Some(checks[0].expected_sha256.as_str()) == version.value_sha256.as_deref()
+                && checks[0].observed_sha256 == get.value_sha256
+                && checks[0].outcome == get.outcome
+                && checks[0].http_status == get.http_status,
+            "ACK data-version audit does not match the protected version GET"
+        );
+        proven |= match report.failure_classification() {
+            RecoveryStabilityClassification::CommittedVersionMissing => {
+                get.outcome == OperationOutcome::NotFound
+                    && get.http_status == Some(404)
+                    && report.missing_committed_versions.contains(&reference)
+            }
+            RecoveryStabilityClassification::VersionHashMismatch => {
+                get.outcome == OperationOutcome::Ok
+                    && get.http_status == Some(200)
+                    && get.value_sha256.is_some()
+                    && (get.value_sha256 != version.value_sha256
+                        || get.size_bytes != version.size_bytes)
+                    && report
+                        .version_hash_mismatches
+                        .iter()
+                        .any(|item| item.starts_with(&format!("{reference}:")))
+            }
+            RecoveryStabilityClassification::CommittedVersionUnavailable => {
+                matches!(
+                    get.outcome,
+                    OperationOutcome::Failed
+                        | OperationOutcome::Timeout
+                        | OperationOutcome::Unknown
+                ) && get.value_sha256.is_none()
+                    && get.size_bytes.is_none()
+                    && get.error.as_ref().is_some_and(|error| !error.is_empty())
+                    && report
+                        .unavailable_committed_versions
+                        .iter()
+                        .any(|item| item.starts_with(&format!("{reference}:")))
+            }
+            _ => false,
+        };
+    }
+    Ok(proven)
+}
+
+fn ack_current_get_failure_signal(
+    report: &CheckerReport,
+    suffix: &[OperationRecord],
+    trigger: &OperationRecord,
+) -> Result<bool> {
+    let key = trigger.key.as_deref().context("ACK trigger has no key")?;
+    let gets = suffix
+        .iter()
+        .filter(|record| {
+            record.kind == OperationKind::Get
+                && record.key == trigger.key
+                && record.version_id.is_none()
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        gets.len() == 1 && gets[0].range.is_none(),
+        "ACK checker must capture exactly one full current GET for its trigger key"
+    );
+    let get = gets[0];
+    let is_delete = trigger.kind == OperationKind::Delete;
+    let successful_body = get.outcome == OperationOutcome::Ok
+        && get.http_status == Some(200)
+        && get.value_sha256.is_some()
+        && get.size_bytes.is_some();
+    Ok(match report.failure_classification() {
+        RecoveryStabilityClassification::DeletedObjectResurrected =>
+            is_delete && successful_body
+                && report.resurrected_deleted_objects.iter().any(|item| item.starts_with(&format!("{key}:"))),
+        RecoveryStabilityClassification::DataCorruption =>
+            !is_delete && successful_body
+                && (get.value_sha256 != trigger.value_sha256 || get.size_bytes != trigger.size_bytes)
+                && report.hash_mismatches.iter().any(|item| item.starts_with(&format!("{key}:"))),
+        RecoveryStabilityClassification::CommittedObjectUnavailable => !is_delete && (
+            (get.outcome == OperationOutcome::NotFound && get.http_status == Some(404)
+                && report.missing_committed_objects.iter().any(|item| item == key))
+            || report.unavailable_committed_objects.iter().chain(&report.unknown_committed_read_failures).any(|failure| {
+                matches!(failure, checker::CommittedReadFailure::Observed {
+                    key: observed_key, outcome, http_status, error, unexpected_body_bytes: None,
+                } if observed_key == key && *outcome == get.outcome && *http_status == get.http_status
+                    && *error == get.error && matches!(get.outcome, OperationOutcome::Failed | OperationOutcome::Timeout | OperationOutcome::Unknown))
+            })),
+        _ => false,
+    })
+}
+
+fn ack_version_listing_failure_signal(
+    report: &CheckerReport,
+    prefix: &[OperationRecord],
+    suffix: &[OperationRecord],
+    trigger: &OperationRecord,
+) -> Result<bool> {
+    let audit = report
+        .audit
+        .as_ref()
+        .context("ACK failure checker has no audit")?;
+    let prefix_key = crate::fault::workload::ObjectSpec::key_prefix(&report.run_id);
+    let lists = suffix
+        .iter()
+        .filter(|record| {
+            record.kind == OperationKind::ListVersions
+                && record.key.as_deref() == Some(prefix_key.as_str())
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        lists.len() == 1,
+        "ACK checker must capture exactly one ListObjectVersions receipt"
+    );
+    let list = lists[0];
+    let completed = list.outcome == OperationOutcome::Ok && list.http_status == Some(200);
+    ensure!(
+        audit.list_object_versions_completed == Some(completed),
+        "ACK version-list completion audit does not match its receipt"
+    );
+    let entries = if completed {
+        list.listed_versions
+            .as_deref()
+            .context("ACK version listing lacks captured entries")?
+    } else {
+        &[]
+    };
+    let mut proven = false;
+    for version in prefix.iter().filter(|record| {
+        record.key == trigger.key
+            && record.outcome == OperationOutcome::Ok
+            && matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::CompleteMultipartUpload | OperationKind::Delete
+            )
+    }) {
+        let reference = operation_version_reference(version)
+            .context("protected ACK version has no identity")?;
+        let is_marker = version.kind == OperationKind::Delete;
+        let visible = entries.iter().any(|entry| {
+            Some(entry.key.as_str()) == version.key.as_deref()
+                && entry.version_id == version.version_id
+                && entry.is_delete_marker == is_marker
+        });
+        if is_marker {
+            let checks = audit
+                .delete_marker_checks
+                .iter()
+                .filter(|check| {
+                    Some(check.key.as_str()) == version.key.as_deref()
+                        && Some(check.version_id.as_str()) == version.version_id.as_deref()
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                checks.len() == 1 && checks[0].visible_in_list_object_versions == visible,
+                "ACK marker audit does not match the protected version listing"
+            );
+        }
+        proven |=
+            completed
+                && !visible
+                && match report.failure_classification() {
+                    RecoveryStabilityClassification::DeleteMarkerMissing => is_marker
+                        && report.missing_committed_delete_markers.contains(&format!(
+                            "{reference}: committed delete marker missing from ListObjectVersions"
+                        )),
+                    RecoveryStabilityClassification::CommittedVersionMissing => {
+                        !is_marker
+                            && report.missing_committed_versions.contains(&format!(
+                                "{reference}: committed version missing from ListObjectVersions"
+                            ))
+                    }
+                    _ => false,
+                };
+    }
+    if completed
+        && report.failure_classification()
+            == RecoveryStabilityClassification::DeleteMarkerLineageIncomplete
+    {
+        let latest = entries
+            .iter()
+            .filter(|entry| Some(entry.key.as_str()) == trigger.key.as_deref() && entry.is_latest)
+            .collect::<Vec<_>>();
+        let key = trigger.key.as_deref().context("ACK trigger has no key")?;
+        proven |= (latest.len() != 1
+            || latest[0].version_id != trigger.version_id
+            || latest[0].is_delete_marker != (trigger.kind == OperationKind::Delete))
+            && report
+                .delete_marker_lineage_incomplete
+                .iter()
+                .any(|item| item.starts_with(&format!("{key}:")));
+    }
+    Ok(proven)
 }
 
 fn failure_summary_reference_root(validation_root: &Path) -> &Path {
@@ -3608,6 +4694,23 @@ struct CrashWindowEvidenceArtifact {
     ack_to_crash_boundary_ms: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct AckTriggeredCrashEvidenceArtifact {
+    scenario: String,
+    run_id: String,
+    trigger_operation_id: String,
+    trigger_kind: AcknowledgedMutationKind,
+    trigger_key: String,
+    trigger_version_id: String,
+    trigger_acknowledged_at_ms: u64,
+    fault_activated_at_ms: u64,
+    ack_to_fault_ms: u64,
+    max_ack_to_fault_ms: u64,
+    crash_boundary_started_at_ms: u64,
+    crash_boundary_next_sequence: u64,
+    ack_to_crash_boundary_ms: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct DmFaultTableArtifact {
     table: String,
@@ -3894,9 +4997,13 @@ mod tests {
         validate_write_quorum_runtime_evidence,
     };
     use crate::fault::{
+        acknowledged_mutation::AcknowledgedMutationKind,
         checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
         config::FaultTestConfig,
-        history::{OperationKind, OperationOutcome, OperationRecord},
+        history::{
+            ByteRange, DurabilityCohort, FaultWindowRelation, ListedVersionEntry, OperationKind,
+            OperationOutcome, OperationRecord,
+        },
         host_storage::{
             HostStorageAllowlist, HostStorageMutationIntent, HostStorageMutationProof,
             HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
@@ -5544,6 +6651,93 @@ mod tests {
         validate_host_storage_artifacts(&host_proof, &cleanup, &target_proof, &run_spec, &evidence)
             .expect("valid host-storage artifacts");
 
+        let mut ack_spec = run_spec.clone();
+        ack_spec.scenario.ack_trigger = Some(crate::fault::spec::FaultRunAckTriggerSpec {
+            mutation: crate::fault::acknowledged_mutation::AcknowledgedMutationKind::Put,
+            operation_timeout_ms: 30_000,
+            max_ack_to_fault_ms: 1_000,
+        });
+        let mut ack_evidence = evidence.clone();
+        ack_evidence.active_during_workload = false;
+        ack_evidence.workload_started_at_ms = None;
+        ack_evidence.workload_ended_at_ms = None;
+        ack_evidence.workload_snapshots.clear();
+        validate_host_storage_artifacts(
+            &host_proof,
+            &cleanup,
+            &target_proof,
+            &ack_spec,
+            &ack_evidence,
+        )
+        .expect("valid ACK-triggered host-storage artifacts");
+
+        ack_evidence.pods_before = vec![
+            super::PodIdentityArtifact {
+                name: "rustfs-0".to_string(),
+                uid: "uid-0".to_string(),
+            },
+            super::PodIdentityArtifact {
+                name: "rustfs-1".to_string(),
+                uid: "uid-1".to_string(),
+            },
+        ];
+        ack_evidence.pods_after = vec![
+            super::PodIdentityArtifact {
+                name: "rustfs-0".to_string(),
+                uid: "uid-0-replacement".to_string(),
+            },
+            super::PodIdentityArtifact {
+                name: "rustfs-1".to_string(),
+                uid: "uid-1-replacement".to_string(),
+            },
+        ];
+        let boundary: super::DmCrashBoundaryArtifact = serde_json::from_value(json!({
+            "scenario": scenario.name,
+            "run_id": "run-1",
+            "started_at_ms": 170,
+            "completed_at_ms": 180,
+            "old_pod_uid": "uid-0",
+            "replacement_pod_uid": "uid-0-replacement",
+            "filesystem_unmounted": true,
+            "mount_before": {
+                "source": "/dev/mapper/rustfs-fault-dm",
+                "canonical_source": "/dev/dm-0",
+                "filesystem": "ext4",
+                "options": "rw"
+            },
+            "fault": {"table": "0 1024 drop_writes /dev/loop0 0"}
+        }))
+        .expect("boundary");
+        super::validate_ack_crash_target_identity(&boundary, &host_proof, &ack_evidence)
+            .expect("boundary is bound to the proven target Pod");
+
+        let masquerading_boundary: super::DmCrashBoundaryArtifact = serde_json::from_value(json!({
+            "scenario": scenario.name,
+            "run_id": "run-1",
+            "started_at_ms": 170,
+            "completed_at_ms": 180,
+            "old_pod_uid": "uid-1",
+            "replacement_pod_uid": "uid-1-replacement",
+            "filesystem_unmounted": true,
+            "mount_before": {
+                "source": "/dev/mapper/rustfs-fault-dm",
+                "canonical_source": "/dev/dm-0",
+                "filesystem": "ext4",
+                "options": "rw"
+            },
+            "fault": {"table": "0 1024 drop_writes /dev/loop0 0"}
+        }))
+        .expect("masquerading boundary");
+        assert!(
+            super::validate_ack_crash_target_identity(
+                &masquerading_boundary,
+                &host_proof,
+                &ack_evidence,
+            )
+            .is_err(),
+            "a same-tenant Pod restart must not masquerade as the target disk Pod crash"
+        );
+
         for workload in [false, true] {
             for replacement in [vec![], vec![json!({})], vec![json!({}), json!({})]] {
                 let mut broken = evidence.clone();
@@ -6089,6 +7283,1820 @@ mod tests {
         let report = fs::read_to_string(report_path).expect("report");
         assert!(report.contains("\"status\": \"passed\""));
         assert!(report.contains("\"schema_version\": 1"));
+    }
+
+    #[test]
+    fn validates_all_ack_triggered_mutation_shapes() {
+        use crate::fault::acknowledged_mutation::AcknowledgedMutationKind;
+        use crate::fault::history::OperationKind;
+
+        let record = |id: &str,
+                      kind: OperationKind,
+                      key: &str,
+                      size_bytes: Option<usize>,
+                      started_at_ms: u64,
+                      ended_at_ms: u64| {
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": id,
+                "scenario": "ack-case",
+                "run_id": "run-1",
+                "kind": kind,
+                "bucket": "bucket",
+                "key": key,
+                "value_sha256": if matches!(kind, OperationKind::Put | OperationKind::CompleteMultipartUpload) { Some("sha256") } else { None },
+                "size_bytes": size_bytes,
+                "version_id": if matches!(kind, OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload) { Some("version-1") } else { None },
+                "started_sequence": started_at_ms,
+                "ended_sequence": ended_at_ms,
+                "started_at_ms": started_at_ms,
+                "ended_at_ms": ended_at_ms,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null
+            }))
+            .expect("operation record")
+        };
+        let put = record("op-1", OperationKind::Put, "create", Some(4), 10, 11);
+        super::validate_ack_mutation_shape(
+            std::slice::from_ref(&put),
+            &put,
+            AcknowledgedMutationKind::Put,
+        )
+        .expect("create PUT shape");
+
+        let zero = record("op-1", OperationKind::Put, "empty", Some(0), 10, 11);
+        super::validate_ack_mutation_shape(
+            std::slice::from_ref(&zero),
+            &zero,
+            AcknowledgedMutationKind::ZeroBytePut,
+        )
+        .expect("zero-byte PUT shape");
+
+        let baseline = record("op-1", OperationKind::Put, "existing", Some(4), 1, 2);
+        let overwrite = record("op-2", OperationKind::Put, "existing", Some(4), 10, 11);
+        let overwrite_history = vec![baseline.clone(), overwrite.clone()];
+        super::validate_ack_mutation_shape(
+            &overwrite_history,
+            &overwrite,
+            AcknowledgedMutationKind::Overwrite,
+        )
+        .expect("overwrite shape");
+
+        let delete = record("op-2", OperationKind::Delete, "existing", None, 10, 11);
+        let delete_history = vec![baseline.clone(), delete.clone()];
+        super::validate_ack_mutation_shape(
+            &delete_history,
+            &delete,
+            AcknowledgedMutationKind::DeleteMarker,
+        )
+        .expect("delete-marker shape");
+
+        let create_mpu = record(
+            "op-1",
+            OperationKind::CreateMultipartUpload,
+            "multipart",
+            None,
+            1,
+            2,
+        );
+        let upload_part = record(
+            "op-2",
+            OperationKind::UploadPart,
+            "multipart",
+            Some(8 * 1024 * 1024),
+            3,
+            4,
+        );
+        let complete = record(
+            "op-3",
+            OperationKind::CompleteMultipartUpload,
+            "multipart",
+            Some(8 * 1024 * 1024),
+            10,
+            11,
+        );
+        let multipart_history = vec![create_mpu, upload_part, complete.clone()];
+        super::validate_ack_mutation_shape(
+            &multipart_history,
+            &complete,
+            AcknowledgedMutationKind::MultipartComplete,
+        )
+        .expect("multipart completion shape");
+
+        assert!(
+            super::validate_ack_mutation_shape(
+                &overwrite_history,
+                &overwrite,
+                AcknowledgedMutationKind::Put,
+            )
+            .is_err(),
+            "create PUT must reject an existing baseline"
+        );
+        let incomplete_multipart_history = vec![multipart_history[0].clone(), complete.clone()];
+        assert!(
+            super::validate_ack_mutation_shape(
+                &incomplete_multipart_history,
+                &complete,
+                AcknowledgedMutationKind::MultipartComplete,
+            )
+            .is_err(),
+            "multipart completion must require both staging operations"
+        );
+
+        for trigger in [&put, &zero] {
+            let prior_complete = record(
+                "prior-complete",
+                OperationKind::CompleteMultipartUpload,
+                trigger.key.as_deref().expect("trigger key"),
+                Some(4),
+                1,
+                2,
+            );
+            assert!(
+                super::validate_ack_mutation_shape(
+                    &[prior_complete, trigger.clone()],
+                    trigger,
+                    if trigger.size_bytes == Some(0) {
+                        AcknowledgedMutationKind::ZeroBytePut
+                    } else {
+                        AcknowledgedMutationKind::Put
+                    },
+                )
+                .is_err(),
+                "create PUT variants must reject a prior multipart completion"
+            );
+        }
+
+        let prior_complete = record(
+            "prior-complete",
+            OperationKind::CompleteMultipartUpload,
+            "multipart",
+            Some(4),
+            1,
+            2,
+        );
+        let staged_create = record(
+            "create-mpu",
+            OperationKind::CreateMultipartUpload,
+            "multipart",
+            None,
+            3,
+            4,
+        );
+        let staged_part = record(
+            "upload-part",
+            OperationKind::UploadPart,
+            "multipart",
+            Some(8 * 1024 * 1024),
+            5,
+            6,
+        );
+        assert!(
+            super::validate_ack_mutation_shape(
+                &[prior_complete, staged_create, staged_part, complete.clone()],
+                &complete,
+                AcknowledgedMutationKind::MultipartComplete,
+            )
+            .is_err(),
+            "multipart create must reject a previously committed object"
+        );
+
+        for intervening_kind in [
+            OperationKind::Delete,
+            OperationKind::CompleteMultipartUpload,
+        ] {
+            let intervening = record("intervening", intervening_kind, "existing", Some(4), 3, 4);
+            for (trigger, mutation) in [
+                (&overwrite, AcknowledgedMutationKind::Overwrite),
+                (&delete, AcknowledgedMutationKind::DeleteMarker),
+            ] {
+                assert!(
+                    super::validate_ack_mutation_shape(
+                        &[baseline.clone(), intervening.clone(), trigger.clone()],
+                        trigger,
+                        mutation,
+                    )
+                    .is_err(),
+                    "overwrite/delete must reject an intervening {intervening_kind:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ack_success_path_rejects_incomplete_baseline_receipts() {
+        for mutation in [
+            AcknowledgedMutationKind::Overwrite,
+            AcknowledgedMutationKind::DeleteMarker,
+        ] {
+            let scenario = match mutation {
+                AcknowledgedMutationKind::Overwrite => "dm-drop-writes-after-ack-overwrite",
+                AcknowledgedMutationKind::DeleteMarker => "dm-drop-writes-after-ack-delete-marker",
+                _ => unreachable!("only baseline-backed mutations are tested"),
+            };
+            let key = "fault-test/run-1/key-1";
+            let mut baseline =
+                ack_failure_record(0, scenario, "baseline", OperationKind::Put, key, true);
+            baseline.version_id = Some("baseline-version".to_string());
+            baseline.value_sha256 = Some("baseline-hash".to_string());
+            baseline.size_bytes = Some(4);
+            baseline.http_status = Some(200);
+
+            let mut trigger = ack_failure_record(
+                1,
+                scenario,
+                "trigger",
+                super::ack_operation_kind(mutation),
+                key,
+                true,
+            );
+            trigger.version_id = Some("trigger-version".to_string());
+            trigger.http_status = Some(if mutation == AcknowledgedMutationKind::DeleteMarker {
+                204
+            } else {
+                200
+            });
+            if mutation == AcknowledgedMutationKind::Overwrite {
+                trigger.value_sha256 = Some("trigger-hash".to_string());
+                trigger.size_bytes = Some(8);
+            }
+
+            let valid = vec![baseline.clone(), trigger.clone()];
+            super::validate_ack_mutation_shape(&valid, &trigger, mutation)
+                .expect("complete baseline receipt reaches the success checker");
+            super::ack_checker_expectation(&valid, &trigger, mutation)
+                .expect("complete baseline builds the success expectation");
+
+            let invalid_baselines = [
+                {
+                    let mut record = baseline.clone();
+                    record.size_bytes = None;
+                    record
+                },
+                {
+                    let mut record = baseline.clone();
+                    record.value_sha256 = None;
+                    record
+                },
+                {
+                    let mut record = baseline.clone();
+                    record.value_sha256 = Some(String::new());
+                    record
+                },
+                {
+                    let mut record = baseline.clone();
+                    record.version_id = None;
+                    record
+                },
+                {
+                    let mut record = baseline.clone();
+                    record.version_id = Some("null".to_string());
+                    record
+                },
+                {
+                    let mut record = baseline.clone();
+                    record.http_status = Some(500);
+                    record
+                },
+            ];
+            for invalid_baseline in invalid_baselines {
+                assert!(
+                    super::validate_ack_mutation_shape(
+                        &[invalid_baseline, trigger.clone()],
+                        &trigger,
+                        mutation,
+                    )
+                    .is_err(),
+                    "{mutation:?} success artifacts must reject an incomplete baseline receipt"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ack_trigger_contract_rejects_pre_ack_or_late_fault_activation() {
+        use crate::fault::{
+            acknowledged_mutation::AcknowledgedMutationKind, spec::FaultRunAckTriggerSpec,
+        };
+
+        let planned = FaultRunAckTriggerSpec {
+            mutation: AcknowledgedMutationKind::Put,
+            operation_timeout_ms: 30_000,
+            max_ack_to_fault_ms: 5,
+        };
+        let valid = super::AckTriggeredCrashEvidenceArtifact {
+            scenario: "dm-drop-writes-after-ack-put".to_string(),
+            run_id: "run-1".to_string(),
+            trigger_operation_id: "op-1".to_string(),
+            trigger_kind: AcknowledgedMutationKind::Put,
+            trigger_key: "key".to_string(),
+            trigger_version_id: "version-1".to_string(),
+            trigger_acknowledged_at_ms: 100,
+            fault_activated_at_ms: 105,
+            ack_to_fault_ms: 5,
+            max_ack_to_fault_ms: 5,
+            crash_boundary_started_at_ms: 110,
+            crash_boundary_next_sequence: 3,
+            ack_to_crash_boundary_ms: 10,
+        };
+        let trigger = serde_json::from_value::<OperationRecord>(json!({
+            "id": "op-1",
+            "scenario": "dm-drop-writes-after-ack-put",
+            "run_id": "run-1",
+            "kind": "put",
+            "bucket": "bucket",
+            "key": "key",
+            "value_sha256": "trigger-hash",
+            "size_bytes": 4,
+            "version_id": "version-1",
+            "started_sequence": 1,
+            "ended_sequence": 2,
+            "started_at_ms": 90,
+            "ended_at_ms": 100,
+            "outcome": "ok",
+            "http_status": 200,
+            "durability_cohort": "pre_fault"
+        }))
+        .expect("valid trigger operation");
+        super::validate_ack_trigger_contract(
+            &valid,
+            &planned,
+            AcknowledgedMutationKind::Put,
+            "dm-drop-writes-after-ack-put",
+            "run-1",
+            Some(101),
+            &trigger,
+        )
+        .expect("valid trigger contract");
+
+        let boundary_plan = FaultRunAckTriggerSpec {
+            operation_timeout_ms: 10,
+            ..planned.clone()
+        };
+        super::validate_ack_trigger_contract(
+            &valid,
+            &boundary_plan,
+            AcknowledgedMutationKind::Put,
+            "dm-drop-writes-after-ack-put",
+            "run-1",
+            Some(101),
+            &trigger,
+        )
+        .expect("trigger duration equal to the planned timeout is valid");
+
+        let mut inverted_trigger = trigger.clone();
+        inverted_trigger.started_at_ms = 101;
+        assert!(
+            super::validate_ack_trigger_contract(
+                &valid,
+                &planned,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+                &inverted_trigger,
+            )
+            .is_err(),
+            "an inverted trigger request interval must be rejected"
+        );
+
+        let over_timeout_plan = FaultRunAckTriggerSpec {
+            operation_timeout_ms: 9,
+            ..planned.clone()
+        };
+        assert!(
+            super::validate_ack_trigger_contract(
+                &valid,
+                &over_timeout_plan,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+                &trigger,
+            )
+            .is_err(),
+            "a trigger request longer than its planned timeout must be rejected"
+        );
+
+        let mut pre_ack = valid.clone();
+        pre_ack.fault_activated_at_ms = 99;
+        pre_ack.ack_to_fault_ms = 0;
+        assert!(
+            super::validate_ack_trigger_contract(
+                &pre_ack,
+                &planned,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+                &trigger,
+            )
+            .is_err()
+        );
+
+        let mut late = valid.clone();
+        late.fault_activated_at_ms = 106;
+        late.ack_to_fault_ms = 6;
+        assert!(
+            super::validate_ack_trigger_contract(
+                &late,
+                &planned,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+                &trigger,
+            )
+            .is_err()
+        );
+
+        let mut false_interval = valid.clone();
+        false_interval.ack_to_fault_ms = 4;
+        assert!(
+            super::validate_ack_trigger_contract(
+                &false_interval,
+                &planned,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+                &trigger,
+            )
+            .is_err()
+        );
+
+        assert!(
+            super::validate_ack_trigger_contract(
+                &valid,
+                &planned,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(99),
+                &trigger,
+            )
+            .is_err(),
+            "starting fault application before the ACK must be rejected"
+        );
+
+        let over_wide_plan = FaultRunAckTriggerSpec {
+            max_ack_to_fault_ms: crate::fault::config::MAX_ACK_TO_FAULT_MS + 1,
+            ..planned
+        };
+        let mut over_wide_evidence = valid;
+        over_wide_evidence.max_ack_to_fault_ms = over_wide_plan.max_ack_to_fault_ms;
+        assert!(
+            super::validate_ack_trigger_contract(
+                &over_wide_evidence,
+                &over_wide_plan,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+                &trigger,
+            )
+            .is_err(),
+            "artifact validation must reject an ACK window too wide for durability evidence"
+        );
+    }
+
+    #[test]
+    fn ack_mutation_preparation_requires_sequence_happens_before() {
+        use crate::fault::acknowledged_mutation::AcknowledgedMutationKind;
+        for (kind, preparation) in [
+            (AcknowledgedMutationKind::Overwrite, OperationKind::Put),
+            (AcknowledgedMutationKind::DeleteMarker, OperationKind::Put),
+            (
+                AcknowledgedMutationKind::MultipartComplete,
+                OperationKind::UploadPart,
+            ),
+        ] {
+            let record = |id: &str, operation: OperationKind, start: u64, end: u64| {
+                serde_json::from_value::<OperationRecord>(json!({
+                    "id": id, "scenario": "ack", "run_id": "run-1", "bucket": "bucket",
+                    "key": "key", "kind": operation, "started_sequence": start, "ended_sequence": end,
+                    "value_sha256": matches!(operation, OperationKind::Put | OperationKind::CompleteMultipartUpload).then_some("hash"),
+                    "size_bytes": matches!(operation, OperationKind::Put | OperationKind::UploadPart | OperationKind::CompleteMultipartUpload).then_some(4),
+                    "version_id": matches!(operation, OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload).then_some("version"),
+                    "started_at_ms": 10, "ended_at_ms": 10, "outcome": "ok", "http_status": 200
+                })).expect("record")
+            };
+            let trigger = record("trigger", super::ack_operation_kind(kind), 5, 6);
+            let create = record("create", OperationKind::CreateMultipartUpload, 1, 2);
+            let prepared = record("prepare", preparation, 3, 4);
+            super::validate_ack_mutation_shape(
+                &[create.clone(), prepared.clone(), trigger.clone()],
+                &trigger,
+                kind,
+            )
+            .expect("same-millisecond preparation with causal ordering");
+            let mut overlapping = prepared;
+            overlapping.ended_sequence = Some(6);
+            assert!(
+                super::validate_ack_mutation_shape(
+                    &[create, overlapping, trigger.clone()],
+                    &trigger,
+                    kind,
+                )
+                .is_err(),
+                "overlapping preparation cannot establish a prior committed state"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_checker_phases_require_contiguous_independent_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let mut history =
+            read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+        let pre = read_json::<CheckerReport>(&case_dir.join("checker-pre-recommit-report.json"))
+            .expect("prechecker");
+        let mut final_report = read_json::<CheckerReport>(&case_dir.join("checker-report.json"))
+            .expect("final checker");
+        history.drain(4..6);
+        for (index, record) in history.iter_mut().enumerate() {
+            record.started_sequence = Some(index as u64 * 2 + 1);
+            record.ended_sequence = Some(index as u64 * 2 + 2);
+        }
+        final_report
+            .audit
+            .as_mut()
+            .expect("audit")
+            .history_prefix_record_count = 4;
+        super::validate_ack_checker_phase_chain(&pre, &final_report, "bucket", &history)
+            .expect("no recommit phase chain");
+        assert!(
+            super::validate_ack_checker_phase_chain(
+                &final_report,
+                &final_report,
+                "bucket",
+                &history
+            )
+            .is_err(),
+            "one checker receipt cannot serve as both phases"
+        );
+        assert!(
+            super::validate_ack_checker_phase_chain(&final_report, &pre, "bucket", &history)
+                .is_err(),
+            "checker phases cannot be swapped"
+        );
+        let mut overlap = history.clone();
+        overlap[3].ended_sequence = Some(9);
+        overlap[4].started_sequence = Some(8);
+        let error =
+            super::validate_ack_checker_phase_chain(&pre, &final_report, "bucket", &overlap)
+                .expect_err("cross-phase sequence overlap");
+        assert!(
+            error.to_string().contains("ACK prechecker/final-checker"),
+            "{error:#}"
+        );
+
+        let mut intervening = history[4].clone();
+        intervening.id = "intervening-get".to_string();
+        history.insert(4, intervening);
+        for (index, record) in history.iter_mut().enumerate() {
+            record.started_sequence = Some(index as u64 * 2 + 1);
+            record.ended_sequence = Some(index as u64 * 2 + 2);
+        }
+        final_report
+            .audit
+            .as_mut()
+            .expect("audit")
+            .history_prefix_record_count = 5;
+        assert!(
+            super::validate_ack_checker_phase_chain(&pre, &final_report, "bucket", &history)
+                .is_err(),
+            "unattributed GET between checker phases must invalidate the chain"
+        );
+    }
+
+    #[derive(Clone)]
+    struct AckFailureFixture {
+        history: Vec<OperationRecord>,
+        report: CheckerReport,
+        ack: super::AckTriggeredCrashEvidenceArtifact,
+        prefix_len: usize,
+    }
+
+    fn ack_failure_record(
+        ordinal: usize,
+        scenario: &str,
+        id: &str,
+        kind: OperationKind,
+        key: &str,
+        before_fault: bool,
+    ) -> OperationRecord {
+        let started_sequence = ordinal as u64 * 2 + 1;
+        let started_at_ms = if before_fault {
+            10 + ordinal as u64 * 2
+        } else {
+            100 + ordinal as u64 * 2
+        };
+        OperationRecord {
+            id: id.to_string(),
+            scenario: scenario.to_string(),
+            run_id: Some("run-1".to_string()),
+            kind,
+            bucket: "bucket".to_string(),
+            key: Some(key.to_string()),
+            value_sha256: None,
+            size_bytes: None,
+            version_id: None,
+            listed_keys: None,
+            listed_versions: None,
+            payload_ref: None,
+            range: None,
+            started_sequence: Some(started_sequence),
+            ended_sequence: Some(started_sequence + 1),
+            started_at_ms,
+            ended_at_ms: started_at_ms + 1,
+            outcome: OperationOutcome::Ok,
+            http_status: None,
+            error: None,
+            durability_cohort: Some(if before_fault {
+                DurabilityCohort::PreFault
+            } else {
+                DurabilityCohort::PostRecovery
+            }),
+            fault_window_relation: (!before_fault).then_some(FaultWindowRelation::AfterFault),
+        }
+    }
+
+    impl AckFailureFixture {
+        fn new(kind: AcknowledgedMutationKind) -> Self {
+            let scenario = match kind {
+                AcknowledgedMutationKind::Put => "dm-drop-writes-after-ack-put",
+                AcknowledgedMutationKind::Overwrite => "dm-drop-writes-after-ack-overwrite",
+                AcknowledgedMutationKind::DeleteMarker => "dm-drop-writes-after-ack-delete-marker",
+                AcknowledgedMutationKind::ZeroBytePut => "dm-drop-writes-after-ack-zero-byte-put",
+                AcknowledgedMutationKind::MultipartComplete => {
+                    "dm-drop-writes-after-ack-multipart-complete"
+                }
+            };
+            let key = "fault-test/run-1/key-1";
+            let mut history = Vec::new();
+            if matches!(
+                kind,
+                AcknowledgedMutationKind::Overwrite | AcknowledgedMutationKind::DeleteMarker
+            ) {
+                let mut baseline = ack_failure_record(
+                    history.len(),
+                    scenario,
+                    "baseline",
+                    OperationKind::Put,
+                    key,
+                    true,
+                );
+                baseline.version_id = Some("baseline-version".to_string());
+                baseline.value_sha256 = Some("baseline-hash".to_string());
+                baseline.size_bytes = Some(4);
+                baseline.http_status = Some(200);
+                history.push(baseline);
+            }
+            if kind == AcknowledgedMutationKind::MultipartComplete {
+                let mut create = ack_failure_record(
+                    history.len(),
+                    scenario,
+                    "create-mpu",
+                    OperationKind::CreateMultipartUpload,
+                    key,
+                    true,
+                );
+                create.http_status = Some(200);
+                history.push(create);
+                let mut upload_part = ack_failure_record(
+                    history.len(),
+                    scenario,
+                    "upload-part",
+                    OperationKind::UploadPart,
+                    key,
+                    true,
+                );
+                upload_part.value_sha256 = Some("part-hash".to_string());
+                upload_part.size_bytes = Some(4);
+                upload_part.http_status = Some(200);
+                history.push(upload_part);
+            }
+            let (trigger_hash, trigger_size) = match kind {
+                AcknowledgedMutationKind::DeleteMarker => (None, None),
+                AcknowledgedMutationKind::ZeroBytePut => (Some("empty-hash"), Some(0)),
+                _ => (Some("trigger-hash"), Some(8)),
+            };
+            let mut trigger = ack_failure_record(
+                history.len(),
+                scenario,
+                "trigger",
+                super::ack_operation_kind(kind),
+                key,
+                true,
+            );
+            trigger.version_id = Some("trigger-version".to_string());
+            trigger.value_sha256 = trigger_hash.map(str::to_string);
+            trigger.size_bytes = trigger_size;
+            trigger.http_status = Some(if kind == AcknowledgedMutationKind::DeleteMarker {
+                204
+            } else {
+                200
+            });
+            history.push(trigger);
+            let prefix_len = history.len();
+            let trigger = history.last().expect("trigger").clone();
+            let is_delete = kind == AcknowledgedMutationKind::DeleteMarker;
+            let mut current_get = ack_failure_record(
+                history.len(),
+                scenario,
+                "current-get",
+                OperationKind::Get,
+                key,
+                false,
+            );
+            set_ack_get(
+                &mut current_get,
+                if is_delete {
+                    OperationOutcome::NotFound
+                } else {
+                    OperationOutcome::Ok
+                },
+                Some(if is_delete { 404 } else { 200 }),
+                if is_delete {
+                    None
+                } else {
+                    trigger.value_sha256.as_deref()
+                },
+                if is_delete { None } else { trigger.size_bytes },
+                is_delete.then_some("not found"),
+            );
+            history.push(current_get);
+            let committed_data = history[..prefix_len]
+                .iter()
+                .filter(|record| {
+                    record.outcome == OperationOutcome::Ok
+                        && matches!(
+                            record.kind,
+                            OperationKind::Put | OperationKind::CompleteMultipartUpload
+                        )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for version in &committed_data {
+                let mut version_get = ack_failure_record(
+                    history.len(),
+                    scenario,
+                    &format!("version-get-{}", version.id),
+                    OperationKind::Get,
+                    key,
+                    false,
+                );
+                version_get.version_id = version.version_id.clone();
+                set_ack_get(
+                    &mut version_get,
+                    OperationOutcome::Ok,
+                    Some(200),
+                    version.value_sha256.as_deref(),
+                    version.size_bytes,
+                    None,
+                );
+                history.push(version_get);
+            }
+            let prefix_key = crate::fault::workload::ObjectSpec::key_prefix("run-1");
+            let mut version_list = ack_failure_record(
+                history.len(),
+                scenario,
+                "list-versions",
+                OperationKind::ListVersions,
+                &prefix_key,
+                false,
+            );
+            version_list.http_status = Some(200);
+            version_list.listed_versions = Some(
+                checker::checker_expected_version_listing(&history[..prefix_len])
+                    .into_iter()
+                    .collect(),
+            );
+            history.push(version_list);
+            let mut final_list = ack_failure_record(
+                history.len(),
+                scenario,
+                "list",
+                OperationKind::List,
+                &prefix_key,
+                false,
+            );
+            final_list.http_status = Some(200);
+            final_list.listed_keys = Some(if is_delete {
+                Vec::new()
+            } else {
+                vec![key.to_string()]
+            });
+            history.push(final_list);
+
+            let live_objects = usize::from(!is_delete);
+            let report = CheckerReport {
+                scenario: scenario.to_string(),
+                run_id: "run-1".to_string(),
+                committed_puts: committed_data.len(),
+                expected_live_objects: live_objects,
+                verified_live_objects: live_objects,
+                missing_committed_objects: Vec::new(),
+                unavailable_committed_objects: Vec::new(),
+                unknown_committed_read_failures: Vec::new(),
+                hash_mismatches: Vec::new(),
+                successful_corrupted_reads: Vec::new(),
+                unexpected_visible_deleted_objects: Vec::new(),
+                unknown_writes_materialized: Vec::new(),
+                unknown_writes_preserved_committed: Vec::new(),
+                unknown_write_value_conflicts: Vec::new(),
+                list_history_warning_count: 0,
+                final_list_warning_count: 0,
+                list_history_warnings: Vec::new(),
+                list_warnings: Vec::new(),
+                final_listed_objects: Some(live_objects),
+                versioning_expected: true,
+                expected_committed_versions: committed_data.len(),
+                verified_committed_versions: committed_data.len(),
+                committed_writes_missing_version_id_count: 0,
+                committed_writes_missing_version_id: Vec::new(),
+                missing_committed_versions: Vec::new(),
+                unavailable_committed_versions: Vec::new(),
+                version_hash_mismatches: Vec::new(),
+                missing_committed_delete_markers: Vec::new(),
+                resurrected_deleted_objects: Vec::new(),
+                delete_marker_lineage_incomplete: Vec::new(),
+                multipart_upload_lineage_incomplete: Vec::new(),
+                tolerated_ambiguous_deletes: Vec::new(),
+                operation_cohorts: BTreeMap::from([("pre_fault".to_string(), prefix_len)]),
+                fault_window_relations: BTreeMap::new(),
+                audit: Some(checker::CheckerAudit {
+                    bucket: "bucket".to_string(),
+                    started_at_ms: 0,
+                    completed_at_ms: 0,
+                    history_prefix_record_count: prefix_len,
+                    history_prefix_sha256: String::new(),
+                    history_suffix_record_count: 0,
+                    history_suffix_sha256: String::new(),
+                    suffix_operations: Vec::new(),
+                    data_version_checks: Vec::new(),
+                    delete_marker_checks: Vec::new(),
+                    list_object_versions_completed: Some(true),
+                }),
+                tenant_recovered: true,
+                passed: false,
+            };
+            let trigger_acknowledged_at_ms = trigger.ended_at_ms;
+            let ack = super::AckTriggeredCrashEvidenceArtifact {
+                scenario: scenario.to_string(),
+                run_id: "run-1".to_string(),
+                trigger_operation_id: trigger.id.clone(),
+                trigger_kind: kind,
+                trigger_key: key.to_string(),
+                trigger_version_id: "trigger-version".to_string(),
+                trigger_acknowledged_at_ms,
+                fault_activated_at_ms: trigger_acknowledged_at_ms + 1,
+                ack_to_fault_ms: 1,
+                max_ack_to_fault_ms: 5,
+                crash_boundary_started_at_ms: trigger_acknowledged_at_ms + 2,
+                crash_boundary_next_sequence: trigger.ended_sequence.expect("trigger end sequence")
+                    + 1,
+                ack_to_crash_boundary_ms: 2,
+            };
+            let mut fixture = Self {
+                history,
+                report,
+                ack,
+                prefix_len,
+            };
+            fixture.refresh_audit();
+            if is_delete {
+                fixture.fail_delete_marker_listing();
+            } else {
+                fixture.fail_data_version("trigger-version", true);
+            }
+            fixture
+        }
+
+        fn validate(&self) -> anyhow::Result<()> {
+            super::validate_ack_expected_failure_report(
+                &self.report,
+                &self.history,
+                &self.ack,
+                "bucket",
+            )
+        }
+
+        fn trigger(&self) -> &OperationRecord {
+            &self.history[self.prefix_len - 1]
+        }
+
+        fn data_versions(&self) -> Vec<OperationRecord> {
+            self.history[..self.prefix_len]
+                .iter()
+                .filter(|record| {
+                    record.outcome == OperationOutcome::Ok
+                        && matches!(
+                            record.kind,
+                            OperationKind::Put | OperationKind::CompleteMultipartUpload
+                        )
+                })
+                .cloned()
+                .collect()
+        }
+
+        fn current_get_mut(&mut self) -> &mut OperationRecord {
+            self.history[self.prefix_len..]
+                .iter_mut()
+                .find(|record| record.kind == OperationKind::Get && record.version_id.is_none())
+                .expect("current GET")
+        }
+
+        fn version_get_mut(&mut self, version_id: &str) -> &mut OperationRecord {
+            self.history[self.prefix_len..]
+                .iter_mut()
+                .find(|record| {
+                    record.kind == OperationKind::Get
+                        && record.version_id.as_deref() == Some(version_id)
+                })
+                .expect("version GET")
+        }
+
+        fn version_list_mut(&mut self) -> &mut OperationRecord {
+            self.history[self.prefix_len..]
+                .iter_mut()
+                .find(|record| record.kind == OperationKind::ListVersions)
+                .expect("ListObjectVersions")
+        }
+
+        fn final_list_mut(&mut self) -> &mut OperationRecord {
+            self.history[self.prefix_len..]
+                .iter_mut()
+                .find(|record| record.kind == OperationKind::List)
+                .expect("final LIST")
+        }
+
+        fn clear_failures(&mut self) {
+            self.report.missing_committed_objects.clear();
+            self.report.unavailable_committed_objects.clear();
+            self.report.unknown_committed_read_failures.clear();
+            self.report.hash_mismatches.clear();
+            self.report.successful_corrupted_reads.clear();
+            self.report.unexpected_visible_deleted_objects.clear();
+            self.report.missing_committed_versions.clear();
+            self.report.unavailable_committed_versions.clear();
+            self.report.version_hash_mismatches.clear();
+            self.report.missing_committed_delete_markers.clear();
+            self.report.resurrected_deleted_objects.clear();
+            self.report.delete_marker_lineage_incomplete.clear();
+            self.report.multipart_upload_lineage_incomplete.clear();
+            self.report.final_list_warning_count = 0;
+            self.report.list_warnings.clear();
+            self.report.passed = false;
+        }
+
+        fn restore_healthy_observations(&mut self) {
+            self.clear_failures();
+            let data_versions = self.data_versions();
+            for version in &data_versions {
+                let get = self
+                    .version_get_mut(version.version_id.as_deref().expect("committed version id"));
+                set_ack_get(
+                    get,
+                    OperationOutcome::Ok,
+                    Some(200),
+                    version.value_sha256.as_deref(),
+                    version.size_bytes,
+                    None,
+                );
+            }
+            self.report.verified_committed_versions = data_versions.len();
+            let expected_listing =
+                checker::checker_expected_version_listing(&self.history[..self.prefix_len])
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            self.version_list_mut().listed_versions = Some(expected_listing);
+            let trigger = self.trigger().clone();
+            if trigger.kind == OperationKind::Delete {
+                set_ack_get(
+                    self.current_get_mut(),
+                    OperationOutcome::NotFound,
+                    Some(404),
+                    None,
+                    None,
+                    Some("not found"),
+                );
+                self.final_list_mut().listed_keys = Some(Vec::new());
+                self.report.verified_live_objects = 0;
+                self.report.final_listed_objects = Some(0);
+            } else {
+                set_ack_get(
+                    self.current_get_mut(),
+                    OperationOutcome::Ok,
+                    Some(200),
+                    trigger.value_sha256.as_deref(),
+                    trigger.size_bytes,
+                    None,
+                );
+                let trigger_key = self.ack.trigger_key.clone();
+                self.final_list_mut().listed_keys = Some(vec![trigger_key]);
+                self.report.verified_live_objects = 1;
+                self.report.final_listed_objects = Some(1);
+            }
+            self.refresh_audit();
+        }
+
+        fn fail_data_version(&mut self, version_id: &str, current_missing: bool) {
+            self.restore_healthy_observations();
+            let version = self
+                .data_versions()
+                .into_iter()
+                .find(|record| record.version_id.as_deref() == Some(version_id))
+                .expect("protected data version");
+            set_ack_get(
+                self.version_get_mut(version_id),
+                OperationOutcome::NotFound,
+                Some(404),
+                None,
+                None,
+                Some("not found"),
+            );
+            let protected_history = self.history[..self.prefix_len].to_vec();
+            let entries = self
+                .version_list_mut()
+                .listed_versions
+                .as_mut()
+                .expect("listed versions");
+            entries.retain(|entry| entry.version_id.as_deref() != Some(version_id));
+            normalize_ack_latest(entries, &protected_history);
+            let reference = format!("{}@{version_id}", self.ack.trigger_key);
+            self.report.missing_committed_versions = vec![
+                reference.clone(),
+                format!("{reference}: committed version missing from ListObjectVersions"),
+            ];
+            self.report.verified_committed_versions = self.data_versions().len() - 1;
+            if version.kind == OperationKind::CompleteMultipartUpload {
+                self.report.multipart_upload_lineage_incomplete = vec![
+                    format!("{reference}: committed multipart completion version is missing"),
+                    format!(
+                        "{reference}: committed multipart completion missing from ListObjectVersions"
+                    ),
+                ];
+            }
+            if current_missing {
+                set_ack_get(
+                    self.current_get_mut(),
+                    OperationOutcome::NotFound,
+                    Some(404),
+                    None,
+                    None,
+                    Some("not found"),
+                );
+                self.final_list_mut().listed_keys = Some(Vec::new());
+                self.report.missing_committed_objects = vec![self.ack.trigger_key.clone()];
+                self.report.verified_live_objects = 0;
+                self.report.final_listed_objects = Some(0);
+                self.report.delete_marker_lineage_incomplete = vec![format!(
+                    "{}: latest version does not match the committed trigger",
+                    self.ack.trigger_key
+                )];
+            }
+            self.refresh_audit();
+        }
+
+        fn fail_delete_marker_listing(&mut self) {
+            self.restore_healthy_observations();
+            let marker_version = self.ack.trigger_version_id.clone();
+            let protected_history = self.history[..self.prefix_len].to_vec();
+            let entries = self
+                .version_list_mut()
+                .listed_versions
+                .as_mut()
+                .expect("listed versions");
+            entries.retain(|entry| entry.version_id.as_deref() != Some(marker_version.as_str()));
+            normalize_ack_latest(entries, &protected_history);
+            let reference = format!("{}@{marker_version}", self.ack.trigger_key);
+            self.report.missing_committed_delete_markers = vec![format!(
+                "{reference}: committed delete marker missing from ListObjectVersions"
+            )];
+            self.report.delete_marker_lineage_incomplete = vec![format!(
+                "{}: latest version does not match the committed delete marker",
+                self.ack.trigger_key
+            )];
+            self.refresh_audit();
+        }
+
+        fn refresh_audit(&mut self) {
+            let prefix = &self.history[..self.prefix_len];
+            let suffix = &self.history[self.prefix_len..];
+            let listed_versions = suffix
+                .iter()
+                .find(|record| record.kind == OperationKind::ListVersions)
+                .and_then(|record| record.listed_versions.clone())
+                .unwrap_or_default();
+            let mut data_version_checks = prefix
+                .iter()
+                .filter(|record| {
+                    record.outcome == OperationOutcome::Ok
+                        && matches!(
+                            record.kind,
+                            OperationKind::Put | OperationKind::CompleteMultipartUpload
+                        )
+                })
+                .filter_map(|version| {
+                    let version_id = version.version_id.as_deref()?;
+                    let get = suffix.iter().find(|record| {
+                        record.kind == OperationKind::Get
+                            && record.key == version.key
+                            && record.version_id.as_deref() == Some(version_id)
+                    })?;
+                    Some(checker::CheckerDataVersionAudit {
+                        key: version.key.clone()?,
+                        version_id: version_id.to_string(),
+                        expected_sha256: version.value_sha256.clone()?,
+                        observed_sha256: get.value_sha256.clone(),
+                        outcome: get.outcome,
+                        http_status: get.http_status,
+                    })
+                })
+                .collect::<Vec<_>>();
+            data_version_checks.sort_by(|left, right| {
+                (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id))
+            });
+            let mut delete_marker_checks = prefix
+                .iter()
+                .filter(|record| {
+                    record.kind == OperationKind::Delete && record.outcome == OperationOutcome::Ok
+                })
+                .filter_map(|marker| {
+                    let key = marker.key.clone()?;
+                    let version_id = marker.version_id.clone()?;
+                    Some(checker::CheckerDeleteMarkerAudit {
+                        visible_in_list_object_versions: listed_versions.iter().any(|entry| {
+                            entry.key == key
+                                && entry.version_id.as_deref() == Some(version_id.as_str())
+                                && entry.is_delete_marker
+                        }),
+                        key,
+                        version_id,
+                    })
+                })
+                .collect::<Vec<_>>();
+            delete_marker_checks.sort_by(|left, right| {
+                (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id))
+            });
+            let list_completed = suffix
+                .iter()
+                .find(|record| record.kind == OperationKind::ListVersions)
+                .is_some_and(|record| {
+                    record.outcome == OperationOutcome::Ok && record.http_status == Some(200)
+                });
+            let audit = self.report.audit.as_mut().expect("checker audit");
+            audit.started_at_ms = suffix
+                .iter()
+                .map(|record| record.started_at_ms)
+                .min()
+                .expect("checker suffix");
+            audit.completed_at_ms = suffix
+                .iter()
+                .map(|record| record.ended_at_ms)
+                .max()
+                .expect("checker suffix");
+            audit.history_prefix_record_count = self.prefix_len;
+            audit.history_prefix_sha256 =
+                checker::checker_history_records_sha256(prefix).expect("prefix digest");
+            audit.history_suffix_record_count = suffix.len();
+            audit.history_suffix_sha256 =
+                checker::checker_history_records_sha256(suffix).expect("suffix digest");
+            audit.suffix_operations = checker::checker_operation_audits(suffix);
+            audit.data_version_checks = data_version_checks;
+            audit.delete_marker_checks = delete_marker_checks;
+            audit.list_object_versions_completed = Some(list_completed);
+        }
+    }
+
+    fn set_ack_get(
+        record: &mut OperationRecord,
+        outcome: OperationOutcome,
+        http_status: Option<u16>,
+        value_sha256: Option<&str>,
+        size_bytes: Option<usize>,
+        error: Option<&str>,
+    ) {
+        record.outcome = outcome;
+        record.http_status = http_status;
+        record.value_sha256 = value_sha256.map(str::to_string);
+        record.size_bytes = size_bytes;
+        record.error = error.map(str::to_string);
+    }
+
+    fn normalize_ack_latest(entries: &mut [ListedVersionEntry], prefix: &[OperationRecord]) {
+        entries.iter_mut().for_each(|entry| entry.is_latest = false);
+        if let Some(latest) = prefix.iter().rev().find(|record| {
+            entries.iter().any(|entry| {
+                entry.key == record.key.as_deref().unwrap_or_default()
+                    && entry.version_id == record.version_id
+                    && entry.is_delete_marker == (record.kind == OperationKind::Delete)
+            })
+        }) && let Some(entry) = entries.iter_mut().find(|entry| {
+            Some(entry.key.as_str()) == latest.key.as_deref()
+                && entry.version_id == latest.version_id
+                && entry.is_delete_marker == (latest.kind == OperationKind::Delete)
+        }) {
+            entry.is_latest = true;
+        }
+    }
+
+    #[test]
+    fn ack_expected_failure_accepts_direct_loss_for_all_trigger_types() {
+        for kind in [
+            AcknowledgedMutationKind::Put,
+            AcknowledgedMutationKind::Overwrite,
+            AcknowledgedMutationKind::DeleteMarker,
+            AcknowledgedMutationKind::ZeroBytePut,
+            AcknowledgedMutationKind::MultipartComplete,
+        ] {
+            let fixture = AckFailureFixture::new(kind);
+            fixture
+                .validate()
+                .unwrap_or_else(|error| panic!("{kind:?}: {error:#}"));
+            super::validate_ack_prechecker_boundary(
+                &fixture.report,
+                &fixture.history,
+                &fixture.ack.trigger_operation_id,
+                Some(90),
+            )
+            .expect("checker starts after recovery and exactly after trigger");
+        }
+    }
+
+    #[test]
+    fn ack_expected_failure_accepts_baseline_loss_for_overwrite_and_delete() {
+        for kind in [
+            AcknowledgedMutationKind::Overwrite,
+            AcknowledgedMutationKind::DeleteMarker,
+        ] {
+            let mut fixture = AckFailureFixture::new(kind);
+            fixture.fail_data_version("baseline-version", false);
+            fixture
+                .validate()
+                .unwrap_or_else(|error| panic!("{kind:?}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn ack_expected_failure_accepts_current_rollback_or_absence_with_exact_versions() {
+        let mut rollback = AckFailureFixture::new(AcknowledgedMutationKind::Overwrite);
+        rollback.restore_healthy_observations();
+        set_ack_get(
+            rollback.current_get_mut(),
+            OperationOutcome::Ok,
+            Some(200),
+            Some("baseline-hash"),
+            Some(4),
+            None,
+        );
+        rollback.report.verified_live_objects = 0;
+        rollback.report.hash_mismatches = vec![format!(
+            "{}: current GET returned the baseline value",
+            rollback.ack.trigger_key
+        )];
+        rollback.refresh_audit();
+        rollback.validate().expect("authenticated current rollback");
+
+        let mut absent = AckFailureFixture::new(AcknowledgedMutationKind::Overwrite);
+        absent.restore_healthy_observations();
+        set_ack_get(
+            absent.current_get_mut(),
+            OperationOutcome::NotFound,
+            Some(404),
+            None,
+            None,
+            Some("not found"),
+        );
+        absent.final_list_mut().listed_keys = Some(Vec::new());
+        absent.report.verified_live_objects = 0;
+        absent.report.final_listed_objects = Some(0);
+        absent.report.missing_committed_objects = vec![absent.ack.trigger_key.clone()];
+        absent.refresh_audit();
+        absent
+            .validate()
+            .expect("authenticated current GET 404 with exact versions readable");
+    }
+
+    #[test]
+    fn ack_expected_failure_accepts_marker_latest_conflict_and_resurrection() {
+        for duplicate_latest in [false, true] {
+            let mut fixture = AckFailureFixture::new(AcknowledgedMutationKind::DeleteMarker);
+            fixture.restore_healthy_observations();
+            let entries = fixture
+                .version_list_mut()
+                .listed_versions
+                .as_mut()
+                .expect("listed versions");
+            for entry in entries {
+                if entry.version_id.as_deref() == Some("baseline-version") {
+                    entry.is_latest = true;
+                } else if !duplicate_latest {
+                    entry.is_latest = false;
+                }
+            }
+            fixture.report.delete_marker_lineage_incomplete = vec![format!(
+                "{}: ListObjectVersions latest identity is invalid",
+                fixture.ack.trigger_key
+            )];
+            fixture.refresh_audit();
+            fixture
+                .validate()
+                .expect("authenticated marker latest conflict");
+        }
+
+        let mut resurrected = AckFailureFixture::new(AcknowledgedMutationKind::DeleteMarker);
+        resurrected.restore_healthy_observations();
+        set_ack_get(
+            resurrected.current_get_mut(),
+            OperationOutcome::Ok,
+            Some(200),
+            Some("baseline-hash"),
+            Some(4),
+            None,
+        );
+        resurrected.report.resurrected_deleted_objects = vec![format!(
+            "{}: committed delete resurrected on GET",
+            resurrected.ack.trigger_key
+        )];
+        resurrected.refresh_audit();
+        resurrected
+            .validate()
+            .expect("authenticated deleted-object resurrection");
+    }
+
+    #[test]
+    fn ack_expected_failure_accepts_version_timeout_hash_mismatch_and_list_only_omission() {
+        let mut timeout = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        timeout.restore_healthy_observations();
+        set_ack_get(
+            timeout.version_get_mut("trigger-version"),
+            OperationOutcome::Timeout,
+            Some(200),
+            None,
+            None,
+            Some("body timed out"),
+        );
+        timeout.report.verified_committed_versions = 0;
+        timeout.report.unavailable_committed_versions = vec![format!(
+            "{}@trigger-version: Timeout HTTP 200: body timed out",
+            timeout.ack.trigger_key
+        )];
+        timeout.refresh_audit();
+        timeout
+            .validate()
+            .expect("authenticated version body timeout");
+
+        let mut mismatch = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        mismatch.restore_healthy_observations();
+        set_ack_get(
+            mismatch.version_get_mut("trigger-version"),
+            OperationOutcome::Ok,
+            Some(200),
+            Some("wrong-hash"),
+            Some(8),
+            None,
+        );
+        mismatch.report.verified_committed_versions = 0;
+        mismatch.report.version_hash_mismatches = vec![format!(
+            "{}@trigger-version: expected trigger-hash, got wrong-hash",
+            mismatch.ack.trigger_key
+        )];
+        mismatch.refresh_audit();
+        mismatch
+            .validate()
+            .expect("authenticated version hash mismatch");
+
+        let mut listing = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        listing.restore_healthy_observations();
+        listing
+            .version_list_mut()
+            .listed_versions
+            .as_mut()
+            .expect("listed versions")
+            .clear();
+        listing.report.missing_committed_versions = vec![format!(
+            "{}@trigger-version: committed version missing from ListObjectVersions",
+            listing.ack.trigger_key
+        )];
+        listing.report.delete_marker_lineage_incomplete = vec![format!(
+            "{}: ListObjectVersions has no unique latest entry",
+            listing.ack.trigger_key
+        )];
+        listing.refresh_audit();
+        listing
+            .validate()
+            .expect("authenticated listing-only omission");
+    }
+
+    #[test]
+    fn ack_expected_failure_rejects_unrelated_or_forged_evidence() {
+        let fixture = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+
+        let mut unrelated = fixture.clone();
+        unrelated.report.missing_committed_versions = vec![
+            "fault-test/run-1/other@other-version".to_string(),
+            "fault-test/run-1/other@other-version: committed version missing from ListObjectVersions"
+                .to_string(),
+        ];
+        assert!(
+            unrelated.validate().is_err(),
+            "another key/version is not proof"
+        );
+
+        let mut forged_receipt = fixture.clone();
+        forged_receipt
+            .report
+            .audit
+            .as_mut()
+            .expect("audit")
+            .suffix_operations
+            .clear();
+        assert!(
+            forged_receipt.validate().is_err(),
+            "a self-reported audit cannot replace raw operation receipts"
+        );
+
+        let mut forged_classification = fixture.clone();
+        forged_classification
+            .report
+            .missing_committed_versions
+            .clear();
+        forged_classification.report.hash_mismatches = vec![format!(
+            "{}: claimed corruption",
+            forged_classification.ack.trigger_key
+        )];
+        assert!(
+            forged_classification.validate().is_err(),
+            "classification without a matching negative receipt must fail closed"
+        );
+
+        let mut wrong_audit_identity = fixture.clone();
+        wrong_audit_identity
+            .report
+            .audit
+            .as_mut()
+            .expect("audit")
+            .data_version_checks[0]
+            .version_id = "other-version".to_string();
+        assert!(wrong_audit_identity.validate().is_err());
+
+        let mut ranged = fixture.clone();
+        ranged.version_get_mut("trigger-version").range = Some(ByteRange {
+            offset: 0,
+            length: 1,
+        });
+        ranged.refresh_audit();
+        assert!(
+            ranged.validate().is_err(),
+            "a ranged GET is not full-version proof"
+        );
+
+        let mut missing_size = AckFailureFixture::new(AcknowledgedMutationKind::Overwrite);
+        missing_size.history[0].size_bytes = None;
+        missing_size.refresh_audit();
+        assert!(
+            missing_size.validate().is_err(),
+            "protected baseline data without size cannot prove hash correctness"
+        );
+
+        let mut duplicate_sequence = fixture.clone();
+        duplicate_sequence.history[duplicate_sequence.prefix_len].started_sequence =
+            duplicate_sequence.history[0].started_sequence;
+        duplicate_sequence.refresh_audit();
+        assert!(
+            duplicate_sequence.validate().is_err(),
+            "duplicate global history sequence must be rejected"
+        );
+
+        let mut cross_bucket = fixture.clone();
+        cross_bucket.history[cross_bucket.prefix_len - 1].bucket = "other-bucket".to_string();
+        cross_bucket.refresh_audit();
+        assert!(
+            cross_bucket.validate().is_err(),
+            "ACK trigger from another bucket must be rejected"
+        );
+    }
+
+    #[test]
+    fn ack_expected_failure_rejects_mutating_or_pre_recovery_checker_traffic() {
+        for kind in [OperationKind::Put, OperationKind::Delete] {
+            let mut fixture = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+            let trigger_key = fixture.ack.trigger_key.clone();
+            let record = fixture.final_list_mut();
+            record.kind = kind;
+            record.key = Some(trigger_key);
+            record.version_id = Some(format!("post-{kind:?}"));
+            record.value_sha256 = (kind == OperationKind::Put).then(|| "post-hash".to_string());
+            record.size_bytes = (kind == OperationKind::Put).then_some(4);
+            fixture.refresh_audit();
+            assert!(
+                fixture.validate().is_err(),
+                "post-boundary {kind:?} must invalidate checker evidence"
+            );
+        }
+
+        let mut fault_active = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        let read = fault_active.current_get_mut();
+        read.durability_cohort = Some(DurabilityCohort::FaultActive);
+        read.fault_window_relation = Some(FaultWindowRelation::DuringFault);
+        fault_active.refresh_audit();
+        assert!(
+            fault_active.validate().is_err(),
+            "fault-active reads cannot serve as post-recovery checker evidence"
+        );
+
+        let mut extra_before_checker = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        extra_before_checker.prefix_len += 1;
+        extra_before_checker.refresh_audit();
+        assert!(
+            super::validate_ack_prechecker_boundary(
+                &extra_before_checker.report,
+                &extra_before_checker.history,
+                &extra_before_checker.ack.trigger_operation_id,
+                Some(90),
+            )
+            .is_err(),
+            "the first checker prefix must end exactly at the trigger"
+        );
+
+        let fixture = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        let checker_started_at_ms = fixture.report.audit.as_ref().expect("audit").started_at_ms;
+        assert!(
+            super::validate_ack_prechecker_boundary(
+                &fixture.report,
+                &fixture.history,
+                &fixture.ack.trigger_operation_id,
+                Some(checker_started_at_ms + 1),
+            )
+            .is_err(),
+            "checker observations cannot start before recovery completes"
+        );
+    }
+
+    #[test]
+    fn ack_checker_must_prove_the_exact_history_derived_version() {
+        use crate::fault::{
+            acknowledged_mutation::AcknowledgedMutationKind, checker::CheckerReport,
+            history::OperationRecord,
+        };
+
+        let trigger: OperationRecord = serde_json::from_value(json!({
+            "id": "put-1",
+            "scenario": "dm-drop-writes-after-ack-put",
+            "run_id": "run-1",
+            "kind": "put",
+            "bucket": "bucket",
+            "key": "key-1",
+            "value_sha256": "hash-1",
+            "size_bytes": 4,
+            "version_id": "version-1",
+            "started_at_ms": 10,
+            "ended_at_ms": 11,
+            "outcome": "ok",
+            "http_status": 200,
+            "error": null
+        }))
+        .expect("trigger");
+        let expectation = super::ack_checker_expectation(
+            std::slice::from_ref(&trigger),
+            &trigger,
+            AcknowledgedMutationKind::Put,
+        )
+        .expect("expectation");
+        let report = |verified_refs: Vec<&str>| {
+            serde_json::from_value::<CheckerReport>(json!({
+                "scenario": "dm-drop-writes-after-ack-put",
+                "run_id": "run-1",
+                "committed_puts": 1,
+                "expected_live_objects": 1,
+                "verified_live_objects": 1,
+                "missing_committed_objects": [],
+                "unavailable_committed_objects": [],
+                "unknown_committed_read_failures": [],
+                "hash_mismatches": [],
+                "successful_corrupted_reads": [],
+                "unexpected_visible_deleted_objects": [],
+                "list_history_warning_count": 0,
+                "final_list_warning_count": 0,
+                "list_history_warnings": [],
+                "list_warnings": [],
+                "final_listed_objects": 1,
+                "versioning_expected": true,
+                "expected_committed_versions": 1,
+                "verified_committed_versions": verified_refs.len(),
+                "audit": {
+                    "bucket": "bucket",
+                    "started_at_ms": 20,
+                    "completed_at_ms": 30,
+                    "history_prefix_record_count": 1,
+                    "history_prefix_sha256": "prefix",
+                    "history_suffix_record_count": 1,
+                    "history_suffix_sha256": "suffix",
+                    "suffix_operations": [],
+                    "data_version_checks": verified_refs.iter().map(|reference| {
+                        let (key, version) = reference.split_once('@').expect("version reference");
+                        json!({"key": key, "version_id": version, "expected_sha256": "hash-1",
+                            "observed_sha256": "hash-1", "outcome": "ok", "http_status": 200})
+                    }).collect::<Vec<_>>(),
+                    "delete_marker_checks": [],
+                    "list_object_versions_completed": true
+                },
+                "operation_cohorts": {"pre_fault": 1},
+                "fault_window_relations": {},
+                "tenant_recovered": true,
+                "passed": true
+            }))
+            .expect("checker report")
+        };
+
+        super::validate_ack_checker_report(
+            "checker-report.json",
+            &report(vec!["key-1@version-1"]),
+            &expectation,
+        )
+        .expect("exact version proof");
+        assert!(
+            super::validate_ack_checker_report(
+                "checker-report.json",
+                &report(Vec::new()),
+                &expectation,
+            )
+            .is_err(),
+            "an empty passed checker must not prove ACK durability"
+        );
+        assert!(
+            super::validate_ack_checker_report(
+                "checker-report.json",
+                &report(vec!["key-1@other-version"]),
+                &expectation,
+            )
+            .is_err(),
+            "a different version from the same run must not prove the trigger"
+        );
+    }
+
+    #[test]
+    fn ack_checker_must_prove_the_exact_delete_marker() {
+        use crate::fault::{
+            acknowledged_mutation::AcknowledgedMutationKind, checker::CheckerReport,
+            history::OperationRecord,
+        };
+
+        let record = |id: &str, kind: &str, version_id: &str, hash: Option<&str>| {
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": id,
+                "scenario": "dm-drop-writes-after-ack-delete-marker",
+                "run_id": "run-1",
+                "kind": kind,
+                "bucket": "bucket",
+                "key": "key-1",
+                "value_sha256": hash,
+                "size_bytes": hash.map(|_| 4),
+                "version_id": version_id,
+                "started_at_ms": if kind == "put" { 1 } else { 10 },
+                "ended_at_ms": if kind == "put" { 2 } else { 11 },
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null
+            }))
+            .expect("record")
+        };
+        let baseline = record("put-1", "put", "version-1", Some("hash-1"));
+        let trigger = record("delete-1", "delete", "marker-1", None);
+        let expectation = super::ack_checker_expectation(
+            &[baseline, trigger.clone()],
+            &trigger,
+            AcknowledgedMutationKind::DeleteMarker,
+        )
+        .expect("expectation");
+        let report = |markers: Vec<&str>| {
+            serde_json::from_value::<CheckerReport>(json!({
+                "scenario": "dm-drop-writes-after-ack-delete-marker",
+                "run_id": "run-1",
+                "committed_puts": 1,
+                "expected_live_objects": 0,
+                "verified_live_objects": 0,
+                "missing_committed_objects": [],
+                "unavailable_committed_objects": [],
+                "unknown_committed_read_failures": [],
+                "hash_mismatches": [],
+                "successful_corrupted_reads": [],
+                "unexpected_visible_deleted_objects": [],
+                "list_history_warning_count": 0,
+                "final_list_warning_count": 0,
+                "list_history_warnings": [],
+                "list_warnings": [],
+                "final_listed_objects": 0,
+                "versioning_expected": true,
+                "expected_committed_versions": 1,
+                "verified_committed_versions": 1,
+                "audit": {
+                    "bucket": "bucket",
+                    "started_at_ms": 20,
+                    "completed_at_ms": 30,
+                    "history_prefix_record_count": 2,
+                    "history_prefix_sha256": "prefix",
+                    "history_suffix_record_count": 1,
+                    "history_suffix_sha256": "suffix",
+                    "suffix_operations": [],
+                    "data_version_checks": [{"key": "key-1", "version_id": "version-1",
+                        "expected_sha256": "hash-1", "observed_sha256": "hash-1",
+                        "outcome": "ok", "http_status": 200}],
+                    "delete_marker_checks": markers.iter().map(|reference| {
+                        let (key, version) = reference.split_once('@').expect("marker reference");
+                        json!({"key": key, "version_id": version, "visible_in_list_object_versions": true})
+                    }).collect::<Vec<_>>(),
+                    "list_object_versions_completed": true
+                },
+                "operation_cohorts": {"pre_fault": 2},
+                "fault_window_relations": {},
+                "tenant_recovered": true,
+                "passed": true
+            }))
+            .expect("checker report")
+        };
+
+        super::validate_ack_checker_report(
+            "checker-report.json",
+            &report(vec!["key-1@marker-1"]),
+            &expectation,
+        )
+        .expect("exact delete marker proof");
+        assert!(
+            super::validate_ack_checker_report(
+                "checker-report.json",
+                &report(Vec::new()),
+                &expectation,
+            )
+            .is_err(),
+            "a passed checker without the trigger delete marker must fail closed"
+        );
+    }
+
+    #[test]
+    fn ack_trigger_contract_rejects_s3_traffic_before_crash_boundary() {
+        let record = |id: &str, kind: OperationKind, started_at_ms: u64, recovered: bool| {
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": id,
+                "scenario": "ack-case",
+                "run_id": "run-1",
+                "kind": kind,
+                "bucket": "bucket",
+                "key": id,
+                "value_sha256": "abc",
+                "size_bytes": 4,
+                "version_id": if kind == OperationKind::Put { Some(id) } else { None },
+                "started_sequence": if id == "op-1" { 1 } else { 3 },
+                "ended_sequence": if id == "op-1" { 2 } else { 4 },
+                "started_at_ms": started_at_ms,
+                "ended_at_ms": started_at_ms + 1,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": if recovered { "post_recovery" } else { "pre_fault" },
+                "fault_window_relation": if recovered { "after_fault" } else { "before_fault" }
+            }))
+            .expect("operation record")
+        };
+        let trigger = record("op-1", OperationKind::Put, 90, false);
+        let recovery_read = record("op-2", OperationKind::Get, 121, true);
+        super::validate_ack_quiet_gap(&[trigger.clone(), recovery_read], &trigger, 120, 3)
+            .expect("quiet gap");
+
+        let extra = record("op-2", OperationKind::Get, 115, true);
+        assert!(
+            super::validate_ack_quiet_gap(&[trigger.clone(), extra], &trigger, 120, 5).is_err(),
+            "traffic after the ACK must invalidate the quiet crash window"
+        );
+
+        let mut trigger = trigger;
+        trigger.ended_at_ms = trigger.started_at_ms;
+        let mut same_ms = record("op-2", OperationKind::Get, trigger.started_at_ms, true);
+        same_ms.ended_at_ms = trigger.started_at_ms;
+        for boundary_sequence in [4, 5] {
+            assert!(
+                super::validate_ack_quiet_gap(
+                    &[trigger.clone(), same_ms.clone()],
+                    &trigger,
+                    trigger.started_at_ms,
+                    boundary_sequence,
+                )
+                .is_err(),
+                "pending or completed same-millisecond traffic before the boundary invalidates the quiet gap"
+            );
+        }
+        super::validate_ack_quiet_gap(
+            &[trigger.clone(), same_ms],
+            &trigger,
+            trigger.started_at_ms,
+            3,
+        )
+        .expect("recovery traffic after the captured sequence boundary may share its millisecond");
     }
 
     #[test]

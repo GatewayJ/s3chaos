@@ -26,7 +26,8 @@ use crate::{
         reporting::FailureSummary,
         scenarios::{
             FaultBackend, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
-            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, requires_prefault_multipart_staging,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, acknowledged_mutation_kind,
+            requires_prefault_multipart_staging,
         },
         workload::S3WorkloadClient,
     },
@@ -297,7 +298,11 @@ impl FaultRun<'_> {
             None,
         )?;
         self.create_workload_bucket(&s3).await?;
-        let prefilled = self.prefill_workload(&s3).await?;
+        let prefilled = if acknowledged_mutation_kind(&scenario.name).is_some() {
+            Vec::new()
+        } else {
+            self.prefill_workload(&s3).await?
+        };
         Ok(PreparedWorkload {
             s3,
             endpoint,

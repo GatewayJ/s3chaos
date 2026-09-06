@@ -461,6 +461,16 @@ pub(crate) fn validate_checker_audit_against_history(
     report: &CheckerReport,
     history: &[OperationRecord],
 ) -> Result<()> {
+    let (prefix, suffix) = validate_checker_audit_receipt(report, history)?;
+    validate_successful_checker_observations(report, prefix, suffix)
+}
+
+/// Authenticate captured operations independently of whether their S3 verdict
+/// passed. Failure validators must additionally prove their negative signal.
+pub(crate) fn validate_checker_audit_receipt<'a>(
+    report: &CheckerReport,
+    history: &'a [OperationRecord],
+) -> Result<(&'a [OperationRecord], &'a [OperationRecord])> {
     let audit = report
         .audit
         .as_ref()
@@ -517,7 +527,14 @@ pub(crate) fn validate_checker_audit_against_history(
         }),
         "checker audit suffix contains a mutating or unrelated operation"
     );
+    Ok((prefix, suffix))
+}
 
+fn validate_successful_checker_observations(
+    report: &CheckerReport,
+    prefix: &[OperationRecord],
+    suffix: &[OperationRecord],
+) -> Result<()> {
     let model = object_model(prefix);
     let historical_read_anomalies = successful_read_anomalies(prefix);
     ensure!(
