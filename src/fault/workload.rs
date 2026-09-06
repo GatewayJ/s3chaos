@@ -30,7 +30,8 @@ use std::{future::Future, time::Duration};
 use tokio::time::{Instant, timeout};
 
 use crate::fault::history::{
-    ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef, Recorder,
+    ByteRange, ListedVersionEntry, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
+    Recorder,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +214,7 @@ pub struct GetObjectResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWriteResult {
+    pub write_operation_id: String,
     pub write_outcome: OperationOutcome,
     pub verify_get_outcome: Option<OperationOutcome>,
     pub verified: bool,
@@ -228,6 +230,14 @@ impl ObjectSpec {
         format!("fault-test/{run_id}/")
     }
 
+    pub(crate) fn seeded_key(run_id: &str, index: usize) -> String {
+        format!("{}object-{index:06}", Self::key_prefix(run_id))
+    }
+
+    pub(crate) fn directory_marker_key(run_id: &str, index: usize) -> String {
+        format!("{}dir-{index:06}/", Self::key_prefix(run_id))
+    }
+
     pub fn matches_body(&self, body: &[u8]) -> bool {
         body.len() == self.size_bytes && sha256_hex(body) == self.sha256
     }
@@ -238,7 +248,7 @@ impl ObjectSpec {
         size_bytes: usize,
         seed: u64,
     ) -> PreparedObject {
-        let key = format!("{}object-{index:06}", Self::key_prefix(run_id));
+        let key = Self::seeded_key(run_id, index);
         let body = seeded_bytes(seed, index, size_bytes);
         let sha256 = sha256_hex(&body);
 
@@ -262,7 +272,7 @@ impl ObjectSpec {
     /// directory-key delete path, rustfs/backlog#798). Size 0 keeps it off the
     /// erasure-shard and ranged-read paths.
     pub fn prepare_directory_marker(run_id: &str, index: usize, seed: u64) -> PreparedObject {
-        let key = format!("{}dir-{index:06}/", Self::key_prefix(run_id));
+        let key = Self::directory_marker_key(run_id, index);
         let body = Vec::new();
         let sha256 = sha256_hex(&body);
 
@@ -688,6 +698,10 @@ impl S3WorkloadClient {
             request_timeout,
             mutation_deadline: None,
         })
+    }
+
+    pub(crate) fn bucket(&self) -> &str {
+        &self.bucket
     }
 
     pub(crate) fn for_quiet_mutation(&self, deadline: Instant) -> Self {
@@ -1134,9 +1148,11 @@ impl S3WorkloadClient {
         object: &PreparedObject,
         recorder: &Recorder,
     ) -> Result<VerifiedWriteResult> {
-        let write_outcome = self.put_object(object, recorder).await?;
+        let write_record = self.put_object_record(object, recorder).await?;
+        let write_outcome = write_record.outcome;
         if write_outcome != OperationOutcome::Ok {
             return Ok(VerifiedWriteResult {
+                write_operation_id: write_record.id,
                 write_outcome,
                 verify_get_outcome: None,
                 verified: false,
@@ -1149,6 +1165,7 @@ impl S3WorkloadClient {
             .as_deref()
             .is_some_and(|body| object.spec.matches_body(body));
         Ok(VerifiedWriteResult {
+            write_operation_id: write_record.id,
             write_outcome,
             verify_get_outcome: Some(get.outcome),
             verified,
@@ -1338,17 +1355,6 @@ impl S3WorkloadClient {
         }
         cancellation_cleanup.disarm();
         Ok(Some(staged))
-    }
-
-    pub(crate) async fn complete_staged_multipart_object(
-        &self,
-        staged: &StagedMultipartUpload,
-        recorder: &Recorder,
-    ) -> Result<OperationOutcome> {
-        Ok(self
-            .complete_staged_multipart_object_record(staged, recorder)
-            .await?
-            .outcome)
     }
 
     pub(crate) async fn complete_staged_multipart_object_record(
@@ -1815,6 +1821,17 @@ impl S3WorkloadClient {
 
         let mut record = record;
         record.size_bytes = Some(entries.len());
+        record.listed_versions = Some(
+            entries
+                .iter()
+                .map(|entry| ListedVersionEntry {
+                    key: entry.key.clone(),
+                    version_id: entry.version_id.clone(),
+                    is_latest: entry.is_latest,
+                    is_delete_marker: entry.is_delete_marker,
+                })
+                .collect(),
+        );
         recorder.finish(record, OperationOutcome::Ok, Some(200), None)?;
         Ok(Some(entries))
     }

@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::future::Future;
+use std::time::Duration;
 
 /// A suite-wide monotonic deadline. Expiration unwinds the operation's guards;
 /// callers keep asynchronous cleanup outside this boundary.
@@ -54,6 +55,23 @@ impl RunDeadline {
             return Err(SuiteDeadlineExceeded(self.seconds.expect("deadline has budget")).into());
         }
         Ok(())
+    }
+
+    /// Caps an internally finalized operation to the remaining suite budget.
+    /// Callers must await that operation instead of wrapping it in `run`, so
+    /// cancellation cannot leave its durable history record unfinished.
+    pub(crate) fn bounded_timeout(self, requested: Duration) -> Result<Duration> {
+        self.check()?;
+        let Some(at) = self.at else {
+            return Ok(requested);
+        };
+        let remaining = at.saturating_duration_since(tokio::time::Instant::now());
+        let remaining_ms = u64::try_from(remaining.as_millis())
+            .context("remaining suite maxDuration exceeds the supported millisecond range")?;
+        if remaining_ms == 0 {
+            return Err(SuiteDeadlineExceeded(self.seconds.expect("deadline has budget")).into());
+        }
+        Ok(requested.min(Duration::from_millis(remaining_ms)))
     }
 
     pub(crate) async fn run<F, T>(self, operation: F) -> Result<T>
@@ -235,5 +253,36 @@ mod tests {
             .await
             .expect_err("expired");
         assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn internal_timeout_is_capped_to_remaining_suite_budget() {
+        let deadline = RunDeadline::new(Some(3)).expect("deadline");
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+
+        assert_eq!(
+            deadline
+                .bounded_timeout(std::time::Duration::from_secs(30))
+                .expect("remaining budget"),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            deadline
+                .bounded_timeout(std::time::Duration::from_millis(500))
+                .expect("shorter configured timeout"),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            RunDeadline::default()
+                .bounded_timeout(std::time::Duration::from_secs(30))
+                .expect("unbounded suite"),
+            std::time::Duration::from_secs(30)
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let error = deadline
+            .bounded_timeout(std::time::Duration::from_secs(30))
+            .expect_err("expired suite");
+        assert!(error.is::<SuiteDeadlineExceeded>());
     }
 }

@@ -790,6 +790,46 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn prefault_staging_deadline_finishes_history_and_aborts_known_upload() {
+        let expected = vec![
+            OperationKind::CreateMultipartUpload,
+            OperationKind::UploadPart,
+            OperationKind::AbortMultipartUpload,
+        ];
+        let (client, requests, server) = mock_s3(vec![
+            (OperationKind::CreateMultipartUpload, MockReply::Ok),
+            (OperationKind::UploadPart, MockReply::Hang),
+            (OperationKind::AbortMultipartUpload, MockReply::Ok),
+        ])
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder =
+            Recorder::create(dir.path().join("history.jsonl"), "ack", "run").expect("recorder");
+        let object = test_object().prepare();
+        let quiet = client.for_quiet_mutation(Instant::now() + Duration::from_millis(300));
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            quiet.stage_multipart_object(&object, &recorder),
+        )
+        .await
+        .expect("staging and cleanup are bounded")
+        .expect_err("stalled part cannot produce a staged upload");
+
+        assert_eq!(*requests.lock().expect("requests"), expected);
+        let records = persisted_records(&recorder);
+        assert_eq!(
+            records.iter().map(|record| record.kind).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(records[0].outcome, OperationOutcome::Ok);
+        assert_eq!(records[1].outcome, OperationOutcome::Timeout);
+        assert_eq!(records[2].outcome, OperationOutcome::Ok);
+        assert!(records.iter().all(|record| record.ended_sequence.is_some()));
+        server.abort();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelling_a_pre_staged_completion_aborts_the_registered_upload() {
         let expected = vec![
@@ -976,8 +1016,11 @@ mod tests {
             size_bytes: None,
             version_id: version_id.map(str::to_string),
             listed_keys: None,
+            listed_versions: None,
             payload_ref: None,
             range: None,
+            started_sequence: None,
+            ended_sequence: None,
             started_at_ms,
             ended_at_ms,
             outcome,

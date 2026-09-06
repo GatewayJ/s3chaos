@@ -253,12 +253,18 @@ proves the host-storage target, issues one typed mutation, and starts
 `drop_writes` only after a definite 2xx response with a non-null version ID.
 `ack-to-fault-evidence.json` records the operation ID, key, version ID, ACK
 timestamp, fault activation timestamp, measured ACK-to-fault interval, and
-`maxAckToFaultMs`. No S3 request is allowed between that ACK and the forced
-crash boundary. A timeout, unknown result, missing version identity, late
+`maxAckToFaultMs`. The crash boundary also captures the recorder's next event
+sequence, so same-millisecond or unfinished requests cannot masquerade as a
+quiet window. No S3 request is allowed between that ACK and the first recovery
+checker; subsequent history must contain only post-recovery reads.
+A timeout, unknown result, missing version identity, late
 activation, or extra request invalidates the run rather than producing PASS.
 The gate contract rejects `maxAckToFaultMs` above 1000 ms. Both checker reports
-must enumerate the exact history-derived `key@version` values, including the
-trigger version or DELETE marker. Multipart staging is registered for normal
+must authenticate the exact history-derived versions and DELETE markers through
+their native audits, with contiguous, independent checker phases and no recommit.
+Expected failures must bind real observations to the protected key, including
+the baseline version for overwrite and DELETE marker cases.
+Multipart staging is registered for normal
 error cleanup and guarded for cancellation before the completion ACK.
 
 Its recovery boundary is intentionally owned by the host backend:

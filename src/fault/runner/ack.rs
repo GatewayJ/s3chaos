@@ -41,6 +41,7 @@ struct AckTriggeredCrashEvidence {
     #[serde(flatten)]
     trigger: AckToFaultEvidence,
     crash_boundary_started_at_ms: u64,
+    crash_boundary_next_sequence: u64,
     ack_to_crash_boundary_ms: u64,
 }
 
@@ -86,7 +87,7 @@ impl FaultRun<'_> {
             let mut evidence =
                 self.write_ack_recovery_evidence(&target, &active, &removal, &recovered)?;
             self.deadline
-                .run(self.verify_recovered(&prepared.s3))
+                .run(self.verify_recovered_without_recommit(&prepared.s3))
                 .await?;
             self.deadline
                 .run(self.verify_final_without_recommit(&prepared.s3, &mut evidence))
@@ -106,6 +107,13 @@ impl FaultRun<'_> {
         s3: &S3WorkloadClient,
         staged_uploads: &mut BTreeMap<usize, StagedMultipartUpload>,
     ) -> Result<PreparedQuietMutation> {
+        let preparation_timeout = self
+            .deadline
+            .bounded_timeout(self.config.ack_operation_timeout)?;
+        let preparation_deadline = tokio::time::Instant::now()
+            .checked_add(preparation_timeout)
+            .context("ACK mutation preparation timeout exceeds the monotonic clock range")?;
+        let preparation_s3 = s3.for_quiet_mutation(preparation_deadline);
         let kind = acknowledged_mutation_kind(&self.scenario.name)
             .context("ACK-triggered scenario lacks a typed mutation kind")?;
         let index = self
@@ -129,7 +137,11 @@ impl FaultRun<'_> {
             "ack-mutation-prepare",
             RunEventStatus::Started,
             "preparing the single ACK-triggered mutation without activating the fault",
-            Some(serde_json::json!({ "mutation": kind })),
+            Some(serde_json::json!({
+                "mutation": kind,
+                "preparation_timeout_ms": preparation_timeout.as_millis(),
+                "configured_operation_timeout_ms": self.config.ack_operation_timeout.as_millis(),
+            })),
         )?;
 
         let mut staged_upload_index = None;
@@ -137,10 +149,11 @@ impl FaultRun<'_> {
         let workload = match kind {
             AcknowledgedMutationKind::Put => QuietMutationWorkload::put(object),
             AcknowledgedMutationKind::Overwrite | AcknowledgedMutationKind::DeleteMarker => {
-                let baseline = s3
+                let baseline = preparation_s3
                     .put_object_record(&object.prepare(), &self.context.history)
                     .await
                     .context("create ACK-trigger baseline version")?;
+                self.deadline.check()?;
                 ensure!(
                     baseline.outcome == OperationOutcome::Ok
                         && baseline
@@ -169,17 +182,19 @@ impl FaultRun<'_> {
                 QuietMutationWorkload::zero_byte_put(empty)?
             }
             AcknowledgedMutationKind::MultipartComplete => {
-                let staged = s3
+                let staged = preparation_s3
                     .stage_multipart_object(&object.prepare(), &self.context.history)
                     .await
                     .context("stage ACK-trigger multipart upload")?;
-                staged_uploads.insert(index, staged.clone());
-                staged_upload_index = Some(index);
-                cancellation_cleanup = Some(StagedMultipartCleanupGuard::new(
+                let cleanup = StagedMultipartCleanupGuard::new(
                     s3.clone(),
                     self.context.history.clone(),
                     staged.clone(),
-                ));
+                );
+                self.deadline.check()?;
+                staged_uploads.insert(index, staged.clone());
+                staged_upload_index = Some(index);
+                cancellation_cleanup = Some(cleanup);
                 QuietMutationWorkload::staged_multipart_complete(staged)
             }
         };
@@ -202,17 +217,19 @@ impl FaultRun<'_> {
         target: &ProvenTarget,
         quiet: QuietMutationWorkload,
     ) -> Result<(ActiveFault, AckToFaultEvidence)> {
-        let trigger = AcknowledgedMutationTrigger::new(
-            self.config.ack_operation_timeout,
-            self.config.max_ack_to_fault,
-        )?;
+        let operation_timeout = self
+            .deadline
+            .bounded_timeout(self.config.ack_operation_timeout)?;
+        let trigger =
+            AcknowledgedMutationTrigger::new(operation_timeout, self.config.max_ack_to_fault)?;
         self.context.events.record(
             "ack-trigger",
             RunEventStatus::Started,
             "executing one quiet mutation and arming fault activation only after a definite ACK",
             Some(serde_json::json!({
                 "mutation": quiet.kind(),
-                "operation_timeout_ms": self.config.ack_operation_timeout.as_millis(),
+                "operation_timeout_ms": operation_timeout.as_millis(),
+                "configured_operation_timeout_ms": self.config.ack_operation_timeout.as_millis(),
                 "max_ack_to_fault_ms": self.config.max_ack_to_fault.as_millis(),
             })),
         )?;
@@ -220,6 +237,7 @@ impl FaultRun<'_> {
         let mut activated = None;
         let result = trigger
             .execute_and_activate_fault(s3, &self.context.history, quiet, || {
+                self.deadline.check()?;
                 let active = self.activate_fault(target)?;
                 let activated_at_ms = active.fault_active_at_ms;
                 activated = Some(active);
@@ -276,6 +294,7 @@ impl FaultRun<'_> {
         trigger: AckToFaultEvidence,
     ) -> Result<()> {
         let started_at_ms = now_ms();
+        let crash_boundary_next_sequence = self.context.history.next_event_sequence();
         let evidence = AckTriggeredCrashEvidence {
             scenario: self.scenario.name.clone(),
             run_id: self.context.run_id.clone(),
@@ -283,6 +302,7 @@ impl FaultRun<'_> {
                 .saturating_sub(trigger.trigger_acknowledged_at_ms),
             trigger,
             crash_boundary_started_at_ms: started_at_ms,
+            crash_boundary_next_sequence,
         };
         self.collector.write_text(
             self.scenario.case_name,
@@ -368,6 +388,8 @@ impl FaultRun<'_> {
             fault_delete_started_at_ms: Some(removal.fault_delete_started_at_ms),
             recovery_started_at_ms: Some(removal.recovery_started_at_ms),
             recovery_ended_at_ms: Some(*recovery_ended_at_ms),
+            quorum_health_before_workload: None,
+            quorum_health_after_workload: None,
         };
         self.collector.write_text(
             self.scenario.case_name,

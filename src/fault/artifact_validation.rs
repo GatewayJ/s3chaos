@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -36,7 +36,10 @@ use crate::fault::{
         DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS, MAX_ACK_TO_FAULT_MS,
     },
     events::{RunEvent, RunEventStatus},
-    history::{DurabilityCohort, OperationKind, OperationOutcome, OperationRecord},
+    history::{
+        DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome, OperationRecord,
+        validate_history_phase_boundary, validate_history_scope_and_order,
+    },
     host_storage::DmStatusSnapshot,
     host_storage::{
         HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT, HostStorageMutationProof,
@@ -51,7 +54,10 @@ use crate::fault::{
         PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus,
         target_pod_has_bound_volume, target_pod_has_fixed_volume,
     },
-    quorum::require_fresh_runtime_observation,
+    quorum::{
+        QuorumHealthObservation, QuorumMutationClass, QuorumVolumeBoundary,
+        require_fresh_runtime_observation,
+    },
     reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
     scenarios::{
         self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario, acknowledged_mutation_kind,
@@ -60,7 +66,13 @@ use crate::fault::{
         FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunAckTriggerSpec, FaultRunArtifactSpec,
         FaultRunFaultSpec, FaultRunSpec, FaultRunTargetSpec,
     },
-    workload::WorkloadPlan,
+    workload::{
+        WorkloadPlan,
+        execution::{
+            TypedQuorumReadCohortSource, TypedQuorumReadExpectation,
+            require_typed_quorum_read_survival,
+        },
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -657,6 +669,14 @@ fn validate_fault_artifacts_with_identity(
             && json_spec.metadata.run_id == metadata.run_id,
         "run-spec metadata does not match the selected case and run-metadata.json run identity"
     );
+    ensure!(
+        json_spec.workload.plan == workload_plan
+            && json_spec.workload.seed == workload_plan.seed
+            && json_spec.workload.object_count == workload_plan.object_count
+            && json_spec.workload.concurrency == workload_plan.concurrency
+            && json_spec.workload.operation_mix == workload_plan.operation_mix,
+        "run-spec workload fields and workload-plan.json do not identify the same deterministic workload"
+    );
 
     let preflight_summary =
         read_json::<PreflightSummary>(required(&artifacts, "preflight-summary.json")?)?;
@@ -788,6 +808,12 @@ fn validate_fault_artifacts_with_identity(
     if fixed_volume_fault(&json_spec).is_some() {
         validate_fixed_volume_runtime_evidence(&evidence, &target_proof, &json_spec)?;
     }
+    if matches!(
+        options.scenario.as_str(),
+        scenarios::QUORUM_P_IO_FAULT_SCENARIO | scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+    ) {
+        validate_volume_quorum_health_evidence(&evidence, &target_proof, &history)?;
+    }
     if ack_mutation.is_some() {
         validate_ack_fault_window_evidence(&evidence)?;
     } else {
@@ -830,6 +856,7 @@ fn validate_fault_artifacts_with_identity(
         "checker-pre-recommit-report.json",
         &prechecker,
         options.expected_workload_versioning,
+        &history,
     )?;
     let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
     validate_checker_identity("checker-report.json", &checker, &metadata)?;
@@ -837,13 +864,26 @@ fn validate_fault_artifacts_with_identity(
         "checker-report.json",
         &checker,
         options.expected_workload_versioning,
+        &history,
     )?;
     if let Some(expectation) = &ack_checker_expectation {
+        validate_ack_prechecker_boundary(
+            &prechecker,
+            &history,
+            &expectation.trigger_operation_id,
+            evidence.recovery_ended_at_ms,
+        )?;
         validate_ack_checker_report("checker-pre-recommit-report.json", &prechecker, expectation)?;
         validate_ack_checker_report("checker-report.json", &checker, expectation)?;
     }
 
     if ack_mutation.is_some() {
+        validate_ack_checker_phase_chain(
+            &prechecker,
+            &checker,
+            &json_spec.metadata.bucket,
+            &history,
+        )?;
         return Ok(ArtifactValidationReport {
             scenario: options.scenario.clone(),
             case_name: scenario_spec.case_name.to_string(),
@@ -871,7 +911,6 @@ fn validate_fault_artifacts_with_identity(
             && recommit.attempts.len() == recommit.attempted,
         "recommit-report.json must have attempted == committed, failed == 0, harness_errors == 0, and attempts length matching attempted"
     );
-
     let summary =
         read_json::<WorkloadSummaryArtifact>(required(&artifacts, "workload-summary.json")?)?;
     validate_optional_identity_fields(
@@ -891,6 +930,17 @@ fn validate_fault_artifacts_with_identity(
         summary.recommitted_after_recovery == recommit.committed,
         "workload-summary.json recommitted_after_recovery does not match recommit-report.json committed"
     );
+    validate_checker_phase_chain(
+        &prechecker,
+        &checker,
+        &recommit,
+        summary
+            .recommit_candidates
+            .as_ref()
+            .context("workload-summary.json has no sealed recommit candidate manifest")?,
+        &json_spec.metadata.bucket,
+        &history,
+    )?;
     ensure!(
         summary.exercised_all_operation_families(),
         "workload-summary.json did not exercise every required S3 operation family"
@@ -899,19 +949,80 @@ fn validate_fault_artifacts_with_identity(
         summary.disrupted()? == evidence.client_disruptions,
         "fault-evidence.json client_disruptions does not match workload-summary.json"
     );
-    if options.scenario == scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+    if matches!(
+        options.scenario.as_str(),
+        scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+            | scenarios::QUORUM_P_IO_FAULT_SCENARIO
+            | scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+    ) {
         let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
-        summary.require_write_quorum_loss_effect(
-            &history,
-            &metadata.scenario,
-            &json_spec.metadata.bucket,
-            evidence
-                .workload_started_at_ms
-                .context("fault-evidence.json workload_started_at_ms is required")?,
-            evidence
-                .workload_ended_at_ms
-                .context("fault-evidence.json workload_ended_at_ms is required")?,
-        )?;
+        let workload_started_at_ms = evidence
+            .workload_started_at_ms
+            .context("fault-evidence.json workload_started_at_ms is required")?;
+        let fault_active_at_ms = evidence
+            .fault_active_at_ms
+            .context("fault-evidence.json fault_active_at_ms is required")?;
+        let workload_ended_at_ms = evidence
+            .workload_ended_at_ms
+            .context("fault-evidence.json workload_ended_at_ms is required")?;
+        if options.scenario == scenarios::QUORUM_P_IO_FAULT_SCENARIO {
+            require_typed_quorum_read_survival(
+                &history,
+                &TypedQuorumReadExpectation {
+                    scenario: &metadata.scenario,
+                    run_id: &metadata.run_id,
+                    bucket: &json_spec.metadata.bucket,
+                    class: json_spec
+                        .faults
+                        .first()
+                        .context("runtime quorum run-spec has no fault")?
+                        .parameters
+                        .quorum_case()?,
+                    workload_plan: &workload_plan,
+                    cohort_source: TypedQuorumReadCohortSource::ArtifactHistory,
+                    fault_active_at_ms,
+                    workload_started_at_ms,
+                },
+            )?;
+        }
+        if matches!(
+            options.scenario.as_str(),
+            scenarios::QUORUM_P_IO_FAULT_SCENARIO | scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        ) {
+            let shape = target_proof
+                .faults
+                .iter()
+                .find_map(|fault| fault.erasure_set.as_ref())
+                .and_then(|proof| proof.shape.as_ref())
+                .context("volume quorum artifacts lack proven runtime geometry")?;
+            let unavailable = QuorumVolumeBoundary {
+                class: json_spec
+                    .faults
+                    .first()
+                    .context("runtime quorum run-spec has no fault")?
+                    .parameters
+                    .quorum_case()?,
+                beyond_read_tolerance: options.scenario
+                    == scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+            }
+            .unavailable_mutations(shape)?;
+            summary.require_typed_write_quorum_loss_effect(
+                &history,
+                &metadata.scenario,
+                &json_spec.metadata.bucket,
+                &unavailable,
+                workload_started_at_ms,
+                workload_ended_at_ms,
+            )?;
+        } else {
+            summary.require_write_quorum_loss_effect(
+                &history,
+                &metadata.scenario,
+                &json_spec.metadata.bucket,
+                workload_started_at_ms,
+                workload_ended_at_ms,
+            )?;
+        }
     }
 
     Ok(ArtifactValidationReport {
@@ -1030,8 +1141,8 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
             fault.name
         );
         ensure!(
-            fault.selection.value > 0,
-            "run-spec fault {} has zero selection value",
+            fault.selection.value > 0 || fault.selection.kind == "runtime-quorum",
+            "run-spec fault {} has zero selection value outside a semantic runtime quorum selection",
             fault.name
         );
         ensure!(
@@ -1317,9 +1428,20 @@ fn validate_target_proof(
             .path
             .as_deref()
             .context("fixed volume path is missing")?;
+        let expected_targets = if fault.selection.kind == "runtime-quorum" {
+            proof
+                .faults
+                .iter()
+                .find_map(|fault| fault.erasure_set.as_ref())
+                .and_then(|proof| proof.volume_quorum.as_ref())
+                .map(|proof| proof.target_count)
+                .context("runtime quorum target proof is missing its resolved volume count")?
+        } else {
+            fault.selection.value
+        };
         ensure!(
-            fault.selection.value > 0
-                && proof.resolved_pods.len() >= usize::try_from(fault.selection.value)?
+            expected_targets > 0
+                && proof.resolved_pods.len() >= usize::try_from(expected_targets)?
                 && proof
                     .resolved_pods
                     .iter()
@@ -1433,6 +1555,36 @@ fn validate_target_proof(
                         fault.name
                     )
                 })?;
+        } else if spec_fault.selection.kind == "runtime-quorum" {
+            let volume_quorum = erasure_set.volume_quorum.as_ref().with_context(|| {
+                format!(
+                    "target-proof.json fault {} lacks runtime volume quorum bindings",
+                    fault.name
+                )
+            })?;
+            volume_quorum.validate(shape, membership).with_context(|| {
+                format!(
+                    "target-proof.json fault {} has invalid volume quorum bindings",
+                    fault.name
+                )
+            })?;
+            proof
+                .validate_volume_quorum_bindings(volume_quorum)
+                .with_context(|| {
+                    format!(
+                        "target-proof.json fault {} volume quorum candidates do not match resolvedPods",
+                        fault.name
+                    )
+                })?;
+            let class = spec_fault.parameters.quorum_case()?;
+            ensure!(
+                volume_quorum.boundary.class == class
+                    && volume_quorum.boundary.beyond_read_tolerance
+                        == (spec_fault.selection.value == 1)
+                    && spec_fault.selection.value <= 1,
+                "target-proof.json fault {} typed quorum boundary does not match run-spec",
+                fault.name
+            );
         }
     }
     Ok(())
@@ -1781,7 +1933,10 @@ fn fixed_volume_fault(spec: &FaultRunSpec) -> Option<&FaultRunFaultSpec> {
         return None;
     };
     (fault.target.kind == "rustfs-volume"
-        && fault.selection.kind == "fixed-targets"
+        && matches!(
+            fault.selection.kind.as_str(),
+            "fixed-targets" | "runtime-quorum"
+        )
         && matches!(
             fault.kind.as_str(),
             "rustfs_volume_io_error"
@@ -1799,7 +1954,39 @@ fn validate_fixed_volume_runtime_evidence(
 ) -> Result<()> {
     let fault = fixed_volume_fault(spec)
         .context("fixed volume runtime proof requires one fixed-target volume fault")?;
-    let injection = fixed_volume_injection_from_run_spec(fault)?;
+    let volume_quorum = if fault.selection.kind == "runtime-quorum" {
+        let erasure_set = proof
+            .faults
+            .iter()
+            .find_map(|fault| fault.erasure_set.as_ref())
+            .context("runtime quorum target proof has no erasure-set evidence")?;
+        let shape = erasure_set
+            .shape
+            .as_ref()
+            .context("runtime quorum target proof has no erasure-set shape")?;
+        let membership = erasure_set
+            .membership
+            .as_ref()
+            .context("runtime quorum target proof has no erasure-set membership")?;
+        let quorum = erasure_set
+            .volume_quorum
+            .as_ref()
+            .context("runtime quorum target proof has no volume bindings")?;
+        quorum.validate(shape, membership)?;
+        proof.validate_volume_quorum_bindings(quorum)?;
+        let fault_apply_started_at_ms = evidence
+            .fault_apply_started_at_ms
+            .context("fault-evidence.json fault_apply_started_at_ms is required")?;
+        require_fresh_runtime_observation(erasure_set.observed_at_ms, fault_apply_started_at_ms)
+            .context("runtime volume quorum topology was stale at fault apply")?;
+        Some(quorum)
+    } else {
+        None
+    };
+    let expected_target_count = volume_quorum
+        .map(|proof| proof.target_count)
+        .unwrap_or(fault.selection.value);
+    let injection = fixed_volume_injection_from_run_spec(fault, expected_target_count)?;
     let runtime_contract =
         crate::fault::backends::chaos_mesh::volume_fault_runtime_contract(&injection)?;
     ensure!(
@@ -1811,7 +1998,7 @@ fn validate_fixed_volume_runtime_evidence(
         .path
         .as_deref()
         .context("fixed volume run-spec target has no path")?;
-    let expected_count = usize::try_from(fault.selection.value)?;
+    let expected_count = usize::try_from(expected_target_count)?;
     let before_identities = unique_pod_identities(
         "fault-evidence.json pods_before",
         evidence
@@ -1864,7 +2051,7 @@ fn validate_fixed_volume_runtime_evidence(
         active_targets.len() == expected_count
             && active_targets.len() == evidence.fixed_volume_targets_at_fault_activation.len(),
         "fault-evidence.json must persist exactly {} unique active fixed volume targets",
-        fault.selection.value
+        expected_target_count
     );
     ensure!(
         workload_targets == active_targets
@@ -1893,6 +2080,30 @@ fn validate_fixed_volume_runtime_evidence(
         active_identity_pods == selected_pods,
         "fault-evidence.json selected Pod identities do not match controller target names"
     );
+    if let Some(quorum) = volume_quorum {
+        let selected_names = active_identities
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<BTreeSet<_>>();
+        let selected_drives = quorum
+            .candidates
+            .iter()
+            .filter(|binding| selected_names.contains(binding.pod_name.as_str()))
+            .map(|binding| binding.drive_uuid.as_str())
+            .collect::<BTreeSet<_>>();
+        let non_target_drives = quorum
+            .candidates
+            .iter()
+            .filter(|binding| !selected_names.contains(binding.pod_name.as_str()))
+            .map(|binding| binding.drive_uuid.as_str())
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            selected_drives.len() == expected_count
+                && selected_drives.is_disjoint(&non_target_drives)
+                && selected_drives.len() + non_target_drives.len() == quorum.candidates.len(),
+            "runtime quorum evidence does not prove the complete selected/non-target drive partition"
+        );
+    }
     let selected_pod_names = active_identities
         .iter()
         .map(|(name, _)| name.clone())
@@ -1958,7 +2169,7 @@ fn validate_fixed_volume_runtime_evidence(
                 run_id: &spec.metadata.run_id,
                 scenario: &spec.scenario.name,
                 volume_path,
-                expected_targets: fault.selection.value,
+                expected_targets: expected_target_count,
                 candidate_pod_ids: &candidate_pod_ids,
                 runtime: &runtime_contract,
             },
@@ -1972,7 +2183,109 @@ fn validate_fixed_volume_runtime_evidence(
     Ok(())
 }
 
-fn fixed_volume_injection_from_run_spec(fault: &FaultRunFaultSpec) -> Result<FaultInjection> {
+fn validate_volume_quorum_health_evidence(
+    evidence: &FaultEvidenceArtifact,
+    proof: &TargetProof,
+    history: &[OperationRecord],
+) -> Result<()> {
+    let erasure_set = proof
+        .faults
+        .iter()
+        .find_map(|fault| fault.erasure_set.as_ref())
+        .context("runtime quorum target proof has no erasure-set evidence")?;
+    let deployment_id = erasure_set
+        .deployment_id
+        .as_deref()
+        .context("runtime quorum target proof has no deployment identity")?;
+    let shape = erasure_set
+        .shape
+        .as_ref()
+        .context("runtime quorum target proof has no erasure-set shape")?;
+    let membership = erasure_set
+        .membership
+        .as_ref()
+        .context("runtime quorum target proof has no erasure-set membership")?;
+    let target = erasure_set
+        .volume_quorum
+        .as_ref()
+        .context("runtime quorum target proof has no volume bindings")?;
+    let selected_at_activation = evidence
+        .pods_at_fault_activation
+        .iter()
+        .map(|pod| pod.name.clone())
+        .collect::<BTreeSet<_>>();
+    let selected_after_workload = evidence
+        .pods_at_workload_snapshot
+        .iter()
+        .map(|pod| pod.name.clone())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        selected_at_activation.len() == evidence.pods_at_fault_activation.len()
+            && selected_after_workload.len() == evidence.pods_at_workload_snapshot.len()
+            && selected_at_activation == selected_after_workload,
+        "volume quorum selected Pod names changed across health guard boundaries"
+    );
+
+    let before = evidence
+        .quorum_health_before_workload
+        .as_ref()
+        .context("fault-evidence.json lacks the pre-workload quorum health observation")?;
+    let after = evidence
+        .quorum_health_after_workload
+        .as_ref()
+        .context("fault-evidence.json lacks the post-workload quorum health observation")?;
+    before.validate(
+        deployment_id,
+        shape,
+        membership,
+        target,
+        &selected_at_activation,
+    )?;
+    after.validate(
+        deployment_id,
+        shape,
+        membership,
+        target,
+        &selected_after_workload,
+    )?;
+
+    let fault_active_at_ms = evidence
+        .fault_active_at_ms
+        .context("fault-evidence.json fault_active_at_ms is required")?;
+    let workload_started_at_ms = evidence
+        .workload_started_at_ms
+        .context("fault-evidence.json workload_started_at_ms is required")?;
+    let workload_ended_at_ms = evidence
+        .workload_ended_at_ms
+        .context("fault-evidence.json workload_ended_at_ms is required")?;
+    let fault_delete_started_at_ms = evidence
+        .fault_delete_started_at_ms
+        .context("fault-evidence.json fault_delete_started_at_ms is required")?;
+    let first_fault_active_operation_at_ms = history
+        .iter()
+        .filter(|record| {
+            record.durability_cohort == Some(DurabilityCohort::FaultActive)
+                && record.started_at_ms >= fault_active_at_ms
+        })
+        .map(|record| record.started_at_ms)
+        .min()
+        .unwrap_or(workload_started_at_ms);
+    before.require_within(
+        fault_active_at_ms,
+        workload_started_at_ms.min(first_fault_active_operation_at_ms),
+    )?;
+    after.require_within(workload_ended_at_ms, fault_delete_started_at_ms)?;
+    ensure!(
+        before.completed_at_ms <= after.started_at_ms,
+        "volume quorum health observations are not in pre/post workload order"
+    );
+    Ok(())
+}
+
+fn fixed_volume_injection_from_run_spec(
+    fault: &FaultRunFaultSpec,
+    expected_target_count: u32,
+) -> Result<FaultInjection> {
     let kind = match fault.kind.as_str() {
         "rustfs_volume_io_error" => FaultKind::RustfsVolumeIoError,
         "rustfs_volume_latency" => FaultKind::RustfsVolumeLatency,
@@ -1989,7 +2302,7 @@ fn fixed_volume_injection_from_run_spec(fault: &FaultRunFaultSpec) -> Result<Fau
         kind,
         crate::fault::scenarios::FaultBackend::ChaosMeshIoChaos,
         FaultTarget::RustfsVolume { path: volume_path },
-        FaultSelection::FixedTargets(fault.selection.value),
+        FaultSelection::FixedTargets(expected_target_count),
         Duration::from_secs(fault.fault_duration_seconds),
         fault.parameters.clone(),
     )
@@ -2020,6 +2333,7 @@ fn validate_checker_report(
     name: &str,
     report: &CheckerReport,
     expected_versioning: bool,
+    history: &[OperationRecord],
 ) -> Result<()> {
     report
         .require_success()
@@ -2034,27 +2348,315 @@ fn validate_checker_report(
         !report.operation_cohorts.is_empty(),
         "{name} must include operation_cohorts derived from history.jsonl"
     );
+    checker::validate_checker_audit_against_history(report, history)
+        .with_context(|| format!("{name} audit does not match history.jsonl"))?;
+    if name == "checker-report.json" {
+        let audit = report
+            .audit
+            .as_ref()
+            .context("checker-report.json has no history-bound audit")?;
+        ensure!(
+            audit.history_prefix_record_count + audit.history_suffix_record_count == history.len(),
+            "checker-report.json audit does not cover the terminal history.jsonl record"
+        );
+    }
+    Ok(())
+}
+
+type RecommitIdentity = (String, usize, String);
+
+fn derive_recommit_candidates(
+    history_prefix: &[OperationRecord],
+) -> Result<HashMap<RecommitIdentity, String>> {
+    let mut latest_mutations = HashMap::<&str, (u64, &OperationRecord)>::new();
+    for record in history_prefix.iter().filter(|record| {
+        matches!(
+            record.kind,
+            OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+        )
+    }) {
+        let key = record
+            .key
+            .as_deref()
+            .context("authenticated mutation history contains an operation without a key")?;
+        let sequence = record
+            .started_sequence
+            .context("authenticated mutation history contains an operation without a sequence")?;
+        latest_mutations
+            .entry(key)
+            .and_modify(|latest| {
+                if sequence > latest.0 {
+                    *latest = (sequence, record);
+                }
+            })
+            .or_insert((sequence, record));
+    }
+
+    let mut candidates = HashMap::with_capacity(latest_mutations.len());
+    for (_, source) in latest_mutations.into_values() {
+        if !matches!(
+            source.kind,
+            OperationKind::Put | OperationKind::CompleteMultipartUpload
+        ) || source.outcome == OperationOutcome::Ok
+        {
+            continue;
+        }
+        let identity = (
+            source.key.clone().context("recommit source has no key")?,
+            source.size_bytes.context("recommit source has no size")?,
+            source
+                .value_sha256
+                .clone()
+                .context("recommit source has no body digest")?,
+        );
+        ensure!(
+            candidates.insert(identity, source.id.clone()).is_none(),
+            "authenticated history produced duplicate recommit candidate identities"
+        );
+    }
+    Ok(candidates)
+}
+
+fn validate_checker_phase_chain(
+    prechecker: &CheckerReport,
+    checker: &CheckerReport,
+    recommit: &RecommitReportArtifact,
+    manifest: &RecommitCandidateManifestArtifact,
+    expected_bucket: &str,
+    history: &[OperationRecord],
+) -> Result<()> {
+    let pre_audit = prechecker
+        .audit
+        .as_ref()
+        .context("checker-pre-recommit-report.json has no history-bound audit")?;
+    let final_audit = checker
+        .audit
+        .as_ref()
+        .context("checker-report.json has no history-bound audit")?;
+    let pre_end = pre_audit
+        .history_prefix_record_count
+        .checked_add(pre_audit.history_suffix_record_count)
+        .context("pre-recommit checker audit history bounds overflow")?;
+    validate_history_scope_and_order(
+        history,
+        &prechecker.scenario,
+        &prechecker.run_id,
+        expected_bucket,
+    )?;
     ensure!(
-        report.missing_committed_objects.is_empty()
-            && report.unavailable_committed_objects.is_empty()
-            && report.unknown_committed_read_failures.is_empty()
-            && report.hash_mismatches.is_empty()
-            && report.successful_corrupted_reads.is_empty()
-            && report.unexpected_visible_deleted_objects.is_empty()
-            && report.unknown_writes_materialized.is_empty()
-            && report.unknown_write_value_conflicts.is_empty()
-            && report.final_list_warning_count == 0
-            && report.list_warnings.is_empty()
-            && report.committed_writes_missing_version_id_count == 0
-            && report.missing_committed_versions.is_empty()
-            && report.unavailable_committed_versions.is_empty()
-            && report.version_hash_mismatches.is_empty()
-            && report.missing_committed_delete_markers.is_empty()
-            && report.resurrected_deleted_objects.is_empty()
-            && report.delete_marker_lineage_incomplete.is_empty()
-            && report.multipart_upload_lineage_incomplete.is_empty()
-            && report.tenant_recovered,
-        "{name} contains a non-clean checker verdict"
+        pre_audit.history_suffix_record_count > 0 && final_audit.history_suffix_record_count > 0,
+        "checker phase audits must each contain independently captured operations"
+    );
+    ensure!(
+        pre_audit.bucket == expected_bucket
+            && final_audit.bucket == expected_bucket
+            && manifest.bucket == expected_bucket
+            && manifest.scenario == prechecker.scenario
+            && manifest.run_id == prechecker.run_id
+            && checker.scenario == prechecker.scenario
+            && checker.run_id == prechecker.run_id,
+        "checker phases and recommit candidate manifest do not match the run target identity"
+    );
+    ensure!(
+        manifest.history_record_count == pre_audit.history_prefix_record_count
+            && manifest.history_sha256 == pre_audit.history_prefix_sha256,
+        "recommit candidate manifest is not bound to the authenticated pre-recommit history"
+    );
+    ensure!(
+        pre_end <= final_audit.history_prefix_record_count
+            && pre_audit.completed_at_ms <= final_audit.started_at_ms,
+        "checker phase audits overlap or are out of order"
+    );
+
+    let recommit_record_count = recommit
+        .attempted
+        .checked_mul(2)
+        .context("recommit history record count overflow")?;
+    let recommit_end = pre_end
+        .checked_add(recommit_record_count)
+        .context("recommit history bounds overflow")?;
+    ensure!(
+        recommit_end == final_audit.history_prefix_record_count,
+        "history between checker phases must contain exactly one PUT and verification GET per recommit attempt"
+    );
+    let recommit_history = history
+        .get(pre_end..recommit_end)
+        .context("checker phase history bounds exceed history.jsonl")?;
+    let pre_prefix = history
+        .get(..pre_audit.history_prefix_record_count)
+        .context("pre-recommit checker prefix exceeds history.jsonl")?;
+    let pre_suffix = history
+        .get(pre_audit.history_prefix_record_count..pre_end)
+        .context("pre-recommit checker suffix exceeds history.jsonl")?;
+    let final_suffix_end = final_audit
+        .history_prefix_record_count
+        .checked_add(final_audit.history_suffix_record_count)
+        .context("final checker audit history bounds overflow")?;
+    let final_prefix = history
+        .get(..final_audit.history_prefix_record_count)
+        .context("final checker prefix exceeds history.jsonl")?;
+    let final_suffix = history
+        .get(final_audit.history_prefix_record_count..final_suffix_end)
+        .context("final checker suffix exceeds history.jsonl")?;
+    ensure!(
+        final_suffix_end == history.len(),
+        "final checker audit does not cover terminal history.jsonl"
+    );
+    validate_history_phase_boundary(pre_prefix, pre_suffix, "workload/prechecker")?;
+    validate_history_phase_boundary(&history[..pre_end], recommit_history, "prechecker/recommit")?;
+    validate_history_phase_boundary(final_prefix, final_suffix, "recommit/final-checker")?;
+
+    let mut records_by_id = HashMap::with_capacity(manifest.history_record_count);
+    for record in &history[..manifest.history_record_count] {
+        records_by_id.insert(record.id.as_str(), record);
+    }
+    let derived_candidates = derive_recommit_candidates(&history[..manifest.history_record_count])?;
+
+    let mut expected = HashMap::<RecommitIdentity, String>::new();
+    for candidate in &manifest.candidates {
+        ensure!(
+            expected
+                .insert(
+                    (
+                        candidate.key.clone(),
+                        candidate.size_bytes,
+                        candidate.sha256.clone(),
+                    ),
+                    candidate.source_operation_id.clone(),
+                )
+                .is_none(),
+            "recommit candidate manifest contains a duplicate object identity"
+        );
+        let source = records_by_id
+            .get(candidate.source_operation_id.as_str())
+            .copied()
+            .with_context(|| {
+                format!(
+                    "recommit candidate {} source operation is absent from its authenticated history",
+                    candidate.key
+                )
+            })?;
+        ensure!(
+            matches!(
+                source.kind,
+                OperationKind::Put | OperationKind::CompleteMultipartUpload
+            ) && source.outcome != OperationOutcome::Ok
+                && source.bucket == expected_bucket
+                && source.key.as_deref() == Some(candidate.key.as_str())
+                && source.value_sha256.as_deref() == Some(candidate.sha256.as_str())
+                && source.size_bytes == Some(candidate.size_bytes),
+            "recommit candidate {} does not match its authenticated source operation",
+            candidate.key
+        );
+    }
+    ensure!(
+        expected == derived_candidates,
+        "recommit candidate manifest does not match the final unconfirmed mutations in authenticated history"
+    );
+    ensure!(
+        manifest.candidates.len() == recommit.attempted,
+        "recommit candidate manifest count does not match recommit-report.json"
+    );
+    let mut attempts = HashMap::<RecommitIdentity, &RecommitAttemptArtifact>::new();
+    for attempt in &recommit.attempts {
+        ensure!(
+            attempt.outcome == Some(OperationOutcome::Ok)
+                && attempt.verify_get_outcome == Some(OperationOutcome::Ok)
+                && attempt.http_status == Some(200)
+                && attempt.error.is_none()
+                && attempt.harness_error.is_none(),
+            "recommit-report.json contains an unsuccessful attempt"
+        );
+        let identity = (
+            attempt.key.clone(),
+            attempt.size_bytes,
+            attempt.sha256.clone(),
+        );
+        ensure!(
+            expected.get(&identity) == Some(&attempt.source_operation_id)
+                && attempts.insert(identity, attempt).is_none(),
+            "recommit-report.json attempt does not match its sealed candidate manifest"
+        );
+    }
+
+    let mut put_by_key = BTreeMap::<String, (&OperationRecord, RecommitIdentity)>::new();
+    let mut get_by_key = BTreeMap::<String, (&OperationRecord, RecommitIdentity)>::new();
+    for record in recommit_history {
+        ensure!(
+            record.started_at_ms <= record.ended_at_ms
+                && record.started_at_ms >= pre_audit.completed_at_ms
+                && record.ended_at_ms <= final_audit.started_at_ms,
+            "recommit history is outside the authenticated checker phase interval"
+        );
+        let started_sequence = record
+            .started_sequence
+            .context("recommit history operation has no started sequence")?;
+        let ended_sequence = record
+            .ended_sequence
+            .context("recommit history operation has no ended sequence")?;
+        ensure!(
+            started_sequence < ended_sequence
+                && record.bucket == expected_bucket
+                && record.outcome == OperationOutcome::Ok
+                && record.http_status == Some(200)
+                && record.error.is_none(),
+            "recommit history contains an unsuccessful operation"
+        );
+        let identity = (
+            record
+                .key
+                .clone()
+                .context("recommit history operation has no key")?,
+            record
+                .size_bytes
+                .context("recommit history operation has no size")?,
+            record
+                .value_sha256
+                .clone()
+                .context("recommit history operation has no body digest")?,
+        );
+        let key = identity.0.clone();
+        match record.kind {
+            OperationKind::Put => ensure!(
+                put_by_key.insert(key, (record, identity)).is_none(),
+                "recommit history contains duplicate PUTs for one candidate key"
+            ),
+            OperationKind::Get if record.version_id.is_none() && record.range.is_none() => {
+                ensure!(
+                    get_by_key.insert(key, (record, identity)).is_none(),
+                    "recommit history contains duplicate verification GETs for one candidate key"
+                );
+            }
+            _ => bail!(
+                "history between checker phases contains a non-recommit operation {}",
+                record.id
+            ),
+        }
+    }
+    ensure!(
+        put_by_key.len() == expected.len() && get_by_key.len() == expected.len(),
+        "recommit history operation count does not match the sealed candidate manifest"
+    );
+    for identity in expected.keys() {
+        let (put, put_identity) = put_by_key
+            .get(&identity.0)
+            .context("recommit history is missing a candidate PUT")?;
+        let (get, get_identity) = get_by_key
+            .get(&identity.0)
+            .context("recommit history is missing a candidate verification GET")?;
+        ensure!(
+            put_identity == identity
+                && get_identity == identity
+                && put
+                    .ended_sequence
+                    .zip(get.started_sequence)
+                    .is_some_and(|(put_ended, get_started)| put_ended < get_started),
+            "recommit PUT/GET identity or happens-before order does not match the sealed candidate manifest"
+        );
+    }
+    ensure!(
+        attempts.len() == expected.len(),
+        "recommit-report.json attempts do not match the authenticated PUT/GET history between checker phases"
     );
     Ok(())
 }
@@ -2195,6 +2797,7 @@ struct AckArtifactValidationContext<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct AckCheckerExpectation {
+    trigger_operation_id: String,
     trigger_reference: String,
     trigger_is_delete_marker: bool,
     committed_version_refs: BTreeSet<String>,
@@ -2216,6 +2819,7 @@ fn validate_ack_triggered_dm_artifacts(
         bucket,
         run_spec,
     } = context;
+    validate_history_scope_and_order(history, scenario, run_id, bucket)?;
     ensure!(
         events.iter().any(|event| {
             event.stage == "ack-trigger"
@@ -2240,6 +2844,10 @@ fn validate_ack_triggered_dm_artifacts(
         .ack_trigger
         .as_ref()
         .context("run-spec lacks the ACK trigger contract")?;
+    let trigger = history
+        .iter()
+        .find(|record| record.id == ack.trigger_operation_id)
+        .context("history.jsonl lacks the declared ACK trigger operation")?;
     validate_ack_trigger_contract(
         &ack,
         planned,
@@ -2247,16 +2855,13 @@ fn validate_ack_triggered_dm_artifacts(
         scenario,
         run_id,
         evidence.fault_apply_started_at_ms,
+        trigger,
     )?;
     ensure!(
         evidence.fault_active_at_ms == Some(ack.fault_activated_at_ms),
         "ACK activation timestamp does not match fault-evidence.json"
     );
 
-    let trigger = history
-        .iter()
-        .find(|record| record.id == ack.trigger_operation_id)
-        .context("history.jsonl lacks the declared ACK trigger operation")?;
     ensure!(
         trigger.scenario == scenario
             && trigger.run_id.as_deref() == Some(run_id)
@@ -2279,7 +2884,12 @@ fn validate_ack_triggered_dm_artifacts(
             "zero-byte ACK trigger history record is not empty"
         );
     }
-    validate_ack_quiet_gap(history, trigger, ack.crash_boundary_started_at_ms)?;
+    validate_ack_quiet_gap(
+        history,
+        trigger,
+        ack.crash_boundary_started_at_ms,
+        ack.crash_boundary_next_sequence,
+    )?;
     validate_ack_mutation_shape(history, trigger, expected_mutation)?;
     let checker_expectation = ack_checker_expectation(history, trigger, expected_mutation)?;
 
@@ -2355,12 +2965,19 @@ fn validate_ack_trigger_contract(
     scenario: &str,
     run_id: &str,
     fault_apply_started_at_ms: Option<u64>,
+    trigger: &OperationRecord,
 ) -> Result<()> {
     ensure!(
         ack.scenario == scenario
             && ack.run_id == run_id
             && ack.trigger_kind == expected_mutation
             && planned.mutation == expected_mutation
+            && planned.operation_timeout_ms > 0
+            && trigger.ended_at_ms == ack.trigger_acknowledged_at_ms
+            && trigger
+                .ended_at_ms
+                .checked_sub(trigger.started_at_ms)
+                .is_some_and(|duration| duration <= planned.operation_timeout_ms)
             && (1..=MAX_ACK_TO_FAULT_MS).contains(&planned.max_ack_to_fault_ms)
             && ack.max_ack_to_fault_ms == planned.max_ack_to_fault_ms
             && !ack.trigger_operation_id.is_empty()
@@ -2422,6 +3039,7 @@ fn ack_checker_expectation(
         "eligible ACK trigger is absent from the history-derived checker expectation"
     );
     Ok(AckCheckerExpectation {
+        trigger_operation_id: trigger.id.clone(),
         trigger_reference,
         trigger_is_delete_marker,
         committed_version_refs,
@@ -2441,23 +3059,34 @@ fn validate_ack_checker_report(
     report: &CheckerReport,
     expectation: &AckCheckerExpectation,
 ) -> Result<()> {
-    let verified_versions = report
-        .verified_committed_version_refs
+    let audit = report
+        .audit
+        .as_ref()
+        .context("ACK checker has no history-bound audit")?;
+    let verified_versions = audit
+        .data_version_checks
         .iter()
-        .cloned()
+        .filter(|check| {
+            check.outcome == OperationOutcome::Ok
+                && check.http_status == Some(200)
+                && check.observed_sha256.as_deref() == Some(check.expected_sha256.as_str())
+        })
+        .map(|check| format!("{}@{}", check.key, check.version_id))
         .collect::<BTreeSet<_>>();
-    let verified_delete_markers = report
-        .verified_committed_delete_marker_refs
+    let verified_delete_markers = audit
+        .delete_marker_checks
         .iter()
-        .cloned()
+        .filter(|check| check.visible_in_list_object_versions)
+        .map(|check| format!("{}@{}", check.key, check.version_id))
         .collect::<BTreeSet<_>>();
     ensure!(
         report.versioning_expected
             && report.expected_committed_versions == expectation.committed_version_refs.len()
             && report.verified_committed_versions == expectation.committed_version_refs.len()
-            && report.verified_committed_version_refs.len() == verified_versions.len()
+            && audit.data_version_checks.len() == verified_versions.len()
             && verified_versions == expectation.committed_version_refs
-            && report.verified_committed_delete_marker_refs.len() == verified_delete_markers.len()
+            && audit.list_object_versions_completed == Some(true)
+            && audit.delete_marker_checks.len() == verified_delete_markers.len()
             && verified_delete_markers == expectation.committed_delete_marker_refs,
         "{name} exact committed version/delete-marker proof does not match history.jsonl"
     );
@@ -2472,6 +3101,78 @@ fn validate_ack_checker_report(
         expectation.trigger_reference
     );
     Ok(())
+}
+
+fn validate_ack_prechecker_boundary(
+    report: &CheckerReport,
+    history: &[OperationRecord],
+    trigger_operation_id: &str,
+    recovery_ended_at_ms: Option<u64>,
+) -> Result<()> {
+    let recovery_ended_at_ms =
+        recovery_ended_at_ms.context("ACK recovery has no completion timestamp")?;
+    let trigger_index = history
+        .iter()
+        .position(|record| record.id == trigger_operation_id)
+        .context("ACK checker history lacks the trigger operation")?;
+    ensure!(
+        report
+            .audit
+            .as_ref()
+            .is_some_and(
+                |audit| audit.history_prefix_record_count == trigger_index + 1
+                    && audit.started_at_ms >= recovery_ended_at_ms
+            ),
+        "ACK prechecker must start after recovery and its prefix must end exactly at the trigger without intervening S3 traffic"
+    );
+    Ok(())
+}
+
+fn validate_ack_checker_phase_chain(
+    prechecker: &CheckerReport,
+    checker: &CheckerReport,
+    bucket: &str,
+    history: &[OperationRecord],
+) -> Result<()> {
+    let pre = prechecker
+        .audit
+        .as_ref()
+        .context("ACK prechecker has no audit")?;
+    let final_audit = checker
+        .audit
+        .as_ref()
+        .context("ACK final checker has no audit")?;
+    let pre_end = pre
+        .history_prefix_record_count
+        .checked_add(pre.history_suffix_record_count)
+        .context("ACK prechecker history bounds overflow")?;
+    let final_end = final_audit
+        .history_prefix_record_count
+        .checked_add(final_audit.history_suffix_record_count)
+        .context("ACK final checker history bounds overflow")?;
+    validate_history_scope_and_order(history, &prechecker.scenario, &prechecker.run_id, bucket)?;
+    ensure!(
+        pre.bucket == bucket
+            && final_audit.bucket == bucket
+            && prechecker.scenario == checker.scenario
+            && prechecker.run_id == checker.run_id,
+        "ACK checker phases do not match the run target identity"
+    );
+    ensure!(
+        pre.history_suffix_record_count > 0
+            && final_audit.history_suffix_record_count > 0
+            && pre.completed_at_ms <= final_audit.started_at_ms
+            && pre_end == final_audit.history_prefix_record_count
+            && final_end == history.len(),
+        "ACK checker phases must be independent, contiguous, ordered, and terminal without recommit"
+    );
+    let prefix = history
+        .get(..pre_end)
+        .context("ACK prechecker exceeds history bounds")?;
+    let suffix = history
+        .get(pre_end..final_end)
+        .context("ACK final checker exceeds history bounds")?;
+    validate_history_phase_boundary(prefix, suffix, "ACK prechecker/final-checker")
 }
 
 fn validate_ack_crash_target_identity(
@@ -2510,13 +3211,30 @@ fn validate_ack_quiet_gap(
     history: &[OperationRecord],
     trigger: &OperationRecord,
     crash_boundary_started_at_ms: u64,
+    crash_boundary_next_sequence: u64,
 ) -> Result<()> {
+    let trigger_start = trigger
+        .started_sequence
+        .context("ACK trigger lacks start sequence")?;
+    let trigger_end = trigger
+        .ended_sequence
+        .context("ACK trigger lacks end sequence")?;
     ensure!(
         trigger.ended_at_ms <= crash_boundary_started_at_ms
+            && trigger_end.checked_add(1) == Some(crash_boundary_next_sequence)
             && history.iter().all(|record| {
                 record.id == trigger.id
-                    || record.ended_at_ms <= trigger.started_at_ms
-                    || record.started_at_ms >= crash_boundary_started_at_ms
+                    || (record.ended_sequence.is_some_and(|end| end < trigger_start)
+                        && record.ended_at_ms <= trigger.started_at_ms)
+                    || (matches!(
+                        record.kind,
+                        OperationKind::Get | OperationKind::List | OperationKind::ListVersions
+                    ) && record.durability_cohort == Some(DurabilityCohort::PostRecovery)
+                        && record.fault_window_relation == Some(FaultWindowRelation::AfterFault)
+                        && record
+                            .started_sequence
+                            .is_some_and(|start| start >= crash_boundary_next_sequence)
+                        && record.started_at_ms >= crash_boundary_started_at_ms)
             }),
         "S3 traffic overlapped the quiet trigger or occurred before its crash boundary"
     );
@@ -2538,36 +3256,66 @@ fn validate_ack_mutation_shape(
     trigger: &OperationRecord,
     kind: AcknowledgedMutationKind,
 ) -> Result<()> {
-    let prior_puts = history
+    let trigger_start = trigger
+        .started_sequence
+        .context("ACK trigger lacks start sequence")?;
+    let prior_mutations = history
         .iter()
         .filter(|record| {
             record.id != trigger.id
                 && record.key == trigger.key
-                && record.kind == OperationKind::Put
+                && matches!(
+                    record.kind,
+                    OperationKind::Put
+                        | OperationKind::Delete
+                        | OperationKind::CompleteMultipartUpload
+                )
                 && record.outcome == OperationOutcome::Ok
+                && record.ended_sequence.is_some_and(|end| end < trigger_start)
                 && record.ended_at_ms <= trigger.started_at_ms
         })
-        .count();
+        .collect::<Vec<_>>();
     match kind {
         AcknowledgedMutationKind::Put | AcknowledgedMutationKind::ZeroBytePut => ensure!(
-            prior_puts == 0,
+            prior_mutations.is_empty(),
             "create-style ACK trigger unexpectedly has a prior object version"
         ),
-        AcknowledgedMutationKind::Overwrite | AcknowledgedMutationKind::DeleteMarker => ensure!(
-            prior_puts == 1,
-            "overwrite/delete-marker ACK trigger must have exactly one baseline version"
-        ),
+        AcknowledgedMutationKind::Overwrite | AcknowledgedMutationKind::DeleteMarker => {
+            ensure!(
+                prior_mutations.len() == 1 && prior_mutations[0].kind == OperationKind::Put,
+                "overwrite/delete-marker ACK trigger must have exactly one baseline PUT"
+            );
+            let baseline = prior_mutations[0];
+            ensure!(
+                baseline
+                    .http_status
+                    .is_some_and(|status| (200..300).contains(&status))
+                    && operation_version_reference(baseline).is_some()
+                    && baseline
+                        .value_sha256
+                        .as_deref()
+                        .is_some_and(|hash| !hash.is_empty())
+                    && baseline.size_bytes.is_some(),
+                "ACK baseline PUT lacks a definite versioned commit with complete payload evidence"
+            );
+        }
         AcknowledgedMutationKind::MultipartComplete => {
+            ensure!(
+                prior_mutations.is_empty(),
+                "multipart ACK trigger unexpectedly has a prior object version"
+            );
             ensure!(
                 history.iter().any(|record| {
                     record.key == trigger.key
                         && record.kind == OperationKind::CreateMultipartUpload
                         && record.outcome == OperationOutcome::Ok
+                        && record.ended_sequence.is_some_and(|end| end < trigger_start)
                         && record.ended_at_ms <= trigger.started_at_ms
                 }) && history.iter().any(|record| {
                     record.key == trigger.key
                         && record.kind == OperationKind::UploadPart
                         && record.outcome == OperationOutcome::Ok
+                        && record.ended_sequence.is_some_and(|end| end < trigger_start)
                         && record.ended_at_ms <= trigger.started_at_ms
                 }),
                 "multipart ACK trigger lacks successfully staged upload evidence"
@@ -3139,7 +3887,352 @@ fn read_expected_failure_checker(
         report.scenario == scenario && report.run_id == run_id,
         "{name} identity does not match the current attempt"
     );
+    if acknowledged_mutation_kind(scenario).is_some() {
+        let case_dir = path.parent().context("ACK checker has no case directory")?;
+        let history =
+            read_jsonl::<OperationRecord>(&bound_case_artifact(case_dir, "history.jsonl")?)?;
+        let ack = read_json::<AckTriggeredCrashEvidenceArtifact>(&bound_case_artifact(
+            case_dir,
+            "ack-to-fault-evidence.json",
+        )?)?;
+        let spec = read_json::<FaultRunSpec>(&bound_case_artifact(case_dir, "run-spec.json")?)?;
+        let evidence = read_json::<FaultEvidenceArtifact>(&bound_case_artifact(
+            case_dir,
+            "fault-evidence.json",
+        )?)?;
+        validate_ack_expected_failure_report(&report, &history, &ack, &spec.metadata.bucket)?;
+        if name == "checker-report.json" {
+            let prechecker = read_json::<CheckerReport>(&bound_case_artifact(
+                case_dir,
+                "checker-pre-recommit-report.json",
+            )?)?;
+            validate_checker_report(
+                "checker-pre-recommit-report.json",
+                &prechecker,
+                true,
+                &history,
+            )?;
+            validate_ack_prechecker_boundary(
+                &prechecker,
+                &history,
+                &ack.trigger_operation_id,
+                evidence.recovery_ended_at_ms,
+            )?;
+            validate_ack_checker_phase_chain(
+                &prechecker,
+                &report,
+                &spec.metadata.bucket,
+                &history,
+            )?;
+        } else {
+            validate_ack_prechecker_boundary(
+                &report,
+                &history,
+                &ack.trigger_operation_id,
+                evidence.recovery_ended_at_ms,
+            )?;
+        }
+    }
     Ok(report)
+}
+
+fn validate_ack_expected_failure_report(
+    report: &CheckerReport,
+    history: &[OperationRecord],
+    ack: &AckTriggeredCrashEvidenceArtifact,
+    bucket: &str,
+) -> Result<()> {
+    validate_history_scope_and_order(history, &ack.scenario, &ack.run_id, bucket)?;
+    let (prefix, suffix) = checker::validate_checker_audit_receipt(report, history)?;
+    let audit = report
+        .audit
+        .as_ref()
+        .context("ACK failure checker has no audit")?;
+    ensure!(
+        report.scenario == ack.scenario
+            && report.run_id == ack.run_id
+            && audit.bucket == bucket
+            && report.versioning_expected
+            && !report.passed,
+        "ACK failure checker does not match the versioned run identity or verdict"
+    );
+    let trigger = prefix
+        .iter()
+        .find(|record| record.id == ack.trigger_operation_id)
+        .context("ACK failure checker prefix lacks the committed trigger")?;
+    ensure!(
+        trigger.kind == ack_operation_kind(ack.trigger_kind)
+            && trigger.key.as_deref() == Some(ack.trigger_key.as_str())
+            && trigger.version_id.as_deref() == Some(ack.trigger_version_id.as_str())
+            && trigger.outcome == OperationOutcome::Ok,
+        "ACK failure checker trigger does not match its authenticated history"
+    );
+    validate_ack_quiet_gap(
+        history,
+        trigger,
+        ack.crash_boundary_started_at_ms,
+        ack.crash_boundary_next_sequence,
+    )?;
+    let protected_history = &prefix[..prefix
+        .iter()
+        .position(|record| record.id == trigger.id)
+        .context("ACK trigger disappeared from its authenticated prefix")?
+        + 1];
+    let data_signal = ack_data_version_failure_signal(report, protected_history, suffix, trigger)?;
+    let current_signal = ack_current_get_failure_signal(report, suffix, trigger)?;
+    let listing_signal =
+        ack_version_listing_failure_signal(report, protected_history, suffix, trigger)?;
+    ensure!(
+        data_signal || current_signal || listing_signal,
+        "ACK failure classification is not supported by the authenticated protected-key observations"
+    );
+    Ok(())
+}
+
+fn ack_data_version_failure_signal(
+    report: &CheckerReport,
+    prefix: &[OperationRecord],
+    suffix: &[OperationRecord],
+    trigger: &OperationRecord,
+) -> Result<bool> {
+    let audit = report
+        .audit
+        .as_ref()
+        .context("ACK failure checker has no audit")?;
+    let mut proven = false;
+    for version in prefix.iter().filter(|record| {
+        record.key == trigger.key
+            && record.outcome == OperationOutcome::Ok
+            && matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::CompleteMultipartUpload
+            )
+    }) {
+        ensure!(
+            version
+                .value_sha256
+                .as_ref()
+                .is_some_and(|hash| !hash.is_empty())
+                && version.size_bytes.is_some()
+                && version
+                    .http_status
+                    .is_some_and(|status| (200..300).contains(&status)),
+            "protected ACK data version lacks a complete committed payload receipt"
+        );
+        let reference = operation_version_reference(version)
+            .context("protected ACK data version has no identity")?;
+        let gets = suffix
+            .iter()
+            .filter(|record| {
+                record.kind == OperationKind::Get
+                    && record.key == version.key
+                    && record.version_id == version.version_id
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            gets.len() == 1 && gets[0].range.is_none(),
+            "ACK failure needs exactly one full GET per protected data version"
+        );
+        let get = gets[0];
+        let checks = audit
+            .data_version_checks
+            .iter()
+            .filter(|check| {
+                Some(check.key.as_str()) == version.key.as_deref()
+                    && Some(check.version_id.as_str()) == version.version_id.as_deref()
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            checks.len() == 1
+                && Some(checks[0].expected_sha256.as_str()) == version.value_sha256.as_deref()
+                && checks[0].observed_sha256 == get.value_sha256
+                && checks[0].outcome == get.outcome
+                && checks[0].http_status == get.http_status,
+            "ACK data-version audit does not match the protected version GET"
+        );
+        proven |= match report.failure_classification() {
+            RecoveryStabilityClassification::CommittedVersionMissing => {
+                get.outcome == OperationOutcome::NotFound
+                    && get.http_status == Some(404)
+                    && report.missing_committed_versions.contains(&reference)
+            }
+            RecoveryStabilityClassification::VersionHashMismatch => {
+                get.outcome == OperationOutcome::Ok
+                    && get.http_status == Some(200)
+                    && get.value_sha256.is_some()
+                    && (get.value_sha256 != version.value_sha256
+                        || get.size_bytes != version.size_bytes)
+                    && report
+                        .version_hash_mismatches
+                        .iter()
+                        .any(|item| item.starts_with(&format!("{reference}:")))
+            }
+            RecoveryStabilityClassification::CommittedVersionUnavailable => {
+                matches!(
+                    get.outcome,
+                    OperationOutcome::Failed
+                        | OperationOutcome::Timeout
+                        | OperationOutcome::Unknown
+                ) && get.value_sha256.is_none()
+                    && get.size_bytes.is_none()
+                    && get.error.as_ref().is_some_and(|error| !error.is_empty())
+                    && report
+                        .unavailable_committed_versions
+                        .iter()
+                        .any(|item| item.starts_with(&format!("{reference}:")))
+            }
+            _ => false,
+        };
+    }
+    Ok(proven)
+}
+
+fn ack_current_get_failure_signal(
+    report: &CheckerReport,
+    suffix: &[OperationRecord],
+    trigger: &OperationRecord,
+) -> Result<bool> {
+    let key = trigger.key.as_deref().context("ACK trigger has no key")?;
+    let gets = suffix
+        .iter()
+        .filter(|record| {
+            record.kind == OperationKind::Get
+                && record.key == trigger.key
+                && record.version_id.is_none()
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        gets.len() == 1 && gets[0].range.is_none(),
+        "ACK checker must capture exactly one full current GET for its trigger key"
+    );
+    let get = gets[0];
+    let is_delete = trigger.kind == OperationKind::Delete;
+    let successful_body = get.outcome == OperationOutcome::Ok
+        && get.http_status == Some(200)
+        && get.value_sha256.is_some()
+        && get.size_bytes.is_some();
+    Ok(match report.failure_classification() {
+        RecoveryStabilityClassification::DeletedObjectResurrected =>
+            is_delete && successful_body
+                && report.resurrected_deleted_objects.iter().any(|item| item.starts_with(&format!("{key}:"))),
+        RecoveryStabilityClassification::DataCorruption =>
+            !is_delete && successful_body
+                && (get.value_sha256 != trigger.value_sha256 || get.size_bytes != trigger.size_bytes)
+                && report.hash_mismatches.iter().any(|item| item.starts_with(&format!("{key}:"))),
+        RecoveryStabilityClassification::CommittedObjectUnavailable => !is_delete && (
+            (get.outcome == OperationOutcome::NotFound && get.http_status == Some(404)
+                && report.missing_committed_objects.iter().any(|item| item == key))
+            || report.unavailable_committed_objects.iter().chain(&report.unknown_committed_read_failures).any(|failure| {
+                matches!(failure, checker::CommittedReadFailure::Observed {
+                    key: observed_key, outcome, http_status, error, unexpected_body_bytes: None,
+                } if observed_key == key && *outcome == get.outcome && *http_status == get.http_status
+                    && *error == get.error && matches!(get.outcome, OperationOutcome::Failed | OperationOutcome::Timeout | OperationOutcome::Unknown))
+            })),
+        _ => false,
+    })
+}
+
+fn ack_version_listing_failure_signal(
+    report: &CheckerReport,
+    prefix: &[OperationRecord],
+    suffix: &[OperationRecord],
+    trigger: &OperationRecord,
+) -> Result<bool> {
+    let audit = report
+        .audit
+        .as_ref()
+        .context("ACK failure checker has no audit")?;
+    let prefix_key = crate::fault::workload::ObjectSpec::key_prefix(&report.run_id);
+    let lists = suffix
+        .iter()
+        .filter(|record| {
+            record.kind == OperationKind::ListVersions
+                && record.key.as_deref() == Some(prefix_key.as_str())
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        lists.len() == 1,
+        "ACK checker must capture exactly one ListObjectVersions receipt"
+    );
+    let list = lists[0];
+    let completed = list.outcome == OperationOutcome::Ok && list.http_status == Some(200);
+    ensure!(
+        audit.list_object_versions_completed == Some(completed),
+        "ACK version-list completion audit does not match its receipt"
+    );
+    let entries = if completed {
+        list.listed_versions
+            .as_deref()
+            .context("ACK version listing lacks captured entries")?
+    } else {
+        &[]
+    };
+    let mut proven = false;
+    for version in prefix.iter().filter(|record| {
+        record.key == trigger.key
+            && record.outcome == OperationOutcome::Ok
+            && matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::CompleteMultipartUpload | OperationKind::Delete
+            )
+    }) {
+        let reference = operation_version_reference(version)
+            .context("protected ACK version has no identity")?;
+        let is_marker = version.kind == OperationKind::Delete;
+        let visible = entries.iter().any(|entry| {
+            Some(entry.key.as_str()) == version.key.as_deref()
+                && entry.version_id == version.version_id
+                && entry.is_delete_marker == is_marker
+        });
+        if is_marker {
+            let checks = audit
+                .delete_marker_checks
+                .iter()
+                .filter(|check| {
+                    Some(check.key.as_str()) == version.key.as_deref()
+                        && Some(check.version_id.as_str()) == version.version_id.as_deref()
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                checks.len() == 1 && checks[0].visible_in_list_object_versions == visible,
+                "ACK marker audit does not match the protected version listing"
+            );
+        }
+        proven |=
+            completed
+                && !visible
+                && match report.failure_classification() {
+                    RecoveryStabilityClassification::DeleteMarkerMissing => is_marker
+                        && report.missing_committed_delete_markers.contains(&format!(
+                            "{reference}: committed delete marker missing from ListObjectVersions"
+                        )),
+                    RecoveryStabilityClassification::CommittedVersionMissing => {
+                        !is_marker
+                            && report.missing_committed_versions.contains(&format!(
+                                "{reference}: committed version missing from ListObjectVersions"
+                            ))
+                    }
+                    _ => false,
+                };
+    }
+    if completed
+        && report.failure_classification()
+            == RecoveryStabilityClassification::DeleteMarkerLineageIncomplete
+    {
+        let latest = entries
+            .iter()
+            .filter(|entry| Some(entry.key.as_str()) == trigger.key.as_deref() && entry.is_latest)
+            .collect::<Vec<_>>();
+        let key = trigger.key.as_deref().context("ACK trigger has no key")?;
+        proven |= (latest.len() != 1
+            || latest[0].version_id != trigger.version_id
+            || latest[0].is_delete_marker != (trigger.kind == OperationKind::Delete))
+            && report
+                .delete_marker_lineage_incomplete
+                .iter()
+                .any(|item| item.starts_with(&format!("{key}:")));
+    }
+    Ok(proven)
 }
 
 fn failure_summary_reference_root(validation_root: &Path) -> &Path {
@@ -3554,6 +4647,10 @@ struct FaultEvidenceArtifact {
     recovery_started_at_ms: Option<u64>,
     #[serde(default)]
     recovery_ended_at_ms: Option<u64>,
+    #[serde(default)]
+    quorum_health_before_workload: Option<QuorumHealthObservation>,
+    #[serde(default)]
+    quorum_health_after_workload: Option<QuorumHealthObservation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3610,6 +4707,7 @@ struct AckTriggeredCrashEvidenceArtifact {
     ack_to_fault_ms: u64,
     max_ack_to_fault_ms: u64,
     crash_boundary_started_at_ms: u64,
+    crash_boundary_next_sequence: u64,
     ack_to_crash_boundary_ms: u64,
 }
 
@@ -3660,7 +4758,20 @@ struct RecommitReportArtifact {
     committed: usize,
     failed: usize,
     harness_errors: usize,
-    attempts: Vec<Value>,
+    attempts: Vec<RecommitAttemptArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecommitAttemptArtifact {
+    source_operation_id: String,
+    key: String,
+    size_bytes: usize,
+    sha256: String,
+    outcome: Option<OperationOutcome>,
+    verify_get_outcome: Option<OperationOutcome>,
+    http_status: Option<u16>,
+    error: Option<String>,
+    harness_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3672,6 +4783,8 @@ struct WorkloadSummaryArtifact {
     seed: u64,
     object_count: usize,
     concurrency: usize,
+    #[serde(default)]
+    recommit_candidates: Option<RecommitCandidateManifestArtifact>,
     recommitted_after_recovery: usize,
     puts: OutcomeCountsArtifact,
     gets: OutcomeCountsArtifact,
@@ -3679,6 +4792,24 @@ struct WorkloadSummaryArtifact {
     lists: OutcomeCountsArtifact,
     multipart_completes: OutcomeCountsArtifact,
     multipart_aborts: OutcomeCountsArtifact,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecommitCandidateManifestArtifact {
+    scenario: String,
+    run_id: String,
+    bucket: String,
+    history_record_count: usize,
+    history_sha256: String,
+    candidates: Vec<RecommitCandidateArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecommitCandidateArtifact {
+    source_operation_id: String,
+    key: String,
+    size_bytes: usize,
+    sha256: String,
 }
 
 impl WorkloadSummaryArtifact {
@@ -3716,22 +4847,74 @@ impl WorkloadSummaryArtifact {
         workload_started_at_ms: u64,
         workload_ended_at_ms: u64,
     ) -> Result<()> {
-        ensure!(
-            self.puts.total() > 0
-                && self.deletes.total() > 0
-                && self.multipart_completes.total() > 0,
-            "workload-summary.json did not exercise every committing mutation family"
-        );
-        for (kind, counts) in [
+        self.require_rejected_write_mutations(&[
             ("PUT", &self.puts),
             ("DELETE", &self.deletes),
             ("CompleteMultipartUpload", &self.multipart_completes),
-        ] {
+        ])?;
+        self.require_write_mutation_history_matches(
+            history,
+            scenario,
+            bucket,
+            workload_started_at_ms,
+            workload_ended_at_ms,
+        )
+    }
+
+    fn require_typed_write_quorum_loss_effect(
+        &self,
+        history: &[OperationRecord],
+        scenario: &str,
+        bucket: &str,
+        unavailable_mutations: &[QuorumMutationClass],
+        workload_started_at_ms: u64,
+        workload_ended_at_ms: u64,
+    ) -> Result<()> {
+        let mutations = unavailable_mutations
+            .iter()
+            .map(|mutation| match mutation {
+                QuorumMutationClass::PutObject => ("PUT", &self.puts),
+                QuorumMutationClass::DeleteMarker => ("DELETE", &self.deletes),
+                QuorumMutationClass::MultipartComplete => {
+                    ("CompleteMultipartUpload", &self.multipart_completes)
+                }
+            })
+            .collect::<Vec<_>>();
+        self.require_rejected_write_mutations(&mutations)?;
+        self.require_write_mutation_history_matches(
+            history,
+            scenario,
+            bucket,
+            workload_started_at_ms,
+            workload_ended_at_ms,
+        )
+    }
+
+    fn require_rejected_write_mutations(
+        &self,
+        mutations: &[(&str, &OutcomeCountsArtifact)],
+    ) -> Result<()> {
+        ensure!(
+            mutations.iter().all(|(_, counts)| counts.total() > 0),
+            "workload-summary.json did not exercise every mutation selected by the quorum case"
+        );
+        for (kind, counts) in mutations {
             ensure!(
                 counts.ok == 0 && counts.not_found == 0 && counts.disrupted()? > 0,
                 "write-quorum-loss {kind} outcomes must all be failed, timed out, or unknown: {counts:?}"
             );
         }
+        Ok(())
+    }
+
+    fn require_write_mutation_history_matches(
+        &self,
+        history: &[OperationRecord],
+        scenario: &str,
+        bucket: &str,
+        workload_started_at_ms: u64,
+        workload_ended_at_ms: u64,
+    ) -> Result<()> {
         for (kind, summary_counts) in [
             (OperationKind::Put, &self.puts),
             (OperationKind::Delete, &self.deletes),
@@ -3804,41 +4987,55 @@ impl OutcomeCountsArtifact {
 mod tests {
     use super::{
         ArtifactValidationOptions, FailureSummary, FaultEvidenceArtifact, OutcomeCountsArtifact,
-        WorkloadSummaryArtifact, recursive_find, validate_fault_artifacts,
+        RecommitCandidateManifestArtifact, RecommitReportArtifact, WorkloadSummaryArtifact,
+        derive_recommit_candidates, read_json, read_jsonl, recursive_find,
+        validate_checker_phase_chain, validate_fault_artifacts,
         validate_fault_artifacts_and_write_report,
         validate_fault_artifacts_for_planned_attempt_and_write_report,
         validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts, validate_run_spec,
-        validate_target_proof, validate_write_quorum_runtime_evidence,
+        validate_target_proof, validate_volume_quorum_health_evidence,
+        validate_write_quorum_runtime_evidence,
     };
     use crate::fault::{
-        checker::{RecoveryStabilityClassification, RecoveryStabilityReport},
+        acknowledged_mutation::AcknowledgedMutationKind,
+        checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
         config::FaultTestConfig,
-        history::{OperationOutcome, OperationRecord},
+        history::{
+            ByteRange, DurabilityCohort, FaultWindowRelation, ListedVersionEntry, OperationKind,
+            OperationOutcome, OperationRecord,
+        },
         host_storage::{
             HostStorageAllowlist, HostStorageMutationIntent, HostStorageMutationProof,
             HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
             HostStoragePostCleanupObservation, HostStorageTargetObservation,
         },
-        plan::{FaultInjection, FaultKind, FaultPlan, FaultSelection, FaultTarget},
+        plan::{
+            FaultInjection, FaultInjectionParameters, FaultKind, FaultPlan, FaultPlanOptions,
+            FaultSelection, FaultTarget,
+        },
         preflight::{
             TargetNodeAffinityProof, TargetNodeSelectorRequirementProof,
             TargetNodeSelectorTermProof, TargetPersistentVolumeClaimProof,
             TargetPersistentVolumeProof, TargetProof, TargetResolvedPodProof,
             TargetVolumeMountProof,
         },
-        quorum::{ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape},
+        quorum::{
+            ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape,
+            QuorumCaseClass, QuorumDriveHealth, QuorumHealthObservation, QuorumVolumeBinding,
+            QuorumVolumeBoundary, QuorumVolumeTargetProof,
+        },
         reporting::{
             AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity,
             FailureVerdict, ResponsibilityDomain,
         },
         scenarios::{
             DM_FLAKEY_SCENARIO, FaultScenario, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
-            scenario_spec,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, apply_catalog_defaults, scenario_spec,
         },
         spec::{FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec},
         workload::WorkloadPlan,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::{collections::BTreeMap, fs, time::Duration};
 
     #[test]
@@ -3862,8 +5059,304 @@ mod tests {
         assert_eq!(report.scenario, "io-eio");
         assert_eq!(
             report.validation_summary_tsv_row(),
-            "io-eio\t42\t0\t2\t1\t7\t0\t0\t0\t0\ttrue"
+            "io-eio\t42\t0\t2\t1\t2\t0\t0\t0\t0\ttrue"
         );
+    }
+
+    #[test]
+    fn successful_artifact_validation_requires_history_bound_checker_audits() {
+        for name in ["checker-pre-recommit-report.json", "checker-report.json"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_success_artifacts(dir.path(), "io-eio");
+            let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+            let path = case_dir.join(name);
+            let mut report: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).expect("checker report"))
+                    .expect("checker JSON");
+            report
+                .as_object_mut()
+                .expect("checker object")
+                .remove("audit");
+            write_json(&case_dir, name, &report);
+
+            let error = validate_fault_artifacts(&success_options(dir.path()))
+                .expect_err("a successful current report cannot omit its audit");
+            assert!(format!("{error:#}").contains("history-bound audit"));
+        }
+    }
+
+    #[test]
+    fn final_checker_audit_must_cover_terminal_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("history.jsonl");
+        let current = fs::read_to_string(&path).expect("history");
+        let appended = json!({
+            "id": "op-000004",
+            "scenario": "io-eio",
+            "run_id": "run-00000000-0000-4000-8000-000000000001",
+            "kind": "put",
+            "bucket": "bucket",
+            "key": "late-key",
+            "value_sha256": "late-sha",
+            "size_bytes": 1,
+            "started_at_ms": 16,
+            "ended_at_ms": 17,
+            "outcome": "ok",
+            "http_status": 200,
+            "error": null
+        });
+        fs::write(&path, format!("{current}{appended}\n")).expect("append history mutation");
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("final checker cannot ignore a later history mutation");
+        assert!(format!("{error:#}").contains("terminal history.jsonl record"));
+    }
+
+    #[test]
+    fn checker_phase_audits_must_be_ordered_and_independent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let final_report =
+            fs::read_to_string(case_dir.join("checker-report.json")).expect("final checker report");
+        fs::write(
+            case_dir.join("checker-pre-recommit-report.json"),
+            final_report,
+        )
+        .expect("copy final checker report over pre-recommit report");
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("a final audit cannot stand in for the pre-recommit phase");
+        assert!(
+            format!("{error:#}").contains("authenticated pre-recommit history"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recommit_report_must_match_history_between_checker_phases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("recommit-report.json");
+        let mut recommit: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("recommit report"))
+                .expect("recommit JSON");
+        recommit["attempts"][0]["sha256"] = json!("forged-sha");
+        write_json(&case_dir, "recommit-report.json", &recommit);
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("recommit report must be bound to its history operations");
+        assert!(
+            format!("{error:#}").contains("sealed candidate manifest"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recommit_candidates_cannot_be_omitted_from_the_sealed_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join("workload-summary.json");
+        let mut summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("workload summary"))
+                .expect("summary JSON");
+        summary["recommit_candidates"]["candidates"] = json!([]);
+        write_json(&case_dir, "workload-summary.json", &summary);
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("an authenticated final ambiguous mutation cannot be omitted");
+        assert!(
+            format!("{error:#}").contains("final unconfirmed mutations"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recommit_history_must_use_the_run_bucket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        rewrite_history_and_refresh_final_audit(&case_dir, |records| {
+            for record in &mut records[4..6] {
+                record.bucket = "other-bucket".to_string();
+            }
+        });
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("recommit evidence from another bucket must be rejected");
+        assert!(
+            format!("{error:#}").contains("outside the checker run"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recommit_put_must_happen_before_its_verification_get() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        rewrite_history_and_refresh_final_audit(&case_dir, |records| {
+            let put_ended = records[4].ended_sequence;
+            records[4].ended_sequence = records[5].started_sequence;
+            records[5].started_sequence = put_ended;
+        });
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("verification GET must begin after its candidate PUT ended");
+        assert!(
+            format!("{error:#}").contains("happens-before order"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn checker_phase_chain_rejects_cross_phase_sequence_overlap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let original = read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl"))
+            .expect("fixture history");
+        let prechecker =
+            read_json::<CheckerReport>(&case_dir.join("checker-pre-recommit-report.json"))
+                .expect("prechecker");
+        let checker =
+            read_json::<CheckerReport>(&case_dir.join("checker-report.json")).expect("checker");
+        let recommit = read_json::<RecommitReportArtifact>(&case_dir.join("recommit-report.json"))
+            .expect("recommit");
+        let summary = read_json::<WorkloadSummaryArtifact>(&case_dir.join("workload-summary.json"))
+            .expect("summary");
+        let manifest = summary.recommit_candidates.as_ref().expect("manifest");
+        let pre_audit = prechecker.audit.as_ref().expect("pre audit");
+        let pre_end = pre_audit.history_prefix_record_count + pre_audit.history_suffix_record_count;
+        let final_prefix_count = checker
+            .audit
+            .as_ref()
+            .expect("final audit")
+            .history_prefix_record_count;
+
+        for (left, right, boundary) in [
+            (pre_end - 1, pre_end, "prechecker/recommit"),
+            (
+                final_prefix_count - 1,
+                final_prefix_count,
+                "recommit/final-checker",
+            ),
+        ] {
+            let mut history = original.clone();
+            let left_end = history[left].ended_sequence.expect("left end");
+            let right_start = history[right].started_sequence.expect("right start");
+            history[left].ended_sequence = Some(right_start);
+            history[right].started_sequence = Some(left_end);
+
+            let error = validate_checker_phase_chain(
+                &prechecker,
+                &checker,
+                &recommit,
+                manifest,
+                "bucket",
+                &history,
+            )
+            .expect_err("cross-phase operations must not overlap");
+            assert!(error.to_string().contains(boundary), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn offline_candidate_derivation_scales_to_twenty_thousand_keys() {
+        const CANDIDATES: usize = 20_000;
+        let records = (0..CANDIDATES)
+            .map(|index| OperationRecord {
+                id: format!("op-{index:06}"),
+                scenario: "storage".to_string(),
+                run_id: Some("run-1".to_string()),
+                kind: OperationKind::Put,
+                bucket: "bucket".to_string(),
+                key: Some(format!("key-{index:06}")),
+                value_sha256: Some(format!("hash-{index:06}")),
+                size_bytes: Some(1),
+                version_id: None,
+                listed_keys: None,
+                listed_versions: None,
+                payload_ref: None,
+                range: None,
+                started_sequence: Some((index as u64) * 2 + 1),
+                ended_sequence: Some((index as u64) * 2 + 2),
+                started_at_ms: (index as u64) * 2 + 1,
+                ended_at_ms: (index as u64) * 2 + 2,
+                outcome: OperationOutcome::Timeout,
+                http_status: None,
+                error: Some("timeout".to_string()),
+                durability_cohort: None,
+                fault_window_relation: None,
+            })
+            .collect::<Vec<_>>();
+
+        let candidates = derive_recommit_candidates(&records).expect("linear derivation");
+        assert_eq!(candidates.len(), CANDIDATES);
+    }
+
+    #[test]
+    fn checker_phase_chain_accepts_zero_recommit_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let mut history = read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl"))
+            .expect("read fixture history");
+        history[1].outcome = OperationOutcome::Ok;
+        history[1].http_status = Some(200);
+        history[1].error = None;
+        history.drain(4..6);
+        for (index, record) in history.iter_mut().enumerate() {
+            record.started_sequence = Some((index as u64) * 2 + 1);
+            record.ended_sequence = Some((index as u64) * 2 + 2);
+        }
+        let pre_prefix = &history[..2];
+        let final_prefix = &history[..4];
+
+        let mut prechecker =
+            read_json::<CheckerReport>(&case_dir.join("checker-pre-recommit-report.json"))
+                .expect("prechecker");
+        let mut checker =
+            read_json::<CheckerReport>(&case_dir.join("checker-report.json")).expect("checker");
+        let pre_audit = prechecker.audit.as_mut().expect("pre audit");
+        pre_audit.history_prefix_sha256 =
+            checker::checker_history_records_sha256(pre_prefix).expect("pre digest");
+        let final_audit = checker.audit.as_mut().expect("final audit");
+        final_audit.history_prefix_record_count = final_prefix.len();
+        final_audit.history_prefix_sha256 =
+            checker::checker_history_records_sha256(final_prefix).expect("final digest");
+        let manifest = RecommitCandidateManifestArtifact {
+            scenario: "io-eio".to_string(),
+            run_id: "run-00000000-0000-4000-8000-000000000001".to_string(),
+            bucket: "bucket".to_string(),
+            history_record_count: pre_prefix.len(),
+            history_sha256: checker::checker_history_records_sha256(pre_prefix)
+                .expect("manifest digest"),
+            candidates: Vec::new(),
+        };
+        let recommit = RecommitReportArtifact {
+            scenario: Some("io-eio".to_string()),
+            run_id: Some("run-00000000-0000-4000-8000-000000000001".to_string()),
+            attempted: 0,
+            committed: 0,
+            failed: 0,
+            harness_errors: 0,
+            attempts: Vec::new(),
+        };
+
+        validate_checker_phase_chain(
+            &prechecker,
+            &checker,
+            &recommit,
+            &manifest,
+            "bucket",
+            &history,
+        )
+        .expect("zero-candidate phase chain");
     }
 
     #[test]
@@ -3945,11 +5438,9 @@ mod tests {
             let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
             let path = case_dir.join(name);
             if name == "history.jsonl" {
-                let mut record: serde_json::Value =
-                    serde_json::from_str(fs::read_to_string(&path).expect("history").trim())
-                        .expect("record");
-                record["run_id"] = json!("run-old");
-                fs::write(&path, format!("{record}\n")).expect("write history");
+                rewrite_first_history_record(&path, |record| {
+                    record["run_id"] = json!("run-old");
+                });
             } else {
                 let mut artifact: serde_json::Value =
                     serde_json::from_str(&fs::read_to_string(&path).expect("artifact"))
@@ -3987,11 +5478,9 @@ mod tests {
             let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
             let path = case_dir.join(name);
             if name == "history.jsonl" {
-                let mut record: serde_json::Value =
-                    serde_json::from_str(fs::read_to_string(&path).expect("history").trim())
-                        .expect("record");
-                record.as_object_mut().expect("object").remove("run_id");
-                fs::write(&path, format!("{record}\n")).expect("write history");
+                rewrite_first_history_record(&path, |record| {
+                    record.as_object_mut().expect("object").remove("run_id");
+                });
             } else {
                 let mut artifact: serde_json::Value =
                     serde_json::from_str(&fs::read_to_string(&path).expect("artifact"))
@@ -4005,7 +5494,13 @@ mod tests {
                 write_json(&case_dir, name, &artifact);
             }
             let options = success_options(dir.path());
-            validate_fault_artifacts(&options).expect("legacy additive field may be absent");
+            if name == "history.jsonl" {
+                let legacy = validate_fault_artifacts(&options)
+                    .expect_err("history identity removal invalidates the checker audit");
+                assert!(format!("{legacy:#}").contains("audit"));
+            } else {
+                validate_fault_artifacts(&options).expect("legacy additive field may be absent");
+            }
             let strict = validate_fault_artifacts_for_planned_attempt_and_write_report(
                 &options,
                 "run-00000000-0000-4000-8000-000000000001",
@@ -4037,7 +5532,8 @@ mod tests {
         let path = case_dir.join("history.jsonl");
         let current = fs::read_to_string(&path).expect("history");
         let mut other: serde_json::Value =
-            serde_json::from_str(current.trim()).expect("operation record");
+            serde_json::from_str(current.lines().next().expect("history record"))
+                .expect("operation record");
         other["id"] = json!("op-000002");
         other["run_id"] = json!("run-old");
         fs::write(&path, format!("{current}{other}\n")).expect("mixed history");
@@ -4167,10 +5663,12 @@ mod tests {
                 .with_ready(true)
                 .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
                     name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-0".to_string(),
                     volume_name: Some("pv-csi".to_string()),
                     storage_class: Some("fast-csi".to_string()),
                     persistent_volume: Some(TargetPersistentVolumeProof {
                         name: "pv-csi".to_string(),
+                        uid: "pv-uid-0".to_string(),
                         source: Some("csi".to_string()),
                         required_node_affinity: None,
                         node: None,
@@ -4246,10 +5744,12 @@ mod tests {
                     }])
                     .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
                         name: format!("data-{index}"),
+                        uid: format!("pvc-uid-{index}"),
                         volume_name: Some(format!("pv-{index}")),
                         storage_class: Some("fast-csi".to_string()),
                         persistent_volume: Some(TargetPersistentVolumeProof {
                             name: format!("pv-{index}"),
+                            uid: format!("pv-uid-{index}"),
                             source: Some("local".to_string()),
                             required_node_affinity: Some(TargetNodeAffinityProof {
                                 well_formed: true,
@@ -4524,6 +6024,245 @@ mod tests {
     }
 
     #[test]
+    fn runtime_quorum_artifacts_bind_typed_boundary_to_every_volume() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO.to_string();
+        config.scenario_parameters = FaultInjectionParameters::QuorumIo {
+            class: QuorumCaseClass::Metadata,
+        };
+        apply_catalog_defaults(&mut config).expect("quorum defaults");
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario_with_options(
+            &scenario,
+            catalog,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("semantic plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let run_spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+        let shape =
+            ErasureSetShape::from_runtime_single_set(4, 1, &[1], &[4], 2).expect("runtime shape");
+        let membership = ErasureSetMembership::from_runtime(
+            &shape,
+            (0..4)
+                .map(|index| ErasureSetMember {
+                    pod_name: format!("rustfs-{index}"),
+                    server_endpoint: format!("http://rustfs-{index}:9000"),
+                    shard_ids: vec![format!("drive-{index}")],
+                })
+                .collect(),
+        )
+        .expect("runtime membership");
+        let pods = (0..4)
+            .map(|index| {
+                TargetResolvedPodProof::new(format!("rustfs-{index}"), format!("uid-{index}"))
+                    .with_node(format!("node-{index}"))
+                    .with_node_labels(BTreeMap::from([(
+                        "kubernetes.io/hostname".to_string(),
+                        format!("node-{index}"),
+                    )]))
+                    .with_ready(true)
+                    .with_rustfs_container_id(format!("containerd://rustfs-{index}"))
+                    .with_volume_mounts(vec![TargetVolumeMountProof {
+                        container_name: "rustfs".to_string(),
+                        mount_path: "/data/rustfs0".to_string(),
+                        volume_name: format!("data-{index}"),
+                        persistent_volume_claim: Some(format!("data-{index}")),
+                    }])
+                    .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
+                        name: format!("data-{index}"),
+                        volume_name: Some(format!("pv-{index}")),
+                        uid: format!("pvc-uid-{index}"),
+                        storage_class: Some("fast-csi".to_string()),
+                        persistent_volume: Some(TargetPersistentVolumeProof {
+                            name: format!("pv-{index}"),
+                            source: Some("csi".to_string()),
+                            uid: format!("pv-uid-{index}"),
+                            required_node_affinity: None,
+                            node: None,
+                            device_or_path: Some(format!("csi://volume-{index}")),
+                        }),
+                    }])
+            })
+            .collect::<Vec<_>>();
+        let boundary = QuorumVolumeBoundary {
+            class: QuorumCaseClass::Metadata,
+            beyond_read_tolerance: true,
+        };
+        let volume_quorum = QuorumVolumeTargetProof::from_runtime(
+            &shape,
+            &membership,
+            boundary,
+            (0..4)
+                .map(|index| QuorumVolumeBinding {
+                    pod_name: format!("rustfs-{index}"),
+                    pod_uid: format!("uid-{index}"),
+                    container_id: format!("containerd://rustfs-{index}"),
+                    mount_path: "/data/rustfs0".to_string(),
+                    persistent_volume_claim: format!("data-{index}"),
+                    persistent_volume: format!("pv-{index}"),
+                    drive_uuid: format!("drive-{index}"),
+                    pool_index: 0,
+                    set_index: 0,
+                })
+                .collect(),
+        )
+        .expect("volume quorum proof");
+        assert_eq!(volume_quorum.target_count, 3);
+        let proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs(pods)
+            .with_erasure_set_topology_proven(
+                shape.clone(),
+                ErasureSetHealth::from_runtime(4, 4, 0, 0).expect("runtime health"),
+                membership.clone(),
+                "deployment-1",
+                100,
+            )
+            .expect("topology proof")
+            .with_volume_quorum_proven(volume_quorum.clone())
+            .expect("drive binding proof");
+        let options = ArtifactValidationOptions {
+            scenario: scenario.name.clone(),
+            artifact_root: std::path::PathBuf::from("unused"),
+            expected_workload_objects: scenario.object_count,
+            expected_workload_concurrency: config.workload.concurrency,
+            expected_workload_versioning: true,
+            expected_rustfs_pod_count: config.expected_rustfs_pod_count,
+            expected_stable_window_seconds: config.rustfs_pod_stable_window.as_secs(),
+            expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
+            expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
+        };
+
+        validate_run_spec(&run_spec, &options).expect("semantic run spec");
+        validate_target_proof(&proof, &run_spec, &options).expect("runtime quorum target proof");
+
+        for field in ["pod_uid", "container_id", "mount_path", "pvc", "pv"] {
+            let mut tampered = proof.clone();
+            let candidate = tampered.faults[0]
+                .erasure_set
+                .as_mut()
+                .and_then(|erasure| erasure.volume_quorum.as_mut())
+                .and_then(|quorum| quorum.candidates.first_mut())
+                .expect("first volume quorum candidate");
+            match field {
+                "pod_uid" => candidate.pod_uid = "replacement-uid".to_string(),
+                "container_id" => candidate.container_id = "containerd://replacement".to_string(),
+                "mount_path" => candidate.mount_path = "/data/replacement".to_string(),
+                "pvc" => candidate.persistent_volume_claim = "replacement-pvc".to_string(),
+                "pv" => candidate.persistent_volume = "replacement-pv".to_string(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_target_proof(&tampered, &run_spec, &options).is_err(),
+                "runtime quorum candidate {field} must match resolvedPods exactly"
+            );
+        }
+
+        let health = |started_at_ms, completed_at_ms| QuorumHealthObservation {
+            started_at_ms,
+            completed_at_ms,
+            deployment_id: "deployment-1".to_string(),
+            shape: shape.clone(),
+            drives: (0..4)
+                .map(|index| QuorumDriveHealth {
+                    pod_name: format!("rustfs-{index}"),
+                    server_endpoint: format!("http://rustfs-{index}:9000"),
+                    drive_uuid: format!("drive-{index}"),
+                    state: if index < 3 { "offline" } else { "ok" }.to_string(),
+                    pool_index: 0,
+                    set_index: 0,
+                })
+                .collect(),
+        };
+        let mut health_evidence = serde_json::from_value::<FaultEvidenceArtifact>(json!({
+            "injected": true,
+            "active_during_workload": true,
+            "recovered": true,
+            "require_client_disruption": false,
+            "client_disruptions": 0,
+            "pods_before": (0..4).map(|index| json!({
+                "name": format!("rustfs-{index}"), "uid": format!("uid-{index}")
+            })).collect::<Vec<_>>(),
+            "pods_at_fault_activation": (0..3).map(|index| json!({
+                "name": format!("rustfs-{index}"), "uid": format!("uid-{index}")
+            })).collect::<Vec<_>>(),
+            "pods_at_workload_snapshot": (0..3).map(|index| json!({
+                "name": format!("rustfs-{index}"), "uid": format!("uid-{index}")
+            })).collect::<Vec<_>>(),
+            "pods_after": [],
+            "active_snapshots": [],
+            "workload_snapshots": [],
+            "fault_active_at_ms": 200,
+            "workload_started_at_ms": 250,
+            "workload_ended_at_ms": 300,
+            "fault_delete_started_at_ms": 350,
+            "quorum_health_before_workload": health(210, 220),
+            "quorum_health_after_workload": health(310, 320)
+        }))
+        .expect("quorum health evidence");
+        validate_volume_quorum_health_evidence(&health_evidence, &proof, &[])
+            .expect("both bounded quorum health observations");
+
+        let saved_before = health_evidence.quorum_health_before_workload.take();
+        assert!(
+            validate_volume_quorum_health_evidence(&health_evidence, &proof, &[]).is_err(),
+            "runtime quorum artifacts require the pre-workload health observation"
+        );
+        health_evidence.quorum_health_before_workload = saved_before;
+        let saved_after = health_evidence.quorum_health_after_workload.take();
+        assert!(
+            validate_volume_quorum_health_evidence(&health_evidence, &proof, &[]).is_err(),
+            "runtime quorum artifacts require the post-workload health observation"
+        );
+        health_evidence.quorum_health_after_workload = saved_after;
+        health_evidence
+            .quorum_health_after_workload
+            .as_mut()
+            .expect("post-workload health")
+            .completed_at_ms = 351;
+        assert!(
+            validate_volume_quorum_health_evidence(&health_evidence, &proof, &[]).is_err(),
+            "post-workload health observation must complete before fault removal"
+        );
+
+        let evidence_at = |fault_apply_started_at_ms| {
+            serde_json::from_value::<FaultEvidenceArtifact>(json!({
+                "injected": true,
+                "active_during_workload": true,
+                "recovered": true,
+                "require_client_disruption": false,
+                "client_disruptions": 0,
+                "pods_before": [],
+                "pods_after": [],
+                "active_snapshots": [],
+                "workload_snapshots": [],
+                "fault_apply_started_at_ms": fault_apply_started_at_ms
+            }))
+            .expect("fault evidence")
+        };
+        let stale = validate_fixed_volume_runtime_evidence(&evidence_at(5_101), &proof, &run_spec)
+            .expect_err("topology older than five seconds must be rejected");
+        assert!(format!("{stale:#}").contains("maximum is 5000ms"));
+        let future = validate_fixed_volume_runtime_evidence(&evidence_at(99), &proof, &run_spec)
+            .expect_err("future topology observation must be rejected");
+        assert!(format!("{future:#}").contains("must precede fault application"));
+
+        let mut wrong_boundary = run_spec;
+        wrong_boundary.faults[0].selection.value = 0;
+        assert!(validate_target_proof(&proof, &wrong_boundary, &options).is_err());
+    }
+
+    #[test]
     fn target_proof_v2_binds_runtime_shape_to_typed_run_spec_requirement() {
         let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
         config.scenario = NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO.to_string();
@@ -4754,10 +6493,12 @@ mod tests {
                 .with_node("worker-a")
                 .with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
                     name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-0".to_string(),
                     volume_name: Some("pv-a".to_string()),
                     storage_class: Some("rustfs-fault-dm".to_string()),
                     persistent_volume: Some(TargetPersistentVolumeProof {
                         name: "pv-a".to_string(),
+                        uid: "pv-uid-0".to_string(),
                         source: Some("local".to_string()),
                         required_node_affinity: None,
                         node: Some("storage-host-a".to_string()),
@@ -5270,6 +7011,7 @@ mod tests {
                     seed: 42,
                     object_count: 3,
                     concurrency: 1,
+                    recommit_candidates: None,
                     recommitted_after_recovery: 0,
                 };
                 let error = invalid
@@ -5342,6 +7084,181 @@ mod tests {
     }
 
     #[test]
+    fn typed_write_quorum_loss_artifacts_follow_runtime_geometry() {
+        let unavailable = |shards, parity, class, beyond_read_tolerance| {
+            let shape =
+                ErasureSetShape::from_runtime_single_set(shards, 1, &[1], &[shards], parity)
+                    .expect("runtime shape");
+            QuorumVolumeBoundary {
+                class,
+                beyond_read_tolerance,
+            }
+            .unavailable_mutations(&shape)
+            .expect("mutation quorum")
+        };
+        let payload_unavailable = unavailable(8, 2, QuorumCaseClass::Payload, true);
+        let metadata_unavailable = unavailable(8, 2, QuorumCaseClass::Metadata, true);
+        let summary = |puts: Value, deletes: Value, multipart_completes: Value| {
+            serde_json::from_value::<WorkloadSummaryArtifact>(json!({
+                "seed": 42,
+                "object_count": 3,
+                "concurrency": 1,
+                "recommitted_after_recovery": 0,
+                "puts": puts,
+                "gets": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "deletes": deletes,
+                "lists": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "multipart_completes": multipart_completes,
+                "multipart_aborts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}
+            }))
+            .expect("summary")
+        };
+        let record = |id: &str, kind: &str, outcome: &str| {
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": id,
+                "scenario": QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                "kind": kind,
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": null,
+                "size_bytes": null,
+                "started_at_ms": 10,
+                "ended_at_ms": 11,
+                "outcome": outcome,
+                "http_status": null,
+                "error": null,
+                "durability_cohort": "fault_active"
+            }))
+            .expect("history record")
+        };
+
+        let payload = summary(
+            json!({"ok": 0, "not_found": 0, "failed": 1, "timeout": 0, "unknown": 0}),
+            json!({"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}),
+            json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0}),
+        );
+        let payload_history = vec![
+            record("put-1", "put", "failed"),
+            record("delete-1", "delete", "ok"),
+            record("mpu-1", "complete_multipart_upload", "timeout"),
+        ];
+        payload
+            .require_typed_write_quorum_loss_effect(
+                &payload_history,
+                QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                "bucket",
+                &payload_unavailable,
+                10,
+                11,
+            )
+            .expect("payload quorum loss may retain metadata write quorum");
+        assert!(
+            payload
+                .require_typed_write_quorum_loss_effect(
+                    &payload_history,
+                    QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                    "bucket",
+                    &metadata_unavailable,
+                    10,
+                    11,
+                )
+                .is_err()
+        );
+
+        for (shards, parity, class, beyond, delete_allowed) in [
+            (4, 2, QuorumCaseClass::Payload, false, false),
+            (4, 2, QuorumCaseClass::Payload, true, false),
+            (8, 4, QuorumCaseClass::Payload, true, false),
+            (8, 2, QuorumCaseClass::Payload, false, true),
+            (12, 4, QuorumCaseClass::Payload, true, true),
+            (8, 2, QuorumCaseClass::Metadata, false, false),
+        ] {
+            assert_eq!(
+                payload
+                    .require_typed_write_quorum_loss_effect(
+                        &payload_history,
+                        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                        "bucket",
+                        &unavailable(shards, parity, class, beyond),
+                        10,
+                        11,
+                    )
+                    .is_ok(),
+                delete_allowed,
+                "DELETE at {shards}/{parity} {class:?} beyond={beyond}"
+            );
+        }
+
+        let metadata = summary(
+            json!({"ok": 0, "not_found": 0, "failed": 1, "timeout": 0, "unknown": 0}),
+            json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 1}),
+            json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0}),
+        );
+        let metadata_history = vec![
+            record("put-2", "put", "failed"),
+            record("delete-2", "delete", "unknown"),
+            record("mpu-2", "complete_multipart_upload", "timeout"),
+        ];
+        metadata
+            .require_typed_write_quorum_loss_effect(
+                &metadata_history,
+                QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                "bucket",
+                &metadata_unavailable,
+                10,
+                11,
+            )
+            .expect("metadata quorum loss also crosses payload write quorum");
+
+        let metadata_with_payload_ack = summary(
+            json!({"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}),
+            json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 1}),
+            json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0}),
+        );
+        let mut metadata_history_with_payload_ack = metadata_history.clone();
+        metadata_history_with_payload_ack[0].outcome = OperationOutcome::Ok;
+        assert!(
+            metadata_with_payload_ack
+                .require_typed_write_quorum_loss_effect(
+                    &metadata_history_with_payload_ack,
+                    QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                    "bucket",
+                    &metadata_unavailable,
+                    10,
+                    11,
+                )
+                .is_err(),
+            "metadata P+1 also loses payload write quorum"
+        );
+        metadata_with_payload_ack
+            .require_typed_write_quorum_loss_effect(
+                &metadata_history_with_payload_ack,
+                QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                "bucket",
+                &unavailable(8, 2, QuorumCaseClass::Payload, false),
+                10,
+                11,
+            )
+            .expect("payload P may retain every write quorum");
+
+        let mut tampered_history = payload_history;
+        tampered_history[1].outcome = OperationOutcome::Failed;
+        assert!(
+            payload
+                .require_typed_write_quorum_loss_effect(
+                    &tampered_history,
+                    QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                    "bucket",
+                    &payload_unavailable,
+                    10,
+                    11,
+                )
+                .is_err(),
+            "unselected mutation history must still match the signed summary"
+        );
+    }
+
+    #[test]
     fn validation_wrapper_writes_report_artifact() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_success_artifacts(dir.path(), "io-eio");
@@ -5389,6 +7306,8 @@ mod tests {
                 "value_sha256": if matches!(kind, OperationKind::Put | OperationKind::CompleteMultipartUpload) { Some("sha256") } else { None },
                 "size_bytes": size_bytes,
                 "version_id": if matches!(kind, OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload) { Some("version-1") } else { None },
+                "started_sequence": started_at_ms,
+                "ended_sequence": ended_at_ms,
                 "started_at_ms": started_at_ms,
                 "ended_at_ms": ended_at_ms,
                 "outcome": "ok",
@@ -5424,7 +7343,7 @@ mod tests {
         .expect("overwrite shape");
 
         let delete = record("op-2", OperationKind::Delete, "existing", None, 10, 11);
-        let delete_history = vec![baseline, delete.clone()];
+        let delete_history = vec![baseline.clone(), delete.clone()];
         super::validate_ack_mutation_shape(
             &delete_history,
             &delete,
@@ -5483,6 +7402,175 @@ mod tests {
             .is_err(),
             "multipart completion must require both staging operations"
         );
+
+        for trigger in [&put, &zero] {
+            let prior_complete = record(
+                "prior-complete",
+                OperationKind::CompleteMultipartUpload,
+                trigger.key.as_deref().expect("trigger key"),
+                Some(4),
+                1,
+                2,
+            );
+            assert!(
+                super::validate_ack_mutation_shape(
+                    &[prior_complete, trigger.clone()],
+                    trigger,
+                    if trigger.size_bytes == Some(0) {
+                        AcknowledgedMutationKind::ZeroBytePut
+                    } else {
+                        AcknowledgedMutationKind::Put
+                    },
+                )
+                .is_err(),
+                "create PUT variants must reject a prior multipart completion"
+            );
+        }
+
+        let prior_complete = record(
+            "prior-complete",
+            OperationKind::CompleteMultipartUpload,
+            "multipart",
+            Some(4),
+            1,
+            2,
+        );
+        let staged_create = record(
+            "create-mpu",
+            OperationKind::CreateMultipartUpload,
+            "multipart",
+            None,
+            3,
+            4,
+        );
+        let staged_part = record(
+            "upload-part",
+            OperationKind::UploadPart,
+            "multipart",
+            Some(8 * 1024 * 1024),
+            5,
+            6,
+        );
+        assert!(
+            super::validate_ack_mutation_shape(
+                &[prior_complete, staged_create, staged_part, complete.clone()],
+                &complete,
+                AcknowledgedMutationKind::MultipartComplete,
+            )
+            .is_err(),
+            "multipart create must reject a previously committed object"
+        );
+
+        for intervening_kind in [
+            OperationKind::Delete,
+            OperationKind::CompleteMultipartUpload,
+        ] {
+            let intervening = record("intervening", intervening_kind, "existing", Some(4), 3, 4);
+            for (trigger, mutation) in [
+                (&overwrite, AcknowledgedMutationKind::Overwrite),
+                (&delete, AcknowledgedMutationKind::DeleteMarker),
+            ] {
+                assert!(
+                    super::validate_ack_mutation_shape(
+                        &[baseline.clone(), intervening.clone(), trigger.clone()],
+                        trigger,
+                        mutation,
+                    )
+                    .is_err(),
+                    "overwrite/delete must reject an intervening {intervening_kind:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ack_success_path_rejects_incomplete_baseline_receipts() {
+        for mutation in [
+            AcknowledgedMutationKind::Overwrite,
+            AcknowledgedMutationKind::DeleteMarker,
+        ] {
+            let scenario = match mutation {
+                AcknowledgedMutationKind::Overwrite => "dm-drop-writes-after-ack-overwrite",
+                AcknowledgedMutationKind::DeleteMarker => "dm-drop-writes-after-ack-delete-marker",
+                _ => unreachable!("only baseline-backed mutations are tested"),
+            };
+            let key = "fault-test/run-1/key-1";
+            let mut baseline =
+                ack_failure_record(0, scenario, "baseline", OperationKind::Put, key, true);
+            baseline.version_id = Some("baseline-version".to_string());
+            baseline.value_sha256 = Some("baseline-hash".to_string());
+            baseline.size_bytes = Some(4);
+            baseline.http_status = Some(200);
+
+            let mut trigger = ack_failure_record(
+                1,
+                scenario,
+                "trigger",
+                super::ack_operation_kind(mutation),
+                key,
+                true,
+            );
+            trigger.version_id = Some("trigger-version".to_string());
+            trigger.http_status = Some(if mutation == AcknowledgedMutationKind::DeleteMarker {
+                204
+            } else {
+                200
+            });
+            if mutation == AcknowledgedMutationKind::Overwrite {
+                trigger.value_sha256 = Some("trigger-hash".to_string());
+                trigger.size_bytes = Some(8);
+            }
+
+            let valid = vec![baseline.clone(), trigger.clone()];
+            super::validate_ack_mutation_shape(&valid, &trigger, mutation)
+                .expect("complete baseline receipt reaches the success checker");
+            super::ack_checker_expectation(&valid, &trigger, mutation)
+                .expect("complete baseline builds the success expectation");
+
+            let invalid_baselines = [
+                {
+                    let mut record = baseline.clone();
+                    record.size_bytes = None;
+                    record
+                },
+                {
+                    let mut record = baseline.clone();
+                    record.value_sha256 = None;
+                    record
+                },
+                {
+                    let mut record = baseline.clone();
+                    record.value_sha256 = Some(String::new());
+                    record
+                },
+                {
+                    let mut record = baseline.clone();
+                    record.version_id = None;
+                    record
+                },
+                {
+                    let mut record = baseline.clone();
+                    record.version_id = Some("null".to_string());
+                    record
+                },
+                {
+                    let mut record = baseline.clone();
+                    record.http_status = Some(500);
+                    record
+                },
+            ];
+            for invalid_baseline in invalid_baselines {
+                assert!(
+                    super::validate_ack_mutation_shape(
+                        &[invalid_baseline, trigger.clone()],
+                        &trigger,
+                        mutation,
+                    )
+                    .is_err(),
+                    "{mutation:?} success artifacts must reject an incomplete baseline receipt"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5508,8 +7596,28 @@ mod tests {
             ack_to_fault_ms: 5,
             max_ack_to_fault_ms: 5,
             crash_boundary_started_at_ms: 110,
+            crash_boundary_next_sequence: 3,
             ack_to_crash_boundary_ms: 10,
         };
+        let trigger = serde_json::from_value::<OperationRecord>(json!({
+            "id": "op-1",
+            "scenario": "dm-drop-writes-after-ack-put",
+            "run_id": "run-1",
+            "kind": "put",
+            "bucket": "bucket",
+            "key": "key",
+            "value_sha256": "trigger-hash",
+            "size_bytes": 4,
+            "version_id": "version-1",
+            "started_sequence": 1,
+            "ended_sequence": 2,
+            "started_at_ms": 90,
+            "ended_at_ms": 100,
+            "outcome": "ok",
+            "http_status": 200,
+            "durability_cohort": "pre_fault"
+        }))
+        .expect("valid trigger operation");
         super::validate_ack_trigger_contract(
             &valid,
             &planned,
@@ -5517,8 +7625,58 @@ mod tests {
             "dm-drop-writes-after-ack-put",
             "run-1",
             Some(101),
+            &trigger,
         )
         .expect("valid trigger contract");
+
+        let boundary_plan = FaultRunAckTriggerSpec {
+            operation_timeout_ms: 10,
+            ..planned.clone()
+        };
+        super::validate_ack_trigger_contract(
+            &valid,
+            &boundary_plan,
+            AcknowledgedMutationKind::Put,
+            "dm-drop-writes-after-ack-put",
+            "run-1",
+            Some(101),
+            &trigger,
+        )
+        .expect("trigger duration equal to the planned timeout is valid");
+
+        let mut inverted_trigger = trigger.clone();
+        inverted_trigger.started_at_ms = 101;
+        assert!(
+            super::validate_ack_trigger_contract(
+                &valid,
+                &planned,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+                &inverted_trigger,
+            )
+            .is_err(),
+            "an inverted trigger request interval must be rejected"
+        );
+
+        let over_timeout_plan = FaultRunAckTriggerSpec {
+            operation_timeout_ms: 9,
+            ..planned.clone()
+        };
+        assert!(
+            super::validate_ack_trigger_contract(
+                &valid,
+                &over_timeout_plan,
+                AcknowledgedMutationKind::Put,
+                "dm-drop-writes-after-ack-put",
+                "run-1",
+                Some(101),
+                &trigger,
+            )
+            .is_err(),
+            "a trigger request longer than its planned timeout must be rejected"
+        );
 
         let mut pre_ack = valid.clone();
         pre_ack.fault_activated_at_ms = 99;
@@ -5531,6 +7689,7 @@ mod tests {
                 "dm-drop-writes-after-ack-put",
                 "run-1",
                 Some(101),
+                &trigger,
             )
             .is_err()
         );
@@ -5546,6 +7705,7 @@ mod tests {
                 "dm-drop-writes-after-ack-put",
                 "run-1",
                 Some(101),
+                &trigger,
             )
             .is_err()
         );
@@ -5560,6 +7720,7 @@ mod tests {
                 "dm-drop-writes-after-ack-put",
                 "run-1",
                 Some(101),
+                &trigger,
             )
             .is_err()
         );
@@ -5572,6 +7733,7 @@ mod tests {
                 "dm-drop-writes-after-ack-put",
                 "run-1",
                 Some(99),
+                &trigger,
             )
             .is_err(),
             "starting fault application before the ACK must be rejected"
@@ -5591,9 +7753,1088 @@ mod tests {
                 "dm-drop-writes-after-ack-put",
                 "run-1",
                 Some(101),
+                &trigger,
             )
             .is_err(),
             "artifact validation must reject an ACK window too wide for durability evidence"
+        );
+    }
+
+    #[test]
+    fn ack_mutation_preparation_requires_sequence_happens_before() {
+        use crate::fault::acknowledged_mutation::AcknowledgedMutationKind;
+        for (kind, preparation) in [
+            (AcknowledgedMutationKind::Overwrite, OperationKind::Put),
+            (AcknowledgedMutationKind::DeleteMarker, OperationKind::Put),
+            (
+                AcknowledgedMutationKind::MultipartComplete,
+                OperationKind::UploadPart,
+            ),
+        ] {
+            let record = |id: &str, operation: OperationKind, start: u64, end: u64| {
+                serde_json::from_value::<OperationRecord>(json!({
+                    "id": id, "scenario": "ack", "run_id": "run-1", "bucket": "bucket",
+                    "key": "key", "kind": operation, "started_sequence": start, "ended_sequence": end,
+                    "value_sha256": matches!(operation, OperationKind::Put | OperationKind::CompleteMultipartUpload).then_some("hash"),
+                    "size_bytes": matches!(operation, OperationKind::Put | OperationKind::UploadPart | OperationKind::CompleteMultipartUpload).then_some(4),
+                    "version_id": matches!(operation, OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload).then_some("version"),
+                    "started_at_ms": 10, "ended_at_ms": 10, "outcome": "ok", "http_status": 200
+                })).expect("record")
+            };
+            let trigger = record("trigger", super::ack_operation_kind(kind), 5, 6);
+            let create = record("create", OperationKind::CreateMultipartUpload, 1, 2);
+            let prepared = record("prepare", preparation, 3, 4);
+            super::validate_ack_mutation_shape(
+                &[create.clone(), prepared.clone(), trigger.clone()],
+                &trigger,
+                kind,
+            )
+            .expect("same-millisecond preparation with causal ordering");
+            let mut overlapping = prepared;
+            overlapping.ended_sequence = Some(6);
+            assert!(
+                super::validate_ack_mutation_shape(
+                    &[create, overlapping, trigger.clone()],
+                    &trigger,
+                    kind,
+                )
+                .is_err(),
+                "overlapping preparation cannot establish a prior committed state"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_checker_phases_require_contiguous_independent_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let mut history =
+            read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+        let pre = read_json::<CheckerReport>(&case_dir.join("checker-pre-recommit-report.json"))
+            .expect("prechecker");
+        let mut final_report = read_json::<CheckerReport>(&case_dir.join("checker-report.json"))
+            .expect("final checker");
+        history.drain(4..6);
+        for (index, record) in history.iter_mut().enumerate() {
+            record.started_sequence = Some(index as u64 * 2 + 1);
+            record.ended_sequence = Some(index as u64 * 2 + 2);
+        }
+        final_report
+            .audit
+            .as_mut()
+            .expect("audit")
+            .history_prefix_record_count = 4;
+        super::validate_ack_checker_phase_chain(&pre, &final_report, "bucket", &history)
+            .expect("no recommit phase chain");
+        assert!(
+            super::validate_ack_checker_phase_chain(
+                &final_report,
+                &final_report,
+                "bucket",
+                &history
+            )
+            .is_err(),
+            "one checker receipt cannot serve as both phases"
+        );
+        assert!(
+            super::validate_ack_checker_phase_chain(&final_report, &pre, "bucket", &history)
+                .is_err(),
+            "checker phases cannot be swapped"
+        );
+        let mut overlap = history.clone();
+        overlap[3].ended_sequence = Some(9);
+        overlap[4].started_sequence = Some(8);
+        let error =
+            super::validate_ack_checker_phase_chain(&pre, &final_report, "bucket", &overlap)
+                .expect_err("cross-phase sequence overlap");
+        assert!(
+            error.to_string().contains("ACK prechecker/final-checker"),
+            "{error:#}"
+        );
+
+        let mut intervening = history[4].clone();
+        intervening.id = "intervening-get".to_string();
+        history.insert(4, intervening);
+        for (index, record) in history.iter_mut().enumerate() {
+            record.started_sequence = Some(index as u64 * 2 + 1);
+            record.ended_sequence = Some(index as u64 * 2 + 2);
+        }
+        final_report
+            .audit
+            .as_mut()
+            .expect("audit")
+            .history_prefix_record_count = 5;
+        assert!(
+            super::validate_ack_checker_phase_chain(&pre, &final_report, "bucket", &history)
+                .is_err(),
+            "unattributed GET between checker phases must invalidate the chain"
+        );
+    }
+
+    #[derive(Clone)]
+    struct AckFailureFixture {
+        history: Vec<OperationRecord>,
+        report: CheckerReport,
+        ack: super::AckTriggeredCrashEvidenceArtifact,
+        prefix_len: usize,
+    }
+
+    fn ack_failure_record(
+        ordinal: usize,
+        scenario: &str,
+        id: &str,
+        kind: OperationKind,
+        key: &str,
+        before_fault: bool,
+    ) -> OperationRecord {
+        let started_sequence = ordinal as u64 * 2 + 1;
+        let started_at_ms = if before_fault {
+            10 + ordinal as u64 * 2
+        } else {
+            100 + ordinal as u64 * 2
+        };
+        OperationRecord {
+            id: id.to_string(),
+            scenario: scenario.to_string(),
+            run_id: Some("run-1".to_string()),
+            kind,
+            bucket: "bucket".to_string(),
+            key: Some(key.to_string()),
+            value_sha256: None,
+            size_bytes: None,
+            version_id: None,
+            listed_keys: None,
+            listed_versions: None,
+            payload_ref: None,
+            range: None,
+            started_sequence: Some(started_sequence),
+            ended_sequence: Some(started_sequence + 1),
+            started_at_ms,
+            ended_at_ms: started_at_ms + 1,
+            outcome: OperationOutcome::Ok,
+            http_status: None,
+            error: None,
+            durability_cohort: Some(if before_fault {
+                DurabilityCohort::PreFault
+            } else {
+                DurabilityCohort::PostRecovery
+            }),
+            fault_window_relation: (!before_fault).then_some(FaultWindowRelation::AfterFault),
+        }
+    }
+
+    impl AckFailureFixture {
+        fn new(kind: AcknowledgedMutationKind) -> Self {
+            let scenario = match kind {
+                AcknowledgedMutationKind::Put => "dm-drop-writes-after-ack-put",
+                AcknowledgedMutationKind::Overwrite => "dm-drop-writes-after-ack-overwrite",
+                AcknowledgedMutationKind::DeleteMarker => "dm-drop-writes-after-ack-delete-marker",
+                AcknowledgedMutationKind::ZeroBytePut => "dm-drop-writes-after-ack-zero-byte-put",
+                AcknowledgedMutationKind::MultipartComplete => {
+                    "dm-drop-writes-after-ack-multipart-complete"
+                }
+            };
+            let key = "fault-test/run-1/key-1";
+            let mut history = Vec::new();
+            if matches!(
+                kind,
+                AcknowledgedMutationKind::Overwrite | AcknowledgedMutationKind::DeleteMarker
+            ) {
+                let mut baseline = ack_failure_record(
+                    history.len(),
+                    scenario,
+                    "baseline",
+                    OperationKind::Put,
+                    key,
+                    true,
+                );
+                baseline.version_id = Some("baseline-version".to_string());
+                baseline.value_sha256 = Some("baseline-hash".to_string());
+                baseline.size_bytes = Some(4);
+                baseline.http_status = Some(200);
+                history.push(baseline);
+            }
+            if kind == AcknowledgedMutationKind::MultipartComplete {
+                let mut create = ack_failure_record(
+                    history.len(),
+                    scenario,
+                    "create-mpu",
+                    OperationKind::CreateMultipartUpload,
+                    key,
+                    true,
+                );
+                create.http_status = Some(200);
+                history.push(create);
+                let mut upload_part = ack_failure_record(
+                    history.len(),
+                    scenario,
+                    "upload-part",
+                    OperationKind::UploadPart,
+                    key,
+                    true,
+                );
+                upload_part.value_sha256 = Some("part-hash".to_string());
+                upload_part.size_bytes = Some(4);
+                upload_part.http_status = Some(200);
+                history.push(upload_part);
+            }
+            let (trigger_hash, trigger_size) = match kind {
+                AcknowledgedMutationKind::DeleteMarker => (None, None),
+                AcknowledgedMutationKind::ZeroBytePut => (Some("empty-hash"), Some(0)),
+                _ => (Some("trigger-hash"), Some(8)),
+            };
+            let mut trigger = ack_failure_record(
+                history.len(),
+                scenario,
+                "trigger",
+                super::ack_operation_kind(kind),
+                key,
+                true,
+            );
+            trigger.version_id = Some("trigger-version".to_string());
+            trigger.value_sha256 = trigger_hash.map(str::to_string);
+            trigger.size_bytes = trigger_size;
+            trigger.http_status = Some(if kind == AcknowledgedMutationKind::DeleteMarker {
+                204
+            } else {
+                200
+            });
+            history.push(trigger);
+            let prefix_len = history.len();
+            let trigger = history.last().expect("trigger").clone();
+            let is_delete = kind == AcknowledgedMutationKind::DeleteMarker;
+            let mut current_get = ack_failure_record(
+                history.len(),
+                scenario,
+                "current-get",
+                OperationKind::Get,
+                key,
+                false,
+            );
+            set_ack_get(
+                &mut current_get,
+                if is_delete {
+                    OperationOutcome::NotFound
+                } else {
+                    OperationOutcome::Ok
+                },
+                Some(if is_delete { 404 } else { 200 }),
+                if is_delete {
+                    None
+                } else {
+                    trigger.value_sha256.as_deref()
+                },
+                if is_delete { None } else { trigger.size_bytes },
+                is_delete.then_some("not found"),
+            );
+            history.push(current_get);
+            let committed_data = history[..prefix_len]
+                .iter()
+                .filter(|record| {
+                    record.outcome == OperationOutcome::Ok
+                        && matches!(
+                            record.kind,
+                            OperationKind::Put | OperationKind::CompleteMultipartUpload
+                        )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for version in &committed_data {
+                let mut version_get = ack_failure_record(
+                    history.len(),
+                    scenario,
+                    &format!("version-get-{}", version.id),
+                    OperationKind::Get,
+                    key,
+                    false,
+                );
+                version_get.version_id = version.version_id.clone();
+                set_ack_get(
+                    &mut version_get,
+                    OperationOutcome::Ok,
+                    Some(200),
+                    version.value_sha256.as_deref(),
+                    version.size_bytes,
+                    None,
+                );
+                history.push(version_get);
+            }
+            let prefix_key = crate::fault::workload::ObjectSpec::key_prefix("run-1");
+            let mut version_list = ack_failure_record(
+                history.len(),
+                scenario,
+                "list-versions",
+                OperationKind::ListVersions,
+                &prefix_key,
+                false,
+            );
+            version_list.http_status = Some(200);
+            version_list.listed_versions = Some(
+                checker::checker_expected_version_listing(&history[..prefix_len])
+                    .into_iter()
+                    .collect(),
+            );
+            history.push(version_list);
+            let mut final_list = ack_failure_record(
+                history.len(),
+                scenario,
+                "list",
+                OperationKind::List,
+                &prefix_key,
+                false,
+            );
+            final_list.http_status = Some(200);
+            final_list.listed_keys = Some(if is_delete {
+                Vec::new()
+            } else {
+                vec![key.to_string()]
+            });
+            history.push(final_list);
+
+            let live_objects = usize::from(!is_delete);
+            let report = CheckerReport {
+                scenario: scenario.to_string(),
+                run_id: "run-1".to_string(),
+                committed_puts: committed_data.len(),
+                expected_live_objects: live_objects,
+                verified_live_objects: live_objects,
+                missing_committed_objects: Vec::new(),
+                unavailable_committed_objects: Vec::new(),
+                unknown_committed_read_failures: Vec::new(),
+                hash_mismatches: Vec::new(),
+                successful_corrupted_reads: Vec::new(),
+                unexpected_visible_deleted_objects: Vec::new(),
+                unknown_writes_materialized: Vec::new(),
+                unknown_writes_preserved_committed: Vec::new(),
+                unknown_write_value_conflicts: Vec::new(),
+                list_history_warning_count: 0,
+                final_list_warning_count: 0,
+                list_history_warnings: Vec::new(),
+                list_warnings: Vec::new(),
+                final_listed_objects: Some(live_objects),
+                versioning_expected: true,
+                expected_committed_versions: committed_data.len(),
+                verified_committed_versions: committed_data.len(),
+                committed_writes_missing_version_id_count: 0,
+                committed_writes_missing_version_id: Vec::new(),
+                missing_committed_versions: Vec::new(),
+                unavailable_committed_versions: Vec::new(),
+                version_hash_mismatches: Vec::new(),
+                missing_committed_delete_markers: Vec::new(),
+                resurrected_deleted_objects: Vec::new(),
+                delete_marker_lineage_incomplete: Vec::new(),
+                multipart_upload_lineage_incomplete: Vec::new(),
+                tolerated_ambiguous_deletes: Vec::new(),
+                operation_cohorts: BTreeMap::from([("pre_fault".to_string(), prefix_len)]),
+                fault_window_relations: BTreeMap::new(),
+                audit: Some(checker::CheckerAudit {
+                    bucket: "bucket".to_string(),
+                    started_at_ms: 0,
+                    completed_at_ms: 0,
+                    history_prefix_record_count: prefix_len,
+                    history_prefix_sha256: String::new(),
+                    history_suffix_record_count: 0,
+                    history_suffix_sha256: String::new(),
+                    suffix_operations: Vec::new(),
+                    data_version_checks: Vec::new(),
+                    delete_marker_checks: Vec::new(),
+                    list_object_versions_completed: Some(true),
+                }),
+                tenant_recovered: true,
+                passed: false,
+            };
+            let trigger_acknowledged_at_ms = trigger.ended_at_ms;
+            let ack = super::AckTriggeredCrashEvidenceArtifact {
+                scenario: scenario.to_string(),
+                run_id: "run-1".to_string(),
+                trigger_operation_id: trigger.id.clone(),
+                trigger_kind: kind,
+                trigger_key: key.to_string(),
+                trigger_version_id: "trigger-version".to_string(),
+                trigger_acknowledged_at_ms,
+                fault_activated_at_ms: trigger_acknowledged_at_ms + 1,
+                ack_to_fault_ms: 1,
+                max_ack_to_fault_ms: 5,
+                crash_boundary_started_at_ms: trigger_acknowledged_at_ms + 2,
+                crash_boundary_next_sequence: trigger.ended_sequence.expect("trigger end sequence")
+                    + 1,
+                ack_to_crash_boundary_ms: 2,
+            };
+            let mut fixture = Self {
+                history,
+                report,
+                ack,
+                prefix_len,
+            };
+            fixture.refresh_audit();
+            if is_delete {
+                fixture.fail_delete_marker_listing();
+            } else {
+                fixture.fail_data_version("trigger-version", true);
+            }
+            fixture
+        }
+
+        fn validate(&self) -> anyhow::Result<()> {
+            super::validate_ack_expected_failure_report(
+                &self.report,
+                &self.history,
+                &self.ack,
+                "bucket",
+            )
+        }
+
+        fn trigger(&self) -> &OperationRecord {
+            &self.history[self.prefix_len - 1]
+        }
+
+        fn data_versions(&self) -> Vec<OperationRecord> {
+            self.history[..self.prefix_len]
+                .iter()
+                .filter(|record| {
+                    record.outcome == OperationOutcome::Ok
+                        && matches!(
+                            record.kind,
+                            OperationKind::Put | OperationKind::CompleteMultipartUpload
+                        )
+                })
+                .cloned()
+                .collect()
+        }
+
+        fn current_get_mut(&mut self) -> &mut OperationRecord {
+            self.history[self.prefix_len..]
+                .iter_mut()
+                .find(|record| record.kind == OperationKind::Get && record.version_id.is_none())
+                .expect("current GET")
+        }
+
+        fn version_get_mut(&mut self, version_id: &str) -> &mut OperationRecord {
+            self.history[self.prefix_len..]
+                .iter_mut()
+                .find(|record| {
+                    record.kind == OperationKind::Get
+                        && record.version_id.as_deref() == Some(version_id)
+                })
+                .expect("version GET")
+        }
+
+        fn version_list_mut(&mut self) -> &mut OperationRecord {
+            self.history[self.prefix_len..]
+                .iter_mut()
+                .find(|record| record.kind == OperationKind::ListVersions)
+                .expect("ListObjectVersions")
+        }
+
+        fn final_list_mut(&mut self) -> &mut OperationRecord {
+            self.history[self.prefix_len..]
+                .iter_mut()
+                .find(|record| record.kind == OperationKind::List)
+                .expect("final LIST")
+        }
+
+        fn clear_failures(&mut self) {
+            self.report.missing_committed_objects.clear();
+            self.report.unavailable_committed_objects.clear();
+            self.report.unknown_committed_read_failures.clear();
+            self.report.hash_mismatches.clear();
+            self.report.successful_corrupted_reads.clear();
+            self.report.unexpected_visible_deleted_objects.clear();
+            self.report.missing_committed_versions.clear();
+            self.report.unavailable_committed_versions.clear();
+            self.report.version_hash_mismatches.clear();
+            self.report.missing_committed_delete_markers.clear();
+            self.report.resurrected_deleted_objects.clear();
+            self.report.delete_marker_lineage_incomplete.clear();
+            self.report.multipart_upload_lineage_incomplete.clear();
+            self.report.final_list_warning_count = 0;
+            self.report.list_warnings.clear();
+            self.report.passed = false;
+        }
+
+        fn restore_healthy_observations(&mut self) {
+            self.clear_failures();
+            let data_versions = self.data_versions();
+            for version in &data_versions {
+                let get = self
+                    .version_get_mut(version.version_id.as_deref().expect("committed version id"));
+                set_ack_get(
+                    get,
+                    OperationOutcome::Ok,
+                    Some(200),
+                    version.value_sha256.as_deref(),
+                    version.size_bytes,
+                    None,
+                );
+            }
+            self.report.verified_committed_versions = data_versions.len();
+            let expected_listing =
+                checker::checker_expected_version_listing(&self.history[..self.prefix_len])
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            self.version_list_mut().listed_versions = Some(expected_listing);
+            let trigger = self.trigger().clone();
+            if trigger.kind == OperationKind::Delete {
+                set_ack_get(
+                    self.current_get_mut(),
+                    OperationOutcome::NotFound,
+                    Some(404),
+                    None,
+                    None,
+                    Some("not found"),
+                );
+                self.final_list_mut().listed_keys = Some(Vec::new());
+                self.report.verified_live_objects = 0;
+                self.report.final_listed_objects = Some(0);
+            } else {
+                set_ack_get(
+                    self.current_get_mut(),
+                    OperationOutcome::Ok,
+                    Some(200),
+                    trigger.value_sha256.as_deref(),
+                    trigger.size_bytes,
+                    None,
+                );
+                let trigger_key = self.ack.trigger_key.clone();
+                self.final_list_mut().listed_keys = Some(vec![trigger_key]);
+                self.report.verified_live_objects = 1;
+                self.report.final_listed_objects = Some(1);
+            }
+            self.refresh_audit();
+        }
+
+        fn fail_data_version(&mut self, version_id: &str, current_missing: bool) {
+            self.restore_healthy_observations();
+            let version = self
+                .data_versions()
+                .into_iter()
+                .find(|record| record.version_id.as_deref() == Some(version_id))
+                .expect("protected data version");
+            set_ack_get(
+                self.version_get_mut(version_id),
+                OperationOutcome::NotFound,
+                Some(404),
+                None,
+                None,
+                Some("not found"),
+            );
+            let protected_history = self.history[..self.prefix_len].to_vec();
+            let entries = self
+                .version_list_mut()
+                .listed_versions
+                .as_mut()
+                .expect("listed versions");
+            entries.retain(|entry| entry.version_id.as_deref() != Some(version_id));
+            normalize_ack_latest(entries, &protected_history);
+            let reference = format!("{}@{version_id}", self.ack.trigger_key);
+            self.report.missing_committed_versions = vec![
+                reference.clone(),
+                format!("{reference}: committed version missing from ListObjectVersions"),
+            ];
+            self.report.verified_committed_versions = self.data_versions().len() - 1;
+            if version.kind == OperationKind::CompleteMultipartUpload {
+                self.report.multipart_upload_lineage_incomplete = vec![
+                    format!("{reference}: committed multipart completion version is missing"),
+                    format!(
+                        "{reference}: committed multipart completion missing from ListObjectVersions"
+                    ),
+                ];
+            }
+            if current_missing {
+                set_ack_get(
+                    self.current_get_mut(),
+                    OperationOutcome::NotFound,
+                    Some(404),
+                    None,
+                    None,
+                    Some("not found"),
+                );
+                self.final_list_mut().listed_keys = Some(Vec::new());
+                self.report.missing_committed_objects = vec![self.ack.trigger_key.clone()];
+                self.report.verified_live_objects = 0;
+                self.report.final_listed_objects = Some(0);
+                self.report.delete_marker_lineage_incomplete = vec![format!(
+                    "{}: latest version does not match the committed trigger",
+                    self.ack.trigger_key
+                )];
+            }
+            self.refresh_audit();
+        }
+
+        fn fail_delete_marker_listing(&mut self) {
+            self.restore_healthy_observations();
+            let marker_version = self.ack.trigger_version_id.clone();
+            let protected_history = self.history[..self.prefix_len].to_vec();
+            let entries = self
+                .version_list_mut()
+                .listed_versions
+                .as_mut()
+                .expect("listed versions");
+            entries.retain(|entry| entry.version_id.as_deref() != Some(marker_version.as_str()));
+            normalize_ack_latest(entries, &protected_history);
+            let reference = format!("{}@{marker_version}", self.ack.trigger_key);
+            self.report.missing_committed_delete_markers = vec![format!(
+                "{reference}: committed delete marker missing from ListObjectVersions"
+            )];
+            self.report.delete_marker_lineage_incomplete = vec![format!(
+                "{}: latest version does not match the committed delete marker",
+                self.ack.trigger_key
+            )];
+            self.refresh_audit();
+        }
+
+        fn refresh_audit(&mut self) {
+            let prefix = &self.history[..self.prefix_len];
+            let suffix = &self.history[self.prefix_len..];
+            let listed_versions = suffix
+                .iter()
+                .find(|record| record.kind == OperationKind::ListVersions)
+                .and_then(|record| record.listed_versions.clone())
+                .unwrap_or_default();
+            let mut data_version_checks = prefix
+                .iter()
+                .filter(|record| {
+                    record.outcome == OperationOutcome::Ok
+                        && matches!(
+                            record.kind,
+                            OperationKind::Put | OperationKind::CompleteMultipartUpload
+                        )
+                })
+                .filter_map(|version| {
+                    let version_id = version.version_id.as_deref()?;
+                    let get = suffix.iter().find(|record| {
+                        record.kind == OperationKind::Get
+                            && record.key == version.key
+                            && record.version_id.as_deref() == Some(version_id)
+                    })?;
+                    Some(checker::CheckerDataVersionAudit {
+                        key: version.key.clone()?,
+                        version_id: version_id.to_string(),
+                        expected_sha256: version.value_sha256.clone()?,
+                        observed_sha256: get.value_sha256.clone(),
+                        outcome: get.outcome,
+                        http_status: get.http_status,
+                    })
+                })
+                .collect::<Vec<_>>();
+            data_version_checks.sort_by(|left, right| {
+                (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id))
+            });
+            let mut delete_marker_checks = prefix
+                .iter()
+                .filter(|record| {
+                    record.kind == OperationKind::Delete && record.outcome == OperationOutcome::Ok
+                })
+                .filter_map(|marker| {
+                    let key = marker.key.clone()?;
+                    let version_id = marker.version_id.clone()?;
+                    Some(checker::CheckerDeleteMarkerAudit {
+                        visible_in_list_object_versions: listed_versions.iter().any(|entry| {
+                            entry.key == key
+                                && entry.version_id.as_deref() == Some(version_id.as_str())
+                                && entry.is_delete_marker
+                        }),
+                        key,
+                        version_id,
+                    })
+                })
+                .collect::<Vec<_>>();
+            delete_marker_checks.sort_by(|left, right| {
+                (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id))
+            });
+            let list_completed = suffix
+                .iter()
+                .find(|record| record.kind == OperationKind::ListVersions)
+                .is_some_and(|record| {
+                    record.outcome == OperationOutcome::Ok && record.http_status == Some(200)
+                });
+            let audit = self.report.audit.as_mut().expect("checker audit");
+            audit.started_at_ms = suffix
+                .iter()
+                .map(|record| record.started_at_ms)
+                .min()
+                .expect("checker suffix");
+            audit.completed_at_ms = suffix
+                .iter()
+                .map(|record| record.ended_at_ms)
+                .max()
+                .expect("checker suffix");
+            audit.history_prefix_record_count = self.prefix_len;
+            audit.history_prefix_sha256 =
+                checker::checker_history_records_sha256(prefix).expect("prefix digest");
+            audit.history_suffix_record_count = suffix.len();
+            audit.history_suffix_sha256 =
+                checker::checker_history_records_sha256(suffix).expect("suffix digest");
+            audit.suffix_operations = checker::checker_operation_audits(suffix);
+            audit.data_version_checks = data_version_checks;
+            audit.delete_marker_checks = delete_marker_checks;
+            audit.list_object_versions_completed = Some(list_completed);
+        }
+    }
+
+    fn set_ack_get(
+        record: &mut OperationRecord,
+        outcome: OperationOutcome,
+        http_status: Option<u16>,
+        value_sha256: Option<&str>,
+        size_bytes: Option<usize>,
+        error: Option<&str>,
+    ) {
+        record.outcome = outcome;
+        record.http_status = http_status;
+        record.value_sha256 = value_sha256.map(str::to_string);
+        record.size_bytes = size_bytes;
+        record.error = error.map(str::to_string);
+    }
+
+    fn normalize_ack_latest(entries: &mut [ListedVersionEntry], prefix: &[OperationRecord]) {
+        entries.iter_mut().for_each(|entry| entry.is_latest = false);
+        if let Some(latest) = prefix.iter().rev().find(|record| {
+            entries.iter().any(|entry| {
+                entry.key == record.key.as_deref().unwrap_or_default()
+                    && entry.version_id == record.version_id
+                    && entry.is_delete_marker == (record.kind == OperationKind::Delete)
+            })
+        }) && let Some(entry) = entries.iter_mut().find(|entry| {
+            Some(entry.key.as_str()) == latest.key.as_deref()
+                && entry.version_id == latest.version_id
+                && entry.is_delete_marker == (latest.kind == OperationKind::Delete)
+        }) {
+            entry.is_latest = true;
+        }
+    }
+
+    #[test]
+    fn ack_expected_failure_accepts_direct_loss_for_all_trigger_types() {
+        for kind in [
+            AcknowledgedMutationKind::Put,
+            AcknowledgedMutationKind::Overwrite,
+            AcknowledgedMutationKind::DeleteMarker,
+            AcknowledgedMutationKind::ZeroBytePut,
+            AcknowledgedMutationKind::MultipartComplete,
+        ] {
+            let fixture = AckFailureFixture::new(kind);
+            fixture
+                .validate()
+                .unwrap_or_else(|error| panic!("{kind:?}: {error:#}"));
+            super::validate_ack_prechecker_boundary(
+                &fixture.report,
+                &fixture.history,
+                &fixture.ack.trigger_operation_id,
+                Some(90),
+            )
+            .expect("checker starts after recovery and exactly after trigger");
+        }
+    }
+
+    #[test]
+    fn ack_expected_failure_accepts_baseline_loss_for_overwrite_and_delete() {
+        for kind in [
+            AcknowledgedMutationKind::Overwrite,
+            AcknowledgedMutationKind::DeleteMarker,
+        ] {
+            let mut fixture = AckFailureFixture::new(kind);
+            fixture.fail_data_version("baseline-version", false);
+            fixture
+                .validate()
+                .unwrap_or_else(|error| panic!("{kind:?}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn ack_expected_failure_accepts_current_rollback_or_absence_with_exact_versions() {
+        let mut rollback = AckFailureFixture::new(AcknowledgedMutationKind::Overwrite);
+        rollback.restore_healthy_observations();
+        set_ack_get(
+            rollback.current_get_mut(),
+            OperationOutcome::Ok,
+            Some(200),
+            Some("baseline-hash"),
+            Some(4),
+            None,
+        );
+        rollback.report.verified_live_objects = 0;
+        rollback.report.hash_mismatches = vec![format!(
+            "{}: current GET returned the baseline value",
+            rollback.ack.trigger_key
+        )];
+        rollback.refresh_audit();
+        rollback.validate().expect("authenticated current rollback");
+
+        let mut absent = AckFailureFixture::new(AcknowledgedMutationKind::Overwrite);
+        absent.restore_healthy_observations();
+        set_ack_get(
+            absent.current_get_mut(),
+            OperationOutcome::NotFound,
+            Some(404),
+            None,
+            None,
+            Some("not found"),
+        );
+        absent.final_list_mut().listed_keys = Some(Vec::new());
+        absent.report.verified_live_objects = 0;
+        absent.report.final_listed_objects = Some(0);
+        absent.report.missing_committed_objects = vec![absent.ack.trigger_key.clone()];
+        absent.refresh_audit();
+        absent
+            .validate()
+            .expect("authenticated current GET 404 with exact versions readable");
+    }
+
+    #[test]
+    fn ack_expected_failure_accepts_marker_latest_conflict_and_resurrection() {
+        for duplicate_latest in [false, true] {
+            let mut fixture = AckFailureFixture::new(AcknowledgedMutationKind::DeleteMarker);
+            fixture.restore_healthy_observations();
+            let entries = fixture
+                .version_list_mut()
+                .listed_versions
+                .as_mut()
+                .expect("listed versions");
+            for entry in entries {
+                if entry.version_id.as_deref() == Some("baseline-version") {
+                    entry.is_latest = true;
+                } else if !duplicate_latest {
+                    entry.is_latest = false;
+                }
+            }
+            fixture.report.delete_marker_lineage_incomplete = vec![format!(
+                "{}: ListObjectVersions latest identity is invalid",
+                fixture.ack.trigger_key
+            )];
+            fixture.refresh_audit();
+            fixture
+                .validate()
+                .expect("authenticated marker latest conflict");
+        }
+
+        let mut resurrected = AckFailureFixture::new(AcknowledgedMutationKind::DeleteMarker);
+        resurrected.restore_healthy_observations();
+        set_ack_get(
+            resurrected.current_get_mut(),
+            OperationOutcome::Ok,
+            Some(200),
+            Some("baseline-hash"),
+            Some(4),
+            None,
+        );
+        resurrected.report.resurrected_deleted_objects = vec![format!(
+            "{}: committed delete resurrected on GET",
+            resurrected.ack.trigger_key
+        )];
+        resurrected.refresh_audit();
+        resurrected
+            .validate()
+            .expect("authenticated deleted-object resurrection");
+    }
+
+    #[test]
+    fn ack_expected_failure_accepts_version_timeout_hash_mismatch_and_list_only_omission() {
+        let mut timeout = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        timeout.restore_healthy_observations();
+        set_ack_get(
+            timeout.version_get_mut("trigger-version"),
+            OperationOutcome::Timeout,
+            Some(200),
+            None,
+            None,
+            Some("body timed out"),
+        );
+        timeout.report.verified_committed_versions = 0;
+        timeout.report.unavailable_committed_versions = vec![format!(
+            "{}@trigger-version: Timeout HTTP 200: body timed out",
+            timeout.ack.trigger_key
+        )];
+        timeout.refresh_audit();
+        timeout
+            .validate()
+            .expect("authenticated version body timeout");
+
+        let mut mismatch = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        mismatch.restore_healthy_observations();
+        set_ack_get(
+            mismatch.version_get_mut("trigger-version"),
+            OperationOutcome::Ok,
+            Some(200),
+            Some("wrong-hash"),
+            Some(8),
+            None,
+        );
+        mismatch.report.verified_committed_versions = 0;
+        mismatch.report.version_hash_mismatches = vec![format!(
+            "{}@trigger-version: expected trigger-hash, got wrong-hash",
+            mismatch.ack.trigger_key
+        )];
+        mismatch.refresh_audit();
+        mismatch
+            .validate()
+            .expect("authenticated version hash mismatch");
+
+        let mut listing = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        listing.restore_healthy_observations();
+        listing
+            .version_list_mut()
+            .listed_versions
+            .as_mut()
+            .expect("listed versions")
+            .clear();
+        listing.report.missing_committed_versions = vec![format!(
+            "{}@trigger-version: committed version missing from ListObjectVersions",
+            listing.ack.trigger_key
+        )];
+        listing.report.delete_marker_lineage_incomplete = vec![format!(
+            "{}: ListObjectVersions has no unique latest entry",
+            listing.ack.trigger_key
+        )];
+        listing.refresh_audit();
+        listing
+            .validate()
+            .expect("authenticated listing-only omission");
+    }
+
+    #[test]
+    fn ack_expected_failure_rejects_unrelated_or_forged_evidence() {
+        let fixture = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+
+        let mut unrelated = fixture.clone();
+        unrelated.report.missing_committed_versions = vec![
+            "fault-test/run-1/other@other-version".to_string(),
+            "fault-test/run-1/other@other-version: committed version missing from ListObjectVersions"
+                .to_string(),
+        ];
+        assert!(
+            unrelated.validate().is_err(),
+            "another key/version is not proof"
+        );
+
+        let mut forged_receipt = fixture.clone();
+        forged_receipt
+            .report
+            .audit
+            .as_mut()
+            .expect("audit")
+            .suffix_operations
+            .clear();
+        assert!(
+            forged_receipt.validate().is_err(),
+            "a self-reported audit cannot replace raw operation receipts"
+        );
+
+        let mut forged_classification = fixture.clone();
+        forged_classification
+            .report
+            .missing_committed_versions
+            .clear();
+        forged_classification.report.hash_mismatches = vec![format!(
+            "{}: claimed corruption",
+            forged_classification.ack.trigger_key
+        )];
+        assert!(
+            forged_classification.validate().is_err(),
+            "classification without a matching negative receipt must fail closed"
+        );
+
+        let mut wrong_audit_identity = fixture.clone();
+        wrong_audit_identity
+            .report
+            .audit
+            .as_mut()
+            .expect("audit")
+            .data_version_checks[0]
+            .version_id = "other-version".to_string();
+        assert!(wrong_audit_identity.validate().is_err());
+
+        let mut ranged = fixture.clone();
+        ranged.version_get_mut("trigger-version").range = Some(ByteRange {
+            offset: 0,
+            length: 1,
+        });
+        ranged.refresh_audit();
+        assert!(
+            ranged.validate().is_err(),
+            "a ranged GET is not full-version proof"
+        );
+
+        let mut missing_size = AckFailureFixture::new(AcknowledgedMutationKind::Overwrite);
+        missing_size.history[0].size_bytes = None;
+        missing_size.refresh_audit();
+        assert!(
+            missing_size.validate().is_err(),
+            "protected baseline data without size cannot prove hash correctness"
+        );
+
+        let mut duplicate_sequence = fixture.clone();
+        duplicate_sequence.history[duplicate_sequence.prefix_len].started_sequence =
+            duplicate_sequence.history[0].started_sequence;
+        duplicate_sequence.refresh_audit();
+        assert!(
+            duplicate_sequence.validate().is_err(),
+            "duplicate global history sequence must be rejected"
+        );
+
+        let mut cross_bucket = fixture.clone();
+        cross_bucket.history[cross_bucket.prefix_len - 1].bucket = "other-bucket".to_string();
+        cross_bucket.refresh_audit();
+        assert!(
+            cross_bucket.validate().is_err(),
+            "ACK trigger from another bucket must be rejected"
+        );
+    }
+
+    #[test]
+    fn ack_expected_failure_rejects_mutating_or_pre_recovery_checker_traffic() {
+        for kind in [OperationKind::Put, OperationKind::Delete] {
+            let mut fixture = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+            let trigger_key = fixture.ack.trigger_key.clone();
+            let record = fixture.final_list_mut();
+            record.kind = kind;
+            record.key = Some(trigger_key);
+            record.version_id = Some(format!("post-{kind:?}"));
+            record.value_sha256 = (kind == OperationKind::Put).then(|| "post-hash".to_string());
+            record.size_bytes = (kind == OperationKind::Put).then_some(4);
+            fixture.refresh_audit();
+            assert!(
+                fixture.validate().is_err(),
+                "post-boundary {kind:?} must invalidate checker evidence"
+            );
+        }
+
+        let mut fault_active = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        let read = fault_active.current_get_mut();
+        read.durability_cohort = Some(DurabilityCohort::FaultActive);
+        read.fault_window_relation = Some(FaultWindowRelation::DuringFault);
+        fault_active.refresh_audit();
+        assert!(
+            fault_active.validate().is_err(),
+            "fault-active reads cannot serve as post-recovery checker evidence"
+        );
+
+        let mut extra_before_checker = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        extra_before_checker.prefix_len += 1;
+        extra_before_checker.refresh_audit();
+        assert!(
+            super::validate_ack_prechecker_boundary(
+                &extra_before_checker.report,
+                &extra_before_checker.history,
+                &extra_before_checker.ack.trigger_operation_id,
+                Some(90),
+            )
+            .is_err(),
+            "the first checker prefix must end exactly at the trigger"
+        );
+
+        let fixture = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        let checker_started_at_ms = fixture.report.audit.as_ref().expect("audit").started_at_ms;
+        assert!(
+            super::validate_ack_prechecker_boundary(
+                &fixture.report,
+                &fixture.history,
+                &fixture.ack.trigger_operation_id,
+                Some(checker_started_at_ms + 1),
+            )
+            .is_err(),
+            "checker observations cannot start before recovery completes"
         );
     }
 
@@ -5648,7 +8889,23 @@ mod tests {
                 "versioning_expected": true,
                 "expected_committed_versions": 1,
                 "verified_committed_versions": verified_refs.len(),
-                "verified_committed_version_refs": verified_refs,
+                "audit": {
+                    "bucket": "bucket",
+                    "started_at_ms": 20,
+                    "completed_at_ms": 30,
+                    "history_prefix_record_count": 1,
+                    "history_prefix_sha256": "prefix",
+                    "history_suffix_record_count": 1,
+                    "history_suffix_sha256": "suffix",
+                    "suffix_operations": [],
+                    "data_version_checks": verified_refs.iter().map(|reference| {
+                        let (key, version) = reference.split_once('@').expect("version reference");
+                        json!({"key": key, "version_id": version, "expected_sha256": "hash-1",
+                            "observed_sha256": "hash-1", "outcome": "ok", "http_status": 200})
+                    }).collect::<Vec<_>>(),
+                    "delete_marker_checks": [],
+                    "list_object_versions_completed": true
+                },
                 "operation_cohorts": {"pre_fault": 1},
                 "fault_window_relations": {},
                 "tenant_recovered": true,
@@ -5738,8 +8995,24 @@ mod tests {
                 "versioning_expected": true,
                 "expected_committed_versions": 1,
                 "verified_committed_versions": 1,
-                "verified_committed_version_refs": ["key-1@version-1"],
-                "verified_committed_delete_marker_refs": markers,
+                "audit": {
+                    "bucket": "bucket",
+                    "started_at_ms": 20,
+                    "completed_at_ms": 30,
+                    "history_prefix_record_count": 2,
+                    "history_prefix_sha256": "prefix",
+                    "history_suffix_record_count": 1,
+                    "history_suffix_sha256": "suffix",
+                    "suffix_operations": [],
+                    "data_version_checks": [{"key": "key-1", "version_id": "version-1",
+                        "expected_sha256": "hash-1", "observed_sha256": "hash-1",
+                        "outcome": "ok", "http_status": 200}],
+                    "delete_marker_checks": markers.iter().map(|reference| {
+                        let (key, version) = reference.split_once('@').expect("marker reference");
+                        json!({"key": key, "version_id": version, "visible_in_list_object_versions": true})
+                    }).collect::<Vec<_>>(),
+                    "list_object_versions_completed": true
+                },
                 "operation_cohorts": {"pre_fault": 2},
                 "fault_window_relations": {},
                 "tenant_recovered": true,
@@ -5767,37 +9040,63 @@ mod tests {
 
     #[test]
     fn ack_trigger_contract_rejects_s3_traffic_before_crash_boundary() {
-        use crate::fault::history::OperationKind;
-
-        let record = |id: &str, started_at_ms: u64| {
+        let record = |id: &str, kind: OperationKind, started_at_ms: u64, recovered: bool| {
             serde_json::from_value::<OperationRecord>(json!({
                 "id": id,
                 "scenario": "ack-case",
                 "run_id": "run-1",
-                "kind": OperationKind::Put,
+                "kind": kind,
                 "bucket": "bucket",
                 "key": id,
                 "value_sha256": "abc",
                 "size_bytes": 4,
-                "version_id": id,
+                "version_id": if kind == OperationKind::Put { Some(id) } else { None },
+                "started_sequence": if id == "op-1" { 1 } else { 3 },
+                "ended_sequence": if id == "op-1" { 2 } else { 4 },
                 "started_at_ms": started_at_ms,
                 "ended_at_ms": started_at_ms + 1,
                 "outcome": "ok",
                 "http_status": 200,
-                "error": null
+                "error": null,
+                "durability_cohort": if recovered { "post_recovery" } else { "pre_fault" },
+                "fault_window_relation": if recovered { "after_fault" } else { "before_fault" }
             }))
             .expect("operation record")
         };
-        let trigger = record("op-1", 90);
-        let recovery_read = record("op-2", 121);
-        super::validate_ack_quiet_gap(&[trigger.clone(), recovery_read], &trigger, 120)
+        let trigger = record("op-1", OperationKind::Put, 90, false);
+        let recovery_read = record("op-2", OperationKind::Get, 121, true);
+        super::validate_ack_quiet_gap(&[trigger.clone(), recovery_read], &trigger, 120, 3)
             .expect("quiet gap");
 
-        let extra = record("op-2", 115);
+        let extra = record("op-2", OperationKind::Get, 115, true);
         assert!(
-            super::validate_ack_quiet_gap(&[trigger.clone(), extra], &trigger, 120).is_err(),
+            super::validate_ack_quiet_gap(&[trigger.clone(), extra], &trigger, 120, 5).is_err(),
             "traffic after the ACK must invalidate the quiet crash window"
         );
+
+        let mut trigger = trigger;
+        trigger.ended_at_ms = trigger.started_at_ms;
+        let mut same_ms = record("op-2", OperationKind::Get, trigger.started_at_ms, true);
+        same_ms.ended_at_ms = trigger.started_at_ms;
+        for boundary_sequence in [4, 5] {
+            assert!(
+                super::validate_ack_quiet_gap(
+                    &[trigger.clone(), same_ms.clone()],
+                    &trigger,
+                    trigger.started_at_ms,
+                    boundary_sequence,
+                )
+                .is_err(),
+                "pending or completed same-millisecond traffic before the boundary invalidates the quiet gap"
+            );
+        }
+        super::validate_ack_quiet_gap(
+            &[trigger.clone(), same_ms],
+            &trigger,
+            trigger.started_at_ms,
+            3,
+        )
+        .expect("recovery traffic after the captured sequence boundary may share its millisecond");
     }
 
     #[test]
@@ -6710,11 +10009,7 @@ mod tests {
 
         let error = validate_fault_artifacts(&options).expect_err("ambiguous evidence mismatch");
 
-        assert!(
-            error
-                .to_string()
-                .contains("contains a non-clean checker verdict")
-        );
+        assert!(error.to_string().contains("did not pass"));
     }
 
     #[test]
@@ -7443,25 +10738,190 @@ mod tests {
         workload_plan["scenario"] = json!(scenario);
         workload_plan["run_id"] = json!(run_id);
         write_json(&case_dir, "workload-plan.json", &workload_plan);
+        let history_prefix = vec![
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000001",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "put",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "sha",
+                "size_bytes": 1,
+                "started_at_ms": 1,
+                "ended_at_ms": 2,
+                "started_sequence": 1,
+                "ended_sequence": 2,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "pre_fault",
+                "fault_window_relation": "before_fault"
+            }))
+            .expect("history PUT"),
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000002",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "put",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "recommit-sha",
+                "size_bytes": 1,
+                "started_at_ms": 3,
+                "ended_at_ms": 4,
+                "started_sequence": 3,
+                "ended_sequence": 4,
+                "outcome": "timeout",
+                "http_status": null,
+                "error": "put object timed out",
+                "durability_cohort": "fault_active",
+                "fault_window_relation": "during_fault"
+            }))
+            .expect("ambiguous workload PUT"),
+        ];
+        let pre_checker_suffix = vec![
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000003",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "get",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "sha",
+                "size_bytes": 1,
+                "started_at_ms": 11,
+                "ended_at_ms": 12,
+                "started_sequence": 5,
+                "ended_sequence": 6,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
+            }))
+            .expect("checker GET"),
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000004",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "list",
+                "bucket": "bucket",
+                "key": format!("fault-test/{run_id}/"),
+                "value_sha256": null,
+                "size_bytes": 1,
+                "listed_keys": ["key"],
+                "started_at_ms": 13,
+                "ended_at_ms": 14,
+                "started_sequence": 7,
+                "ended_sequence": 8,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
+            }))
+            .expect("checker LIST"),
+        ];
+        let recommit_history = vec![
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000005",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "put",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "recommit-sha",
+                "size_bytes": 1,
+                "started_at_ms": 16,
+                "ended_at_ms": 17,
+                "started_sequence": 9,
+                "ended_sequence": 10,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
+            }))
+            .expect("recommit PUT"),
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000006",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "get",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "recommit-sha",
+                "size_bytes": 1,
+                "started_at_ms": 18,
+                "ended_at_ms": 19,
+                "started_sequence": 11,
+                "ended_sequence": 12,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
+            }))
+            .expect("recommit verification GET"),
+        ];
+        let final_checker_suffix = vec![
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000007",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "get",
+                "bucket": "bucket",
+                "key": "key",
+                "value_sha256": "recommit-sha",
+                "size_bytes": 1,
+                "started_at_ms": 21,
+                "ended_at_ms": 22,
+                "started_sequence": 13,
+                "ended_sequence": 14,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
+            }))
+            .expect("final checker GET"),
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": "op-000008",
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": "list",
+                "bucket": "bucket",
+                "key": format!("fault-test/{run_id}/"),
+                "value_sha256": null,
+                "size_bytes": 1,
+                "listed_keys": ["key"],
+                "started_at_ms": 23,
+                "ended_at_ms": 24,
+                "started_sequence": 15,
+                "ended_sequence": 16,
+                "outcome": "ok",
+                "http_status": 200,
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
+            }))
+            .expect("final checker LIST"),
+        ];
+        let mut history = history_prefix.clone();
+        history.extend(pre_checker_suffix.clone());
+        history.extend(recommit_history.clone());
+        let final_checker_prefix = history.clone();
+        history.extend(final_checker_suffix.clone());
         fs::write(
             case_dir.join("history.jsonl"),
             format!(
                 "{}\n",
-                json!({
-                    "id": "op-000001",
-                    "scenario": scenario,
-                    "run_id": run_id,
-                    "kind": "put",
-                    "bucket": "bucket",
-                    "key": "key",
-                    "value_sha256": "sha",
-                    "size_bytes": 1,
-                    "started_at_ms": 1,
-                    "ended_at_ms": 2,
-                    "outcome": "ok",
-                    "http_status": 200,
-                    "error": null
-                })
+                history
+                    .iter()
+                    .map(|record| serde_json::to_string(record).expect("history record"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ),
         )
         .expect("history");
@@ -7475,12 +10935,25 @@ mod tests {
                 "object_count": 12,
                 "concurrency": 4,
                 "total_payload_bytes": 12582912,
-                "puts": {"ok": 1, "not_found": 0, "failed": 1, "timeout": 0, "unknown": 0},
+                "puts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
                 "gets": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
                 "deletes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
                 "lists": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
                 "multipart_completes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
                 "multipart_aborts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "recommit_candidates": {
+                    "scenario": scenario,
+                    "run_id": run_id,
+                    "bucket": "bucket",
+                    "history_record_count": history_prefix.len(),
+                    "history_sha256": checker::checker_history_records_sha256(&history_prefix).expect("candidate history digest"),
+                    "candidates": [{
+                        "source_operation_id": "op-000002",
+                        "key": "key",
+                        "size_bytes": 1,
+                        "sha256": "recommit-sha"
+                    }]
+                },
                 "recommitted_after_recovery": 1
             }),
         );
@@ -7494,34 +10967,63 @@ mod tests {
                 "committed": 1,
                 "failed": 0,
                 "harness_errors": 0,
-                "attempts": [{"key": "k", "size_bytes": 1, "sha256": "s", "outcome": "ok", "verify_get_outcome": "ok", "http_status": 200, "error": null, "harness_error": null}]
+                "attempts": [{"source_operation_id": "op-000002", "key": "key", "size_bytes": 1, "sha256": "recommit-sha", "outcome": "ok", "verify_get_outcome": "ok", "http_status": 200, "error": null, "harness_error": null}]
             }),
         );
-        let checker = json!({
-            "scenario": scenario,
-            "run_id": run_id,
-            "committed_puts": 7,
-            "expected_live_objects": 7,
-            "verified_live_objects": 7,
-            "missing_committed_objects": [],
-            "unavailable_committed_objects": [],
-            "unknown_committed_read_failures": [],
-            "hash_mismatches": [],
-            "successful_corrupted_reads": [],
-            "unexpected_visible_deleted_objects": [],
-            "unknown_writes_materialized": [],
-            "operation_cohorts": {"pre_fault": 12, "fault_active": 8, "post_recovery": 4},
-            "fault_window_relations": {"during_fault": 8, "after_fault": 4},
-            "list_history_warning_count": 0,
-            "final_list_warning_count": 0,
-            "list_history_warnings": [],
-            "list_warnings": [],
-            "final_listed_objects": 7,
-            "tenant_recovered": true,
-            "passed": true
-        });
-        write_json(&case_dir, "checker-pre-recommit-report.json", &checker);
-        write_json(&case_dir, "checker-report.json", &checker);
+        let checker_report = |prefix: &[OperationRecord],
+                              suffix: &[OperationRecord],
+                              started_at_ms: u64,
+                              completed_at_ms: u64,
+                              committed_puts: usize| {
+            json!({
+                "scenario": scenario,
+                "run_id": run_id,
+                "committed_puts": committed_puts,
+                "expected_live_objects": 1,
+                "verified_live_objects": 1,
+                "missing_committed_objects": [],
+                "unavailable_committed_objects": [],
+                "unknown_committed_read_failures": [],
+                "hash_mismatches": [],
+                "successful_corrupted_reads": [],
+                "unexpected_visible_deleted_objects": [],
+                "unknown_writes_materialized": [],
+                "operation_cohorts": if committed_puts == 1 {
+                    json!({"pre_fault": 1, "fault_active": 1})
+                } else {
+                    json!({"pre_fault": 1, "fault_active": 1, "post_recovery": 4})
+                },
+                "fault_window_relations": if committed_puts == 1 {
+                    json!({"before_fault": 1, "during_fault": 1})
+                } else {
+                    json!({"before_fault": 1, "during_fault": 1, "after_fault": 4})
+                },
+                "list_history_warning_count": 0,
+                "final_list_warning_count": 0,
+                "list_history_warnings": [],
+                "list_warnings": [],
+                "final_listed_objects": 1,
+                "audit": {
+                    "bucket": "bucket",
+                    "started_at_ms": started_at_ms,
+                    "completed_at_ms": completed_at_ms,
+                    "history_prefix_record_count": prefix.len(),
+                    "history_prefix_sha256": checker::checker_history_records_sha256(prefix).expect("checker prefix digest"),
+                    "history_suffix_record_count": suffix.len(),
+                    "history_suffix_sha256": checker::checker_history_records_sha256(suffix).expect("checker suffix digest"),
+                    "suffix_operations": checker::checker_operation_audits(suffix),
+                    "data_version_checks": [],
+                    "delete_marker_checks": [],
+                    "list_object_versions_completed": null
+                },
+                "tenant_recovered": true,
+                "passed": true
+            })
+        };
+        let pre_checker = checker_report(&history_prefix, &pre_checker_suffix, 10, 15, 1);
+        let final_checker = checker_report(&final_checker_prefix, &final_checker_suffix, 20, 25, 2);
+        write_json(&case_dir, "checker-pre-recommit-report.json", &pre_checker);
+        write_json(&case_dir, "checker-report.json", &final_checker);
         write_json(
             &case_dir,
             "fault-evidence.json",
@@ -7558,6 +11060,55 @@ mod tests {
             serde_json::to_string_pretty(value).expect("json"),
         )
         .expect("write json");
+    }
+
+    fn rewrite_first_history_record(
+        path: &std::path::Path,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let current = fs::read_to_string(path).expect("history");
+        let mut records = current.lines().map(str::to_string).collect::<Vec<_>>();
+        let mut first = serde_json::from_str::<serde_json::Value>(
+            records.first().expect("first history record"),
+        )
+        .expect("history record");
+        mutate(&mut first);
+        records[0] = first.to_string();
+        fs::write(path, format!("{}\n", records.join("\n"))).expect("rewrite history");
+    }
+
+    fn rewrite_history_and_refresh_final_audit(
+        case_dir: &std::path::Path,
+        mutate: impl FnOnce(&mut Vec<OperationRecord>),
+    ) {
+        let history_path = case_dir.join("history.jsonl");
+        let mut records = read_jsonl::<OperationRecord>(&history_path).expect("history");
+        mutate(&mut records);
+        fs::write(
+            &history_path,
+            format!(
+                "{}\n",
+                records
+                    .iter()
+                    .map(|record| serde_json::to_string(record).expect("history record"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )
+        .expect("rewrite history");
+
+        let checker_path = case_dir.join("checker-report.json");
+        let mut checker: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&checker_path).expect("checker report"))
+                .expect("checker JSON");
+        let prefix_count = checker["audit"]["history_prefix_record_count"]
+            .as_u64()
+            .expect("prefix count") as usize;
+        checker["audit"]["history_prefix_sha256"] = json!(
+            checker::checker_history_records_sha256(&records[..prefix_count])
+                .expect("checker prefix digest")
+        );
+        write_json(case_dir, "checker-report.json", &checker);
     }
 
     fn rewrite_run_spec_versioning(case_dir: &std::path::Path, versioning: bool) {
