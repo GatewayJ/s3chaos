@@ -791,7 +791,10 @@ mod tests {
     use crate::fault::{
         plan::FaultInjectionParameters,
         reporting::{FailureClassification, FailureSeverity, ResponsibilityDomain},
-        scenarios::{DetectorQualification, FaultScenarioStatus},
+        scenarios::{
+            ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, DetectorQualification,
+            FaultScenarioStatus,
+        },
     };
 
     #[test]
@@ -1277,24 +1280,28 @@ scenarios:
     fn rejects_planned_scenario_names() {
         let planned = crate::fault::scenarios::scenario_catalog()
             .iter()
-            .find(|scenario| scenario.status == FaultScenarioStatus::Planned)
-            .expect("catalog has a planned scenario")
-            .scenario;
-        let suite = serde_yaml_ng::from_str::<FaultSuite>(&format!(
-            r#"
+            .filter(|scenario| scenario.status == FaultScenarioStatus::Planned)
+            .map(|scenario| scenario.scenario)
+            .collect::<Vec<_>>();
+        assert!(planned.contains(&ADMIN_DECOMMISSION_SCENARIO));
+        assert!(planned.contains(&ADMIN_REBALANCE_SCENARIO));
+        for scenario in planned {
+            let suite = serde_yaml_ng::from_str::<FaultSuite>(&format!(
+                r#"
 apiVersion: rustfs.com/s3chaos/v1alpha1
 kind: FaultSuite
 metadata:
   name: rustfs-smoke
 scenarios:
-  - name: {planned}
+  - name: {scenario}
 "#
-        ))
-        .expect("suite yaml");
+            ))
+            .expect("suite yaml");
 
-        let error = suite.resolve().expect_err("planned scenario");
+            let error = suite.resolve().expect_err("planned scenario");
 
-        assert!(error.to_string().contains("not executable"));
+            assert!(error.to_string().contains("not executable"));
+        }
     }
 
     #[test]
