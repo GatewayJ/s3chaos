@@ -25,7 +25,8 @@ use crate::protocol::{
     cases::{
         CaseContext, ProtocolCaseExecution,
         authz::{
-            expect_access_denied, expect_eventual_access_denied, expect_eventual_ok, expect_ok,
+            ExpectationFailure, expect_access_denied, expect_eventual_access_denied,
+            expect_eventual_ok, expect_ok,
         },
         iam::clean_attachment,
     },
@@ -60,7 +61,7 @@ pub(crate) enum CannedPolicy {
     ReadOnly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum MatrixOperation {
     PutObject,
     GetObject,
@@ -275,6 +276,24 @@ async fn ensure_key_presence(
         } else {
             "no longer listed"
         }
+    );
+    Ok(())
+}
+
+async fn ensure_keys_present(
+    admin_s3: &impl ProtocolListingPort,
+    bucket: &str,
+    keys: &[&str],
+    operation: &str,
+) -> Result<()> {
+    let listed = admin_keys(admin_s3, bucket).await?;
+    let missing = keys
+        .iter()
+        .filter(|key| !listed.iter().any(|listed| listed == *key))
+        .collect::<Vec<_>>();
+    ensure!(
+        missing.is_empty(),
+        "{operation}: objects {missing:?} outside the targeted key were removed"
     );
     Ok(())
 }
@@ -730,14 +749,30 @@ where
     registry.transition(&objects.id, ResourceState::Creating, None)?;
     let root_tree = format!("{prefix}root-tree/");
     let actor_tree = format!("{prefix}actor-tree/");
+    let actor_tree_keys = [format!("{actor_tree}a"), format!("{actor_tree}nested/b")];
     let single = format!("{prefix}single");
-    for tree in [&root_tree, &actor_tree] {
-        for leaf in ["a", "nested/b"] {
-            seed_object(admin_s3, &bucket, &format!("{tree}{leaf}"), b"tree").await?;
-        }
+    // `single/child` shares `single` as a key prefix: the header also sets the server's
+    // delete_prefix option (rustfs storage/options.rs), so a server that merely relaxed the
+    // authorization gate would remove the child too. It must survive a single-object delete.
+    let single_child = format!("{single}/child");
+    let sacrificial = format!("{prefix}sacrificial");
+    for leaf in ["a", "nested/b"] {
+        seed_object(admin_s3, &bucket, &format!("{root_tree}{leaf}"), b"tree").await?;
+    }
+    for key in &actor_tree_keys {
+        seed_object(admin_s3, &bucket, key, b"tree").await?;
     }
     seed_object(admin_s3, &bucket, &single, b"single").await?;
+    seed_object(admin_s3, &bucket, &single_child, b"child").await?;
+    seed_object(admin_s3, &bucket, &sacrificial, b"sacrificial").await?;
     registry.transition(&objects.id, ResourceState::Created, None)?;
+    let untouched_by_prefix_deletes = [
+        actor_tree_keys[0].as_str(),
+        actor_tree_keys[1].as_str(),
+        single.as_str(),
+        single_child.as_str(),
+        sacrificial.as_str(),
+    ];
 
     // The Console attaches consoleAdmin to its operators; that is the non-owner identity the
     // reporter of rustfs/rustfs#7649 used.
@@ -789,6 +824,13 @@ where
         remaining.is_empty(),
         "{root_operation}: owner force-delete of {root_tree} was accepted but left {remaining:?}"
     );
+    ensure_keys_present(
+        admin_s3,
+        &bucket,
+        &untouched_by_prefix_deletes,
+        root_operation,
+    )
+    .await?;
 
     let actor_operation = "delete-object-prefix-with-force-header-as-non-owner";
     expect_access_denied(
@@ -800,20 +842,33 @@ where
         || async { actor_shaped.delete_object(&bucket, &actor_tree).await },
     )
     .await?;
-    let surviving = admin_keys(admin_s3, &bucket)
-        .await?
-        .into_iter()
-        .filter(|key| key.starts_with(&actor_tree))
-        .count();
-    ensure!(
-        surviving == 2,
-        "{actor_operation}: non-owner force-delete was denied but {actor_tree} lost objects"
-    );
+    ensure_keys_present(
+        admin_s3,
+        &bucket,
+        &untouched_by_prefix_deletes,
+        actor_operation,
+    )
+    .await?;
+
+    // A plain DeleteObject from the same actor must succeed right now, so the shaped delete
+    // that follows is judged against the force-delete gate and not against IAM propagation lag
+    // on the node that happens to serve it.
+    let plain_operation = "delete-object-plain-without-force-header";
+    expect_ok(
+        context,
+        "iam-user",
+        plain_operation,
+        &bucket,
+        Some(&sacrificial),
+        || async { fixture.actor_s3.delete_object(&bucket, &sacrificial).await },
+    )
+    .await?;
+    ensure_key_presence(admin_s3, &bucket, &sacrificial, false, plain_operation).await?;
 
     let single_operation = "delete-object-single-with-force-header-as-non-owner";
     match contract {
         ForceDeleteHeaderSingleObjectContract::IgnoreHeader => {
-            let outcome = expect_ok(
+            match expect_ok(
                 context,
                 "iam-user",
                 single_operation,
@@ -821,20 +876,24 @@ where
                 Some(&single),
                 || async { actor_shaped.delete_object(&bucket, &single).await },
             )
-            .await;
-            if let Err(error) = outcome {
-                let denied = context.assertions.last().is_some_and(|assertion| {
-                    assertion.actual == ProtocolAssertionClass::AccessDenied
-                });
-                if denied {
+            .await
+            {
+                Ok(()) => {}
+                Err(failure) if failure.observed == ProtocolAssertionClass::AccessDenied => {
                     bail!(
-                        "{error}; contracts.forceDeleteHeaderSingleObject={} expects a non-owner single-object DeleteObject carrying {FORCE_DELETE_HEADER}: true to behave like a plain DeleteObject (rustfs/rustfs#7649 reporter expectation), but RustFS rejected it; RustFS main currently rejects the header for every non-owner in recursive_force_delete_is_authorized (rustfs/src/storage/access.rs). Set contracts.forceDeleteHeaderSingleObject: reject to assert the current server behavior instead",
+                        "{failure}; contracts.forceDeleteHeaderSingleObject={} expects a non-owner single-object DeleteObject carrying {FORCE_DELETE_HEADER}: true to behave like a plain DeleteObject (rustfs/rustfs#7649 reporter expectation), but RustFS rejected it; RustFS main currently rejects the header for every non-owner in recursive_force_delete_is_authorized (rustfs/src/storage/access.rs). Set contracts.forceDeleteHeaderSingleObject: reject to assert the current server behavior instead",
                         contract.as_str()
                     );
                 }
-                return Err(error);
+                Err(failure) => return Err(ExpectationFailure::into(failure)),
             }
-            ensure_key_presence(admin_s3, &bucket, &single, false, single_operation).await
+            ensure_key_presence(admin_s3, &bucket, &single, false, single_operation).await?;
+            let listed = admin_keys(admin_s3, &bucket).await?;
+            ensure!(
+                listed.iter().any(|key| key == &single_child),
+                "{single_operation}: the delete was accepted but also removed {single_child}; the header still acted as a prefix delete instead of a plain DeleteObject"
+            );
+            Ok(())
         }
         ForceDeleteHeaderSingleObjectContract::Reject => {
             expect_access_denied(
@@ -846,7 +905,13 @@ where
                 || async { actor_shaped.delete_object(&bucket, &single).await },
             )
             .await?;
-            ensure_key_presence(admin_s3, &bucket, &single, true, single_operation).await
+            ensure_keys_present(
+                admin_s3,
+                &bucket,
+                &[single.as_str(), single_child.as_str()],
+                single_operation,
+            )
+            .await
         }
     }
 }
@@ -883,13 +948,19 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    /// How the fake server treats `x-rustfs-force-delete: true` from a non-owner.
+    /// How the fake server treats `x-rustfs-force-delete: true` from a non-owner. The header
+    /// keeps its prefix-delete semantics for every accepted request unless a variant says
+    /// otherwise, mirroring `opts.delete_prefix` being set independently of the auth gate.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ForceHeaderGate {
         /// RustFS main: any non-owner request carrying the header is rejected.
         RejectNonOwner,
-        /// rustfs/rustfs#7649 reporter expectation: only a prefix delete is rejected.
+        /// rustfs/rustfs#7649 reporter expectation: a prefix delete is rejected and a
+        /// single-object delete behaves like a plain DeleteObject.
         IgnoreForSingleObject,
+        /// Half fix: the gate lets a non-slash key through but the header still deletes every
+        /// key sharing that prefix.
+        RelaxGateKeepPrefixDelete,
         /// Regressed server: the header is honored for anyone.
         Unrestricted,
     }
@@ -911,8 +982,15 @@ mod tests {
         force_header_gate: Option<ForceHeaderGate>,
         /// Owner prefix delete removes only the literal key instead of the subtree.
         shallow_owner_force_delete: bool,
-        /// Server bug simulation: `readonly` also grants `s3:DeleteObject`.
-        readonly_grants_delete: bool,
+        /// Server bug simulation: a canned policy also grants one matrix operation.
+        extra_grants: Vec<(&'static str, MatrixOperation)>,
+        /// Server bug simulation: a denied DeleteObject still removes the object.
+        deny_but_delete: bool,
+        /// Propagation stall simulation: plain (header-less) non-owner deletes are denied.
+        stall_plain_deletes: bool,
+        /// Number of authorization decisions after a detach that still see the old grant.
+        detach_visibility_lag: usize,
+        lagging_grants: BTreeMap<String, BTreeMap<String, usize>>,
     }
 
     impl State {
@@ -1042,6 +1120,14 @@ mod tests {
                     state.user_policies.remove(principal);
                 }
             }
+            if state.detach_visibility_lag > 0 {
+                let lag = state.detach_visibility_lag;
+                state
+                    .lagging_grants
+                    .entry(principal.to_string())
+                    .or_default()
+                    .insert(policy.to_string(), lag);
+            }
             Ok(())
         }
         async fn policy_attached(
@@ -1161,9 +1247,10 @@ mod tests {
 
         fn authorize(
             &self,
-            state: &State,
+            state: &mut State,
             action: &str,
             bucket: &str,
+            operation: MatrixOperation,
         ) -> std::result::Result<(), ProtocolS3Error> {
             let Some(actor) = self.actor.as_deref() else {
                 return Ok(());
@@ -1171,18 +1258,24 @@ mod tests {
             if !state.buckets.contains(bucket) {
                 return Err(not_found("NoSuchBucket"));
             }
-            let allowed = state
-                .user_policies
-                .get(actor)
-                .into_iter()
-                .flatten()
+            let mut attached = state.user_policies.get(actor).cloned().unwrap_or_default();
+            if let Some(lagging) = state.lagging_grants.get_mut(actor) {
+                for (policy, remaining) in lagging.iter_mut() {
+                    attached.insert(policy.clone());
+                    *remaining -= 1;
+                }
+                lagging.retain(|_, remaining| *remaining > 0);
+            }
+            let allowed = attached
+                .iter()
                 .filter_map(|policy| canned_actions(policy).map(|actions| (policy, actions)))
                 .any(|(policy, actions)| {
                     actions.contains(&"s3:*")
                         || actions.contains(&action)
-                        || (state.readonly_grants_delete
-                            && policy == "readonly"
-                            && action == "s3:DeleteObject")
+                        || state
+                            .extra_grants
+                            .iter()
+                            .any(|(granted, op)| granted == policy && *op == operation)
                 });
             if allowed {
                 Ok(())
@@ -1205,7 +1298,8 @@ mod tests {
                 .expect("force header gate must be configured for shaped requests");
             let rejected = match gate {
                 ForceHeaderGate::RejectNonOwner => true,
-                ForceHeaderGate::IgnoreForSingleObject => key.ends_with('/'),
+                ForceHeaderGate::IgnoreForSingleObject
+                | ForceHeaderGate::RelaxGateKeepPrefixDelete => key.ends_with('/'),
                 ForceHeaderGate::Unrestricted => false,
             };
             if rejected {
@@ -1289,8 +1383,13 @@ mod tests {
     #[async_trait]
     impl ProtocolListingPort for FakeS3 {
         async fn list_objects(&self, bucket: &str) -> Result<Vec<String>, ProtocolS3Error> {
-            let state = self.state.lock().expect("state");
-            self.authorize(&state, "s3:ListBucket", bucket)?;
+            let mut state = self.state.lock().expect("state");
+            self.authorize(
+                &mut state,
+                "s3:ListBucket",
+                bucket,
+                MatrixOperation::GetObject,
+            )?;
             Ok(state
                 .objects
                 .iter()
@@ -1321,13 +1420,23 @@ mod tests {
             body: &[u8],
         ) -> Result<(), ProtocolS3Error> {
             let mut state = self.state.lock().expect("state");
-            self.authorize(&state, "s3:PutObject", bucket)?;
+            self.authorize(
+                &mut state,
+                "s3:PutObject",
+                bucket,
+                MatrixOperation::PutObject,
+            )?;
             FakeS3::write(&mut state, bucket, key, Some(body.to_vec()));
             Ok(())
         }
         async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, ProtocolS3Error> {
-            let state = self.state.lock().expect("state");
-            self.authorize(&state, "s3:GetObject", bucket)?;
+            let mut state = self.state.lock().expect("state");
+            self.authorize(
+                &mut state,
+                "s3:GetObject",
+                bucket,
+                MatrixOperation::GetObject,
+            )?;
             state
                 .objects
                 .get(&(bucket.to_string(), key.to_string()))
@@ -1337,9 +1446,28 @@ mod tests {
         }
         async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ProtocolS3Error> {
             let mut state = self.state.lock().expect("state");
-            self.authorize(&state, "s3:DeleteObject", bucket)?;
+            if let Err(error) = self.authorize(
+                &mut state,
+                "s3:DeleteObject",
+                bucket,
+                MatrixOperation::DeleteObject,
+            ) {
+                if state.deny_but_delete {
+                    FakeS3::delete_current(&mut state, bucket, key);
+                }
+                return Err(error);
+            }
+            if state.stall_plain_deletes && !self.is_owner() && !self.force_header() {
+                return Err(access_denied());
+            }
             self.force_header_gate(&state, key)?;
-            if self.force_header() && key.ends_with('/') && !state.shallow_owner_force_delete {
+            // The header selects delete_prefix for every accepted request; only the reporter's
+            // expected fix narrows it to keys that name a prefix.
+            let prefix_delete = self.force_header()
+                && !state.shallow_owner_force_delete
+                && (key.ends_with('/')
+                    || state.force_header_gate != Some(ForceHeaderGate::IgnoreForSingleObject));
+            if prefix_delete {
                 state.objects.retain(|(candidate, existing), _| {
                     candidate != bucket || !existing.starts_with(key)
                 });
@@ -1367,11 +1495,16 @@ mod tests {
             for key in keys {
                 // RustFS answers 200 with a per-key AccessDenied entry; the real client
                 // surfaces the first entry error as the operation error.
-                self.authorize(&state, "s3:DeleteObject", bucket)
-                    .map_err(|error| ProtocolS3Error {
-                        status: Some(200),
-                        ..error
-                    })?;
+                self.authorize(
+                    &mut state,
+                    "s3:DeleteObject",
+                    bucket,
+                    MatrixOperation::DeleteObjects,
+                )
+                .map_err(|error| ProtocolS3Error {
+                    status: Some(200),
+                    ..error
+                })?;
                 FakeS3::delete_current(&mut state, bucket, key);
                 deleted.push(key.clone());
             }
@@ -1400,8 +1533,13 @@ mod tests {
             key: &str,
             version_id: &str,
         ) -> Result<Vec<u8>, ProtocolS3Error> {
-            let state = self.state.lock().expect("state");
-            self.authorize(&state, "s3:GetObjectVersion", bucket)?;
+            let mut state = self.state.lock().expect("state");
+            self.authorize(
+                &mut state,
+                "s3:GetObjectVersion",
+                bucket,
+                MatrixOperation::GetObject,
+            )?;
             state
                 .objects
                 .get(&(bucket.to_string(), key.to_string()))
@@ -1415,8 +1553,13 @@ mod tests {
             &self,
             bucket: &str,
         ) -> Result<Vec<ProtocolObjectVersion>, ProtocolS3Error> {
-            let state = self.state.lock().expect("state");
-            self.authorize(&state, "s3:ListBucketVersions", bucket)?;
+            let mut state = self.state.lock().expect("state");
+            self.authorize(
+                &mut state,
+                "s3:ListBucketVersions",
+                bucket,
+                MatrixOperation::GetObject,
+            )?;
             Ok(state
                 .objects
                 .iter()
@@ -1437,8 +1580,14 @@ mod tests {
             version_id: &str,
         ) -> Result<(), ProtocolS3Error> {
             let mut state = self.state.lock().expect("state");
-            self.authorize(&state, "s3:DeleteObject", bucket)?;
-            self.authorize(&state, "s3:DeleteObjectVersion", bucket)?;
+            for action in ["s3:DeleteObject", "s3:DeleteObjectVersion"] {
+                self.authorize(
+                    &mut state,
+                    action,
+                    bucket,
+                    MatrixOperation::DeleteObjectVersion,
+                )?;
+            }
             self.force_header_gate(&state, key)?;
             let entry = (bucket.to_string(), key.to_string());
             if let Some(versions) = state.objects.get_mut(&entry) {
@@ -1724,11 +1873,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matrix_case_fails_when_the_server_grants_a_denied_cell() {
+    async fn matrix_case_fails_on_every_denied_cell_the_server_grants() {
+        let over_grants = [
+            (
+                "readonly",
+                MatrixOperation::PutObject,
+                "put-object-with-readonly:",
+            ),
+            (
+                "writeonly",
+                MatrixOperation::GetObject,
+                "get-object-with-writeonly:",
+            ),
+            (
+                "writeonly",
+                MatrixOperation::DeleteObject,
+                "delete-object-with-writeonly:",
+            ),
+            (
+                "readonly",
+                MatrixOperation::DeleteObjects,
+                "delete-objects-with-readonly:",
+            ),
+            (
+                "writeonly",
+                MatrixOperation::DeleteObjectVersion,
+                "delete-object-version-with-writeonly:",
+            ),
+        ];
+        for (policy, operation, expected_failure) in over_grants {
+            let run = run_case(
+                IAM_CANNED_POLICY_MATRIX,
+                State {
+                    extra_grants: vec![(policy, operation)],
+                    ..State::default()
+                },
+                ProtocolSuiteContracts::default(),
+            )
+            .await;
+            assert_eq!(
+                run.execution.report.status,
+                ProtocolCaseStatus::Failed,
+                "{policy} x {operation:?}"
+            );
+            let failure = run.execution.report.failure.clone().expect("failure");
+            assert!(failure.starts_with(expected_failure), "{failure}");
+            assert_target_is_clean(&run, IAM_CANNED_POLICY_MATRIX);
+        }
+
         let run = run_case(
             IAM_CANNED_POLICY_MATRIX,
             State {
-                readonly_grants_delete: true,
+                deny_but_delete: true,
                 ..State::default()
             },
             ProtocolSuiteContracts::default(),
@@ -1737,8 +1933,49 @@ mod tests {
         assert_eq!(run.execution.report.status, ProtocolCaseStatus::Failed);
         let failure = run.execution.report.failure.clone().expect("failure");
         assert!(
-            failure.starts_with("delete-object-with-readonly:"),
+            failure.starts_with("delete-object-with-writeonly:")
+                && failure.contains("no longer listed"),
             "{failure}"
+        );
+        assert_target_is_clean(&run, IAM_CANNED_POLICY_MATRIX);
+    }
+
+    #[tokio::test]
+    async fn matrix_detach_barrier_absorbs_lagging_grant_visibility() {
+        let run = run_case(
+            IAM_CANNED_POLICY_MATRIX,
+            State {
+                detach_visibility_lag: 1,
+                ..State::default()
+            },
+            ProtocolSuiteContracts::default(),
+        )
+        .await;
+        assert_eq!(
+            run.execution.report.status,
+            ProtocolCaseStatus::Passed,
+            "{:?}",
+            run.execution.report.failure
+        );
+        for policy in CannedPolicy::ALL {
+            let barrier = format!("probe-after-detach-{}", policy.label());
+            let assertion = run
+                .execution
+                .report
+                .assertions
+                .iter()
+                .find(|assertion| assertion.operation.ends_with(&barrier))
+                .expect("detach barrier");
+            assert_eq!(assertion.retry_count, 1, "{barrier}");
+            assert_eq!(assertion.actual, ProtocolAssertionClass::AccessDenied);
+        }
+        assert!(
+            run.execution
+                .report
+                .assertions
+                .iter()
+                .filter(|assertion| assertion.phase == "assertion")
+                .all(|assertion| assertion.retry_count == 0)
         );
         assert_target_is_clean(&run, IAM_CANNED_POLICY_MATRIX);
     }
@@ -1807,6 +2044,51 @@ mod tests {
             })
             .expect("non-owner assertion");
         assert_eq!(non_owner.actual, ProtocolAssertionClass::AccessDenied);
+        let plain = assertions
+            .iter()
+            .find(|assertion| assertion.operation == "delete-object-plain-without-force-header")
+            .expect("plain delete probe");
+        assert_eq!(plain.actual, ProtocolAssertionClass::Ok);
+        assert_target_is_clean(&run, DELETE_FORCE_HEADER_CONTRACT);
+    }
+
+    #[tokio::test]
+    async fn force_header_default_contract_fails_when_the_relaxed_gate_still_prefix_deletes() {
+        let run = run_case(
+            DELETE_FORCE_HEADER_CONTRACT,
+            State::with_gate(ForceHeaderGate::RelaxGateKeepPrefixDelete),
+            ProtocolSuiteContracts::default(),
+        )
+        .await;
+        assert_eq!(run.execution.report.status, ProtocolCaseStatus::Failed);
+        let failure = run.execution.report.failure.clone().expect("failure");
+        assert!(
+            failure.starts_with("delete-object-single-with-force-header-as-non-owner:")
+                && failure.contains("single/child"),
+            "{failure}"
+        );
+        assert_target_is_clean(&run, DELETE_FORCE_HEADER_CONTRACT);
+    }
+
+    #[tokio::test]
+    async fn force_header_reject_contract_fails_when_the_plain_delete_is_stalled() {
+        // Without the plain-delete probe an IAM propagation stall would satisfy the reject
+        // expectation for the wrong reason; with it the case fails on the probe first.
+        let run = run_case(
+            DELETE_FORCE_HEADER_CONTRACT,
+            State {
+                stall_plain_deletes: true,
+                ..State::with_gate(ForceHeaderGate::RejectNonOwner)
+            },
+            reject_contract(),
+        )
+        .await;
+        assert_eq!(run.execution.report.status, ProtocolCaseStatus::Failed);
+        let failure = run.execution.report.failure.clone().expect("failure");
+        assert!(
+            failure.starts_with("delete-object-plain-without-force-header:"),
+            "{failure}"
+        );
         assert_target_is_clean(&run, DELETE_FORCE_HEADER_CONTRACT);
     }
 

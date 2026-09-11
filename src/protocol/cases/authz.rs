@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use anyhow::{Result, bail, ensure};
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, fmt, time::Duration};
 use tokio::time::Instant;
 
 use crate::protocol::{
@@ -103,6 +103,26 @@ where
     }
 }
 
+/// A failed single-shot expectation, carrying the class the server actually returned so a caller
+/// can explain a specific divergence without re-reading the recorded assertions.
+#[derive(Debug)]
+pub(crate) struct ExpectationFailure {
+    pub(crate) operation: String,
+    pub(crate) observed: ProtocolAssertionClass,
+}
+
+impl fmt::Display for ExpectationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}: expected success, received {:?}",
+            self.operation, self.observed
+        )
+    }
+}
+
+impl std::error::Error for ExpectationFailure {}
+
 /// Single-shot success assertion for operations whose grant has already been proven to have
 /// propagated. Unlike [`expect_eventual_ok`] it never retries an `AccessDenied`, so a denial is
 /// reported as the assertion result instead of being absorbed as propagation delay.
@@ -113,7 +133,7 @@ pub(crate) async fn expect_ok<T, F, Fut>(
     bucket: &str,
     object_key: Option<&str>,
     mut invoke: F,
-) -> Result<T>
+) -> std::result::Result<T, ExpectationFailure>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<T, ProtocolS3Error>>,
@@ -155,7 +175,10 @@ where
                     started.elapsed(),
                 ),
             );
-            bail!("{operation}: expected success, received {actual:?}")
+            Err(ExpectationFailure {
+                operation: operation.to_string(),
+                observed: actual,
+            })
         }
     }
 }

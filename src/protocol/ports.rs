@@ -750,15 +750,21 @@ pub struct ProtocolRequestShape {
 /// Headers the signer or transport own. Overriding them would not change the request shape
 /// under test; it would forge or break the request, so they are rejected up front.
 const RESERVED_REQUEST_SHAPE_HEADERS: &[&str] = &[
+    "amz-sdk-invocation-id",
+    "amz-sdk-request",
     "authorization",
+    "content-encoding",
     "content-length",
     "content-md5",
     "content-type",
+    "expect",
     "host",
     "transfer-encoding",
     "x-amz-content-sha256",
     "x-amz-date",
+    "x-amz-decoded-content-length",
     "x-amz-security-token",
+    "x-amz-trailer",
 ];
 
 impl ProtocolRequestShape {
@@ -846,6 +852,12 @@ mod tests {
             "x-amz-content-sha256",
             "x-amz-security-token",
             "x-amz-checksum-crc32",
+            "content-encoding",
+            "x-amz-decoded-content-length",
+            "x-amz-trailer",
+            "expect",
+            "amz-sdk-invocation-id",
+            "amz-sdk-request",
         ] {
             assert!(
                 ProtocolRequestShape::with_header(name, "value").is_err(),

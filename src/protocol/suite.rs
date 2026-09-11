@@ -808,6 +808,19 @@ mod tests {
     }
 
     #[test]
+    fn contract_as_str_matches_the_serde_spelling() {
+        for contract in [
+            super::ForceDeleteHeaderSingleObjectContract::IgnoreHeader,
+            super::ForceDeleteHeaderSingleObjectContract::Reject,
+        ] {
+            assert_eq!(
+                serde_json::to_value(contract).expect("contract json"),
+                serde_json::Value::String(contract.as_str().to_string())
+            );
+        }
+    }
+
+    #[test]
     fn endpoint_rejects_partial_or_unsafe_interpolation() {
         assert!(resolve_protocol_endpoint("http://${HOST}:9000").is_err());
         assert!(resolve_protocol_endpoint("${lowercase}").is_err());

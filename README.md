@@ -288,7 +288,9 @@ settled yet; every key and value is validated and unknown ones fail
 asserted by `delete-force-header-contract` for a non-owner single-object
 DeleteObject that carries `X-Rustfs-Force-Delete: true`
 (rustfs/rustfs#7649). The selected value is recorded in
-`protocol-suite-plan.json`.
+`protocol-suite-plan.json`. `full-regression.yaml` pins `reject`, the
+behavior RustFS main enforces today, so the release-candidate gate is not
+permanently red; flip it to `ignore-header` once #7649 settles.
 
 Validate before cleanup: for a failed or interrupted run the artifact root is
 the only record of what happened on the server, and cleanup deletes registered

@@ -6,8 +6,8 @@ selector:
   # The full profile rejects any case tagged smoke or slow
   # (validate_protocol_execution_profile_as in src/protocol/suite.rs), so the
   # smoke-gate cases and the slow STS expiration case must be excluded here.
-  # They are not skipped: the smoke profile runs the first three before this
-  # suite, and slow-regression.yaml runs the last one after it.
+  # They are not skipped: the smoke profile runs the two smoke cases before this
+  # suite, and slow-regression.yaml runs the slow case after it.
   excludeCases:
     - bucket-policy-authenticated-user-rw
     - iam-canned-policy-console-admin-delete
@@ -35,7 +35,10 @@ target:
     dedicatedTarget: required
 contracts:
   # delete-force-header-contract: expectation for a non-owner single-object
-  # DeleteObject that carries X-Rustfs-Force-Delete: true. ignore-header follows
-  # the rustfs/rustfs#7649 reporter (plain DeleteObject semantics); reject asserts
-  # the AccessDenied RustFS main currently returns. Unknown values fail validation.
-  forceDeleteHeaderSingleObject: ignore-header
+  # DeleteObject that carries X-Rustfs-Force-Delete: true. The suite-level
+  # default is ignore-header (rustfs/rustfs#7649 reporter expectation: plain
+  # DeleteObject semantics). This profile pins reject, the current server
+  # behavior, so the release-candidate gate is not deterministically red until
+  # #7649 settles; flip to ignore-header once it does. Either side changing
+  # turns this red. Unknown values fail validation.
+  forceDeleteHeaderSingleObject: reject

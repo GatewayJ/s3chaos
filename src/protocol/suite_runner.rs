@@ -685,7 +685,12 @@ fn update_protocol_flake_history(
         .parent()
         .and_then(Path::parent)
         .context("protocol artifact root is missing suite/base parents")?;
-    let history_relative = Path::new(".history").join(format!("{}.json", plan.profile));
+    // Keyed by target fingerprint as well as profile so a run redirected to a per-candidate
+    // endpoint never mixes its outcomes into the shared target's flake signals.
+    let history_relative = Path::new(".history").join(format!(
+        "{}-{}.json",
+        plan.profile, plan.target.fingerprint.sha256
+    ));
     let history_path = artifact_base.join(&history_relative);
     let mut entries = if history_path.is_file() {
         let existing: ProtocolFlakeHistory =
@@ -1164,6 +1169,82 @@ mod tests {
         assert_eq!(cleanup.attempts.len(), 1);
         assert_eq!(cleanup.leftovers.len(), 1);
         serde_json::to_vec(&cleanup).expect("cleanup diagnostics remain serializable");
+    }
+
+    #[test]
+    fn flake_history_is_partitioned_by_target_fingerprint() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let suite: ProtocolSuite =
+            serde_yaml_ng::from_str(protocol_suite_template_yaml()).expect("template suite");
+        let resolved = suite.resolve().expect("resolved suite");
+        let preflight = || crate::protocol::suite_plan::ProtocolSuitePlanPreflight {
+            endpoint_reachable: true,
+            admin_api_reachable: true,
+            external_identity: None,
+            capability_matrix: Vec::new(),
+            stale_buckets: Vec::new(),
+            stale_identities: Vec::new(),
+            stale_resource_policy: "record-only-phase-1".to_string(),
+            mutating_permission_probe:
+                crate::protocol::suite_plan::ProtocolMutatingProbeSummary::not_run(),
+        };
+        let plan_for = |deployment: &str, run_id: &str| {
+            let fingerprint = TargetFingerprint::new(
+                "http://127.0.0.1:9000",
+                "us-east-1",
+                deployment,
+                None,
+                None,
+            )
+            .expect("fingerprint");
+            ProtocolSuitePlan::build(&resolved, fingerprint, preflight(), base.path(), run_id)
+                .expect("plan")
+        };
+        let outcome = || {
+            vec![(
+                ProtocolCaseExecution::harness_failed("case", "executor failed"),
+                ProtocolCleanupReport::empty("rustfs.com/s3chaos/v1alpha1"),
+            )]
+        };
+
+        let shared_first = plan_for("shared-target", "run-1");
+        let shared_second = plan_for("shared-target", "run-2");
+        let candidate = plan_for("candidate-target", "run-3");
+        for plan in [&shared_first, &shared_second, &candidate] {
+            super::update_protocol_flake_history(&plan.artifact_root(), plan, &outcome())
+                .expect("history update");
+        }
+
+        let history_file = |plan: &ProtocolSuitePlan| {
+            base.path().join(".history").join(format!(
+                "{}-{}.json",
+                plan.profile, plan.target.fingerprint.sha256
+            ))
+        };
+        assert_ne!(history_file(&shared_first), history_file(&candidate));
+        let shared: ProtocolFlakeHistory = serde_json::from_str(
+            &fs::read_to_string(history_file(&shared_second)).expect("shared"),
+        )
+        .expect("shared history");
+        assert_eq!(
+            shared
+                .entries
+                .iter()
+                .map(|entry| entry.run_id.as_str())
+                .collect::<Vec<_>>(),
+            ["run-1", "run-2"]
+        );
+        let isolated: ProtocolFlakeHistory =
+            serde_json::from_str(&fs::read_to_string(history_file(&candidate)).expect("candidate"))
+                .expect("candidate history");
+        assert_eq!(
+            isolated
+                .entries
+                .iter()
+                .map(|entry| entry.run_id.as_str())
+                .collect::<Vec<_>>(),
+            ["run-3"]
+        );
     }
 
     #[test]
