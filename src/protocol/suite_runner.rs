@@ -55,7 +55,7 @@ use crate::protocol::{
             ensure_dedicated_target_fingerprint, protocol_artifact_base,
         },
     },
-    suite::{ProtocolSuite, ProtocolSuiteSelector},
+    suite::{ProtocolSuite, ProtocolSuiteContracts, ProtocolSuiteSelector},
     suite_plan::{
         ProtocolMutatingProbeStatus, ProtocolMutatingProbeSummary, ProtocolSuitePlan,
         ProtocolSuitePlanCase, TargetFingerprint,
@@ -74,6 +74,7 @@ struct LiveProtocolCaseLifecycle<'a> {
     external_identity: Option<&'a dyn ProtocolExternalIdentityPort>,
     web_identity_sts: Option<&'a dyn ProtocolWebIdentityStsPort>,
     actor_clients: &'a AwsS3ClientFactory,
+    contracts: ProtocolSuiteContracts,
     cleanup: &'a ProtocolCleanupCoordinator<'a, RustfsAdminClient, ProtocolS3Client>,
     api_version: &'a str,
 }
@@ -253,7 +254,11 @@ async fn run_protocol_suite(
     let mut probe_forbidden_secrets = probe.forbidden_secrets;
 
     let selected_cases = plan.cases.clone();
-    let actor_clients = AwsS3ClientFactory::new(&runtime.endpoint, &runtime.suite.target.region);
+    let actor_clients = AwsS3ClientFactory::new(
+        &runtime.endpoint,
+        &runtime.suite.target.region,
+        runtime.credentials.clone(),
+    );
     let preflight_failure_message = capability_failure
         .as_ref()
         .map(|(capability, reason)| {
@@ -287,6 +292,7 @@ async fn run_protocol_suite(
             .as_ref()
             .map(|sts| sts as &dyn ProtocolWebIdentityStsPort),
         actor_clients: &actor_clients,
+        contracts: plan.contracts,
         cleanup: &cleanup,
         api_version: &runtime.suite.api_version,
     };
@@ -896,6 +902,7 @@ impl ProtocolCaseLifecycle for LiveProtocolCaseLifecycle<'_> {
                 external_identity: self.external_identity,
                 web_identity_sts: self.web_identity_sts,
                 actor_clients: self.actor_clients,
+                contracts: self.contracts,
             },
         )
         .await;

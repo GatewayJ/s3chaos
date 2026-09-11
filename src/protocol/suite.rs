@@ -36,6 +36,42 @@ pub struct ProtocolSuite {
     pub selector: ProtocolSuiteSelector,
     pub execution: ProtocolSuiteExecution,
     pub target: ProtocolSuiteTarget,
+    /// Server contracts RustFS has not settled yet. Each parameter selects which behavior the
+    /// matching case asserts; unknown fields and values are rejected at parse time.
+    #[serde(default)]
+    pub contracts: ProtocolSuiteContracts,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolSuiteContracts {
+    /// Asserted by `delete-force-header-contract` for a non-owner single-object DeleteObject
+    /// that carries `X-Rustfs-Force-Delete: true` (rustfs/rustfs#7649).
+    #[serde(default)]
+    pub force_delete_header_single_object: ForceDeleteHeaderSingleObjectContract,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ForceDeleteHeaderSingleObjectContract {
+    /// The header is ignored for a single object: the delete behaves like a plain DeleteObject
+    /// and succeeds whenever the caller's policy allows `s3:DeleteObject`. This is the
+    /// rustfs/rustfs#7649 reporter expectation and the default.
+    #[default]
+    IgnoreHeader,
+    /// A non-owner request carrying the header is rejected with `AccessDenied` even for a
+    /// single object, which is what RustFS main enforces today in
+    /// `recursive_force_delete_is_authorized`.
+    Reject,
+}
+
+impl ForceDeleteHeaderSingleObjectContract {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IgnoreHeader => "ignore-header",
+            Self::Reject => "reject",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +271,7 @@ pub struct ResolvedProtocolSuite {
     pub metadata: ProtocolSuiteMetadata,
     pub execution: ProtocolSuiteExecution,
     pub target: ProtocolSuiteTarget,
+    pub contracts: ProtocolSuiteContracts,
     pub cases: Vec<&'static ProtocolCase>,
 }
 
@@ -394,6 +431,7 @@ impl ProtocolSuite {
             metadata: self.metadata.clone(),
             execution: self.execution.clone(),
             target: self.target.clone(),
+            contracts: self.contracts,
             cases,
         })
     }
@@ -590,6 +628,11 @@ target:
       identity: s3chaos
   safety:
     dedicatedTarget: required
+# Unsettled RustFS contracts. Values are validated; unknown keys or values fail validation.
+contracts:
+  # delete-force-header-contract, non-owner single-object DeleteObject with
+  # X-Rustfs-Force-Delete: true (rustfs/rustfs#7649): ignore-header | reject
+  forceDeleteHeaderSingleObject: ignore-header
 "#
 }
 
@@ -726,6 +769,42 @@ mod tests {
         let suite =
             serde_yaml_ng::from_str::<ProtocolSuite>(&inverted_timeout).expect("timeout parse");
         assert!(suite.resolve().is_err());
+    }
+
+    #[test]
+    fn contracts_default_to_reporter_expectation_and_reject_unknown_values() {
+        let yaml = protocol_suite_template_yaml()
+            .replace("  forceDeleteHeaderSingleObject: ignore-header\n", "");
+        let suite: ProtocolSuite = serde_yaml_ng::from_str(&yaml).expect("suite");
+        assert_eq!(
+            suite.contracts.force_delete_header_single_object,
+            super::ForceDeleteHeaderSingleObjectContract::IgnoreHeader
+        );
+        let resolved = suite.resolve().expect("resolved");
+        assert_eq!(resolved.contracts, suite.contracts);
+
+        let reject = protocol_suite_template_yaml().replace(
+            "forceDeleteHeaderSingleObject: ignore-header",
+            "forceDeleteHeaderSingleObject: reject",
+        );
+        let suite: ProtocolSuite = serde_yaml_ng::from_str(&reject).expect("reject suite");
+        assert_eq!(
+            suite.contracts.force_delete_header_single_object,
+            super::ForceDeleteHeaderSingleObjectContract::Reject
+        );
+
+        for invalid in [
+            "forceDeleteHeaderSingleObject: allow",
+            "forceDeleteHeaderSingleObject: true",
+            "forceDeleteHeaderSingleObjekt: reject",
+        ] {
+            let yaml = protocol_suite_template_yaml()
+                .replace("forceDeleteHeaderSingleObject: ignore-header", invalid);
+            assert!(
+                serde_yaml_ng::from_str::<ProtocolSuite>(&yaml).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
     }
 
     #[test]

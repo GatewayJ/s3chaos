@@ -28,7 +28,7 @@ use crate::protocol::{
     scheduler::{ProtocolLock, plan_protocol_schedule},
     suite::{
         ProtocolArtifactRetentionPolicy, ProtocolCleanupPolicy, ProtocolExecutionProfile,
-        ProtocolExecutionTimeouts, ResolvedProtocolSuite,
+        ProtocolExecutionTimeouts, ProtocolSuiteContracts, ResolvedProtocolSuite,
     },
 };
 
@@ -94,6 +94,8 @@ pub struct ProtocolSuitePlan {
     pub target: ProtocolSuitePlanTarget,
     pub preflight: ProtocolSuitePlanPreflight,
     pub execution: ProtocolSuitePlanExecution,
+    #[serde(default)]
+    pub contracts: ProtocolSuiteContracts,
     pub cases: Vec<ProtocolSuitePlanCase>,
 }
 
@@ -421,6 +423,7 @@ impl ProtocolSuitePlan {
                 product_case_retry: ProtocolProductCaseRetryPolicy::Never,
                 artifact_retention: suite.execution.artifact_retention,
             },
+            contracts: suite.contracts,
             cases,
         })
     }

@@ -103,6 +103,63 @@ where
     }
 }
 
+/// Single-shot success assertion for operations whose grant has already been proven to have
+/// propagated. Unlike [`expect_eventual_ok`] it never retries an `AccessDenied`, so a denial is
+/// reported as the assertion result instead of being absorbed as propagation delay.
+pub(crate) async fn expect_ok<T, F, Fut>(
+    context: &mut CaseContext,
+    actor_id: &str,
+    operation: &str,
+    bucket: &str,
+    object_key: Option<&str>,
+    mut invoke: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, ProtocolS3Error>>,
+{
+    let started = Instant::now();
+    match invoke().await {
+        Ok(value) => {
+            record(
+                context,
+                assertion(
+                    context.dimensions,
+                    actor_id,
+                    operation,
+                    bucket,
+                    object_key,
+                    ProtocolAssertionClass::Ok,
+                    ProtocolAssertionClass::Ok,
+                    None,
+                    0,
+                    started.elapsed(),
+                ),
+            );
+            Ok(value)
+        }
+        Err(error) => {
+            let actual = class_for_error(&error);
+            record(
+                context,
+                assertion(
+                    context.dimensions,
+                    actor_id,
+                    operation,
+                    bucket,
+                    object_key,
+                    ProtocolAssertionClass::Ok,
+                    actual,
+                    Some(error),
+                    0,
+                    started.elapsed(),
+                ),
+            );
+            bail!("{operation}: expected success, received {actual:?}")
+        }
+    }
+}
+
 pub(crate) async fn expect_eventual_access_denied<T, F, Fut>(
     context: &mut CaseContext,
     actor_id: &str,

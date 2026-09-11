@@ -281,6 +281,15 @@ make protocol-validate-artifacts ARTIFACT_ROOT=target/protocol-tests/<run>  # ve
 make protocol-cleanup ARTIFACT_ROOT=target/protocol-tests/<run>             # then release fixtures
 ```
 
+Suite YAML may carry a `contracts` block for RustFS behaviors that are not
+settled yet; every key and value is validated and unknown ones fail
+`protocol-suite-validate`. Today it holds
+`forceDeleteHeaderSingleObject` (`ignore-header`, the default, or `reject`),
+asserted by `delete-force-header-contract` for a non-owner single-object
+DeleteObject that carries `X-Rustfs-Force-Delete: true`
+(rustfs/rustfs#7649). The selected value is recorded in
+`protocol-suite-plan.json`.
+
 Validate before cleanup: for a failed or interrupted run the artifact root is
 the only record of what happened on the server, and cleanup deletes registered
 fixtures.
