@@ -156,6 +156,32 @@ export RUSTFS_FAULT_TEST_SERVER_IMAGE='docker.io/rustfs/rustfs@sha256:<digest>'
 dedicated Kubernetes/K3s context and aborts if the current context differs.
 Workload size and concurrency are tunable via `RUSTFS_FAULT_TEST_WORKLOAD_*`
 variables; see `src/fault/config.rs`.
+
+Every scenario proves recovery beyond S3 readability. Before the fault the
+runner captures the healthy RustFS layout from `/rustfs/admin/v3/info`; after
+Tenant readiness and the stable Pod window it polls until every baseline
+drive reports `ok`, the deployment identity and erasure geometry are
+unchanged, and every RustFS Pod answers `/health/ready` through the API
+server Pod proxy (`recovery-health.json`, failure classification
+`recovery_health_degraded`). It then writes, reads back, lists, and deletes a
+small set of fresh objects under a run-scoped prefix outside the workload
+prefix (`post-recovery-write-report.json` plus its own
+`post-recovery-write-history.jsonl`, classification
+`post_recovery_write_failed`). The final checker also rejects listed keys that
+no write explains or that GET cannot read back (`listed_key_unreadable`,
+`unexpected_listed_object`). Scenarios whose fault stays inside RustFS
+redundancy (`pod-kill-one`, `pod-failure`, `network-partition-one`) carry the
+`availability-required` impact policy: every prefilled object must read back
+with its committed hash while the fault is active and each mixed-workload
+operation family must reach `RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT`
+(default 99; a floor below 100 always tolerates one disrupted operation per
+family) non-disrupted operations (`availability-report.json`, classification
+`availability_regression`). Because a `kubectl port-forward` stays pinned to
+one Pod, the runner re-pins the S3 endpoint to a surviving Pod that the Chaos
+Mesh controller did not target once the fault is active, so the contract
+measures a client attached to a healthy node; ClusterIP endpoints need no
+pinning. These contracts are not yet calibrated on a live cluster; treat the
+first live runs as calibration.
 `make fault-dashboard-install` mutates the current cluster (installs/upgrades
 the Chaos Mesh release via Helm); treat it like a live run.
 `make fault-cleanup` is scoped by the current Kubernetes context, namespace,

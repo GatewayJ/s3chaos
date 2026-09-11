@@ -13,13 +13,25 @@
 // limitations under the License.
 
 use crate::fault::{
-    events::RunEventStatus, fault_lifecycle::AppliedFault, history::DurabilityCohort,
-    pods::rustfs_pod_identities, reporting::FaultEvidence,
+    events::RunEventStatus,
+    fault_lifecycle::AppliedFault,
+    history::DurabilityCohort,
+    pods::rustfs_pod_identities,
+    recovery_health::{
+        PodReadinessProbe, RECOVERY_HEALTH_ARTIFACT, RecoveryHealthBaseline,
+        RecoveryHealthObservation, RecoveryHealthReport, readiness_proxy_path,
+    },
+    reporting::FaultEvidence,
 };
 use crate::fault::{reporting::PodIdentity, workload::StagedMultipartUpload};
-use anyhow::{Context, Result};
+use crate::framework::{kubectl::Kubectl, resources};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::time::sleep as async_sleep;
+
+const RECOVERY_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const READINESS_DETAIL_LIMIT: usize = 300;
 
 use super::access::{ensure_s3_access, wait_for_ready_tenant, wait_for_stable_rustfs_pods};
 use super::{
@@ -175,6 +187,7 @@ impl FaultRun<'_> {
     pub(super) async fn recover_access(
         &self,
         prepared: &mut PreparedWorkload,
+        target: &ProvenTarget,
         staged_multipart_uploads: &mut BTreeMap<usize, StagedMultipartUpload>,
     ) -> Result<(Vec<PodIdentity>, u64)> {
         let config = self.config;
@@ -271,6 +284,8 @@ impl FaultRun<'_> {
             "S3 endpoint is reachable after recovery",
             Some(serde_json::json!({ "endpoint": endpoint })),
         )?;
+        self.require_recovery_health(endpoint, &target.health_baseline, &pods_after)
+            .await?;
         cleanup_staged_multipart_uploads(
             s3,
             history,
@@ -301,6 +316,7 @@ impl FaultRun<'_> {
             topology_observed_at_ms: _,
             host_storage_proof: _,
             execution_injection: _,
+            health_baseline: _,
         } = target;
         let ActiveFault {
             fault,
@@ -373,5 +389,282 @@ impl FaultRun<'_> {
             &serde_json::to_string_pretty(&evidence)?,
         )?;
         Ok(evidence)
+    }
+}
+
+impl FaultRun<'_> {
+    /// Poll RustFS until it reports the pre-fault drive set fully `ok` and
+    /// every Pod answers readiness, or the recovery timeout expires. The
+    /// report is written on every outcome so a degraded cluster leaves the
+    /// exact drive states behind as evidence.
+    async fn require_recovery_health(
+        &self,
+        endpoint: &str,
+        baseline: &RecoveryHealthBaseline,
+        pods: &[PodIdentity],
+    ) -> Result<()> {
+        let collector = self.collector;
+        let scenario = self.scenario;
+        let events = &self.context.events;
+        let cluster = &self.config.cluster;
+        events.record(
+            "recovery-health",
+            RunEventStatus::Started,
+            "waiting for RustFS to report every baseline drive ok and every Pod ready",
+            Some(serde_json::json!({
+                "expected_drives": baseline.drive_uuids.len(),
+                "pods": pods.len(),
+                "timeout_seconds": cluster.timeout.as_secs(),
+            })),
+        )?;
+        let report = match self
+            .deadline
+            .run(observe_recovery_health(
+                cluster,
+                endpoint,
+                baseline,
+                pods,
+                &self.scenario.name,
+                &self.context.run_id,
+                &|report| {
+                    collector
+                        .write_text(
+                            scenario.case_name,
+                            RECOVERY_HEALTH_ARTIFACT,
+                            &serde_json::to_string_pretty(report)?,
+                        )
+                        .map(|_| ())
+                },
+            ))
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                // The harness could not observe RustFS at all (for example the
+                // kube context lacks `pods/proxy`); that is not product evidence.
+                self.record_failure("recovery-health", "test_or_environment", &error, None, None)?;
+                return Err(error);
+            }
+        };
+        collector.write_text(
+            scenario.case_name,
+            RECOVERY_HEALTH_ARTIFACT,
+            &serde_json::to_string_pretty(&report)?,
+        )?;
+        if let Err(error) = report.require_success() {
+            self.record_failure(
+                "recovery-health",
+                "recovery_health_degraded",
+                &error,
+                Some(serde_json::json!({
+                    "attempts": report.attempts,
+                    "violations": report.violations,
+                    "unready_pods": report
+                        .readiness
+                        .iter()
+                        .filter(|probe| !probe.ready)
+                        .map(|probe| probe.pod_name.clone())
+                        .collect::<Vec<_>>(),
+                })),
+                None,
+            )?;
+            return Err(error);
+        }
+        events.record(
+            "recovery-health",
+            RunEventStatus::Succeeded,
+            "RustFS reports the full baseline drive set ok and every Pod ready",
+            Some(serde_json::json!({
+                "attempts": report.attempts,
+                "first_healthy_at_ms": report.first_healthy_at_ms,
+            })),
+        )?;
+        Ok(())
+    }
+}
+
+async fn observe_recovery_health(
+    cluster: &crate::framework::config::ClusterTestConfig,
+    endpoint: &str,
+    baseline: &RecoveryHealthBaseline,
+    pods: &[PodIdentity],
+    scenario: &str,
+    run_id: &str,
+    persist: &dyn Fn(&RecoveryHealthReport) -> Result<()>,
+) -> Result<RecoveryHealthReport> {
+    let (access_key, secret_key) = resources::test_credentials();
+    let started_at_ms = now_ms();
+    let deadline = Instant::now() + cluster.timeout;
+    let mut report = RecoveryHealthReport {
+        scenario: scenario.to_string(),
+        run_id: run_id.to_string(),
+        baseline: baseline.clone(),
+        started_at_ms,
+        completed_at_ms: started_at_ms,
+        timeout_seconds: cluster.timeout.as_secs(),
+        attempts: 0,
+        first_healthy_at_ms: None,
+        observation: None,
+        readiness: Vec::new(),
+        violations: Vec::new(),
+        passed: false,
+    };
+    loop {
+        report.attempts += 1;
+        let attempt_started_at_ms = now_ms();
+        let mut violations =
+            match crate::rustfs::read_erasure_layout(endpoint, "us-east-1", access_key, secret_key)
+                .await
+            {
+                Ok(layout) => {
+                    let observation = RecoveryHealthObservation::from_layout(
+                        &layout,
+                        attempt_started_at_ms,
+                        now_ms(),
+                    );
+                    let violations = observation.violations(baseline);
+                    report.observation = Some(observation);
+                    violations
+                }
+                Err(error) => {
+                    report.observation = None;
+                    vec![format!("RustFS admin info unavailable: {error:#}")]
+                }
+            };
+        report.readiness = pods
+            .iter()
+            .map(|pod| probe_pod_readiness(cluster, &pod.name))
+            .collect();
+        if let Some(denied) = report
+            .readiness
+            .iter()
+            .find(|probe| probe.detail.as_deref().is_some_and(readiness_probe_denied))
+        {
+            bail!(
+                "readiness probe for Pod {} was refused by the API server rather than answered by RustFS; grant `get` on `pods/proxy` to the fault-test context: {}",
+                denied.pod_name,
+                denied.detail.as_deref().unwrap_or_default()
+            );
+        }
+        violations.extend(
+            report
+                .readiness
+                .iter()
+                .filter(|probe| !probe.ready)
+                .map(|probe| {
+                    format!(
+                        "Pod {} readiness {} failed: {}",
+                        probe.pod_name,
+                        probe.proxy_path,
+                        probe.detail.as_deref().unwrap_or("no detail")
+                    )
+                }),
+        );
+        if pods.is_empty() {
+            violations.push("no RustFS Pods to probe for readiness".to_string());
+        }
+        violations.sort();
+        report.violations = violations;
+        report.completed_at_ms = now_ms();
+        // Persist every attempt so a run cut off by the outer deadline still
+        // leaves the last observed drive states behind as evidence.
+        persist(&report)?;
+        if report.violations.is_empty() {
+            report.first_healthy_at_ms = Some(report.completed_at_ms);
+            report.passed = true;
+            return Ok(report);
+        }
+        if Instant::now() >= deadline {
+            return Ok(report);
+        }
+        async_sleep(RECOVERY_HEALTH_POLL_INTERVAL).await;
+    }
+}
+
+/// `kubectl get --raw` through the API server Pod proxy returns success only
+/// for a 2xx readiness reply, so the exit status is the probe verdict.
+fn probe_pod_readiness(
+    cluster: &crate::framework::config::ClusterTestConfig,
+    pod_name: &str,
+) -> PodReadinessProbe {
+    let proxy_path = readiness_proxy_path(&cluster.test_namespace, pod_name);
+    let observed_at_ms = now_ms();
+    let (ready, detail) = match Kubectl::new(cluster)
+        .command(["get", "--raw", proxy_path.as_str()])
+        .run()
+    {
+        Ok(output) if output.code == Some(0) => (true, None),
+        Ok(output) => (
+            false,
+            Some(truncate_detail(&format!(
+                "exit={:?} {}",
+                output.code,
+                output.stderr.trim()
+            ))),
+        ),
+        Err(error) => (false, Some(truncate_detail(&error.to_string()))),
+    };
+    PodReadinessProbe {
+        pod_name: pod_name.to_string(),
+        proxy_path,
+        ready,
+        observed_at_ms,
+        detail,
+    }
+}
+
+/// An authorization refusal comes from the API server, not from RustFS, so it
+/// must not be recorded as a degraded product.
+fn readiness_probe_denied(detail: &str) -> bool {
+    let lowered = detail.to_ascii_lowercase();
+    lowered.contains("forbidden")
+        || lowered.contains("unauthorized")
+        || lowered.contains("unable to connect to the server")
+        || lowered.contains("context was not found")
+        || lowered.contains("failed to start command")
+}
+
+fn truncate_detail(detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.chars().count() <= READINESS_DETAIL_LIMIT {
+        return detail.to_string();
+    }
+    let truncated = detail
+        .chars()
+        .take(READINESS_DETAIL_LIMIT)
+        .collect::<String>();
+    format!("{truncated}...")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{readiness_probe_denied, truncate_detail};
+
+    #[test]
+    fn api_server_refusals_are_environment_not_product() {
+        assert!(readiness_probe_denied(
+            "exit=Some(1) Error from server (Forbidden): pods \"rustfs-0\" is forbidden"
+        ));
+        assert!(readiness_probe_denied(
+            "error: You must be logged in to the server (Unauthorized)"
+        ));
+        assert!(!readiness_probe_denied(
+            "exit=Some(1) Error from server (ServiceUnavailable): the server is currently unable to handle the request"
+        ));
+        assert!(readiness_probe_denied(
+            "exit=Some(1) Unable to connect to the server: dial tcp 10.0.0.1:6443: i/o timeout"
+        ));
+        assert!(!readiness_probe_denied(
+            "exit=Some(1) error: connection refused"
+        ));
+    }
+
+    #[test]
+    fn readiness_detail_is_bounded() {
+        let long = "x".repeat(1000);
+        let detail = truncate_detail(&long);
+        assert!(detail.ends_with("..."));
+        assert!(detail.chars().count() <= 303);
+        assert_eq!(truncate_detail("  short  "), "short");
     }
 }

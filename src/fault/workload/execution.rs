@@ -20,17 +20,17 @@ use crate::fault::{
     },
     quorum::{QuorumCaseClass, QuorumMutationClass},
     workload::{
-        ObjectSpec, S3WorkloadClient, StagedMultipartUpload, WorkloadOperation, WorkloadPlan,
-        sha256_hex,
+        GetObjectResult, ObjectSpec, S3WorkloadClient, StagedMultipartUpload, WorkloadOperation,
+        WorkloadPlan, sha256_hex,
     },
 };
 use crate::framework::{artifacts::ArtifactCollector, command::CommandSpec};
 use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep as async_sleep;
 
@@ -2653,5 +2653,725 @@ mod tests {
                 .failure_message()
                 .contains("object-a=harness_error(record PUT: disk full)")
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Availability contract for scenarios whose fault must stay inside RustFS
+// redundancy: reads of the committed cohort must succeed while the fault is
+// active, and the mixed workload must keep serving.
+// ---------------------------------------------------------------------------
+
+pub(in crate::fault) const AVAILABILITY_REPORT_ARTIFACT: &str = "availability-report.json";
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::fault) struct ReadProbeSummary {
+    pub(in crate::fault) objects: usize,
+    pub(in crate::fault) verified: usize,
+    /// `key: reason` for every object that was not readable with its
+    /// committed bytes, sorted.
+    pub(in crate::fault) failures: Vec<String>,
+}
+
+/// GET every prefilled object once while the fault is active and compare the
+/// full body against the committed hash. Unlike the quorum probe this does not
+/// filter by object class, and it reports every failure instead of stopping at
+/// the first so the artifact shows how much of the cohort was unavailable.
+pub(in crate::fault) async fn probe_read_cohort(
+    s3: &S3WorkloadClient,
+    history: &Recorder,
+    prefilled: &[ObjectSpec],
+    concurrency: usize,
+) -> Result<ReadProbeSummary> {
+    ensure!(
+        !prefilled.is_empty(),
+        "availability read probe has no prefilled cohort"
+    );
+    let outcomes = stream::iter(prefilled.iter())
+        .map(|object| async move {
+            let get = s3.get_object_result(&object.key, history).await?;
+            let failure = match (get.outcome, get.body.as_deref()) {
+                (OperationOutcome::Ok, Some(body)) if object.matches_body(body) => None,
+                (OperationOutcome::Ok, Some(body)) => Some(format!(
+                    "{}: wrong bytes (expected size={} sha256={}, got size={} sha256={})",
+                    object.key,
+                    object.size_bytes,
+                    object.sha256,
+                    body.len(),
+                    sha256_hex(body)
+                )),
+                (outcome, _) => Some(format!(
+                    "{}: {outcome:?}{}{}",
+                    object.key,
+                    get.http_status
+                        .map(|status| format!(" http_status={status}"))
+                        .unwrap_or_default(),
+                    get.error
+                        .as_deref()
+                        .map(|error| format!(" error={error}"))
+                        .unwrap_or_default()
+                )),
+            };
+            Ok::<_, anyhow::Error>(failure)
+        })
+        .buffer_unordered(concurrency.max(1))
+        .try_collect::<Vec<_>>()
+        .await?;
+    let mut failures = outcomes.into_iter().flatten().collect::<Vec<_>>();
+    failures.sort();
+    Ok(ReadProbeSummary {
+        objects: prefilled.len(),
+        verified: prefilled.len() - failures.len(),
+        failures,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::fault) struct FamilyAvailability {
+    pub(in crate::fault) family: String,
+    pub(in crate::fault) total: usize,
+    pub(in crate::fault) disrupted: usize,
+    /// Integer percentage of non-disrupted operations, rounded down so a
+    /// single failure never rounds up to 100.
+    pub(in crate::fault) success_percent: u8,
+}
+
+impl FamilyAvailability {
+    /// Disruptions the floor tolerates. Percent floors below 100 always allow
+    /// at least one disrupted operation so small rehearsal plans are not
+    /// failed by a single port-forward reconnect; 100 stays strict.
+    pub(in crate::fault) fn allowed_disruptions(total: usize, min_success_percent: u8) -> usize {
+        let proportional = total * usize::from(100 - min_success_percent.min(100)) / 100;
+        if min_success_percent < 100 {
+            proportional.max(1)
+        } else {
+            0
+        }
+    }
+
+    pub(in crate::fault) fn meets_floor(&self, min_success_percent: u8) -> bool {
+        self.total > 0
+            && self.disrupted <= self.total
+            && self.disrupted <= Self::allowed_disruptions(self.total, min_success_percent)
+    }
+
+    fn from_counts(family: &str, counts: &OutcomeCounts) -> Self {
+        let total = counts.total();
+        let disrupted = counts.disrupted();
+        let success_percent = ((total - disrupted) * 100)
+            .checked_div(total)
+            .map_or(100, |percent| u8::try_from(percent).unwrap_or(0));
+        Self {
+            family: family.to_string(),
+            total,
+            disrupted,
+            success_percent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::fault) struct AvailabilityReport {
+    pub(in crate::fault) scenario: String,
+    pub(in crate::fault) run_id: String,
+    pub(in crate::fault) min_success_percent: u8,
+    /// Surviving Pod the port-forward was pinned to while the fault was
+    /// active; absent for ClusterIP endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::fault) served_by_pod: Option<String>,
+    pub(in crate::fault) read_probe: ReadProbeSummary,
+    pub(in crate::fault) workload: Vec<FamilyAvailability>,
+    /// Sorted human-readable reasons the contract failed; empty on success.
+    pub(in crate::fault) violations: Vec<String>,
+    pub(in crate::fault) passed: bool,
+}
+
+impl AvailabilityReport {
+    pub(in crate::fault) fn require_success(&self) -> Result<()> {
+        ensure!(
+            self.passed && self.violations.is_empty() && self.success_predicate(),
+            "availability contract failed for scenario {} run {}: {}",
+            self.scenario,
+            self.run_id,
+            if self.violations.is_empty() {
+                "report content contradicts its passed verdict".to_string()
+            } else {
+                self.violations.join("; ")
+            }
+        );
+        Ok(())
+    }
+
+    /// Recomputed from the report content so a hand-edited `passed` flag or an
+    /// empty `violations` list cannot claim availability the numbers refute.
+    fn success_predicate(&self) -> bool {
+        self.read_probe.objects > 0
+            && self.read_probe.verified == self.read_probe.objects
+            && self.read_probe.failures.is_empty()
+            && !self.workload.is_empty()
+            && self
+                .workload
+                .iter()
+                .all(|family| family.meets_floor(self.min_success_percent))
+    }
+}
+
+impl WorkloadSummary {
+    fn family_availability(&self) -> Vec<FamilyAvailability> {
+        vec![
+            FamilyAvailability::from_counts("put", &self.puts),
+            FamilyAvailability::from_counts("get", &self.gets),
+            FamilyAvailability::from_counts("delete", &self.deletes),
+            FamilyAvailability::from_counts("list", &self.lists),
+            FamilyAvailability::from_counts("multipart_complete", &self.multipart_completes),
+            FamilyAvailability::from_counts("multipart_abort", &self.multipart_aborts),
+        ]
+    }
+
+    /// Combine the fault-active read probe with per-family workload success.
+    /// The read probe is strict: every committed object must be readable with
+    /// its committed bytes. Workload families use the configured threshold.
+    pub(in crate::fault) fn availability_report(
+        &self,
+        read_probe: ReadProbeSummary,
+        min_success_percent: u8,
+        served_by_pod: Option<String>,
+    ) -> AvailabilityReport {
+        let mut violations = Vec::new();
+        if read_probe.verified != read_probe.objects || !read_probe.failures.is_empty() {
+            violations.push(format!(
+                "fault-active read probe verified {} of {} committed objects; first failures: {}",
+                read_probe.verified,
+                read_probe.objects,
+                read_probe
+                    .failures
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let workload = self.family_availability();
+        for family in &workload {
+            if family.total == 0 {
+                violations.push(format!(
+                    "workload family {} was not exercised under the fault",
+                    family.family
+                ));
+            } else if !family.meets_floor(min_success_percent) {
+                violations.push(format!(
+                    "workload family {} succeeded {}% ({} of {} disrupted, {} allowed), below the {min_success_percent}% floor",
+                    family.family,
+                    family.success_percent,
+                    family.disrupted,
+                    family.total,
+                    FamilyAvailability::allowed_disruptions(family.total, min_success_percent)
+                ));
+            }
+        }
+        violations.sort();
+        AvailabilityReport {
+            scenario: self.scenario.clone(),
+            run_id: self.run_id.clone(),
+            min_success_percent,
+            served_by_pod,
+            read_probe,
+            workload,
+            passed: violations.is_empty(),
+            violations,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Post-recovery write probe: prove the recovered cluster accepts and serves
+// *new* mutations, not only reads of data committed before the fault.
+// ---------------------------------------------------------------------------
+
+pub(in crate::fault) const POST_RECOVERY_WRITE_REPORT_ARTIFACT: &str =
+    "post-recovery-write-report.json";
+pub(in crate::fault) const POST_RECOVERY_WRITE_HISTORY_ARTIFACT: &str =
+    "post-recovery-write-history.jsonl";
+const POST_RECOVERY_MIN_OBJECTS: usize = 8;
+const POST_RECOVERY_MAX_OBJECTS: usize = 64;
+const POST_RECOVERY_OBJECT_SIZE_STEP_BYTES: usize = 4 * 1024;
+const POST_RECOVERY_OBJECT_SIZE_CLASSES: usize = 16;
+/// Two full parts plus a tail so CompleteMultipartUpload assembles more than
+/// one shard-sized part.
+const POST_RECOVERY_MULTIPART_SIZE_BYTES: usize = 2 * 5 * 1024 * 1024 + 4096;
+
+/// Number of fresh objects the probe writes: a small fraction of the workload
+/// so it stays cheap, bounded so tiny rehearsals still exercise every path.
+pub(in crate::fault) fn post_recovery_object_count(workload_object_count: usize) -> usize {
+    (workload_object_count / 20).clamp(POST_RECOVERY_MIN_OBJECTS, POST_RECOVERY_MAX_OBJECTS)
+}
+
+fn post_recovery_object_size(index: usize) -> usize {
+    POST_RECOVERY_OBJECT_SIZE_STEP_BYTES * (1 + index % POST_RECOVERY_OBJECT_SIZE_CLASSES)
+}
+
+pub(in crate::fault) struct PostRecoveryWriteRequest<'a> {
+    pub(in crate::fault) s3: &'a S3WorkloadClient,
+    /// Dedicated recorder: probe traffic must not enter the workload history
+    /// whose phase chain the checker and artifact validation authenticate.
+    pub(in crate::fault) history: &'a Recorder,
+    pub(in crate::fault) run_id: &'a str,
+    pub(in crate::fault) seed: u64,
+    pub(in crate::fault) object_count: usize,
+    pub(in crate::fault) concurrency: usize,
+    pub(in crate::fault) deadline: RunDeadline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::fault) struct PostRecoveryWriteReport {
+    pub(in crate::fault) scenario: String,
+    pub(in crate::fault) run_id: String,
+    pub(in crate::fault) key_prefix: String,
+    pub(in crate::fault) started_at_ms: u64,
+    pub(in crate::fault) completed_at_ms: u64,
+    pub(in crate::fault) objects: usize,
+    pub(in crate::fault) puts_verified: usize,
+    pub(in crate::fault) deletes_verified_absent: usize,
+    pub(in crate::fault) multipart_completes_verified: usize,
+    pub(in crate::fault) multipart_aborts_ok: usize,
+    pub(in crate::fault) lists_verified: usize,
+    /// Sorted `operation key: reason` entries; empty on success.
+    pub(in crate::fault) failures: Vec<String>,
+    pub(in crate::fault) passed: bool,
+}
+
+impl PostRecoveryWriteReport {
+    pub(in crate::fault) fn require_success(&self) -> Result<()> {
+        ensure!(
+            self.passed && self.failures.is_empty() && self.success_predicate(),
+            "post-recovery write probe failed for scenario {} run {}: {}",
+            self.scenario,
+            self.run_id,
+            self.failures.join("; ")
+        );
+        Ok(())
+    }
+
+    fn success_predicate(&self) -> bool {
+        self.objects >= POST_RECOVERY_MIN_OBJECTS
+            && self.puts_verified == self.objects
+            && self.deletes_verified_absent == self.objects
+            && self.multipart_completes_verified == 1
+            && self.multipart_aborts_ok == 1
+            && self.lists_verified == 2
+            && self.started_at_ms > 0
+            && self.started_at_ms <= self.completed_at_ms
+    }
+}
+
+fn get_failure_reason(get: &GetObjectResult) -> String {
+    format!(
+        "{:?}{}{}",
+        get.outcome,
+        get.http_status
+            .map(|status| format!(" http_status={status}"))
+            .unwrap_or_default(),
+        get.error
+            .as_deref()
+            .map(|error| format!(" error={error}"))
+            .unwrap_or_default()
+    )
+}
+
+/// Write, read back, list, and delete fresh objects after recovery. Every
+/// step must succeed: a recovered cluster that still rejects writes (the
+/// rustfs/rustfs#7361 shape) or lists stale keys fails here even though every
+/// pre-fault object reads back correctly.
+pub(in crate::fault) async fn run_post_recovery_write_probe(
+    request: &PostRecoveryWriteRequest<'_>,
+) -> Result<PostRecoveryWriteReport> {
+    let PostRecoveryWriteRequest {
+        s3,
+        history,
+        run_id,
+        seed,
+        object_count,
+        concurrency,
+        deadline,
+    } = request;
+    let object_count = *object_count;
+    ensure!(
+        object_count >= POST_RECOVERY_MIN_OBJECTS,
+        "post-recovery write probe needs at least {POST_RECOVERY_MIN_OBJECTS} objects"
+    );
+    let prefix = ObjectSpec::post_recovery_key_prefix(run_id);
+    let started_at_ms = now_ms();
+    let failures = AsyncMutex::new(Vec::<String>::new());
+    let record_failure = |message: String| {
+        let failures = &failures;
+        async move { failures.lock().await.push(message) }
+    };
+
+    // Phase 1: PUT + GET verify every object.
+    let objects = (0..object_count)
+        .map(|index| {
+            ObjectSpec::prepare_post_recovery(
+                run_id,
+                index,
+                post_recovery_object_size(index),
+                *seed,
+            )
+        })
+        .collect::<Vec<_>>();
+    let puts_verified = stream::iter(objects.iter())
+        .map(|object| async {
+            deadline.check()?;
+            let put = s3.put_object_record(object, history).await?;
+            if put.outcome != OperationOutcome::Ok {
+                record_failure(format!(
+                    "put {}: {:?}{}",
+                    object.spec.key,
+                    put.outcome,
+                    put.error
+                        .as_deref()
+                        .map(|error| format!(" error={error}"))
+                        .unwrap_or_default()
+                ))
+                .await;
+                return Ok::<bool, anyhow::Error>(false);
+            }
+            let get = s3.get_object_result(&object.spec.key, history).await?;
+            match (get.outcome, get.body.as_deref()) {
+                (OperationOutcome::Ok, Some(body)) if object.spec.matches_body(body) => Ok(true),
+                (OperationOutcome::Ok, Some(body)) => {
+                    record_failure(format!(
+                        "get {}: wrong bytes after acknowledged PUT (expected sha256={}, got sha256={})",
+                        object.spec.key,
+                        object.spec.sha256,
+                        sha256_hex(body)
+                    ))
+                    .await;
+                    Ok(false)
+                }
+                _ => {
+                    record_failure(format!(
+                        "get {}: {} after acknowledged PUT",
+                        object.spec.key,
+                        get_failure_reason(&get)
+                    ))
+                    .await;
+                    Ok(false)
+                }
+            }
+        })
+        .buffer_unordered((*concurrency).clamp(1, 8))
+        .try_fold(0usize, |verified, ok| async move {
+            Ok(verified + usize::from(ok))
+        })
+        .await?;
+
+    // Phase 2: one multipart completion and one multipart abort.
+    deadline.check()?;
+    let multipart = ObjectSpec::prepare_post_recovery(
+        run_id,
+        object_count,
+        POST_RECOVERY_MULTIPART_SIZE_BYTES,
+        *seed,
+    );
+    let multipart_completes_verified = match s3
+        .complete_multipart_object_record(&multipart, history)
+        .await?
+    {
+        Some(record) if record.outcome == OperationOutcome::Ok => {
+            let get = s3.get_object_result(&multipart.spec.key, history).await?;
+            match (get.outcome, get.body.as_deref()) {
+                (OperationOutcome::Ok, Some(body)) if multipart.spec.matches_body(body) => 1,
+                _ => {
+                    record_failure(format!(
+                        "get {}: {} after acknowledged CompleteMultipartUpload",
+                        multipart.spec.key,
+                        get_failure_reason(&get)
+                    ))
+                    .await;
+                    0
+                }
+            }
+        }
+        Some(record) => {
+            record_failure(format!(
+                "complete-multipart {}: {:?}{}",
+                multipart.spec.key,
+                record.outcome,
+                record
+                    .error
+                    .as_deref()
+                    .map(|error| format!(" error={error}"))
+                    .unwrap_or_default()
+            ))
+            .await;
+            0
+        }
+        None => {
+            record_failure(format!(
+                "complete-multipart {}: upload staging failed before completion",
+                multipart.spec.key
+            ))
+            .await;
+            0
+        }
+    };
+    let abort_target = ObjectSpec::prepare_post_recovery(run_id, object_count + 1, 4096, *seed);
+    let multipart_aborts_ok = match s3.abort_multipart_object(&abort_target, history).await? {
+        OperationOutcome::Ok => 1,
+        outcome => {
+            record_failure(format!(
+                "abort-multipart {}: {outcome:?}",
+                abort_target.spec.key
+            ))
+            .await;
+            0
+        }
+    };
+
+    // Phase 3: LIST must show exactly the live probe objects.
+    deadline.check()?;
+    let mut lists_verified = 0usize;
+    let mut expected_live = objects
+        .iter()
+        .map(|object| object.spec.key.clone())
+        .collect::<Vec<_>>();
+    if multipart_completes_verified == 1 {
+        expected_live.push(multipart.spec.key.clone());
+    }
+    expected_live.sort();
+    match s3.list_prefix(&prefix, history).await? {
+        Some(mut listed) => {
+            listed.sort();
+            if listed == expected_live {
+                lists_verified += 1;
+            } else {
+                record_failure(format!(
+                    "list {prefix}: expected {} live keys, listed {} (missing={:?} unexpected={:?})",
+                    expected_live.len(),
+                    listed.len(),
+                    expected_live
+                        .iter()
+                        .filter(|key| listed.binary_search(key).is_err())
+                        .take(5)
+                        .collect::<Vec<_>>(),
+                    listed
+                        .iter()
+                        .filter(|key| expected_live.binary_search(key).is_err())
+                        .take(5)
+                        .collect::<Vec<_>>()
+                ))
+                .await;
+            }
+        }
+        None => record_failure(format!("list {prefix}: did not complete after PUTs")).await,
+    }
+
+    // Phase 4: DELETE every probe object and prove it is gone.
+    let mut delete_targets = objects
+        .iter()
+        .map(|object| object.spec.key.clone())
+        .collect::<Vec<_>>();
+    if multipart_completes_verified == 1 {
+        delete_targets.push(multipart.spec.key.clone());
+    }
+    let deletes_verified_absent = stream::iter(delete_targets.iter())
+        .map(|key| async move {
+            deadline.check()?;
+            let delete = s3.delete_object_record(key, history).await?;
+            if delete.outcome != OperationOutcome::Ok {
+                record_failure(format!(
+                    "delete {key}: {:?}{}",
+                    delete.outcome,
+                    delete
+                        .error
+                        .as_deref()
+                        .map(|error| format!(" error={error}"))
+                        .unwrap_or_default()
+                ))
+                .await;
+                return Ok::<bool, anyhow::Error>(false);
+            }
+            let get = s3.get_object_result(key, history).await?;
+            if get.outcome == OperationOutcome::NotFound {
+                Ok(true)
+            } else {
+                record_failure(format!(
+                    "get {key}: {} after acknowledged DELETE",
+                    get_failure_reason(&get)
+                ))
+                .await;
+                Ok(false)
+            }
+        })
+        .buffer_unordered((*concurrency).clamp(1, 8))
+        .try_fold(0usize, |verified, ok| async move {
+            Ok(verified + usize::from(ok))
+        })
+        .await?;
+    // Count only the plain objects toward the object contract; the multipart
+    // key is verified through its own counter.
+    let deletes_verified_absent =
+        deletes_verified_absent.saturating_sub(usize::from(multipart_completes_verified == 1));
+
+    // Phase 5: LIST must be empty again.
+    deadline.check()?;
+    match s3.list_prefix(&prefix, history).await? {
+        Some(listed) if listed.is_empty() => lists_verified += 1,
+        Some(listed) => {
+            record_failure(format!(
+                "list {prefix}: {} key(s) still listed after acknowledged DELETEs: {:?}",
+                listed.len(),
+                listed.iter().take(5).collect::<Vec<_>>()
+            ))
+            .await
+        }
+        None => record_failure(format!("list {prefix}: did not complete after DELETEs")).await,
+    }
+
+    let mut failures = failures.into_inner();
+    failures.sort();
+    let report = PostRecoveryWriteReport {
+        scenario: history.scenario(),
+        run_id: history.run_id(),
+        key_prefix: prefix,
+        started_at_ms,
+        completed_at_ms: now_ms(),
+        objects: object_count,
+        puts_verified,
+        deletes_verified_absent,
+        multipart_completes_verified,
+        multipart_aborts_ok,
+        lists_verified,
+        failures,
+        passed: false,
+    };
+    let passed = report.failures.is_empty() && report.success_predicate();
+    Ok(PostRecoveryWriteReport { passed, ..report })
+}
+
+#[cfg(test)]
+mod post_recovery_tests {
+    use super::{
+        AvailabilityReport, FamilyAvailability, OutcomeCounts, PostRecoveryWriteReport,
+        ReadProbeSummary, post_recovery_object_count, post_recovery_object_size,
+    };
+    use crate::fault::history::OperationOutcome;
+
+    fn counts(ok: usize, not_found: usize, failed: usize, timeout: usize) -> OutcomeCounts {
+        let mut counts = OutcomeCounts::default();
+        for _ in 0..ok {
+            counts.record(OperationOutcome::Ok);
+        }
+        for _ in 0..not_found {
+            counts.record(OperationOutcome::NotFound);
+        }
+        for _ in 0..failed {
+            counts.record(OperationOutcome::Failed);
+        }
+        for _ in 0..timeout {
+            counts.record(OperationOutcome::Timeout);
+        }
+        counts
+    }
+
+    #[test]
+    fn family_availability_rounds_down_and_treats_not_found_as_served() {
+        let family = FamilyAvailability::from_counts("get", &counts(198, 1, 1, 0));
+        assert_eq!(family.total, 200);
+        assert_eq!(family.disrupted, 1);
+        assert_eq!(family.success_percent, 99);
+        let single_failure = FamilyAvailability::from_counts("put", &counts(999, 0, 0, 1));
+        assert_eq!(single_failure.success_percent, 99);
+        assert_eq!(
+            FamilyAvailability::from_counts("list", &counts(0, 0, 0, 0)).success_percent,
+            100
+        );
+    }
+
+    #[test]
+    fn availability_floor_tolerates_one_disruption_below_a_hundred_percent() {
+        assert_eq!(FamilyAvailability::allowed_disruptions(50, 99), 1);
+        assert_eq!(FamilyAvailability::allowed_disruptions(1000, 99), 10);
+        assert_eq!(FamilyAvailability::allowed_disruptions(50, 100), 0);
+        assert_eq!(FamilyAvailability::allowed_disruptions(1000, 90), 100);
+        assert!(FamilyAvailability::from_counts("put", &counts(49, 0, 1, 0)).meets_floor(99));
+        assert!(!FamilyAvailability::from_counts("put", &counts(48, 0, 2, 0)).meets_floor(99));
+        assert!(!FamilyAvailability::from_counts("put", &counts(49, 0, 1, 0)).meets_floor(100));
+        assert!(!FamilyAvailability::from_counts("put", &counts(0, 0, 0, 0)).meets_floor(99));
+    }
+
+    #[test]
+    fn post_recovery_object_count_is_bounded() {
+        assert_eq!(post_recovery_object_count(12), 8);
+        assert_eq!(post_recovery_object_count(600), 30);
+        assert_eq!(post_recovery_object_count(40_000), 64);
+        assert_eq!(post_recovery_object_size(0), 4096);
+        assert_eq!(post_recovery_object_size(15), 16 * 4096);
+        assert_eq!(post_recovery_object_size(16), 4096);
+    }
+
+    fn passing_report() -> PostRecoveryWriteReport {
+        PostRecoveryWriteReport {
+            scenario: "io-eio".to_string(),
+            run_id: "run-1".to_string(),
+            key_prefix: "fault-test-post-recovery/run-1/".to_string(),
+            started_at_ms: 10,
+            completed_at_ms: 20,
+            objects: 8,
+            puts_verified: 8,
+            deletes_verified_absent: 8,
+            multipart_completes_verified: 1,
+            multipart_aborts_ok: 1,
+            lists_verified: 2,
+            failures: Vec::new(),
+            passed: true,
+        }
+    }
+
+    #[test]
+    fn post_recovery_report_requires_every_counter_to_match() {
+        passing_report().require_success().expect("complete probe");
+        let mut short = passing_report();
+        short.deletes_verified_absent = 7;
+        assert!(short.require_success().is_err());
+        let mut no_list = passing_report();
+        no_list.lists_verified = 1;
+        assert!(no_list.require_success().is_err());
+        let mut failed_put = passing_report();
+        failed_put
+            .failures
+            .push("put k: Failed error=503".to_string());
+        failed_put.passed = true;
+        assert!(failed_put.require_success().is_err());
+        let mut flag_only = passing_report();
+        flag_only.multipart_aborts_ok = 0;
+        assert!(flag_only.require_success().is_err());
+    }
+
+    #[test]
+    fn availability_report_requires_full_read_probe_and_threshold() {
+        let report = AvailabilityReport {
+            scenario: "pod-failure".to_string(),
+            run_id: "run-1".to_string(),
+            min_success_percent: 99,
+            served_by_pod: None,
+            read_probe: ReadProbeSummary {
+                objects: 10,
+                verified: 9,
+                failures: vec!["k: Failed http_status=503".to_string()],
+            },
+            workload: Vec::new(),
+            violations: Vec::new(),
+            passed: true,
+        };
+        assert!(report.require_success().is_err());
     }
 }

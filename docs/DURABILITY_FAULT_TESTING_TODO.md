@@ -60,11 +60,14 @@ Status legend:
   `delete_marker_lineage_incomplete`,
   `version_id_missing_on_committed_write`,
   `multipart_upload_lineage_incomplete`, `list_unavailable_or_unknown`,
-  `data_corruption`, and `ambiguous_write_materialized`.
+  `listed_key_unreadable`, `unexpected_listed_object`, `data_corruption`, and
+  `ambiguous_write_materialized`.
 - Current run-failure reasons are `harness_error`, `test_harness`,
   `workload_execution_error`, `artifact_validation_failed`,
   `checker_execution_error`, `preflight_failed`, `health_guard_failed`,
   `fault_backend_unavailable`, `fault_not_active`, `fault_not_recovered`,
+  `recovery_health_degraded`, `post_recovery_write_failed`,
+  `availability_regression`,
   `unknown`, `checker_or_environment`, `test_or_environment`,
   `environment_or_fault_backend`, `product_or_environment`,
   `environment_or_workload`, `workload_or_product`, and `no_signal`. Mixed
@@ -360,8 +363,35 @@ guardrails when implementing the ordered TODO below.
   observations before the read probes/mutations and after the workload require
   all non-target drives to be healthy, with unchanged deployment, geometry,
   and drive identities. These are two endpoint guards, not proof of continuous
-  health between samples. Continuous monitoring and post-recovery target-aware
-  guards remain pending.
+  health between samples. Continuous monitoring remains pending.
+
+- [x] DONE: Post-recovery RustFS health gate for every scenario.
+  Meaning: `recovery_health.rs` captures the healthy drive/server/geometry
+  baseline before fault activation and, after the recovery gate, polls until
+  RustFS reports exactly that drive set `ok` and every Pod answers readiness,
+  writing `recovery-health.json` (rustfs/backlog#2443). A drive that stays
+  `offline`/`unknown`/`faulty` after recovery fails as
+  `recovery_health_degraded` even when every committed object reads back.
+
+- [x] DONE: Post-recovery fresh-write probe and LIST ghost-key check.
+  Meaning: after recovery the runner writes, reads, lists, and deletes fresh
+  objects under a separate prefix with its own history file so the
+  authenticated workload phase chain stays untouched
+  (`post-recovery-write-report.json`, rustfs/backlog#2444). The final checker
+  reports listed keys that GET cannot read (`listed_key_unreadable`) and
+  readable listed keys no write explains (`unexpected_listed_object`);
+  failed-but-materialized writes are recorded and tolerated.
+
+- [x] DONE: Availability contract for in-redundancy faults.
+  Meaning: `pod-kill-one`, `pod-failure`, and `network-partition-one` use the
+  `availability-required` impact policy (rustfs/backlog#2445): a fault-active
+  read probe over the prefilled cohort must verify every object and each
+  workload family must meet `RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT`
+  (floors below 100 tolerate at least one disrupted operation per family).
+  The port-forward is re-pinned to a surviving Pod after activation because a
+  Service forward stays attached to the Pod it started on. The 99% default is
+  a pre-calibration margin; live runs must calibrate it before it gates a
+  release.
 
 - [x] DONE: Add host/storage mutation preflight.
   Meaning: executable device-mapper scenarios now require exact singleton

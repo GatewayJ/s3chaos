@@ -82,7 +82,10 @@ impl FaultRun<'_> {
             let removal = self.remove_fault(&mut active.fault)?;
             let mut no_staged_uploads = BTreeMap::new();
             let recovered = self
-                .recover_access(prepared, &mut no_staged_uploads)
+                .recover_access(prepared, &target, &mut no_staged_uploads)
+                .await?;
+            self.deadline
+                .run(self.probe_post_recovery_writes(&prepared.s3))
                 .await?;
             let mut evidence =
                 self.write_ack_recovery_evidence(&target, &active, &removal, &recovered)?;

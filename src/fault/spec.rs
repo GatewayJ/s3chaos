@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::fault::recovery_health::RECOVERY_HEALTH_ARTIFACT;
+use crate::fault::workload::execution::{
+    AVAILABILITY_REPORT_ARTIFACT, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+    POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +29,7 @@ use crate::fault::{
     },
     scenarios::{
         FaultDetectorContract, FaultScenario, FaultScenarioSpec, acknowledged_mutation_kind,
+        scenario_spec,
     },
     workload::WorkloadPlan,
 };
@@ -282,6 +288,9 @@ impl FaultRunArtifactSpec {
             "checker-pre-recommit-report.json",
             "checker-report.json",
             "fault-evidence.json",
+            RECOVERY_HEALTH_ARTIFACT,
+            POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+            POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
         ]
         .into_iter()
         .map(str::to_string)
@@ -289,28 +298,36 @@ impl FaultRunArtifactSpec {
     }
 
     pub fn required_names_for_scenario(scenario: &str) -> Vec<String> {
-        if acknowledged_mutation_kind(scenario).is_none() {
-            return Self::required_names();
+        let mut names = if acknowledged_mutation_kind(scenario).is_none() {
+            Self::required_names()
+        } else {
+            [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "target-proof.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "ack-to-fault-evidence.json",
+                "dm-crash-boundary.json",
+                "dm-crash-recovered.json",
+                "checker-pre-recommit-report.json",
+                "checker-report.json",
+                "fault-evidence.json",
+                RECOVERY_HEALTH_ARTIFACT,
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        };
+        if scenario_spec(scenario).is_ok_and(|spec| spec.impact_policy.requires_availability()) {
+            names.push(AVAILABILITY_REPORT_ARTIFACT.to_string());
         }
-        [
-            "run-spec.yaml",
-            "run-spec.json",
-            "preflight-summary.json",
-            "target-proof.json",
-            "run-events.jsonl",
-            "run-metadata.json",
-            "workload-plan.json",
-            "history.jsonl",
-            "ack-to-fault-evidence.json",
-            "dm-crash-boundary.json",
-            "dm-crash-recovered.json",
-            "checker-pre-recommit-report.json",
-            "checker-report.json",
-            "fault-evidence.json",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+        names
     }
 }
 

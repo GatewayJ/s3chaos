@@ -16,6 +16,7 @@ use crate::fault::shutdown::RunDeadline;
 use crate::fault::{
     host_storage::HostStorageMutationProof,
     quorum::QuorumHealthObservation,
+    recovery_health::RecoveryHealthBaseline,
     reporting::{FaultStatusSnapshot, PodIdentity},
     workload::ObjectSpec,
 };
@@ -49,6 +50,7 @@ use uuid::Uuid;
 mod access;
 mod ack;
 mod injection;
+mod post_recovery;
 mod recovery;
 mod setup;
 mod targets;
@@ -191,7 +193,10 @@ async fn run_fault_case(
             run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
             let removal = run.remove_fault(&mut active.fault)?;
             let recovered = run
-                .recover_access(&mut prepared, &mut staged_multipart_uploads)
+                .recover_access(&mut prepared, &target, &mut staged_multipart_uploads)
+                .await?;
+            deadline
+                .run(run.probe_post_recovery_writes(&prepared.s3))
                 .await?;
             let mut evidence =
                 run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
@@ -288,6 +293,9 @@ struct ProvenTarget {
     topology_observed_at_ms: Option<u64>,
     host_storage_proof: Option<HostStorageMutationProof>,
     execution_injection: crate::fault::plan::FaultInjection,
+    /// Healthy RustFS layout captured before the fault; recovery must return
+    /// the cluster to exactly this state.
+    health_baseline: RecoveryHealthBaseline,
 }
 
 struct ActiveFault {

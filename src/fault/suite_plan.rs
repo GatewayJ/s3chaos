@@ -842,7 +842,10 @@ mod tests {
             "recommit-report.json",
             "checker-pre-recommit-report.json",
             "checker-report.json",
-            "fault-evidence.json"
+            "fault-evidence.json",
+            "recovery-health.json",
+            "post-recovery-write-report.json",
+            "post-recovery-write-history.jsonl"
         ]);
         let operation_mix = json!({
             "put": 1,

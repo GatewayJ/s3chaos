@@ -134,6 +134,21 @@ pub struct CheckerReport {
     pub missing_committed_delete_markers: Vec<String>,
     #[serde(default)]
     pub resurrected_deleted_objects: Vec<String>,
+    /// Keys the final LIST returned that no committed or ambiguous write
+    /// explains, or that GET could not read back (`key: outcome`). A listed
+    /// key that GETs 404 is a "ghost" object: present in listing metadata,
+    /// unreadable as data.
+    #[serde(default)]
+    pub listed_keys_unreadable: Vec<String>,
+    /// Keys the final LIST returned whose bytes are readable but that no write
+    /// attempt in history (committed, ambiguous, or failed) ever targeted.
+    #[serde(default)]
+    pub unexpected_listed_objects: Vec<String>,
+    /// Keys whose only writes returned a definite failure yet are listed and
+    /// readable after recovery. Recorded for audit; a failed-but-materialized
+    /// write is a legitimate S3 outcome and does not fail the run.
+    #[serde(default)]
+    pub failed_writes_materialized: Vec<String>,
     #[serde(default)]
     pub delete_marker_lineage_incomplete: Vec<String>,
     #[serde(default)]
@@ -334,6 +349,8 @@ impl CheckerReport {
             && self.version_hash_mismatches.is_empty()
             && self.missing_committed_delete_markers.is_empty()
             && self.resurrected_deleted_objects.is_empty()
+            && self.listed_keys_unreadable.is_empty()
+            && self.unexpected_listed_objects.is_empty()
             && self.delete_marker_lineage_incomplete.is_empty()
             && self.multipart_upload_lineage_incomplete.is_empty()
     }
@@ -586,7 +603,34 @@ fn validate_successful_checker_observations(
         "checker tolerated ambiguous deletes are not derived from the authenticated model"
     );
 
-    let expected_current_keys = checker_expected_current_get_keys(prefix);
+    let mut expected_current_keys = checker_expected_current_get_keys(prefix);
+    // The checker also GETs every key its own final LIST returned that the
+    // model cannot explain; on a passing report those are exactly the
+    // tolerated failed-but-materialized writes.
+    let run_prefix_key = ObjectSpec::key_prefix(&report.run_id);
+    let unexplained_listed = suffix
+        .iter()
+        .filter(|record| {
+            record.kind == OperationKind::List && record.key.as_deref() == Some(&run_prefix_key)
+        })
+        .filter_map(|record| record.listed_keys.as_ref())
+        .flatten()
+        .filter(|key| !expected_current_keys.contains(*key))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let tolerated_failed_writes = report
+        .failed_writes_materialized
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        tolerated_failed_writes == unexplained_listed
+            && tolerated_failed_writes
+                .iter()
+                .all(|key| model.failed_writes.contains(key)),
+        "checker tolerated failed-write keys do not match the unexplained keys its final LIST returned"
+    );
+    expected_current_keys.extend(unexplained_listed.iter().cloned());
     let mut current_gets = BTreeMap::<&str, &OperationRecord>::new();
     for record in suffix
         .iter()
@@ -625,6 +669,11 @@ fn validate_successful_checker_observations(
                     "checker current GET for {key} does not match the authenticated committed value"
                 );
             }
+        } else if unexplained_listed.contains(key) {
+            ensure!(
+                record.outcome == OperationOutcome::Ok && record.http_status == Some(200),
+                "checker tolerated failed-write key {key} is not authenticated by a readable GET"
+            );
         } else {
             ensure!(
                 record.outcome == OperationOutcome::NotFound && record.http_status == Some(404),
@@ -664,6 +713,7 @@ fn validate_successful_checker_observations(
         .live
         .keys()
         .filter(|key| !tolerated.contains(key.as_str()))
+        .chain(report.failed_writes_materialized.iter())
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     ensure!(
@@ -992,6 +1042,9 @@ pub async fn check_s3_history(
         version_hash_mismatches: Vec::new(),
         missing_committed_delete_markers: Vec::new(),
         resurrected_deleted_objects: Vec::new(),
+        listed_keys_unreadable: Vec::new(),
+        unexpected_listed_objects: Vec::new(),
+        failed_writes_materialized: Vec::new(),
         delete_marker_lineage_incomplete: Vec::new(),
         multipart_upload_lineage_incomplete: Vec::new(),
         tolerated_ambiguous_deletes: Vec::new(),
@@ -1006,6 +1059,7 @@ pub async fn check_s3_history(
     let mut list_object_versions_completed = None;
     let mut ambiguous_delete_absent = BTreeSet::new();
     let mut ambiguous_delete_present = BTreeSet::new();
+    let mut ambiguous_write_absent = BTreeSet::new();
     let mut version_latest_by_key = None;
     let expected_latest_versions = expect_versioning.then(|| {
         checker_expected_version_listing(&initial_records)
@@ -1055,6 +1109,11 @@ pub async fn check_s3_history(
             && model.ambiguous_delete_pending.contains(&key)
         {
             ambiguous_delete_present.insert(key.clone());
+        }
+        if expected.is_none() && get.outcome == OperationOutcome::NotFound {
+            // An ambiguous write that never materialized is fine on GET, but
+            // if LIST still advertises the key it is a ghost entry.
+            ambiguous_write_absent.insert(key.clone());
         }
         evaluate_final_get(&mut report, key, expected.as_ref(), &unknown_writes, get);
     }
@@ -1178,6 +1237,25 @@ pub async fn check_s3_history(
                 &prefix,
                 &mut final_list_warnings,
             );
+            for key in ambiguous_write_absent.intersection(&listed) {
+                report.listed_keys_unreadable.push(format!(
+                    "{key}: NotFound (ambiguous write listed but absent on GET)"
+                ));
+            }
+            let unexplained = unexplained_listed_keys(&model, &listed);
+            let mut unexplained_results = stream::iter(unexplained.into_iter().map(|key| {
+                let s3 = s3.clone();
+                let recorder = recorder.clone();
+                async move {
+                    let get = s3.get_object_result(&key, &recorder).await?;
+                    Ok::<_, anyhow::Error>((key, get))
+                }
+            }))
+            .buffer_unordered(concurrency);
+            while let Some(result) = unexplained_results.next().await {
+                let (key, get) = result?;
+                evaluate_unexplained_listed_key(&mut report, &model, key, &get);
+            }
             final_listed_keys = Some(listed);
         }
         None => final_list_warnings.push(format!("LIST prefix {prefix} did not complete")),
@@ -1221,6 +1299,9 @@ pub async fn check_s3_history(
     report.version_hash_mismatches.sort();
     report.missing_committed_delete_markers.sort();
     sort_dedup(&mut report.resurrected_deleted_objects);
+    sort_dedup(&mut report.listed_keys_unreadable);
+    sort_dedup(&mut report.unexpected_listed_objects);
+    sort_dedup(&mut report.failed_writes_materialized);
     sort_dedup(&mut report.delete_marker_lineage_incomplete);
     sort_dedup(&mut report.multipart_upload_lineage_incomplete);
     report.tolerated_ambiguous_deletes.sort();
@@ -1437,6 +1518,11 @@ struct ObjectModel {
     // (timeout/unknown): the object may or may not have been removed, so a
     // post-recovery 404 is a legitimate outcome rather than a lost object.
     ambiguous_delete_pending: BTreeSet<String>,
+    // Keys whose PUT or CompleteMultipartUpload returned a definite failure.
+    // S3 allows a failed response for a write that still materialized, so a
+    // listed, readable key with only failed writes is tolerated rather than
+    // reported as an unexplained object.
+    failed_writes: BTreeSet<String>,
     committed_writes: usize,
 }
 
@@ -1966,6 +2052,44 @@ fn evaluate_final_list_keys(
         if listed.contains(key) {
             warnings.push(format!("LIST prefix {prefix} included deleted key {key}"));
         }
+    }
+}
+
+/// Listed keys that no committed, ambiguous, or deleted state explains. The
+/// checker LISTs only its own run prefix, so every listed key must trace back
+/// to a write this run attempted.
+fn unexplained_listed_keys(model: &ObjectModel, listed: &BTreeSet<String>) -> Vec<String> {
+    listed
+        .iter()
+        .filter(|key| {
+            !model.live.contains_key(*key)
+                && !model.unknown_writes.contains_key(*key)
+                && !model.deleted.contains(*key)
+        })
+        .cloned()
+        .collect()
+}
+
+fn evaluate_unexplained_listed_key(
+    report: &mut CheckerReport,
+    model: &ObjectModel,
+    key: String,
+    get: &GetObjectResult,
+) {
+    match (get.outcome, get.body.as_ref()) {
+        (OperationOutcome::Ok, Some(_)) => {
+            if model.failed_writes.contains(&key) {
+                report.failed_writes_materialized.push(key);
+            } else {
+                report.unexpected_listed_objects.push(key);
+            }
+        }
+        (outcome, _) => report.listed_keys_unreadable.push(format!(
+            "{key}: {outcome:?}{}",
+            get.http_status
+                .map(|status| format!(" http_status={status}"))
+                .unwrap_or_default()
+        )),
     }
 }
 
@@ -2505,6 +2629,10 @@ fn classify_without_reread(report: &CheckerReport) -> RecoveryStabilityClassific
         || !report.unexpected_visible_deleted_objects.is_empty()
     {
         RecoveryStabilityClassification::DeletedObjectResurrected
+    } else if !report.listed_keys_unreadable.is_empty() {
+        RecoveryStabilityClassification::ListedKeyUnreadable
+    } else if !report.unexpected_listed_objects.is_empty() {
+        RecoveryStabilityClassification::UnexpectedListedObject
     } else if !report.missing_committed_versions.is_empty() {
         RecoveryStabilityClassification::CommittedVersionMissing
     } else if has_data_corruption_signal(report) {
@@ -2645,6 +2773,18 @@ fn immediate_classification_evidence(report: &CheckerReport) -> Vec<String> {
             .iter()
             .chain(report.unexpected_visible_deleted_objects.iter())
             .map(|item| format!("resurrected_deleted_object: {item}")),
+    );
+    evidence.extend(
+        report
+            .listed_keys_unreadable
+            .iter()
+            .map(|item| format!("listed_key_unreadable: {item}")),
+    );
+    evidence.extend(
+        report
+            .unexpected_listed_objects
+            .iter()
+            .map(|item| format!("unexpected_listed_object: {item}")),
     );
     evidence.extend(
         report
@@ -2940,6 +3080,8 @@ fn immediate_failures_are_only_reread_candidates(
         && immediate_report.version_hash_mismatches.is_empty()
         && immediate_report.missing_committed_delete_markers.is_empty()
         && immediate_report.resurrected_deleted_objects.is_empty()
+        && immediate_report.listed_keys_unreadable.is_empty()
+        && immediate_report.unexpected_listed_objects.is_empty()
         && immediate_report.delete_marker_lineage_incomplete.is_empty()
         && immediate_report
             .multipart_upload_lineage_incomplete
@@ -2993,6 +3135,13 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
                         ended_sequence: record.ended_sequence,
                         superseded_by: None,
                     });
+            }
+        }
+        OperationKind::Put | OperationKind::CompleteMultipartUpload
+            if record.outcome == OperationOutcome::Failed =>
+        {
+            if let Some(key) = record.key.clone() {
+                model.failed_writes.insert(key);
             }
         }
         OperationKind::Delete if record.outcome == OperationOutcome::Ok => {
@@ -3776,10 +3925,11 @@ mod tests {
         checker_data_version_audit, checker_delete_marker_audits,
         checker_expected_current_get_keys, checker_history_records_sha256,
         checker_operation_audits, evaluate_committed_get, evaluate_final_get,
-        evaluate_final_list_keys, evaluate_recovery_reread_get,
+        evaluate_final_list_keys, evaluate_recovery_reread_get, evaluate_unexplained_listed_key,
         finalize_ambiguous_delete_observations, finish_recovery_stability_report,
-        immediate_still_unavailable_keys, is_recovery_tail_read_failure, list_history_warnings,
-        object_model, recovery_tail_candidate_keys, successful_read_anomalies,
+        immediate_classification_evidence, immediate_still_unavailable_keys,
+        is_recovery_tail_read_failure, list_history_warnings, object_model,
+        recovery_tail_candidate_keys, successful_read_anomalies, unexplained_listed_keys,
         validate_checker_audit_against_history, validate_recovery_key_sets,
     };
     use crate::fault::history::{
@@ -4441,6 +4591,14 @@ mod tests {
         list_content_mismatch
             .list_warnings
             .push("LIST prefix did not include expected live key put-key".to_string());
+        let mut ghost_key = empty_report();
+        ghost_key
+            .listed_keys_unreadable
+            .push("ghost-key: NotFound http_status=404".to_string());
+        let mut unexplained_object = empty_report();
+        unexplained_object
+            .unexpected_listed_objects
+            .push("never-written-key".to_string());
 
         let golden = [
             ("put_200_loss", object_missing.failure_classification()),
@@ -4489,6 +4647,14 @@ mod tests {
                 "completed_list_wrong_content",
                 list_content_mismatch.failure_classification(),
             ),
+            (
+                "listed_key_get_404_ghost",
+                ghost_key.failure_classification(),
+            ),
+            (
+                "listed_key_never_written",
+                unexplained_object.failure_classification(),
+            ),
         ]
         .map(|(case, classification)| (case, classification.as_str()));
 
@@ -4517,7 +4683,122 @@ mod tests {
                 ),
                 ("list_timeout", "list_unavailable_or_unknown"),
                 ("completed_list_wrong_content", "data_corruption"),
+                ("listed_key_get_404_ghost", "listed_key_unreadable"),
+                ("listed_key_never_written", "unexpected_listed_object"),
             ]
+        );
+        assert!(!ghost_key.success_predicate());
+        assert!(!unexplained_object.success_predicate());
+        let mut tolerated = empty_report();
+        tolerated
+            .failed_writes_materialized
+            .push("failed-put-key".to_string());
+        assert!(tolerated.success_predicate());
+    }
+
+    #[test]
+    fn unexplained_listed_keys_exclude_every_state_history_explains() {
+        let model = object_model(&[
+            record(
+                "op-1",
+                OperationKind::Put,
+                "live",
+                "a",
+                OperationOutcome::Ok,
+            ),
+            record(
+                "op-2",
+                OperationKind::Put,
+                "gone",
+                "b",
+                OperationOutcome::Ok,
+            ),
+            record(
+                "op-3",
+                OperationKind::Delete,
+                "gone",
+                "b",
+                OperationOutcome::Ok,
+            ),
+            record(
+                "op-4",
+                OperationKind::Put,
+                "ambiguous",
+                "c",
+                OperationOutcome::Timeout,
+            ),
+            record(
+                "op-5",
+                OperationKind::CompleteMultipartUpload,
+                "failed",
+                "d",
+                OperationOutcome::Failed,
+            ),
+        ]);
+        assert!(model.failed_writes.contains("failed"));
+        let listed = BTreeSet::from([
+            "live".to_string(),
+            "gone".to_string(),
+            "ambiguous".to_string(),
+            "failed".to_string(),
+            "ghost".to_string(),
+        ]);
+
+        let unexplained = unexplained_listed_keys(&model, &listed);
+
+        assert_eq!(unexplained, vec!["failed".to_string(), "ghost".to_string()]);
+    }
+
+    #[test]
+    fn unexplained_listed_key_outcomes_split_ghost_tolerated_and_unexpected() {
+        let model = object_model(&[record(
+            "op-1",
+            OperationKind::Put,
+            "failed",
+            "d",
+            OperationOutcome::Failed,
+        )]);
+        let readable = GetObjectResult {
+            outcome: OperationOutcome::Ok,
+            http_status: Some(200),
+            error: None,
+            body: Some(b"d".to_vec()),
+        };
+        let absent = GetObjectResult {
+            outcome: OperationOutcome::NotFound,
+            http_status: Some(404),
+            error: None,
+            body: None,
+        };
+        let timeout = GetObjectResult {
+            outcome: OperationOutcome::Timeout,
+            http_status: None,
+            error: Some("timed out".to_string()),
+            body: None,
+        };
+
+        let mut report = empty_report();
+        evaluate_unexplained_listed_key(&mut report, &model, "failed".to_string(), &readable);
+        evaluate_unexplained_listed_key(&mut report, &model, "ghost".to_string(), &absent);
+        evaluate_unexplained_listed_key(&mut report, &model, "never".to_string(), &readable);
+        evaluate_unexplained_listed_key(&mut report, &model, "stalled".to_string(), &timeout);
+
+        assert_eq!(
+            report.failed_writes_materialized,
+            vec!["failed".to_string()]
+        );
+        assert_eq!(report.unexpected_listed_objects, vec!["never".to_string()]);
+        assert_eq!(
+            report.listed_keys_unreadable,
+            vec![
+                "ghost: NotFound http_status=404".to_string(),
+                "stalled: Timeout".to_string(),
+            ]
+        );
+        assert!(!report.success_predicate());
+        assert_eq!(
+            report.failure_classification().as_str(),
+            "listed_key_unreadable"
         );
     }
 
@@ -4958,6 +5239,35 @@ mod tests {
         assert_eq!(
             recovery.classification,
             RecoveryStabilityClassification::RecoveryTailReadLatency
+        );
+    }
+
+    #[test]
+    fn ghost_listed_keys_are_never_softened_into_recovery_tail_latency() {
+        let mut immediate = empty_report();
+        immediate.unavailable_committed_objects.push(
+            "k: outcome=Timeout status=200 error=\"get body read timed out\""
+                .to_string()
+                .into(),
+        );
+        immediate
+            .listed_keys_unreadable
+            .push("ghost: NotFound http_status=404".to_string());
+        let mut recovery = recovery_report_with_attempted_key("k");
+        recovery.reread_recovered_keys.push("k".to_string());
+
+        finish_recovery_stability_report(&mut recovery, &immediate);
+
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::ListedKeyUnreadable
+        );
+        // The live reread path seeds the report with this evidence, which the
+        // artifact validator later requires for the classification.
+        assert!(
+            immediate_classification_evidence(&immediate)
+                .iter()
+                .any(|item| item.starts_with("listed_key_unreadable: ghost"))
         );
     }
 
@@ -7045,6 +7355,105 @@ mod tests {
     }
 
     #[test]
+    fn checker_audit_accepts_tolerated_failed_write_gets_and_rejects_untracked_ones() {
+        let run_prefix = "fault-test/run-1/";
+        let live_key = format!("{run_prefix}object-000001");
+        let failed_key = format!("{run_prefix}object-000002");
+        let mut committed = record(
+            "op-1",
+            OperationKind::Put,
+            &live_key,
+            &sha256_hex(b"a"),
+            OperationOutcome::Ok,
+        );
+        committed.run_id = Some("run-1".to_string());
+        let mut failed = record(
+            "op-2",
+            OperationKind::Put,
+            &failed_key,
+            &sha256_hex(b"b"),
+            OperationOutcome::Failed,
+        );
+        failed.run_id = Some("run-1".to_string());
+        failed.http_status = Some(503);
+        let mut live_get = record(
+            "op-3",
+            OperationKind::Get,
+            &live_key,
+            &sha256_hex(b"a"),
+            OperationOutcome::Ok,
+        );
+        live_get.run_id = Some("run-1".to_string());
+        let mut final_list = list_record(
+            "op-4",
+            run_prefix,
+            30,
+            31,
+            &[live_key.as_str(), failed_key.as_str()],
+        );
+        final_list.run_id = Some("run-1".to_string());
+        let mut failed_get = record(
+            "op-5",
+            OperationKind::Get,
+            &failed_key,
+            &sha256_hex(b"b"),
+            OperationOutcome::Ok,
+        );
+        failed_get.run_id = Some("run-1".to_string());
+        let mut history = vec![committed, failed, live_get, final_list, failed_get];
+        assign_recorder_sequences(&mut history);
+        let prefix = history[..2].to_vec();
+        let suffix = history[2..].to_vec();
+        let audit = |suffix: &[OperationRecord]| CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 1,
+            completed_at_ms: 40,
+            history_prefix_record_count: prefix.len(),
+            history_prefix_sha256: checker_history_records_sha256(&prefix).expect("prefix digest"),
+            history_suffix_record_count: suffix.len(),
+            history_suffix_sha256: checker_history_records_sha256(suffix).expect("suffix digest"),
+            suffix_operations: checker_operation_audits(suffix),
+            data_version_checks: Vec::new(),
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: None,
+        };
+        let mut report = empty_report();
+        report.run_id = "run-1".to_string();
+        report.committed_puts = 1;
+        report.expected_live_objects = 1;
+        report.verified_live_objects = 1;
+        report.final_listed_objects = Some(2);
+        report.failed_writes_materialized = vec![failed_key.clone()];
+        report.operation_cohorts = super::operation_cohort_counts(&prefix);
+        report.fault_window_relations = super::fault_window_relation_counts(&prefix);
+        report.audit = Some(audit(&suffix));
+        report.passed = true;
+
+        validate_checker_audit_against_history(&report, &history)
+            .expect("tolerated failed-write GET is authenticated");
+
+        let mut untracked = report.clone();
+        untracked.failed_writes_materialized.clear();
+        assert!(
+            validate_checker_audit_against_history(&untracked, &history)
+                .expect_err("a GET the report does not account for")
+                .to_string()
+                .contains("tolerated failed-write keys")
+        );
+
+        let mut missing_get_history = history.clone();
+        missing_get_history.pop();
+        let mut missing_get = report.clone();
+        missing_get.audit = Some(audit(&missing_get_history[2..]));
+        assert!(
+            validate_checker_audit_against_history(&missing_get, &missing_get_history)
+                .expect_err("listed unexplained key must be probed")
+                .to_string()
+                .contains("current GET coverage")
+        );
+    }
+
+    #[test]
     fn checker_audit_binds_exact_history_prefix_serialization() {
         let records = vec![record(
             "op-1",
@@ -7187,6 +7596,9 @@ mod tests {
             version_hash_mismatches: Vec::new(),
             missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
+            listed_keys_unreadable: Vec::new(),
+            unexpected_listed_objects: Vec::new(),
+            failed_writes_materialized: Vec::new(),
             delete_marker_lineage_incomplete: Vec::new(),
             multipart_upload_lineage_incomplete: Vec::new(),
             tolerated_ambiguous_deletes: Vec::new(),
@@ -7581,6 +7993,9 @@ mod tests {
             version_hash_mismatches: Vec::new(),
             missing_committed_delete_markers: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
+            listed_keys_unreadable: Vec::new(),
+            unexpected_listed_objects: Vec::new(),
+            failed_writes_materialized: Vec::new(),
             delete_marker_lineage_incomplete: Vec::new(),
             multipart_upload_lineage_incomplete: Vec::new(),
             tolerated_ambiguous_deletes: Vec::new(),
