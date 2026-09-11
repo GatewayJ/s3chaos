@@ -1134,9 +1134,22 @@ list_scenarios() {
 # own restore leaves that record behind; undo it here, and refuse to guess
 # when the record cannot be read.
 restore_paused_operators() {
-  local deployments name replicas
-  deployments="$(kubectl_ns "$OPERATOR_NAMESPACE" get deployment -o json 2>/dev/null \
-    | jq -r --arg key "$OPERATOR_PAUSE_REPLICAS_ANNOTATION" '.items[] | select(.metadata.annotations[$key] != null) | "\(.metadata.name)\t\(.metadata.annotations[$key])"')" || return 0
+  local listing kubectl_stderr kubectl_error deployments name replicas
+  kubectl_stderr="$(mktemp)"
+  if ! listing="$(kubectl_ns "$OPERATOR_NAMESPACE" get deployment -o json 2>"$kubectl_stderr")"; then
+    kubectl_error="$(cat "$kubectl_stderr")"
+    rm -f "$kubectl_stderr"
+    # Only an absent operator namespace means there is nothing to restore;
+    # RBAC denials, API errors, or a wrong context must not pass as clean.
+    if [[ "$kubectl_error" == *"NotFound"* && "$kubectl_error" == *"namespaces \"$OPERATOR_NAMESPACE\""* ]]; then
+      return 0
+    fi
+    die "cannot inspect operator Deployments in namespace $OPERATOR_NAMESPACE for pause records left by a previous run; refusing to report a clean cleanup: $kubectl_error"
+  fi
+  rm -f "$kubectl_stderr"
+  deployments="$(printf '%s' "$listing" \
+    | jq -r --arg key "$OPERATOR_PAUSE_REPLICAS_ANNOTATION" '.items[] | select(.metadata.annotations[$key] != null) | "\(.metadata.name)\t\(.metadata.annotations[$key])"')" \
+    || die "cannot parse the operator Deployment listing for namespace $OPERATOR_NAMESPACE"
   [[ -n "$deployments" ]] || return 0
   while IFS=$'\t' read -r name replicas; do
     [[ -n "$name" ]] || continue

@@ -502,6 +502,11 @@ pub struct PodLifecycleEvidence {
     pub targets: Vec<PodTerminationEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outage: Option<OutageEvidence>,
+    /// The harness stopped observing the Pods (kubectl or API failure)
+    /// before the operation finished; gaps in the targets below are then a
+    /// harness problem, not product evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_failure: Option<String>,
     pub started_at_ms: u64,
     pub completed_at_ms: u64,
     #[serde(default)]
@@ -638,6 +643,11 @@ impl PodLifecycleEvidence {
         if self.started_at_ms == 0 || self.started_at_ms > self.completed_at_ms {
             violations.push("operation window is invalid".to_string());
         }
+        if let Some(failure) = &self.observation_failure {
+            violations.push(format!(
+                "Pod observation failed during the operation: {failure}"
+            ));
+        }
         violations.sort();
         violations.dedup();
         violations
@@ -683,6 +693,11 @@ impl PodLifecycleEvidence {
             if candidate == REPLACEMENT_NOT_READY_CLASSIFICATION {
                 classification = candidate;
             }
+        }
+        // A replacement the harness stopped watching is not a replacement
+        // that failed; an already fully observed grace timeout returned above.
+        if self.observation_failure.is_some() {
+            return HARNESS_CLASSIFICATION;
         }
         classification
     }
@@ -1078,6 +1093,7 @@ mod tests {
             operator_pause: None,
             targets,
             outage: None,
+            observation_failure: None,
             started_at_ms,
             completed_at_ms: started_at_ms + 600_000,
             violations: Vec::new(),
@@ -1239,6 +1255,33 @@ mod tests {
         let report = evidence(LifecycleOperation::GracefulPod, vec![unobserved]);
         assert!(!report.passed);
         assert_eq!(report.failure_classification(), "test_or_environment");
+
+        // A replacement the harness stopped watching is a harness problem;
+        // a fully observed grace timeout still outranks the lost observation.
+        let mut lost = target("rustfs-1", 1, false);
+        lost.replacement_ready_at_ms = None;
+        let mut report = evidence(LifecycleOperation::GracefulPod, vec![lost]);
+        assert_eq!(report.failure_classification(), "product_or_environment");
+        report.observation_failure = Some("kubectl: connection refused".to_string());
+        let report = report.finalize();
+        assert_eq!(report.failure_classification(), "test_or_environment");
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("observation failed"))
+        );
+        let mut killed_then_lost = target("rustfs-1", 1, false);
+        killed_then_lost.terminated = Some(terminated(137, "2026-09-11T10:05:30Z"));
+        killed_then_lost.termination_duration_ms = Some(30_000);
+        killed_then_lost.classification = TerminationClassification::KilledOnGraceTimeout;
+        killed_then_lost.replacement_ready_at_ms = None;
+        let mut report = evidence(LifecycleOperation::GracefulPod, vec![killed_then_lost]);
+        report.observation_failure = Some("kubectl: connection refused".to_string());
+        assert_eq!(
+            report.finalize().failure_classification(),
+            "graceful_shutdown_failed"
+        );
 
         let mut short_grace = target("rustfs-1", 1, false);
         short_grace.deletion_grace_period_seconds = Some(0);

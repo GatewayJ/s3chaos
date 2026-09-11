@@ -220,8 +220,9 @@ drains every Pod before the workload, records every `spec.replicas` sample
 while the outage is held, requires every workload operation to fail, then
 scales both back. The operator is restored when the run unwinds normally or
 on a signal; if the harness is killed outright, the annotations remain and
-the next lifecycle run's pre-cleanup or `make fault-cleanup` restores the
-operator from them (an unreadable record fails cleanup rather than guessing).
+the next `cluster-cold-restart` pre-cleanup or `make fault-cleanup` restores
+the operator from them (an unreadable record, or a cleanup that cannot read
+the operator namespace, fails rather than reporting a clean cluster).
 These scenarios have not yet been calibrated on a live cluster.
 `make fault-dashboard-install` mutates the current cluster (installs/upgrades
 the Chaos Mesh release via Helm); treat it like a live run.

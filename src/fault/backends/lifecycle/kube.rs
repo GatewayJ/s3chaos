@@ -451,6 +451,35 @@ pub fn get_statefulset_command(cluster: &ClusterTestConfig, name: &str) -> Resul
         .arg(REQUEST_TIMEOUT_FLAG))
 }
 
+pub fn get_statefulset_yaml_command(
+    cluster: &ClusterTestConfig,
+    name: &str,
+) -> Result<CommandSpec> {
+    ensure_dns1123_subdomain(name, "StatefulSet name")?;
+    Ok(kubectl(cluster, &cluster.test_namespace)?
+        .command(["get", "statefulset", name, "-o", "yaml"])
+        .arg(REQUEST_TIMEOUT_FLAG))
+}
+
+pub fn list_rustfs_pods_yaml_command(cluster: &ClusterTestConfig) -> Result<CommandSpec> {
+    Ok(kubectl(cluster, &cluster.test_namespace)?
+        .command([
+            "get",
+            "pod",
+            "-l",
+            rustfs_tenant_selector(cluster).as_str(),
+            "-o",
+            "yaml",
+        ])
+        .arg(REQUEST_TIMEOUT_FLAG))
+}
+
+pub fn list_events_command(cluster: &ClusterTestConfig) -> Result<CommandSpec> {
+    Ok(kubectl(cluster, &cluster.test_namespace)?
+        .command(["get", "events", "--sort-by=.lastTimestamp"])
+        .arg(REQUEST_TIMEOUT_FLAG))
+}
+
 pub fn get_deployment_command(
     cluster: &ClusterTestConfig,
     namespace: &str,
@@ -604,7 +633,9 @@ pub struct PermissionCheck {
 }
 
 /// RBAC the operation needs. `kubectl scale` patches the `scale`
-/// subresource, so that is what is checked, not the parent resource.
+/// subresource, so that is what is checked, not the parent resource. Only
+/// the cold restart touches the operator namespace (pause, resume, and the
+/// pre-cleanup repair of a pause a killed run left behind).
 pub fn required_permissions(
     operation: LifecycleOperation,
     test_namespace: &str,
@@ -1124,6 +1155,25 @@ mod tests {
                 .expect("get")
                 .display(),
             "kubectl --context real-cluster -n rustfs-fault-test get statefulset fault-test-tenant-primary -o json --request-timeout=30s"
+        );
+        assert_eq!(
+            super::get_statefulset_yaml_command(&cluster, "fault-test-tenant-primary")
+                .expect("yaml")
+                .display(),
+            "kubectl --context real-cluster -n rustfs-fault-test get statefulset fault-test-tenant-primary -o yaml --request-timeout=30s"
+        );
+        assert!(super::get_statefulset_yaml_command(&cluster, "-o").is_err());
+        assert_eq!(
+            super::list_rustfs_pods_yaml_command(&cluster)
+                .expect("yaml")
+                .display(),
+            "kubectl --context real-cluster -n rustfs-fault-test get pod -l rustfs.tenant=fault-test-tenant -o yaml --request-timeout=30s"
+        );
+        assert_eq!(
+            super::list_events_command(&cluster)
+                .expect("events")
+                .display(),
+            "kubectl --context real-cluster -n rustfs-fault-test get events --sort-by=.lastTimestamp --request-timeout=30s"
         );
         assert_eq!(
             watch_rustfs_pods_command(&cluster)

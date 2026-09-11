@@ -120,11 +120,15 @@ pub(in crate::fault) fn cleanup_fault_backends(
     config: &FaultTestConfig,
     plan: &FaultPlan,
 ) -> Result<()> {
-    cleanup_fault_backend(config, plan.fault().backend())?;
+    cleanup_fault_backend(config, plan.fault().backend(), plan.fault().kind())?;
     Ok(())
 }
 
-fn cleanup_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Result<()> {
+fn cleanup_fault_backend(
+    config: &FaultTestConfig,
+    backend: FaultBackend,
+    kind: FaultKind,
+) -> Result<()> {
     match backend {
         FaultBackend::ChaosMeshIoChaos
         | FaultBackend::MinioWarpWithChaos
@@ -140,9 +144,15 @@ fn cleanup_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Res
         FaultBackend::DeviceMapper => Ok(()),
         FaultBackend::PlannedReliabilityWorkflow => Ok(()),
         // A cold restart records its operator pause on the operator Deployment;
-        // a previous run that died before restoring it is repaired here.
+        // a previous run that died before restoring it is repaired here. Only
+        // the cold restart holds the operator-namespace RBAC this needs, so
+        // the other lifecycle kinds leave the repair to fault-cleanup.
         FaultBackend::KubernetesLifecycle => {
-            lifecycle::restore_paused_operators(config).map(|_| ())
+            if kind == FaultKind::RustfsServerColdRestart {
+                lifecycle::restore_paused_operators(config).map(|_| ())
+            } else {
+                Ok(())
+            }
         }
     }
 }
