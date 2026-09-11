@@ -1,5 +1,18 @@
 name: RustFS protocol live gate
 
+# Triggers:
+# - pull_request: smoke gate only, for protocol harness changes in this repository.
+# - workflow_dispatch: full live execution; inputs identify the RustFS build under test and may
+#   redirect the run to a per-candidate endpoint.
+# - repository_dispatch (event_type rustfs-release-candidate): sent by the rustfs repository for
+#   every release candidate so smoke and full regression run against it. client_payload keys
+#   mirror the workflow_dispatch inputs: rustfs_image_digest, rustfs_version, rustfs_endpoint,
+#   rustfs_target_fingerprint.
+#
+# An endpoint override is only accepted together with a fingerprint override: the harness refuses
+# destructive runs unless the pinned target fingerprint matches the server it reaches, and the
+# stored fingerprint secret only pins the shared dedicated target.
+
 on:
   pull_request:
     paths:
@@ -9,6 +22,31 @@ on:
       - "src/protocol/**"
       - "src/bin/s3chaos.rs"
   workflow_dispatch:
+    inputs:
+      rustfs_image_digest:
+        description: "RustFS image digest under test (sha256:...), recorded with the run artifacts"
+        required: false
+        type: string
+      rustfs_version:
+        description: "RustFS release candidate tag under test, for example 1.0.0-rc.6"
+        required: false
+        type: string
+      rustfs_endpoint:
+        description: "Endpoint of a per-candidate RustFS target; overrides the RUSTFS_PROTOCOL_TEST_ENDPOINT secret and requires rustfs_target_fingerprint"
+        required: false
+        type: string
+      rustfs_target_fingerprint:
+        description: "Target fingerprint (sha256) of that endpoint; overrides the RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT secret"
+        required: false
+        type: string
+  repository_dispatch:
+    types: [rustfs-release-candidate]
+
+run-name: >-
+  ${{ (github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch')
+      && (inputs.rustfs_version || github.event.client_payload.rustfs_version || inputs.rustfs_image_digest || github.event.client_payload.rustfs_image_digest)
+      && format('RustFS protocol live gate for {0}', inputs.rustfs_version || github.event.client_payload.rustfs_version || inputs.rustfs_image_digest || github.event.client_payload.rustfs_image_digest)
+      || 'RustFS protocol live gate' }}
 
 concurrency:
   group: protocol-live-${{ github.ref }}
@@ -17,6 +55,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFS_PROTOCOL_TEST_DEDICATED: "1"
+  # Provenance of the RustFS build under test; empty for pull requests.
+  RUSTFS_TARGET_IMAGE_DIGEST: ${{ inputs.rustfs_image_digest || github.event.client_payload.rustfs_image_digest }}
+  RUSTFS_TARGET_VERSION: ${{ inputs.rustfs_version || github.event.client_payload.rustfs_version }}
+  RUSTFS_TARGET_ENDPOINT_OVERRIDE: ${{ inputs.rustfs_endpoint || github.event.client_payload.rustfs_endpoint }}
+  RUSTFS_TARGET_FINGERPRINT_OVERRIDE: ${{ inputs.rustfs_target_fingerprint || github.event.client_payload.rustfs_target_fingerprint }}
 
 jobs:
   smoke:
@@ -26,13 +69,28 @@ jobs:
     environment: rustfs-protocol-test
     timeout-minutes: 20
     env:
-      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
-      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
+      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ inputs.rustfs_endpoint || github.event.client_payload.rustfs_endpoint || secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
+      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ inputs.rustfs_target_fingerprint || github.event.client_payload.rustfs_target_fingerprint || secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
       RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
       RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Validate target override and record provenance
+        run: |
+          if [[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" && -z "$RUSTFS_TARGET_FINGERPRINT_OVERRIDE" ]]; then
+            echo "rustfs_endpoint requires rustfs_target_fingerprint" >&2
+            exit 1
+          fi
+          mkdir -p target/protocol-tests
+          {
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "s3chaos_revision=${GITHUB_SHA}"
+            echo "rustfs_version=${RUSTFS_TARGET_VERSION}"
+            echo "rustfs_image_digest=${RUSTFS_TARGET_IMAGE_DIGEST}"
+            echo "endpoint_override=$([[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" ]] && echo yes || echo no)"
+          } > target/protocol-tests/target-provenance.env
+          { echo '```'; cat target/protocol-tests/target-provenance.env; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Restore smoke history
         uses: actions/cache/restore@v4
         with:
@@ -63,13 +121,27 @@ jobs:
     environment: rustfs-protocol-test
     timeout-minutes: 60
     env:
-      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
-      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
+      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ inputs.rustfs_endpoint || github.event.client_payload.rustfs_endpoint || secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
+      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ inputs.rustfs_target_fingerprint || github.event.client_payload.rustfs_target_fingerprint || secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
       RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
       RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Validate target override and record provenance
+        run: |
+          if [[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" && -z "$RUSTFS_TARGET_FINGERPRINT_OVERRIDE" ]]; then
+            echo "rustfs_endpoint requires rustfs_target_fingerprint" >&2
+            exit 1
+          fi
+          mkdir -p target/protocol-tests
+          {
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "s3chaos_revision=${GITHUB_SHA}"
+            echo "rustfs_version=${RUSTFS_TARGET_VERSION}"
+            echo "rustfs_image_digest=${RUSTFS_TARGET_IMAGE_DIGEST}"
+            echo "endpoint_override=$([[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" ]] && echo yes || echo no)"
+          } > target/protocol-tests/target-provenance.env
       - name: Restore full history
         uses: actions/cache/restore@v4
         with:
@@ -105,13 +177,19 @@ jobs:
     environment: rustfs-protocol-test
     timeout-minutes: 30
     env:
-      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
-      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
+      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ inputs.rustfs_endpoint || github.event.client_payload.rustfs_endpoint || secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
+      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ inputs.rustfs_target_fingerprint || github.event.client_payload.rustfs_target_fingerprint || secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
       RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
       RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Validate target override
+        run: |
+          if [[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" && -z "$RUSTFS_TARGET_FINGERPRINT_OVERRIDE" ]]; then
+            echo "rustfs_endpoint requires rustfs_target_fingerprint" >&2
+            exit 1
+          fi
       - name: Restore slow history
         uses: actions/cache/restore@v4
         with:
@@ -147,8 +225,8 @@ jobs:
     environment: rustfs-protocol-test
     timeout-minutes: 45
     env:
-      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
-      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
+      RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ inputs.rustfs_endpoint || github.event.client_payload.rustfs_endpoint || secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
+      RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ inputs.rustfs_target_fingerprint || github.event.client_payload.rustfs_target_fingerprint || secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
       RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
       RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
       RUSTFS_PROTOCOL_OIDC_ISSUER: ${{ secrets.RUSTFS_PROTOCOL_OIDC_ISSUER }}
@@ -161,6 +239,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Validate target override
+        run: |
+          if [[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" && -z "$RUSTFS_TARGET_FINGERPRINT_OVERRIDE" ]]; then
+            echo "rustfs_endpoint requires rustfs_target_fingerprint" >&2
+            exit 1
+          fi
       - name: Restore external history
         uses: actions/cache/restore@v4
         with:

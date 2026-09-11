@@ -301,7 +301,16 @@ fixtures.
   needed; fault suites are never executed by CI.
 - `.github/workflows/protocol-live.yml`: live RustFS suites (smoke gate,
   native regression, expiration regression, external OIDC regression) on a
-  self-hosted runner. Full live execution is manually dispatchable. Mint is
+  self-hosted runner. Pull requests run the smoke gate only. Full live
+  execution runs on `workflow_dispatch` (inputs `rustfs_image_digest`,
+  `rustfs_version`, and an optional `rustfs_endpoint` +
+  `rustfs_target_fingerprint` pair that redirects the run to a
+  per-candidate target) and on `repository_dispatch` with event type
+  `rustfs-release-candidate`, which the rustfs repository sends for every
+  release candidate with the same keys in `client_payload`, for example:
+  `gh api repos/rustfs/s3chaos/dispatches -f event_type=rustfs-release-candidate -f 'client_payload[rustfs_version]=1.0.0-rc.6' -f 'client_payload[rustfs_image_digest]=sha256:...'`.
+  The build provenance is written to the run summary and to
+  `target-provenance.env` inside every uploaded artifact. Mint is
   run by command on the independent Kubernetes test server; no Mint workflow
   or schedule is installed by this repository.
 
