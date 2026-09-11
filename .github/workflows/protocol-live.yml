@@ -9,12 +9,16 @@ name: RustFS protocol live gate
 #   mirror the workflow_dispatch inputs: rustfs_image_digest, rustfs_version, rustfs_endpoint,
 #   rustfs_target_fingerprint.
 #
-# Dispatch inputs are untrusted. The validate-inputs job constrains their character set and only
-# honors an endpoint override whose host is listed in the PROTOCOL_LIVE_ENDPOINT_ALLOWLIST
-# repository variable (comma-separated hosts; unset or empty refuses every override). The target
-# fingerprint alone cannot protect this: it is derived from the target's own server info, so
-# whoever controls the endpoint controls the fingerprint. An endpoint override must still come
-# with its fingerprint because the harness refuses destructive runs against an unpinned target.
+# Dispatch inputs are untrusted. The validate-inputs job constrains their character set, requires
+# a candidate identity (rustfs_version or rustfs_image_digest) for every dispatch so the
+# concurrency group never collapses two candidates onto the ref, and only honors an endpoint
+# override whose host[:port] is listed in the PROTOCOL_LIVE_ENDPOINT_ALLOWLIST repository
+# variable (comma-separated host or host:port entries, compared lowercased and exactly, so an
+# entry without a port accepts only an endpoint without an explicit port; unset or empty refuses
+# every override). The target fingerprint alone cannot protect this: it is derived from the
+# target's own server info, so whoever controls the endpoint controls the fingerprint. Endpoint
+# and fingerprint overrides are only accepted together: the harness refuses destructive runs
+# against an unpinned target, and a fingerprint without its endpoint can only fail at that pin.
 
 on:
   pull_request:
@@ -35,7 +39,7 @@ on:
         required: false
         type: string
       rustfs_endpoint:
-        description: "Endpoint of a per-candidate RustFS target; overrides the RUSTFS_PROTOCOL_TEST_ENDPOINT secret, requires rustfs_target_fingerprint, and its host must be in PROTOCOL_LIVE_ENDPOINT_ALLOWLIST"
+        description: "Endpoint of a per-candidate RustFS target; overrides the RUSTFS_PROTOCOL_TEST_ENDPOINT secret, requires rustfs_target_fingerprint, and its host[:port] must be in PROTOCOL_LIVE_ENDPOINT_ALLOWLIST"
         required: false
         type: string
       rustfs_target_fingerprint:
@@ -53,8 +57,10 @@ run-name: >-
 
 concurrency:
   # One group per candidate: GitHub keeps at most one pending run per group and cancels earlier
-  # pending ones, so candidates dispatched in quick succession must not share a group. Runs that
-  # target the shared dedicated server still serialize on the single self-hosted runner.
+  # pending ones, so candidates dispatched in quick succession must not share a group; validate-
+  # inputs refuses dispatches without an identity. Pull request and push runs fall back to the
+  # ref. Runs that target the shared dedicated server still serialize on the single self-hosted
+  # runner.
   group: protocol-live-${{ inputs.rustfs_version || github.event.client_payload.rustfs_version || inputs.rustfs_image_digest || github.event.client_payload.rustfs_image_digest || github.ref }}
   cancel-in-progress: false
 
@@ -88,6 +94,15 @@ jobs:
               exit 1
             fi
           done
+          if [[ "$GITHUB_EVENT_NAME" == repository_dispatch || "$GITHUB_EVENT_NAME" == workflow_dispatch ]] \
+            && [[ -z "$RUSTFS_TARGET_VERSION" && -z "$RUSTFS_TARGET_IMAGE_DIGEST" ]]; then
+            echo "a dispatch must identify its candidate with rustfs_version or rustfs_image_digest; without one the concurrency group falls back to the ref and a later dispatch would cancel this one" >&2
+            exit 1
+          fi
+          if [[ -z "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" && -n "$RUSTFS_TARGET_FINGERPRINT_OVERRIDE" ]]; then
+            echo "rustfs_target_fingerprint override requires rustfs_endpoint override; alone it can only fail the runtime fingerprint pin" >&2
+            exit 1
+          fi
           decision=none
           host=""
           if [[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" ]]; then
@@ -95,6 +110,8 @@ jobs:
               echo "rustfs_endpoint requires rustfs_target_fingerprint" >&2
               exit 1
             fi
+            # host[:port] exactly as the endpoint names it, lowercased; an allowlist entry
+            # without a port therefore only matches an endpoint without an explicit port.
             host=$(python3 - "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" <<'PY'
           import sys
           from urllib.parse import urlsplit
@@ -110,19 +127,19 @@ jobs:
               or url.fragment
           ):
               sys.exit("rustfs_endpoint must be an http(s) origin without credentials, path, query, or fragment")
-          print(url.hostname)
+          print(url.netloc.lower())
           PY
             )
             allowed=no
             IFS=',' read -ra allowlist <<< "$PROTOCOL_LIVE_ENDPOINT_ALLOWLIST"
             for entry in "${allowlist[@]}"; do
-              entry="${entry// /}"
+              entry=$(printf '%s' "${entry//[[:space:]]/}" | tr '[:upper:]' '[:lower:]')
               if [[ -n "$entry" && "$entry" == "$host" ]]; then
                 allowed=yes
               fi
             done
             if [[ "$allowed" != yes ]]; then
-              echo "rustfs_endpoint host $host is not in PROTOCOL_LIVE_ENDPOINT_ALLOWLIST; overrides are refused" >&2
+              echo "rustfs_endpoint host $host is not in PROTOCOL_LIVE_ENDPOINT_ALLOWLIST (host or host:port entries); overrides are refused" >&2
               exit 1
             fi
             decision=allowlisted
