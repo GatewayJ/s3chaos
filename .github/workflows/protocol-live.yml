@@ -9,9 +9,12 @@ name: RustFS protocol live gate
 #   mirror the workflow_dispatch inputs: rustfs_image_digest, rustfs_version, rustfs_endpoint,
 #   rustfs_target_fingerprint.
 #
-# An endpoint override is only accepted together with a fingerprint override: the harness refuses
-# destructive runs unless the pinned target fingerprint matches the server it reaches, and the
-# stored fingerprint secret only pins the shared dedicated target.
+# Dispatch inputs are untrusted. The validate-inputs job constrains their character set and only
+# honors an endpoint override whose host is listed in the PROTOCOL_LIVE_ENDPOINT_ALLOWLIST
+# repository variable (comma-separated hosts; unset or empty refuses every override). The target
+# fingerprint alone cannot protect this: it is derived from the target's own server info, so
+# whoever controls the endpoint controls the fingerprint. An endpoint override must still come
+# with its fingerprint because the harness refuses destructive runs against an unpinned target.
 
 on:
   pull_request:
@@ -32,7 +35,7 @@ on:
         required: false
         type: string
       rustfs_endpoint:
-        description: "Endpoint of a per-candidate RustFS target; overrides the RUSTFS_PROTOCOL_TEST_ENDPOINT secret and requires rustfs_target_fingerprint"
+        description: "Endpoint of a per-candidate RustFS target; overrides the RUSTFS_PROTOCOL_TEST_ENDPOINT secret, requires rustfs_target_fingerprint, and its host must be in PROTOCOL_LIVE_ENDPOINT_ALLOWLIST"
         required: false
         type: string
       rustfs_target_fingerprint:
@@ -49,7 +52,10 @@ run-name: >-
       || 'RustFS protocol live gate' }}
 
 concurrency:
-  group: protocol-live-${{ github.ref }}
+  # One group per candidate: GitHub keeps at most one pending run per group and cancels earlier
+  # pending ones, so candidates dispatched in quick succession must not share a group. Runs that
+  # target the shared dedicated server still serialize on the single self-hosted runner.
+  group: protocol-live-${{ inputs.rustfs_version || github.event.client_payload.rustfs_version || inputs.rustfs_image_digest || github.event.client_payload.rustfs_image_digest || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -62,8 +68,80 @@ env:
   RUSTFS_TARGET_FINGERPRINT_OVERRIDE: ${{ inputs.rustfs_target_fingerprint || github.event.client_payload.rustfs_target_fingerprint }}
 
 jobs:
+  validate-inputs:
+    name: Validate dispatch inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      endpoint_override_host: ${{ steps.validate.outputs.endpoint_override_host }}
+      endpoint_override_decision: ${{ steps.validate.outputs.endpoint_override_decision }}
+    env:
+      PROTOCOL_LIVE_ENDPOINT_ALLOWLIST: ${{ vars.PROTOCOL_LIVE_ENDPOINT_ALLOWLIST }}
+    steps:
+      - name: Validate dispatch inputs
+        id: validate
+        run: |
+          pattern='^[A-Za-z0-9._:+-]{0,128}$'
+          for name in RUSTFS_TARGET_IMAGE_DIGEST RUSTFS_TARGET_VERSION RUSTFS_TARGET_FINGERPRINT_OVERRIDE; do
+            if ! [[ "${!name}" =~ $pattern ]]; then
+              echo "$name must match $pattern" >&2
+              exit 1
+            fi
+          done
+          decision=none
+          host=""
+          if [[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" ]]; then
+            if [[ -z "$RUSTFS_TARGET_FINGERPRINT_OVERRIDE" ]]; then
+              echo "rustfs_endpoint requires rustfs_target_fingerprint" >&2
+              exit 1
+            fi
+            host=$(python3 - "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" <<'PY'
+          import sys
+          from urllib.parse import urlsplit
+
+          url = urlsplit(sys.argv[1])
+          if (
+              url.scheme not in ("http", "https")
+              or not url.hostname
+              or url.username
+              or url.password
+              or url.path not in ("", "/")
+              or url.query
+              or url.fragment
+          ):
+              sys.exit("rustfs_endpoint must be an http(s) origin without credentials, path, query, or fragment")
+          print(url.hostname)
+          PY
+            )
+            allowed=no
+            IFS=',' read -ra allowlist <<< "$PROTOCOL_LIVE_ENDPOINT_ALLOWLIST"
+            for entry in "${allowlist[@]}"; do
+              entry="${entry// /}"
+              if [[ -n "$entry" && "$entry" == "$host" ]]; then
+                allowed=yes
+              fi
+            done
+            if [[ "$allowed" != yes ]]; then
+              echo "rustfs_endpoint host $host is not in PROTOCOL_LIVE_ENDPOINT_ALLOWLIST; overrides are refused" >&2
+              exit 1
+            fi
+            decision=allowlisted
+          fi
+          {
+            echo "endpoint_override_host=$host"
+            echo "endpoint_override_decision=$decision"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "event=$GITHUB_EVENT_NAME"
+            echo "rustfs_version=$RUSTFS_TARGET_VERSION"
+            echo "rustfs_image_digest=$RUSTFS_TARGET_IMAGE_DIGEST"
+            echo "endpoint_override_host=$host"
+            echo "endpoint_override_decision=$decision"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   smoke:
     name: Native smoke gate
+    needs: validate-inputs
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: sm-standard-4
     environment: rustfs-protocol-test
@@ -73,24 +151,18 @@ jobs:
       RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ inputs.rustfs_target_fingerprint || github.event.client_payload.rustfs_target_fingerprint || secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
       RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
       RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
+      RUSTFS_TARGET_ENDPOINT_OVERRIDE_HOST: ${{ needs.validate-inputs.outputs.endpoint_override_host }}
+      RUSTFS_TARGET_ENDPOINT_OVERRIDE_DECISION: ${{ needs.validate-inputs.outputs.endpoint_override_decision }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Validate target override and record provenance
+      - name: Record target provenance
         run: |
-          if [[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" && -z "$RUSTFS_TARGET_FINGERPRINT_OVERRIDE" ]]; then
-            echo "rustfs_endpoint requires rustfs_target_fingerprint" >&2
-            exit 1
-          fi
           mkdir -p target/protocol-tests
-          {
-            echo "event=${GITHUB_EVENT_NAME}"
-            echo "s3chaos_revision=${GITHUB_SHA}"
-            echo "rustfs_version=${RUSTFS_TARGET_VERSION}"
-            echo "rustfs_image_digest=${RUSTFS_TARGET_IMAGE_DIGEST}"
-            echo "endpoint_override=$([[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" ]] && echo yes || echo no)"
-          } > target/protocol-tests/target-provenance.env
-          { echo '```'; cat target/protocol-tests/target-provenance.env; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          printf 'event=%s\ns3chaos_revision=%s\nrustfs_version=%s\nrustfs_image_digest=%s\nendpoint_override_host=%s\nendpoint_override_decision=%s\n' \
+            "$GITHUB_EVENT_NAME" "$GITHUB_SHA" "$RUSTFS_TARGET_VERSION" "$RUSTFS_TARGET_IMAGE_DIGEST" \
+            "$RUSTFS_TARGET_ENDPOINT_OVERRIDE_HOST" "$RUSTFS_TARGET_ENDPOINT_OVERRIDE_DECISION" \
+            > target/protocol-tests/target-provenance.env
       - name: Restore smoke history
         uses: actions/cache/restore@v4
         with:
@@ -115,7 +187,7 @@ jobs:
 
   native-regression:
     name: Native full regression
-    needs: smoke
+    needs: [validate-inputs, smoke]
     if: github.event_name != 'pull_request'
     runs-on: sm-standard-4
     environment: rustfs-protocol-test
@@ -125,23 +197,18 @@ jobs:
       RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ inputs.rustfs_target_fingerprint || github.event.client_payload.rustfs_target_fingerprint || secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
       RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
       RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
+      RUSTFS_TARGET_ENDPOINT_OVERRIDE_HOST: ${{ needs.validate-inputs.outputs.endpoint_override_host }}
+      RUSTFS_TARGET_ENDPOINT_OVERRIDE_DECISION: ${{ needs.validate-inputs.outputs.endpoint_override_decision }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Validate target override and record provenance
+      - name: Record target provenance
         run: |
-          if [[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" && -z "$RUSTFS_TARGET_FINGERPRINT_OVERRIDE" ]]; then
-            echo "rustfs_endpoint requires rustfs_target_fingerprint" >&2
-            exit 1
-          fi
           mkdir -p target/protocol-tests
-          {
-            echo "event=${GITHUB_EVENT_NAME}"
-            echo "s3chaos_revision=${GITHUB_SHA}"
-            echo "rustfs_version=${RUSTFS_TARGET_VERSION}"
-            echo "rustfs_image_digest=${RUSTFS_TARGET_IMAGE_DIGEST}"
-            echo "endpoint_override=$([[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" ]] && echo yes || echo no)"
-          } > target/protocol-tests/target-provenance.env
+          printf 'event=%s\ns3chaos_revision=%s\nrustfs_version=%s\nrustfs_image_digest=%s\nendpoint_override_host=%s\nendpoint_override_decision=%s\n' \
+            "$GITHUB_EVENT_NAME" "$GITHUB_SHA" "$RUSTFS_TARGET_VERSION" "$RUSTFS_TARGET_IMAGE_DIGEST" \
+            "$RUSTFS_TARGET_ENDPOINT_OVERRIDE_HOST" "$RUSTFS_TARGET_ENDPOINT_OVERRIDE_DECISION" \
+            > target/protocol-tests/target-provenance.env
       - name: Restore full history
         uses: actions/cache/restore@v4
         with:
@@ -171,8 +238,8 @@ jobs:
 
   expiration-regression:
     name: STS expiration regression
-    needs: native-regression
-    if: ${{ github.event_name != 'pull_request' && always() }}
+    needs: [validate-inputs, native-regression]
+    if: ${{ github.event_name != 'pull_request' && always() && needs.validate-inputs.result == 'success' }}
     runs-on: sm-standard-4
     environment: rustfs-protocol-test
     timeout-minutes: 30
@@ -181,15 +248,18 @@ jobs:
       RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ inputs.rustfs_target_fingerprint || github.event.client_payload.rustfs_target_fingerprint || secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
       RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
       RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
+      RUSTFS_TARGET_ENDPOINT_OVERRIDE_HOST: ${{ needs.validate-inputs.outputs.endpoint_override_host }}
+      RUSTFS_TARGET_ENDPOINT_OVERRIDE_DECISION: ${{ needs.validate-inputs.outputs.endpoint_override_decision }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Validate target override
+      - name: Record target provenance
         run: |
-          if [[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" && -z "$RUSTFS_TARGET_FINGERPRINT_OVERRIDE" ]]; then
-            echo "rustfs_endpoint requires rustfs_target_fingerprint" >&2
-            exit 1
-          fi
+          mkdir -p target/protocol-tests
+          printf 'event=%s\ns3chaos_revision=%s\nrustfs_version=%s\nrustfs_image_digest=%s\nendpoint_override_host=%s\nendpoint_override_decision=%s\n' \
+            "$GITHUB_EVENT_NAME" "$GITHUB_SHA" "$RUSTFS_TARGET_VERSION" "$RUSTFS_TARGET_IMAGE_DIGEST" \
+            "$RUSTFS_TARGET_ENDPOINT_OVERRIDE_HOST" "$RUSTFS_TARGET_ENDPOINT_OVERRIDE_DECISION" \
+            > target/protocol-tests/target-provenance.env
       - name: Restore slow history
         uses: actions/cache/restore@v4
         with:
@@ -219,8 +289,8 @@ jobs:
 
   external-regression:
     name: External identity profile
-    needs: native-regression
-    if: ${{ github.event_name != 'pull_request' && always() }}
+    needs: [validate-inputs, native-regression]
+    if: ${{ github.event_name != 'pull_request' && always() && needs.validate-inputs.result == 'success' }}
     runs-on: sm-standard-4
     environment: rustfs-protocol-test
     timeout-minutes: 45
@@ -229,6 +299,8 @@ jobs:
       RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT: ${{ inputs.rustfs_target_fingerprint || github.event.client_payload.rustfs_target_fingerprint || secrets.RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT }}
       RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY }}
       RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY: ${{ secrets.RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY }}
+      RUSTFS_TARGET_ENDPOINT_OVERRIDE_HOST: ${{ needs.validate-inputs.outputs.endpoint_override_host }}
+      RUSTFS_TARGET_ENDPOINT_OVERRIDE_DECISION: ${{ needs.validate-inputs.outputs.endpoint_override_decision }}
       RUSTFS_PROTOCOL_OIDC_ISSUER: ${{ secrets.RUSTFS_PROTOCOL_OIDC_ISSUER }}
       RUSTFS_PROTOCOL_OIDC_ADMIN_URL: ${{ secrets.RUSTFS_PROTOCOL_OIDC_ADMIN_URL }}
       RUSTFS_PROTOCOL_OIDC_REALM: ${{ secrets.RUSTFS_PROTOCOL_OIDC_REALM }}
@@ -239,12 +311,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Validate target override
+      - name: Record target provenance
         run: |
-          if [[ -n "$RUSTFS_TARGET_ENDPOINT_OVERRIDE" && -z "$RUSTFS_TARGET_FINGERPRINT_OVERRIDE" ]]; then
-            echo "rustfs_endpoint requires rustfs_target_fingerprint" >&2
-            exit 1
-          fi
+          mkdir -p target/protocol-tests
+          printf 'event=%s\ns3chaos_revision=%s\nrustfs_version=%s\nrustfs_image_digest=%s\nendpoint_override_host=%s\nendpoint_override_decision=%s\n' \
+            "$GITHUB_EVENT_NAME" "$GITHUB_SHA" "$RUSTFS_TARGET_VERSION" "$RUSTFS_TARGET_IMAGE_DIGEST" \
+            "$RUSTFS_TARGET_ENDPOINT_OVERRIDE_HOST" "$RUSTFS_TARGET_ENDPOINT_OVERRIDE_DECISION" \
+            > target/protocol-tests/target-provenance.env
       - name: Restore external history
         uses: actions/cache/restore@v4
         with:

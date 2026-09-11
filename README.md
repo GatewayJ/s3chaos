@@ -311,8 +311,15 @@ fixtures.
   `rustfs-release-candidate`, which the rustfs repository sends for every
   release candidate with the same keys in `client_payload`, for example:
   `gh api repos/rustfs/s3chaos/dispatches -f event_type=rustfs-release-candidate -f 'client_payload[rustfs_version]=1.0.0-rc.6' -f 'client_payload[rustfs_image_digest]=sha256:...'`.
-  The build provenance is written to the run summary and to
-  `target-provenance.env` inside every uploaded artifact. Mint is
+  A `validate-inputs` job gates every live job: dispatch values are
+  character-restricted, and an endpoint override is honored only when its
+  host is listed in the `PROTOCOL_LIVE_ENDPOINT_ALLOWLIST` repository
+  variable (comma-separated hosts; unset refuses all overrides). Build
+  provenance, the override host, and the allowlist decision are written to
+  the run summary and to `target-provenance.env` inside every uploaded
+  artifact; flake history under `.history/` is keyed by profile and target
+  fingerprint so a redirected run never pollutes the shared target's
+  signals. Mint is
   run by command on the independent Kubernetes test server; no Mint workflow
   or schedule is installed by this repository.
 
