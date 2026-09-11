@@ -35,6 +35,9 @@ use crate::fault::{
         NetworkPartitionEvidenceContract, VolumeTargetEvidenceContract, iochaos_record_pod_id,
         validate_fixed_volume_snapshot, validate_network_partition_snapshot,
     },
+    backends::lifecycle::evidence::{
+        LifecycleRunContext, POD_LIFECYCLE_EVIDENCE_ARTIFACT, PodLifecycleEvidence,
+    },
     checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
     config::{
         DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, DEFAULT_RUSTFS_POD_COUNT,
@@ -929,6 +932,16 @@ fn validate_fault_artifacts_with_identity(
         &json_spec.metadata.bucket,
         post_recovery_object_count(workload_plan.object_count),
     )?;
+    if scenario_spec.backend == scenarios::FaultBackend::KubernetesLifecycle {
+        validate_pod_lifecycle_artifact(
+            &artifacts,
+            &metadata,
+            identity,
+            &evidence,
+            &json_spec,
+            scenario_spec.impact_policy.requires_availability(),
+        )?;
+    }
 
     let ack_checker_expectation = if let Some(expected_mutation) = ack_mutation {
         Some(validate_ack_triggered_dm_artifacts(
@@ -1511,6 +1524,56 @@ fn validate_target_proof(
                 );
             }
         }
+    }
+    for (proof_fault, spec_fault) in proof.faults.iter().zip(&spec.faults) {
+        let lifecycle = spec_fault.backend == scenarios::FaultBackend::KubernetesLifecycle.as_str();
+        ensure!(
+            proof_fault.statefulset.is_some() == lifecycle,
+            "target-proof.json fault {} StatefulSet evidence does not match its backend",
+            spec_fault.name
+        );
+        let Some(statefulset) = &proof_fault.statefulset else {
+            continue;
+        };
+        ensure!(
+            !statefulset.uid.trim().is_empty()
+                && !statefulset.name.trim().is_empty()
+                && statefulset.namespace == spec.cluster.namespace,
+            "target-proof.json fault {} StatefulSet identity is incomplete",
+            spec_fault.name
+        );
+        ensure!(
+            usize::try_from(statefulset.replicas).ok() == Some(options.expected_rustfs_pod_count)
+                && statefulset.owned_pods.len() == options.expected_rustfs_pod_count,
+            "target-proof.json fault {} StatefulSet replicas {} / owned Pods {} do not match the expected {} RustFS Pods",
+            spec_fault.name,
+            statefulset.replicas,
+            statefulset.owned_pods.len(),
+            options.expected_rustfs_pod_count
+        );
+        let owned = statefulset
+            .owned_pods
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str()))
+            .collect::<BTreeSet<_>>();
+        let resolved = proof
+            .resolved_pods
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str()))
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            owned == resolved && owned.len() == statefulset.owned_pods.len(),
+            "target-proof.json fault {} StatefulSet-owned Pods do not match resolved_pods",
+            spec_fault.name
+        );
+        ensure!(
+            proof.requirements.iter().any(|requirement| {
+                requirement.name == crate::fault::preflight::STATEFULSET_OWNERSHIP_REQUIREMENT
+                    && requirement.status == PreflightStatus::Passed
+            }),
+            "target-proof.json fault {} lacks the passed StatefulSet ownership requirement",
+            spec_fault.name
+        );
     }
     if proof
         .faults
@@ -3358,6 +3421,117 @@ fn validate_availability_artifact(
         "{AVAILABILITY_REPORT_ARTIFACT} workload disruptions {disrupted} do not match fault-evidence.json client_disruptions {}",
         evidence.client_disruptions
     );
+    Ok(())
+}
+
+/// Lifecycle scenarios must prove which Pods were restarted, that every
+/// RustFS container left cleanly, and that the restart identities match the
+/// run's Pod evidence and fault window. The active snapshot must name the
+/// same under-workload targets so the availability endpoint pinning was
+/// computed from the Pods that actually restarted.
+fn validate_pod_lifecycle_artifact(
+    artifacts: &BTreeMap<String, PathBuf>,
+    metadata: &RunMetadataArtifact,
+    identity: ArtifactIdentityPolicy<'_>,
+    evidence: &FaultEvidenceArtifact,
+    spec: &FaultRunSpec,
+    requires_availability: bool,
+) -> Result<()> {
+    let report =
+        read_json::<PodLifecycleEvidence>(required(artifacts, POD_LIFECYCLE_EVIDENCE_ARTIFACT)?)?;
+    validate_optional_identity_fields(
+        POD_LIFECYCLE_EVIDENCE_ARTIFACT,
+        Some(report.scenario.as_str()),
+        Some(report.run_id.as_str()),
+        metadata,
+        identity,
+    )?;
+    let kind_name = &spec
+        .faults
+        .first()
+        .context("lifecycle run-spec has no fault")?
+        .kind;
+    let kind = [
+        FaultKind::RustfsServerPodGracefulRestart,
+        FaultKind::RustfsServerRollingRestart,
+        FaultKind::RustfsServerColdRestart,
+    ]
+    .into_iter()
+    .find(|kind| kind.as_str() == kind_name)
+    .with_context(|| format!("run-spec fault kind {kind_name:?} is not a lifecycle operation"))?;
+    let served_by_pod = if requires_availability {
+        read_json::<AvailabilityReport>(required(artifacts, AVAILABILITY_REPORT_ARTIFACT)?)?
+            .served_by_pod
+    } else {
+        None
+    };
+    let pods_before = evidence
+        .pods_before
+        .iter()
+        .map(|pod| (pod.name.clone(), pod.uid.clone()))
+        .collect::<Vec<_>>();
+    let pods_after = evidence
+        .pods_after
+        .iter()
+        .map(|pod| (pod.name.clone(), pod.uid.clone()))
+        .collect::<Vec<_>>();
+    report.validate_against_run(&LifecycleRunContext {
+        kind,
+        pods_before: &pods_before,
+        pods_after: &pods_after,
+        fault_apply_started_at_ms: evidence
+            .fault_apply_started_at_ms
+            .context("fault-evidence.json fault_apply_started_at_ms is required")?,
+        fault_active_at_ms: evidence
+            .fault_active_at_ms
+            .context("fault-evidence.json fault_active_at_ms is required")?,
+        workload_started_at_ms: evidence
+            .workload_started_at_ms
+            .context("fault-evidence.json workload_started_at_ms is required")?,
+        workload_ended_at_ms: evidence
+            .workload_ended_at_ms
+            .context("fault-evidence.json workload_ended_at_ms is required")?,
+        recovery_ended_at_ms: evidence
+            .recovery_ended_at_ms
+            .context("fault-evidence.json recovery_ended_at_ms is required")?,
+        served_by_pod: served_by_pod.as_deref(),
+    })?;
+    let active_targets = evidence
+        .active_snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.pointer("/lifecycle_status/target_pods"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let under_workload = report
+        .targets
+        .iter()
+        .filter(|target| !target.restarted_after_workload)
+        .map(|target| target.pod_name.clone())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        active_targets == under_workload,
+        "fault-evidence.json active snapshot lifecycle targets {active_targets:?} do not match {POD_LIFECYCLE_EVIDENCE_ARTIFACT} under-workload targets {under_workload:?}"
+    );
+    if kind == FaultKind::RustfsServerColdRestart {
+        let summary =
+            read_json::<WorkloadSummaryArtifact>(required(artifacts, "workload-summary.json")?)?;
+        for (family, counts) in [
+            ("puts", &summary.puts),
+            ("gets", &summary.gets),
+            ("deletes", &summary.deletes),
+            ("lists", &summary.lists),
+            ("multipart_completes", &summary.multipart_completes),
+            ("multipart_aborts", &summary.multipart_aborts),
+        ] {
+            ensure!(
+                counts.ok == 0 && counts.not_found == 0,
+                "workload-summary.json {family} recorded successes while the cold-restart outage should have been total"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -5692,7 +5866,10 @@ impl OutcomeCountsArtifact {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactIdentityPolicy, RunMetadataArtifact, validate_availability_artifact};
+    use super::{
+        ArtifactIdentityPolicy, POD_LIFECYCLE_EVIDENCE_ARTIFACT, RunMetadataArtifact,
+        validate_availability_artifact, validate_pod_lifecycle_artifact,
+    };
     use super::{
         ArtifactValidationOptions, FailureSummary, FaultEvidenceArtifact, OutcomeCountsArtifact,
         RecommitCandidateManifestArtifact, RecommitReportArtifact, WorkloadSummaryArtifact,
@@ -13365,6 +13542,558 @@ mod tests {
         );
         assert!(!plain.iter().any(|name| name == "availability-report.json"));
         assert!(!ack.iter().any(|name| name == "availability-report.json"));
+    }
+
+    fn lifecycle_run_spec(
+        scenario_name: &str,
+    ) -> (FaultTestConfig, crate::fault::spec::FaultRunSpec) {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = scenario_name.to_string();
+        config.workload = crate::fault::config::FaultWorkloadProfile::new(12, 4).expect("workload");
+        let scenario =
+            crate::fault::scenarios::FaultScenario::from_config(&config).expect("scenario");
+        let spec = crate::fault::scenarios::scenario_spec(scenario_name).expect("spec");
+        let plan = FaultPlan::from_scenario_with_options(
+            &scenario,
+            spec,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("plan");
+        let workload_plan = crate::fault::workload::WorkloadPlan::seeded(42, 12, 4);
+        let run_spec = crate::fault::spec::FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            spec,
+            &plan,
+            &workload_plan,
+            "run-lifecycle",
+            "bucket",
+        );
+        (config, run_spec)
+    }
+
+    fn lifecycle_options(root: &std::path::Path, scenario: &str) -> ArtifactValidationOptions {
+        ArtifactValidationOptions {
+            scenario: scenario.to_string(),
+            ..success_options(root)
+        }
+    }
+
+    fn statefulset_proof(pods: &[(&str, &str)]) -> crate::fault::preflight::TargetStatefulSetProof {
+        crate::fault::preflight::TargetStatefulSetProof {
+            name: "fault-test-tenant-primary".to_string(),
+            uid: "sts-uid".to_string(),
+            namespace: "rustfs-fault-test".to_string(),
+            replicas: u32::try_from(pods.len()).expect("replicas"),
+            pod_management_policy: Some("Parallel".to_string()),
+            update_strategy: Some("RollingUpdate".to_string()),
+            pvc_retention_when_scaled: Some("Retain".to_string()),
+            pvc_retention_when_deleted: Some("Retain".to_string()),
+            termination_grace_period_seconds: 30,
+            current_revision: Some("rev".to_string()),
+            update_revision: Some("rev".to_string()),
+            owned_pods: pods
+                .iter()
+                .enumerate()
+                .map(
+                    |(ordinal, (name, uid))| crate::fault::preflight::TargetStatefulSetPodProof {
+                        name: (*name).to_string(),
+                        uid: (*uid).to_string(),
+                        ordinal: u32::try_from(ordinal).expect("ordinal"),
+                        restart_count: 0,
+                    },
+                )
+                .collect(),
+            observed_at_ms: 5,
+        }
+    }
+
+    #[test]
+    fn lifecycle_target_proof_requires_the_live_statefulset_ownership_proof() {
+        let (config, run_spec) = lifecycle_run_spec("pod-graceful-restart-one");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let options = lifecycle_options(dir.path(), "pod-graceful-restart-one");
+        let scenario =
+            crate::fault::scenarios::FaultScenario::from_config(&config).expect("scenario");
+        let spec =
+            crate::fault::scenarios::scenario_spec("pod-graceful-restart-one").expect("spec");
+        let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan");
+        let pods: Vec<(&str, &str)> = vec![
+            ("fault-test-tenant-primary-0", "u0"),
+            ("fault-test-tenant-primary-1", "u1"),
+            ("fault-test-tenant-primary-2", "u2"),
+            ("fault-test-tenant-primary-3", "u3"),
+        ];
+        let resolved = pods.iter().map(|(name, uid)| {
+            TargetResolvedPodProof::new(*name, *uid)
+                .with_node("node-a")
+                .with_ready(true)
+        });
+        let pending = crate::fault::preflight::TargetProof::from_plan(
+            &config,
+            &scenario,
+            spec,
+            &plan,
+            "run-lifecycle",
+        )
+        .with_resolved_pod_proofs(resolved);
+        assert_eq!(
+            pending.status,
+            crate::fault::preflight::TargetProofStatus::Missing,
+            "ownership is pending until the live observation binds it"
+        );
+        assert!(validate_target_proof(&pending, &run_spec, &options).is_err());
+
+        let proven = pending
+            .clone()
+            .with_statefulset_proven(statefulset_proof(&pods))
+            .expect("bound");
+        assert_eq!(
+            proven.status,
+            crate::fault::preflight::TargetProofStatus::Satisfied
+        );
+        validate_target_proof(&proven, &run_spec, &options).expect("lifecycle target proof");
+
+        // A StatefulSet that does not own the resolved Pods cannot bind.
+        let mut foreign = pods.clone();
+        foreign[3] = ("fault-test-tenant-primary-3", "other");
+        assert!(
+            pending
+                .clone()
+                .with_statefulset_proven(statefulset_proof(&foreign))
+                .is_err()
+        );
+        assert!(
+            pending
+                .clone()
+                .with_statefulset_proven(statefulset_proof(&pods[..3]))
+                .is_err()
+        );
+
+        // Hand-edited evidence: a passed requirement without the proof, or a
+        // replica count that disagrees with the expected Pod count.
+        let mut forged = pending.clone();
+        for requirement in &mut forged.requirements {
+            requirement.status = crate::fault::preflight::PreflightStatus::Passed;
+        }
+        forged.status = crate::fault::preflight::TargetProofStatus::Satisfied;
+        let error =
+            validate_target_proof(&forged, &run_spec, &options).expect_err("no StatefulSet proof");
+        assert!(
+            error.to_string().contains("StatefulSet evidence"),
+            "{error:#}"
+        );
+        let mut short = proven.clone();
+        short.faults[0].statefulset.as_mut().unwrap().replicas = 3;
+        assert!(validate_target_proof(&short, &run_spec, &options).is_err());
+    }
+
+    fn lifecycle_evidence_json(
+        run_id: &str,
+        scenario: &str,
+        operation: &str,
+        targets: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        json!({
+            "scenario": scenario,
+            "runId": run_id,
+            "operation": operation,
+            "statefulset": {
+                "name": "fault-test-tenant-primary",
+                "uid": "sts-uid",
+                "namespace": "rustfs-fault-test",
+                "replicas": 4,
+                "podManagementPolicy": "Parallel",
+                "pvcRetentionWhenScaled": "Retain",
+                "terminationGracePeriodSeconds": 30
+            },
+            "statefulsetUidAfter": "sts-uid",
+            "targets": targets,
+            "startedAtMs": 10,
+            "completedAtMs": 60_000,
+            "violations": [],
+            "passed": true
+        })
+    }
+
+    fn lifecycle_target_json(
+        name: &str,
+        ordinal: u32,
+        old_uid: &str,
+        new_uid: &str,
+        deferred: bool,
+    ) -> serde_json::Value {
+        let sigterm =
+            crate::fault::backends::lifecycle::evidence::parse_rfc3339_ms("2026-09-11T10:05:00Z")
+                .unwrap();
+        let delete_requested = if deferred { 40_500 } else { 11 };
+        json!({
+            "podName": name,
+            "ordinal": ordinal,
+            "oldUid": old_uid,
+            "restartCountBefore": 0,
+            "terminationGracePeriodSeconds": 30,
+            "deleteRequestedAtMs": delete_requested,
+            "deletionTimestamp": "2026-09-11T10:05:30Z",
+            "deletionGracePeriodSeconds": 30,
+            "sigtermRequestedAtMs": sigterm,
+            "terminated": {"exitCode": 0, "reason": "Completed", "finishedAt": "2026-09-11T10:05:06Z"},
+            "observationSource": "watch",
+            "terminationDurationMs": 6_000,
+            "oldUidGoneAtMs": delete_requested + 100,
+            "newUid": new_uid,
+            "restartCountAfter": 0,
+            "replacementReadyAtMs": delete_requested + 5_000,
+            "classification": "graceful_exit",
+            "restartedAfterWorkload": deferred
+        })
+    }
+
+    fn lifecycle_fault_evidence(
+        run_id: &str,
+        scenario: &str,
+        target_pods: &[&str],
+        before: &[(&str, &str)],
+        after: &[(&str, &str)],
+    ) -> FaultEvidenceArtifact {
+        let identities = |pods: &[(&str, &str)]| {
+            pods.iter()
+                .map(|(name, uid)| json!({"name": name, "uid": uid}))
+                .collect::<Vec<_>>()
+        };
+        serde_json::from_value(json!({
+            "scenario": scenario,
+            "run_id": run_id,
+            "injected": true,
+            "active_during_workload": true,
+            "recovered": true,
+            "require_client_disruption": false,
+            "client_disruptions": 0,
+            "pods_before": identities(before),
+            "pods_after": identities(after),
+            "active_snapshots": [{"stage": "active", "lifecycle_status": {"target_pods": target_pods}}],
+            "workload_snapshots": [{"stage": "after-workload"}],
+            "fault_apply_started_at_ms": 10,
+            "fault_active_at_ms": 20,
+            "workload_started_at_ms": 30,
+            "workload_ended_at_ms": 40_000,
+            "fault_delete_started_at_ms": 40_100,
+            "recovery_started_at_ms": 40_200,
+            "recovery_ended_at_ms": 50_000
+        }))
+        .expect("evidence")
+    }
+
+    #[test]
+    fn lifecycle_artifact_validation_binds_targets_to_the_run_and_fails_closed() {
+        let run_id = "run-lifecycle";
+        let scenario = "rolling-restart-all";
+        let (_, run_spec) = lifecycle_run_spec(scenario);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let metadata = RunMetadataArtifact {
+            scenario: scenario.to_string(),
+            run_id: run_id.to_string(),
+            context: "real-cluster".to_string(),
+            storage_class: "fast-csi".to_string(),
+            rustfs_image: "rustfs:test".to_string(),
+            workload_objects: 12,
+            workload_concurrency: 4,
+            require_client_disruption: false,
+            recovery_stability_reread_seconds: 60,
+            min_availability_percent: Some(99),
+        };
+        let before = [
+            ("p-0", "old-0"),
+            ("p-1", "old-1"),
+            ("p-2", "old-2"),
+            ("p-3", "old-3"),
+        ];
+        let after = [
+            ("p-0", "new-0"),
+            ("p-1", "new-1"),
+            ("p-2", "new-2"),
+            ("p-3", "new-3"),
+        ];
+        let report = lifecycle_evidence_json(
+            run_id,
+            scenario,
+            "rolling-restart",
+            vec![
+                lifecycle_target_json("p-3", 3, "old-3", "new-3", false),
+                lifecycle_target_json("p-2", 2, "old-2", "new-2", false),
+                lifecycle_target_json("p-1", 1, "old-1", "new-1", false),
+                lifecycle_target_json("p-0", 0, "old-0", "new-0", true),
+            ],
+        );
+        let availability = json!({
+            "scenario": scenario,
+            "run_id": run_id,
+            "min_success_percent": 99,
+            "served_by_pod": "p-0",
+            "read_probe": {"objects": 6, "verified": 6, "failures": []},
+            "workload": [],
+            "violations": [],
+            "passed": true
+        });
+        let write = |report: &serde_json::Value, availability: &serde_json::Value| {
+            write_json(dir.path(), POD_LIFECYCLE_EVIDENCE_ARTIFACT, report);
+            write_json(dir.path(), AVAILABILITY_REPORT_ARTIFACT, availability);
+            BTreeMap::from([
+                (
+                    POD_LIFECYCLE_EVIDENCE_ARTIFACT.to_string(),
+                    dir.path().join(POD_LIFECYCLE_EVIDENCE_ARTIFACT),
+                ),
+                (
+                    AVAILABILITY_REPORT_ARTIFACT.to_string(),
+                    dir.path().join(AVAILABILITY_REPORT_ARTIFACT),
+                ),
+            ])
+        };
+        let evidence =
+            lifecycle_fault_evidence(run_id, scenario, &["p-3", "p-2", "p-1"], &before, &after);
+        validate_pod_lifecycle_artifact(
+            &write(&report, &availability),
+            &metadata,
+            ArtifactIdentityPolicy::LegacyCompatible,
+            &evidence,
+            &run_spec,
+            true,
+        )
+        .expect("consistent rolling restart evidence");
+
+        // The active snapshot must name exactly the under-workload targets.
+        let drifted = lifecycle_fault_evidence(run_id, scenario, &["p-3", "p-2"], &before, &after);
+        let error = validate_pod_lifecycle_artifact(
+            &write(&report, &availability),
+            &metadata,
+            ArtifactIdentityPolicy::LegacyCompatible,
+            &drifted,
+            &run_spec,
+            true,
+        )
+        .expect_err("snapshot target drift");
+        assert!(
+            error.to_string().contains("under-workload targets"),
+            "{error:#}"
+        );
+
+        // A Pod that was SIGKILLed at grace expiry cannot pass even with passed=true.
+        let mut killed = report.clone();
+        killed["targets"][0]["terminated"] =
+            json!({"exitCode": 137, "reason": "Error", "finishedAt": "2026-09-11T10:05:30Z"});
+        let error = validate_pod_lifecycle_artifact(
+            &write(&killed, &availability),
+            &metadata,
+            ArtifactIdentityPolicy::LegacyCompatible,
+            &evidence,
+            &run_spec,
+            true,
+        )
+        .expect_err("grace timeout");
+        assert!(error.to_string().contains("does not follow"), "{error:#}");
+
+        // The deferred Pod must be the one that served the availability endpoint.
+        let mut other_served = availability.clone();
+        other_served["served_by_pod"] = json!("p-1");
+        assert!(
+            validate_pod_lifecycle_artifact(
+                &write(&report, &other_served),
+                &metadata,
+                ArtifactIdentityPolicy::LegacyCompatible,
+                &evidence,
+                &run_spec,
+                true,
+            )
+            .is_err()
+        );
+
+        // Recovered Pod identities must match the recorded replacements.
+        let mut stale_after = after;
+        stale_after[2] = ("p-2", "old-2");
+        let stale = lifecycle_fault_evidence(
+            run_id,
+            scenario,
+            &["p-3", "p-2", "p-1"],
+            &before,
+            &stale_after,
+        );
+        assert!(
+            validate_pod_lifecycle_artifact(
+                &write(&report, &availability),
+                &metadata,
+                ArtifactIdentityPolicy::LegacyCompatible,
+                &stale,
+                &run_spec,
+                true,
+            )
+            .is_err()
+        );
+
+        // Missing artifact fails closed.
+        assert!(
+            validate_pod_lifecycle_artifact(
+                &BTreeMap::new(),
+                &metadata,
+                ArtifactIdentityPolicy::LegacyCompatible,
+                &evidence,
+                &run_spec,
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cold_restart_artifact_validation_rejects_any_served_operation() {
+        let run_id = "run-lifecycle";
+        let scenario = "cluster-cold-restart";
+        let (_, run_spec) = lifecycle_run_spec(scenario);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let metadata = RunMetadataArtifact {
+            scenario: scenario.to_string(),
+            run_id: run_id.to_string(),
+            context: "real-cluster".to_string(),
+            storage_class: "fast-csi".to_string(),
+            rustfs_image: "rustfs:test".to_string(),
+            workload_objects: 12,
+            workload_concurrency: 4,
+            require_client_disruption: true,
+            recovery_stability_reread_seconds: 60,
+            min_availability_percent: None,
+        };
+        let before = [
+            ("p-0", "old-0"),
+            ("p-1", "old-1"),
+            ("p-2", "old-2"),
+            ("p-3", "old-3"),
+        ];
+        let after = [
+            ("p-0", "new-0"),
+            ("p-1", "new-1"),
+            ("p-2", "new-2"),
+            ("p-3", "new-3"),
+        ];
+        let mut report = lifecycle_evidence_json(
+            run_id,
+            scenario,
+            "cold-restart",
+            (0..4)
+                .map(|ordinal| {
+                    let mut target = lifecycle_target_json(
+                        &format!("p-{ordinal}"),
+                        ordinal,
+                        &format!("old-{ordinal}"),
+                        &format!("new-{ordinal}"),
+                        false,
+                    );
+                    target["replacementReadyAtMs"] = json!(45_000);
+                    target
+                })
+                .collect(),
+        );
+        report["outage"] = json!({
+            "scaleDownRequestedAtMs": 11,
+            "allPodsTerminatedAtMs": 15,
+            "replicaObservations": [
+                {"observedAtMs": 12, "specReplicas": 0, "pods": 4},
+                {"observedAtMs": 15, "specReplicas": 0, "pods": 0}
+            ],
+            "scaleUpRequestedAtMs": 40_500,
+            "allPodsReadyAtMs": 45_000
+        });
+        report["operatorPause"] = json!({
+            "namespace": "rustfs-system",
+            "deployment": "rustfs-operator",
+            "replicasBefore": 1,
+            "pauseRequestedAtMs": 5,
+            "operatorPodsGoneAtMs": 8,
+            "resumeRequestedAtMs": 45_100,
+            "resumedAtMs": 46_000
+        });
+        let counts =
+            |ok: usize| json!({"ok": ok, "not_found": 0, "failed": 3, "timeout": 0, "unknown": 0});
+        let summary = |ok: usize| {
+            json!({
+                "scenario": scenario,
+                "run_id": run_id,
+                "seed": 42,
+                "object_count": 12,
+                "concurrency": 4,
+                "recommitted_after_recovery": 0,
+                "puts": counts(0),
+                "gets": counts(ok),
+                "deletes": counts(0),
+                "lists": counts(0),
+                "multipart_completes": counts(0),
+                "multipart_aborts": counts(0)
+            })
+        };
+        let write = |report: &serde_json::Value, summary: &serde_json::Value| {
+            write_json(dir.path(), POD_LIFECYCLE_EVIDENCE_ARTIFACT, report);
+            write_json(dir.path(), "workload-summary.json", summary);
+            BTreeMap::from([
+                (
+                    POD_LIFECYCLE_EVIDENCE_ARTIFACT.to_string(),
+                    dir.path().join(POD_LIFECYCLE_EVIDENCE_ARTIFACT),
+                ),
+                (
+                    "workload-summary.json".to_string(),
+                    dir.path().join("workload-summary.json"),
+                ),
+            ])
+        };
+        let evidence = lifecycle_fault_evidence(
+            run_id,
+            scenario,
+            &["p-0", "p-1", "p-2", "p-3"],
+            &before,
+            &after,
+        );
+        validate_pod_lifecycle_artifact(
+            &write(&report, &summary(0)),
+            &metadata,
+            ArtifactIdentityPolicy::LegacyCompatible,
+            &evidence,
+            &run_spec,
+            false,
+        )
+        .expect("held outage");
+        let error = validate_pod_lifecycle_artifact(
+            &write(&report, &summary(1)),
+            &metadata,
+            ArtifactIdentityPolicy::LegacyCompatible,
+            &evidence,
+            &run_spec,
+            false,
+        )
+        .expect_err("a served GET during a total outage");
+        assert!(
+            error.to_string().contains("should have been total"),
+            "{error:#}"
+        );
+        let mut reverted = report.clone();
+        reverted["outage"]["replicaObservations"][1]["specReplicas"] = json!(4);
+        assert!(
+            validate_pod_lifecycle_artifact(
+                &write(&reverted, &summary(0)),
+                &metadata,
+                ArtifactIdentityPolicy::LegacyCompatible,
+                &evidence,
+                &run_spec,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::fault::spec::FaultRunArtifactSpec::required_names_for_scenario(scenario)
+                .iter()
+                .any(|name| name == POD_LIFECYCLE_EVIDENCE_ARTIFACT)
+        );
+        assert!(
+            !crate::fault::spec::FaultRunArtifactSpec::required_names_for_scenario("io-eio")
+                .iter()
+                .any(|name| name == POD_LIFECYCLE_EVIDENCE_ARTIFACT)
+        );
     }
 
     fn write_json(dir: &std::path::Path, name: &str, value: &serde_json::Value) {

@@ -60,6 +60,9 @@ pub const ADMIN_DECOMMISSION_SCENARIO: &str = "admin-decommission";
 pub const ADMIN_REBALANCE_SCENARIO: &str = "admin-rebalance";
 pub const ON_DISK_BITROT_SCENARIO: &str = "on-disk-bitrot";
 pub const STALE_DISK_RETURN_DETECT_SCENARIO: &str = "stale-disk-return-detect";
+pub const POD_GRACEFUL_RESTART_ONE_SCENARIO: &str = "pod-graceful-restart-one";
+pub const ROLLING_RESTART_ALL_SCENARIO: &str = "rolling-restart-all";
+pub const CLUSTER_COLD_RESTART_SCENARIO: &str = "cluster-cold-restart";
 
 const IOCHAOS_CRD: &str = "iochaos.chaos-mesh.org";
 const PODCHAOS_CRD: &str = "podchaos.chaos-mesh.org";
@@ -181,6 +184,10 @@ pub enum FaultBackend {
     DeviceMapper,
     MinioWarpWithChaos,
     PlannedReliabilityWorkflow,
+    /// kubectl-driven Pod lifecycle operations against the Tenant StatefulSet
+    /// (graceful delete, ordered rolling restart, scale to zero and back);
+    /// no Chaos Mesh CRD is involved.
+    KubernetesLifecycle,
 }
 
 impl FaultBackend {
@@ -193,6 +200,7 @@ impl FaultBackend {
             Self::DeviceMapper => "device-mapper",
             Self::MinioWarpWithChaos => "minio-warp-with-chaos",
             Self::PlannedReliabilityWorkflow => "planned-reliability-workflow",
+            Self::KubernetesLifecycle => "kubernetes-lifecycle",
         }
     }
 
@@ -1314,6 +1322,93 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         observability: "disk-generation-proof.json, shard-inventory-before.json, shard-inventory-after.json, dangling-cleanup-proof.json, workload history, version-aware checker reports, Kubernetes snapshots, RustFS logs",
         conflict_domain: "dedicated host volume and fresh Tenant owned by the run; no other fault or cleanup may touch the detached generation",
     },
+    FaultScenarioSpec {
+        scenario: POD_GRACEFUL_RESTART_ONE_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
+        case_name: "fault_pod_graceful_restart_one_exits_cleanly_and_preserves_committed_objects",
+        description: "Delete one RustFS Pod with its default grace period during the workload and verify RustFS exits cleanly on SIGTERM within the grace period, the StatefulSet replacement becomes Ready without container restarts, and committed S3 objects survive.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::KubernetesLifecycle,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
+        boundary: "rustfs-workload/graceful-pod-restart",
+        ci_phase: "faults",
+        target: "the highest-ordinal RustFS Pod of the Tenant StatefulSet, deleted with its default terminationGracePeriodSeconds",
+        target_proof: &[
+            "target-proof.json must bind every RustFS Pod to exactly one controlling StatefulSet with its UID, replica count, grace period, and PVC retention policy before the delete",
+            "pod-lifecycle-evidence.json must record the deleted Pod's old and new UID, restart counts, the API server deletion timestamp, and the RustFS container's final terminated exit code, reason, and timestamps",
+        ],
+        validation: "the RustFS container exits with code 0 within terminationGracePeriodSeconds of the graceful delete (a SIGKILL at grace expiry is a product failure classified graceful_shutdown_failed), the replacement Pod reaches Ready with zero container restarts, every committed object remains readable during the restart and the mixed workload meets the availability floor, RustFS reports every drive ok and every Pod ready after recovery, fresh post-recovery writes succeed, and committed PUTs remain readable with matching hashes",
+        observability: "pod-lifecycle-evidence.json, pod-lifecycle-watch.json, history.jsonl, workload-summary.json, availability-report.json, checker-report.json, recovery-health.json, StatefulSet and Pod snapshots, RustFS logs",
+        conflict_domain: "one Tenant StatefulSet Pod; can reuse a ready Tenant after the prior scenario has cleaned up",
+    },
+    FaultScenarioSpec {
+        scenario: ROLLING_RESTART_ALL_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
+        case_name: "fault_rolling_restart_all_keeps_serving_and_preserves_committed_objects",
+        description: "Restart every RustFS Pod one at a time from the highest ordinal down with default grace periods while the workload runs, waiting for each replacement to become Ready, and verify every Pod exits cleanly, the service keeps serving, and committed objects survive.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::KubernetesLifecycle,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
+        boundary: "rustfs-workload/rolling-restart",
+        ci_phase: "faults",
+        target: "every RustFS Pod of the Tenant StatefulSet, deleted one at a time with the default grace period in descending ordinal order; with a port-forward endpoint the Pod serving the availability contract is restarted after the workload",
+        target_proof: &[
+            "target-proof.json must bind every RustFS Pod to exactly one controlling StatefulSet with its UID, replica count, grace period, and PVC retention policy before the first delete",
+            "pod-lifecycle-evidence.json must record every Pod's old and new UID, restart counts, deletion timestamp, and the RustFS container's final terminated state, and must mark the Pod restarted after the workload when a port-forward endpoint was pinned to it",
+        ],
+        validation: "every RustFS container exits with code 0 within its grace period, every replacement reaches Ready with zero container restarts before the next Pod is deleted, the StatefulSet UID is unchanged, every committed object remains readable during the rollout and the mixed workload meets the availability floor, RustFS reports every drive ok and every Pod ready after recovery, fresh post-recovery writes succeed, and committed PUTs remain readable with matching hashes",
+        observability: "pod-lifecycle-evidence.json, pod-lifecycle-watch.json, history.jsonl, workload-summary.json, availability-report.json, checker-report.json, recovery-health.json, StatefulSet and Pod snapshots, RustFS logs",
+        conflict_domain: "every Tenant StatefulSet Pod in sequence; can reuse a ready Tenant after the prior scenario has cleaned up",
+    },
+    FaultScenarioSpec {
+        scenario: CLUSTER_COLD_RESTART_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
+        case_name: "fault_cluster_cold_restart_recovers_and_preserves_committed_objects",
+        description: "Pause the RustFS operator, scale the Tenant StatefulSet to zero, hold the total outage while the workload runs, scale back to the full replica count, resume the operator, and verify every Pod exited cleanly, the cluster comes back healthy, and committed objects survive.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::KubernetesLifecycle,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        boundary: "rustfs-workload/cluster-cold-restart",
+        ci_phase: "faults",
+        target: "the whole Tenant StatefulSet scaled to zero replicas and back, with the RustFS operator Deployment named by RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT paused so it cannot reconcile the replica count",
+        target_proof: &[
+            "target-proof.json must bind every RustFS Pod to exactly one controlling StatefulSet with its UID, replica count, grace period, and a PVC retention policy that retains claims on scale-down",
+            "pod-lifecycle-evidence.json must record the operator pause and resume, every spec.replicas sample taken while the outage was held, every Pod's terminated state, and the new Pod UIDs after scale-up",
+        ],
+        validation: "every RustFS container exits with code 0 within its grace period on scale-down, spec.replicas stays zero and no RustFS Pod exists for the whole workload so every workload operation fails (any success proves the outage was not held), after scale-up every Pod reaches Ready with zero container restarts, RustFS reports every drive ok and every Pod ready, fresh post-recovery writes succeed, and committed PUTs remain readable with matching hashes",
+        observability: "pod-lifecycle-evidence.json, pod-lifecycle-watch.json, history.jsonl, workload-summary.json, checker-report.json, recovery-health.json, StatefulSet, Pod and operator Deployment snapshots, RustFS logs",
+        conflict_domain: "the whole Tenant StatefulSet plus the RustFS operator Deployment while paused; nothing else may reconcile the Tenant during the run",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1506,7 +1601,7 @@ pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+        CLUSTER_COLD_RESTART_SCENARIO, DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO,
@@ -1514,12 +1609,12 @@ mod tests {
         FaultScenario, FaultScenarioStatus, FaultScenarioWorkloadProfile, IO_EIO_SCENARIO,
         IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
-        POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
-        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO,
-        WARP_UNDER_CHAOS_SCENARIO, acknowledged_mutation_kind, apply_catalog_defaults,
-        executable_scenario_catalog, expected_workload_versioning_for_scenario,
-        requires_prefault_multipart_staging, scenario_catalog, scenario_catalog_json,
-        scenario_spec,
+        POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO,
+        QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+        ROLLING_RESTART_ALL_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO,
+        acknowledged_mutation_kind, apply_catalog_defaults, executable_scenario_catalog,
+        expected_workload_versioning_for_scenario, requires_prefault_multipart_staging,
+        scenario_catalog, scenario_catalog_json, scenario_spec,
     };
     use crate::fault::acknowledged_mutation::AcknowledgedMutationKind;
     use crate::fault::config::{FaultTestConfig, FaultWorkloadProfile};
@@ -1598,8 +1693,8 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 25);
-        assert_eq!(scenario_catalog().len(), 30);
+        assert_eq!(executable_scenario_catalog().count(), 28);
+        assert_eq!(scenario_catalog().len(), 33);
         assert_eq!(
             scenario_catalog()
                 .iter()
@@ -1919,6 +2014,52 @@ mod tests {
             super::FaultImpactPolicy::AvailabilityRequired.as_str(),
             "availability-required"
         );
+    }
+
+    #[test]
+    fn lifecycle_scenarios_use_the_kubectl_backend_without_chaos_mesh() {
+        for name in [
+            POD_GRACEFUL_RESTART_ONE_SCENARIO,
+            ROLLING_RESTART_ALL_SCENARIO,
+            CLUSTER_COLD_RESTART_SCENARIO,
+        ] {
+            let spec = scenario_spec(name).expect("lifecycle scenario");
+            assert_eq!(spec.status, FaultScenarioStatus::Executable, "{name}");
+            assert_eq!(
+                spec.backend,
+                super::FaultBackend::KubernetesLifecycle,
+                "{name}"
+            );
+            assert!(!spec.requires_chaos_mesh(), "{name}");
+            assert!(!spec.requires_static_storage(), "{name}");
+            assert!(!spec.percent_supported, "{name}");
+            assert_eq!(spec.priority, super::FaultPriority::P0, "{name}");
+        }
+        assert!(
+            scenario_spec(POD_GRACEFUL_RESTART_ONE_SCENARIO)
+                .expect("scenario")
+                .impact_policy
+                .requires_availability()
+        );
+        assert!(
+            scenario_spec(ROLLING_RESTART_ALL_SCENARIO)
+                .expect("scenario")
+                .impact_policy
+                .requires_availability()
+        );
+        // A held total outage must disrupt clients; availability cannot be
+        // claimed for a cluster with zero Pods.
+        assert!(
+            scenario_spec(CLUSTER_COLD_RESTART_SCENARIO)
+                .expect("scenario")
+                .impact_policy
+                .requires_client_disruption()
+        );
+        assert_eq!(
+            super::FaultBackend::KubernetesLifecycle.as_str(),
+            "kubernetes-lifecycle"
+        );
+        assert!(!super::FaultBackend::KubernetesLifecycle.accepts_percent());
     }
 
     #[test]

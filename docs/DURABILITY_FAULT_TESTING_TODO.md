@@ -396,6 +396,20 @@ guardrails when implementing the ordered TODO below.
   a pre-calibration margin; live runs must calibrate it before it gates a
   release.
 
+- [x] DONE: Shutdown and restart coverage through a kubectl lifecycle backend.
+  Meaning: `pod-graceful-restart-one`, `rolling-restart-all`, and
+  `cluster-cold-restart` use `FaultBackend::KubernetesLifecycle`
+  (rustfs/backlog#2446). Pods are deleted with their default grace period
+  (the operator reconciles StatefulSet replicas and template annotations, so
+  `rollout restart` and bare scaling are not usable); the final container
+  `terminated` state is captured from a Pod watch and classified by the
+  documented grace-timeout rule (`graceful_shutdown_failed` is a product
+  failure). Cold restart pauses the operator Deployment named by
+  `RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT`, holds `spec.replicas` at zero,
+  requires the workload to fail entirely, and restores both. All three reuse
+  the recovery-health gate, the post-recovery write probe, and (for the first
+  two) the availability contract. Live calibration is still pending.
+
 - [x] DONE: Add host/storage mutation preflight.
   Meaning: executable device-mapper scenarios now require exact singleton
   node/device/PV allowlists, a separate device-mapper destructive opt-in, and a

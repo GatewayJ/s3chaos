@@ -168,7 +168,7 @@ impl FaultRun<'_> {
             } else {
                 self.record_failure(
                     "fault-delete",
-                    "environment_or_fault_backend",
+                    crate::fault::fault_lifecycle::removal_failure_classification(&error),
                     &error,
                     None,
                     Some((fault, "delete-failed")),

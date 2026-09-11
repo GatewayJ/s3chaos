@@ -236,6 +236,13 @@ scenario_crds() {
   fault_catalog_json | jq -r --arg scenario "$scenario" '.[] | select(.scenario == $scenario) | .crds[]?'
 }
 
+# Chaos Mesh is only a requirement for scenarios that render one of its CRDs;
+# kubectl-driven lifecycle scenarios and host device-mapper scenarios run
+# without it.
+scenario_requires_chaos_mesh() {
+  catalog_scenario_query "$1" '.[] | select(.scenario == $scenario) | (.crds | length) > 0' >/dev/null
+}
+
 scenario_required_tools() {
   local scenario="$1"
   fault_catalog_json | jq -r --arg scenario "$scenario" '.[] | select(.scenario == $scenario) | .required_tools[]?'
@@ -525,7 +532,7 @@ preflight() {
   require_namespace_ownership
   require_non_fault_tenants_ready
 
-  if ! scenario_requires_static_storage "$scenario"; then
+  if scenario_requires_chaos_mesh "$scenario"; then
     for crd in $(scenario_crds "$scenario"); do
       kubectl_cluster get crd "$crd" >/dev/null
     done
@@ -886,10 +893,10 @@ run_scenario() {
   baseline_ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
   baseline_tenants="$artifacts/baseline-non-fault-tenants.tsv"
   list_non_fault_tenants >"$baseline_tenants"
-  if scenario_requires_static_storage "$scenario"; then
-    require_chaos=false
-  else
+  if scenario_requires_chaos_mesh "$scenario"; then
     require_chaos=true
+  else
+    require_chaos=false
   fi
   capture_cluster_snapshot "$artifacts" before
   prepare_host_mutation_state "$artifacts"

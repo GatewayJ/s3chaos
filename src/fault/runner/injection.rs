@@ -1024,6 +1024,12 @@ impl FaultRun<'_> {
                         )?;
                     }
                     Ok(())
+                } else if plan.fault().kind()
+                    == crate::fault::plan::FaultKind::RustfsServerColdRestart
+                {
+                    // Zero Pods can serve nothing: a single success means the
+                    // outage the scenario claims was not held.
+                    workload.summary.require_total_outage_effect()
                 } else {
                     Ok(())
                 }
@@ -1070,6 +1076,10 @@ impl FaultRun<'_> {
 fn injected_source_pod_names(snapshots: &[FaultStatusSnapshot]) -> Result<BTreeSet<String>> {
     let mut targets = BTreeSet::new();
     for snapshot in snapshots {
+        if let Some(lifecycle) = &snapshot.lifecycle_status {
+            targets.extend(lifecycle.target_pods.iter().cloned());
+            continue;
+        }
         let Some(status) = &snapshot.chaos_status else {
             continue;
         };
@@ -1266,7 +1276,41 @@ mod availability_endpoint_tests {
                 "status": {"experiment": {"containerRecords": records}}
             })),
             dm_status: None,
+            lifecycle_status: None,
         }
+    }
+
+    #[test]
+    fn lifecycle_snapshots_name_their_restart_targets() {
+        use crate::fault::backends::lifecycle::evidence::{
+            LifecycleOperation, LifecycleStatusSnapshot,
+        };
+        let snapshot = FaultStatusSnapshot {
+            stage: "active".to_string(),
+            resource_kind: Some("statefulset".to_string()),
+            resource_name: Some("tenant-primary".to_string()),
+            chaos_status: None,
+            dm_status: None,
+            lifecycle_status: Some(LifecycleStatusSnapshot {
+                operation: LifecycleOperation::RollingRestart,
+                statefulset_name: "tenant-primary".to_string(),
+                statefulset_uid: "sts".to_string(),
+                spec_replicas: 4,
+                ready_replicas: 3,
+                target_pods: vec![
+                    "rustfs-3".to_string(),
+                    "rustfs-2".to_string(),
+                    "rustfs-1".to_string(),
+                ],
+                pods: Vec::new(),
+                observed_at_ms: 1,
+            }),
+        };
+        let targets = injected_source_pod_names(&[snapshot]).expect("targets");
+        assert_eq!(
+            surviving_pod_name(&pods(), &targets).expect("survivor"),
+            "rustfs-0"
+        );
     }
 
     #[test]
@@ -1300,6 +1344,7 @@ mod availability_endpoint_tests {
             resource_name: None,
             chaos_status: None,
             dm_status: None,
+            lifecycle_status: None,
         };
         assert!(injected_source_pod_names(&[dm_only]).is_err());
     }

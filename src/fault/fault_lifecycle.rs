@@ -52,6 +52,33 @@ pub(super) trait FaultLifecyclePort {
 
 pub(super) type AppliedFault = Box<dyn FaultLifecyclePort>;
 
+/// A fault-removal error that carries its own failure classification. The
+/// runner classifies removal failures as environment/backend problems by
+/// default; a backend that observed a product defect while removing the
+/// fault (for example a RustFS container SIGKILLed at grace expiry) reports it
+/// through this type so the verdict is not misattributed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ClassifiedFaultFailure {
+    pub(super) classification: &'static str,
+    pub(super) message: String,
+}
+
+impl std::fmt::Display for ClassifiedFaultFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClassifiedFaultFailure {}
+
+pub(super) fn removal_failure_classification(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<ClassifiedFaultFailure>()
+        .map_or("environment_or_fault_backend", |failure| {
+            failure.classification
+        })
+}
+
 pub(super) struct FaultDeleteTimeoutRecoveryRequest<'a> {
     pub(super) config: &'a FaultTestConfig,
     pub(super) collector: &'a ArtifactCollector,
@@ -141,6 +168,7 @@ mod tests {
                 resource_name: Some(self.name.to_string()),
                 chaos_status: None,
                 dm_status: None,
+                lifecycle_status: None,
             })
         }
 
@@ -255,6 +283,30 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state.borrow().recoveries, vec!["target"]);
+    }
+
+    #[test]
+    fn removal_failures_keep_their_backend_classification_through_context() {
+        let plain = anyhow!("kubectl timed out");
+        assert_eq!(
+            super::removal_failure_classification(&plain),
+            "environment_or_fault_backend"
+        );
+        let classified: anyhow::Error = super::ClassifiedFaultFailure {
+            classification: "graceful_shutdown_failed",
+            message: "Pod exited 137".to_string(),
+        }
+        .into();
+        assert_eq!(
+            super::removal_failure_classification(&classified),
+            "graceful_shutdown_failed"
+        );
+        let wrapped = classified.context("removing applied faults");
+        assert_eq!(
+            super::removal_failure_classification(&wrapped),
+            "graceful_shutdown_failed"
+        );
+        assert!(wrapped.to_string().contains("removing applied faults"));
     }
 
     #[test]

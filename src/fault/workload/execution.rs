@@ -1450,6 +1450,26 @@ impl WorkloadSummary {
         self.require_rejected_write_mutations(&mutations)
     }
 
+    /// A held total outage serves nothing: every operation family must have
+    /// been attempted and none may have succeeded or answered 404.
+    pub(in crate::fault) fn require_total_outage_effect(&self) -> Result<()> {
+        self.require_exercised()?;
+        for (kind, counts) in [
+            ("PUT", &self.puts),
+            ("GET", &self.gets),
+            ("DELETE", &self.deletes),
+            ("LIST", &self.lists),
+            ("CompleteMultipartUpload", &self.multipart_completes),
+            ("AbortMultipartUpload", &self.multipart_aborts),
+        ] {
+            ensure!(
+                counts.ok == 0 && counts.not_found == 0,
+                "cold-restart outage was not total: {kind} outcomes include successes while no RustFS Pod should exist: {counts:?}"
+            );
+        }
+        Ok(())
+    }
+
     fn require_rejected_write_mutations(&self, mutations: &[(&str, &OutcomeCounts)]) -> Result<()> {
         ensure!(
             mutations.iter().all(|(_, counts)| counts.total() > 0),

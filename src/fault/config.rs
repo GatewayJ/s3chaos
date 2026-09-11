@@ -115,6 +115,10 @@ pub struct FaultTestConfig {
     /// impact policy requires availability. The default leaves a small margin
     /// for port-forward reconnects; live calibration may tighten it to 100.
     pub min_availability_percent: u8,
+    /// RustFS operator Deployment (in `cluster.operator_namespace`) that
+    /// `cluster-cold-restart` scales to zero while it holds the outage, so
+    /// the operator cannot reconcile the StatefulSet replica count back.
+    pub operator_deployment: Option<String>,
     pub dm_name: Option<String>,
     pub dm_node: Option<String>,
     pub dm_mount_path: Option<String>,
@@ -347,6 +351,7 @@ impl FaultTestConfig {
                 );
                 percent
             },
+            operator_deployment: env_optional(&get_env, "RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT"),
             workload_ranged_get_percent: {
                 let percent = env_u8(&get_env, "RUSTFS_FAULT_TEST_WORKLOAD_RANGED_GET_PERCENT", 0)?;
                 ensure!(
