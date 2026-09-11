@@ -27,6 +27,7 @@ pub const DEFAULT_FAULT_NAMESPACE: &str = "rustfs-fault-test";
 pub const DEFAULT_FAULT_TENANT: &str = "fault-test-tenant";
 pub const DEFAULT_CHAOS_NAMESPACE: &str = "chaos-mesh";
 pub const DEFAULT_OPERATOR_NAMESPACE: &str = "rustfs-system";
+pub const DEFAULT_OPERATOR_IMAGE_MATCH: &str = "rustfs/operator";
 pub const DEFAULT_WORKLOAD_OBJECTS: usize = 40_000;
 pub const DEFAULT_WORKLOAD_CONCURRENCY: usize = 80;
 pub const DEFAULT_PREFILL_CONCURRENCY: usize = 16;
@@ -119,6 +120,9 @@ pub struct FaultTestConfig {
     /// `cluster-cold-restart` scales to zero while it holds the outage, so
     /// the operator cannot reconcile the StatefulSet replica count back.
     pub operator_deployment: Option<String>,
+    /// Substring a container image of that Deployment must contain before
+    /// it is paused, so a mistyped name can never scale a foreign workload.
+    pub operator_image_match: String,
     pub dm_name: Option<String>,
     pub dm_node: Option<String>,
     pub dm_mount_path: Option<String>,
@@ -352,6 +356,11 @@ impl FaultTestConfig {
                 percent
             },
             operator_deployment: env_optional(&get_env, "RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT"),
+            operator_image_match: env_or(
+                &get_env,
+                "RUSTFS_FAULT_TEST_OPERATOR_IMAGE_MATCH",
+                DEFAULT_OPERATOR_IMAGE_MATCH,
+            ),
             workload_ranged_get_percent: {
                 let percent = env_u8(&get_env, "RUSTFS_FAULT_TEST_WORKLOAD_RANGED_GET_PERCENT", 0)?;
                 ensure!(

@@ -36,6 +36,9 @@ FAULT_CONTEXT="${RUSTFS_FAULT_TEST_EXPECTED_CONTEXT:-}"
 FAULT_NAMESPACE="${RUSTFS_FAULT_TEST_NAMESPACE:-rustfs-fault-test}"
 FAULT_TENANT="${RUSTFS_FAULT_TEST_TENANT:-fault-test-tenant}"
 CHAOS_NAMESPACE="${RUSTFS_FAULT_TEST_CHAOS_NAMESPACE:-chaos-mesh}"
+OPERATOR_NAMESPACE="${RUSTFS_FAULT_TEST_OPERATOR_NAMESPACE:-rustfs-system}"
+OPERATOR_PAUSE_REPLICAS_ANNOTATION="s3chaos.rustfs.com/operator-paused-replicas"
+OPERATOR_PAUSE_RUN_ANNOTATION="s3chaos.rustfs.com/operator-paused-run"
 ACTIVE_PID=""
 ACTIVE_ARTIFACTS=""
 ACTIVE_HOST_MUTATION_STATE_FILE=""
@@ -1126,8 +1129,28 @@ list_scenarios() {
   fault_catalog_json | jq -r '.[] | select(.status == "executable") | .scenario'
 }
 
+# cluster-cold-restart records the operator pause as annotations on the
+# operator Deployment before scaling it to zero. A run that died before its
+# own restore leaves that record behind; undo it here, and refuse to guess
+# when the record cannot be read.
+restore_paused_operators() {
+  local deployments name replicas
+  deployments="$(kubectl_ns "$OPERATOR_NAMESPACE" get deployment -o json 2>/dev/null \
+    | jq -r --arg key "$OPERATOR_PAUSE_REPLICAS_ANNOTATION" '.items[] | select(.metadata.annotations[$key] != null) | "\(.metadata.name)\t\(.metadata.annotations[$key])"')" || return 0
+  [[ -n "$deployments" ]] || return 0
+  while IFS=$'\t' read -r name replicas; do
+    [[ -n "$name" ]] || continue
+    [[ "$replicas" =~ ^[0-9]+$ && "$replicas" -ge 1 ]] || die "operator Deployment $OPERATOR_NAMESPACE/$name carries an unreadable pause record ($OPERATOR_PAUSE_REPLICAS_ANNOTATION=$replicas); restore it manually and remove the annotation"
+    echo "restoring operator Deployment $OPERATOR_NAMESPACE/$name left paused by a previous run to $replicas replica(s)"
+    kubectl_ns "$OPERATOR_NAMESPACE" scale deployment "$name" --replicas="$replicas"
+    kubectl_ns "$OPERATOR_NAMESPACE" rollout status deployment "$name" --timeout=300s
+    kubectl_ns "$OPERATOR_NAMESPACE" annotate deployment "$name" "${OPERATOR_PAUSE_REPLICAS_ANNOTATION}-" "${OPERATOR_PAUSE_RUN_ANNOTATION}-"
+  done <<<"$deployments"
+}
+
 cleanup() {
   cleanup_managed_chaos
+  restore_paused_operators
   if kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1; then
     require_namespace_ownership
     kubectl_cluster delete namespace "$FAULT_NAMESPACE" --wait=true

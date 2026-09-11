@@ -37,6 +37,7 @@ use crate::fault::{
     },
     backends::lifecycle::evidence::{
         LifecycleRunContext, POD_LIFECYCLE_EVIDENCE_ARTIFACT, PodLifecycleEvidence,
+        SNAPSHOT_TARGET_PODS_POINTER, total_outage_violation,
     },
     checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
     config::{
@@ -3499,7 +3500,7 @@ fn validate_pod_lifecycle_artifact(
     let active_targets = evidence
         .active_snapshots
         .iter()
-        .filter_map(|snapshot| snapshot.pointer("/lifecycle_status/target_pods"))
+        .filter_map(|snapshot| snapshot.pointer(SNAPSHOT_TARGET_PODS_POINTER))
         .filter_map(Value::as_array)
         .flatten()
         .filter_map(Value::as_str)
@@ -3526,10 +3527,11 @@ fn validate_pod_lifecycle_artifact(
             ("multipart_completes", &summary.multipart_completes),
             ("multipart_aborts", &summary.multipart_aborts),
         ] {
-            ensure!(
-                counts.ok == 0 && counts.not_found == 0,
-                "workload-summary.json {family} recorded successes while the cold-restart outage should have been total"
-            );
+            if let Some(violation) =
+                total_outage_violation(family, counts.ok, counts.not_found, counts.total())
+            {
+                bail!("workload-summary.json: {violation}");
+            }
         }
     }
     Ok(())
@@ -13685,7 +13687,42 @@ mod tests {
         );
         let mut short = proven.clone();
         short.faults[0].statefulset.as_mut().unwrap().replicas = 3;
-        assert!(validate_target_proof(&short, &run_spec, &options).is_err());
+        let error = validate_target_proof(&short, &run_spec, &options).expect_err("short replicas");
+        assert!(
+            error.to_string().contains("do not match the expected 4"),
+            "{error:#}"
+        );
+        let mut elsewhere = proven.clone();
+        elsewhere.faults[0].statefulset.as_mut().unwrap().namespace = "other".to_string();
+        let error = validate_target_proof(&elsewhere, &run_spec, &options).expect_err("namespace");
+        assert!(
+            error.to_string().contains("identity is incomplete"),
+            "{error:#}"
+        );
+        let mut unproven = proven.clone();
+        for requirement in &mut unproven.requirements {
+            if requirement.name == crate::fault::preflight::STATEFULSET_OWNERSHIP_REQUIREMENT {
+                requirement.status = crate::fault::preflight::PreflightStatus::Failed;
+            }
+        }
+        let error =
+            validate_target_proof(&unproven, &run_spec, &options).expect_err("failed requirement");
+        assert!(
+            error.to_string().contains("failed target requirements"),
+            "{error:#}"
+        );
+        let mut pending_requirement = proven.clone();
+        pending_requirement.requirements.retain(|requirement| {
+            requirement.name != crate::fault::preflight::STATEFULSET_OWNERSHIP_REQUIREMENT
+        });
+        let error = validate_target_proof(&pending_requirement, &run_spec, &options)
+            .expect_err("requirement removed");
+        assert!(
+            error
+                .to_string()
+                .contains("lacks the passed StatefulSet ownership requirement"),
+            "{error:#}"
+        );
     }
 
     fn lifecycle_evidence_json(
@@ -13761,6 +13798,35 @@ mod tests {
                 .map(|(name, uid)| json!({"name": name, "uid": uid}))
                 .collect::<Vec<_>>()
         };
+        // Serialize the real snapshot type so the fixture cannot drift from
+        // what a live run writes (camelCase payload under a snake_case field).
+        let active_snapshot = serde_json::to_value(crate::fault::reporting::FaultStatusSnapshot {
+            stage: "active".to_string(),
+            resource_kind: Some("statefulset".to_string()),
+            resource_name: Some("fault-test-tenant-primary".to_string()),
+            chaos_status: None,
+            dm_status: None,
+            lifecycle_status: Some(
+                crate::fault::backends::lifecycle::evidence::LifecycleStatusSnapshot {
+                    operation:
+                        crate::fault::backends::lifecycle::evidence::LifecycleOperation::Rolling,
+                    statefulset_name: "fault-test-tenant-primary".to_string(),
+                    statefulset_uid: "sts-uid".to_string(),
+                    spec_replicas: 4,
+                    ready_replicas: 3,
+                    target_pods: target_pods.iter().map(|pod| (*pod).to_string()).collect(),
+                    pods: Vec::new(),
+                    observed_at_ms: 21,
+                },
+            ),
+        })
+        .expect("snapshot json");
+        assert!(
+            active_snapshot
+                .pointer("/lifecycle_status/targetPods")
+                .is_some(),
+            "live snapshots serialize target_pods as targetPods: {active_snapshot}"
+        );
         serde_json::from_value(json!({
             "scenario": scenario,
             "run_id": run_id,
@@ -13771,7 +13837,7 @@ mod tests {
             "client_disruptions": 0,
             "pods_before": identities(before),
             "pods_after": identities(after),
-            "active_snapshots": [{"stage": "active", "lifecycle_status": {"target_pods": target_pods}}],
+            "active_snapshots": [active_snapshot],
             "workload_snapshots": [{"stage": "after-workload"}],
             "fault_apply_started_at_ms": 10,
             "fault_active_at_ms": 20,
@@ -14004,6 +14070,8 @@ mod tests {
         report["operatorPause"] = json!({
             "namespace": "rustfs-system",
             "deployment": "rustfs-operator",
+            "image": "docker.io/rustfs/operator:1.0.0",
+            "identityMatchedBy": "image",
             "replicasBefore": 1,
             "pauseRequestedAtMs": 5,
             "operatorPodsGoneAtMs": 8,
@@ -14067,10 +14135,32 @@ mod tests {
             false,
         )
         .expect_err("a served GET during a total outage");
-        assert!(
-            error.to_string().contains("should have been total"),
-            "{error:#}"
-        );
+        assert!(error.to_string().contains("was not total"), "{error:#}");
+        let mut not_found = summary(0);
+        not_found["deletes"]["not_found"] = json!(1);
+        let error = validate_pod_lifecycle_artifact(
+            &write(&report, &not_found),
+            &metadata,
+            ArtifactIdentityPolicy::LegacyCompatible,
+            &evidence,
+            &run_spec,
+            false,
+        )
+        .expect_err("a 404 during a total outage");
+        assert!(error.to_string().contains("deletes answered"), "{error:#}");
+        let mut unattempted = summary(0);
+        unattempted["multipart_aborts"] =
+            json!({"ok": 0, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0});
+        let error = validate_pod_lifecycle_artifact(
+            &write(&report, &unattempted),
+            &metadata,
+            ArtifactIdentityPolicy::LegacyCompatible,
+            &evidence,
+            &run_spec,
+            false,
+        )
+        .expect_err("family never attempted");
+        assert!(error.to_string().contains("never attempted"), "{error:#}");
         let mut reverted = report.clone();
         reverted["outage"]["replicaObservations"][1]["specReplicas"] = json!(4);
         assert!(

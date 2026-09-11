@@ -190,23 +190,39 @@ measures a client attached to a healthy node; ClusterIP endpoints need no
 pinning. These contracts are not yet calibrated on a live cluster; treat the
 first live runs as calibration.
 The lifecycle scenarios (`kubernetes-lifecycle` backend) restart RustFS
-through kubectl instead of Chaos Mesh. Because the RustFS operator reconciles
-the Tenant StatefulSet's replica count and Pod template, they delete Pods
-with the default `terminationGracePeriodSeconds` (never `rollout restart` or a
-bare scale) and capture each RustFS container's final `terminated` state from
-a streaming Pod watch (`pod-lifecycle-watch.json`). A container that is
-SIGKILLed at grace expiry, dies to SIGTERM's default action, or exits non-zero
-fails the run as `graceful_shutdown_failed`; a replacement that restarts before
-Ready or a StatefulSet whose UID changes fails too (`pod-lifecycle-evidence.json`).
-`rolling-restart-all` restarts Pods from the highest ordinal down and, with a
-port-forward endpoint, restarts the Pod the availability endpoint is pinned to
-only after the workload. `cluster-cold-restart` scales the operator Deployment
-named by `RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT` (in
-`RUSTFS_FAULT_TEST_OPERATOR_NAMESPACE`) to zero, scales the StatefulSet to zero,
-records every `spec.replicas` sample while the outage is held, requires every
-workload operation to fail, then scales both back; the operator is restored
-on every exit path. These scenarios have not yet been calibrated on a live
-cluster.
+through kubectl instead of Chaos Mesh. The RustFS operator writes the Tenant
+StatefulSet with server-side apply and owns `spec.replicas` and the Pod
+template annotations, so a `kubectl scale` or `rollout restart` makes kubectl
+a co-owner of those fields and the operator's next apply conflicts
+(`StatefulSetApplyFailed`) instead of converging. The scenarios therefore
+delete Pods with the default `terminationGracePeriodSeconds` and capture each
+RustFS container's final `terminated` state from a streaming Pod watch
+(`pod-lifecycle-watch.json`, kubectl stderr in
+`pod-lifecycle-watch.stderr.log`); the SIGTERM reference is the graceful
+delete's `deletionTimestamp - deletionGracePeriodSeconds`, never kubelet's
+final grace-0 rewrite. A container that is SIGKILLed at grace expiry, dies to
+SIGTERM's default action, or exits non-zero fails the run as
+`graceful_shutdown_failed`; a replacement that never becomes Ready or restarts
+before Ready fails as `product_or_environment`, and a StatefulSet whose UID
+changes fails too (`pod-lifecycle-evidence.json`). `pod-graceful-restart-one`
+and `rolling-restart-all` count the fault as active once the API server
+accepts the delete, so SIGTERM lands under load; the rolling restart goes from
+the highest ordinal down and, with a port-forward endpoint, pins all client
+traffic to the smallest-name Pod and restarts that Pod only after the
+workload. `cluster-cold-restart` runs on a fresh Tenant fixture (the scale
+leaves `kubectl-scale` co-owning `spec.replicas`), requires
+`podManagementPolicy: Parallel`, pauses the operator Deployment named by
+`RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT` (in
+`RUSTFS_FAULT_TEST_OPERATOR_NAMESPACE`; it must run an image containing
+`RUSTFS_FAULT_TEST_OPERATOR_IMAGE_MATCH`, default `rustfs/operator`) by
+recording the pause as annotations on that Deployment and scaling it to zero,
+drains every Pod before the workload, records every `spec.replicas` sample
+while the outage is held, requires every workload operation to fail, then
+scales both back. The operator is restored when the run unwinds normally or
+on a signal; if the harness is killed outright, the annotations remain and
+the next lifecycle run's pre-cleanup or `make fault-cleanup` restores the
+operator from them (an unreadable record fails cleanup rather than guessing).
+These scenarios have not yet been calibrated on a live cluster.
 `make fault-dashboard-install` mutates the current cluster (installs/upgrades
 the Chaos Mesh release via Helm); treat it like a live run.
 `make fault-cleanup` is scoped by the current Kubernetes context, namespace,

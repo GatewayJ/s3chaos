@@ -1292,7 +1292,7 @@ mod availability_endpoint_tests {
             chaos_status: None,
             dm_status: None,
             lifecycle_status: Some(LifecycleStatusSnapshot {
-                operation: LifecycleOperation::RollingRestart,
+                operation: LifecycleOperation::Rolling,
                 statefulset_name: "tenant-primary".to_string(),
                 statefulset_uid: "sts".to_string(),
                 spec_replicas: 4,

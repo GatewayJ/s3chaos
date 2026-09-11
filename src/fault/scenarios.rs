@@ -1329,7 +1329,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::RecoveryAvailabilityRegression,
         ]),
         case_name: "fault_pod_graceful_restart_one_exits_cleanly_and_preserves_committed_objects",
-        description: "Delete one RustFS Pod with its default grace period during the workload and verify RustFS exits cleanly on SIGTERM within the grace period, the StatefulSet replacement becomes Ready without container restarts, and committed S3 objects survive.",
+        description: "Delete one RustFS Pod with its default grace period while the workload runs (the fault counts as active once the API server accepts the delete, so SIGTERM lands under load) and verify RustFS exits cleanly within the grace period, the StatefulSet replacement becomes Ready without container restarts, and committed S3 objects survive.",
         priority: FaultPriority::P0,
         backend: FaultBackend::KubernetesLifecycle,
         status: FaultScenarioStatus::Executable,
@@ -1371,7 +1371,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         impact_policy: FaultImpactPolicy::AvailabilityRequired,
         boundary: "rustfs-workload/rolling-restart",
         ci_phase: "faults",
-        target: "every RustFS Pod of the Tenant StatefulSet, deleted one at a time with the default grace period in descending ordinal order; with a port-forward endpoint the Pod serving the availability contract is restarted after the workload",
+        target: "every RustFS Pod of the Tenant StatefulSet, deleted one at a time with the default grace period in descending ordinal order while the workload runs; with a port-forward endpoint all client traffic is pinned to the smallest-name Pod, which is restarted only after the workload",
         target_proof: &[
             "target-proof.json must bind every RustFS Pod to exactly one controlling StatefulSet with its UID, replica count, grace period, and PVC retention policy before the first delete",
             "pod-lifecycle-evidence.json must record every Pod's old and new UID, restart counts, deletion timestamp, and the RustFS container's final terminated state, and must mark the Pod restarted after the workload when a port-forward endpoint was pinned to it",
@@ -1387,12 +1387,15 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::RecoveryAvailabilityRegression,
         ]),
         case_name: "fault_cluster_cold_restart_recovers_and_preserves_committed_objects",
-        description: "Pause the RustFS operator, scale the Tenant StatefulSet to zero, hold the total outage while the workload runs, scale back to the full replica count, resume the operator, and verify every Pod exited cleanly, the cluster comes back healthy, and committed objects survive.",
+        description: "Pause the RustFS operator, scale the fresh Tenant StatefulSet to zero, drain every Pod before the workload starts, hold the total outage while the workload runs, scale back to the full replica count, resume the operator, and verify every Pod exited cleanly, the cluster comes back healthy, and committed objects survive; SIGTERM under load is covered by the other two lifecycle scenarios.",
         priority: FaultPriority::P0,
         backend: FaultBackend::KubernetesLifecycle,
         status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::Default,
-        isolation: FaultIsolation::ReusableTenant,
+        // kubectl scale leaves kubectl-scale co-owning spec.replicas of the
+        // fixture StatefulSet (server-side apply field management); only a
+        // fixture the next run recreates may carry that residue.
+        isolation: FaultIsolation::FreshTenant,
         crds: &[],
         required_tools: &[],
         percent_supported: false,
@@ -1400,7 +1403,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/cluster-cold-restart",
         ci_phase: "faults",
-        target: "the whole Tenant StatefulSet scaled to zero replicas and back, with the RustFS operator Deployment named by RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT paused so it cannot reconcile the replica count",
+        target: "the whole fresh Tenant StatefulSet (podManagementPolicy Parallel, claims retained on scale-down) scaled to zero replicas and back, with the RustFS operator Deployment named by RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT paused so its server-side apply cannot race or conflict with the scale",
         target_proof: &[
             "target-proof.json must bind every RustFS Pod to exactly one controlling StatefulSet with its UID, replica count, grace period, and a PVC retention policy that retains claims on scale-down",
             "pod-lifecycle-evidence.json must record the operator pause and resume, every spec.replicas sample taken while the outage was held, every Pod's terminated state, and the new Pod UIDs after scale-up",
@@ -2035,6 +2038,33 @@ mod tests {
             assert!(!spec.percent_supported, "{name}");
             assert_eq!(spec.priority, super::FaultPriority::P0, "{name}");
         }
+        // The fault-test script's Chaos Mesh gate keys off these fields.
+        let json: serde_json::Value =
+            serde_json::from_str(&scenario_catalog_json().expect("catalog json")).expect("json");
+        let lifecycle_entries = json
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter(|entry| entry["backend"] == "kubernetes-lifecycle")
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle_entries.len(), 3);
+        for entry in lifecycle_entries {
+            assert_eq!(entry["crds"], serde_json::json!([]), "{entry}");
+            assert_eq!(entry["required_tools"], serde_json::json!([]), "{entry}");
+        }
+        assert_eq!(
+            scenario_spec(CLUSTER_COLD_RESTART_SCENARIO)
+                .expect("scenario")
+                .isolation,
+            super::FaultIsolation::FreshTenant,
+            "the scale residue must not survive into another scenario"
+        );
+        assert_eq!(
+            scenario_spec(ROLLING_RESTART_ALL_SCENARIO)
+                .expect("scenario")
+                .isolation,
+            super::FaultIsolation::ReusableTenant
+        );
         assert!(
             scenario_spec(POD_GRACEFUL_RESTART_ONE_SCENARIO)
                 .expect("scenario")

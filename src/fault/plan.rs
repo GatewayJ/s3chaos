@@ -117,7 +117,9 @@ pub enum FaultTarget {
     RustfsServerPeerNetwork,
     RustfsServerResource,
     DedicatedBlockDevice,
-    /// The whole Tenant StatefulSet: every RustFS server Pod in turn or at once.
+    /// The whole Tenant StatefulSet: every RustFS server Pod in turn or at
+    /// once. Plans select it as `FixedTargets(1)`, meaning one StatefulSet;
+    /// the Pod set is proven live from that StatefulSet at apply time.
     RustfsServerStatefulSet,
 }
 

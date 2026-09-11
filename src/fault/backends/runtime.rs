@@ -139,9 +139,11 @@ fn cleanup_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Res
         }
         FaultBackend::DeviceMapper => Ok(()),
         FaultBackend::PlannedReliabilityWorkflow => Ok(()),
-        // Lifecycle operations leave no resource behind: a Pod delete or a
-        // scale completes or is rolled back by the handle itself.
-        FaultBackend::KubernetesLifecycle => Ok(()),
+        // A cold restart records its operator pause on the operator Deployment;
+        // a previous run that died before restoring it is repaired here.
+        FaultBackend::KubernetesLifecycle => {
+            lifecycle::restore_paused_operators(config).map(|_| ())
+        }
     }
 }
 

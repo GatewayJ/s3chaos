@@ -33,26 +33,35 @@ pub const TIMESTAMP_TOLERANCE_MS: u64 = 1_000;
 /// on SIGTERM within its grace period; a product defect, not an environment
 /// problem.
 pub const GRACEFUL_SHUTDOWN_FAILED_CLASSIFICATION: &str = "graceful_shutdown_failed";
+/// Failure classification for a replacement Pod that never became Ready or
+/// restarted its container while starting (rustfs/rustfs#6573 family): the
+/// product could not come back, but node pressure or image pulls can produce
+/// the same symptom, so the domain stays shared.
+pub const REPLACEMENT_NOT_READY_CLASSIFICATION: &str = "product_or_environment";
+const HARNESS_CLASSIFICATION: &str = "test_or_environment";
 
+/// The restart shapes; serialized names keep the `-restart` suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum LifecycleOperation {
     /// Delete one Pod with its default grace period; the StatefulSet
     /// controller recreates it.
-    GracefulPodRestart,
+    #[serde(rename = "graceful-pod-restart")]
+    GracefulPod,
     /// Delete every Pod one at a time from the highest ordinal down, waiting
     /// for each replacement to become Ready before the next deletion.
-    RollingRestart,
+    #[serde(rename = "rolling-restart")]
+    Rolling,
     /// Scale the StatefulSet to zero, hold the outage, and scale it back.
-    ColdRestart,
+    #[serde(rename = "cold-restart")]
+    Cold,
 }
 
 impl LifecycleOperation {
     pub fn from_kind(kind: FaultKind) -> Result<Self> {
         match kind {
-            FaultKind::RustfsServerPodGracefulRestart => Ok(Self::GracefulPodRestart),
-            FaultKind::RustfsServerRollingRestart => Ok(Self::RollingRestart),
-            FaultKind::RustfsServerColdRestart => Ok(Self::ColdRestart),
+            FaultKind::RustfsServerPodGracefulRestart => Ok(Self::GracefulPod),
+            FaultKind::RustfsServerRollingRestart => Ok(Self::Rolling),
+            FaultKind::RustfsServerColdRestart => Ok(Self::Cold),
             other => bail!(
                 "fault kind {} is not a Kubernetes lifecycle operation",
                 other.as_str()
@@ -62,14 +71,14 @@ impl LifecycleOperation {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::GracefulPodRestart => "graceful-pod-restart",
-            Self::RollingRestart => "rolling-restart",
-            Self::ColdRestart => "cold-restart",
+            Self::GracefulPod => "graceful-pod-restart",
+            Self::Rolling => "rolling-restart",
+            Self::Cold => "cold-restart",
         }
     }
 
     pub fn restarts_every_pod(self) -> bool {
-        matches!(self, Self::RollingRestart | Self::ColdRestart)
+        matches!(self, Self::Rolling | Self::Cold)
     }
 }
 
@@ -97,6 +106,30 @@ pub struct StatefulSetIdentity {
     pub update_revision: Option<String>,
 }
 
+impl StatefulSetIdentity {
+    /// A cold restart scales to zero and back: the claims must survive the
+    /// scale-down, and every replacement must be created at once because
+    /// RustFS readiness needs its peers (under `OrderedReady` ordinal 1 is
+    /// never created while ordinal 0 waits for it, wedging the Tenant).
+    pub fn require_cold_restart_eligible(&self) -> Result<()> {
+        ensure!(
+            self.pvc_retention_when_scaled
+                .as_deref()
+                .is_none_or(|policy| policy == "Retain"),
+            "StatefulSet {} persistentVolumeClaimRetentionPolicy.whenScaled={:?} would delete data on scale-down; refusing the cold restart",
+            self.name,
+            self.pvc_retention_when_scaled
+        );
+        ensure!(
+            self.pod_management_policy.as_deref() == Some("Parallel"),
+            "StatefulSet {} podManagementPolicy is {:?}; a cold restart requires Parallel so every RustFS Pod is recreated at once",
+            self.name,
+            self.pod_management_policy
+        );
+        Ok(())
+    }
+}
+
 /// Final `state.terminated` of the RustFS container in a deleted Pod.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,11 +151,13 @@ pub struct ContainerTermination {
 
 /// How the RustFS container left when its Pod was deleted.
 ///
-/// Rule (inputs: effective grace period G, SIGTERM reference time T, final
-/// terminated state with exit code E, signal S, reason R, finishedAt F;
+/// Rule (inputs: effective grace period G, SIGTERM reference time T taken
+/// from the graceful delete's `deletionTimestamp - deletionGracePeriodSeconds`,
+/// final terminated state with exit code E, signal S, reason R, finishedAt F;
 /// duration D = F - T, tolerance 1s for second-granular timestamps):
 ///
-/// - no terminated state observed -> `unobserved` (harness failure);
+/// - no terminated state or no SIGTERM reference observed -> `unobserved`
+///   (harness failure);
 /// - R == "OOMKilled" -> `oom_killed`;
 /// - E == 0 and D <= G + 1s -> `graceful_exit` (the only PASS);
 /// - E == 0 and D > G + 1s -> `inconsistent_timing` (kubelet would have
@@ -160,14 +195,14 @@ impl TerminationClassification {
                 GRACEFUL_SHUTDOWN_FAILED_CLASSIFICATION
             }
             Self::KilledBeforeGraceExpired | Self::OomKilled => "product_or_environment",
-            Self::InconsistentTiming | Self::Unobserved => "test_or_environment",
+            Self::InconsistentTiming | Self::Unobserved => HARNESS_CLASSIFICATION,
         }
     }
 }
 
 pub struct TerminationClassificationInput<'a> {
     pub grace_period_seconds: u64,
-    pub sigterm_reference_at_ms: u64,
+    pub sigterm_reference_at_ms: Option<u64>,
     pub terminated: Option<&'a ContainerTermination>,
 }
 
@@ -176,30 +211,30 @@ pub struct ClassifiedTermination {
     pub duration_ms: Option<u64>,
 }
 
+const UNOBSERVED: ClassifiedTermination = ClassifiedTermination {
+    classification: TerminationClassification::Unobserved,
+    duration_ms: None,
+};
+
 pub fn classify_termination(input: &TerminationClassificationInput<'_>) -> ClassifiedTermination {
-    let Some(terminated) = input.terminated else {
-        return ClassifiedTermination {
-            classification: TerminationClassification::Unobserved,
-            duration_ms: None,
-        };
+    let (Some(terminated), Some(sigterm_at_ms)) = (input.terminated, input.sigterm_reference_at_ms)
+    else {
+        return UNOBSERVED;
     };
-    let finished_at_ms = terminated
+    let Some(finished_at_ms) = terminated
         .finished_at
         .as_deref()
-        .and_then(|value| parse_rfc3339_ms(value).ok());
-    let Some(finished_at_ms) = finished_at_ms else {
-        return ClassifiedTermination {
-            classification: TerminationClassification::Unobserved,
-            duration_ms: None,
-        };
+        .and_then(|value| parse_rfc3339_ms(value).ok())
+    else {
+        return UNOBSERVED;
     };
-    if finished_at_ms + TIMESTAMP_TOLERANCE_MS < input.sigterm_reference_at_ms {
+    if finished_at_ms + TIMESTAMP_TOLERANCE_MS < sigterm_at_ms {
         return ClassifiedTermination {
             classification: TerminationClassification::InconsistentTiming,
             duration_ms: None,
         };
     }
-    let duration_ms = finished_at_ms.saturating_sub(input.sigterm_reference_at_ms);
+    let duration_ms = finished_at_ms.saturating_sub(sigterm_at_ms);
     let grace_ms = input.grace_period_seconds.saturating_mul(1_000);
     let reason = terminated.reason.as_deref().unwrap_or_default();
     let sigkill = terminated.exit_code == 137 || terminated.signal == Some(9);
@@ -238,6 +273,26 @@ pub fn parse_rfc3339_ms(value: &str) -> Result<u64> {
     u64::try_from(millis).map_err(|_| anyhow::anyhow!("timestamp {value:?} predates the epoch"))
 }
 
+/// A held total outage serves nothing: a family that answered a request
+/// (2xx or 404) or that was never attempted is a contract violation.
+pub fn total_outage_violation(
+    family: &str,
+    ok: usize,
+    not_found: usize,
+    total: usize,
+) -> Option<String> {
+    if total == 0 {
+        return Some(format!(
+            "cold-restart outage evidence is incomplete: {family} was never attempted while the StatefulSet was scaled to zero"
+        ));
+    }
+    (ok > 0 || not_found > 0).then(|| {
+        format!(
+            "cold-restart outage was not total: {family} answered {ok} request(s) with success and {not_found} with 404 while no RustFS Pod should exist"
+        )
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodTerminationEvidence {
@@ -246,9 +301,11 @@ pub struct PodTerminationEvidence {
     pub old_uid: String,
     pub restart_count_before: u64,
     pub termination_grace_period_seconds: u64,
-    /// Harness clock when the delete request was issued; the SIGTERM
-    /// reference when the API server's deletion timestamp was not observed.
+    /// Harness clock when the delete request was issued.
     pub delete_requested_at_ms: u64,
+    /// From the graceful delete (the first observation with a positive
+    /// `deletionGracePeriodSeconds`); kubelet's final delete rewrites both to
+    /// now/0 and is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,6 +326,8 @@ pub struct PodTerminationEvidence {
     pub old_uid_gone_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_uid: Option<String>,
+    /// RustFS container restarts of the replacement Pod when it became Ready
+    /// (or was last seen); anything above zero is a crash-looping start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_count_after: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -281,13 +340,6 @@ pub struct PodTerminationEvidence {
 }
 
 impl PodTerminationEvidence {
-    /// The time kubelet started terminating the container, best evidence
-    /// first.
-    pub fn sigterm_reference_at_ms(&self) -> u64 {
-        self.sigterm_requested_at_ms
-            .unwrap_or(self.delete_requested_at_ms)
-    }
-
     pub fn violations(&self) -> Vec<String> {
         let mut violations = Vec::new();
         let pod = &self.pod_name;
@@ -307,7 +359,7 @@ impl PodTerminationEvidence {
         }
         let expected = classify_termination(&TerminationClassificationInput {
             grace_period_seconds: self.termination_grace_period_seconds,
-            sigterm_reference_at_ms: self.sigterm_reference_at_ms(),
+            sigterm_reference_at_ms: self.sigterm_requested_at_ms,
             terminated: self.terminated.as_ref(),
         });
         if expected.classification != self.classification
@@ -321,12 +373,23 @@ impl PodTerminationEvidence {
                 expected.duration_ms
             ));
         }
-        if let Some(grace) = self.deletion_grace_period_seconds
-            && u64::try_from(grace).ok() != Some(self.termination_grace_period_seconds)
-        {
+        match self.deletion_grace_period_seconds {
+            None => violations.push(format!(
+                "Pod {pod} graceful deletion timestamp was never observed"
+            )),
+            Some(grace)
+                if u64::try_from(grace).ok() != Some(self.termination_grace_period_seconds) =>
+            {
+                violations.push(format!(
+                    "Pod {pod} was deleted with grace {grace}s instead of its spec terminationGracePeriodSeconds {}",
+                    self.termination_grace_period_seconds
+                ));
+            }
+            Some(_) => {}
+        }
+        if self.deletion_timestamp.is_none() || self.sigterm_requested_at_ms.is_none() {
             violations.push(format!(
-                "Pod {pod} was deleted with grace {grace}s instead of its spec terminationGracePeriodSeconds {}",
-                self.termination_grace_period_seconds
+                "Pod {pod} has no SIGTERM reference derived from its deletion timestamp"
             ));
         }
         match &self.new_uid {
@@ -353,6 +416,19 @@ impl PodTerminationEvidence {
         }
         violations
     }
+
+    /// The failure classification this target contributes, if it failed.
+    pub fn failure_classification(&self) -> Option<&'static str> {
+        if !self.classification.is_graceful() {
+            return Some(self.classification.failure_classification());
+        }
+        let replacement_failed = self.replacement_ready_at_ms.is_none()
+            || self.restart_count_after.is_none_or(|count| count > 0);
+        if replacement_failed {
+            return Some(REPLACEMENT_NOT_READY_CLASSIFICATION);
+        }
+        (!self.violations().is_empty()).then_some(HARNESS_CLASSIFICATION)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,6 +436,10 @@ impl PodTerminationEvidence {
 pub struct OperatorPauseEvidence {
     pub namespace: String,
     pub deployment: String,
+    /// Container image that identified the Deployment as the RustFS operator.
+    pub image: String,
+    /// `"image"` or `"label"`: which identity rule matched.
+    pub identity_matched_by: String,
     pub replicas_before: u32,
     pub pause_requested_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -386,8 +466,8 @@ pub struct OutageEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub all_pods_terminated_at_ms: Option<u64>,
     /// Every `spec.replicas` sample taken while the outage was supposed to be
-    /// held; any non-zero sample means an external controller fought the
-    /// scale-down and the outage was not what the scenario claims.
+    /// held; any non-zero sample means something else wrote the scale and the
+    /// outage was not what the scenario claims.
     #[serde(default)]
     pub replica_observations: Vec<ReplicaObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -450,7 +530,7 @@ impl PodLifecycleEvidence {
             violations.push("no Pod was restarted".to_string());
         }
         match self.operation {
-            LifecycleOperation::GracefulPodRestart => {
+            LifecycleOperation::GracefulPod => {
                 if self.targets.len() != 1 {
                     violations.push(format!(
                         "graceful Pod restart must target exactly one Pod, got {}",
@@ -458,7 +538,7 @@ impl PodLifecycleEvidence {
                     ));
                 }
             }
-            LifecycleOperation::RollingRestart | LifecycleOperation::ColdRestart => {
+            LifecycleOperation::Rolling | LifecycleOperation::Cold => {
                 if self.targets.len() != usize::try_from(self.statefulset.replicas).unwrap_or(0) {
                     violations.push(format!(
                         "{} must restart every one of {} Pods, got {}",
@@ -505,16 +585,16 @@ impl PodLifecycleEvidence {
             .iter()
             .filter(|target| target.restarted_after_workload)
             .count();
-        if deferred > 1 || (deferred == 1 && self.operation != LifecycleOperation::RollingRestart) {
+        if deferred > 1 || (deferred == 1 && self.operation != LifecycleOperation::Rolling) {
             violations.push(format!(
                 "{deferred} Pod(s) marked restarted-after-workload; only a rolling restart may defer exactly one"
             ));
         }
         match (self.operation, &self.outage) {
-            (LifecycleOperation::ColdRestart, None) => {
+            (LifecycleOperation::Cold, None) => {
                 violations.push("cold restart recorded no outage evidence".to_string());
             }
-            (LifecycleOperation::ColdRestart, Some(outage)) => {
+            (LifecycleOperation::Cold, Some(outage)) => {
                 if !outage.held_at_zero() {
                     violations.push(
                         "StatefulSet spec.replicas was not held at zero for the whole outage"
@@ -546,16 +626,8 @@ impl PodLifecycleEvidence {
                             .to_string(),
                     ),
                 }
-                if self
-                    .statefulset
-                    .pvc_retention_when_scaled
-                    .as_deref()
-                    .is_some_and(|policy| policy != "Retain")
-                {
-                    violations.push(
-                        "StatefulSet persistentVolumeClaimRetentionPolicy.whenScaled would delete data on scale-down"
-                            .to_string(),
-                    );
+                if let Err(error) = self.statefulset.require_cold_restart_eligible() {
+                    violations.push(error.to_string());
                 }
             }
             (_, Some(_)) => {
@@ -593,20 +665,22 @@ impl PodLifecycleEvidence {
         Ok(())
     }
 
-    /// The failure classification a failed operation records: the most
-    /// product-attributable termination outcome wins, and structural
-    /// problems (missing evidence, unheld outage) stay on the harness side.
+    /// The failure classification a failed operation records. Precedence:
+    /// a container that did not leave cleanly (`graceful_shutdown_failed`),
+    /// then a replacement that could not come back
+    /// (`product_or_environment`), then structural evidence problems
+    /// (`test_or_environment`).
     pub fn failure_classification(&self) -> &'static str {
-        let mut classification = "test_or_environment";
-        for target in &self.targets {
-            if target.classification.is_graceful() {
-                continue;
-            }
-            let candidate = target.classification.failure_classification();
+        let mut classification = HARNESS_CLASSIFICATION;
+        for candidate in self
+            .targets
+            .iter()
+            .filter_map(PodTerminationEvidence::failure_classification)
+        {
             if candidate == GRACEFUL_SHUTDOWN_FAILED_CLASSIFICATION {
                 return candidate;
             }
-            if candidate == "product_or_environment" {
+            if candidate == REPLACEMENT_NOT_READY_CLASSIFICATION {
                 classification = candidate;
             }
         }
@@ -723,7 +797,7 @@ impl PodLifecycleEvidence {
             }
         }
         if let Some(served) = run.served_by_pod
-            && self.operation == LifecycleOperation::RollingRestart
+            && self.operation == LifecycleOperation::Rolling
         {
             ensure!(
                 self.targets
@@ -793,13 +867,17 @@ pub struct LifecycleStatusSnapshot {
     pub observed_at_ms: u64,
 }
 
+/// JSON pointer to `target_pods` inside a serialized `FaultStatusSnapshot`
+/// (`lifecycle_status` is a plain field; the payload is camelCase).
+pub const SNAPSHOT_TARGET_PODS_POINTER: &str = "/lifecycle_status/targetPods";
+
 #[cfg(test)]
 mod tests {
     use super::{
         ContainerTermination, LifecycleOperation, LifecycleRunContext, OperatorPauseEvidence,
         OutageEvidence, PodLifecycleEvidence, PodTerminationEvidence, ReplicaObservation,
         StatefulSetIdentity, TerminationClassification, TerminationClassificationInput,
-        classify_termination, parse_rfc3339_ms,
+        classify_termination, parse_rfc3339_ms, total_outage_violation,
     };
     use crate::fault::plan::FaultKind;
 
@@ -817,13 +895,17 @@ mod tests {
 
     const SIGTERM_AT: &str = "2026-09-11T10:05:00Z";
 
+    fn sigterm_ms() -> u64 {
+        parse_rfc3339_ms(SIGTERM_AT).expect("sigterm")
+    }
+
     fn classify(
         grace: u64,
         terminated_state: Option<&ContainerTermination>,
     ) -> (TerminationClassification, Option<u64>) {
         let result = classify_termination(&TerminationClassificationInput {
             grace_period_seconds: grace,
-            sigterm_reference_at_ms: parse_rfc3339_ms(SIGTERM_AT).expect("sigterm"),
+            sigterm_reference_at_ms: Some(sigterm_ms()),
             terminated: terminated_state,
         });
         (result.classification, result.duration_ms)
@@ -844,6 +926,12 @@ mod tests {
             classify(30, Some(&terminated(0, "2026-09-11T10:05:32Z"))).0,
             TerminationClassification::InconsistentTiming
         );
+        // Sub-second exits that finish before the second-granular SIGTERM
+        // reference stay graceful within the tolerance.
+        assert_eq!(
+            classify(30, Some(&terminated(0, "2026-09-11T10:04:59.500Z"))),
+            (TerminationClassification::GracefulExit, Some(0))
+        );
     }
 
     #[test]
@@ -858,6 +946,11 @@ mod tests {
         assert_eq!(
             classify(30, Some(&terminated(137, "2026-09-11T10:05:29Z"))).0,
             TerminationClassification::KilledOnGraceTimeout
+        );
+        // Two seconds early is outside the rounding tolerance: an external kill.
+        assert_eq!(
+            classify(30, Some(&terminated(137, "2026-09-11T10:05:28Z"))).0,
+            TerminationClassification::KilledBeforeGraceExpired
         );
         assert_eq!(
             classify(30, Some(&terminated(137, "2026-09-11T10:05:10Z"))).0,
@@ -874,6 +967,10 @@ mod tests {
             TerminationClassification::KilledOnGraceTimeout.failure_classification(),
             "graceful_shutdown_failed"
         );
+        assert_eq!(
+            TerminationClassification::KilledBeforeGraceExpired.failure_classification(),
+            "product_or_environment"
+        );
     }
 
     #[test]
@@ -882,11 +979,20 @@ mod tests {
             classify(30, Some(&terminated(143, "2026-09-11T10:05:00Z"))).0,
             TerminationClassification::TerminatedBySignalDefault
         );
+        // Signal 15 reported with a foreign exit code is still the default
+        // SIGTERM action.
+        let mut signalled = terminated(1, "2026-09-11T10:05:00Z");
+        signalled.signal = Some(15);
+        assert_eq!(
+            classify(30, Some(&signalled)).0,
+            TerminationClassification::TerminatedBySignalDefault
+        );
         assert_eq!(
             classify(30, Some(&terminated(1, "2026-09-11T10:05:02Z"))).0,
             TerminationClassification::ErrorExit
         );
-        let mut oom = terminated(137, "2026-09-11T10:05:03Z");
+        // OOMKilled wins even when the runtime reports exit code 0.
+        let mut oom = terminated(0, "2026-09-11T10:05:03Z");
         oom.reason = Some("OOMKilled".to_string());
         assert_eq!(
             classify(30, Some(&oom)).0,
@@ -906,10 +1012,20 @@ mod tests {
             classify(30, Some(&no_finish)).0,
             TerminationClassification::Unobserved
         );
+        // Without a SIGTERM reference nothing can be classified.
+        let no_reference = classify_termination(&TerminationClassificationInput {
+            grace_period_seconds: 30,
+            sigterm_reference_at_ms: None,
+            terminated: Some(&terminated(0, "2026-09-11T10:05:01Z")),
+        });
+        assert_eq!(
+            no_reference.classification,
+            TerminationClassification::Unobserved
+        );
     }
 
     fn target(name: &str, ordinal: u32, deferred: bool) -> PodTerminationEvidence {
-        let delete_requested_at_ms = parse_rfc3339_ms(SIGTERM_AT).expect("sigterm") - 200;
+        let delete_requested_at_ms = sigterm_ms() - 200;
         PodTerminationEvidence {
             pod_name: name.to_string(),
             ordinal,
@@ -919,7 +1035,7 @@ mod tests {
             delete_requested_at_ms,
             deletion_timestamp: Some("2026-09-11T10:05:30Z".to_string()),
             deletion_grace_period_seconds: Some(30),
-            sigterm_requested_at_ms: Some(parse_rfc3339_ms(SIGTERM_AT).expect("sigterm")),
+            sigterm_requested_at_ms: Some(sigterm_ms()),
             terminated: Some(terminated(0, "2026-09-11T10:05:07Z")),
             observation_source: Some("watch".to_string()),
             termination_duration_ms: Some(7_000),
@@ -952,7 +1068,7 @@ mod tests {
         operation: LifecycleOperation,
         targets: Vec<PodTerminationEvidence>,
     ) -> PodLifecycleEvidence {
-        let started_at_ms = parse_rfc3339_ms(SIGTERM_AT).expect("sigterm") - 1_000;
+        let started_at_ms = sigterm_ms() - 1_000;
         PodLifecycleEvidence {
             scenario: "pod-graceful-restart-one".to_string(),
             run_id: "run-1".to_string(),
@@ -983,7 +1099,7 @@ mod tests {
         after: &'a [(String, String)],
         served_by_pod: Option<&'a str>,
     ) -> LifecycleRunContext<'a> {
-        let base = parse_rfc3339_ms(SIGTERM_AT).expect("sigterm");
+        let base = sigterm_ms();
         LifecycleRunContext {
             kind,
             pods_before: before,
@@ -1000,7 +1116,7 @@ mod tests {
     #[test]
     fn graceful_single_restart_passes_and_binds_to_run_identities() {
         let report = evidence(
-            LifecycleOperation::GracefulPodRestart,
+            LifecycleOperation::GracefulPod,
             vec![target("rustfs-1", 1, false)],
         );
         assert!(report.passed, "{:?}", report.violations);
@@ -1035,26 +1151,29 @@ mod tests {
         // A stale old uid cannot pass.
         let mut wrong_before = before.clone();
         wrong_before[1].1 = "other".to_string();
-        assert!(
-            report
-                .validate_against_run(&run_context(
-                    FaultKind::RustfsServerPodGracefulRestart,
-                    &wrong_before,
-                    &after,
-                    None,
-                ))
-                .is_err()
-        );
+        let error = report
+            .validate_against_run(&run_context(
+                FaultKind::RustfsServerPodGracefulRestart,
+                &wrong_before,
+                &after,
+                None,
+            ))
+            .expect_err("stale old uid");
+        assert!(error.to_string().contains("old uid"), "{error}");
         // The operation must match the scenario's fault kind.
+        let error = report
+            .validate_against_run(&run_context(
+                FaultKind::RustfsServerRollingRestart,
+                &before,
+                &after,
+                None,
+            ))
+            .expect_err("kind mismatch");
         assert!(
-            report
-                .validate_against_run(&run_context(
-                    FaultKind::RustfsServerRollingRestart,
-                    &before,
-                    &after,
-                    None,
-                ))
-                .is_err()
+            error
+                .to_string()
+                .contains("does not match the scenario fault kind"),
+            "{error}"
         );
     }
 
@@ -1064,7 +1183,7 @@ mod tests {
         killed.terminated = Some(terminated(137, "2026-09-11T10:05:30Z"));
         killed.termination_duration_ms = Some(30_000);
         killed.classification = TerminationClassification::KilledOnGraceTimeout;
-        let report = evidence(LifecycleOperation::GracefulPodRestart, vec![killed]);
+        let report = evidence(LifecycleOperation::GracefulPod, vec![killed]);
         assert!(!report.passed);
         assert!(report.require_success().is_err());
         assert_eq!(report.failure_classification(), "graceful_shutdown_failed");
@@ -1072,7 +1191,7 @@ mod tests {
         // A passed flag with a classification that contradicts the terminated
         // state is rejected on recomputation.
         let mut forged = evidence(
-            LifecycleOperation::GracefulPodRestart,
+            LifecycleOperation::GracefulPod,
             vec![target("rustfs-1", 1, false)],
         );
         forged.targets[0].terminated = Some(terminated(137, "2026-09-11T10:05:30Z"));
@@ -1080,32 +1199,193 @@ mod tests {
         let error = forged.require_success().expect_err("forged classification");
         assert!(error.to_string().contains("does not follow"), "{error}");
 
+        // A replacement that crash-looped or never came back is a product
+        // (or environment) failure, not a harness problem.
         let mut crashlooping = target("rustfs-1", 1, false);
         crashlooping.restart_count_after = Some(2);
-        let report = evidence(LifecycleOperation::GracefulPodRestart, vec![crashlooping]);
+        let report = evidence(LifecycleOperation::GracefulPod, vec![crashlooping]);
         assert!(
             report
                 .violations
                 .iter()
                 .any(|v| v.contains("restarted 2 time"))
         );
-        assert_eq!(report.failure_classification(), "test_or_environment");
+        assert_eq!(report.failure_classification(), "product_or_environment");
+        let mut never_ready = target("rustfs-1", 1, false);
+        never_ready.replacement_ready_at_ms = None;
+        never_ready.restart_count_after = None;
+        let report = evidence(LifecycleOperation::GracefulPod, vec![never_ready]);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("never became Ready"))
+        );
+        assert_eq!(report.failure_classification(), "product_or_environment");
+        // A grace timeout outranks a replacement failure on another target.
+        let mut killed = target("rustfs-0", 0, false);
+        killed.terminated = Some(terminated(137, "2026-09-11T10:05:30Z"));
+        killed.termination_duration_ms = Some(30_000);
+        killed.classification = TerminationClassification::KilledOnGraceTimeout;
+        let mut never_ready = target("rustfs-1", 1, false);
+        never_ready.replacement_ready_at_ms = None;
+        let report = evidence(LifecycleOperation::Rolling, vec![never_ready, killed]);
+        assert_eq!(report.failure_classification(), "graceful_shutdown_failed");
 
         let mut unobserved = target("rustfs-1", 1, false);
         unobserved.terminated = None;
         unobserved.termination_duration_ms = None;
         unobserved.classification = TerminationClassification::Unobserved;
-        let report = evidence(LifecycleOperation::GracefulPodRestart, vec![unobserved]);
+        let report = evidence(LifecycleOperation::GracefulPod, vec![unobserved]);
         assert!(!report.passed);
+        assert_eq!(report.failure_classification(), "test_or_environment");
 
         let mut short_grace = target("rustfs-1", 1, false);
         short_grace.deletion_grace_period_seconds = Some(0);
-        let report = evidence(LifecycleOperation::GracefulPodRestart, vec![short_grace]);
+        let report = evidence(LifecycleOperation::GracefulPod, vec![short_grace]);
         assert!(
             report
                 .violations
                 .iter()
                 .any(|v| v.contains("instead of its spec"))
+        );
+
+        // Missing deletion metadata is a violation, never a silent fallback.
+        let mut no_deletion = target("rustfs-1", 1, false);
+        no_deletion.deletion_timestamp = None;
+        no_deletion.deletion_grace_period_seconds = None;
+        no_deletion.sigterm_requested_at_ms = None;
+        no_deletion.termination_duration_ms = None;
+        no_deletion.classification = TerminationClassification::Unobserved;
+        let report = evidence(LifecycleOperation::GracefulPod, vec![no_deletion]);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("deletion timestamp was never observed"))
+        );
+    }
+
+    #[test]
+    fn target_violations_cover_identity_and_restart_count_gaps() {
+        let mut same_uid = target("rustfs-1", 1, false);
+        same_uid.new_uid = Some(same_uid.old_uid.clone());
+        assert!(
+            same_uid
+                .violations()
+                .iter()
+                .any(|v| v.contains("equals the deleted uid"))
+        );
+        let mut no_uid = target("rustfs-1", 1, false);
+        no_uid.new_uid = None;
+        assert!(
+            no_uid
+                .violations()
+                .iter()
+                .any(|v| v.contains("no replacement uid"))
+        );
+        let mut unknown_restarts = target("rustfs-1", 1, false);
+        unknown_restarts.restart_count_after = None;
+        assert!(
+            unknown_restarts
+                .violations()
+                .iter()
+                .any(|v| v.contains("restart count unknown"))
+        );
+        assert_eq!(
+            unknown_restarts.failure_classification(),
+            Some("product_or_environment")
+        );
+        let mut never_gone = target("rustfs-1", 1, false);
+        never_gone.old_uid_gone_at_ms = None;
+        assert!(
+            never_gone
+                .violations()
+                .iter()
+                .any(|v| v.contains("never observed gone"))
+        );
+        assert_eq!(
+            never_gone.failure_classification(),
+            Some("test_or_environment")
+        );
+        assert_eq!(target("rustfs-1", 1, false).failure_classification(), None);
+    }
+
+    #[test]
+    fn structural_violations_are_reported_individually() {
+        let base = evidence(
+            LifecycleOperation::GracefulPod,
+            vec![target("rustfs-1", 1, false)],
+        );
+        let mut no_after = base.clone();
+        no_after.statefulset_uid_after = None;
+        assert!(
+            no_after
+                .compute_violations()
+                .iter()
+                .any(|v| v.contains("not re-observed"))
+        );
+        let mut changed = base.clone();
+        changed.statefulset_uid_after = Some("sts-new".to_string());
+        assert!(
+            changed
+                .compute_violations()
+                .iter()
+                .any(|v| v.contains("UID changed"))
+        );
+        let mut duplicate = base.clone();
+        duplicate.targets.push(target("rustfs-1", 1, false));
+        assert!(
+            duplicate
+                .compute_violations()
+                .iter()
+                .any(|v| v.contains("duplicate Pod names"))
+        );
+        let mut early = base.clone();
+        early.targets[0].delete_requested_at_ms = early.started_at_ms - 1;
+        assert!(
+            early
+                .compute_violations()
+                .iter()
+                .any(|v| v.contains("outside the operation window"))
+        );
+        let mut deferred = base.clone();
+        deferred.targets[0].restarted_after_workload = true;
+        assert!(
+            deferred
+                .compute_violations()
+                .iter()
+                .any(|v| v.contains("only a rolling restart may defer"))
+        );
+        let mut outage = base.clone();
+        outage.outage = Some(OutageEvidence {
+            scale_down_requested_at_ms: 1,
+            all_pods_terminated_at_ms: None,
+            replica_observations: Vec::new(),
+            scale_up_requested_at_ms: None,
+            all_pods_ready_at_ms: None,
+        });
+        assert!(
+            outage
+                .compute_violations()
+                .iter()
+                .any(|v| v.contains("only a cold restart records outage"))
+        );
+        let mut window = base.clone();
+        window.started_at_ms = 0;
+        assert!(
+            window
+                .compute_violations()
+                .iter()
+                .any(|v| v.contains("operation window is invalid"))
+        );
+        let mut empty = base;
+        empty.targets.clear();
+        assert!(
+            empty
+                .compute_violations()
+                .iter()
+                .any(|v| v.contains("no Pod was restarted"))
         );
     }
 
@@ -1114,15 +1394,13 @@ mod tests {
         let before = pods("old");
         let after = pods("new");
         let complete = evidence(
-            LifecycleOperation::RollingRestart,
+            LifecycleOperation::Rolling,
             vec![target("rustfs-1", 1, false), target("rustfs-0", 0, true)],
         );
         assert!(complete.passed, "{:?}", complete.violations);
         let mut deferred_late = complete.clone();
-        deferred_late.targets[1].delete_requested_at_ms =
-            parse_rfc3339_ms(SIGTERM_AT).expect("sigterm") + 200_000;
-        deferred_late.targets[1].replacement_ready_at_ms =
-            Some(parse_rfc3339_ms(SIGTERM_AT).expect("sigterm") + 260_000);
+        deferred_late.targets[1].delete_requested_at_ms = sigterm_ms() + 200_000;
+        deferred_late.targets[1].replacement_ready_at_ms = Some(sigterm_ms() + 260_000);
         deferred_late
             .validate_against_run(&run_context(
                 FaultKind::RustfsServerRollingRestart,
@@ -1132,30 +1410,36 @@ mod tests {
             ))
             .expect("deferred served Pod");
         // Deferring the Pod that did not serve the endpoint is rejected.
+        let error = deferred_late
+            .validate_against_run(&run_context(
+                FaultKind::RustfsServerRollingRestart,
+                &before,
+                &after,
+                Some("rustfs-1"),
+            ))
+            .expect_err("wrong deferred Pod");
         assert!(
-            deferred_late
-                .validate_against_run(&run_context(
-                    FaultKind::RustfsServerRollingRestart,
-                    &before,
-                    &after,
-                    Some("rustfs-1"),
-                ))
-                .is_err()
+            error.to_string().contains("is not the Pod that served"),
+            "{error}"
         );
         // Deleting the deferred Pod during the workload is rejected.
+        let error = complete
+            .validate_against_run(&run_context(
+                FaultKind::RustfsServerRollingRestart,
+                &before,
+                &after,
+                Some("rustfs-0"),
+            ))
+            .expect_err("deferred Pod deleted under workload");
         assert!(
-            complete
-                .validate_against_run(&run_context(
-                    FaultKind::RustfsServerRollingRestart,
-                    &before,
-                    &after,
-                    Some("rustfs-0"),
-                ))
-                .is_err()
+            error
+                .to_string()
+                .contains("was deleted during the workload"),
+            "{error}"
         );
         // ClusterIP runs defer nothing.
         let all_during = evidence(
-            LifecycleOperation::RollingRestart,
+            LifecycleOperation::Rolling,
             vec![target("rustfs-1", 1, false), target("rustfs-0", 0, false)],
         );
         all_during
@@ -1166,18 +1450,20 @@ mod tests {
                 None,
             ))
             .expect("cluster ip rolling restart");
+        let error = all_during
+            .validate_against_run(&run_context(
+                FaultKind::RustfsServerRollingRestart,
+                &before,
+                &after,
+                Some("rustfs-0"),
+            ))
+            .expect_err("pinned endpoint without deferral");
         assert!(
-            all_during
-                .validate_against_run(&run_context(
-                    FaultKind::RustfsServerRollingRestart,
-                    &before,
-                    &after,
-                    Some("rustfs-0"),
-                ))
-                .is_err()
+            error.to_string().contains("did not defer its restart"),
+            "{error}"
         );
         let partial = evidence(
-            LifecycleOperation::RollingRestart,
+            LifecycleOperation::Rolling,
             vec![target("rustfs-1", 1, false)],
         );
         assert!(!partial.passed);
@@ -1189,14 +1475,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cold_restart_requires_a_held_outage_and_operator_pause() {
-        let base = parse_rfc3339_ms(SIGTERM_AT).expect("sigterm");
+    fn cold_restart_report() -> PodLifecycleEvidence {
+        let base = sigterm_ms();
         let mut report = evidence(
-            LifecycleOperation::ColdRestart,
+            LifecycleOperation::Cold,
             vec![target("rustfs-1", 1, false), target("rustfs-0", 0, false)],
         );
-        assert!(!report.passed);
         report.outage = Some(OutageEvidence {
             scale_down_requested_at_ms: base - 500,
             all_pods_terminated_at_ms: Some(base + 9_000),
@@ -1218,6 +1502,8 @@ mod tests {
         report.operator_pause = Some(OperatorPauseEvidence {
             namespace: "rustfs-system".to_string(),
             deployment: "rustfs-operator".to_string(),
+            image: "docker.io/rustfs/operator:1.0.0".to_string(),
+            identity_matched_by: "image".to_string(),
             replicas_before: 1,
             pause_requested_at_ms: base - 5_000,
             operator_pods_gone_at_ms: Some(base - 2_000),
@@ -1227,7 +1513,23 @@ mod tests {
         for target in &mut report.targets {
             target.replacement_ready_at_ms = Some(base + 200_000);
         }
-        let report = report.finalize();
+        report.finalize()
+    }
+
+    #[test]
+    fn cold_restart_requires_a_held_outage_and_operator_pause() {
+        let base = sigterm_ms();
+        let unheld = evidence(
+            LifecycleOperation::Cold,
+            vec![target("rustfs-1", 1, false), target("rustfs-0", 0, false)],
+        );
+        assert!(
+            unheld
+                .violations
+                .iter()
+                .any(|v| v.contains("recorded no outage evidence"))
+        );
+        let report = cold_restart_report();
         assert!(report.passed, "{:?}", report.violations);
         let before = pods("old");
         let after = pods("new");
@@ -1252,16 +1554,83 @@ mod tests {
 
         let mut unpaused = report.clone();
         unpaused.operator_pause = None;
-        assert!(!unpaused.finalize().passed);
+        assert!(
+            unpaused
+                .finalize()
+                .violations
+                .iter()
+                .any(|v| v.contains("requires the operator pause"))
+        );
+        let mut unresumed = report.clone();
+        unresumed.operator_pause.as_mut().unwrap().resumed_at_ms = None;
+        assert!(
+            unresumed
+                .finalize()
+                .violations
+                .iter()
+                .any(|v| v.contains("never resumed"))
+        );
 
         let mut deleting_pvcs = report.clone();
         deleting_pvcs.statefulset.pvc_retention_when_scaled = Some("Delete".to_string());
-        assert!(!deleting_pvcs.finalize().passed);
+        assert!(
+            deleting_pvcs
+                .finalize()
+                .violations
+                .iter()
+                .any(|v| v.contains("whenScaled"))
+        );
+        let mut ordered = report.clone();
+        ordered.statefulset.pod_management_policy = Some("OrderedReady".to_string());
+        assert!(ordered.statefulset.require_cold_restart_eligible().is_err());
+        assert!(
+            ordered
+                .finalize()
+                .violations
+                .iter()
+                .any(|v| v.contains("requires Parallel"))
+        );
+        let mut scaled_early = report.clone();
+        scaled_early
+            .outage
+            .as_mut()
+            .unwrap()
+            .scale_up_requested_at_ms = Some(base + 8_000);
+        assert!(
+            scaled_early
+                .finalize()
+                .violations
+                .iter()
+                .any(|v| v.contains("scaled up before every Pod was gone"))
+        );
 
         // The workload must lie entirely inside the outage.
         let mut context = run_context(FaultKind::RustfsServerColdRestart, &before, &after, None);
         context.workload_ended_at_ms = base + 130_000;
-        assert!(report.validate_against_run(&context).is_err());
+        let error = report
+            .validate_against_run(&context)
+            .expect_err("workload outlived the outage");
+        assert!(error.to_string().contains("does not enclose"), "{error}");
+    }
+
+    #[test]
+    fn total_outage_predicate_flags_any_served_or_unattempted_family() {
+        assert_eq!(total_outage_violation("gets", 0, 0, 12), None);
+        assert!(
+            total_outage_violation("deletes", 0, 1, 5)
+                .expect("404 counts as served")
+                .contains("1 with 404")
+        );
+        assert!(
+            total_outage_violation("multipart_aborts", 2, 0, 2)
+                .expect("success counts as served")
+                .contains("2 request(s) with success")
+        );
+        assert!(
+            total_outage_violation("lists", 0, 0, 0)
+                .expect("unattempted family")
+                .contains("never attempted")
+        );
     }
 
     #[test]

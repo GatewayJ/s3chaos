@@ -1453,19 +1453,24 @@ impl WorkloadSummary {
     /// A held total outage serves nothing: every operation family must have
     /// been attempted and none may have succeeded or answered 404.
     pub(in crate::fault) fn require_total_outage_effect(&self) -> Result<()> {
-        self.require_exercised()?;
-        for (kind, counts) in [
-            ("PUT", &self.puts),
-            ("GET", &self.gets),
-            ("DELETE", &self.deletes),
-            ("LIST", &self.lists),
-            ("CompleteMultipartUpload", &self.multipart_completes),
-            ("AbortMultipartUpload", &self.multipart_aborts),
+        for (family, counts) in [
+            ("puts", &self.puts),
+            ("gets", &self.gets),
+            ("deletes", &self.deletes),
+            ("lists", &self.lists),
+            ("multipart_completes", &self.multipart_completes),
+            ("multipart_aborts", &self.multipart_aborts),
         ] {
-            ensure!(
-                counts.ok == 0 && counts.not_found == 0,
-                "cold-restart outage was not total: {kind} outcomes include successes while no RustFS Pod should exist: {counts:?}"
-            );
+            if let Some(violation) =
+                crate::fault::backends::lifecycle::evidence::total_outage_violation(
+                    family,
+                    counts.ok,
+                    counts.not_found,
+                    counts.total(),
+                )
+            {
+                bail!("{violation}");
+            }
         }
         Ok(())
     }
