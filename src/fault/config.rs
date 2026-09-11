@@ -35,6 +35,7 @@ pub const DEFAULT_RUSTFS_VOLUME_PATH: &str = "/data/rustfs0";
 pub const DEFAULT_RUSTFS_POD_STABLE_WINDOW_SECONDS: u64 = 60;
 pub const DEFAULT_FAULT_DURATION_SECONDS: u64 = 7_200;
 pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+pub const DEFAULT_MIN_AVAILABILITY_PERCENT: u8 = 99;
 pub const DEFAULT_ACK_OPERATION_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_ACK_TO_FAULT_MS: u64 = 1_000;
 pub const DEFAULT_MAX_ACK_TO_FAULT_MS: u64 = MAX_ACK_TO_FAULT_MS;
@@ -108,6 +109,11 @@ pub struct FaultTestConfig {
     /// Percentage (0-100) of mixed-workload GETs issued as ranged reads.
     /// 0 keeps the historical whole-object-only behavior.
     pub workload_ranged_get_percent: u8,
+    /// Minimum per-operation-family success percentage (0-100) the mixed
+    /// workload must reach while the fault is active for scenarios whose
+    /// impact policy requires availability. The default leaves a small margin
+    /// for port-forward reconnects; live calibration may tighten it to 100.
+    pub min_availability_percent: u8,
     pub dm_name: Option<String>,
     pub dm_node: Option<String>,
     pub dm_mount_path: Option<String>,
@@ -322,6 +328,18 @@ impl FaultTestConfig {
                 ensure!(
                     percent <= 100,
                     "RUSTFS_FAULT_TEST_WORKLOAD_DIRECTORY_MARKER_PERCENT must be between 0 and 100"
+                );
+                percent
+            },
+            min_availability_percent: {
+                let percent = env_u8(
+                    &get_env,
+                    "RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT",
+                    DEFAULT_MIN_AVAILABILITY_PERCENT,
+                )?;
+                ensure!(
+                    percent <= 100,
+                    "RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT must be between 0 and 100"
                 );
                 percent
             },

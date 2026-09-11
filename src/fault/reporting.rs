@@ -657,6 +657,65 @@ mod tests {
     }
 
     #[test]
+    fn recovery_gate_classifications_project_as_product_run_failures() {
+        for (classification, stage, expected_ref) in [
+            (
+                "recovery_health_degraded",
+                "recovery-health",
+                "recovery-health.json",
+            ),
+            (
+                "post_recovery_write_failed",
+                "post-recovery-write",
+                "post-recovery-write-report.json",
+            ),
+            (
+                "availability_regression",
+                "availability",
+                "availability-report.json",
+            ),
+        ] {
+            let summary = FailureSummary::new("pod-failure", stage, classification, "degraded")
+                .expect("allowlisted classification");
+            assert_eq!(summary.s3_model_classification(), None, "{classification}");
+            assert_eq!(
+                summary.run_failure_reason(),
+                Some(classification),
+                "{classification}"
+            );
+            assert_eq!(
+                summary.responsibility_domain(),
+                Some(ResponsibilityDomain::Product),
+                "{classification}"
+            );
+            assert_eq!(
+                summary.phase(),
+                Some(if stage == "availability" {
+                    FailurePhase::Workload
+                } else {
+                    FailurePhase::Recovery
+                }),
+                "{classification}"
+            );
+            assert_eq!(
+                summary.primary_evidence_refs().first().map(String::as_str),
+                Some(expected_ref),
+                "{classification}"
+            );
+            summary
+                .validate_classification_projection()
+                .expect("consistent projection");
+        }
+        for classification in ["listed_key_unreadable", "unexpected_listed_object"] {
+            let summary = FailureSummary::new("io-eio", "checker-verdict", classification, "ghost")
+                .expect("allowlisted classification");
+            assert_eq!(summary.s3_model_classification(), Some(classification));
+            assert_eq!(summary.run_failure_reason(), None);
+            assert_eq!(summary.severity(), FailureSeverity::FailCorrectness);
+        }
+    }
+
+    #[test]
     fn writer_classification_allowlist_is_exhaustive_and_unique() {
         let expected = BTreeSet::from([
             "recovery_tail_read_latency",
@@ -670,8 +729,13 @@ mod tests {
             "version_id_missing_on_committed_write",
             "multipart_upload_lineage_incomplete",
             "list_unavailable_or_unknown",
+            "listed_key_unreadable",
+            "unexpected_listed_object",
             "data_corruption",
             "ambiguous_write_materialized",
+            "recovery_health_degraded",
+            "post_recovery_write_failed",
+            "availability_regression",
             "harness_error",
             "test_harness",
             "workload_execution_error",
@@ -759,6 +823,17 @@ mod tests {
                 "ambiguous_write_materialized",
                 FailureSeverity::NeedsInvestigation,
             ),
+            ("listed_key_unreadable", FailureSeverity::FailCorrectness),
+            ("unexpected_listed_object", FailureSeverity::FailCorrectness),
+            (
+                "recovery_health_degraded",
+                FailureSeverity::FailAvailability,
+            ),
+            (
+                "post_recovery_write_failed",
+                FailureSeverity::FailAvailability,
+            ),
+            ("availability_regression", FailureSeverity::FailAvailability),
         ] {
             let summary = FailureSummary::new("io-eio", "checker", classification, "failure")
                 .expect("allowlisted product classification");

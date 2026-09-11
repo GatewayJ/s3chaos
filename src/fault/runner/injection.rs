@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::fault::recovery_health::RUSTFS_CONTAINER_PORT;
+use crate::fault::reporting::PodIdentity;
 use crate::fault::{reporting::FaultStatusSnapshot, workload::StagedMultipartUpload};
-use crate::framework::port_forward::PortForwardGuard;
+use crate::framework::{
+    kubectl::Kubectl,
+    port_forward::{PortForwardGuard, PortForwardSpec},
+};
 use crate::{
     fault::{
         events::RunEventStatus,
@@ -41,9 +46,10 @@ use super::{
 };
 use crate::fault::backends::runtime::apply_fault;
 use crate::fault::workload::execution::{
-    MixedWorkloadRequest, MixedWorkloadResult, TypedQuorumReadCohortSource,
-    TypedQuorumReadExpectation, probe_typed_quorum_read_cohort, require_typed_quorum_read_survival,
-    run_mixed_workload, run_warp_mixed,
+    AVAILABILITY_REPORT_ARTIFACT, MixedWorkloadRequest, MixedWorkloadResult, ReadProbeSummary,
+    TypedQuorumReadCohortSource, TypedQuorumReadExpectation, probe_read_cohort,
+    probe_typed_quorum_read_cohort, require_typed_quorum_read_survival, run_mixed_workload,
+    run_warp_mixed,
 };
 
 impl FaultRun<'_> {
@@ -60,6 +66,7 @@ impl FaultRun<'_> {
             topology_observed_at_ms,
             host_storage_proof,
             execution_injection,
+            health_baseline: _,
         } = target;
         events.record(
             "fault-apply",
@@ -215,6 +222,8 @@ impl FaultRun<'_> {
             prefilled,
         } = prepared;
         let fault = &active.fault;
+        let served_by_pod =
+            self.pin_availability_endpoint(target, active, endpoint, port_forward)?;
         let volume_quorum_scenario = matches!(
             plan.scenario.as_str(),
             QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
@@ -334,6 +343,49 @@ impl FaultRun<'_> {
                 Some(serde_json::json!({ "class": class })),
             )?;
         }
+        let availability_read_probe = if self.context.spec.impact_policy.requires_availability() {
+            events.record(
+                "availability-read-probe",
+                RunEventStatus::Started,
+                "reading every committed object while the fault is active",
+                Some(serde_json::json!({ "objects": prefilled.len() })),
+            )?;
+            let summary = match self
+                .deadline
+                .run(probe_read_cohort(
+                    s3,
+                    history,
+                    prefilled,
+                    workload_plan.concurrency,
+                ))
+                .await
+            {
+                Ok(summary) => summary,
+                Err(error) => {
+                    self.record_failure(
+                        "availability-read-probe",
+                        "workload_or_product",
+                        &error,
+                        None,
+                        Some((fault, "availability-read-probe-failed")),
+                    )?;
+                    return Err(error);
+                }
+            };
+            events.record(
+                "availability-read-probe",
+                RunEventStatus::Observed,
+                "fault-active read probe completed; verdict follows the mixed workload",
+                Some(serde_json::json!({
+                    "objects": summary.objects,
+                    "verified": summary.verified,
+                    "failures": summary.failures.len(),
+                })),
+            )?;
+            Some(summary)
+        } else {
+            None
+        };
         events.record(
             "mixed-workload",
             RunEventStatus::Started,
@@ -392,6 +444,7 @@ impl FaultRun<'_> {
             active.fault_active_at_ms,
             workload_started_at_ms,
         )?;
+        self.require_availability(&workload, fault, availability_read_probe, served_by_pod)?;
         events.record(
             "fault-snapshot-after-workload",
             RunEventStatus::Started,
@@ -728,6 +781,138 @@ impl FaultRun<'_> {
         };
         Ok((fault_active_at_ms, active_snapshots))
     }
+    /// Availability scenarios must prove the service kept serving: the
+    /// fault-active read probe verified every committed object and each
+    /// workload family met the configured success floor.
+    /// The workload endpoint is a `kubectl port-forward` pinned to one Pod for
+    /// its lifetime. An availability verdict is only meaningful for a client
+    /// attached to a surviving node, so once the fault is active the forward
+    /// is re-established to a Pod the controller did not target. A ClusterIP
+    /// endpoint balances per connection and needs no pinning.
+    fn pin_availability_endpoint(
+        &self,
+        target: &ProvenTarget,
+        active: &ActiveFault,
+        endpoint: &str,
+        port_forward: &mut Option<PortForwardGuard>,
+    ) -> Result<Option<String>> {
+        let events = &self.context.events;
+        let cluster = &self.config.cluster;
+        if !self.context.spec.impact_policy.requires_availability() {
+            return Ok(None);
+        }
+        let Some(guard) = port_forward else {
+            events.record(
+                "availability-endpoint",
+                RunEventStatus::Observed,
+                "ClusterIP endpoint balances across ready Pods; no surviving-Pod pinning needed",
+                Some(serde_json::json!({ "endpoint": endpoint })),
+            )?;
+            return Ok(None);
+        };
+        let pinned = injected_source_pod_names(&active.active_snapshots).and_then(|targets| {
+            let survivor = surviving_pod_name(&target.pods_before, &targets)?;
+            let local_port = endpoint
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok())
+                .context("parse local S3 port-forward endpoint")?;
+            let spec = PortForwardSpec {
+                namespace: cluster.test_namespace.clone(),
+                service: format!("pod/{survivor}"),
+                local_port,
+                remote_port: RUSTFS_CONTAINER_PORT,
+            };
+            // Replacing the guard drops the Service forward first so the
+            // local port is free for the Pod forward.
+            *guard = spec.start_with_temp_log(&Kubectl::new(cluster))?;
+            Ok((survivor, targets))
+        });
+        match pinned {
+            Ok((survivor, targets)) => {
+                events.record(
+                    "availability-endpoint",
+                    RunEventStatus::Succeeded,
+                    "S3 endpoint re-pinned to a surviving RustFS Pod for the availability contract",
+                    Some(serde_json::json!({
+                        "served_by_pod": survivor,
+                        "fault_target_pods": targets,
+                        "endpoint": endpoint,
+                    })),
+                )?;
+                Ok(Some(survivor))
+            }
+            Err(error) => {
+                self.record_failure(
+                    "availability-endpoint",
+                    "environment_or_fault_backend",
+                    &error,
+                    None,
+                    Some((&active.fault, "availability-endpoint-failed")),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn require_availability(
+        &self,
+        workload: &MixedWorkloadResult,
+        fault: &AppliedFault,
+        availability_read_probe: Option<ReadProbeSummary>,
+        served_by_pod: Option<String>,
+    ) -> Result<()> {
+        let config = self.config;
+        let collector = self.collector;
+        let scenario = self.scenario;
+        let spec = self.context.spec;
+        let events = &self.context.events;
+        if !spec.impact_policy.requires_availability() {
+            ensure!(
+                availability_read_probe.is_none(),
+                "read probe ran for a scenario without an availability contract"
+            );
+            return Ok(());
+        }
+        let read_probe = availability_read_probe
+            .context("availability scenario ran its workload without the read probe")?;
+        let report = workload.summary.availability_report(
+            read_probe,
+            config.min_availability_percent,
+            served_by_pod,
+        );
+        collector.write_text(
+            scenario.case_name,
+            AVAILABILITY_REPORT_ARTIFACT,
+            &serde_json::to_string_pretty(&report)?,
+        )?;
+        if let Err(error) = report.require_success() {
+            self.record_failure(
+                "availability",
+                "availability_regression",
+                &error,
+                Some(serde_json::json!({
+                    "min_success_percent": report.min_success_percent,
+                    "read_probe_verified": report.read_probe.verified,
+                    "read_probe_objects": report.read_probe.objects,
+                    "violations": report.violations,
+                })),
+                Some((fault, "availability-failed")),
+            )?;
+            return Err(error);
+        }
+        events.record(
+            "availability",
+            RunEventStatus::Succeeded,
+            "the service kept serving committed reads and the mixed workload under the fault",
+            Some(serde_json::json!({
+                "min_success_percent": report.min_success_percent,
+                "read_probe_verified": report.read_probe.verified,
+                "workload": report.workload,
+            })),
+        )?;
+        Ok(())
+    }
+
     fn require_workload_impact(
         &self,
         workload: &MixedWorkloadResult,
@@ -821,5 +1006,126 @@ impl FaultRun<'_> {
             return Err(error);
         }
         Ok(require_client_disruption)
+    }
+}
+
+/// Pod names the Chaos Mesh controller injected as fault sources (selector
+/// key "."), read from the active-stage status snapshots. NetworkChaos
+/// ".Target" peers are not fault targets and stay eligible as survivors.
+fn injected_source_pod_names(snapshots: &[FaultStatusSnapshot]) -> Result<BTreeSet<String>> {
+    let mut targets = BTreeSet::new();
+    for snapshot in snapshots {
+        let Some(status) = &snapshot.chaos_status else {
+            continue;
+        };
+        let records = status
+            .pointer("/status/experiment/containerRecords")
+            .and_then(serde_json::Value::as_array)
+            .with_context(|| {
+                format!(
+                    "active {} snapshot has no controller records to identify the fault target",
+                    snapshot.resource_kind.as_deref().unwrap_or("chaos")
+                )
+            })?;
+        for record in records.iter().filter(|record| {
+            record
+                .get("selectorKey")
+                .and_then(serde_json::Value::as_str)
+                == Some(".")
+        }) {
+            let id = record
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .context("controller record has no id")?;
+            let pod = id
+                .split('/')
+                .nth(1)
+                .filter(|pod| !pod.is_empty())
+                .with_context(|| format!("controller record id {id:?} is not namespace/pod"))?;
+            targets.insert(pod.to_string());
+        }
+    }
+    ensure!(
+        !targets.is_empty(),
+        "active fault snapshots identify no injected target Pod"
+    );
+    Ok(targets)
+}
+
+fn surviving_pod_name(pods_before: &[PodIdentity], targets: &BTreeSet<String>) -> Result<String> {
+    ensure!(
+        targets
+            .iter()
+            .all(|target| pods_before.iter().any(|pod| &pod.name == target)),
+        "fault target Pods {targets:?} are not all members of the proven tenant Pods"
+    );
+    pods_before
+        .iter()
+        .map(|pod| pod.name.clone())
+        .filter(|name| !targets.contains(name))
+        .min()
+        .context("every proven RustFS Pod is a fault target; no surviving Pod can serve the availability contract")
+}
+
+#[cfg(test)]
+mod availability_endpoint_tests {
+    use super::{injected_source_pod_names, surviving_pod_name};
+    use crate::fault::reporting::{FaultStatusSnapshot, PodIdentity};
+    use std::collections::BTreeSet;
+
+    fn pods() -> Vec<PodIdentity> {
+        (0..4)
+            .map(|index| PodIdentity {
+                name: format!("rustfs-{index}"),
+                uid: format!("uid-{index}"),
+            })
+            .collect()
+    }
+
+    fn snapshot(records: serde_json::Value) -> FaultStatusSnapshot {
+        FaultStatusSnapshot {
+            stage: "active".to_string(),
+            resource_kind: Some("NetworkChaos".to_string()),
+            resource_name: Some("chaos-1".to_string()),
+            chaos_status: Some(serde_json::json!({
+                "status": {"experiment": {"containerRecords": records}}
+            })),
+            dm_status: None,
+        }
+    }
+
+    #[test]
+    fn survivor_excludes_source_targets_but_not_partition_peers() {
+        let snapshot = snapshot(serde_json::json!([
+            {"id": "ns/rustfs-0", "selectorKey": ".", "phase": "Injected", "injectedCount": 1},
+            {"id": "ns/rustfs-1", "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1},
+            {"id": "ns/rustfs-2", "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1}
+        ]));
+        let targets = injected_source_pod_names(&[snapshot]).expect("targets");
+        assert_eq!(targets, BTreeSet::from(["rustfs-0".to_string()]));
+        assert_eq!(
+            surviving_pod_name(&pods(), &targets).expect("survivor"),
+            "rustfs-1"
+        );
+    }
+
+    #[test]
+    fn missing_records_or_unknown_targets_fail_closed() {
+        assert!(injected_source_pod_names(&[snapshot(serde_json::json!([]))]).is_err());
+        let foreign = BTreeSet::from(["other-0".to_string()]);
+        assert!(surviving_pod_name(&pods(), &foreign).is_err());
+        let all = pods()
+            .into_iter()
+            .map(|pod| pod.name)
+            .collect::<BTreeSet<_>>();
+        assert!(surviving_pod_name(&pods(), &all).is_err());
+        let dm_only = FaultStatusSnapshot {
+            stage: "active".to_string(),
+            resource_kind: None,
+            resource_name: None,
+            chaos_status: None,
+            dm_status: None,
+        };
+        assert!(injected_source_pod_names(&[dm_only]).is_err());
     }
 }

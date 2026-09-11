@@ -64,6 +64,7 @@ use crate::fault::{
         QuorumHealthObservation, QuorumMutationClass, QuorumVolumeBoundary,
         require_fresh_runtime_observation,
     },
+    recovery_health::{RECOVERY_HEALTH_ARTIFACT, RecoveryHealthReport},
     reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
     scenarios::{
         self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario, acknowledged_mutation_kind,
@@ -71,6 +72,10 @@ use crate::fault::{
     spec::{
         FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunAckTriggerSpec, FaultRunArtifactSpec,
         FaultRunFaultSpec, FaultRunSpec, FaultRunTargetSpec,
+    },
+    workload::execution::{
+        AVAILABILITY_REPORT_ARTIFACT, AvailabilityReport, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+        POST_RECOVERY_WRITE_REPORT_ARTIFACT, PostRecoveryWriteReport,
     },
     workload::{
         WorkloadPlan,
@@ -899,6 +904,24 @@ fn validate_fault_artifacts_with_identity(
             &json_spec.metadata.bucket,
         )?;
     }
+    validate_recovery_health_artifact(&artifacts, &metadata, identity, &evidence)?;
+    validate_post_recovery_write_artifacts(
+        &artifacts,
+        &metadata,
+        identity,
+        &evidence,
+        &json_spec.metadata.bucket,
+    )?;
+    if scenario_spec.impact_policy.requires_availability() {
+        validate_availability_artifact(
+            &artifacts,
+            &metadata,
+            identity,
+            &evidence,
+            workload_plan.object_count,
+        )?;
+    }
+
     let ack_checker_expectation = if let Some(expected_mutation) = ack_mutation {
         Some(validate_ack_triggered_dm_artifacts(
             AckArtifactValidationContext {
@@ -2787,6 +2810,164 @@ fn validate_optional_identity_fields(
     Ok(())
 }
 
+fn validate_recovery_health_artifact(
+    artifacts: &BTreeMap<String, PathBuf>,
+    metadata: &RunMetadataArtifact,
+    identity: ArtifactIdentityPolicy<'_>,
+    evidence: &FaultEvidenceArtifact,
+) -> Result<()> {
+    let report = read_json::<RecoveryHealthReport>(required(artifacts, RECOVERY_HEALTH_ARTIFACT)?)?;
+    validate_optional_identity_fields(
+        RECOVERY_HEALTH_ARTIFACT,
+        Some(report.scenario.as_str()),
+        Some(report.run_id.as_str()),
+        metadata,
+        identity,
+    )?;
+    report
+        .require_success()
+        .with_context(|| format!("{RECOVERY_HEALTH_ARTIFACT} did not pass"))?;
+    let recovery_started = evidence
+        .recovery_started_at_ms
+        .context("fault-evidence.json recovery_started_at_ms is required")?;
+    let recovery_ended = evidence
+        .recovery_ended_at_ms
+        .context("fault-evidence.json recovery_ended_at_ms is required")?;
+    report.require_within_recovery_window(recovery_started, recovery_ended)?;
+    ensure!(
+        report.readiness.len() == evidence.pods_after.len()
+            && evidence.pods_after.iter().all(|pod| {
+                report
+                    .readiness
+                    .iter()
+                    .any(|probe| probe.pod_name == pod.name && probe.ready)
+            }),
+        "{RECOVERY_HEALTH_ARTIFACT} readiness probes do not cover every Pod in fault-evidence.json pods_after"
+    );
+    Ok(())
+}
+
+fn validate_post_recovery_write_artifacts(
+    artifacts: &BTreeMap<String, PathBuf>,
+    metadata: &RunMetadataArtifact,
+    identity: ArtifactIdentityPolicy<'_>,
+    evidence: &FaultEvidenceArtifact,
+    expected_bucket: &str,
+) -> Result<()> {
+    let report = read_json::<PostRecoveryWriteReport>(required(
+        artifacts,
+        POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+    )?)?;
+    validate_optional_identity_fields(
+        POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+        Some(report.scenario.as_str()),
+        Some(report.run_id.as_str()),
+        metadata,
+        identity,
+    )?;
+    report
+        .require_success()
+        .with_context(|| format!("{POST_RECOVERY_WRITE_REPORT_ARTIFACT} did not pass"))?;
+    let recovery_ended = evidence
+        .recovery_ended_at_ms
+        .context("fault-evidence.json recovery_ended_at_ms is required")?;
+    ensure!(
+        report.started_at_ms >= recovery_ended,
+        "{POST_RECOVERY_WRITE_REPORT_ARTIFACT} started before recovery ended"
+    );
+    let expected_prefix = format!("fault-test-post-recovery/{}/", metadata.run_id);
+    ensure!(
+        report.key_prefix == expected_prefix,
+        "{POST_RECOVERY_WRITE_REPORT_ARTIFACT} key_prefix {:?} is not the run-scoped post-recovery prefix",
+        report.key_prefix
+    );
+    let history =
+        read_jsonl::<OperationRecord>(required(artifacts, POST_RECOVERY_WRITE_HISTORY_ARTIFACT)?)?;
+    ensure!(
+        !history.is_empty(),
+        "{POST_RECOVERY_WRITE_HISTORY_ARTIFACT} must contain operation records"
+    );
+    validate_history_scope_and_order(
+        &history,
+        &metadata.scenario,
+        &metadata.run_id,
+        expected_bucket,
+    )?;
+    for record in &history {
+        ensure!(
+            record
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(&expected_prefix)),
+            "{POST_RECOVERY_WRITE_HISTORY_ARTIFACT} record {} touched a key outside the post-recovery prefix",
+            record.id
+        );
+        ensure!(
+            record.started_at_ms >= report.started_at_ms
+                && record.ended_at_ms <= report.completed_at_ms,
+            "{POST_RECOVERY_WRITE_HISTORY_ARTIFACT} record {} lies outside the probe window",
+            record.id
+        );
+    }
+    let acknowledged_puts = history
+        .iter()
+        .filter(|record| {
+            record.kind == OperationKind::Put && record.outcome == OperationOutcome::Ok
+        })
+        .count();
+    ensure!(
+        acknowledged_puts >= report.objects,
+        "{POST_RECOVERY_WRITE_HISTORY_ARTIFACT} holds {acknowledged_puts} acknowledged PUTs but the report claims {} verified objects",
+        report.objects
+    );
+    Ok(())
+}
+
+fn validate_availability_artifact(
+    artifacts: &BTreeMap<String, PathBuf>,
+    metadata: &RunMetadataArtifact,
+    identity: ArtifactIdentityPolicy<'_>,
+    evidence: &FaultEvidenceArtifact,
+    workload_object_count: usize,
+) -> Result<()> {
+    let report =
+        read_json::<AvailabilityReport>(required(artifacts, AVAILABILITY_REPORT_ARTIFACT)?)?;
+    validate_optional_identity_fields(
+        AVAILABILITY_REPORT_ARTIFACT,
+        Some(report.scenario.as_str()),
+        Some(report.run_id.as_str()),
+        metadata,
+        identity,
+    )?;
+    report
+        .require_success()
+        .with_context(|| format!("{AVAILABILITY_REPORT_ARTIFACT} did not pass"))?;
+    ensure!(
+        report.read_probe.objects == workload_object_count / 2
+            && report.read_probe.verified == report.read_probe.objects
+            && report.read_probe.failures.is_empty(),
+        "{AVAILABILITY_REPORT_ARTIFACT} read probe did not verify the complete prefilled cohort"
+    );
+    let disrupted = report
+        .workload
+        .iter()
+        .map(|family| family.disrupted)
+        .sum::<usize>();
+    ensure!(
+        disrupted == evidence.client_disruptions,
+        "{AVAILABILITY_REPORT_ARTIFACT} workload disruptions {disrupted} do not match fault-evidence.json client_disruptions {}",
+        evidence.client_disruptions
+    );
+    ensure!(
+        report
+            .workload
+            .iter()
+            .all(|family| family.meets_floor(report.min_success_percent)),
+        "{AVAILABILITY_REPORT_ARTIFACT} workload families contradict its passed verdict"
+    );
+    Ok(())
+}
+
 fn validate_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Result<()> {
     let apply_started = evidence
         .fault_apply_started_at_ms
@@ -4415,7 +4596,9 @@ fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Resul
         classification @ (RecoveryStabilityClassification::CommittedVersionMissing
         | RecoveryStabilityClassification::VersionHashMismatch
         | RecoveryStabilityClassification::DeleteMarkerMissing
-        | RecoveryStabilityClassification::DeletedObjectResurrected) => {
+        | RecoveryStabilityClassification::DeletedObjectResurrected
+        | RecoveryStabilityClassification::ListedKeyUnreadable
+        | RecoveryStabilityClassification::UnexpectedListedObject) => {
             ensure!(
                 report
                     .classification_evidence
@@ -5054,6 +5237,7 @@ impl OutcomeCountsArtifact {
 
 #[cfg(test)]
 mod tests {
+    use super::{ArtifactIdentityPolicy, RunMetadataArtifact, validate_availability_artifact};
     use super::{
         ArtifactValidationOptions, FailureSummary, FaultEvidenceArtifact, OutcomeCountsArtifact,
         RecommitCandidateManifestArtifact, RecommitReportArtifact, WorkloadSummaryArtifact,
@@ -5064,6 +5248,11 @@ mod tests {
         validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts, validate_run_spec,
         validate_target_proof, validate_volume_quorum_health_evidence,
         validate_write_quorum_runtime_evidence,
+    };
+    use crate::fault::recovery_health::RECOVERY_HEALTH_ARTIFACT;
+    use crate::fault::workload::execution::{
+        AVAILABILITY_REPORT_ARTIFACT, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+        POST_RECOVERY_WRITE_REPORT_ARTIFACT,
     };
     use crate::fault::{
         acknowledged_mutation::AcknowledgedMutationKind,
@@ -8835,6 +9024,9 @@ mod tests {
                 version_hash_mismatches: Vec::new(),
                 missing_committed_delete_markers: Vec::new(),
                 resurrected_deleted_objects: Vec::new(),
+                listed_keys_unreadable: Vec::new(),
+                unexpected_listed_objects: Vec::new(),
+                failed_writes_materialized: Vec::new(),
                 delete_marker_lineage_incomplete: Vec::new(),
                 multipart_upload_lineage_incomplete: Vec::new(),
                 tolerated_ambiguous_deletes: Vec::new(),
@@ -11764,6 +11956,367 @@ mod tests {
                 "recovery_ended_at_ms": 70
             }),
         );
+        write_json(
+            &case_dir,
+            RECOVERY_HEALTH_ARTIFACT,
+            &json!({
+                "scenario": scenario,
+                "runId": run_id,
+                "baseline": {
+                    "observedAtMs": 5,
+                    "deploymentId": "deployment-1",
+                    "standardParity": 2,
+                    "totalSets": [1],
+                    "drivesPerSet": [4],
+                    "serverEndpoints": ["http://p0:9000", "http://p1:9000", "http://p2:9000", "http://p3:9000"],
+                    "driveUuids": ["d0", "d1", "d2", "d3"]
+                },
+                "startedAtMs": 61,
+                "completedAtMs": 69,
+                "timeoutSeconds": 300,
+                "attempts": 1,
+                "firstHealthyAtMs": 68,
+                "observation": {
+                    "startedAtMs": 61,
+                    "completedAtMs": 62,
+                    "deploymentId": "deployment-1",
+                    "standardParity": 2,
+                    "totalSets": [1],
+                    "drivesPerSet": [4],
+                    "onlineDrives": 4,
+                    "offlineDrives": 0,
+                    "unknownDrives": 0,
+                    "drives": (0..4).map(|index| json!({
+                        "serverEndpoint": format!("http://p{index}:9000"),
+                        "driveUuid": format!("d{index}"),
+                        "state": "ok",
+                        "poolIndex": 0,
+                        "setIndex": 0
+                    })).collect::<Vec<_>>()
+                },
+                "readiness": [{
+                    "podName": "p0",
+                    "proxyPath": "/api/v1/namespaces/rustfs-fault-test/pods/p0:9000/proxy/health/ready",
+                    "ready": true,
+                    "observedAtMs": 65
+                }],
+                "violations": [],
+                "passed": true
+            }),
+        );
+        let probe_prefix = format!("fault-test-post-recovery/{run_id}/");
+        let probe_history = (0..8)
+            .flat_map(|index| {
+                let key = format!("{probe_prefix}object-{index:06}");
+                let base = 72 + index as u64 * 2;
+                [
+                    json!({
+                        "id": format!("op-{:06}", index * 2 + 1),
+                        "scenario": scenario,
+                        "run_id": run_id,
+                        "kind": "put",
+                        "bucket": "bucket",
+                        "key": key,
+                        "value_sha256": "probe-sha",
+                        "size_bytes": 4096,
+                        "started_at_ms": base,
+                        "ended_at_ms": base,
+                        "started_sequence": index * 4 + 1,
+                        "ended_sequence": index * 4 + 2,
+                        "outcome": "ok",
+                        "http_status": 200,
+                        "error": null,
+                        "durability_cohort": "post_recovery",
+                        "fault_window_relation": "after_fault"
+                    }),
+                    json!({
+                        "id": format!("op-{:06}", index * 2 + 2),
+                        "scenario": scenario,
+                        "run_id": run_id,
+                        "kind": "get",
+                        "bucket": "bucket",
+                        "key": key,
+                        "value_sha256": "probe-sha",
+                        "size_bytes": 4096,
+                        "started_at_ms": base + 1,
+                        "ended_at_ms": base + 1,
+                        "started_sequence": index * 4 + 3,
+                        "ended_sequence": index * 4 + 4,
+                        "outcome": "ok",
+                        "http_status": 200,
+                        "error": null,
+                        "durability_cohort": "post_recovery",
+                        "fault_window_relation": "after_fault"
+                    }),
+                ]
+            })
+            .map(|record| record.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            case_dir.join(POST_RECOVERY_WRITE_HISTORY_ARTIFACT),
+            format!("{probe_history}\n"),
+        )
+        .expect("probe history");
+        write_json(
+            &case_dir,
+            POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+            &json!({
+                "scenario": scenario,
+                "run_id": run_id,
+                "key_prefix": probe_prefix,
+                "started_at_ms": 71,
+                "completed_at_ms": 95,
+                "objects": 8,
+                "puts_verified": 8,
+                "deletes_verified_absent": 8,
+                "multipart_completes_verified": 1,
+                "multipart_aborts_ok": 1,
+                "lists_verified": 2,
+                "failures": [],
+                "passed": true
+            }),
+        );
+    }
+
+    #[test]
+    fn success_validation_rejects_a_degraded_recovery_health_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join(RECOVERY_HEALTH_ARTIFACT);
+        let mut report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("report")).expect("json");
+        // A hand-edited verdict cannot hide a drive that never came back.
+        report["observation"]["drives"][2]["state"] = json!("offline");
+        write_json(&case_dir, RECOVERY_HEALTH_ARTIFACT, &report);
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("offline drive after recovery");
+        assert!(
+            error
+                .to_string()
+                .contains("recovery-health.json did not pass"),
+            "{error:#}"
+        );
+
+        let mut outside_window = report.clone();
+        outside_window["observation"]["drives"][2]["state"] = json!("ok");
+        outside_window["completedAtMs"] = json!(71);
+        write_json(&case_dir, RECOVERY_HEALTH_ARTIFACT, &outside_window);
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("observation after recovery ended");
+        assert!(error.to_string().contains("recovery window"), "{error:#}");
+
+        let mut unready = outside_window.clone();
+        unready["completedAtMs"] = json!(69);
+        unready["readiness"][0]["ready"] = json!(false);
+        write_json(&case_dir, RECOVERY_HEALTH_ARTIFACT, &unready);
+        assert!(validate_fault_artifacts(&success_options(dir.path())).is_err());
+    }
+
+    #[test]
+    fn success_validation_rejects_a_post_recovery_write_probe_that_did_not_complete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join(POST_RECOVERY_WRITE_REPORT_ARTIFACT);
+        let mut report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("report")).expect("json");
+        report["deletes_verified_absent"] = json!(7);
+        write_json(&case_dir, POST_RECOVERY_WRITE_REPORT_ARTIFACT, &report);
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("incomplete delete verification");
+        assert!(
+            error
+                .to_string()
+                .contains("post-recovery-write-report.json did not pass"),
+            "{error:#}"
+        );
+
+        report["deletes_verified_absent"] = json!(8);
+        report["started_at_ms"] = json!(65);
+        write_json(&case_dir, POST_RECOVERY_WRITE_REPORT_ARTIFACT, &report);
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("probe before recovery ended");
+        assert!(
+            error.to_string().contains("started before recovery ended"),
+            "{error:#}"
+        );
+
+        report["started_at_ms"] = json!(71);
+        write_json(&case_dir, POST_RECOVERY_WRITE_REPORT_ARTIFACT, &report);
+        let history_path = case_dir.join(POST_RECOVERY_WRITE_HISTORY_ARTIFACT);
+        let mut history = fs::read_to_string(&history_path).expect("history");
+        history = history.replace(
+            "fault-test-post-recovery/run-00000000-0000-4000-8000-000000000001/object-000003",
+            "fault-test/run-00000000-0000-4000-8000-000000000001/object-000003",
+        );
+        fs::write(&history_path, history).expect("rewrite history");
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("probe touched the workload prefix");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the post-recovery prefix"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recovery_health_readiness_must_cover_every_pod_after_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join(RECOVERY_HEALTH_ARTIFACT);
+        let mut report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("report")).expect("json");
+        report["readiness"][0]["podName"] = json!("px");
+        write_json(&case_dir, RECOVERY_HEALTH_ARTIFACT, &report);
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("readiness for a different Pod");
+        assert!(
+            error.to_string().contains("readiness probes do not cover"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn availability_artifact_must_bind_to_the_cohort_and_workload_disruptions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        let metadata = RunMetadataArtifact {
+            scenario: "pod-failure".to_string(),
+            run_id: run_id.to_string(),
+            context: "real-cluster".to_string(),
+            storage_class: "fast-csi".to_string(),
+            rustfs_image: "rustfs:test".to_string(),
+            workload_objects: 12,
+            workload_concurrency: 4,
+            require_client_disruption: false,
+            recovery_stability_reread_seconds: 60,
+        };
+        let evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
+            "scenario": "pod-failure",
+            "run_id": run_id,
+            "injected": true,
+            "active_during_workload": true,
+            "recovered": true,
+            "require_client_disruption": false,
+            "client_disruptions": 3,
+            "pods_before": [],
+            "pods_after": [],
+            "active_snapshots": [],
+            "workload_snapshots": []
+        }))
+        .expect("evidence");
+        let family = |name: &str, total: usize, disrupted: usize| {
+            json!({
+                "family": name,
+                "total": total,
+                "disrupted": disrupted,
+                "success_percent": (total - disrupted) * 100 / total
+            })
+        };
+        let mut report = json!({
+            "scenario": "pod-failure",
+            "run_id": run_id,
+            "min_success_percent": 99,
+            "read_probe": {"objects": 6, "verified": 6, "failures": []},
+            "workload": [
+                family("put", 200, 1),
+                family("get", 200, 1),
+                family("delete", 100, 1),
+                family("list", 100, 0),
+                family("multipart_complete", 100, 0),
+                family("multipart_abort", 100, 0)
+            ],
+            "violations": [],
+            "passed": true
+        });
+        let write = |report: &serde_json::Value| {
+            write_json(dir.path(), AVAILABILITY_REPORT_ARTIFACT, report);
+            BTreeMap::from([(
+                AVAILABILITY_REPORT_ARTIFACT.to_string(),
+                dir.path().join(AVAILABILITY_REPORT_ARTIFACT),
+            )])
+        };
+
+        validate_availability_artifact(
+            &write(&report),
+            &metadata,
+            ArtifactIdentityPolicy::LegacyCompatible,
+            &evidence,
+            12,
+        )
+        .expect("consistent availability report");
+
+        report["read_probe"]["objects"] = json!(5);
+        report["read_probe"]["verified"] = json!(5);
+        let error = validate_availability_artifact(
+            &write(&report),
+            &metadata,
+            ArtifactIdentityPolicy::LegacyCompatible,
+            &evidence,
+            12,
+        )
+        .expect_err("probe smaller than the prefilled cohort");
+        assert!(
+            error.to_string().contains("complete prefilled cohort"),
+            "{error:#}"
+        );
+
+        report["read_probe"]["objects"] = json!(6);
+        report["read_probe"]["verified"] = json!(6);
+        report["workload"][2] = family("delete", 100, 0);
+        let error = validate_availability_artifact(
+            &write(&report),
+            &metadata,
+            ArtifactIdentityPolicy::LegacyCompatible,
+            &evidence,
+            12,
+        )
+        .expect_err("disruption count drift from fault-evidence.json");
+        assert!(
+            error.to_string().contains("client_disruptions"),
+            "{error:#}"
+        );
+
+        report["workload"][2] = family("delete", 100, 1);
+        report["workload"][0] = family("put", 100, 2);
+        report["workload"][1] = family("get", 200, 0);
+        let error = validate_availability_artifact(
+            &write(&report),
+            &metadata,
+            ArtifactIdentityPolicy::LegacyCompatible,
+            &evidence,
+            12,
+        )
+        .expect_err("a family below the floor cannot pass");
+        assert!(error.to_string().contains("did not pass"), "{error:#}");
+    }
+
+    #[test]
+    fn required_artifacts_include_recovery_evidence_for_every_scenario_family() {
+        let plain = FaultRunArtifactSpec::required_names_for_scenario("io-eio");
+        let ack = FaultRunArtifactSpec::required_names_for_scenario("dm-drop-writes-after-ack-put");
+        let availability = FaultRunArtifactSpec::required_names_for_scenario("pod-failure");
+        for names in [&plain, &ack, &availability] {
+            for artifact in [
+                RECOVERY_HEALTH_ARTIFACT,
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+            ] {
+                assert!(names.iter().any(|name| name == artifact), "{artifact}");
+            }
+        }
+        assert!(
+            availability
+                .iter()
+                .any(|name| name == "availability-report.json")
+        );
+        assert!(!plain.iter().any(|name| name == "availability-report.json"));
+        assert!(!ack.iter().any(|name| name == "availability-report.json"));
     }
 
     fn write_json(dir: &std::path::Path, name: &str, value: &serde_json::Value) {

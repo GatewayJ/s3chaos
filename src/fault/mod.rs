@@ -30,6 +30,7 @@ pub mod plan;
 pub mod pods;
 pub mod preflight;
 pub mod quorum;
+pub mod recovery_health;
 pub mod reporting;
 pub mod runner;
 pub mod scenarios;

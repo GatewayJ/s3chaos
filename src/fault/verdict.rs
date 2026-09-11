@@ -32,6 +32,8 @@ pub enum RecoveryStabilityClassification {
     VersionIdMissingOnCommittedWrite,
     MultipartUploadLineageIncomplete,
     ListUnavailableOrUnknown,
+    ListedKeyUnreadable,
+    UnexpectedListedObject,
     RecoveryTailReadLatency,
     AmbiguousWriteMaterialized,
     HarnessError,
@@ -61,6 +63,10 @@ impl RecoveryStabilityClassification {
             Some(Self::VersionIdMissingOnCommittedWrite)
         } else if evidence.starts_with("multipart_upload_lineage_incomplete:") {
             Some(Self::MultipartUploadLineageIncomplete)
+        } else if evidence.starts_with("listed_key_unreadable:") {
+            Some(Self::ListedKeyUnreadable)
+        } else if evidence.starts_with("unexpected_listed_object:") {
+            Some(Self::UnexpectedListedObject)
         } else {
             None
         }
@@ -127,6 +133,10 @@ pub enum AvailabilityStatus {
     CommittedObjectUnavailable,
     CommittedVersionUnavailable,
     ListUnavailableOrUnknown,
+    /// The service itself is degraded after the fault: RustFS drives or
+    /// readiness did not recover, or S3 mutations and reads failed when the
+    /// scenario required them to succeed.
+    ServiceDegraded,
     Unknown,
 }
 
@@ -144,8 +154,13 @@ pub enum FailureClassification {
     VersionIdMissingOnCommittedWrite,
     MultipartUploadLineageIncomplete,
     ListUnavailableOrUnknown,
+    ListedKeyUnreadable,
+    UnexpectedListedObject,
     DataCorruption,
     AmbiguousWriteMaterialized,
+    RecoveryHealthDegraded,
+    PostRecoveryWriteFailed,
+    AvailabilityRegression,
     HarnessError,
     TestHarness,
     WorkloadExecutionError,
@@ -167,7 +182,7 @@ pub enum FailureClassification {
 }
 
 impl FailureClassification {
-    pub(crate) const ALL: [Self; 31] = [
+    pub(crate) const ALL: [Self; 36] = [
         Self::RecoveryTailReadLatency,
         Self::CommittedObjectUnavailable,
         Self::CommittedVersionMissing,
@@ -179,8 +194,13 @@ impl FailureClassification {
         Self::VersionIdMissingOnCommittedWrite,
         Self::MultipartUploadLineageIncomplete,
         Self::ListUnavailableOrUnknown,
+        Self::ListedKeyUnreadable,
+        Self::UnexpectedListedObject,
         Self::DataCorruption,
         Self::AmbiguousWriteMaterialized,
+        Self::RecoveryHealthDegraded,
+        Self::PostRecoveryWriteFailed,
+        Self::AvailabilityRegression,
         Self::HarnessError,
         Self::TestHarness,
         Self::WorkloadExecutionError,
@@ -220,8 +240,13 @@ impl FailureClassification {
             Self::VersionIdMissingOnCommittedWrite => "version_id_missing_on_committed_write",
             Self::MultipartUploadLineageIncomplete => "multipart_upload_lineage_incomplete",
             Self::ListUnavailableOrUnknown => "list_unavailable_or_unknown",
+            Self::ListedKeyUnreadable => "listed_key_unreadable",
+            Self::UnexpectedListedObject => "unexpected_listed_object",
             Self::DataCorruption => "data_corruption",
             Self::AmbiguousWriteMaterialized => "ambiguous_write_materialized",
+            Self::RecoveryHealthDegraded => "recovery_health_degraded",
+            Self::PostRecoveryWriteFailed => "post_recovery_write_failed",
+            Self::AvailabilityRegression => "availability_regression",
             Self::HarnessError => "harness_error",
             Self::TestHarness => "test_harness",
             Self::WorkloadExecutionError => "workload_execution_error",
@@ -257,6 +282,8 @@ impl FailureClassification {
                 | Self::VersionIdMissingOnCommittedWrite
                 | Self::MultipartUploadLineageIncomplete
                 | Self::ListUnavailableOrUnknown
+                | Self::ListedKeyUnreadable
+                | Self::UnexpectedListedObject
                 | Self::DataCorruption
                 | Self::AmbiguousWriteMaterialized
         )
@@ -275,8 +302,13 @@ impl FailureClassification {
             | Self::VersionIdMissingOnCommittedWrite
             | Self::MultipartUploadLineageIncomplete
             | Self::ListUnavailableOrUnknown
+            | Self::ListedKeyUnreadable
+            | Self::UnexpectedListedObject
             | Self::DataCorruption
-            | Self::AmbiguousWriteMaterialized => ResponsibilityDomain::Product,
+            | Self::AmbiguousWriteMaterialized
+            | Self::RecoveryHealthDegraded
+            | Self::PostRecoveryWriteFailed
+            | Self::AvailabilityRegression => ResponsibilityDomain::Product,
             Self::HarnessError
             | Self::TestHarness
             | Self::WorkloadExecutionError
@@ -302,11 +334,16 @@ impl FailureClassification {
             Self::RecoveryTailReadLatency => FailureSeverity::Degraded,
             Self::CommittedObjectUnavailable
             | Self::CommittedVersionUnavailable
-            | Self::ListUnavailableOrUnknown => FailureSeverity::FailAvailability,
+            | Self::ListUnavailableOrUnknown
+            | Self::RecoveryHealthDegraded
+            | Self::PostRecoveryWriteFailed
+            | Self::AvailabilityRegression => FailureSeverity::FailAvailability,
             Self::CommittedVersionMissing
             | Self::VersionHashMismatch
             | Self::DeleteMarkerMissing
             | Self::DeletedObjectResurrected
+            | Self::ListedKeyUnreadable
+            | Self::UnexpectedListedObject
             | Self::DataCorruption => FailureSeverity::FailCorrectness,
             Self::HarnessError
             | Self::TestHarness
@@ -364,6 +401,8 @@ impl From<RecoveryStabilityClassification> for FailureClassification {
             RecoveryStabilityClassification::ListUnavailableOrUnknown => {
                 Self::ListUnavailableOrUnknown
             }
+            RecoveryStabilityClassification::ListedKeyUnreadable => Self::ListedKeyUnreadable,
+            RecoveryStabilityClassification::UnexpectedListedObject => Self::UnexpectedListedObject,
             RecoveryStabilityClassification::RecoveryTailReadLatency => {
                 Self::RecoveryTailReadLatency
             }
@@ -658,7 +697,10 @@ impl FailurePhase {
             "tenant-recovery"
             | "pod-stability-after-recovery"
             | "s3-access-after-recovery"
+            | "recovery-health"
+            | "post-recovery-write"
             | "recommit-unconfirmed" => Self::Recovery,
+            "availability-read-probe" | "availability" => Self::Workload,
             "checker-pre-recommit"
             | "checker-pre-recommit-verdict"
             | "checker-final"
@@ -691,6 +733,18 @@ fn primary_evidence_refs_for(stage: &str, phase: FailurePhase) -> Vec<String> {
         }
         FailurePhase::Recovery if stage == "recommit-unconfirmed" => {
             push_unique(&mut refs, "fault-evidence.json");
+        }
+        FailurePhase::Recovery if stage == "recovery-health" => {
+            push_unique(&mut refs, "recovery-health.json");
+            push_unique(&mut refs, "fault-evidence.json");
+        }
+        FailurePhase::Recovery if stage == "post-recovery-write" => {
+            push_unique(&mut refs, "post-recovery-write-report.json");
+            push_unique(&mut refs, "post-recovery-write-history.jsonl");
+        }
+        FailurePhase::Workload if stage == "availability-read-probe" || stage == "availability" => {
+            push_unique(&mut refs, "availability-report.json");
+            push_unique(&mut refs, "workload-summary.json");
         }
         FailurePhase::Preflight
         | FailurePhase::Setup
@@ -745,12 +799,23 @@ impl FailureClassificationDetails {
             },
             FailureClassification::VersionHashMismatch
             | FailureClassification::DeleteMarkerMissing
-            | FailureClassification::DeletedObjectResurrected => Self {
+            | FailureClassification::DeletedObjectResurrected
+            | FailureClassification::ListedKeyUnreadable
+            | FailureClassification::UnexpectedListedObject => Self {
                 data_correctness: DataCorrectnessStatus::Failed,
                 availability: AvailabilityStatus::Unknown,
                 data_loss: Some(false),
                 corruption: Some(true),
                 recovered_within_window: None,
+            },
+            FailureClassification::RecoveryHealthDegraded
+            | FailureClassification::PostRecoveryWriteFailed
+            | FailureClassification::AvailabilityRegression => Self {
+                data_correctness: DataCorrectnessStatus::Unknown,
+                availability: AvailabilityStatus::ServiceDegraded,
+                data_loss: None,
+                corruption: Some(false),
+                recovered_within_window: Some(false),
             },
             FailureClassification::DeleteMarkerLineageIncomplete
             | FailureClassification::VersionIdMissingOnCommittedWrite

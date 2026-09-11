@@ -539,6 +539,52 @@ impl FaultRun<'_> {
         let pods_before = target_inventory.identities;
         let mut target_proof = TargetProof::from_plan(config, scenario, spec, plan, run_id)
             .with_resolved_pod_proofs(target_inventory.pod_proofs);
+        events.record(
+            "recovery-health-baseline",
+            RunEventStatus::Started,
+            "capturing the healthy RustFS drive and readiness baseline before fault activation",
+            None,
+        )?;
+        let health_baseline = match self.capture_recovery_health_baseline(endpoint).await {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                preflight_phases.push(PreflightPhase::new(
+                    "recovery-health-baseline",
+                    vec![PreflightCheck::failed(
+                        "recovery_health_baseline",
+                        error.to_string(),
+                        crate::fault::reporting::ResponsibilityDomain::Environment,
+                    )],
+                ));
+                write_preflight_summary(collector, scenario, config, run_id, preflight_phases).ok();
+                self.record_failure(
+                    "recovery-health-baseline",
+                    "preflight_failed",
+                    &error,
+                    None,
+                    None,
+                )?;
+                return Err(error);
+            }
+        };
+        preflight_phases.push(PreflightPhase::new(
+            "recovery-health-baseline",
+            vec![PreflightCheck::passed(
+                "recovery_health_baseline",
+                format!(
+                    "RustFS reports {} healthy drives on {} servers before the fault",
+                    health_baseline.drive_uuids.len(),
+                    health_baseline.server_endpoints.len()
+                ),
+                crate::fault::reporting::ResponsibilityDomain::Harness,
+            )],
+        ));
+        events.record(
+            "recovery-health-baseline",
+            RunEventStatus::Succeeded,
+            "healthy RustFS baseline captured",
+            Some(serde_json::to_value(&health_baseline)?),
+        )?;
         let mut topology_observed_at_ms = None;
         let mut execution_injection = plan.fault().clone();
         if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
@@ -689,6 +735,7 @@ impl FaultRun<'_> {
             topology_observed_at_ms,
             host_storage_proof,
             execution_injection,
+            health_baseline,
         })
     }
     pub(super) async fn prove_host_storage(
@@ -759,5 +806,21 @@ impl FaultRun<'_> {
             )?;
         }
         Ok(host_storage_proof)
+    }
+}
+
+impl FaultRun<'_> {
+    async fn capture_recovery_health_baseline(
+        &self,
+        endpoint: &str,
+    ) -> Result<crate::fault::recovery_health::RecoveryHealthBaseline> {
+        let (access_key, secret_key) = resources::test_credentials();
+        let observed_at_ms = super::now_ms();
+        let layout =
+            crate::rustfs::read_erasure_layout(endpoint, "us-east-1", access_key, secret_key)
+                .await
+                .context("reading the RustFS admin layout for the recovery health baseline")?;
+        crate::fault::recovery_health::RecoveryHealthBaseline::from_layout(&layout, observed_at_ms)
+            .context("RustFS is not fully healthy before fault activation")
     }
 }

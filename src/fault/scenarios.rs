@@ -238,6 +238,12 @@ impl FaultIsolation {
 pub enum FaultImpactPolicy {
     ClientDisruptionRequired,
     ClientDisruptionOptional,
+    /// The fault stays inside RustFS redundancy, so the run must prove the
+    /// service kept serving: every committed object reads back while the
+    /// fault is active and the mixed workload meets the configured success
+    /// floor. Client disruption is evidence of a product defect, not of the
+    /// fault being real.
+    AvailabilityRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -344,11 +350,16 @@ impl FaultImpactPolicy {
         match self {
             Self::ClientDisruptionRequired => "client-disruption-required",
             Self::ClientDisruptionOptional => "client-disruption-optional",
+            Self::AvailabilityRequired => "availability-required",
         }
     }
 
     pub fn requires_client_disruption(self) -> bool {
         matches!(self, Self::ClientDisruptionRequired)
+    }
+
+    pub fn requires_availability(self) -> bool {
+        matches!(self, Self::AvailabilityRequired)
     }
 }
 
@@ -479,12 +490,12 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
-        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
         boundary: "rustfs-workload/pod-recovery",
         ci_phase: "faults",
         target: "one RustFS Pod selected by tenant label",
         target_proof: DEFAULT_TARGET_PROOF,
-        validation: "the killed Pod is recreated, Tenant returns Ready, committed PUTs remain readable with matching hashes, and failed or unknown operations are recorded without becoming correctness failures",
+        validation: "the killed Pod is recreated, Tenant returns Ready, every committed object remains readable with its hash while the fault is active and the mixed workload meets the availability floor, RustFS reports every drive ok and every Pod ready after recovery, fresh post-recovery writes succeed, and committed PUTs remain readable with matching hashes",
         observability: "history.jsonl, workload-summary.json, checker-report.json, podchaos manifest/describe/yaml, Pod restart counts, current and previous RustFS logs",
         conflict_domain: "run-scoped PodChaos resource and one target Pod; can reuse a ready Tenant after the prior scenario has cleaned up",
     },
@@ -505,12 +516,12 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
-        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
         boundary: "rustfs-workload/network-partition",
         ci_phase: "faults",
         target: "one RustFS Pod selected by tenant label with peer traffic disrupted inside the e2e namespace",
         target_proof: DEFAULT_TARGET_PROOF,
-        validation: "network disruption is active during workload, successful reads never return wrong hashes, committed PUTs remain readable after heal, and Tenant recovers Ready",
+        validation: "network disruption is active during workload, every committed object remains readable with its hash from the surviving peers and the mixed workload meets the availability floor, successful reads never return wrong hashes, committed PUTs remain readable after heal, RustFS reports every drive ok and every Pod ready, fresh post-recovery writes succeed, and Tenant recovers Ready",
         observability: "history.jsonl, workload-summary.json, checker-report.json, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
         conflict_domain: "run-scoped NetworkChaos resource; must not overlap with PodChaos or IOChaos in the same Tenant",
     },
@@ -733,12 +744,12 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
-        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
         boundary: "rustfs-workload/pod-failure",
         ci_phase: "faults",
         target: "one RustFS Pod selected by tenant label and failed for the scenario duration",
         target_proof: DEFAULT_TARGET_PROOF,
-        validation: "the failed Pod recovers, Tenant returns Ready, and the S3 object model remains explainable",
+        validation: "the failed Pod recovers, Tenant returns Ready, every committed object remains readable with its hash while one Pod is down and the mixed workload meets the availability floor, RustFS reports every drive ok and every Pod ready after recovery, fresh post-recovery writes succeed, and the S3 object model remains explainable",
         observability: "history.jsonl, checker reports, podchaos manifest/describe/yaml, Pod restart counts, current and previous RustFS logs",
         conflict_domain: "run-scoped PodChaos resource and one target Pod; can reuse a ready Tenant after the prior scenario has cleaned up",
     },
@@ -1478,8 +1489,9 @@ mod tests {
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO,
         DetectorQualification, DurabilityBugFamily, FaultDetectorContract, FaultParameterSchema,
         FaultScenario, FaultScenarioStatus, FaultScenarioWorkloadProfile, IO_EIO_SCENARIO,
-        IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
-        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+        IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
+        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
+        POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
         QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO,
         WARP_UNDER_CHAOS_SCENARIO, acknowledged_mutation_kind, apply_catalog_defaults,
         executable_scenario_catalog, expected_workload_versioning_for_scenario,
@@ -1855,6 +1867,38 @@ mod tests {
     }
 
     #[test]
+    fn single_component_pod_and_partition_faults_require_availability() {
+        for name in [
+            POD_KILL_ONE_SCENARIO,
+            POD_FAILURE_SCENARIO,
+            NETWORK_PARTITION_ONE_SCENARIO,
+        ] {
+            let spec = scenario_spec(name).expect("scenario");
+            assert_eq!(
+                spec.impact_policy,
+                super::FaultImpactPolicy::AvailabilityRequired,
+                "{name}"
+            );
+            assert!(!spec.impact_policy.requires_client_disruption());
+            assert!(spec.impact_policy.requires_availability());
+        }
+        // Faults that must break clients keep their disruption requirement.
+        for name in [
+            IO_EIO_SCENARIO,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+        ] {
+            let spec = scenario_spec(name).expect("scenario");
+            assert!(spec.impact_policy.requires_client_disruption(), "{name}");
+            assert!(!spec.impact_policy.requires_availability(), "{name}");
+        }
+        assert_eq!(
+            super::FaultImpactPolicy::AvailabilityRequired.as_str(),
+            "availability-required"
+        );
+    }
+
+    #[test]
     fn catalog_marks_negative_controls_as_diagnostic_only() {
         for name in [
             DM_FLAKEY_VERSIONED_HOT_SCENARIO,
@@ -1909,6 +1953,7 @@ mod tests {
         assert!(json.contains("\"target_proof\""));
         assert!(json.contains("\"crds\""));
         assert!(json.contains("\"impact_policy\""));
+        assert!(json.contains("\"impact_policy\": \"availability-required\""));
         assert!(json.contains("\"qualification\": \"gate-candidate\""));
         assert!(json.contains("\"data-shard-loss\""));
     }

@@ -244,6 +244,42 @@ impl ObjectSpec {
         format!("{}dir-{index:06}/", Self::key_prefix(run_id))
     }
 
+    /// Prefix for the post-recovery write probe. It lives outside
+    /// [`Self::key_prefix`] on purpose: the checker LISTs only the workload
+    /// prefix and treats every key there as something history must explain,
+    /// so probe objects must never appear in that listing.
+    pub fn post_recovery_key_prefix(run_id: &str) -> String {
+        format!("fault-test-post-recovery/{run_id}/")
+    }
+
+    pub(crate) fn post_recovery_key(run_id: &str, index: usize) -> String {
+        format!(
+            "{}object-{index:06}",
+            Self::post_recovery_key_prefix(run_id)
+        )
+    }
+
+    pub(crate) fn prepare_post_recovery(
+        run_id: &str,
+        index: usize,
+        size_bytes: usize,
+        seed: u64,
+    ) -> PreparedObject {
+        let key = Self::post_recovery_key(run_id, index);
+        let body = seeded_bytes(seed, index, size_bytes);
+        let sha256 = sha256_hex(&body);
+        PreparedObject {
+            spec: Self {
+                key,
+                size_bytes,
+                sha256,
+                seed,
+                index,
+            },
+            body,
+        }
+    }
+
     pub fn matches_body(&self, body: &[u8]) -> bool {
         body.len() == self.size_bytes && sha256_hex(body) == self.sha256
     }
