@@ -22,7 +22,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::fault::{
     config::{DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, FaultTestConfig},
-    host_storage::{HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT},
+    host_storage::{
+        DM_FILESYSTEM_CHECK_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT,
+    },
     plan::{
         FaultInjection, FaultInjectionParameters, FaultPlan, FaultSelection, FaultTarget,
         FaultWorkloadMode,
@@ -194,6 +196,11 @@ impl FaultRunSpec {
             artifacts.required.extend(
                 [HOST_STORAGE_PROOF_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT].map(str::to_string),
             );
+        }
+        if plan.fault().kind() == crate::fault::plan::FaultKind::RustfsBlockDeviceDropWritesCrash {
+            artifacts
+                .required
+                .push(DM_FILESYSTEM_CHECK_ARTIFACT.to_string());
         }
         Self {
             api_version: FAULT_RUN_API_VERSION.to_string(),
@@ -599,6 +606,10 @@ mod tests {
                     .artifacts
                     .required
                     .contains(&"host-storage-post-cleanup.json".to_string())
+                && spec
+                    .artifacts
+                    .required
+                    .contains(&"dm-filesystem-check.json".to_string())
         );
     }
 }

@@ -859,11 +859,11 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             "host-storage proof must bind exact node/device/PV allowlists and rollback/quarantine/post-cleanup contracts before mutation",
             "dmsetup table/status must prove an always-down flakey drop_writes table on the dedicated mapped device",
             "the owning Pod must be force-deleted while drop_writes remains active and the filesystem must be unmounted before the healthy table is restored",
-            "the mapped filesystem must be remounted and the owning Pod identity must change before recovery verification",
+            "the mapped filesystem must pass its offline read-only checker, be remounted, and have a changed owning Pod identity before recovery verification",
             "run-spec workload.versioning must be true and workload.hotspot must be present",
         ],
         validation: "the crash window contains at least one versioned mutation acknowledged while drop_writes is active; after forced Pod loss, unmount, healthy-table restore and remount, all committed object versions are re-read by versionId, delete markers remain latest, and successful reads never return corrupt bytes; because only one EC volume is lost this is a negative-control proxy, not quorum-loss proof",
-        observability: "run-spec.json/yaml, host-storage-proof.json, host-storage-post-cleanup.json, workload-plan.json, history.jsonl, crash-window-evidence.json, dm-crash-boundary.json, dm-crash-recovered.json, checker-report.json, dmsetup table/status, mount identity, Pod UID transition, events, RustFS logs",
+        observability: "run-spec.json/yaml, host-storage-proof.json, host-storage-post-cleanup.json, dm-filesystem-check.json, workload-plan.json, history.jsonl, crash-window-evidence.json, dm-crash-boundary.json, dm-crash-recovered.json, checker-report.json, dmsetup table/status, mount identity, Pod UID transition, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {
@@ -889,11 +889,13 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target: "one dedicated Linux block-device-backed PV; one quiet versioned PUT arms drop_writes only after a definite ACK",
         target_proof: &[
             "host-storage proof must bind the exact node, device, PV, Pod, mount, mapper and recovery table before the trigger mutation",
+            "fault preparation and its refreshed host-storage proof must complete before the trigger ACK",
             "the trigger PUT must have a 2xx status, non-null version ID, and an ACK-to-fault interval within maxAckToFaultMs",
             "the owning Pod must be force-deleted and the filesystem unmounted while drop_writes remains active",
+            "the recovered filesystem must pass its offline read-only checker before remount and verification",
         ],
         validation: "the exact acknowledged PUT version remains readable with its committed hash after crash recovery; missing or ambiguous ACK identity is a harness failure, never PASS",
-        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
+        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, dm-filesystem-check.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {
@@ -919,11 +921,13 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target: "one dedicated Linux block-device-backed PV; one quiet versioned overwrite arms drop_writes only after a definite ACK",
         target_proof: &[
             "host-storage proof must bind the exact node, device, PV, Pod, mount, mapper and recovery table before the trigger mutation",
+            "fault preparation and its refreshed host-storage proof must complete before the trigger ACK",
             "the overwrite target must have a committed baseline version before target proof",
             "the trigger overwrite must have a 2xx status, non-null version ID, and an ACK-to-fault interval within maxAckToFaultMs",
+            "the recovered filesystem must pass its offline read-only checker before remount and verification",
         ],
         validation: "the acknowledged overwrite is latest with its committed hash and the baseline version remains addressable after recovery",
-        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
+        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, dm-filesystem-check.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {
@@ -949,11 +953,13 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target: "one dedicated Linux block-device-backed PV; one quiet versioned DELETE marker arms drop_writes only after a definite ACK",
         target_proof: &[
             "host-storage proof must bind the exact node, device, PV, Pod, mount, mapper and recovery table before the trigger mutation",
+            "fault preparation and its refreshed host-storage proof must complete before the trigger ACK",
             "the delete target must have a committed baseline version before target proof",
             "the trigger DELETE must prove is-delete-marker, a non-null version ID, and an ACK-to-fault interval within maxAckToFaultMs",
+            "the recovered filesystem must pass its offline read-only checker before remount and verification",
         ],
         validation: "the acknowledged delete marker remains latest, an unversioned GET stays absent, and the prior version remains addressable after recovery",
-        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
+        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, dm-filesystem-check.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {
@@ -979,11 +985,13 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target: "one dedicated Linux block-device-backed PV; one quiet zero-byte versioned PUT arms drop_writes only after a definite ACK",
         target_proof: &[
             "host-storage proof must bind the exact node, device, PV, Pod, mount, mapper and recovery table before the trigger mutation",
+            "fault preparation and its refreshed host-storage proof must complete before the trigger ACK",
             "the trigger PUT must record size zero, a 2xx status, non-null version ID, and an ACK-to-fault interval within maxAckToFaultMs",
             "the owning Pod must be force-deleted and the filesystem unmounted while drop_writes remains active",
+            "the recovered filesystem must pass its offline read-only checker before remount and verification",
         ],
         validation: "the exact acknowledged zero-byte version remains latest and readable as an empty object after crash recovery",
-        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
+        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, dm-filesystem-check.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {
@@ -1010,11 +1018,13 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target: "one dedicated Linux block-device-backed PV; pre-staged parts and one quiet CompleteMultipartUpload arm drop_writes only after a definite ACK",
         target_proof: &[
             "host-storage proof must bind the exact node, device, PV, Pod, mount, mapper and recovery table before the trigger mutation",
+            "fault preparation and its refreshed host-storage proof must complete before the trigger ACK",
             "multipart create and part uploads must finish before target proof; only CompleteMultipartUpload may occur in the ACK trigger interval",
             "the completion must have a 2xx status, non-null version ID, and an ACK-to-fault interval within maxAckToFaultMs",
+            "the recovered filesystem must pass its offline read-only checker before remount and verification",
         ],
         validation: "the exact acknowledged multipart version remains readable with the committed full-object hash after crash recovery",
-        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
+        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, dm-filesystem-check.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {

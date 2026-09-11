@@ -16,6 +16,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+use crate::fault::backends::runtime::{PreparedHostFault, prepare_host_fault};
 use crate::fault::{
     acknowledged_mutation::{
         AckToFaultEvidence, AcknowledgedMutationKind, AcknowledgedMutationTrigger,
@@ -23,6 +24,7 @@ use crate::fault::{
     },
     events::RunEventStatus,
     history::OperationOutcome,
+    quorum::require_fresh_runtime_observation,
     reporting::FaultEvidence,
     scenarios::acknowledged_mutation_kind,
     workload::{ObjectSpec, S3WorkloadClient, StagedMultipartCleanupGuard, StagedMultipartUpload},
@@ -51,6 +53,11 @@ struct PreparedQuietMutation {
     cancellation_cleanup: Option<StagedMultipartCleanupGuard>,
 }
 
+struct PreparedAckFault {
+    fault: PreparedHostFault,
+    started_at_ms: u64,
+}
+
 impl FaultRun<'_> {
     pub(super) async fn run_ack_triggered_case(
         &self,
@@ -71,8 +78,22 @@ impl FaultRun<'_> {
                 .run(self.prove_target(&prepared.endpoint, preflight_phases))
                 .await?;
             self.deadline.check()?;
+            let prepared_fault = match self.prepare_ack_fault(&target) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.record_failure(
+                        "fault-prepare",
+                        "environment_or_fault_backend",
+                        &error,
+                        None,
+                        None,
+                    )?;
+                    return Err(error);
+                }
+            };
+            self.deadline.check()?;
             let (mut active, trigger) = self
-                .activate_fault_after_ack(&prepared.s3, &target, workload)
+                .activate_fault_after_ack(&prepared.s3, &target, workload, prepared_fault)
                 .await?;
             if let Some(index) = staged_upload_index {
                 staged_uploads.remove(&index);
@@ -219,6 +240,7 @@ impl FaultRun<'_> {
         s3: &S3WorkloadClient,
         target: &ProvenTarget,
         quiet: QuietMutationWorkload,
+        prepared: PreparedAckFault,
     ) -> Result<(ActiveFault, AckToFaultEvidence)> {
         let operation_timeout = self
             .deadline
@@ -237,13 +259,49 @@ impl FaultRun<'_> {
             })),
         )?;
 
+        let PreparedAckFault {
+            fault: prepared_fault,
+            started_at_ms: fault_prepare_started_at_ms,
+        } = prepared;
+        let mut prepared_fault = Some(prepared_fault);
         let mut activated = None;
         let result = trigger
             .execute_and_activate_fault(s3, &self.context.history, quiet, || {
                 self.deadline.check()?;
-                let active = self.activate_fault(target)?;
-                let activated_at_ms = active.fault_active_at_ms;
-                activated = Some(active);
+                let fault_apply_started_at_ms = now_ms();
+                self.context.events.record(
+                    "fault-apply",
+                    RunEventStatus::Started,
+                    "activating the prepared device-mapper fault after the mutation ACK",
+                    None,
+                )?;
+                let activation = prepared_fault
+                    .take()
+                    .context("prepared device-mapper fault was already consumed")?
+                    .activate();
+                let (fault, activated_at_ms) = match activation {
+                    Ok(activated) => activated,
+                    Err(error) => {
+                        self.context
+                            .events
+                            .record(
+                                "fault-apply",
+                                RunEventStatus::Failed,
+                                error.to_string(),
+                                None,
+                            )
+                            .ok();
+                        return Err(error);
+                    }
+                };
+                self.context.history.mark_fault_active_at(activated_at_ms);
+                activated = Some((fault, fault_apply_started_at_ms, activated_at_ms));
+                self.context.events.record(
+                    "fault-apply",
+                    RunEventStatus::Succeeded,
+                    "the prepared device-mapper fault was activated",
+                    None,
+                )?;
                 Ok(activated_at_ms)
             })
             .await;
@@ -251,24 +309,23 @@ impl FaultRun<'_> {
             Ok(evidence) => evidence,
             Err(trigger_error) => {
                 let error = anyhow::Error::new(trigger_error);
-                if let Some(mut active) = activated {
+                if let Some((mut fault, _fault_apply_started_at_ms, _activated_at_ms)) = activated {
                     self.record_failure(
                         "ack-trigger",
                         "environment_or_fault_backend",
                         &error,
                         None,
-                        Some((&active.fault, "ack-trigger-failed")),
+                        Some((&fault, "ack-trigger-failed")),
                     )?;
                     let boundary_started_at_ms = now_ms();
-                    let boundary = active
-                        .fault
+                    let boundary = fault
                         .prepare_recovery_boundary(
                             self.config.cluster.timeout,
                             boundary_started_at_ms,
                         )
                         .context("prepare recovery boundary after late ACK-trigger activation");
                     let removal = self
-                        .remove_fault(&mut active.fault)
+                        .remove_fault(&mut fault)
                         .context("remove fault after failed ACK trigger");
                     if let Err(cleanup_error) = boundary.and(removal.map(|_| ())) {
                         return Err(error.context(format!(
@@ -281,14 +338,61 @@ impl FaultRun<'_> {
                 return Err(error);
             }
         };
-        let active = activated.context("ACK trigger returned without an activated fault")?;
+        let (fault, fault_apply_started_at_ms, fault_active_at_ms) =
+            activated.context("ACK trigger returned without an activated fault")?;
         self.context.events.record(
             "ack-trigger",
             RunEventStatus::Succeeded,
             "the fault became active after the eligible ACK and within its deadline",
             Some(serde_json::to_value(&evidence)?),
         )?;
+        let active = self.complete_fault_activation(
+            target,
+            fault,
+            Some(fault_prepare_started_at_ms),
+            fault_apply_started_at_ms,
+            Some(fault_active_at_ms),
+        )?;
         Ok((active, evidence))
+    }
+
+    fn prepare_ack_fault(&self, target: &ProvenTarget) -> Result<PreparedAckFault> {
+        self.context.events.record(
+            "fault-prepare",
+            RunEventStatus::Started,
+            "preparing the device-mapper actuator before the quiet mutation",
+            None,
+        )?;
+        let started_at_ms = now_ms();
+        if let Some(observed_at_ms) = target.topology_observed_at_ms {
+            require_fresh_runtime_observation(observed_at_ms, started_at_ms)
+                .context("target topology was stale before ACK fault preparation")?;
+        }
+        let proof = target
+            .host_storage_proof
+            .as_ref()
+            .context("ACK-triggered device-mapper fault lacks a host-storage proof")?;
+        proof
+            .require_fresh_at(started_at_ms)
+            .context("host-storage proof was stale before ACK fault preparation")?;
+        let fault = prepare_host_fault(
+            self.config,
+            self.collector,
+            self.scenario,
+            &self.context.run_id,
+            proof,
+            &target.execution_injection,
+        )?;
+        self.context.events.record(
+            "fault-prepare",
+            RunEventStatus::Succeeded,
+            "the device-mapper actuator is ready without an active fault",
+            None,
+        )?;
+        Ok(PreparedAckFault {
+            fault,
+            started_at_ms,
+        })
     }
 
     fn prepare_ack_crash_boundary(
@@ -384,6 +488,7 @@ impl FaultRun<'_> {
             active_snapshots: active.active_snapshots.clone(),
             workload_snapshots: Vec::new(),
             dm_recovery_snapshot: active.fault.recovery_dm_snapshot(),
+            fault_prepare_started_at_ms: active.fault_prepare_started_at_ms,
             fault_apply_started_at_ms: Some(active.fault_apply_started_at_ms),
             fault_active_at_ms: Some(active.fault_active_at_ms),
             workload_started_at_ms: None,

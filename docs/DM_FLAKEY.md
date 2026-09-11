@@ -162,6 +162,7 @@ metadata:
     rustfs.com/fault-host-observer: "true"
 spec:
   nodeName: <dm-node-name>
+  hostPID: true
   restartPolicy: Never
   containers:
     - name: host-tools
@@ -173,6 +174,7 @@ spec:
         - name: host-root
           mountPath: /host
           readOnly: true
+          mountPropagation: HostToContainer
   volumes:
     - name: host-root
       hostPath:
@@ -183,7 +185,13 @@ spec:
 The observer is intentionally separate from the fault namespace because the
 runner recreates that namespace for dedicated-storage scenarios. Its
 privileged access is still security-sensitive; dedicate it to the lab and
-remove it after testing.
+remove it after testing. The runner enters PID 1's mount namespace with the
+host `nsenter` binary for every observer and helper command, then verifies that
+the command sees the same mount namespace as PID 1. The host must provide
+`/usr/bin/nsenter`, `/usr/bin/findmnt`, `/usr/bin/readlink`, and
+`/usr/sbin/dmsetup`. Crash-proxy runs also require `/usr/bin/timeout` and the
+read-only checker for the mounted filesystem: `/usr/sbin/e2fsck` for ext2/3/4
+or `/usr/sbin/xfs_repair` for XFS.
 
 ## dm-flakey Run
 
@@ -249,8 +257,11 @@ make fault-run SCENARIO=dm-drop-writes-after-ack-multipart-complete
 
 These five cases share the same DeviceMapper actuator but remain independent
 catalog entries and suite attempts. Each prepares only its required baseline,
-proves the host-storage target, issues one typed mutation, and starts
-`drop_writes` only after a definite 2xx response with a non-null version ID.
+proves the host-storage target, and prepares the helper and exact mapper
+transaction before issuing the typed mutation. After a definite 2xx response
+with a non-null version ID, one preconditioned host command starts
+`drop_writes`; target snapshots are collected after the activation timestamp.
+`fault-evidence.json` records the preparation and apply timestamps, while
 `ack-to-fault-evidence.json` records the operation ID, key, version ID, ACK
 timestamp, fault activation timestamp, measured ACK-to-fault interval, and
 `maxAckToFaultMs`. The crash boundary also captures the recorder's next event
@@ -275,11 +286,16 @@ Its recovery boundary is intentionally owned by the host backend:
 3. Run the versioned workload and require at least one successful PUT, delete
    marker, or multipart completion with a version ID.
 4. Add a run-owned `NoSchedule` taint, force-delete the owning Pod, and unmount
-   the filesystem while `drop_writes` is still active. The unmount flush is
-   acknowledged but discarded, then releases the page cache.
-5. Restore the exact pre-injection linear table, remount with the captured
-   filesystem type/options, remove the taint, and wait for the replacement Pod
-   and Tenant to stabilize before lineage verification.
+   the filesystem while `drop_writes` is still active. The boundary also
+   requires both the logical and canonical mapper sources to have no remaining
+   mounts. The unmount flush is acknowledged but discarded, then releases the
+   page cache.
+5. Restore the exact pre-injection linear table and mount once to replay the
+   filesystem journal. Unmount it again, run the filesystem-specific checker
+   in read-only mode, and write `dm-filesystem-check.json`.
+6. Only after a clean check, remount with the captured filesystem type/options,
+   remove the taint, and wait for the replacement Pod and Tenant to stabilize
+   before lineage verification.
 
 The adapter refuses multi-segment or non-linear recovery tables, refuses to
 overwrite a pre-existing crash-containment taint, and keeps the node tainted if
@@ -299,7 +315,11 @@ attempts to suspend the mapper with `--noflush --nolockfs` and verifies that
 I/O remains suspended. `NoSchedule` only prevents new scheduling; it does not
 stop an existing Pod. The helper and unresolved mutation marker remain for
 manual recovery even if the scheduling taint succeeds. The wrapper preserves
-that marker after the process exits; only verified recovery clears it.
+that marker after the process exits; only verified recovery clears it. A failed
+offline filesystem check leaves the recovered mapper active but the filesystem
+unmounted, the node tainted, and the helper and mutation marker in place. Treat
+that dedicated filesystem as unsafe: preserve the artifacts, replace or
+recreate the lab volume, and clear the quarantine only after operator review.
 
 The Rust test reads the original `dmsetup table` as the recovery table when
 `RUSTFS_FAULT_TEST_DM_RECOVERY_TABLE` is unset. On normal failure paths it

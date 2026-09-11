@@ -320,6 +320,7 @@ impl FaultRun<'_> {
         } = target;
         let ActiveFault {
             fault,
+            fault_prepare_started_at_ms,
             fault_apply_started_at_ms,
             fault_active_at_ms,
             active_snapshots,
@@ -373,6 +374,7 @@ impl FaultRun<'_> {
             active_snapshots: active_snapshots.clone(),
             workload_snapshots: workload_snapshots.clone(),
             dm_recovery_snapshot: fault.recovery_dm_snapshot(),
+            fault_prepare_started_at_ms: *fault_prepare_started_at_ms,
             fault_apply_started_at_ms: Some(*fault_apply_started_at_ms),
             fault_active_at_ms: Some(*fault_active_at_ms),
             workload_started_at_ms: Some(*workload_started_at_ms),

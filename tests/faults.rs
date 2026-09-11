@@ -88,18 +88,20 @@ fn host_mutation_marker_rejects_wrong_token_and_cross_process_owner() {
     let marker = temporary.path().join("marker.json");
     std::fs::write(&marker, "{}").expect("marker");
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
-    let output = Command::new("bash")
-        .args([
-            "-c",
-            r#"
+    for phase in ["activating", "active", "rollback"] {
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                r#"
 source "$1"
 descends=yes
+marker_phase="$3"
 jq() {
   case "$2" in
     '.schemaVersion // empty') printf '1\n' ;;
     '.token // empty') printf 'token-a\n' ;;
     '.ownerPid // empty') printf '222\n' ;;
-    '.phase // empty') printf 'rollback\n' ;;
+    '.phase // empty') printf '%s\n' "$marker_phase" ;;
     *) return 1 ;;
   esac
 }
@@ -110,18 +112,20 @@ host_storage_mutation_active 111 "$2" token-b || printf 'wrong-token-rejected\n'
 descends=no
 host_storage_mutation_active 111 "$2" token-a || printf 'cross-process-rejected\n'
 "#,
-            "fault-mutation-state-test",
-            script,
-            marker.to_str().expect("marker path"),
-        ])
-        .output()
-        .expect("validate host mutation marker");
+                "fault-mutation-state-test",
+                script,
+                marker.to_str().expect("marker path"),
+                phase,
+            ])
+            .output()
+            .expect("validate host mutation marker");
 
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "valid\nwrong-token-rejected\ncross-process-rejected\n"
-    );
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "valid\nwrong-token-rejected\ncross-process-rejected\n"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -130,7 +134,13 @@ fn wrapper_preserves_unresolved_host_state_after_process_exit() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let marker = temporary.path().join("marker.json");
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
-    for phase in ["active", "rollback", "recovery-required"] {
+    for phase in [
+        "prepared",
+        "activating",
+        "active",
+        "rollback",
+        "recovery-required",
+    ] {
         let content =
             format!(r#"{{"schemaVersion":1,"token":"token-a","ownerPid":4242,"phase":"{phase}"}}"#);
         std::fs::write(&marker, &content).unwrap();

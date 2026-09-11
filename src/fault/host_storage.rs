@@ -20,6 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const HOST_STORAGE_PROOF_SCHEMA_VERSION: u8 = 3;
 pub const HOST_STORAGE_PROOF_ARTIFACT: &str = "host-storage-proof.json";
 pub const HOST_STORAGE_CLEANUP_ARTIFACT: &str = "host-storage-post-cleanup.json";
+pub const DM_FILESYSTEM_CHECK_ARTIFACT: &str = "dm-filesystem-check.json";
+pub(crate) const DM_FILESYSTEM_CHECK_SCHEMA_VERSION: u8 = 1;
 pub const HOST_STORAGE_PROOF_MAX_AGE_MS: u64 = 60_000;
 
 const DM_FLAKEY_KIND: &str = "rustfs_block_device_flakey";
@@ -71,6 +73,34 @@ pub struct HostStorageNodeSelector {
     pub key: String,
     pub operator: String,
     pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DmFilesystemCheck {
+    pub(crate) schema_version: u8,
+    pub(crate) scenario: String,
+    pub(crate) fault_name: String,
+    pub(crate) run_id: String,
+    pub(crate) node: String,
+    pub(crate) persistent_volume: String,
+    pub(crate) mapper_name: String,
+    pub(crate) logical_device: String,
+    pub(crate) canonical_device: String,
+    pub(crate) mount_path: String,
+    pub(crate) filesystem: String,
+    pub(crate) checker: String,
+    pub(crate) arguments: Vec<String>,
+    pub(crate) started_at_ms: u64,
+    pub(crate) completed_at_ms: u64,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) clean: bool,
+    pub(crate) mounted_for_recovery: bool,
+    pub(crate) unmounted_for_check: bool,
+    pub(crate) remounted_after_check: bool,
+    pub(crate) remounted_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -948,7 +978,7 @@ impl DmStatusSnapshot {
                 && self.canonical_device == target.canonical_device
                 && !self.suspended
                 && self.observed_at_ms >= proof.generated_at_ms
-                && normalize_dm_table(&self.table) == normalize_dm_table(expected_table),
+                && dm_tables_match(&self.table, expected_table)?,
             "device-mapper {stage} snapshot does not match the proven device, table, or active state"
         );
         ensure!(
@@ -984,8 +1014,82 @@ pub(crate) fn helper_pod_name(run_id: &str) -> String {
     format!("rustfs-fault-dm-helper-{suffix}")
 }
 
-pub(crate) fn normalize_dm_table(table: &str) -> String {
-    table.split_whitespace().collect::<Vec<_>>().join(" ")
+pub(crate) fn dm_tables_match(left: &str, right: &str) -> Result<bool> {
+    Ok(canonical_dm_table(left)? == canonical_dm_table(right)?)
+}
+
+fn canonical_dm_table(table: &str) -> Result<String> {
+    let fields = table.split_whitespace().collect::<Vec<_>>();
+    let target = fields
+        .get(2)
+        .copied()
+        .context("device-mapper table is missing its target type")?;
+    match target {
+        "linear" => Ok(parse_linear_table(table)?.canonical),
+        "flakey" => canonical_flakey_table(&fields),
+        other => bail!("unsupported device-mapper target type {other:?}"),
+    }
+}
+
+fn canonical_flakey_table(fields: &[&str]) -> Result<String> {
+    ensure!(
+        fields.len() >= 7,
+        "device-mapper flakey table is shorter than its required geometry and intervals"
+    );
+    let start_sector = parse_sector(fields[0], "start")?;
+    let length_sectors = parse_sector(fields[1], "length")?;
+    ensure!(
+        length_sectors > 0,
+        "device-mapper table length must be positive"
+    );
+    let backing_device = parse_backing_device(fields[3])?;
+    let backing_offset_sector = parse_sector(fields[4], "backing offset")?;
+    let up_interval = parse_sector(fields[5], "flakey up interval")?;
+    let down_interval = parse_sector(fields[6], "flakey down interval")?;
+
+    // The kernel expands a flakey table without optional features into the
+    // equivalent explicit error_reads/error_writes pair when `dmsetup table`
+    // reports it. Canonicalizing that representation keeps identity and
+    // behavior checks strict without comparing kernel formatting.
+    let mut features = if fields.len() == 7 {
+        vec!["error_reads", "error_writes"]
+    } else {
+        let count = fields[7]
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("device-mapper flakey feature count is invalid"))?;
+        ensure!(
+            fields.len() == 8 + count,
+            "device-mapper flakey feature count does not match its table"
+        );
+        let features = fields[8..].to_vec();
+        ensure!(
+            features
+                .iter()
+                .all(|feature| matches!(*feature, "drop_writes" | "error_reads" | "error_writes")),
+            "device-mapper flakey table contains unsupported feature arguments"
+        );
+        if features.is_empty() {
+            vec!["error_reads", "error_writes"]
+        } else {
+            features
+        }
+    };
+    features.sort_unstable();
+    ensure!(
+        features.windows(2).all(|pair| pair[0] != pair[1]),
+        "device-mapper flakey table contains duplicate feature arguments"
+    );
+    ensure!(
+        !features.contains(&"drop_writes")
+            || (!features.contains(&"error_writes") && !features.contains(&"error_reads")),
+        "drop_writes cannot be combined with error_reads or error_writes in this fault contract"
+    );
+
+    Ok(format!(
+        "{start_sector} {length_sectors} flakey {backing_device} {backing_offset_sector} {up_interval} {down_interval} {} {}",
+        features.len(),
+        features.join(" ")
+    ))
 }
 
 #[cfg(test)]
@@ -993,7 +1097,7 @@ mod tests {
     use super::{
         HostStorageAllowlist, HostStorageMutationIntent, HostStorageMutationProof,
         HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
-        HostStoragePostCleanupObservation, HostStorageTargetObservation,
+        HostStoragePostCleanupObservation, HostStorageTargetObservation, dm_tables_match,
     };
     use std::collections::BTreeMap;
 
@@ -1189,6 +1293,48 @@ mod tests {
             "0 1024 flakey /dev/loop0 0 0 86400 1 drop_writes"
         );
         assert_eq!(proof.recovery.rollback.suspend_mode, "nolockfs");
+    }
+
+    #[test]
+    fn kernel_expanded_flakey_defaults_match_the_requested_table() {
+        assert!(
+            dm_tables_match(
+                "0 1024 flakey 7:0 0 1 15",
+                "0 1024 flakey 7:0 0 1 15 2 error_reads error_writes",
+            )
+            .expect("compare flakey defaults")
+        );
+        assert!(
+            dm_tables_match(
+                "0 1024 flakey 7:0 0 1 15 2 error_writes error_reads",
+                "0 1024 flakey 7:0 0 1 15",
+            )
+            .expect("compare reordered flakey defaults")
+        );
+        assert!(
+            dm_tables_match("0 1024 flakey 7:0 0 1 15 0", "0 1024 flakey 7:0 0 1 15",)
+                .expect("compare explicit empty flakey defaults")
+        );
+    }
+
+    #[test]
+    fn flakey_table_comparison_rejects_behavior_or_geometry_drift() {
+        for actual in [
+            "0 1024 flakey 7:0 0 1 15 1 drop_writes",
+            "0 2048 flakey 7:0 0 1 15",
+            "0 1024 flakey 7:1 0 1 15",
+        ] {
+            assert!(
+                !dm_tables_match("0 1024 flakey 7:0 0 1 15", actual).expect("compare flakey table")
+            );
+        }
+        assert!(
+            dm_tables_match(
+                "0 1024 flakey 7:0 0 1 15",
+                "0 1024 flakey 7:0 0 1 15 2 error_reads error_reads",
+            )
+            .is_err()
+        );
     }
 
     #[test]

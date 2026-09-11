@@ -74,6 +74,8 @@ pub(crate) struct FaultEvidence {
     pub(crate) workload_snapshots: Vec<FaultStatusSnapshot>,
     pub(crate) dm_recovery_snapshot: Option<DmStatusSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fault_prepare_started_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) fault_apply_started_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) fault_active_at_ms: Option<u64>,
