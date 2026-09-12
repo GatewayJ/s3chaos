@@ -1625,6 +1625,23 @@ fn watch_observation(
     })
 }
 
+fn pre_reattach_watch_samples(
+    samples: Vec<StaleDmTableSample>,
+    reattach_started_at_ms: u64,
+) -> Result<(Vec<StaleDmTableSample>, usize)> {
+    let complete_count = samples.len();
+    let evidence = samples
+        .into_iter()
+        .filter(|sample| sample.observed_at_ms < reattach_started_at_ms)
+        .collect::<Vec<_>>();
+    ensure!(
+        !evidence.is_empty(),
+        "stale device-mapper watch has no absence sample before reattachment"
+    );
+    let post_reattach_count = complete_count - evidence.len();
+    Ok((evidence, post_reattach_count))
+}
+
 pub(crate) async fn run_stale_disk_case(
     config: &FaultTestConfig,
     collector: &ArtifactCollector,
@@ -1886,6 +1903,8 @@ pub(crate) async fn run_stale_disk_case(
             .as_mut()
             .context("stale device-mapper watch is unavailable")?
             .cancel_and_finish(Duration::from_secs(3))?;
+        let (watch_samples, post_reattach_sample_count) =
+            pre_reattach_watch_samples(watch_samples, storage_reattach.started_at_ms)?;
         let absence_observation_id = uuid::Uuid::new_v4().to_string();
         let absence = watch_observation(
             &identity,
@@ -1906,6 +1925,7 @@ pub(crate) async fn run_stale_disk_case(
                 "deleteMarker": delete_record,
                 "ackLoss": ack_loss,
                 "absence": absence,
+                "postReattachDiagnosticSampleCount": post_reattach_sample_count,
             }))?,
         )?;
         let recovery_snapshot = disk
@@ -2802,6 +2822,32 @@ mod tests {
             .expect_err("slow cancellation must time out");
         assert!(error.to_string().contains("cancellation exceeded"));
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn stale_watch_evidence_excludes_samples_observed_during_reattach_cleanup() {
+        let samples = vec![
+            StaleDmTableSample {
+                observed_at_ms: 90,
+                suspended: false,
+                table: "0 8 error".to_string(),
+            },
+            StaleDmTableSample {
+                observed_at_ms: 100,
+                suspended: false,
+                table: "0 8 linear 8:1 0".to_string(),
+            },
+            StaleDmTableSample {
+                observed_at_ms: 110,
+                suspended: false,
+                table: "0 8 linear 8:1 0".to_string(),
+            },
+        ];
+        let (evidence, post_reattach) =
+            pre_reattach_watch_samples(samples, 100).expect("pre-reattach evidence");
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].observed_at_ms, 90);
+        assert_eq!(post_reattach, 2);
     }
 
     #[test]
