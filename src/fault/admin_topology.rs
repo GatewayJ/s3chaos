@@ -1787,8 +1787,39 @@ fn validate_pre_start_snapshot(
     snapshot: &AdminPoolSnapshot,
     operation_requests: &[AdminRequestEvidence],
 ) -> Result<()> {
-    snapshot.validate_list_request()?;
     validate_request_targets(operation_requests, &proof.runtime.target)?;
+    let (start_started_at_ms, _, _) =
+        validate_start_before_status(operation_requests, &proof.scenario, proof.target_pool_id)?;
+    validate_admin_pre_start_snapshot(proof, snapshot, start_started_at_ms)?;
+    let (start_path, _) = admin_request_paths(&proof.scenario)?;
+    let start_runtime_probe = operation_requests
+        .iter()
+        .find(|request| request.method == "POST" && request.path == start_path)
+        .and_then(|request| request.runtime_probe.as_ref())
+        .context("admin start request lacks its fresh RustFS runtime probe")?;
+    ensure!(
+        snapshot.runtime.observed_at_ms < snapshot.tenant_get.started_at_ms
+            && snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
+            && snapshot.request.observed_at_ms
+                < start_runtime_probe.target.endpoint.cluster_started_at_ms
+            && start_runtime_probe.observed_at_ms <= start_started_at_ms
+            && snapshot.tenant_get.observed_at_ms < start_started_at_ms
+            && start_started_at_ms - snapshot.tenant_get.observed_at_ms
+                <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS
+            && start_started_at_ms - snapshot.observed_at_ms <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS,
+        "pre-start Tenant GET and pools/list intervals are stale, overlapping, or not complete before admin start"
+    );
+    Ok(())
+}
+
+/// Revalidate a fresh pool snapshot before issuing an admin topology mutation.
+pub fn validate_admin_pre_start_snapshot(
+    proof: &AdminTopologyProof,
+    snapshot: &AdminPoolSnapshot,
+    evaluated_at_ms: u64,
+) -> Result<()> {
+    proof.require_satisfied()?;
+    snapshot.validate_list_request()?;
     ensure!(
         snapshot.attempt == proof.attempt,
         "pre-start pool snapshot does not belong to the current run/case/Tenant attempt"
@@ -1814,25 +1845,13 @@ fn validate_pre_start_snapshot(
         capacity.target_pool_expression == proof.target_pool_expression,
         "pre-start pool snapshot target identity drifted after preflight"
     );
-    let (start_started_at_ms, _, _) =
-        validate_start_before_status(operation_requests, &proof.scenario, proof.target_pool_id)?;
-    let (start_path, _) = admin_request_paths(&proof.scenario)?;
-    let start_runtime_probe = operation_requests
-        .iter()
-        .find(|request| request.method == "POST" && request.path == start_path)
-        .and_then(|request| request.runtime_probe.as_ref())
-        .context("admin start request lacks its fresh RustFS runtime probe")?;
     ensure!(
-        snapshot.runtime.observed_at_ms < snapshot.tenant_get.started_at_ms
-            && snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
-            && snapshot.request.observed_at_ms
-                < start_runtime_probe.target.endpoint.cluster_started_at_ms
-            && start_runtime_probe.observed_at_ms <= start_started_at_ms
-            && snapshot.tenant_get.observed_at_ms < start_started_at_ms
-            && start_started_at_ms - snapshot.tenant_get.observed_at_ms
-                <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS
-            && start_started_at_ms - snapshot.observed_at_ms <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS,
-        "pre-start Tenant GET and pools/list intervals are stale, overlapping, or not complete before admin start"
+        evaluated_at_ms >= snapshot.observed_at_ms
+            && evaluated_at_ms >= snapshot.tenant_get.observed_at_ms
+            && evaluated_at_ms - snapshot.observed_at_ms <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS
+            && evaluated_at_ms - snapshot.tenant_get.observed_at_ms
+                <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS,
+        "pre-start Tenant GET or pools/list snapshot is stale or was observed after evaluation"
     );
     Ok(())
 }
@@ -2694,6 +2713,66 @@ fn project_rebalance_status(
         objects_moved,
         versions_moved,
         bytes_moved,
+    })
+}
+
+/// Build one progress sample directly from a captured RustFS status response.
+///
+/// Scenario runners use this while polling so the live decision and the
+/// offline validator share the same fail-closed status projection.
+pub fn rebalance_progress_sample(
+    proof: &AdminTopologyProof,
+    operation_id: &str,
+    call: &AdminCall<RebalanceStatus>,
+) -> Result<AdminOperationProgressSample> {
+    proof.require_satisfied()?;
+    ensure!(
+        proof.scenario == ADMIN_REBALANCE_SCENARIO,
+        "rebalance progress requires an admin-rebalance topology proof"
+    );
+    ensure!(
+        !operation_id.trim().is_empty() && call.value.id == operation_id,
+        "rebalance status response belongs to a different operation"
+    );
+    call.request.validate()?;
+    proof
+        .runtime
+        .target
+        .require_same_runtime_identity(&call.request.target)?;
+    ensure!(
+        call.request.method == Method::GET.as_str()
+            && call.request.path == format!("{ADMIN_PREFIX}/rebalance/status")
+            && call.request.query.is_empty()
+            && (200..300).contains(&call.request.status),
+        "rebalance progress source is not a successful status request"
+    );
+    let wire_status = parse_captured_json_response::<RebalanceStatus>(
+        &call.request,
+        "RustFS rebalance status response",
+    )?;
+    ensure!(
+        wire_status == call.value,
+        "rebalance status fields do not match the captured RustFS response"
+    );
+    let projection = project_rebalance_status(&call.value, &proof.runtime_pools, false)?;
+    let status_request_id = call
+        .request
+        .request_id
+        .clone()
+        .filter(|request_id| !request_id.trim().is_empty())
+        .context("rebalance status response lacks a request ID")?;
+    Ok(AdminOperationProgressSample {
+        attempt: proof.attempt.clone(),
+        operation_id: operation_id.to_string(),
+        status_request_id,
+        observed_at_ms: call.request.observed_at_ms,
+        state: projection.state.to_string(),
+        completed: projection.completed,
+        failed: projection.failed,
+        canceled_or_stopped: projection.stopped,
+        objects_moved: Some(projection.objects_moved),
+        versions_moved: Some(projection.versions_moved),
+        bytes_moved: Some(projection.bytes_moved),
     })
 }
 
@@ -5887,6 +5966,36 @@ mod tests {
         evidence
             .require_success(attempt_window())
             .expect("successful rebalance");
+    }
+
+    #[test]
+    fn rebalance_progress_sample_is_derived_from_raw_status_receipt() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_REBALANCE_SCENARIO).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_REBALANCE_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_REBALANCE_SCENARIO),
+        )
+        .unwrap();
+        let status = completed_rebalance_status("rebalance-1");
+        let request = rebalance_requests().remove(1);
+        let sample = rebalance_progress_sample(
+            &proof,
+            "rebalance-1",
+            &AdminCall {
+                value: status,
+                request,
+            },
+        )
+        .expect("progress sample from captured status");
+
+        assert_eq!(sample.state, "completed");
+        assert!(sample.completed);
+        assert_eq!(sample.objects_moved, Some(2));
+        assert_eq!(sample.versions_moved, Some(3));
+        assert_eq!(sample.bytes_moved, Some(128));
     }
 
     #[test]

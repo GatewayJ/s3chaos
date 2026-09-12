@@ -1,0 +1,42 @@
+# Qualification template. Keep outside fault/examples while the catalog entry
+# is Planned; move it there only after a dedicated live run qualifies the
+# staged-pool and RustFS admin API path.
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-admin-rebalance-qualification
+budgets:
+  maxDuration: 2h
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 200
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: disabled
+artifacts:
+  required: strict
+workloadProfiles:
+  bounded-versioned:
+    objects: 120
+    concurrency: 8
+    operationWeights:
+      put: 1
+      overwrite: 2
+      get: 1
+      list: 1
+      delete: 2
+      multipart: 3
+    payloadDistribution:
+      - sizeBytes: 4096
+        weight: 40
+      - sizeBytes: 65536
+        weight: 40
+      - sizeBytes: 2097152
+        weight: 20
+    hotspot:
+      objectPercent: 10
+      operationPercent: 80
+scenarios:
+  - name: admin-rebalance
+    faultDuration: 60m
+    workloadProfile: bounded-versioned

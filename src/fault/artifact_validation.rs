@@ -26,6 +26,10 @@ use uuid::Uuid;
 use crate::fault::{
     acknowledged_mutation::AcknowledgedMutationKind,
     admin_runner::{ADMIN_WORKFLOW_ARTIFACT, AdminWorkflowEvidence},
+    admin_rebalance::{
+        ADMIN_REBALANCE_OVERLAP_ARTIFACT, AdminRebalanceOverlapEvidence,
+        validate_admin_rebalance_evidence,
+    },
     admin_topology::{
         ADMIN_OPERATION_ARTIFACT, ADMIN_OPERATION_PROGRESS_ARTIFACT, ADMIN_TOPOLOGY_PROOF_ARTIFACT,
         AdminAttemptIdentity, AdminAttemptWindow, AdminOperationEvidence,
@@ -77,7 +81,8 @@ use crate::fault::{
     },
     reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
     scenarios::{
-        self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario, acknowledged_mutation_kind,
+        self, ADMIN_REBALANCE_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario,
+        acknowledged_mutation_kind,
     },
     spec::{
         FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunAckTriggerSpec, FaultRunArtifactSpec,
@@ -149,7 +154,19 @@ pub fn validate_admin_topology_artifact_files(
         &proof,
         &operation,
     )?;
-    validate_admin_operation_progress(&operation, &progress, attempt_window)
+    validate_admin_operation_progress(&operation, &progress, attempt_window)?;
+    if scenario == ADMIN_REBALANCE_SCENARIO {
+        let overlap = read_json::<AdminRebalanceOverlapEvidence>(&bound_case_artifact(
+            &case_dir,
+            ADMIN_REBALANCE_OVERLAP_ARTIFACT,
+        )?)?;
+        let history =
+            read_jsonl::<OperationRecord>(&bound_case_artifact(&case_dir, "history.jsonl")?)?;
+        let checker =
+            read_json::<CheckerReport>(&bound_case_artifact(&case_dir, "checker-report.json")?)?;
+        validate_admin_rebalance_evidence(&operation, &progress, &overlap, &history, &checker)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
