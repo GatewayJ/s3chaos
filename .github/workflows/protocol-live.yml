@@ -22,7 +22,7 @@ jobs:
   smoke:
     name: Native smoke gate
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, rustfs-protocol]
+    runs-on: sm-standard-4
     environment: rustfs-protocol-test
     timeout-minutes: 20
     env:
@@ -59,7 +59,7 @@ jobs:
     name: Native full regression
     needs: smoke
     if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, linux, rustfs-protocol]
+    runs-on: sm-standard-4
     environment: rustfs-protocol-test
     timeout-minutes: 60
     env:
@@ -101,7 +101,7 @@ jobs:
     name: STS expiration regression
     needs: native-regression
     if: ${{ github.event_name != 'pull_request' && always() }}
-    runs-on: [self-hosted, linux, rustfs-protocol]
+    runs-on: sm-standard-4
     environment: rustfs-protocol-test
     timeout-minutes: 30
     env:
@@ -143,7 +143,7 @@ jobs:
     name: External identity profile
     needs: native-regression
     if: ${{ github.event_name != 'pull_request' && always() }}
-    runs-on: [self-hosted, linux, rustfs-protocol]
+    runs-on: sm-standard-4
     environment: rustfs-protocol-test
     timeout-minutes: 45
     env:
