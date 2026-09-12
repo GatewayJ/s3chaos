@@ -81,6 +81,7 @@ impl StorageRecoveryCleanupProof {
                             | StorageRecoveryCase::FreshVolumeReplacementAdminDeep
                             | StorageRecoveryCase::OnDiskBitrotAutomaticScanner
                             | StorageRecoveryCase::OnDiskBitrotAdminDeep
+                            | StorageRecoveryCase::StaleDiskReturn
                     ) && *observed_at_ms
                         >= context.exclusive_access.kubernetes_lease.acquired_at_ms,
                     "pre-mutation abort proof is not a supported storage Lease-generation proof"

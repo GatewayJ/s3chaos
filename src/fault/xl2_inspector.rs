@@ -154,6 +154,28 @@ pub fn inspect_xl_meta(bytes: &[u8], requested_version_id: &str) -> Result<Xl2Ob
         "offline XL2 inspection does not target null versions"
     );
 
+    let layouts = inspect_all_xl_meta(bytes)?;
+    let mut matched = layouts
+        .into_iter()
+        .filter(|layout| layout.version_id == requested.to_string());
+    let layout = matched
+        .next()
+        .context("requested object version is absent from xl.meta")?;
+    ensure!(
+        matched.next().is_none(),
+        "requested XL2 version is duplicated"
+    );
+    Ok(layout)
+}
+
+/// Enumerates every non-inline object version and all of its declared shard
+/// parts from one supported `xl.meta`. Delete markers have no shard parts and
+/// are validated but intentionally omitted from the returned layouts.
+pub fn inspect_all_xl_meta(bytes: &[u8]) -> Result<Vec<Xl2ObjectVersionLayout>> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_XL_META_BYTES,
+        "xl.meta size must be between 1 and {MAX_XL_META_BYTES} bytes"
+    );
     let (profile, metadata) = decode_envelope(bytes)?;
     let revision = profile.revision()?;
     let mut cursor = MsgpackCursor::new(metadata);
@@ -171,21 +193,26 @@ pub fn inspect_xl_meta(bytes: &[u8], requested_version_id: &str) -> Result<Xl2Ob
         "XL2 version count exceeds inspection limit"
     );
 
-    let mut matched = None;
+    let mut layouts = Vec::with_capacity(version_count);
+    let mut version_ids = BTreeSet::new();
     for _ in 0..version_count {
         let header = cursor.read_bin("XL2 version header")?;
         let body = cursor.read_bin("XL2 version metadata")?;
         let parsed_header = parse_version_header(header)?;
-        if parsed_header.version_id != requested {
+        ensure!(
+            version_ids.insert(parsed_header.version_id),
+            "XL2 metadata contains a duplicate version id"
+        );
+        if parsed_header.version_type == 2 {
             continue;
         }
         ensure!(
             parsed_header.version_type == 1,
-            "requested XL2 version is not an object version"
+            "XL2 metadata contains an unsupported version type"
         );
         let object = parse_version_body(body)?;
         ensure!(
-            object.version_type == 1 && object.version_id == requested,
+            object.version_type == 1 && object.version_id == parsed_header.version_id,
             "XL2 version header and object body disagree"
         );
         ensure!(
@@ -197,15 +224,27 @@ pub fn inspect_xl_meta(bytes: &[u8], requested_version_id: &str) -> Result<Xl2Ob
                 && parsed_header.erasure_parity_shards == u64::from(object.erasure_parity_shards),
             "XL2 version header and object erasure geometry disagree"
         );
-        ensure!(matched.is_none(), "requested XL2 version is duplicated");
-        matched = Some(object);
+        layouts.push(object_layout(
+            profile,
+            revision,
+            parsed_header.version_id,
+            object,
+        )?);
     }
     ensure!(
         cursor.is_finished(),
         "XL2 metadata has trailing version bytes"
     );
 
-    let object = matched.context("requested object version is absent from xl.meta")?;
+    Ok(layouts)
+}
+
+fn object_layout(
+    profile: Xl2FormatProfile,
+    revision: &str,
+    version_id: Uuid,
+    object: ObjectLayout,
+) -> Result<Xl2ObjectVersionLayout> {
     let data_directory = object
         .data_directory
         .context("requested object version has no data directory")?;
@@ -250,7 +289,7 @@ pub fn inspect_xl_meta(bytes: &[u8], requested_version_id: &str) -> Result<Xl2Ob
     Ok(Xl2ObjectVersionLayout {
         inspector_revision: revision.to_string(),
         profile,
-        version_id: requested.to_string(),
+        version_id: version_id.to_string(),
         data_directory,
         erasure_data_shards: object.erasure_data_shards,
         erasure_parity_shards: object.erasure_parity_shards,

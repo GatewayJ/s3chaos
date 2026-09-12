@@ -20,6 +20,7 @@
 //! helper process operation.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::CString,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
@@ -47,7 +48,7 @@ use crate::fault::{
         StorageHelperInvocation, StorageRecoveryHostOperation, StorageRecoveryOperationReceipt,
         context_sha256, host_generation_sha256, same_storage_volume_generation,
     },
-    xl2_inspector::{inspect_xl_meta, validate_format_json_drive},
+    xl2_inspector::{inspect_all_xl_meta, inspect_xl_meta, validate_format_json_drive},
 };
 
 pub const STORAGE_HELPER_VOLUME_ROOT: &str = "/target";
@@ -57,7 +58,9 @@ const MAX_FORMAT_JSON_BYTES: usize = 1024 * 1024;
 const MAX_XL_META_BYTES: usize = 16 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: usize = 1024 * 1024;
 pub const CONTROLLED_SHARD_XOR_MASK: u8 = 0xff;
-const MAX_STALE_INVENTORY_OBJECTS: usize = 16;
+const MAX_STALE_INVENTORY_OBJECTS: usize = 512;
+const MAX_STALE_INVENTORY_ENTRIES: usize = 4_096;
+const MAX_STALE_INVENTORY_DEPTH: usize = 32;
 
 const RESOLVE_NO_XDEV: u64 = 0x01;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
@@ -333,8 +336,14 @@ fn inventory_stale_scope(
             && orphan.drive_uuid == request.drive_uuid,
         "stale inventory scope or orphan receipt is invalid"
     );
-    let scan_started_at_ms = now_ms()?;
-    let mut entries = Vec::with_capacity(expected_versions.len() + usize::from(include_orphan));
+    ensure!(
+        !request.bucket.is_empty()
+            && !request.bucket.contains('/')
+            && request.bucket != "."
+            && request.bucket != "..",
+        "stale inventory bucket is not a normalized path component"
+    );
+    let mut expected_by_version = BTreeMap::new();
     let mut operation_ids = Vec::with_capacity(expected_versions.len());
     for expected in expected_versions {
         validate_stale_object_key(&expected.object_key)?;
@@ -349,60 +358,44 @@ fn inventory_stale_scope(
                     .all(|byte| byte.is_ascii_hexdigit()),
             "stale inventory expected version identity is invalid"
         );
-        let object = open_stale_object_dir(root, &request.bucket, &expected.object_key)?;
-        let xl_meta = open_beneath(&object, "xl.meta", libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
-        let xl_meta = read_limited(&xl_meta, MAX_XL_META_BYTES, "stale inventory xl.meta")?;
-        let layout = inspect_xl_meta(&xl_meta, &expected.version_id)?;
-        let relative = layout
-            .relative_part_paths
-            .first()
-            .context("stale inventory version has no shard part")?;
-        let part = open_beneath(&object, relative, libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
-        let metadata = part.metadata().context("stat stale inventory shard")?;
-        let bytes = read_limited(&part, MAX_XL_META_BYTES, "stale inventory shard")?;
-        let full_relative = format!("{}/{}/{}", request.bucket, expected.object_key, relative);
-        entries.push(ShardInventoryEntry {
-            fragment_id: stale_fragment_id(&request.drive_uuid, &full_relative, metadata.ino()),
-            bucket: request.bucket.clone(),
-            object_key: expected.object_key.clone(),
-            version_id: expected.version_id.clone(),
-            drive_uuid: request.drive_uuid.clone(),
-            object_sha256: expected.object_sha256.to_ascii_lowercase(),
-            sha256: sha256_bytes(&bytes),
-            reference_state: FragmentReferenceState::ReferencedVersion,
-        });
+        ensure!(
+            expected_by_version
+                .insert(
+                    (expected.object_key.clone(), expected.version_id.clone()),
+                    expected.object_sha256.to_ascii_lowercase(),
+                )
+                .is_none(),
+            "stale inventory contains a duplicate expected object version"
+        );
         operation_ids.push(expected.operation_id.clone());
     }
+    let scan_started_at_ms = now_ms()?;
+    let first = scan_stale_bucket(request, root, &expected_by_version, orphan)?;
+    let entries = scan_stale_bucket(request, root, &expected_by_version, orphan)?;
+    ensure!(
+        first == entries,
+        "stale inventory changed between two exhaustive filesystem traversals"
+    );
+    let injected = entries
+        .iter()
+        .find(|entry| entry.fragment_id == orphan.fragment_id);
     if include_orphan {
-        let part = open_beneath(
-            root,
-            &orphan.relative_part_path,
-            libc::O_RDONLY | libc::O_CLOEXEC,
-            0,
-        )?;
-        let metadata = part.metadata().context("stat run-owned stale orphan")?;
-        let bytes = read_limited(&part, MAX_XL_META_BYTES, "run-owned stale orphan")?;
+        let injected = injected.context("run-owned stale orphan is absent from inventory")?;
         ensure!(
-            metadata.ino() == orphan.part_inode
-                && device_id(&metadata) == orphan.part_device_id
-                && metadata.len() == orphan.part_size_bytes
-                && sha256_bytes(&bytes) == orphan.fragment_sha256,
+            injected.object_key == orphan.object_key
+                && injected.version_id == orphan.version_id
+                && injected.object_sha256 == orphan.object_sha256
+                && injected.sha256 == orphan.fragment_sha256
+                && injected.reference_state == FragmentReferenceState::OrphanedUncommitted,
             "run-owned stale orphan identity changed before inventory"
         );
-        entries.push(ShardInventoryEntry {
-            fragment_id: orphan.fragment_id.clone(),
-            bucket: orphan.bucket.clone(),
-            object_key: orphan.object_key.clone(),
-            version_id: orphan.version_id.clone(),
-            drive_uuid: orphan.drive_uuid.clone(),
-            object_sha256: orphan.object_sha256.clone(),
-            sha256: orphan.fragment_sha256.clone(),
-            reference_state: FragmentReferenceState::OrphanedUncommitted,
-        });
     } else {
+        ensure!(
+            injected.is_none(),
+            "run-owned stale orphan remains present after cleanup"
+        );
         ensure_absent_beneath(root, &orphan.relative_part_path)?;
     }
-    entries.sort();
     let scan_completed_at_ms = now_ms()?.max(scan_started_at_ms + 1);
     let response = RustfsShardInventoryResponse {
         bucket: request.bucket.clone(),
@@ -421,6 +414,268 @@ fn inventory_stale_scope(
         response,
         expected_operation_ids: operation_ids,
     })
+}
+
+fn scan_stale_bucket(
+    request: &StaleOfflineHelperRequest,
+    root: &File,
+    expected: &BTreeMap<(String, String), String>,
+    orphan: &StaleOwnedOrphanReceipt,
+) -> Result<Vec<ShardInventoryEntry>> {
+    let bucket = open_beneath(
+        root,
+        &request.bucket,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )
+    .context("open run-owned stale inventory bucket")?;
+    let scope_prefix = format!("fault-test/{}", request.run_id);
+    validate_stale_object_key(&scope_prefix)?;
+    let scope = open_beneath(
+        &bucket,
+        &scope_prefix,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )
+    .context("open run-owned stale inventory prefix")?;
+    let mut object_keys = Vec::new();
+    discover_stale_objects(&scope, "", 0, &mut object_keys)?;
+    ensure!(
+        !object_keys.is_empty() && object_keys.len() <= MAX_STALE_INVENTORY_OBJECTS,
+        "stale inventory object count is empty or exceeds its bound"
+    );
+
+    let mut entries = Vec::new();
+    let mut discovered_versions = BTreeSet::new();
+    for relative_object_key in object_keys {
+        let object_key = format!("{scope_prefix}/{relative_object_key}");
+        let object = open_beneath(
+            &bucket,
+            &object_key,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        )?;
+        let xl_meta_file = open_beneath(&object, "xl.meta", libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
+        let xl_meta = read_limited(&xl_meta_file, MAX_XL_META_BYTES, "stale inventory xl.meta")?;
+        let layouts = inspect_all_xl_meta(&xl_meta)?;
+        let mut declared = BTreeMap::new();
+        for layout in layouts {
+            discovered_versions.insert((object_key.clone(), layout.version_id.clone()));
+            let expected_hash = expected
+                .get(&(object_key.clone(), layout.version_id.clone()))
+                .cloned();
+            for relative in layout.relative_part_paths {
+                ensure!(
+                    declared
+                        .insert(relative, (layout.version_id.clone(), expected_hash.clone()))
+                        .is_none(),
+                    "XL2 layouts declare the same shard path more than once"
+                );
+            }
+        }
+        scan_stale_object_parts(
+            request,
+            &object,
+            &object_key,
+            &xl_meta,
+            &declared,
+            orphan,
+            &mut entries,
+        )?;
+    }
+    ensure!(
+        expected
+            .keys()
+            .all(|identity| discovered_versions.contains(identity)),
+        "an expected S3 object version is absent from the exhaustive XL2 traversal"
+    );
+    ensure!(
+        entries.len() <= MAX_STALE_INVENTORY_ENTRIES,
+        "stale inventory entry count exceeds its bound"
+    );
+    entries.sort();
+    Ok(entries)
+}
+
+fn discover_stale_objects(
+    directory: &File,
+    relative: &str,
+    depth: usize,
+    objects: &mut Vec<String>,
+) -> Result<()> {
+    ensure!(
+        depth <= MAX_STALE_INVENTORY_DEPTH,
+        "stale inventory directory depth exceeds its bound"
+    );
+    let children = contained_directory_entries(directory)?;
+    if children
+        .iter()
+        .any(|(name, is_dir)| name == "xl.meta" && !is_dir)
+    {
+        ensure!(
+            !relative.is_empty(),
+            "stale inventory found xl.meta at bucket root"
+        );
+        objects.push(relative.to_string());
+        return Ok(());
+    }
+    for (name, is_dir) in children {
+        ensure!(
+            is_dir,
+            "stale bucket contains a file outside an XL2 object directory"
+        );
+        let child = open_beneath(
+            directory,
+            &name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        )?;
+        let child_relative = if relative.is_empty() {
+            name
+        } else {
+            format!("{relative}/{name}")
+        };
+        discover_stale_objects(&child, &child_relative, depth + 1, objects)?;
+        ensure!(
+            objects.len() <= MAX_STALE_INVENTORY_OBJECTS,
+            "stale inventory object count exceeds its bound"
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_stale_object_parts(
+    request: &StaleOfflineHelperRequest,
+    object: &File,
+    object_key: &str,
+    xl_meta: &[u8],
+    declared: &BTreeMap<String, (String, Option<String>)>,
+    orphan: &StaleOwnedOrphanReceipt,
+    entries: &mut Vec<ShardInventoryEntry>,
+) -> Result<()> {
+    let mut discovered_declared = BTreeSet::new();
+    for (directory_name, is_dir) in contained_directory_entries(object)? {
+        if directory_name == "xl.meta" {
+            ensure!(!is_dir, "stale object xl.meta is not a regular file");
+            continue;
+        }
+        ensure!(is_dir, "stale object contains an unexpected top-level file");
+        let directory = open_beneath(
+            object,
+            &directory_name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        )?;
+        let parts = contained_directory_entries(&directory)?;
+        ensure!(
+            !parts.is_empty(),
+            "stale object contains an empty data directory"
+        );
+        for (part_name, part_is_dir) in parts {
+            ensure!(
+                !part_is_dir
+                    && part_name.strip_prefix("part.").is_some_and(
+                        |part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
+                    ),
+                "stale object data directory contains a non-part entry"
+            );
+            let relative = format!("{directory_name}/{part_name}");
+            let part = open_beneath(object, &relative, libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
+            let metadata = part
+                .metadata()
+                .context("stat exhaustively discovered stale shard")?;
+            let bytes = read_limited(
+                &part,
+                MAX_XL_META_BYTES,
+                "exhaustively discovered stale shard",
+            )?;
+            let full_relative = format!("{}/{object_key}/{relative}", request.bucket);
+            let (version_id, expected_hash, reference_state) = match declared.get(&relative) {
+                Some((version_id, Some(hash))) => {
+                    discovered_declared.insert(relative.clone());
+                    (
+                        version_id.clone(),
+                        hash.clone(),
+                        FragmentReferenceState::ReferencedVersion,
+                    )
+                }
+                Some((version_id, None)) => {
+                    discovered_declared.insert(relative.clone());
+                    (
+                        version_id.clone(),
+                        sha256_bytes(xl_meta),
+                        FragmentReferenceState::Unclassified,
+                    )
+                }
+                None if full_relative == orphan.relative_part_path => (
+                    orphan.version_id.clone(),
+                    orphan.object_sha256.clone(),
+                    FragmentReferenceState::OrphanedUncommitted,
+                ),
+                None => (
+                    directory_name.clone(),
+                    sha256_bytes(xl_meta),
+                    FragmentReferenceState::Unclassified,
+                ),
+            };
+            entries.push(ShardInventoryEntry {
+                fragment_id: stale_fragment_id(&request.drive_uuid, &full_relative, metadata.ino()),
+                bucket: request.bucket.clone(),
+                object_key: object_key.to_string(),
+                version_id,
+                drive_uuid: request.drive_uuid.clone(),
+                object_sha256: expected_hash,
+                sha256: sha256_bytes(&bytes),
+                reference_state,
+            });
+            ensure!(
+                entries.len() <= MAX_STALE_INVENTORY_ENTRIES,
+                "stale inventory entry count exceeds its bound"
+            );
+        }
+    }
+    ensure!(
+        discovered_declared.len() == declared.len(),
+        "XL2 metadata declares a shard part absent from the filesystem traversal"
+    );
+    Ok(())
+}
+
+fn contained_directory_entries(directory: &File) -> Result<Vec<(String, bool)>> {
+    let path = format!("/proc/self/fd/{}", directory.as_raw_fd());
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&path)
+        .with_context(|| format!("scan pre-opened stale inventory directory {path}"))?
+    {
+        let entry = entry.context("read stale inventory directory entry")?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("stale inventory contains a non-UTF-8 filename"))?;
+        ensure!(
+            !name.is_empty() && !name.contains('/') && name != "." && name != "..",
+            "stale inventory contains an unsafe filename"
+        );
+        let file_type = entry
+            .file_type()
+            .context("read stale inventory entry type")?;
+        ensure!(
+            !file_type.is_symlink(),
+            "stale inventory contains a symbolic link"
+        );
+        ensure!(
+            file_type.is_dir() || file_type.is_file(),
+            "stale inventory contains a non-file, non-directory entry"
+        );
+        entries.push((name, file_type.is_dir()));
+        ensure!(
+            entries.len() <= MAX_STALE_INVENTORY_ENTRIES,
+            "stale inventory directory exceeds its entry bound"
+        );
+    }
+    entries.sort();
+    Ok(entries)
 }
 
 fn remove_stale_orphan(
@@ -678,6 +933,7 @@ impl StorageHelperSession {
             StorageRecoveryHostOperation::MutateShard { .. }
                 | StorageRecoveryHostOperation::PrepareFreshVolume { .. }
                 | StorageRecoveryHostOperation::DetachDeviceMapper { .. }
+                | StorageRecoveryHostOperation::ReattachDeviceMapper { .. }
         ) {
             self.mutation_started = true;
         }
@@ -745,7 +1001,6 @@ impl StorageHelperSession {
             ),
             StorageRecoveryHostOperation::DetachDeviceMapper { .. }
             | StorageRecoveryHostOperation::ReattachDeviceMapper { .. } => {
-                self.destructive_mutation_started = true;
                 transition_device_mapper(
                     &invocation.context,
                     &self.journal_root,
@@ -778,7 +1033,7 @@ impl StorageHelperSession {
             StaleOfflineHelperOperation::InjectOrphan { .. }
                 | StaleOfflineHelperOperation::RemoveOwnedOrphan { .. }
         ) {
-            self.destructive_mutation_started = true;
+            self.mutation_started = true;
         }
         execute_stale_offline_helper_at_root(request, &self.volume_root)
     }
@@ -2021,6 +2276,7 @@ fn now_ms() -> Result<u64> {
 mod tests {
     use super::*;
     use crate::fault::storage_recovery_runtime::*;
+    use crate::fault::xl2_inspector::test_fixture as xl2_fixture;
     use std::{fs, os::unix::fs::symlink};
     use tempfile::TempDir;
 
@@ -2376,6 +2632,91 @@ mod tests {
             )
             .expect("finish session");
         assert_eq!(fs::read(part_path).expect("restored part"), original);
+    }
+
+    #[test]
+    fn stale_inventory_traversal_surfaces_unlisted_versions_and_orphans() {
+        let (_temporary, roots) = test_roots();
+        let expected_version = "11111111-1111-1111-1111-111111111111";
+        let expected_data = "22222222-2222-2222-2222-222222222222";
+        let extra_version = "33333333-3333-3333-3333-333333333333";
+        let extra_data = "44444444-4444-4444-4444-444444444444";
+        for (object, version, data, body) in [
+            (
+                "fault-test/run-stale-1/expected",
+                expected_version,
+                expected_data,
+                b"expected".as_slice(),
+            ),
+            (
+                "fault-test/run-stale-1/unlisted",
+                extra_version,
+                extra_data,
+                b"unlisted".as_slice(),
+            ),
+        ] {
+            let directory = roots.volume.join("bucket-stale-1").join(object).join(data);
+            fs::create_dir_all(&directory).expect("XL2 data directory");
+            fs::write(directory.join("part.1"), body).expect("XL2 part");
+            fs::write(
+                directory
+                    .parent()
+                    .expect("object directory")
+                    .join("xl.meta"),
+                xl2_fixture(version, Some(data), &[1]),
+            )
+            .expect("XL2 metadata");
+        }
+        let root = open_directory(&roots.volume, "stale test volume").expect("open volume");
+        let request = stale_request(StaleOfflineHelperOperation::InjectOrphan {
+            object_key: "fault-test/run-stale-1/expected".to_string(),
+            version_id: "55555555-5555-5555-5555-555555555555".to_string(),
+        });
+        let orphan = match inject_stale_orphan(
+            &request,
+            &root,
+            "fault-test/run-stale-1/expected",
+            "55555555-5555-5555-5555-555555555555",
+        )
+        .expect("inject owned orphan")
+        {
+            StaleOfflineHelperResponse::OrphanInjected { receipt } => receipt,
+            response => panic!("unexpected helper response: {response:?}"),
+        };
+        let extra_orphan = roots.volume.join(
+            "bucket-stale-1/fault-test/run-stale-1/expected/66666666-6666-6666-6666-666666666666",
+        );
+        fs::create_dir(&extra_orphan).expect("extra orphan directory");
+        fs::write(extra_orphan.join("part.1"), b"unexpected orphan").expect("extra orphan part");
+
+        let response = inventory_stale_scope(
+            &request,
+            &root,
+            "77777777-7777-7777-7777-777777777777",
+            &[StaleOfflineExpectedVersion {
+                operation_id: "put-expected".to_string(),
+                object_key: "fault-test/run-stale-1/expected".to_string(),
+                version_id: expected_version.to_string(),
+                object_sha256: HASH.to_string(),
+            }],
+            &orphan,
+            true,
+        )
+        .expect("exhaustive stale inventory");
+        let StaleOfflineHelperResponse::Inventory { response, .. } = response else {
+            panic!("unexpected inventory response")
+        };
+        assert!(response.exhausted);
+        assert_eq!(response.entries.len(), 4);
+        assert!(response.entries.iter().any(|entry| {
+            entry.object_key == "fault-test/run-stale-1/unlisted"
+                && entry.version_id == extra_version
+                && entry.reference_state == FragmentReferenceState::Unclassified
+        }));
+        assert!(response.entries.iter().any(|entry| {
+            entry.version_id == "66666666-6666-6666-6666-666666666666"
+                && entry.reference_state == FragmentReferenceState::Unclassified
+        }));
     }
 
     #[test]

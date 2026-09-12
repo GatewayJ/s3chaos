@@ -556,8 +556,11 @@ pub(crate) fn observe_stale_host_runtime_identity(
 const STALE_DM_WATCH_SCRIPT: &str = r#"set -eu
 name=$1
 count=$2
+cancel=$3
+trap '/usr/bin/rm -f -- "$cancel"' EXIT
 i=0
 while [ "$i" -lt "$count" ]; do
+    [ ! -e "$cancel" ] || break
     observed=$(/usr/bin/date +%s%3N)
     suspended=$(/usr/sbin/dmsetup info --columns --noheadings --options suspended "$name" | /usr/bin/tr -d '[:space:]' | /usr/bin/tr '[:upper:]' '[:lower:]')
     table=$(/usr/sbin/dmsetup table --showkeys "$name")
@@ -571,6 +574,80 @@ while [ "$i" -lt "$count" ]; do
     /usr/bin/sleep 0.05
 done"#;
 
+const STALE_DM_WATCH_CANCEL_SCRIPT: &str = r#"set -eu
+cancel=$1
+case "$cancel" in
+    /tmp/s3chaos-stale-watch-*) ;;
+    *) exit 72 ;;
+esac
+: > "$cancel""#;
+
+const STALE_DM_WATCH_PREPARE_SCRIPT: &str = r#"set -eu
+cancel=$1
+case "$cancel" in
+    /tmp/s3chaos-stale-watch-*) ;;
+    *) exit 72 ;;
+esac
+/usr/bin/rm -f -- "$cancel""#;
+
+pub(crate) fn stale_dm_watch_cancel_file(proof: &HostStorageMutationProof) -> Result<String> {
+    proof.validate()?;
+    let table = normalized_dm_table_sha256(&proof.tables.recovery_table)?;
+    Ok(format!(
+        "/tmp/s3chaos-stale-watch-{}-{}",
+        &table[..24],
+        proof.generated_at_ms
+    ))
+}
+
+pub(crate) fn cancel_stale_dm_watch(
+    config: &FaultTestConfig,
+    proof: &HostStorageMutationProof,
+) -> Result<()> {
+    let cancel_file = stale_dm_watch_cancel_file(proof)?;
+    let output = observer_host_command(
+        &config.cluster,
+        &proof.observer_namespace,
+        &proof.observer_pod,
+        [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            STALE_DM_WATCH_CANCEL_SCRIPT.to_string(),
+            "s3chaos-stale-watch-cancel".to_string(),
+            cancel_file,
+        ],
+    )?;
+    ensure!(
+        output.stdout.trim().is_empty() && output.stderr.trim().is_empty(),
+        "stale device-mapper watch cancellation wrote unexpected output"
+    );
+    Ok(())
+}
+
+pub(crate) fn prepare_stale_dm_watch(
+    config: &FaultTestConfig,
+    proof: &HostStorageMutationProof,
+) -> Result<()> {
+    let cancel_file = stale_dm_watch_cancel_file(proof)?;
+    let output = observer_host_command(
+        &config.cluster,
+        &proof.observer_namespace,
+        &proof.observer_pod,
+        [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            STALE_DM_WATCH_PREPARE_SCRIPT.to_string(),
+            "s3chaos-stale-watch-prepare".to_string(),
+            cancel_file,
+        ],
+    )?;
+    ensure!(
+        output.stdout.trim().is_empty() && output.stderr.trim().is_empty(),
+        "stale device-mapper watch preparation wrote unexpected output"
+    );
+    Ok(())
+}
+
 pub(crate) fn capture_stale_dm_watch(
     config: &FaultTestConfig,
     proof: &HostStorageMutationProof,
@@ -583,6 +660,7 @@ pub(crate) fn capture_stale_dm_watch(
             && (3..=2_400).contains(&sample_count),
         "stale device-mapper watch identity or bounded sample count is invalid"
     );
+    let cancel_file = stale_dm_watch_cancel_file(proof)?;
     let output = observer_host_command(
         &config.cluster,
         &proof.observer_namespace,
@@ -594,6 +672,7 @@ pub(crate) fn capture_stale_dm_watch(
             "s3chaos-stale-watch".to_string(),
             proof.target.mapper_name.clone(),
             sample_count.to_string(),
+            cancel_file,
         ],
     )?;
     ensure!(
@@ -637,7 +716,7 @@ pub(crate) fn capture_stale_dm_watch(
         })
         .collect::<Result<Vec<_>>>()?;
     ensure!(
-        samples.len() == sample_count
+        (3..=sample_count).contains(&samples.len())
             && samples.windows(2).all(|window| {
                 window[0].observed_at_ms < window[1].observed_at_ms
                     && window[1].observed_at_ms - window[0].observed_at_ms <= 100

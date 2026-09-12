@@ -3981,6 +3981,9 @@ pub struct ShardInventoryEntry {
 pub enum FragmentReferenceState {
     ReferencedVersion,
     OrphanedUncommitted,
+    /// A fragment discovered by the closed offline traversal that cannot be
+    /// reconciled to the captured S3/history model.
+    Unclassified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -9286,6 +9289,39 @@ mod tests {
                 )
                 .is_err(),
             "a client-observed 5xx is not a byte-dropped successful upstream ACK"
+        );
+
+        let extra_unclassified = ShardInventoryEntry {
+            fragment_id: "fragment-unlisted-version".to_string(),
+            version_id: "unlisted-version".to_string(),
+            reference_state: FragmentReferenceState::Unclassified,
+            ..unknown.clone()
+        };
+        let mut unclassified_entries = before_inventory
+            .response()
+            .expect("inventory response")
+            .entries;
+        unclassified_entries.push(extra_unclassified);
+        let unclassified_before = inventory(
+            "inventory-unclassified",
+            "cursor-unclassified",
+            550,
+            unclassified_entries,
+        );
+        let mut unclassified_proof = proof.clone();
+        unclassified_proof.before_inventory_snapshot_id =
+            unclassified_before.receipt.snapshot_id.clone();
+        unclassified_proof.before_inventory_sha256 = unclassified_before.entries_sha256.clone();
+        assert!(
+            unclassified_proof
+                .validate_against_stale_return(
+                    &stale_return,
+                    &unclassified_before,
+                    &after_inventory,
+                    &history,
+                )
+                .is_err(),
+            "an exhaustively discovered unlisted version must deny cleanup authority"
         );
 
         let second_unknown = ShardInventoryEntry {

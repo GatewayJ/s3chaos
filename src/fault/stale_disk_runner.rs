@@ -14,7 +14,12 @@
 
 //! Fail-closed execution route for the planned stale-disk-return qualification.
 
-use std::{net::SocketAddr, thread, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use http::Method;
@@ -30,14 +35,15 @@ use tokio::{
 use crate::{
     fault::{
         backends::host::{
-            StaleDmTableSample, capture_stale_dm_watch, observe_stale_host_runtime_identity,
-            preflight_stale_disk_mutation, prepare_stale_disk,
+            StaleDmTableSample, cancel_stale_dm_watch, capture_stale_dm_watch,
+            observe_stale_host_runtime_identity, preflight_stale_disk_mutation, prepare_stale_disk,
+            prepare_stale_dm_watch,
         },
         checker::check_s3_history,
         config::FaultTestConfig,
         events::RunEventStatus,
         fixture,
-        history::{OperationOutcome, Recorder},
+        history::{OperationKind, OperationOutcome, Recorder},
         host_storage::{DmStatusSnapshot, HOST_STORAGE_PROOF_ARTIFACT, HostStorageMutationProof},
         plan::{ExecutionPlan, StorageRecoveryExecutionPlan},
         pods::rustfs_target_inventory,
@@ -77,8 +83,7 @@ use crate::{
             CurrentStorageObservation, HostFlockProof, KubectlStorageRecoveryAttemptGuard,
             KubectlStorageRecoveryHostAdapter, KubernetesLeaseProof, KubernetesResourceVersions,
             OwnedStorageContext, StorageRecoveryExclusiveAccess, StorageRecoveryHostOperation,
-            StorageRecoveryOperationReceipt, context_sha256, host_generation_sha256,
-            storage_scope_sha256,
+            StorageRecoveryOperationReceipt, host_generation_sha256, storage_scope_sha256,
         },
         workload::{
             ObjectSpec, S3WorkloadClient,
@@ -381,7 +386,6 @@ async fn acquire_stale_ownership(
         Ok(adapter) => adapter,
         Err(primary) => {
             let abort = StorageRecoveryCleanupProof::AbortedBeforeMutation {
-                context_sha256: context_sha256(&context)?,
                 observed_at_ms: now_ms()?.max(context.observed_at_ms),
             };
             return match lease
@@ -399,7 +403,6 @@ async fn acquire_stale_ownership(
         Ok(helper) => helper,
         Err(primary) => {
             let abort = StorageRecoveryCleanupProof::AbortedBeforeMutation {
-                context_sha256: context_sha256(&context)?,
                 observed_at_ms: now_ms()?.max(context.observed_at_ms),
             };
             return match lease
@@ -582,32 +585,80 @@ impl Drop for TenantCleanupGuard<'_> {
 }
 
 struct StaleWatchGuard {
-    task: Option<thread::JoinHandle<Result<Vec<StaleDmTableSample>>>>,
+    cancel: Option<Box<dyn FnOnce() -> Result<()> + Send>>,
+    result: Receiver<Result<Vec<StaleDmTableSample>>>,
+    task: Option<thread::JoinHandle<()>>,
 }
 
 impl StaleWatchGuard {
-    fn new(task: thread::JoinHandle<Result<Vec<StaleDmTableSample>>>) -> Self {
-        Self { task: Some(task) }
+    fn start(config: FaultTestConfig, proof: HostStorageMutationProof) -> Result<Self> {
+        // Clear a stale sentinel before spawning. The watch itself never
+        // clears it, so cancellation wins even if the remote command starts
+        // after the controller has already begun recovery.
+        prepare_stale_dm_watch(&config, &proof)?;
+        let watch_config = config.clone();
+        let watch_proof = proof.clone();
+        Self::spawn(
+            move || cancel_stale_dm_watch(&config, &proof),
+            move || capture_stale_dm_watch(&watch_config, &watch_proof, 600),
+        )
     }
 
-    fn finish(mut self) -> Result<Vec<StaleDmTableSample>> {
+    fn spawn(
+        cancel: impl FnOnce() -> Result<()> + Send + 'static,
+        watch: impl FnOnce() -> Result<Vec<StaleDmTableSample>> + Send + 'static,
+    ) -> Result<Self> {
+        let (sender, result) = mpsc::sync_channel(1);
+        let task = thread::Builder::new()
+            .name("s3chaos-stale-dm-watch".to_string())
+            .spawn(move || {
+                let _ = sender.send(watch());
+            })
+            .context("start bounded stale device-mapper watch")?;
+        Ok(Self {
+            cancel: Some(Box::new(cancel)),
+            result,
+            task: Some(task),
+        })
+    }
+
+    fn cancel_and_finish(&mut self, timeout: Duration) -> Result<Vec<StaleDmTableSample>> {
+        self.cancel
+            .take()
+            .context("stale device-mapper watch cancellation was already requested")?()?;
+        let result = match self.result.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                bail!("stale device-mapper watch did not stop before its cancellation deadline")
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("stale device-mapper watch exited without a result")
+            }
+        };
         self.task
             .take()
             .expect("stale watch task is present")
             .join()
-            .map_err(|_| anyhow::anyhow!("stale device-mapper watch panicked"))?
+            .map_err(|_| anyhow::anyhow!("stale device-mapper watch panicked"))?;
+        result
     }
 }
 
 impl Drop for StaleWatchGuard {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take()
-            && let Err(error) = task
-                .join()
-                .map_err(|_| anyhow::anyhow!("stale device-mapper watch panicked"))
-                .and_then(|result| result)
-        {
-            eprintln!("warning: stale device-mapper watch failed during cancellation: {error:#}");
+        if let Some(task) = self.task.take() {
+            let cancel = self.cancel.take();
+            // Never make unwinding wait for the remote watch's 30 second
+            // bound. Normal error handling reattaches first and calls the
+            // bounded finish path; this detached fallback is only for panic.
+            let _ = thread::Builder::new()
+                .name("s3chaos-stale-dm-watch-cancel".to_string())
+                .spawn(move || {
+                    if let Some(cancel) = cancel {
+                        let _ = cancel();
+                    }
+                    let _ = task.join();
+                });
         }
     }
 }
@@ -1686,17 +1737,15 @@ pub(crate) async fn run_stale_disk_case(
     let mut detach_attempted = false;
     let mut reattach_storage_receipt = None::<StorageRecoveryOperationReceipt>;
     let mut reattach_owned_context = None::<OwnedStorageContext>;
+    let mut watch = None::<StaleWatchGuard>;
     let primary = async {
         deadline.check()?;
         let first_snapshot = disk.snapshot("stale-watch-start")?;
         let (first_binding, watch_started_at_ms) = kubernetes_binding_evidence(config, &volume)?;
-        let watch_config = config.clone();
-        let watch_proof = prepared_proof.clone();
-        let watch = thread::Builder::new()
-            .name("s3chaos-stale-dm-watch".to_string())
-            .spawn(move || capture_stale_dm_watch(&watch_config, &watch_proof, 600))
-            .context("start bounded stale device-mapper watch")?;
-        let watch = StaleWatchGuard::new(watch);
+        watch = Some(StaleWatchGuard::start(
+            config.clone(),
+            prepared_proof.clone(),
+        )?);
         thread::sleep(Duration::from_millis(250));
 
         renew_stale_ownership(
@@ -1785,7 +1834,10 @@ pub(crate) async fn run_stale_disk_case(
         .into_iter()
         .max()
         .context("stale mutation window has no operations")?;
-        let watch_samples = watch.finish()?;
+        let watch_samples = watch
+            .as_mut()
+            .context("stale device-mapper watch is unavailable")?
+            .cancel_and_finish(Duration::from_secs(3))?;
         let absence_observation_id = uuid::Uuid::new_v4().to_string();
         let absence = watch_observation(
             &identity,
@@ -2058,29 +2110,46 @@ pub(crate) async fn run_stale_disk_case(
             }))?,
         )?;
 
-        let expected_versions = vec![
-            StaleOfflineExpectedVersion {
-                operation_id: overwrite_record.id.clone(),
-                object_key: overwrite_record
-                    .key
-                    .clone()
-                    .context("stale overwrite lacks object key")?,
-                version_id: overwrite_record
-                    .version_id
-                    .clone()
-                    .context("stale overwrite lacks version id")?,
-                object_sha256: overwrite.spec.sha256.clone(),
-            },
-            StaleOfflineExpectedVersion {
-                operation_id: ack_record.id.clone(),
-                object_key: ack_record
-                    .key
-                    .clone()
-                    .context("ACK-loss PUT lacks object key")?,
-                version_id: ack_loss.upstream_version_id.clone(),
-                object_sha256: ack_object.spec.sha256.clone(),
-            },
-        ];
+        let inventory_prefix = ObjectSpec::key_prefix(&context.run_id);
+        let mut expected_versions = context
+            .history
+            .records()
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.kind,
+                    OperationKind::Put | OperationKind::CompleteMultipartUpload
+                )
+                    && record.outcome == OperationOutcome::Ok
+                    && record.http_status.is_some_and(|status| (200..300).contains(&status))
+                    && record
+                        .key
+                        .as_deref()
+                        .is_some_and(|key| key.starts_with(&inventory_prefix))
+            })
+            .map(|record| {
+                Ok(StaleOfflineExpectedVersion {
+                    operation_id: record.id,
+                    object_key: record.key.context("committed inventory write lacks object key")?,
+                    version_id: record
+                        .version_id
+                        .filter(|version_id| version_id != "null")
+                        .context("committed inventory write lacks a version id")?,
+                    object_sha256: record
+                        .value_sha256
+                        .context("committed inventory write lacks a content hash")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        expected_versions.push(StaleOfflineExpectedVersion {
+            operation_id: ack_record.id.clone(),
+            object_key: ack_record
+                .key
+                .clone()
+                .context("ACK-loss PUT lacks object key")?,
+            version_id: ack_loss.upstream_version_id.clone(),
+            object_sha256: ack_object.spec.sha256.clone(),
+        });
         let dry_run = run_stale_path_heal(
             stale_ownership_environment(
                 config,
@@ -2227,8 +2296,8 @@ pub(crate) async fn run_stale_disk_case(
                 .map(|entry| entry.fragment_id.clone())
                 .collect::<Vec<_>>();
             ensure!(
-                fragment_ids.len() == 1,
-                "offline inventory did not resolve exactly one target-drive fragment for {object_key:?} version {version_id:?}"
+                !fragment_ids.is_empty(),
+                "offline inventory did not resolve target-drive fragments for {object_key:?} version {version_id:?}"
             );
             Ok(fragment_ids)
         };
@@ -2260,6 +2329,31 @@ pub(crate) async fn run_stale_disk_case(
             removed_fragment_ids: Vec::new(),
         };
         let cleanup_body = serde_json::to_string(&cleanup_response)?;
+        let mut classified_versions = expected_versions
+            .iter()
+            .map(|expected| {
+                Ok(ClassifiedVersionFragments {
+                    evidence_id: uuid::Uuid::new_v4().to_string(),
+                    operation_id: Some(expected.operation_id.clone()),
+                    object_key: expected.object_key.clone(),
+                    version_id: expected.version_id.clone(),
+                    recoverability: if expected.operation_id == ack_record.id {
+                        FragmentRecoverability::RecoverableUnknown
+                    } else {
+                        FragmentRecoverability::Committed
+                    },
+                    fragment_ids: fragments_for(&expected.object_key, &expected.version_id)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        classified_versions.push(ClassifiedVersionFragments {
+            evidence_id: uuid::Uuid::new_v4().to_string(),
+            operation_id: None,
+            object_key: orphan.object_key.clone(),
+            version_id: orphan.version_id.clone(),
+            recoverability: FragmentRecoverability::UncommittedDangling,
+            fragment_ids: vec![orphan.fragment_id.clone()],
+        });
         let cleanup = DanglingCleanupProof {
             schema_version: crate::fault::storage_recovery::STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
             identity: identity.clone(),
@@ -2278,56 +2372,7 @@ pub(crate) async fn run_stale_disk_case(
             started_at_ms: cleanup_started_at_ms,
             completed_at_ms: cleanup_completed_at_ms,
             ack_loss_puts: vec![ack_loss.clone()],
-            classified_versions: vec![
-                ClassifiedVersionFragments {
-                    evidence_id: uuid::Uuid::new_v4().to_string(),
-                    operation_id: Some(overwrite_record.id.clone()),
-                    object_key: overwrite_record
-                        .key
-                        .clone()
-                        .context("stale overwrite lacks object key")?,
-                    version_id: overwrite_record
-                        .version_id
-                        .clone()
-                        .context("stale overwrite lacks version id")?,
-                    recoverability: FragmentRecoverability::Committed,
-                    fragment_ids: fragments_for(
-                        overwrite_record
-                            .key
-                            .as_deref()
-                            .context("stale overwrite lacks object key")?,
-                        overwrite_record
-                            .version_id
-                            .as_deref()
-                            .context("stale overwrite lacks version id")?,
-                    )?,
-                },
-                ClassifiedVersionFragments {
-                    evidence_id: uuid::Uuid::new_v4().to_string(),
-                    operation_id: Some(ack_record.id.clone()),
-                    object_key: ack_record
-                        .key
-                        .clone()
-                        .context("ACK-loss PUT lacks object key")?,
-                    version_id: ack_loss.upstream_version_id.clone(),
-                    recoverability: FragmentRecoverability::RecoverableUnknown,
-                    fragment_ids: fragments_for(
-                        ack_record
-                            .key
-                            .as_deref()
-                            .context("ACK-loss PUT lacks object key")?,
-                        &ack_loss.upstream_version_id,
-                    )?,
-                },
-                ClassifiedVersionFragments {
-                    evidence_id: uuid::Uuid::new_v4().to_string(),
-                    operation_id: None,
-                    object_key: orphan.object_key.clone(),
-                    version_id: orphan.version_id.clone(),
-                    recoverability: FragmentRecoverability::UncommittedDangling,
-                    fragment_ids: vec![orphan.fragment_id.clone()],
-                },
-            ],
+            classified_versions,
         };
         cleanup.validate_against_stale_return(
             &stale,
@@ -2440,6 +2485,14 @@ pub(crate) async fn run_stale_disk_case(
             }
         }
 
+        if let Some(watch) = watch.as_mut().filter(|watch| watch.task.is_some()) {
+            primary = preserve_primary(
+                primary,
+                watch.cancel_and_finish(Duration::from_secs(3)).map(|_| ()),
+                "bounded stale-watch cancellation after device reattachment",
+            );
+        }
+
         if reattach_storage_receipt.is_some()
             && let Some(orphan) = owned_orphan.as_ref()
         {
@@ -2499,7 +2552,6 @@ pub(crate) async fn run_stale_disk_case(
             )
             .await?;
             let cleanup = StorageRecoveryCleanupProof::AbortedBeforeMutation {
-                context_sha256: context_sha256(&owned_context)?,
                 observed_at_ms: now_ms()?.max(owned_context.observed_at_ms),
             };
             collector.write_text(
@@ -2614,6 +2666,7 @@ fn preserve_primary(primary: Result<()>, secondary: Result<()>, label: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[tokio::test]
     async fn ack_loss_proxy_forwards_exact_request_and_drops_response() {
@@ -2677,5 +2730,52 @@ mod tests {
         assert!(loopback_http_endpoint("https://127.0.0.1:9000").is_err());
         assert!(loopback_http_endpoint("http://192.0.2.1:9000").is_err());
         assert!(loopback_http_endpoint("http://127.0.0.1:9000/path").is_err());
+    }
+
+    #[test]
+    fn stale_watch_cancellation_joins_only_after_reattach() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (release, released) = mpsc::sync_channel(1);
+        let cancel_events = Arc::clone(&events);
+        let watch_events = Arc::clone(&events);
+        let mut watch = StaleWatchGuard::spawn(
+            move || {
+                cancel_events.lock().expect("events").push("cancel");
+                release.send(()).expect("release watcher");
+                Ok(())
+            },
+            move || {
+                released.recv().expect("watch cancellation");
+                watch_events.lock().expect("events").push("joined");
+                Ok(Vec::new())
+            },
+        )
+        .expect("watch guard");
+
+        events.lock().expect("events").push("reattach");
+        let started = std::time::Instant::now();
+        watch
+            .cancel_and_finish(Duration::from_secs(1))
+            .expect("bounded watch finish");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            events.lock().expect("events").as_slice(),
+            ["reattach", "cancel", "joined"]
+        );
+    }
+
+    #[test]
+    fn stale_watch_drop_never_waits_for_remote_bound() {
+        let watch = StaleWatchGuard::spawn(
+            || Ok(()),
+            || {
+                thread::sleep(Duration::from_millis(300));
+                Ok(Vec::new())
+            },
+        )
+        .expect("watch guard");
+        let started = std::time::Instant::now();
+        drop(watch);
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 }
