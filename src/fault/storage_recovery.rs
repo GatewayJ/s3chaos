@@ -42,6 +42,7 @@ use crate::fault::{
     },
     preflight::{PreflightStatus, TARGET_PROOF_SCHEMA_VERSION, TargetProof, TargetProofStatus},
     quorum::{ErasureSetMembership, ErasureSetShape, PersistedVersionClass, QuorumRequirements},
+    xl2_inspector::OFFLINE_XL2_INSPECTOR_REVISION,
 };
 
 pub const STORAGE_RECOVERY_PROOF_SCHEMA_VERSION: u8 = 1;
@@ -1700,6 +1701,23 @@ impl StaleDiskReturnProof {
 #[serde(rename_all = "kebab-case")]
 pub enum ShardMappingSource {
     RustfsDiagnosticApi,
+    OfflineXl2Inspector,
+}
+
+impl ShardMappingSource {
+    fn validate_revision(self, revision: &str) -> Result<()> {
+        match self {
+            Self::RustfsDiagnosticApi => ensure!(
+                !revision.trim().is_empty(),
+                "RustFS diagnostic mapping API revision is empty"
+            ),
+            Self::OfflineXl2Inspector => ensure!(
+                revision == OFFLINE_XL2_INSPECTOR_REVISION,
+                "offline XL2 mapping has an unsupported inspector revision"
+            ),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1843,6 +1861,8 @@ impl ShardMutationProof {
         );
         self.volume.validate()?;
         let mutation_target_proof = self.mutation_target_proof()?;
+        self.mapping_source
+            .validate_revision(&self.mapping_api_revision)?;
         for (field, value) in [
             ("mapping API revision", self.mapping_api_revision.as_str()),
             ("object key", self.object_key.as_str()),
@@ -2736,16 +2756,15 @@ impl ForceReadThroughProof {
                 "version-shard mapping has a mismatched schema/identity or duplicate observation id"
             );
             ensure!(
-                mapping.source == ShardMappingSource::RustfsDiagnosticApi
-                    && !mapping.api_revision.trim().is_empty()
-                    && mapping.target_proof_sha256 == self.target_proof_sha256
+                mapping.target_proof_sha256 == self.target_proof_sha256
                     && mapping.observed_at_ms > 0
                     && mapping.observed_at_ms >= runtime.target_proof.generated_at_ms
                     && mapping.observed_at_ms < self.fault_active_from_ms
                     && self.fault_active_from_ms - mapping.observed_at_ms
                         <= STORAGE_OBSERVATION_MAX_AGE_MS,
-                "version-shard mapping is not a fresh pre-fault RustFS diagnostic observation"
+                "version-shard mapping is not a fresh pre-fault observation"
             );
+            mapping.source.validate_revision(&mapping.api_revision)?;
             validate_sha256("version-shard mapping response", &mapping.response_sha256)?;
             ensure!(
                 mapping.response_sha256 == sha256_bytes(mapping.response_body.as_bytes()),
@@ -3695,6 +3714,23 @@ pub enum FragmentReferenceState {
 #[serde(rename_all = "kebab-case")]
 pub enum ShardInventorySource {
     RustfsDiagnosticApi,
+    OfflineXl2Inspector,
+}
+
+impl ShardInventorySource {
+    fn validate_revision(self, revision: &str) -> Result<()> {
+        match self {
+            Self::RustfsDiagnosticApi => ensure!(
+                !revision.trim().is_empty(),
+                "RustFS diagnostic inventory API revision is empty"
+            ),
+            Self::OfflineXl2Inspector => ensure!(
+                revision == OFFLINE_XL2_INSPECTOR_REVISION,
+                "offline XL2 inventory has an unsupported inspector revision"
+            ),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3800,10 +3836,11 @@ impl ShardInventorySnapshot {
         );
         self.identity.validate()?;
         self.volume.validate()?;
+        self.receipt
+            .source
+            .validate_revision(&self.receipt.api_revision)?;
         ensure!(
             !self.receipt.snapshot_id.trim().is_empty()
-                && self.receipt.source == ShardInventorySource::RustfsDiagnosticApi
-                && !self.receipt.api_revision.trim().is_empty()
                 && self.receipt.started_at_ms > 0
                 && self.receipt.started_at_ms < self.receipt.completed_at_ms
                 && self.receipt.completed_at_ms == self.receipt.observed_at_ms
@@ -6731,6 +6768,18 @@ mod tests {
             .validate_against_history(&history)
             .expect("valid bitrot proof");
 
+        let mut offline_mapping = proof.clone();
+        offline_mapping.mapping_source = ShardMappingSource::OfflineXl2Inspector;
+        offline_mapping.mapping_api_revision = OFFLINE_XL2_INSPECTOR_REVISION.to_string();
+        offline_mapping
+            .validate_against_history(&history)
+            .expect("offline XL2 mapping source");
+        offline_mapping.mapping_api_revision = "unknown-xl2-profile".to_string();
+        assert!(
+            offline_mapping.validate_against_history(&history).is_err(),
+            "offline mapping evidence must name the supported capability profile"
+        );
+
         let mut wrong_host_node = proof.clone();
         let host_evidence = wrong_host_node
             .host_mutation_evidence
@@ -8312,6 +8361,17 @@ mod tests {
             "cursor-before",
             550,
             vec![committed.clone(), unknown.clone(), dangling.clone()],
+        );
+        let mut offline_inventory = before_inventory.clone();
+        offline_inventory.receipt.source = ShardInventorySource::OfflineXl2Inspector;
+        offline_inventory.receipt.api_revision = OFFLINE_XL2_INSPECTOR_REVISION.to_string();
+        offline_inventory
+            .validate()
+            .expect("offline XL2 inventory source");
+        offline_inventory.receipt.api_revision = "unknown-xl2-profile".to_string();
+        assert!(
+            offline_inventory.validate().is_err(),
+            "offline inventory evidence must name the supported capability profile"
         );
         let after_inventory = inventory(
             "inventory-after",

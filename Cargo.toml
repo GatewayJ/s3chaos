@@ -28,7 +28,9 @@ uuid = { version = "1", features = ["v4"] }
 k8s-openapi = { version = "0.26.1", features = ["v1_30", "schemars"] }
 kube = { version = "2.0.1", features = ["runtime", "client", "rustls-tls"] }
 reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls", "stream"] }
+rmp = "0.8"
 rustls = { version = "0.23", features = ["ring"] }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 [dev-dependencies]
 tempfile = "3"

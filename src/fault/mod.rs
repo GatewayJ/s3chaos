@@ -38,9 +38,11 @@ pub mod scenarios;
 pub mod shutdown;
 pub mod spec;
 pub mod storage_recovery;
+pub mod storage_recovery_runtime;
 pub mod suite;
 pub mod suite_plan;
 pub mod suite_runner;
 pub mod workload;
+pub mod xl2_inspector;
 
 mod verdict;
