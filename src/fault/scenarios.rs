@@ -1470,7 +1470,9 @@ impl FaultScenario {
         let storage_qualification_allowed = allow_planned_storage
             && matches!(
                 spec.scenario,
-                FRESH_VOLUME_REPLACEMENT_SCENARIO | ON_DISK_BITROT_SCENARIO
+                FRESH_VOLUME_REPLACEMENT_SCENARIO
+                    | ON_DISK_BITROT_SCENARIO
+                    | STALE_DISK_RETURN_DETECT_SCENARIO
             )
             && config
                 .storage_recovery_case

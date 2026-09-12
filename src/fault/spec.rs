@@ -46,8 +46,10 @@ use crate::fault::{
         acknowledged_mutation_kind, scenario_spec,
     },
     storage_recovery::{
-        DISK_GENERATION_PROOF_ARTIFACT, FORCE_READ_PROOF_ARTIFACT, HEAL_PROGRESS_ARTIFACT,
-        HEAL_SUMMARY_ARTIFACT, VERSION_SHARD_MAPPING_ARTIFACT,
+        DANGLING_CLEANUP_PROOF_ARTIFACT, DISK_GENERATION_PROOF_ARTIFACT,
+        FORCE_READ_PROOF_ARTIFACT, HEAL_PROGRESS_ARTIFACT, HEAL_SUMMARY_ARTIFACT,
+        SHARD_INVENTORY_AFTER_ARTIFACT, SHARD_INVENTORY_BEFORE_ARTIFACT,
+        VERSION_SHARD_MAPPING_ARTIFACT,
     },
     storage_recovery_runner::STORAGE_RECOVERY_WORKFLOW_ARTIFACT,
     workload::WorkloadPlan,
@@ -432,7 +434,30 @@ impl FaultRunArtifactSpec {
     }
 
     pub fn required_names_for_scenario(scenario: &str) -> Vec<String> {
-        let mut names = if matches!(
+        let mut names = if scenario == crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO {
+            [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "target-proof.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "workload-summary.json",
+                "checker-report.json",
+                RECOVERY_HEALTH_ARTIFACT,
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+                DISK_GENERATION_PROOF_ARTIFACT,
+                SHARD_INVENTORY_BEFORE_ARTIFACT,
+                SHARD_INVENTORY_AFTER_ARTIFACT,
+                DANGLING_CLEANUP_PROOF_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else if matches!(
             scenario,
             crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO
                 | crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO

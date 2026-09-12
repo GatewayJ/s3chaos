@@ -382,11 +382,15 @@ pub enum StorageRecoveryHostOperation {
     },
     DetachDeviceMapper {
         mapping_name: String,
-        recovery_table_sha256: String,
+        expected_generation_sha256: String,
+        recovery_table: String,
+        isolation_table: String,
     },
     ReattachDeviceMapper {
         mapping_name: String,
-        recovery_table_sha256: String,
+        expected_generation_sha256: String,
+        recovery_table: String,
+        isolation_table: String,
     },
     RestoreShard {
         mutation_operation_id: String,
@@ -453,11 +457,15 @@ impl StorageRecoveryHostOperation {
             }
             Self::DetachDeviceMapper {
                 mapping_name,
-                recovery_table_sha256,
+                expected_generation_sha256,
+                recovery_table,
+                isolation_table,
             }
             | Self::ReattachDeviceMapper {
                 mapping_name,
-                recovery_table_sha256,
+                expected_generation_sha256,
+                recovery_table,
+                isolation_table,
             } => {
                 ensure!(
                     !mapping_name.trim().is_empty()
@@ -466,7 +474,14 @@ impl StorageRecoveryHostOperation {
                             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
                     "device-mapper operation has an unsafe mapping name"
                 );
-                validate_sha256(recovery_table_sha256)
+                validate_sha256(expected_generation_sha256)?;
+                StaleDeviceMapperPlan::new(
+                    mapping_name,
+                    expected_generation_sha256,
+                    recovery_table,
+                    isolation_table,
+                )?;
+                Ok(())
             }
             Self::RestoreShard {
                 mutation_operation_id,
@@ -490,6 +505,90 @@ impl StorageRecoveryHostOperation {
                 Ok(())
             }
         }
+    }
+}
+
+/// Closed device-mapper transition used only by stale-disk-return. The
+/// isolation table retains the exact linear extent and backing device while
+/// forcing both reads and writes to EIO. It is deliberately distinct from the
+/// crash/drop-writes and periodic flakey policies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaleDeviceMapperPlan {
+    pub mapping_name: String,
+    pub expected_generation_sha256: String,
+    pub recovery_table: String,
+    pub recovery_table_sha256: String,
+    pub isolation_table: String,
+    pub isolation_table_sha256: String,
+}
+
+impl StaleDeviceMapperPlan {
+    pub fn new(
+        mapping_name: &str,
+        expected_generation_sha256: &str,
+        recovery_table: &str,
+        isolation_table: &str,
+    ) -> Result<Self> {
+        ensure!(
+            !mapping_name.is_empty()
+                && mapping_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+            "stale device-mapper plan has an unsafe mapping name"
+        );
+        validate_sha256(expected_generation_sha256)?;
+        ensure!(
+            !recovery_table.contains('\n') && !isolation_table.contains('\n'),
+            "stale device-mapper plan must contain one table line"
+        );
+        let recovery = recovery_table.split_whitespace().collect::<Vec<_>>();
+        let isolation = isolation_table.split_whitespace().collect::<Vec<_>>();
+        ensure!(
+            recovery.len() == 5
+                && recovery[0].parse::<u64>().is_ok()
+                && recovery[1].parse::<u64>().is_ok_and(|sectors| sectors > 0)
+                && recovery[2] == "linear"
+                && recovery[3].starts_with("/dev/")
+                && recovery[4].parse::<u64>().is_ok(),
+            "stale device-mapper recovery table is not one non-empty linear extent"
+        );
+        ensure!(
+            isolation.len() == 10
+                && isolation[0] == recovery[0]
+                && isolation[1] == recovery[1]
+                && isolation[2] == "flakey"
+                && isolation[3] == recovery[3]
+                && isolation[4] == recovery[4]
+                && isolation[5] == "0"
+                && isolation[6] == "86400"
+                && isolation[7] == "2"
+                && isolation[8] == "error_reads"
+                && isolation[9] == "error_writes",
+            "stale device-mapper isolation table must preserve the linear extent and force continuous read/write EIO"
+        );
+        Ok(Self {
+            mapping_name: mapping_name.to_string(),
+            expected_generation_sha256: expected_generation_sha256.to_string(),
+            recovery_table: recovery.join(" "),
+            recovery_table_sha256: sha256_bytes(recovery.join(" ").as_bytes()),
+            isolation_table: isolation.join(" "),
+            isolation_table_sha256: sha256_bytes(isolation.join(" ").as_bytes()),
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let rebuilt = Self::new(
+            &self.mapping_name,
+            &self.expected_generation_sha256,
+            &self.recovery_table,
+            &self.isolation_table,
+        )?;
+        ensure!(
+            *self == rebuilt,
+            "stale device-mapper plan digests are not canonical"
+        );
+        Ok(())
     }
 }
 
@@ -1528,5 +1627,40 @@ mod tests {
                 .any(|arg| matches!(arg.as_str(), "sh" | "bash" | "-c"))
         );
         assert!(command.stdin.is_none());
+    }
+
+    #[test]
+    fn stale_dm_plan_preserves_linear_generation_and_forces_eio() {
+        let plan = StaleDeviceMapperPlan::new(
+            "rustfs-data",
+            HASH,
+            "0 2097152 linear /dev/nvme0n1 4096",
+            "0 2097152 flakey /dev/nvme0n1 4096 0 86400 2 error_reads error_writes",
+        )
+        .expect("stale DM plan");
+
+        plan.validate().expect("canonical plan");
+        assert_ne!(plan.recovery_table_sha256, plan.isolation_table_sha256);
+    }
+
+    #[test]
+    fn stale_dm_plan_rejects_crash_and_periodic_flakey_policies() {
+        for table in [
+            "0 2097152 flakey /dev/nvme0n1 4096 0 86400 1 drop_writes",
+            "0 2097152 flakey /dev/nvme0n1 4096 10 1 2 error_reads error_writes",
+            "0 2097152 error",
+            "0 2097152 flakey /dev/other 4096 0 86400 2 error_reads error_writes",
+        ] {
+            assert!(
+                StaleDeviceMapperPlan::new(
+                    "rustfs-data",
+                    HASH,
+                    "0 2097152 linear /dev/nvme0n1 4096",
+                    table,
+                )
+                .is_err(),
+                "unexpectedly accepted {table}"
+            );
+        }
     }
 }

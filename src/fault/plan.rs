@@ -34,8 +34,9 @@ use crate::fault::{
         NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
         ON_DISK_BITROT_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO,
         POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
-        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, ROLLING_RESTART_ALL_SCENARIO, STRESS_CPU_SCENARIO,
-        STRESS_MEMORY_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
+        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, ROLLING_RESTART_ALL_SCENARIO,
+        STALE_DISK_RETURN_DETECT_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
+        WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
     storage_recovery::StorageRecoveryCase,
 };
@@ -112,7 +113,9 @@ impl ExecutionPlan {
         options: FaultPlanOptions,
     ) -> Result<Self> {
         match scenario.name.as_str() {
-            FRESH_VOLUME_REPLACEMENT_SCENARIO | ON_DISK_BITROT_SCENARIO => {
+            FRESH_VOLUME_REPLACEMENT_SCENARIO
+            | ON_DISK_BITROT_SCENARIO
+            | STALE_DISK_RETURN_DETECT_SCENARIO => {
                 ensure!(
                     spec.backend == FaultBackend::PlannedReliabilityWorkflow,
                     "storage-recovery scenario {} must use the planned reliability workflow backend",
