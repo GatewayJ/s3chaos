@@ -36,6 +36,7 @@ use crate::fault::{
 const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 const FAULT_TEST_MANAGER: &str = "s3chaos";
 const FAULT_TEST_TENANT_ANNOTATION: &str = "rustfs.com/fault-test-tenant";
+const FAULT_TEST_RUN_ANNOTATION: &str = "rustfs.com/fault-test-run";
 pub const ADMIN_FIXTURE_ARTIFACT: &str = "admin-fixture.json";
 pub const ADMIN_PRIMARY_POOL_NAME: &str = "primary";
 pub const ADMIN_EXPANSION_POOL_NAME: &str = "expansion";
@@ -244,7 +245,9 @@ pub fn admin_tenant_manifest(
     config: &ClusterTestConfig,
     plan: &AdminFixturePlan,
     expanded: bool,
+    run_id: &str,
 ) -> Result<String> {
+    ensure!(!run_id.trim().is_empty(), "admin fixture run ID is empty");
     let mut template = TenantTemplate::real_cluster(
         &config.test_namespace,
         &config.tenant_name,
@@ -257,7 +260,16 @@ pub fn admin_tenant_manifest(
     template.spread_across_hosts = config.tenant_spread_across_hosts;
     template.unsafe_bypass_disk_check = config.tenant_unsafe_bypass_disk_check;
     template.replace_pools(plan.pools(expanded, config)?)?;
-    template.manifest()
+    let mut manifest = serde_yaml_ng::from_str::<Value>(&template.manifest()?)?;
+    manifest
+        .pointer_mut("/metadata")
+        .and_then(Value::as_object_mut)
+        .context("admin Tenant manifest lacks metadata")?
+        .insert(
+            "annotations".to_string(),
+            serde_json::json!({ FAULT_TEST_RUN_ANNOTATION: run_id }),
+        );
+    Ok(serde_yaml_ng::to_string(&manifest)?)
 }
 
 pub fn apply_tenant_resources(config: &ClusterTestConfig) -> Result<()> {
@@ -286,6 +298,7 @@ pub fn apply_admin_tenant_stage(
     config: &ClusterTestConfig,
     plan: &AdminFixturePlan,
     expanded: bool,
+    run_id: &str,
 ) -> Result<()> {
     let kubectl = Kubectl::new(config);
     let namespace_exists = ensure_namespace_owned_or_absent(config)?;
@@ -294,6 +307,13 @@ pub fn apply_admin_tenant_stage(
             namespace_exists,
             "admin fixture expansion requires the owned primary Tenant stage"
         );
+        let output = Kubectl::new(config)
+            .namespaced(&config.test_namespace)
+            .command(["get", "tenant", &config.tenant_name, "-o", "json"])
+            .run_checked()
+            .context("inspect staged admin Tenant before expansion")?;
+        validate_admin_tenant_run_ownership(&output.stdout, &config.tenant_name, run_id)
+            .context("refuse expansion of a Tenant owned by another attempt")?;
     } else if !namespace_exists {
         kubectl
             .create_yaml_command(namespace_manifest(config))
@@ -309,7 +329,7 @@ pub fn apply_admin_tenant_stage(
         .apply_yaml_command(credential_secret_manifest(config))
         .run_checked()?;
     kubectl
-        .apply_yaml_command(admin_tenant_manifest(config, plan, expanded)?)
+        .apply_yaml_command(admin_tenant_manifest(config, plan, expanded, run_id)?)
         .run_checked()?;
     Ok(())
 }
@@ -355,6 +375,31 @@ pub fn capture_admin_fixture_observation(
         pool_names,
         prefilled_objects,
     })
+}
+
+pub fn reset_owned_admin_tenant_resources(config: &ClusterTestConfig, run_id: &str) -> Result<()> {
+    ensure!(!run_id.trim().is_empty(), "admin fixture run ID is empty");
+    if !ensure_namespace_owned_or_absent(config)? {
+        return Ok(());
+    }
+    let output = Kubectl::new(config)
+        .namespaced(&config.test_namespace)
+        .command(["get", "tenant", &config.tenant_name, "-o", "json"])
+        .run()?;
+    match output.code {
+        Some(0) => {
+            validate_admin_tenant_run_ownership(&output.stdout, &config.tenant_name, run_id)?
+        }
+        _ if is_not_found(&output) => return Ok(()),
+        _ => bail!(
+            "failed to inspect staged admin Tenant {:?} before cleanup\nexit: {:?}\nstdout:\n{}\nstderr:\n{}",
+            config.tenant_name,
+            output.code,
+            output.stdout,
+            output.stderr
+        ),
+    }
+    reset_generic_tenant_resources(config)
 }
 
 pub fn reset_tenant_resources(config: &ClusterTestConfig) -> Result<()> {
@@ -410,6 +455,21 @@ fn validate_namespace_ownership(raw: &str, namespace: &str, tenant_name: &str) -
     Ok(())
 }
 
+fn validate_admin_tenant_run_ownership(raw: &str, tenant_name: &str, run_id: &str) -> Result<()> {
+    let value = serde_json::from_str::<Value>(raw)
+        .with_context(|| format!("parse staged admin Tenant {tenant_name:?} json"))?;
+    let observed_name = value.pointer("/metadata/name").and_then(Value::as_str);
+    let observed_run = value
+        .pointer("/metadata/annotations/rustfs.com~1fault-test-run")
+        .and_then(Value::as_str);
+    ensure!(
+        observed_name == Some(tenant_name) && observed_run == Some(run_id),
+        "refusing cleanup of staged admin Tenant {tenant_name:?}: expected run annotation \
+         {FAULT_TEST_RUN_ANNOTATION}={run_id:?}, got name={observed_name:?}, run={observed_run:?}"
+    );
+    Ok(())
+}
+
 fn is_not_found(output: &CommandOutput) -> bool {
     output.stderr.contains("NotFound")
         || output.stderr.contains("not found")
@@ -422,7 +482,7 @@ mod tests {
     use super::{
         ADMIN_EXPANSION_POOL_NAME, AdminFixtureEvidence, AdminFixtureObservation,
         AdminFixturePhase, AdminFixturePlan, admin_tenant_manifest, namespace_manifest,
-        tenant_manifest, validate_namespace_ownership,
+        tenant_manifest, validate_admin_tenant_run_ownership, validate_namespace_ownership,
     };
     use crate::fault::{
         admin_topology::DECOMMISSION_TARGET_POOL_NAME, config::FaultTestConfig,
@@ -489,11 +549,13 @@ mod tests {
         let plan =
             AdminFixturePlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO, 4).expect("fixture plan");
         let initial: serde_json::Value = serde_yaml_ng::from_str(
-            &admin_tenant_manifest(&config.cluster, &plan, false).expect("initial manifest"),
+            &admin_tenant_manifest(&config.cluster, &plan, false, "run-1")
+                .expect("initial manifest"),
         )
         .expect("initial yaml");
         let expanded: serde_json::Value = serde_yaml_ng::from_str(
-            &admin_tenant_manifest(&config.cluster, &plan, true).expect("expanded manifest"),
+            &admin_tenant_manifest(&config.cluster, &plan, true, "run-1")
+                .expect("expanded manifest"),
         )
         .expect("expanded yaml");
 
@@ -510,6 +572,25 @@ mod tests {
             expanded["spec"]["pools"][1]["name"],
             ADMIN_EXPANSION_POOL_NAME
         );
+        assert_eq!(
+            initial["metadata"]["annotations"]["rustfs.com/fault-test-run"],
+            "run-1"
+        );
+    }
+
+    #[test]
+    fn admin_tenant_cleanup_requires_the_exact_run_annotation() {
+        let tenant = serde_json::json!({
+            "metadata": {
+                "name": "tenant-a",
+                "annotations": {"rustfs.com/fault-test-run": "run-a"}
+            }
+        });
+        let raw = serde_json::to_string(&tenant).expect("tenant json");
+
+        validate_admin_tenant_run_ownership(&raw, "tenant-a", "run-a").expect("owned Tenant");
+        assert!(validate_admin_tenant_run_ownership(&raw, "tenant-a", "run-b").is_err());
+        assert!(validate_admin_tenant_run_ownership(&raw, "tenant-b", "run-a").is_err());
     }
 
     #[test]

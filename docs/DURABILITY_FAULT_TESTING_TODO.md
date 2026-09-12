@@ -569,13 +569,15 @@ Reporting only projects this typed checker result into failure-summary fields.
   or rebalance cleanup-warning entries, even if aggregate counters are clear.
 
 - [ ] PARTIAL: Add the scenario-owned `admin-decommission` operation phase.
-  Meaning: the decommission case now has a narrow staged-fixture port, bounded
-  polling and identity-safe cancel/clear sequencing, raw request/progress
-  capture, and an offline overlap contract. The contract requires a real S3
-  operation and an exact-target status request interval to intersect, rejects
-  zero movement and incomplete mutation families, and binds the version-aware
-  final checker to complete history. The catalog remains Planned until the
-  shared staged-pool executor lands and the Operator/RustFS path is qualified.
+  Meaning: the decommission case now reaches the shared admin executor through
+  the dedicated Planned-admin qualification flag. It stages an attempt-owned
+  two-pool Tenant, runs the bounded versioned S3 workload, polls through the
+  signed RustFS admin adapter, persists raw request/progress/overlap evidence,
+  and performs identity-safe cancel/clear and Tenant cleanup on failure. The
+  contract requires a real S3 operation and an exact-target status request
+  interval to intersect, rejects zero movement and incomplete mutation
+  families, and binds the version-aware final checker to complete history. The
+  catalog remains Planned until the Operator/RustFS path is live-qualified.
 
 - [ ] PARTIAL: Add the scenario-owned `admin-rebalance` operation phase.
   Meaning: the rebalance case now has a narrow staged-fixture port, bounded
@@ -583,18 +585,16 @@ Reporting only projects this typed checker result into failure-summary fields.
   offline overlap contract. The contract requires a real S3 operation and a
   rebalance status request interval to intersect, rejects zero movement and
   incomplete mutation families, and binds the version-aware final checker to
-  the complete history. The catalog remains Planned until the shared staged
-  pool executor lands and the Operator/RustFS path is live-qualified.
+  the complete history. The catalog remains Planned until the Operator/RustFS
+  path is live-qualified.
 
-- [ ] BLOCKED: Keep `admin-decommission` and `admin-rebalance` Planned until the
-  runner supports scenario-owned operation phases.
-  Meaning: the current run plan and artifact validator require one generic
-  `FaultInjection`; marking either admin workflow Executable would claim an
-  end-to-end path that cannot run. Runner integration must create the fresh
-  multi-pool Tenant, keep the S3 workload active while polling, invoke
-  cancel/stop during rollback, persist all three admin artifacts, run the final
-  checker, and receive live RustFS API calibration before an executable suite is
-  added.
+- [ ] PARTIAL: Keep `admin-decommission` and `admin-rebalance` Planned until
+  their production drivers are live-qualified.
+  Meaning: typed admin dispatch and the shared phase executor no longer invent
+  a generic `FaultInjection`; both cases have concrete drivers. They remain
+  behind the exact Planned-admin qualification flag until staged Tenant
+  identity, overlap, rollback, artifact, and final-checker receipts pass
+  against live Operator and RustFS revisions.
 
 ### 11. Add Stale Disk, Dangling Cleanup, And Campaign Scenarios
 

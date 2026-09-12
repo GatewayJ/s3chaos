@@ -26,15 +26,16 @@ use uuid::Uuid;
 
 use crate::fault::{
     acknowledged_mutation::AcknowledgedMutationKind,
+    admin_decommission::{
+        ADMIN_DECOMMISSION_OVERLAP_ARTIFACT, ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
+        AdminDecommissionOverlapEvidence, AdminDecommissionTranscript,
+        validate_admin_decommission_evidence,
+    },
     admin_rebalance::{
         ADMIN_REBALANCE_OVERLAP_ARTIFACT, ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
         AdminRebalanceOverlapEvidence, AdminRebalanceTranscript, validate_admin_rebalance_evidence,
     },
     admin_runner::{ADMIN_WORKFLOW_ARTIFACT, AdminWorkflowEvidence, AdminWorkflowPhaseStatus},
-    admin_decommission::{
-        ADMIN_DECOMMISSION_OVERLAP_ARTIFACT, AdminDecommissionOverlapEvidence,
-        validate_admin_decommission_evidence,
-    },
     admin_topology::{
         ADMIN_OPERATION_ARTIFACT, ADMIN_OPERATION_PROGRESS_ARTIFACT, ADMIN_TOPOLOGY_PROOF_ARTIFACT,
         AdminAttemptIdentity, AdminAttemptWindow, AdminCall, AdminOperationEvidence,
@@ -178,6 +179,16 @@ pub fn validate_admin_topology_artifact_files(
         validate_admin_rebalance_evidence(&operation, &progress, &overlap, &history, &checker)?;
     }
     if scenario == ADMIN_DECOMMISSION_SCENARIO {
+        let transcript = read_json::<AdminDecommissionTranscript>(&bound_case_artifact(
+            &case_dir,
+            ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
+        )?)?;
+        ensure!(
+            transcript.operation_id.as_deref() == Some(operation.operation_id.as_str())
+                && transcript.requests == operation.requests
+                && transcript.progress == progress,
+            "admin-decommission transcript does not match operation/progress evidence"
+        );
         let overlap = read_json::<AdminDecommissionOverlapEvidence>(&bound_case_artifact(
             &case_dir,
             ADMIN_DECOMMISSION_OVERLAP_ARTIFACT,
@@ -7326,8 +7337,10 @@ mod tests {
     };
     use crate::fault::{
         acknowledged_mutation::AcknowledgedMutationKind,
+        admin_decommission::{
+            ADMIN_DECOMMISSION_OVERLAP_ARTIFACT, ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
+        },
         admin_rebalance::ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
-        admin_decommission::ADMIN_DECOMMISSION_OVERLAP_ARTIFACT,
         admin_topology::{ADMIN_TOPOLOGY_PROOF_ARTIFACT, AdminAttemptIdentity, AdminAttemptWindow},
         checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
         config::FaultTestConfig,
@@ -8825,6 +8838,19 @@ mod tests {
                 "workloadOperationIds": ["put", "overwrite", "delete", "multipart", "abort"],
                 "overlappingOperationIds": ["put", "overwrite", "delete", "multipart", "abort"],
                 "overlappingStatusRequestIds": ["decommission-status-request"]
+            }),
+        );
+        let operation = read_json::<Value>(&dir.path().join("admin-operation.json"))
+            .expect("operation artifact");
+        let progress = read_jsonl::<Value>(&dir.path().join("admin-operation-progress.jsonl"))
+            .expect("progress artifact");
+        write_json(
+            dir.path(),
+            ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
+            &json!({
+                "operationId": operation["operationId"],
+                "requests": operation["requests"],
+                "progress": progress,
             }),
         );
 

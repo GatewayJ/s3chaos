@@ -897,6 +897,34 @@ impl RustfsAdminTopologyAdapter {
         Self::connect_bound(endpoint, region, access_key, secret_key, Some(port_forward)).await
     }
 
+    /// Capture the fresh Kubernetes Tenant, RustFS deployment, and pools/list
+    /// receipts bound to this adapter's live port-forward target.
+    pub async fn capture_pool_snapshot(
+        &self,
+        run_id: impl Into<String>,
+        case_name: impl Into<String>,
+    ) -> Result<AdminPoolSnapshot> {
+        let runtime = self.probe_runtime_binding().await?;
+        let tenant_endpoint = self.ensure_port_forward_target()?;
+        runtime
+            .target
+            .endpoint
+            .require_same_live_target(&tenant_endpoint)?;
+        let tenant_response_body = tenant_endpoint.tenant_response_body;
+        let tenant_started_at_ms = tenant_endpoint.tenant_started_at_ms;
+        let tenant_observed_at_ms = tenant_endpoint.tenant_observed_at_ms;
+        let pools = self.list_pools().await?;
+        AdminPoolSnapshot::from_list(
+            run_id,
+            case_name,
+            tenant_response_body.as_bytes(),
+            runtime,
+            tenant_started_at_ms,
+            tenant_observed_at_ms,
+            pools,
+        )
+    }
+
     async fn connect_bound(
         endpoint: AdminEndpointIdentity,
         region: &str,
@@ -952,30 +980,6 @@ impl RustfsAdminTopologyAdapter {
     pub async fn probe_runtime_binding(&self) -> Result<AdminRuntimeBinding> {
         let endpoint = self.ensure_port_forward_target()?;
         probe_runtime_binding(&self.transport, endpoint).await
-    }
-
-    /// Capture the fresh Kubernetes Tenant, RustFS deployment, and pools/list
-    /// receipts needed to bind one admin attempt to this adapter's live
-    /// port-forward target.
-    pub async fn capture_pool_snapshot(
-        &self,
-        run_id: impl Into<String>,
-        case_name: impl Into<String>,
-    ) -> Result<AdminPoolSnapshot> {
-        let runtime = self.probe_runtime_binding().await?;
-        let tenant_response_body = runtime.target.endpoint.tenant_response_body.clone();
-        let tenant_started_at_ms = runtime.target.endpoint.tenant_started_at_ms;
-        let tenant_observed_at_ms = runtime.target.endpoint.tenant_observed_at_ms;
-        let pools = self.list_pools().await?;
-        AdminPoolSnapshot::from_list(
-            run_id,
-            case_name,
-            tenant_response_body.as_bytes(),
-            runtime,
-            tenant_started_at_ms,
-            tenant_observed_at_ms,
-            pools,
-        )
     }
 
     async fn ensure_request_target(

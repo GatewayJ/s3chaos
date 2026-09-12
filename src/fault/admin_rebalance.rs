@@ -1107,7 +1107,7 @@ impl LiveAdminRebalanceDriver {
         reset_tenant_resources(&self.config.cluster)
             .context("reset run-owned Tenant before admin rebalance")?;
         self.state.lock().await.fixture_owned = true;
-        apply_admin_tenant_stage(&self.config.cluster, &fixture.plan, false)
+        apply_admin_tenant_stage(&self.config.cluster, &fixture.plan, false, &self.run_id)
             .context("apply primary admin Tenant pool")?;
         wait_for_ready_tenant(&self.config.cluster)
             .await
@@ -1169,7 +1169,7 @@ impl LiveAdminRebalanceDriver {
         )?);
         self.persist_fixture(&fixture).await?;
 
-        apply_admin_tenant_stage(&self.config.cluster, &fixture.plan, true)
+        apply_admin_tenant_stage(&self.config.cluster, &fixture.plan, true, &self.run_id)
             .context("apply admin Tenant expansion pool")?;
         tokio::time::sleep(Duration::from_millis(1)).await;
         fixture.observations.push(capture_admin_fixture_observation(

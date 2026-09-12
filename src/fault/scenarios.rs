@@ -1224,7 +1224,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             "admin-decommission-overlap.json must bind the exact workload history sequence to a target status request interval and at least one S3 operation interval that overlap the operation window",
         ],
         validation: "decommission reaches successful completion without failed moves or cancellation, before/after topology proves the target absent or terminal, and bounded S3 history/checker evidence preserves the committed object model",
-        observability: "admin-topology-proof.json, admin-operation.json, monotonic admin-operation-progress.jsonl, workload history, checker reports, RustFS logs",
+        observability: "admin-topology-proof.json, admin-operation.json, monotonic admin-operation-progress.jsonl, admin-decommission-transcript.json, workload history, checker reports, RustFS logs",
         conflict_domain: "fresh multi-pool Tenant fixture; must not decommission shared or pre-existing resources",
     },
     FaultScenarioSpec {
@@ -1765,11 +1765,13 @@ mod tests {
     #[test]
     fn planned_admin_qualification_requires_the_dedicated_entrypoint_and_flag() {
         let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
-        config.scenario = ADMIN_REBALANCE_SCENARIO.to_string();
         config.qualify_planned_admin = true;
 
-        assert!(FaultScenario::from_config(&config).is_err());
-        assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+        for scenario in [ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO] {
+            config.scenario = scenario.to_string();
+            assert!(FaultScenario::from_config(&config).is_err());
+            assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+        }
 
         config.scenario = STALE_DISK_RETURN_DETECT_SCENARIO.to_string();
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
