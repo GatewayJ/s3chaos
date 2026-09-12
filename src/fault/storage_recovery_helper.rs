@@ -197,6 +197,7 @@ pub struct StorageHelperSession {
     volume_root: File,
     journal_root: File,
     _lock: File,
+    mutation_started: bool,
 }
 
 impl StorageHelperSession {
@@ -240,6 +241,7 @@ impl StorageHelperSession {
             volume_root,
             journal_root,
             _lock: lock,
+            mutation_started: false,
         })
     }
 
@@ -250,6 +252,14 @@ impl StorageHelperSession {
         validate_session_context(&self.owner, &invocation.context)?;
         invocation.operation.validate()?;
         let started_at_ms = now_ms()?;
+        if matches!(
+            &invocation.operation,
+            StorageRecoveryHostOperation::MutateShard { .. }
+                | StorageRecoveryHostOperation::PrepareFreshVolume { .. }
+                | StorageRecoveryHostOperation::DetachDeviceMapper { .. }
+        ) {
+            self.mutation_started = true;
+        }
         match &invocation.operation {
             StorageRecoveryHostOperation::InspectXlMeta {
                 object_directory,
@@ -318,6 +328,13 @@ impl StorageHelperSession {
         cleanup: &StorageRecoveryCleanupProof,
     ) -> Result<()> {
         validate_session_context(&self.owner, context)?;
+        ensure!(
+            !matches!(
+                cleanup,
+                StorageRecoveryCleanupProof::AbortedBeforeMutation { .. }
+            ) || !self.mutation_started,
+            "pre-mutation abort proof cannot close a helper session after mutation began"
+        );
         cleanup.validate_for(context)
     }
 }
@@ -1545,6 +1562,59 @@ mod tests {
             )
             .expect("finish renewed session");
         assert_eq!(fs::read(part_path).expect("restored part"), original);
+    }
+
+    #[test]
+    fn aborted_before_mutation_cannot_close_a_mutating_helper_session() {
+        let (_temporary, roots) = test_roots();
+        let mut context = context_for(&roots);
+        context.identity.scenario = "fresh-volume-replacement".to_string();
+        context.identity.case_name = "fresh-volume-replacement-automatic-replacement".to_string();
+        context.case =
+            crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement;
+        let scope = storage_scope_sha256(&context);
+        let lock_path = roots.lock.join(format!("storage-{scope}.lock"));
+        File::create(&lock_path).expect("fresh-volume lock file");
+        let lock_metadata = fs::metadata(lock_path).expect("fresh-volume lock metadata");
+        context.scope_sha256 = scope.clone();
+        context.exclusive_access.kubernetes_lease.name =
+            format!("s3chaos-storage-{}", &scope[..20]);
+        context.exclusive_access.kubernetes_lease.scope_sha256 = scope.clone();
+        context.exclusive_access.host_flock.path =
+            format!("{STORAGE_RECOVERY_HOST_LOCK_DIRECTORY}/storage-{scope}.lock");
+        context.exclusive_access.host_flock.device_id = device_id(&lock_metadata);
+        context.exclusive_access.host_flock.inode = lock_metadata.ino();
+        context.exclusive_access.host_flock.scope_sha256 = scope;
+        let proof = StorageRecoveryCleanupProof::AbortedBeforeMutation {
+            observed_at_ms: context
+                .exclusive_access
+                .kubernetes_lease
+                .acquired_at_ms
+                .saturating_add(1),
+        };
+        StorageHelperSession::begin(context.clone(), &roots)
+            .expect("read-only session")
+            .finish(&context, &proof)
+            .expect("read-only attempt may abort");
+
+        let mut session =
+            StorageHelperSession::begin(context.clone(), &roots).expect("fresh mutating session");
+        session
+            .execute(StorageHelperInvocation {
+                context: context.clone(),
+                operation: StorageRecoveryHostOperation::PrepareFreshVolume {
+                    replacement_persistent_volume: "replacement-pv".to_string(),
+                    replacement_persistent_volume_claim: "replacement-pvc".to_string(),
+                },
+            })
+            .expect("begin fresh-volume mutation");
+        let error = session
+            .finish(&context, &proof)
+            .expect_err("mutating session must reject pre-mutation abort");
+        assert!(
+            error.to_string().contains("after mutation began"),
+            "{error:#}"
+        );
     }
 
     #[test]

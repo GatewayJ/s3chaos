@@ -69,8 +69,9 @@ use crate::fault::{
         ShardMappingSource, StorageRecoveryArtifactIdentity, StorageRecoveryCase,
         StorageVolumeIdentity, VERSION_SHARD_MAPPING_ARTIFACT, VersionShardMappingObservation,
     },
-    storage_recovery_lease::KubernetesStorageLeaseAdapter,
-    storage_recovery_lease::StorageRecoveryCleanupProof,
+    storage_recovery_lease::{
+        KubernetesStorageLeaseAdapter, StorageRecoveryCleanupProof, release_owned_lease,
+    },
     storage_recovery_runner::{
         OwnedHealCancel, STORAGE_RECOVERY_WORKFLOW_ARTIFACT, StorageRecoveryCaseDriver,
         StorageRecoveryWorkflowEvidence,
@@ -104,6 +105,9 @@ const ADMIN_HEAL_PATH: &str = "/rustfs/admin/v3/heal/";
 pub(crate) const FRESH_VOLUME_READ_PROOF_ARTIFACT: &str = "force-read-proof.json";
 pub(crate) const FRESH_VOLUME_READ_HISTORY_ARTIFACT: &str = "force-read-history.jsonl";
 pub(crate) const FRESH_VOLUME_CLEANUP_ARTIFACT: &str = "fresh-volume-cleanup.json";
+pub(crate) const FRESH_VOLUME_ABORT_PROOF_ARTIFACT: &str =
+    "fresh-volume-aborted-before-mutation.json";
+pub(crate) const FRESH_VOLUME_HEAL_START_ARTIFACT: &str = "fresh-volume-heal-start.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -611,6 +615,11 @@ fn exhaustive_entries(root: &Path) -> Result<Vec<String>> {
                 .to_string_lossy()
                 .to_string();
             if relative == "lost+found" {
+                ensure!(
+                    file_type.is_dir(),
+                    "fresh volume lost+found entry is not a directory"
+                );
+                visit(root, &entry.path(), entries)?;
                 continue;
             }
             entries.push(relative);
@@ -908,6 +917,17 @@ fn sha256_text(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
+fn helper_pod_is_run_owned(value: &Value, run_id: &str) -> bool {
+    value
+        .pointer("/metadata/labels/app.kubernetes.io~1managed-by")
+        .and_then(Value::as_str)
+        == Some(MANAGER)
+        && value
+            .pointer("/metadata/labels/s3chaos.rustfs.com~1run")
+            .and_then(Value::as_str)
+            == Some(run_id)
+}
+
 async fn delete_owned_pvc(
     client: kube::Client,
     namespace: &str,
@@ -977,15 +997,15 @@ async fn delete_owned_pv(
 async fn delete_owned_helper_pod(
     client: kube::Client,
     namespace: &str,
-    name: &str,
+    identity: &OwnedHelperPodCleanup,
     run_id: &str,
     timeout: Duration,
 ) -> Result<()> {
     let api: Api<Pod> = Api::namespaced(client, namespace);
     let Some(pod) = api
-        .get_opt(name)
+        .get_opt(&identity.name)
         .await
-        .with_context(|| format!("read helper Pod {namespace}/{name}"))?
+        .with_context(|| format!("read helper Pod {namespace}/{}", identity.name))?
     else {
         return Ok(());
     };
@@ -995,21 +1015,27 @@ async fn delete_owned_helper_pod(
         .as_deref()
         .context("run-owned helper Pod lacks a UID")?;
     ensure!(
-        pod.metadata
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(MANAGED_BY_LABEL))
-            .is_some_and(|value| value == MANAGER)
+        identity
+            .uid
+            .as_deref()
+            .is_none_or(|expected| expected == uid)
+            && pod
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(MANAGED_BY_LABEL))
+                .is_some_and(|value| value == MANAGER)
             && pod
                 .metadata
                 .labels
                 .as_ref()
                 .and_then(|labels| labels.get(RUN_LABEL))
                 .is_some_and(|value| value == run_id),
-        "helper Pod {namespace}/{name} is no longer owned by this attempt"
+        "helper Pod {namespace}/{} is no longer the exact run-owned generation",
+        identity.name
     );
     api.delete(
-        name,
+        &identity.name,
         &DeleteParams {
             preconditions: Some(Preconditions {
                 uid: Some(uid.to_string()),
@@ -1019,8 +1045,8 @@ async fn delete_owned_helper_pod(
         },
     )
     .await
-    .with_context(|| format!("delete owned helper Pod {namespace}/{name}"))?;
-    wait_kube_object_absent(&api, name, timeout).await
+    .with_context(|| format!("delete owned helper Pod {namespace}/{}", identity.name))?;
+    wait_kube_object_absent(&api, &identity.name, timeout).await
 }
 
 async fn wait_kube_object_absent<K>(api: &Api<K>, name: &str, timeout: Duration) -> Result<()>
@@ -1124,9 +1150,13 @@ pub(crate) fn validate_heal_transcript(
             "automatic replacement transcript contains another admin operation"
         ),
         StorageRecoveryCase::FreshVolumeReplacementAdminDeep => ensure!(
-            receipts
-                .iter()
-                .all(|receipt| receipt.method == "POST" && receipt.path == ADMIN_HEAL_PATH),
+            receipts.iter().all(|receipt| {
+                receipt.method == "POST"
+                    && receipt
+                        .path
+                        .strip_prefix(ADMIN_HEAL_PATH)
+                        .is_some_and(|bucket| !bucket.is_empty() && !bucket.contains('/'))
+            }),
             "admin deep transcript contains another admin operation"
         ),
         _ => bail!("fresh-volume transcript received another storage case"),
@@ -1191,7 +1221,119 @@ pub(crate) struct RustfsFreshHealAdapter {
     baseline_captured: Mutex<bool>,
     expected_target_drive: Mutex<Option<String>>,
     owned_observer: Mutex<Option<HealObserverIdentity>>,
+    admin_heal_path: String,
+    admin_start: Mutex<AdminHealStartState>,
     transcript: Mutex<Vec<HealWireReceipt>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+enum AdminHealStartState {
+    NotStarted,
+    Ambiguous {
+        bucket: String,
+        prefix: String,
+        request_path: String,
+        requested_at_ms: u64,
+    },
+    Owned {
+        bucket: String,
+        prefix: String,
+        request_path: String,
+        requested_at_ms: u64,
+        acknowledged_at_ms: u64,
+        operation_id: String,
+        start_time: String,
+        reconciled_after_response_loss: bool,
+    },
+}
+
+impl AdminHealStartState {
+    fn ambiguous(bucket: &str, prefix: &str, request_path: &str, requested_at_ms: u64) -> Self {
+        Self::Ambiguous {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            request_path: request_path.to_string(),
+            requested_at_ms,
+        }
+    }
+
+    fn own(
+        &mut self,
+        receipt: &HealWireReceipt,
+        status: &HealWireReceipt,
+        reconciled_after_response_loss: bool,
+        pool_index: u32,
+        set_index: u32,
+    ) -> Result<HealObserverIdentity> {
+        let Self::Ambiguous {
+            bucket,
+            prefix,
+            request_path,
+            requested_at_ms,
+        } = self
+        else {
+            bail!("admin heal start was not durably registered as ambiguous")
+        };
+        ensure!(
+            receipt.path == *request_path && status.path == *request_path,
+            "admin heal reconciliation escaped its exact bucket/prefix path"
+        );
+        ensure_success(receipt, "start admin deep heal")?;
+        ensure_success(status, "reconcile admin deep heal")?;
+        let start: Value = serde_json::from_str(&receipt.response_body)
+            .context("decode admin heal start response")?;
+        let operation_id = start
+            .pointer("/clientToken")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .context("admin heal start response lacks clientToken")?
+            .to_string();
+        let start_time = start
+            .pointer("/startTime")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .context("admin heal start response lacks startTime")?
+            .to_string();
+        let status_body: Value = serde_json::from_str(&status.response_body)
+            .context("decode admin heal reconciliation status")?;
+        ensure!(
+            status_body.pointer("/startTime").and_then(Value::as_str) == Some(start_time.as_str())
+                && status_body
+                    .pointer("/settings/pool")
+                    .and_then(Value::as_u64)
+                    == Some(u64::from(pool_index))
+                && status_body.pointer("/settings/set").and_then(Value::as_u64)
+                    == Some(u64::from(set_index)),
+            "admin heal status does not echo the owned start time and exact erasure-set scope"
+        );
+        let parsed_start = time::OffsetDateTime::parse(
+            &start_time,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .context("parse admin heal startTime")?;
+        let start_ms = u64::try_from(parsed_start.unix_timestamp_nanos() / 1_000_000)
+            .context("admin heal startTime precedes the Unix epoch")?;
+        ensure!(
+            start_ms.saturating_add(2_000) >= *requested_at_ms
+                && start_ms <= status.observed_at_ms.saturating_add(2_000),
+            "admin heal startTime is outside the registered request/status interval"
+        );
+        let observer = HealObserverIdentity::AdminOperation {
+            operation_id: operation_id.clone(),
+        };
+        *self = Self::Owned {
+            bucket: bucket.clone(),
+            prefix: prefix.clone(),
+            request_path: request_path.clone(),
+            requested_at_ms: *requested_at_ms,
+            acknowledged_at_ms: status.observed_at_ms,
+            operation_id,
+            start_time,
+            reconciled_after_response_loss,
+        };
+        Ok(observer)
+    }
 }
 
 impl RustfsFreshHealAdapter {
@@ -1202,6 +1344,7 @@ impl RustfsFreshHealAdapter {
         case: StorageRecoveryCase,
         pool_index: u32,
         set_index: u32,
+        bucket: &str,
     ) -> Result<Self> {
         ensure!(
             matches!(
@@ -1210,6 +1353,15 @@ impl RustfsFreshHealAdapter {
                     | StorageRecoveryCase::FreshVolumeReplacementAdminDeep
             ),
             "fresh-volume heal adapter received another storage case"
+        );
+        ensure!(
+            !bucket.trim().is_empty()
+                && bucket.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'.')
+                }),
+            "fresh-volume heal bucket is invalid"
         );
         Ok(Self {
             transport: RustfsAdminTransport::new(
@@ -1227,6 +1379,8 @@ impl RustfsFreshHealAdapter {
             baseline_captured: Mutex::new(false),
             expected_target_drive: Mutex::new(None),
             owned_observer: Mutex::new(None),
+            admin_heal_path: format!("{ADMIN_HEAL_PATH}{bucket}"),
+            admin_start: Mutex::new(AdminHealStartState::NotStarted),
             transcript: Mutex::new(Vec::new()),
         })
     }
@@ -1271,7 +1425,23 @@ impl RustfsFreshHealAdapter {
         Ok(())
     }
 
-    pub(crate) async fn start(&self) -> Result<()> {
+    pub(crate) async fn register_start_intent(&self) -> Result<String> {
+        if self.case == StorageRecoveryCase::FreshVolumeReplacementAdminDeep {
+            let bucket = self
+                .admin_heal_path
+                .strip_prefix(ADMIN_HEAL_PATH)
+                .context("admin heal path escaped the expected route")?;
+            let mut state = self.admin_start.lock().await;
+            ensure!(
+                matches!(*state, AdminHealStartState::NotStarted),
+                "admin heal start intent was already registered"
+            );
+            *state = AdminHealStartState::ambiguous(bucket, "", &self.admin_heal_path, now_ms());
+        }
+        self.start_state_json().await
+    }
+
+    pub(crate) async fn start_registered(&self) -> Result<()> {
         match self.case {
             StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement => {
                 ensure!(
@@ -1285,32 +1455,74 @@ impl RustfsFreshHealAdapter {
                 Ok(())
             }
             StorageRecoveryCase::FreshVolumeReplacementAdminDeep => {
+                ensure!(
+                    matches!(
+                        *self.admin_start.lock().await,
+                        AdminHealStartState::Ambiguous { .. }
+                    ),
+                    "admin heal request was not registered before transmission"
+                );
                 let body = serde_json::to_vec(&json!({
                     "recursive": true,
                     "scanMode": 2,
                     "pool": self.pool_index,
                     "set": self.set_index,
                 }))?;
-                let receipt = self
+                let first = self
                     .request(
                         Method::POST,
-                        ADMIN_HEAL_PATH,
+                        &self.admin_heal_path,
                         &[],
-                        body,
+                        body.clone(),
                         Some("application/json"),
                     )
-                    .await?;
+                    .await;
+                let (receipt, reconciled_after_response_loss) = match first {
+                    Ok(receipt) => (receipt, false),
+                    Err(response_loss) => (
+                        self.request(
+                            Method::POST,
+                            &self.admin_heal_path,
+                            &[],
+                            body,
+                            Some("application/json"),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "admin heal start remained ambiguous after exact-scope reconciliation: {response_loss:#}"
+                            )
+                        })?,
+                        true,
+                    ),
+                };
                 ensure_success(&receipt, "start admin deep heal")?;
-                let body: Value = serde_json::from_str(&receipt.response_body)
+                let start_body: Value = serde_json::from_str(&receipt.response_body)
                     .context("decode admin heal start response")?;
-                let token = body
+                let token = start_body
                     .pointer("/clientToken")
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty())
-                    .context("admin heal start response lacks clientToken")?;
-                *self.owned_observer.lock().await = Some(HealObserverIdentity::AdminOperation {
-                    operation_id: token.to_string(),
-                });
+                    .context("admin heal start response lacks clientToken")?
+                    .to_string();
+                let status = self
+                    .request(
+                        Method::POST,
+                        &self.admin_heal_path,
+                        &[("clientToken", token.as_str())],
+                        Vec::new(),
+                        None,
+                    )
+                    .await
+                    .context("reconcile admin heal start with exact-scope status")?;
+                let observer = self.admin_start.lock().await.own(
+                    &receipt,
+                    &status,
+                    reconciled_after_response_loss,
+                    self.pool_index,
+                    self.set_index,
+                )?;
+                *self.owned_observer.lock().await = Some(observer);
                 Ok(())
             }
             _ => unreachable!("constructor validates fresh-volume case"),
@@ -1398,7 +1610,7 @@ impl RustfsFreshHealAdapter {
                 let receipt = self
                     .request(
                         Method::POST,
-                        ADMIN_HEAL_PATH,
+                        &self.admin_heal_path,
                         &[("clientToken", operation_id.as_str())],
                         Vec::new(),
                         None,
@@ -1429,14 +1641,21 @@ impl RustfsFreshHealAdapter {
         if self.case == StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement {
             return Ok(OwnedHealCancel::NoOwnedHeal);
         }
-        let observer = self.owned_observer.lock().await.clone();
-        let Some(HealObserverIdentity::AdminOperation { operation_id }) = observer else {
+        let state = self.admin_start.lock().await.clone();
+        let AdminHealStartState::Owned { operation_id, .. } = state else {
             return Ok(OwnedHealCancel::NoOwnedHeal);
         };
+        ensure!(
+            self.owned_observer.lock().await.as_ref()
+                == Some(&HealObserverIdentity::AdminOperation {
+                    operation_id: operation_id.clone(),
+                }),
+            "admin heal ownership state and observer identity diverged"
+        );
         let receipt = self
             .request(
                 Method::POST,
-                ADMIN_HEAL_PATH,
+                &self.admin_heal_path,
                 &[
                     ("forceStop", "true"),
                     ("clientToken", operation_id.as_str()),
@@ -1452,6 +1671,18 @@ impl RustfsFreshHealAdapter {
     pub(crate) async fn transcript_json(&self) -> Result<String> {
         serde_json::to_string_pretty(&*self.transcript.lock().await)
             .context("encode fresh-volume heal transcript")
+    }
+
+    pub(crate) async fn start_state_json(&self) -> Result<String> {
+        serde_json::to_string_pretty(&*self.admin_start.lock().await)
+            .context("encode fresh-volume heal start ownership")
+    }
+
+    pub(crate) async fn has_ambiguous_start(&self) -> bool {
+        matches!(
+            *self.admin_start.lock().await,
+            AdminHealStartState::Ambiguous { .. }
+        )
     }
 
     async fn request(
@@ -1606,8 +1837,10 @@ struct FreshVolumeDriverState {
     membership: Option<ErasureSetMembership>,
     shape: Option<ErasureSetShape>,
     target_pod: Option<String>,
-    helper_pod: Option<String>,
-    replacement_helper_pod: Option<String>,
+    helper_pod: Option<OwnedHelperPodCleanup>,
+    replacement_helper_pod: Option<OwnedHelperPodCleanup>,
+    ownership_checkpoint: Option<FreshVolumeOwnershipCheckpoint>,
+    abort_before_mutation: Option<StorageRecoveryCleanupProof>,
     replacement_volume: Option<StorageVolumeIdentity>,
     prepare_receipt: Option<StorageRecoveryOperationReceipt>,
     old_device_absence_sha256: Option<String>,
@@ -1620,6 +1853,52 @@ struct FreshVolumeDriverState {
     ordinary_after_replacement_operation_id: Option<String>,
     replacement_proof: Option<FreshVolumeReplacementProof>,
     cleanup_evidence: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OwnedHelperPodCleanup {
+    name: String,
+    uid: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperPodRole {
+    Original,
+    Replacement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshVolumeOwnershipCheckpoint {
+    LeaseAcquired,
+    PostAcquireProbePassed,
+    HelperSessionBegun,
+    InspectionStarted,
+    InspectionCompleted,
+    VolumeMutationStarted,
+}
+
+impl FreshVolumeOwnershipCheckpoint {
+    fn permits_abort_before_mutation(self) -> bool {
+        self != Self::VolumeMutationStarted
+    }
+}
+
+impl OwnedHelperPodCleanup {
+    fn registered(name: String) -> Self {
+        Self { name, uid: None }
+    }
+
+    fn record_uid(&mut self, name: &str, uid: String) -> Result<()> {
+        ensure!(self.name == name, "helper Pod cleanup identity changed");
+        ensure!(!uid.trim().is_empty(), "helper Pod cleanup UID is empty");
+        ensure!(
+            self.uid.as_ref().is_none_or(|current| current == &uid),
+            "helper Pod cleanup UID changed"
+        );
+        self.uid = Some(uid);
+        Ok(())
+    }
 }
 
 struct FreshVolumeWorkloadSession {
@@ -1767,6 +2046,8 @@ impl<'a> FreshVolumeDriver<'a> {
                 target_pod: None,
                 helper_pod: None,
                 replacement_helper_pod: None,
+                ownership_checkpoint: None,
+                abort_before_mutation: None,
                 replacement_volume: None,
                 prepare_receipt: None,
                 old_device_absence_sha256: None,
@@ -1783,6 +2064,72 @@ impl<'a> FreshVolumeDriver<'a> {
             helper_guard: Mutex::new(None),
             operator_pause: SyncMutex::new(None),
         })
+    }
+
+    fn register_helper_pod_cleanup(&self, role: HelperPodRole, name: &str) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+        let slot = match role {
+            HelperPodRole::Original => &mut state.helper_pod,
+            HelperPodRole::Replacement => &mut state.replacement_helper_pod,
+        };
+        ensure!(
+            slot.is_none(),
+            "helper Pod cleanup identity was already registered"
+        );
+        *slot = Some(OwnedHelperPodCleanup::registered(name.to_string()));
+        Ok(())
+    }
+
+    fn record_helper_pod_uid(&self, role: HelperPodRole, name: &str, uid: String) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+        let slot = match role {
+            HelperPodRole::Original => &mut state.helper_pod,
+            HelperPodRole::Replacement => &mut state.replacement_helper_pod,
+        };
+        slot.as_mut()
+            .context("helper Pod cleanup identity was not registered before creation")?
+            .record_uid(name, uid)
+    }
+
+    fn create_owned_helper_pod(
+        &self,
+        role: HelperPodRole,
+        namespaced: &Kubectl,
+        name: &str,
+        manifest: String,
+    ) -> Result<String> {
+        self.register_helper_pod_cleanup(role, name)?;
+        let result = namespaced
+            .command(["create", "-f", "-", "-o", "json"])
+            .stdin(manifest)
+            .run_checked();
+        let raw = match result {
+            Ok(output) => output.stdout,
+            Err(primary) => {
+                if let Ok(body) = get_raw_json(namespaced, "pod", name)
+                    && let Ok(value) = serde_json::from_str::<Value>(&body)
+                    && helper_pod_is_run_owned(&value, self.run_id)
+                    && let Ok(uid) = required_json_string(&value, "/metadata/uid", "helper Pod UID")
+                {
+                    self.record_helper_pod_uid(role, name, uid)?;
+                }
+                return Err(primary).context("create run-owned storage helper Pod");
+            }
+        };
+        let value: Value = serde_json::from_str(&raw).context("decode created helper Pod")?;
+        ensure!(
+            helper_pod_is_run_owned(&value, self.run_id),
+            "created helper Pod lacks exact run ownership labels"
+        );
+        let uid = required_json_string(&value, "/metadata/uid", "created helper Pod UID")?;
+        self.record_helper_pod_uid(role, name, uid.clone())?;
+        Ok(uid)
     }
 
     fn prepare_run_artifacts(
@@ -2453,16 +2800,18 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         );
         let namespaced =
             Kubectl::new(&self.config.cluster).namespaced(&self.config.cluster.test_namespace);
-        namespaced
-            .create_yaml_command(storage_helper_pod_manifest(
+        let helper_uid = self.create_owned_helper_pod(
+            HelperPodRole::Original,
+            &namespaced,
+            &helper_name,
+            storage_helper_pod_manifest(
                 self.config,
                 self.run_id,
                 &helper_name,
                 &replacement.node,
                 &original_spec.local_path,
-            )?)
-            .run_checked()
-            .context("create run-owned storage helper Pod")?;
+            )?,
+        )?;
         namespaced
             .command([
                 "wait",
@@ -2642,7 +2991,10 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 "helper Pod resourceVersion",
             )?,
         };
-        let helper_uid = required_json_string(&helper_json, "/metadata/uid", "helper Pod UID")?;
+        ensure!(
+            required_json_string(&helper_json, "/metadata/uid", "helper Pod UID")? == helper_uid,
+            "helper Pod UID changed after creation"
+        );
         let tenant_uid = required_json_string(&tenant_json, "/metadata/uid", "Tenant UID")?;
         let node_uid = required_json_string(&node_json, "/metadata/uid", "node UID")?;
         let observed_at_ms = now_ms();
@@ -2691,6 +3043,42 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             }
             hex::encode(hasher.finalize())
         };
+        let lock_path = PathBuf::from(format!("/var/lock/s3chaos/storage-{scope_sha256}.lock"));
+        let (ownership_probe, ownership_probe_body) =
+            probe_helper(self.config, &helper_name, &probe_request(lock_path.clone()))?;
+        ensure!(
+            ownership_probe.device_major_minor == initial_probe.device_major_minor
+                && ownership_probe.canonical_device == initial_probe.canonical_device
+                && ownership_probe.filesystem_uuid == initial_probe.filesystem_uuid
+                && ownership_probe.rustfs_drive_uuid == initial_probe.rustfs_drive_uuid
+                && ownership_probe.mount_namespace_id == initial_probe.mount_namespace_id,
+            "original host generation drifted before storage ownership acquisition"
+        );
+        original.observed_at_ms = ownership_probe.observed_at_ms;
+        original.host_storage_proof_sha256 = sha256_text(&ownership_probe_body);
+        let identity = StorageRecoveryArtifactIdentity {
+            run_id: self.run_id.to_string(),
+            scenario: self.scenario.name.clone(),
+            case_name: self.scenario.case_name.to_string(),
+            bucket: {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+                state
+                    .session
+                    .as_ref()
+                    .expect("session checked above")
+                    .s3
+                    .bucket()
+                    .to_string()
+            },
+        };
+        let owned_drive_uuid = ownership_probe
+            .rustfs_drive_uuid
+            .clone()
+            .context("original drive disappeared")?;
+        let host_node_uid = original.node_uid.clone();
         let client =
             crate::framework::kube_client::client_for_context(&self.config.cluster.context).await?;
         let lease_adapter = KubernetesStorageLeaseAdapter::new(
@@ -2702,38 +3090,8 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             std::time::Duration::from_secs(self.config.cluster.timeout.as_secs().clamp(5, 300)),
         )?;
         let lease = lease_adapter.acquire().await?;
-        let lock_path = PathBuf::from(format!("/var/lock/s3chaos/storage-{scope_sha256}.lock"));
-        let (current_probe, current_probe_body) =
-            probe_helper(self.config, &helper_name, &probe_request(lock_path.clone()))?;
-        ensure!(
-            current_probe.device_major_minor == initial_probe.device_major_minor
-                && current_probe.canonical_device == initial_probe.canonical_device
-                && current_probe.filesystem_uuid == initial_probe.filesystem_uuid
-                && current_probe.rustfs_drive_uuid == initial_probe.rustfs_drive_uuid
-                && current_probe.mount_namespace_id == initial_probe.mount_namespace_id,
-            "original host generation drifted while acquiring storage ownership"
-        );
-        original.observed_at_ms = current_probe.observed_at_ms;
-        original.host_storage_proof_sha256 = sha256_text(&current_probe_body);
         let context = OwnedStorageContext {
-            identity: StorageRecoveryArtifactIdentity {
-                run_id: self.run_id.to_string(),
-                scenario: self.scenario.name.clone(),
-                case_name: self.scenario.case_name.to_string(),
-                bucket: {
-                    let state = self
-                        .state
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
-                    state
-                        .session
-                        .as_ref()
-                        .expect("session checked above")
-                        .s3
-                        .bucket()
-                        .to_string()
-                },
-            },
+            identity,
             case: self.plan.case,
             attempt_id: "fresh-volume".to_string(),
             cluster_context: self.config.cluster.context.clone(),
@@ -2742,24 +3100,22 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             volume: original,
             resource_versions,
             host_generation: HostGenerationIdentity {
-                mount_id: current_probe.mount_id,
-                mount_namespace_id: current_probe.mount_namespace_id,
-                device_major_minor: current_probe.device_major_minor,
+                mount_id: ownership_probe.mount_id.clone(),
+                mount_namespace_id: ownership_probe.mount_namespace_id.clone(),
+                device_major_minor: ownership_probe.device_major_minor.clone(),
                 device_mapper_uuid: None,
                 device_mapper_table_sha256: None,
-                filesystem_uuid: current_probe.filesystem_uuid,
-                rustfs_drive_uuid: current_probe
-                    .rustfs_drive_uuid
-                    .context("original drive disappeared")?,
+                filesystem_uuid: ownership_probe.filesystem_uuid.clone(),
+                rustfs_drive_uuid: owned_drive_uuid,
             },
             exclusive_access: StorageRecoveryExclusiveAccess {
                 kubernetes_lease: lease,
                 host_flock: HostFlockProof {
                     node: replacement.node.clone(),
-                    node_uid: required_json_string(&node_json, "/metadata/uid", "node UID")?,
+                    node_uid: host_node_uid,
                     path: lock_path.to_string_lossy().to_string(),
-                    device_id: current_probe.lock_device_id,
-                    inode: current_probe.lock_inode,
+                    device_id: ownership_probe.lock_device_id.clone(),
+                    inode: ownership_probe.lock_inode,
                     scope_sha256: scope_sha256.clone(),
                     acquired_at_ms: now_ms(),
                 },
@@ -2768,14 +3124,54 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             helper_pod_uid: helper_uid,
             observed_at_ms: now_ms(),
         };
+        // The acquired Lease and exact helper UID become cleanup obligations
+        // before any post-acquisition probe or helper session can fail.
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+            state.owned_context = Some(context.clone());
+            state.membership = Some(membership.clone());
+            state.shape = Some(shape.clone());
+            state.target_pod = Some(target_pod.name.clone());
+            state.ownership_checkpoint = Some(FreshVolumeOwnershipCheckpoint::LeaseAcquired);
+        }
         context.validate()?;
+        self.collector.write_text(
+            self.scenario.case_name,
+            "fresh-volume-owned-context.json",
+            &serde_json::to_string_pretty(&context)?,
+        )?;
+        let (post_acquire_probe, _) =
+            probe_helper(self.config, &helper_name, &probe_request(lock_path))?;
+        ensure!(
+            post_acquire_probe.mount_id == ownership_probe.mount_id
+                && post_acquire_probe.mount_namespace_id == ownership_probe.mount_namespace_id
+                && post_acquire_probe.device_major_minor == ownership_probe.device_major_minor
+                && post_acquire_probe.canonical_device == ownership_probe.canonical_device
+                && post_acquire_probe.filesystem_uuid == ownership_probe.filesystem_uuid
+                && post_acquire_probe.rustfs_drive_uuid == ownership_probe.rustfs_drive_uuid
+                && post_acquire_probe.lock_device_id == ownership_probe.lock_device_id
+                && post_acquire_probe.lock_inode == ownership_probe.lock_inode,
+            "original host generation drifted after storage ownership acquisition"
+        );
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .ownership_checkpoint = Some(FreshVolumeOwnershipCheckpoint::PostAcquireProbePassed);
         let helper = KubectlStorageRecoveryHostAdapter::new(
             &self.config.cluster,
             &self.config.cluster.test_namespace,
             &helper_name,
             self.config.cluster.timeout,
         )?;
-        let mut guard = helper.begin_attempt(&context).await?;
+        let guard = helper.begin_attempt(&context).await?;
+        *self.helper_guard.lock().await = Some(guard);
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .ownership_checkpoint = Some(FreshVolumeOwnershipCheckpoint::HelperSessionBegun);
         let operation = StorageRecoveryHostOperation::InspectXlMeta {
             object_directory: format!("{}/{}", context.identity.bucket, sealed.key),
             bucket: context.identity.bucket.clone(),
@@ -2786,7 +3182,23 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             expected_mount_device_id: context.host_generation.device_major_minor.clone(),
             expected_drive_uuid: context.volume.rustfs_drive_uuid.clone(),
         };
-        let receipt = guard.execute(&context, &operation).await?;
+        let mut guard = self
+            .helper_guard
+            .lock()
+            .await
+            .take()
+            .context("original-volume helper session disappeared before inspection")?;
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .ownership_checkpoint = Some(FreshVolumeOwnershipCheckpoint::InspectionStarted);
+        let inspection = guard.execute(&context, &operation).await;
+        *self.helper_guard.lock().await = Some(guard);
+        let receipt = inspection?;
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .ownership_checkpoint = Some(FreshVolumeOwnershipCheckpoint::InspectionCompleted);
         let completed_at_ms = receipt.completed_at_ms;
         let observation = VersionShardMappingObservation {
             schema_version: crate::fault::storage_recovery::STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
@@ -2816,18 +3228,13 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             self.plan.case,
             0,
             0,
+            &context.identity.bucket,
         )?);
-        *self.helper_guard.lock().await = Some(guard);
         {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
-            state.owned_context = Some(context);
-            state.membership = Some(membership);
-            state.shape = Some(shape);
-            state.target_pod = Some(target_pod.name.clone());
-            state.helper_pod = Some(helper_name);
             state.heal_adapter = Some(heal_adapter.clone());
         }
         // Store every cleanup handle before the first admin request. If the
@@ -2857,6 +3264,10 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         let deployment = self.config.operator_deployment.as_deref().context(
             "RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT is required for fresh-volume qualification",
         )?;
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .ownership_checkpoint = Some(FreshVolumeOwnershipCheckpoint::VolumeMutationStarted);
         let pause = lifecycle::OperatorPause::pause(
             &self.config.cluster,
             deployment,
@@ -2918,16 +3329,18 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         );
         let namespaced =
             Kubectl::new(&self.config.cluster).namespaced(&self.config.cluster.test_namespace);
-        namespaced
-            .create_yaml_command(storage_helper_pod_manifest(
+        self.create_owned_helper_pod(
+            HelperPodRole::Replacement,
+            &namespaced,
+            &helper_name,
+            storage_helper_pod_manifest(
                 self.config,
                 self.run_id,
                 &helper_name,
                 &replacement_spec.node,
                 &replacement_spec.local_path,
-            )?)
-            .run_checked()
-            .context("create replacement-volume helper Pod")?;
+            )?,
+        )?;
         namespaced
             .command([
                 "wait",
@@ -3189,7 +3602,6 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             state.membership = Some(membership);
             state.shape = Some(shape);
             state.target_pod = Some(target_pod.name.clone());
-            state.replacement_helper_pod = Some(helper_name);
             state.replacement_volume = Some(replacement_volume.clone());
             state.prepare_receipt = Some(prepare_receipt);
             state.old_device_absence_sha256 = Some(old_device_absence_sha256);
@@ -3221,11 +3633,34 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             .clone()
             .context("fresh-volume heal adapter was not initialized")?;
         let started_at_ms = now_ms();
-        adapter.start().await?;
-        self.state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
-            .heal_started_at_ms = Some(started_at_ms);
+        let intent = adapter.register_start_intent().await?;
+        self.collector.write_text(
+            self.scenario.case_name,
+            FRESH_VOLUME_HEAL_START_ARTIFACT,
+            &intent,
+        )?;
+        adapter.start_registered().await?;
+        let owned_start = adapter.start_state_json().await;
+        let record_owned_start = owned_start.and_then(|owned_start| {
+            self.collector.write_text(
+                self.scenario.case_name,
+                FRESH_VOLUME_HEAL_START_ARTIFACT,
+                &owned_start,
+            )?;
+            self.state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+                .heal_started_at_ms = Some(started_at_ms);
+            Ok(())
+        });
+        if let Err(primary) = record_owned_start {
+            return match adapter.cancel_owned().await {
+                Ok(_) => Err(primary),
+                Err(cancel) => Err(primary.context(format!(
+                    "owned heal cancellation after state persistence failure also failed: {cancel:#}"
+                ))),
+            };
+        }
         Ok(())
     }
 
@@ -3590,6 +4025,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             proof_history,
             helper_pod,
             replacement_helper_pod,
+            ownership_checkpoint,
         ) = {
             let state = self
                 .state
@@ -3612,10 +4048,37 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 session.map(|session| session.proof_history.clone()),
                 state.helper_pod.clone(),
                 state.replacement_helper_pod.clone(),
+                state.ownership_checkpoint,
             )
         };
+        if let Some(context) = context.as_ref()
+            && ownership_checkpoint
+                .is_some_and(FreshVolumeOwnershipCheckpoint::permits_abort_before_mutation)
+        {
+            let proof = StorageRecoveryCleanupProof::AbortedBeforeMutation {
+                observed_at_ms: now_ms()
+                    .max(context.exclusive_access.kubernetes_lease.acquired_at_ms),
+            };
+            proof.validate_for(context)?;
+            self.collector.write_text(
+                self.scenario.case_name,
+                FRESH_VOLUME_ABORT_PROOF_ARTIFACT,
+                &serde_json::to_string_pretty(&proof)?,
+            )?;
+            self.state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+                .abort_before_mutation = Some(proof);
+        }
         let transcript = match adapter {
-            Some(adapter) => adapter.transcript_json().await?,
+            Some(adapter) => {
+                self.collector.write_text(
+                    self.scenario.case_name,
+                    FRESH_VOLUME_HEAL_START_ARTIFACT,
+                    &adapter.start_state_json().await?,
+                )?;
+                adapter.transcript_json().await?
+            }
             None => "[]".to_string(),
         };
         self.collector.write_text(
@@ -3763,15 +4226,28 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
     }
 
     async fn cleanup_or_quarantine(&self) -> Result<()> {
-        let (replacement, prepare_receipt, old_device_absence_sha256, helper_pods) = {
+        let (
+            context,
+            replacement,
+            prepare_receipt,
+            old_device_absence_sha256,
+            abort_before_mutation,
+            ownership_checkpoint,
+            heal_adapter,
+            helper_pods,
+        ) = {
             let state = self
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
             (
+                state.owned_context.clone(),
                 state.replacement_volume.clone(),
                 state.prepare_receipt.clone(),
                 state.old_device_absence_sha256.clone(),
+                state.abort_before_mutation.clone(),
+                state.ownership_checkpoint,
+                state.heal_adapter.clone(),
                 [
                     state.helper_pod.clone(),
                     state.replacement_helper_pod.clone(),
@@ -3779,35 +4255,63 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             )
         };
         let mut primary: Option<anyhow::Error> = None;
-        if let (Some(replacement), Some(prepare_receipt), Some(old_device_absence_sha256)) = (
+        if let Some(adapter) = heal_adapter
+            && adapter.has_ambiguous_start().await
+        {
+            primary = Some(anyhow::anyhow!(
+                "admin heal start ownership remains ambiguous; no foreign-safe cancellation is possible"
+            ));
+        }
+        let terminal_proof = match (
             replacement.as_ref(),
             prepare_receipt.as_ref(),
             old_device_absence_sha256.as_ref(),
         ) {
+            (Some(replacement), Some(prepare_receipt), Some(old_device_absence_sha256)) => {
+                Some(StorageRecoveryCleanupProof::FreshVolumeCommitted {
+                    prepare_receipt: Box::new(prepare_receipt.clone()),
+                    replacement_volume: Box::new(replacement.clone()),
+                    old_device_absence_sha256: old_device_absence_sha256.clone(),
+                    observed_at_ms: now_ms().max(prepare_receipt.completed_at_ms),
+                })
+            }
+            _ if context.is_some()
+                && ownership_checkpoint
+                    .is_some_and(FreshVolumeOwnershipCheckpoint::permits_abort_before_mutation) =>
+            {
+                abort_before_mutation
+            }
+            _ => None,
+        };
+        if let (Some(_), Some(proof)) = (context.as_ref(), terminal_proof.as_ref()) {
             let finish_result = async {
                 let context = self.renew_owned_context().await?;
-                let guard = self
-                    .helper_guard
-                    .lock()
-                    .await
-                    .take()
-                    .context("original-volume helper session is absent during cleanup")?;
-                guard
-                    .finish(
-                        &context,
-                        &StorageRecoveryCleanupProof::FreshVolumeCommitted {
-                            prepare_receipt: Box::new(prepare_receipt.clone()),
-                            replacement_volume: Box::new(replacement.clone()),
-                            old_device_absence_sha256: old_device_absence_sha256.clone(),
-                            observed_at_ms: now_ms().max(prepare_receipt.completed_at_ms),
-                        },
+                if let Some(guard) = self.helper_guard.lock().await.take() {
+                    guard.finish(&context, proof).await
+                } else {
+                    let client = crate::framework::kube_client::client_for_context(
+                        &self.config.cluster.context,
                     )
-                    .await
+                    .await?;
+                    release_owned_lease(client, &context, proof).await
+                }
             }
             .await;
             if let Err(error) = finish_result {
-                primary = Some(error.context("finish receipt-bound original-volume helper"));
+                primary = Some(match primary {
+                    Some(original) => original.context(format!(
+                        "receipt-bound original-volume ownership cleanup also failed: {error:#}"
+                    )),
+                    None => error.context("finish receipt-bound original-volume ownership"),
+                });
             }
+        } else if context.is_some() {
+            let error =
+                anyhow::anyhow!("owned storage Lease lacks a durable terminal cleanup proof");
+            primary = Some(match primary {
+                Some(original) => original.context(format!("Lease cleanup also failed: {error:#}")),
+                None => error,
+            });
         }
         if let Err(error) = fixture::reset_tenant_resources(&self.config.cluster) {
             primary = Some(match primary {
@@ -3835,7 +4339,8 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             if let Err(error) = cleanup {
                 primary = Some(match primary {
                     Some(original) => original.context(format!(
-                        "helper Pod cleanup for {helper} also failed: {error:#}"
+                        "helper Pod cleanup for {} also failed: {error:#}",
+                        helper.name
                     )),
                     None => error,
                 });
@@ -3943,6 +4448,132 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lost_found_is_allowed_only_when_recursively_empty() {
+        let volume = tempfile::tempdir().expect("volume");
+        fs::create_dir(volume.path().join("lost+found")).expect("lost+found");
+        assert!(
+            exhaustive_entries(volume.path())
+                .expect("empty scan")
+                .is_empty()
+        );
+
+        fs::create_dir(volume.path().join("lost+found/orphan-dir")).expect("orphan directory");
+        fs::write(
+            volume.path().join("lost+found/orphan-dir/fragment"),
+            b"orphan",
+        )
+        .expect("orphan fragment");
+        let entries = exhaustive_entries(volume.path()).expect("nonempty scan");
+        assert_eq!(
+            entries,
+            [
+                "lost+found/orphan-dir".to_string(),
+                "lost+found/orphan-dir/fragment".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn helper_cleanup_identity_is_registered_before_uid_and_never_rebound() {
+        let mut identity = OwnedHelperPodCleanup::registered("helper-1".to_string());
+        assert_eq!(identity.uid, None);
+        identity
+            .record_uid("helper-1", "uid-1".to_string())
+            .expect("record exact UID");
+        assert!(
+            identity
+                .record_uid("helper-1", "uid-2".to_string())
+                .is_err()
+        );
+        assert!(
+            identity
+                .record_uid("helper-2", "uid-1".to_string())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn every_post_lease_pre_mutation_failure_requires_abort_proof() {
+        for checkpoint in [
+            FreshVolumeOwnershipCheckpoint::LeaseAcquired,
+            FreshVolumeOwnershipCheckpoint::PostAcquireProbePassed,
+            FreshVolumeOwnershipCheckpoint::HelperSessionBegun,
+            FreshVolumeOwnershipCheckpoint::InspectionStarted,
+            FreshVolumeOwnershipCheckpoint::InspectionCompleted,
+        ] {
+            assert!(
+                checkpoint.permits_abort_before_mutation(),
+                "{checkpoint:?} must retain the AbortedBeforeMutation cleanup path"
+            );
+        }
+        assert!(
+            !FreshVolumeOwnershipCheckpoint::VolumeMutationStarted.permits_abort_before_mutation()
+        );
+    }
+
+    #[test]
+    fn response_loss_reconciliation_owns_only_matching_scope_and_time() {
+        let requested_at_ms = 1_000;
+        let mut state = AdminHealStartState::ambiguous(
+            "rustfs-fault-run",
+            "",
+            "/rustfs/admin/v3/heal/rustfs-fault-run",
+            requested_at_ms,
+        );
+        let start = HealWireReceipt {
+            observed_at_ms: 1_200,
+            method: "POST".to_string(),
+            path: "/rustfs/admin/v3/heal/rustfs-fault-run".to_string(),
+            status: 200,
+            request_id: Some("request-1".to_string()),
+            response_body: r#"{"clientToken":"owned-token","startTime":"1970-01-01T00:00:01Z"}"#
+                .to_string(),
+        };
+        let status = HealWireReceipt {
+            observed_at_ms: 1_500,
+            method: "POST".to_string(),
+            path: start.path.clone(),
+            status: 200,
+            request_id: Some("request-2".to_string()),
+            response_body: r#"{"summary":"running","startTime":"1970-01-01T00:00:01Z","settings":{"pool":0,"set":0}}"#
+                .to_string(),
+        };
+        assert_eq!(
+            state
+                .own(&start, &status, true, 0, 0)
+                .expect("reconciled ownership"),
+            HealObserverIdentity::AdminOperation {
+                operation_id: "owned-token".to_string(),
+            }
+        );
+        assert!(matches!(
+            state,
+            AdminHealStartState::Owned {
+                reconciled_after_response_loss: true,
+                ..
+            }
+        ));
+
+        let mut foreign_scope = AdminHealStartState::ambiguous(
+            "rustfs-fault-run",
+            "",
+            "/rustfs/admin/v3/heal/rustfs-fault-run",
+            requested_at_ms,
+        );
+        let mut wrong_status = status;
+        wrong_status.path = "/rustfs/admin/v3/heal/foreign".to_string();
+        assert!(
+            foreign_scope
+                .own(&start, &wrong_status, true, 0, 0)
+                .is_err()
+        );
+        assert!(matches!(
+            foreign_scope,
+            AdminHealStartState::Ambiguous { .. }
+        ));
+    }
 
     #[test]
     fn manifest_is_retain_local_and_run_owned() {
