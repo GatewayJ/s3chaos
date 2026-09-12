@@ -18,7 +18,7 @@
 //! module starts only after that layer has proven the named, populated source
 //! pool and the empty survivor pool for one run-owned Tenant.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1939,38 +1939,30 @@ impl AdminCaseDriver for LiveAdminDecommissionDriver {
                     .target_pool_expression
                     .as_deref()
                     .context("missing target pool expression")?;
-                let deadline = Instant::now() + self.config.cluster.timeout;
-                loop {
-                    let remaining = deadline
-                        .checked_duration_since(Instant::now())
-                        .context("timed out binding an ambiguous decommission start")?;
-                    let status = timeout(
-                        remaining,
-                        adapter.decommission_status(target_pool_id, target_expression),
-                    )
-                    .await
-                    .context("timed out reconciling an ambiguous decommission start")??;
-                    ensure!(
-                        status.request.started_at_ms >= attempted_at_ms,
-                        "ambiguous decommission status predates the start attempt"
-                    );
-                    let candidate_id = operation_id_from_status(&proof, &status)?;
+                let status = timeout(
+                    self.config.cluster.timeout,
+                    adapter.decommission_status(target_pool_id, target_expression),
+                )
+                .await
+                .context("timed out reconciling an ambiguous decommission start")??;
+                ensure!(
+                    status.request.started_at_ms >= attempted_at_ms,
+                    "ambiguous decommission status predates the start attempt"
+                );
+                let candidate_id = operation_id_from_status(&proof, &status)?;
+                lock_transcript(&self.transcript)
+                    .requests
+                    .push(status.request.clone());
+                if let Some(operation_id) = candidate_id {
+                    let sample = decommission_progress_sample(&proof, &operation_id, &status)?;
                     lock_transcript(&self.transcript)
-                        .requests
-                        .push(status.request.clone());
-                    if let Some(operation_id) = candidate_id {
-                        let sample = decommission_progress_sample(&proof, &operation_id, &status)?;
-                        {
-                            let mut transcript = lock_transcript(&self.transcript);
-                            transcript.operation_id = Some(operation_id.clone());
-                            transcript.progress.push(sample.clone());
-                        }
-                        if is_terminal_state(&sample.state) && sample.completed {
-                            self.write_transcript()?;
-                            return Ok(AdminCancelOutcome::NoOwnedOperation);
-                        }
-                        break operation_id;
+                        .progress
+                        .push(sample.clone());
+                    if is_terminal_state(&sample.state) {
+                        self.write_transcript()?;
+                        return Ok(AdminCancelOutcome::NoOwnedOperation);
                     }
+                } else {
                     let sample =
                         decommission_progress_sample(&proof, "unbound-queued-operation", &status)?;
                     ensure!(
@@ -1980,11 +1972,11 @@ impl AdminCaseDriver for LiveAdminDecommissionDriver {
                             && !sample.canceled_or_stopped,
                         "ambiguous decommission lacks a stable owned identity"
                     );
-                    let remaining = deadline
-                        .checked_duration_since(Instant::now())
-                        .context("timed out binding an ambiguous decommission start")?;
-                    sleep(Duration::from_millis(100).min(remaining)).await;
                 }
+                self.write_transcript()?;
+                bail!(
+                    "decommission start remains ambiguous; refusing to cancel an operation without an attempt-bound server identity"
+                )
             }
         };
         let result = cancel_owned_decommission(
