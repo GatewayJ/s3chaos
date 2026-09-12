@@ -173,6 +173,20 @@ fn available_local_port() -> Result<u16> {
 }
 
 impl PortForwardGuard {
+    /// A guard over an arbitrary child process, for tests of code that polls
+    /// a forward's liveness without spawning `kubectl`.
+    #[cfg(test)]
+    pub(crate) fn for_test(child: Child, log_path: PathBuf) -> Self {
+        Self {
+            child,
+            kubectl: Kubectl::new(&crate::framework::config::E2eConfig::defaults()),
+            spec: PortForwardSpec::tenant_io_with_local_port("test", "tenant", 0),
+            started_at_ms: now_ms(),
+            log_path,
+            command_display: "test port-forward".to_string(),
+        }
+    }
+
     pub(crate) fn capture_target(&mut self) -> Result<PortForwardTargetSnapshot> {
         self.ensure_running()?;
         let cluster_started_at_ms = now_ms();

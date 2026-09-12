@@ -35,7 +35,9 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::access::{ensure_s3_access, wait_for_local_forward, wait_for_tenant_s3};
+use super::access::{
+    PortForwardLost, ensure_s3_access, wait_for_local_forward, wait_for_tenant_s3,
+};
 
 /// How long a re-pinned `kubectl port-forward` gets to bind its local port
 /// and start accepting connections; only the harness side of the endpoint.
@@ -875,7 +877,9 @@ impl FaultRun<'_> {
             self.deadline
                 .run(wait_for_tenant_s3(guard, endpoint, cluster.timeout))
                 .await
-                .map_err(|error| AvailabilityEndpointFailure::survivor_unready(&survivor, error))?;
+                .map_err(|error| {
+                    AvailabilityEndpointFailure::from_survivor_wait(&survivor, error)
+                })?;
             Ok::<_, AvailabilityEndpointFailure>((survivor, targets))
         }
         .await;
@@ -1137,6 +1141,16 @@ impl AvailabilityEndpointFailure {
         }
     }
 
+    /// A failed S3 wait through the established forward is the survivor's
+    /// only while the forward stayed up; a forward lost mid-wait is harness.
+    fn from_survivor_wait(pod: &str, error: anyhow::Error) -> Self {
+        if error.is::<PortForwardLost>() {
+            Self::Harness(error)
+        } else {
+            Self::survivor_unready(pod, error)
+        }
+    }
+
     fn classification(&self) -> &'static str {
         match self {
             // The suite budget running out while waiting is a harness limit,
@@ -1194,6 +1208,33 @@ mod availability_endpoint_tests {
         ResponsibilityDomain,
     };
     use std::collections::BTreeSet;
+
+    #[test]
+    fn a_forward_lost_during_the_survivor_wait_is_harness_not_product() {
+        use super::PortForwardLost;
+        use anyhow::Context;
+
+        // The shape `wait_for_tenant_s3` produces when the forward exits
+        // mid-wait: the lost-forward marker under its readiness context.
+        let lost = Err::<(), _>(anyhow::anyhow!(
+            "port-forward exited early with exit status: 1"
+        ))
+        .context(PortForwardLost)
+        .context("S3 port-forward was not ready; command: kubectl port-forward")
+        .unwrap_err();
+        let failure = AvailabilityEndpointFailure::from_survivor_wait("rustfs-1", lost);
+        assert!(
+            matches!(failure, AvailabilityEndpointFailure::Harness(_)),
+            "{failure:?}"
+        );
+        assert_eq!(failure.classification(), "environment_or_fault_backend");
+
+        let unready = AvailabilityEndpointFailure::from_survivor_wait(
+            "rustfs-1",
+            anyhow::anyhow!("timed out waiting for S3 endpoint http://127.0.0.1:19000"),
+        );
+        assert_eq!(unready.classification(), "availability_regression");
+    }
 
     #[test]
     fn survivor_not_serving_s3_is_a_product_availability_failure() {
