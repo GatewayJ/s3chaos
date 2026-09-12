@@ -33,8 +33,8 @@ protocol/
   examples/          Ready-to-run suite YAMLs: smoke, full-regression,
                      slow-regression, oidc-keycloak
 fault/
-  examples/          Ready-to-run fault suites: smoke, regression,
-                     device-mapper lab, Warp performance
+  examples/          Ready-to-run fault suites: canonical Chaos Mesh,
+                     focused correctness suites, Warp performance
 console/             Web console assets served by the run console
 ```
 
@@ -51,31 +51,36 @@ cargo run --quiet --bin s3chaos -- help
 
 ```bash
 make check            # cargo fmt --check + clippy -D warnings + tests
-make fault-check      # check + bash -n on fault-test.sh
+make fault-check      # check + fault script/YAML validation
 make protocol-check   # check + bash -n on protocol scripts
 ```
 
 ## Fault-Injection Testing
 
-Workflow: discover scenarios → preflight → preflight-validate a suite → plan →
-run → inspect artifacts/console → cleanup.
+The normal correctness workflow uses one foreground command for all ordinary
+Chaos Mesh scenarios and one foreground command for exactly one device-mapper
+scenario:
 
 ```bash
-make fault-list                                   # scenario catalog
-make fault-preflight SCENARIO=io-eio              # cluster readiness checks
-make fault-suite-template > suite.yaml            # generate a suite skeleton
-make fault-suite-validate SUITE=suite.yaml        # static suite validation
-make fault-suite-plan SUITE=suite.yaml            # dry-run expansion
-make fault-suite-run SUITE=suite.yaml             # live run (needs a cluster)
-make fault-suite-run SUITE=fault/examples/smoke.yaml
-make fault-console-serve                          # browse run artifacts
+make fault-list                                      # scenario catalog
+make fault-chaos-run                                 # canonical 19-attempt suite
+make fault-dm-run SCENARIO=dm-flakey-versioned-hot  # one supervised DM run
+make fault-console-serve                             # browse run artifacts
 
 # Pin the context, namespace, and tenant recorded in the run's target proof.
 export RUSTFS_FAULT_TEST_EXPECTED_CONTEXT='<run-context>'
 export RUSTFS_FAULT_TEST_NAMESPACE='<run-namespace>'
 export RUSTFS_FAULT_TEST_TENANT='<run-tenant>'
-make fault-cleanup                                # release cluster fixtures
+make fault-cleanup                                   # release cluster fixtures
 ```
+
+Both live targets build once and run cluster preflight once. The Chaos wrapper
+uses one pre-run plan pass. A separate `fault-preflight` command is unnecessary.
+Use `make fault-chaos-plan` only when reviewing the resolved plan without
+starting the suite. Override the canonical suite with
+`CHAOS_SUITE=/path/to/suite.yaml`; `fault-chaos-run` rejects static storage and
+Warp plans. The generic `fault-suite-*` targets remain available for custom
+non-static suites and the separate Warp campaign.
 
 Runnable scenario families (25 executable entries): I/O faults (`io-eio`,
 `io-read-mistake`, `io-latency`, `disk-full`, `dm-flakey*`, and the five
@@ -107,9 +112,10 @@ execution environments and verdicts separate:
 
 | Suite | Scope | Additional requirement |
 | --- | --- | --- |
+| `chaos-mesh.yaml` | Canonical 19-attempt correctness run: smoke, regression, and four typed quorum checks | Dedicated cluster with Chaos Mesh; reference four-server single-erasure-set topology for the write-quorum boundary |
 | `smoke.yaml` | Six short correctness and recovery checks across I/O, pod, and network faults | Dedicated cluster with Chaos Mesh |
 | `regression.yaml` | Remaining ordinary Chaos Mesh scenarios, including the write-quorum boundary | Reference four-server single-erasure-set topology for `network-partition-write-quorum-loss` |
-| `dm-lab.yaml` | `dm-flakey`, the versioned hot-key diagnostic, and five independent ACK-then-activate durability cases | Prepared dedicated block device and static local PV from `docs/DM_FLAKEY.md` |
+| `quorum-reliability.yaml` | Four payload/metadata checks at the P and P+1 volume boundaries | Reference four-server single-erasure-set topology |
 | `warp-performance.yaml` | Performance-only Warp-under-chaos campaign; correctness still comes from the normal checker | `warp` on `PATH`; Warp defaults to 60 seconds |
 
 The Rust runner owns `budgets.maxDuration` for both `make fault-suite-run`
@@ -130,13 +136,14 @@ This headroom is not a runtime guarantee: Warp setup and the correctness workloa
 also take time, and the run fails if the fault expires before they finish.
 
 Each suite runs its scenarios sequentially to keep their conflict domains from
-overlapping. Do not run multiple fault suites concurrently against the same
-fault-test namespace. CI validates these YAML contracts only; it never starts a
-destructive suite.
+overlapping. Device-mapper scenarios are excluded from multi-attempt suites and
+must run one at a time under operator supervision. Do not run multiple fault
+suites concurrently against the same fault-test namespace. CI validates these
+YAML contracts only; it never starts a destructive suite.
 
-The two `dm-flakey*` scenarios need host preparation beyond the environment
-variables below: a device-mapper flakey table over a dedicated block device,
-a static local PV/storage class, and scenario-specific variables
+All seven device-mapper scenarios need host preparation beyond the environment
+variables below: a device-mapper table over a dedicated block device, a static
+local PV/storage class, and scenario-specific variables
 (`RUSTFS_FAULT_TEST_DM_NAME`, `RUSTFS_FAULT_TEST_DM_NODE`,
 `RUSTFS_FAULT_TEST_DM_MOUNT_PATH`, a separate pre-provisioned read-only host
 observer, backend-specific destructive opt-in, exact node/device/PV allowlists,
@@ -156,6 +163,13 @@ export RUSTFS_FAULT_TEST_SERVER_IMAGE='docker.io/rustfs/rustfs@sha256:<digest>'
 dedicated Kubernetes/K3s context and aborts if the current context differs.
 Workload size and concurrency are tunable via `RUSTFS_FAULT_TEST_WORKLOAD_*`
 variables; see `src/fault/config.rs`.
+
+After a live scenario or suite starts, a runner, health guard, signal, or
+artifact-check failure first preserves a failed cluster snapshot, current and
+previous RustFS logs, `runner-failure-summary.json`, `runner-diagnosis.txt`, and
+`failure-evidence.json`. The wrapper removes residual managed Chaos only after
+those files are written. The run directory remains available for diagnosis;
+verify it before the separate cluster-scoped `fault-cleanup` step.
 
 Every scenario proves recovery beyond S3 readability. Before the fault the
 runner captures the healthy RustFS layout from `/rustfs/admin/v3/info`; after
