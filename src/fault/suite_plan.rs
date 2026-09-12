@@ -955,8 +955,23 @@ mod tests {
         let target_proof = json!([
             "run artifacts must include the selected Kubernetes object or host device identity before the fault is activated"
         ]);
+        assert!(
+            plan["attempts"]
+                .as_array()
+                .expect("attempts")
+                .iter()
+                .all(|attempt| attempt["execution"] == json!({"type": "injection"})),
+            "new suite-plan writers must persist the explicit injection route"
+        );
+        let mut legacy_shape = plan.clone();
+        for attempt in legacy_shape["attempts"].as_array_mut().expect("attempts") {
+            attempt
+                .as_object_mut()
+                .expect("attempt object")
+                .remove("execution");
+        }
         assert_eq!(
-            plan,
+            legacy_shape,
             json!({
                 "apiVersion": "rustfs.com/s3chaos/v1alpha1",
                 "kind": "FaultSuitePlan",
