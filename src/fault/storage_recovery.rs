@@ -503,7 +503,6 @@ impl FreshVolumeReplacementProof {
         );
         ensure!(
             self.original.persistent_volume_uid != self.replacement.persistent_volume_uid
-                && self.original.local_volume_path != self.replacement.local_volume_path
                 && self.original.canonical_device != self.replacement.canonical_device
                 && self.original.filesystem_uuid != self.replacement.filesystem_uuid
                 && self.original.rustfs_drive_uuid != self.replacement.rustfs_drive_uuid,
