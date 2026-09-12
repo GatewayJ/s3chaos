@@ -300,6 +300,7 @@ struct ProvenTarget {
 
 struct ActiveFault {
     fault: AppliedFault,
+    fault_prepare_started_at_ms: Option<u64>,
     fault_apply_started_at_ms: u64,
     fault_active_at_ms: u64,
     active_snapshots: Vec<FaultStatusSnapshot>,

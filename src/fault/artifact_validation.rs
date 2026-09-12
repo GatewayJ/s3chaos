@@ -48,6 +48,7 @@ use crate::fault::{
     },
     host_storage::DmStatusSnapshot,
     host_storage::{
+        DM_FILESYSTEM_CHECK_ARTIFACT, DM_FILESYSTEM_CHECK_SCHEMA_VERSION, DmFilesystemCheck,
         HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT, HostStorageMutationProof,
         HostStoragePostCleanupObservation, normalized_dm_table_sha256,
     },
@@ -314,10 +315,11 @@ fn validate_failed_attempt_disruption_evidence(
         );
         validate_fault_window_evidence(&evidence)?;
     }
+    let lifecycle_started_at_ms = evidence
+        .fault_prepare_started_at_ms
+        .or(evidence.fault_apply_started_at_ms);
     ensure!(
-        evidence
-            .fault_apply_started_at_ms
-            .is_some_and(|at| at >= attempt_started_at_ms)
+        lifecycle_started_at_ms.is_some_and(|at| at >= attempt_started_at_ms)
             && evidence
                 .recovery_ended_at_ms
                 .is_some_and(|at| at <= evaluated_at_ms),
@@ -863,6 +865,18 @@ fn validate_fault_artifacts_with_identity(
             &json_spec,
             &evidence,
         )?;
+        if json_spec
+            .faults
+            .iter()
+            .any(|fault| fault.kind == FaultKind::RustfsBlockDeviceDropWritesCrash.as_str())
+        {
+            let filesystem_check = read_json::<DmFilesystemCheck>(&locate_artifact(
+                &options.artifact_root,
+                scenario_spec.case_name,
+                DM_FILESYSTEM_CHECK_ARTIFACT,
+            )?)?;
+            validate_dm_filesystem_check(&filesystem_check, &host_proof, &cleanup, &evidence)?;
+        }
         ensure!(
             preflight_summary.phases.iter().any(|phase| {
                 phase.name == "host-storage-mutation-proof"
@@ -1212,6 +1226,18 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
             "run-spec artifacts.required host-storage contract does not match its fault backends"
         );
     }
+    let requires_filesystem_check = spec
+        .faults
+        .iter()
+        .any(|fault| fault.kind == FaultKind::RustfsBlockDeviceDropWritesCrash.as_str());
+    ensure!(
+        spec.artifacts
+            .required
+            .iter()
+            .any(|name| name == DM_FILESYSTEM_CHECK_ARTIFACT)
+            == requires_filesystem_check,
+        "run-spec artifacts.required filesystem-check contract does not match its fault kind"
+    );
     ensure!(
         !spec.faults.is_empty(),
         "run-spec must contain at least one fault"
@@ -1905,9 +1931,23 @@ fn validate_host_storage_artifacts(
     let fault_active_at_ms = evidence
         .fault_active_at_ms
         .context("fault-evidence.json lacks fault_active_at_ms")?;
-    proof
-        .require_generated_during_apply(fault_apply_started_at_ms, fault_active_at_ms)
-        .context("host-storage proof was not freshly regenerated during fault apply")?;
+    if spec.scenario.ack_trigger.is_some() {
+        let fault_prepare_started_at_ms = evidence
+            .fault_prepare_started_at_ms
+            .context("ACK-triggered fault-evidence.json lacks fault_prepare_started_at_ms")?;
+        ensure!(
+            fault_prepare_started_at_ms <= proof.generated_at_ms
+                && proof.generated_at_ms <= fault_apply_started_at_ms,
+            "host-storage proof was not regenerated during pre-ACK fault preparation"
+        );
+        proof
+            .require_fresh_at(fault_apply_started_at_ms)
+            .context("prepared host-storage proof was stale at ACK-triggered fault apply")?;
+    } else {
+        proof
+            .require_generated_during_apply(fault_apply_started_at_ms, fault_active_at_ms)
+            .context("host-storage proof was not freshly regenerated during fault apply")?;
+    }
     proof
         .validate_post_cleanup(cleanup)
         .context("validate host-storage-post-cleanup.json")?;
@@ -1990,6 +2030,78 @@ fn validate_host_storage_artifacts(
         };
         validate_dm_fault_snapshot(snapshot, stage, proof, start, end)?;
     }
+    Ok(())
+}
+
+fn validate_dm_filesystem_check(
+    check: &DmFilesystemCheck,
+    proof: &HostStorageMutationProof,
+    cleanup: &HostStoragePostCleanupObservation,
+    evidence: &FaultEvidenceArtifact,
+) -> Result<()> {
+    ensure!(
+        check.schema_version == DM_FILESYSTEM_CHECK_SCHEMA_VERSION,
+        "unsupported {DM_FILESYSTEM_CHECK_ARTIFACT} schema version {}",
+        check.schema_version
+    );
+    ensure!(
+        check.scenario == proof.scenario
+            && check.fault_name == proof.fault_name
+            && check.run_id == proof.run_id
+            && check.node == proof.target.node
+            && check.persistent_volume == proof.target.persistent_volume
+            && check.mapper_name == proof.target.mapper_name
+            && check.logical_device == proof.target.logical_device
+            && check.canonical_device == proof.target.canonical_device
+            && check.mount_path == proof.target.persistent_volume_path
+            && check.filesystem == proof.target.filesystem,
+        "{DM_FILESYSTEM_CHECK_ARTIFACT} identity or storage target does not match host-storage-proof.json"
+    );
+    let expected_arguments = match check.filesystem.as_str() {
+        "ext2" | "ext3" | "ext4" => vec![
+            "-f".to_string(),
+            "-n".to_string(),
+            check.logical_device.clone(),
+        ],
+        "xfs" => vec!["-n".to_string(), check.logical_device.clone()],
+        filesystem => {
+            bail!("{DM_FILESYSTEM_CHECK_ARTIFACT} names unsupported filesystem {filesystem:?}")
+        }
+    };
+    let expected_checker = if check.filesystem == "xfs" {
+        "/usr/sbin/xfs_repair"
+    } else {
+        "/usr/sbin/e2fsck"
+    };
+    ensure!(
+        check.checker == expected_checker && check.arguments == expected_arguments,
+        "{DM_FILESYSTEM_CHECK_ARTIFACT} does not record the required read-only checker command"
+    );
+    let recovery_started_at_ms = evidence
+        .recovery_started_at_ms
+        .context("fault-evidence.json lacks recovery_started_at_ms")?;
+    let recovery_ended_at_ms = evidence
+        .recovery_ended_at_ms
+        .context("fault-evidence.json lacks recovery_ended_at_ms")?;
+    let remounted_at_ms = check.remounted_at_ms.context(format!(
+        "{DM_FILESYSTEM_CHECK_ARTIFACT} lacks remountedAtMs"
+    ))?;
+    ensure!(
+        recovery_started_at_ms <= check.started_at_ms
+            && check.started_at_ms <= check.completed_at_ms
+            && check.completed_at_ms <= remounted_at_ms
+            && remounted_at_ms <= cleanup.observed_at_ms
+            && remounted_at_ms <= recovery_ended_at_ms,
+        "{DM_FILESYSTEM_CHECK_ARTIFACT} timestamps are outside the recorded recovery window"
+    );
+    ensure!(
+        check.exit_code == Some(0)
+            && check.clean
+            && check.mounted_for_recovery
+            && check.unmounted_for_check
+            && check.remounted_after_check,
+        "{DM_FILESYSTEM_CHECK_ARTIFACT} does not prove a clean offline check followed by remount"
+    );
     Ok(())
 }
 
@@ -3004,6 +3116,9 @@ fn validate_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Result<()
 }
 
 fn validate_ack_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Result<()> {
+    let prepare_started = evidence
+        .fault_prepare_started_at_ms
+        .context("ACK-triggered fault-evidence.json fault_prepare_started_at_ms is required")?;
     let apply_started = evidence
         .fault_apply_started_at_ms
         .context("ACK-triggered fault-evidence.json fault_apply_started_at_ms is required")?;
@@ -3024,7 +3139,8 @@ fn validate_ack_fault_window_evidence(evidence: &FaultEvidenceArtifact) -> Resul
         "ACK-triggered quiet mutation must not claim an under-fault workload window"
     );
     ensure!(
-        apply_started <= active
+        prepare_started <= apply_started
+            && apply_started <= active
             && active <= delete_started
             && delete_started <= recovery_started
             && recovery_started <= recovery_ended,
@@ -3054,6 +3170,12 @@ struct AckCheckerExpectation {
     committed_delete_marker_refs: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AckFaultTimeline {
+    prepare_started_at_ms: Option<u64>,
+    apply_started_at_ms: Option<u64>,
+}
+
 fn validate_ack_triggered_dm_artifacts(
     context: AckArtifactValidationContext<'_>,
     expected_mutation: AcknowledgedMutationKind,
@@ -3070,6 +3192,15 @@ fn validate_ack_triggered_dm_artifacts(
         run_spec,
     } = context;
     validate_history_scope_and_order(history, scenario, run_id, bucket)?;
+    let preparation_event = events
+        .iter()
+        .find(|event| {
+            event.stage == "fault-prepare"
+                && event.status == RunEventStatus::Succeeded
+                && event.scenario == scenario
+                && event.run_id == run_id
+        })
+        .context("run-events.jsonl lacks successful fault preparation")?;
     ensure!(
         events.iter().any(|event| {
             event.stage == "ack-trigger"
@@ -3104,7 +3235,10 @@ fn validate_ack_triggered_dm_artifacts(
         expected_mutation,
         scenario,
         run_id,
-        evidence.fault_apply_started_at_ms,
+        AckFaultTimeline {
+            prepare_started_at_ms: evidence.fault_prepare_started_at_ms,
+            apply_started_at_ms: evidence.fault_apply_started_at_ms,
+        },
         trigger,
     )?;
     ensure!(
@@ -3154,6 +3288,7 @@ fn validate_ack_triggered_dm_artifacts(
             && boundary.started_at_ms == ack.crash_boundary_started_at_ms
             && boundary.completed_at_ms >= boundary.started_at_ms
             && boundary.filesystem_unmounted
+            && boundary.mapper_mounts_absent
             && !boundary.mount_before.canonical_source.is_empty()
             && !boundary.mount_before.filesystem.is_empty()
             && !boundary.mount_before.options.is_empty()
@@ -3204,6 +3339,11 @@ fn validate_ack_triggered_dm_artifacts(
         case_name,
         HOST_STORAGE_PROOF_ARTIFACT,
     )?)?;
+    ensure!(
+        host_proof.generated_at_ms <= preparation_event.at_ms
+            && preparation_event.at_ms <= ack.trigger_acknowledged_at_ms,
+        "host-storage proof and successful fault preparation must precede the trigger ACK"
+    );
     validate_ack_crash_target_identity(&boundary, &host_proof, evidence)?;
     Ok(checker_expectation)
 }
@@ -3214,7 +3354,7 @@ fn validate_ack_trigger_contract(
     expected_mutation: AcknowledgedMutationKind,
     scenario: &str,
     run_id: &str,
-    fault_apply_started_at_ms: Option<u64>,
+    timeline: AckFaultTimeline,
     trigger: &OperationRecord,
 ) -> Result<()> {
     ensure!(
@@ -3234,8 +3374,12 @@ fn validate_ack_trigger_contract(
             && !ack.trigger_key.is_empty()
             && !ack.trigger_version_id.is_empty()
             && ack.trigger_version_id != "null"
-            && fault_apply_started_at_ms.is_some_and(|started| {
-                ack.trigger_acknowledged_at_ms <= started && started <= ack.fault_activated_at_ms
+            && timeline.prepare_started_at_ms.is_some_and(|prepared| {
+                timeline.apply_started_at_ms.is_some_and(|started| {
+                    prepared <= ack.trigger_acknowledged_at_ms
+                        && ack.trigger_acknowledged_at_ms <= started
+                        && started <= ack.fault_activated_at_ms
+                })
             })
             && ack.fault_activated_at_ms <= ack.crash_boundary_started_at_ms
             && ack.ack_to_fault_ms
@@ -3668,6 +3812,7 @@ fn validate_dm_crash_artifacts(
             && boundary.run_id == run_id
             && boundary.started_at_ms == crash_window.crash_boundary_started_at_ms
             && boundary.filesystem_unmounted
+            && boundary.mapper_mounts_absent
             && !boundary.mount_before.canonical_source.is_empty()
             && !boundary.mount_before.filesystem.is_empty()
             && !boundary.mount_before.options.is_empty()
@@ -4886,6 +5031,8 @@ struct FaultEvidenceArtifact {
     #[serde(default)]
     dm_recovery_snapshot: Option<Value>,
     #[serde(default)]
+    fault_prepare_started_at_ms: Option<u64>,
+    #[serde(default)]
     fault_apply_started_at_ms: Option<u64>,
     #[serde(default)]
     fault_active_at_ms: Option<u64>,
@@ -4985,6 +5132,7 @@ struct DmCrashBoundaryArtifact {
     old_pod_uid: String,
     replacement_pod_uid: Option<String>,
     filesystem_unmounted: bool,
+    mapper_mounts_absent: bool,
     mount_before: DmMountArtifact,
     fault: DmFaultTableArtifact,
 }
@@ -5264,9 +5412,10 @@ mod tests {
             OperationOutcome, OperationRecord,
         },
         host_storage::{
-            HostStorageAllowlist, HostStorageMutationIntent, HostStorageMutationProof,
-            HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
-            HostStoragePostCleanupObservation, HostStorageTargetObservation,
+            DM_FILESYSTEM_CHECK_SCHEMA_VERSION, DmFilesystemCheck, HostStorageAllowlist,
+            HostStorageMutationIntent, HostStorageMutationProof, HostStorageNodeSelector,
+            HostStoragePersistentVolumeClaimRef, HostStoragePostCleanupObservation,
+            HostStorageTargetObservation,
         },
         plan::{
             FaultInjection, FaultInjectionParameters, FaultKind, FaultPlan, FaultPlanOptions,
@@ -7552,6 +7701,60 @@ mod tests {
         validate_host_storage_artifacts(&host_proof, &cleanup, &target_proof, &run_spec, &evidence)
             .expect("valid host-storage artifacts");
 
+        let filesystem_check = DmFilesystemCheck {
+            schema_version: DM_FILESYSTEM_CHECK_SCHEMA_VERSION,
+            scenario: host_proof.scenario.clone(),
+            fault_name: host_proof.fault_name.clone(),
+            run_id: host_proof.run_id.clone(),
+            node: host_proof.target.node.clone(),
+            persistent_volume: host_proof.target.persistent_volume.clone(),
+            mapper_name: host_proof.target.mapper_name.clone(),
+            logical_device: host_proof.target.logical_device.clone(),
+            canonical_device: host_proof.target.canonical_device.clone(),
+            mount_path: host_proof.target.persistent_volume_path.clone(),
+            filesystem: "ext4".to_string(),
+            checker: "/usr/sbin/e2fsck".to_string(),
+            arguments: vec![
+                "-f".to_string(),
+                "-n".to_string(),
+                host_proof.target.logical_device.clone(),
+            ],
+            started_at_ms: 210,
+            completed_at_ms: 220,
+            exit_code: Some(0),
+            stdout: "clean".to_string(),
+            stderr: String::new(),
+            clean: true,
+            mounted_for_recovery: true,
+            unmounted_for_check: true,
+            remounted_after_check: true,
+            remounted_at_ms: Some(230),
+        };
+        super::validate_dm_filesystem_check(&filesystem_check, &host_proof, &cleanup, &evidence)
+            .expect("valid offline filesystem check");
+        for broken in [
+            DmFilesystemCheck {
+                exit_code: Some(4),
+                clean: false,
+                ..filesystem_check.clone()
+            },
+            DmFilesystemCheck {
+                checker: "/usr/sbin/e2fsck".to_string(),
+                arguments: vec!["-y".to_string(), filesystem_check.logical_device.clone()],
+                ..filesystem_check.clone()
+            },
+            DmFilesystemCheck {
+                remounted_at_ms: Some(401),
+                ..filesystem_check.clone()
+            },
+        ] {
+            assert!(
+                super::validate_dm_filesystem_check(&broken, &host_proof, &cleanup, &evidence)
+                    .is_err(),
+                "filesystem evidence must reject a failed, mutating, or out-of-window check"
+            );
+        }
+
         let mut ack_spec = run_spec.clone();
         ack_spec.scenario.ack_trigger = Some(crate::fault::spec::FaultRunAckTriggerSpec {
             mutation: crate::fault::acknowledged_mutation::AcknowledgedMutationKind::Put,
@@ -7560,6 +7763,8 @@ mod tests {
         });
         let mut ack_evidence = evidence.clone();
         ack_evidence.active_during_workload = false;
+        ack_evidence.fault_prepare_started_at_ms = Some(140);
+        ack_evidence.fault_apply_started_at_ms = Some(155);
         ack_evidence.workload_started_at_ms = None;
         ack_evidence.workload_ended_at_ms = None;
         ack_evidence.workload_snapshots.clear();
@@ -7600,6 +7805,7 @@ mod tests {
             "old_pod_uid": "uid-0",
             "replacement_pod_uid": "uid-0-replacement",
             "filesystem_unmounted": true,
+            "mapper_mounts_absent": true,
             "mount_before": {
                 "source": "/dev/mapper/rustfs-fault-dm",
                 "canonical_source": "/dev/dm-0",
@@ -7620,6 +7826,7 @@ mod tests {
             "old_pod_uid": "uid-1",
             "replacement_pod_uid": "uid-1-replacement",
             "filesystem_unmounted": true,
+            "mapper_mounts_absent": true,
             "mount_before": {
                 "source": "/dev/mapper/rustfs-fault-dm",
                 "canonical_source": "/dev/dm-0",
@@ -8525,10 +8732,32 @@ mod tests {
             AcknowledgedMutationKind::Put,
             "dm-drop-writes-after-ack-put",
             "run-1",
-            Some(101),
+            super::AckFaultTimeline {
+                prepare_started_at_ms: Some(80),
+                apply_started_at_ms: Some(101),
+            },
             &trigger,
         )
         .expect("valid trigger contract");
+
+        for invalid_prepare in [None, Some(101)] {
+            assert!(
+                super::validate_ack_trigger_contract(
+                    &valid,
+                    &planned,
+                    AcknowledgedMutationKind::Put,
+                    "dm-drop-writes-after-ack-put",
+                    "run-1",
+                    super::AckFaultTimeline {
+                        prepare_started_at_ms: invalid_prepare,
+                        apply_started_at_ms: Some(101),
+                    },
+                    &trigger,
+                )
+                .is_err(),
+                "fault preparation must be recorded before the trigger ACK"
+            );
+        }
 
         let boundary_plan = FaultRunAckTriggerSpec {
             operation_timeout_ms: 10,
@@ -8540,7 +8769,10 @@ mod tests {
             AcknowledgedMutationKind::Put,
             "dm-drop-writes-after-ack-put",
             "run-1",
-            Some(101),
+            super::AckFaultTimeline {
+                prepare_started_at_ms: Some(80),
+                apply_started_at_ms: Some(101),
+            },
             &trigger,
         )
         .expect("trigger duration equal to the planned timeout is valid");
@@ -8554,7 +8786,10 @@ mod tests {
                 AcknowledgedMutationKind::Put,
                 "dm-drop-writes-after-ack-put",
                 "run-1",
-                Some(101),
+                super::AckFaultTimeline {
+                    prepare_started_at_ms: Some(80),
+                    apply_started_at_ms: Some(101),
+                },
                 &inverted_trigger,
             )
             .is_err(),
@@ -8572,7 +8807,10 @@ mod tests {
                 AcknowledgedMutationKind::Put,
                 "dm-drop-writes-after-ack-put",
                 "run-1",
-                Some(101),
+                super::AckFaultTimeline {
+                    prepare_started_at_ms: Some(80),
+                    apply_started_at_ms: Some(101),
+                },
                 &trigger,
             )
             .is_err(),
@@ -8589,7 +8827,10 @@ mod tests {
                 AcknowledgedMutationKind::Put,
                 "dm-drop-writes-after-ack-put",
                 "run-1",
-                Some(101),
+                super::AckFaultTimeline {
+                    prepare_started_at_ms: Some(80),
+                    apply_started_at_ms: Some(101),
+                },
                 &trigger,
             )
             .is_err()
@@ -8605,7 +8846,10 @@ mod tests {
                 AcknowledgedMutationKind::Put,
                 "dm-drop-writes-after-ack-put",
                 "run-1",
-                Some(101),
+                super::AckFaultTimeline {
+                    prepare_started_at_ms: Some(80),
+                    apply_started_at_ms: Some(101),
+                },
                 &trigger,
             )
             .is_err()
@@ -8620,7 +8864,10 @@ mod tests {
                 AcknowledgedMutationKind::Put,
                 "dm-drop-writes-after-ack-put",
                 "run-1",
-                Some(101),
+                super::AckFaultTimeline {
+                    prepare_started_at_ms: Some(80),
+                    apply_started_at_ms: Some(101),
+                },
                 &trigger,
             )
             .is_err()
@@ -8633,7 +8880,10 @@ mod tests {
                 AcknowledgedMutationKind::Put,
                 "dm-drop-writes-after-ack-put",
                 "run-1",
-                Some(99),
+                super::AckFaultTimeline {
+                    prepare_started_at_ms: Some(80),
+                    apply_started_at_ms: Some(99),
+                },
                 &trigger,
             )
             .is_err(),
@@ -8653,7 +8903,10 @@ mod tests {
                 AcknowledgedMutationKind::Put,
                 "dm-drop-writes-after-ack-put",
                 "run-1",
-                Some(101),
+                super::AckFaultTimeline {
+                    prepare_started_at_ms: Some(80),
+                    apply_started_at_ms: Some(101),
+                },
                 &trigger,
             )
             .is_err(),
@@ -10036,6 +10289,7 @@ mod tests {
                 "old_pod_uid": "uid-before",
                 "replacement_pod_uid": null,
                 "filesystem_unmounted": true,
+                "mapper_mounts_absent": true,
                 "mount_before": {
                     "source": "/dev/mapper/rustfs0",
                     "canonical_source": "/dev/dm-0",

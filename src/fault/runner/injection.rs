@@ -61,8 +61,8 @@ impl FaultRun<'_> {
         let run_id = &self.context.run_id;
         let events = &self.context.events;
         let ProvenTarget {
-            pods_before,
-            target_proof,
+            pods_before: _,
+            target_proof: _,
             topology_observed_at_ms,
             host_storage_proof,
             execution_injection,
@@ -118,15 +118,31 @@ impl FaultRun<'_> {
             None,
         )?;
 
-        let (fault_active_at_ms, active_snapshots) = self.wait_active_fault(&fault)?;
+        self.complete_fault_activation(target, fault, None, fault_apply_started_at_ms, None)
+    }
+
+    pub(super) fn complete_fault_activation(
+        &self,
+        target: &ProvenTarget,
+        fault: AppliedFault,
+        fault_prepare_started_at_ms: Option<u64>,
+        fault_apply_started_at_ms: u64,
+        known_fault_active_at_ms: Option<u64>,
+    ) -> Result<ActiveFault> {
+        let config = self.config;
+        let plan = self.plan;
+        let run_id = &self.context.run_id;
+        let events = &self.context.events;
+        let (fault_active_at_ms, active_snapshots) =
+            self.wait_active_fault(&fault, known_fault_active_at_ms)?;
         let (pods_at_fault_activation, active_partition_targets) =
             if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
                 match require_active_write_quorum_partition(
                     config,
                     run_id,
                     plan,
-                    pods_before,
-                    target_proof,
+                    &target.pods_before,
+                    &target.target_proof,
                     &active_snapshots,
                 ) {
                     Ok(evidence) => evidence,
@@ -149,17 +165,17 @@ impl FaultRun<'_> {
             records: active_fixed_volume_targets,
             containers: active_fixed_volume_containers,
         } = if matches!(
-            execution_injection.selection(),
+            target.execution_injection.selection(),
             crate::fault::plan::FaultSelection::FixedTargets(_)
-        ) && execution_injection.rustfs_volume_path().is_ok()
+        ) && target.execution_injection.rustfs_volume_path().is_ok()
         {
             match require_active_fixed_volume_targets(
                 config,
                 run_id,
-                execution_injection,
+                &target.execution_injection,
                 &plan.scenario,
-                pods_before,
-                target_proof,
+                &target.pods_before,
+                &target.target_proof,
                 &active_snapshots,
             ) {
                 Ok(evidence) => evidence,
@@ -190,6 +206,7 @@ impl FaultRun<'_> {
         )?;
         Ok(ActiveFault {
             fault,
+            fault_prepare_started_at_ms,
             fault_apply_started_at_ms,
             fault_active_at_ms,
             active_snapshots,
@@ -733,7 +750,11 @@ impl FaultRun<'_> {
             workload_fixed_volume_containers,
         })
     }
-    fn wait_active_fault(&self, fault: &AppliedFault) -> Result<(u64, Vec<FaultStatusSnapshot>)> {
+    fn wait_active_fault(
+        &self,
+        fault: &AppliedFault,
+        known_fault_active_at_ms: Option<u64>,
+    ) -> Result<(u64, Vec<FaultStatusSnapshot>)> {
         let events = &self.context.events;
         let history = &self.context.history;
         let cluster = &self.config.cluster;
@@ -753,7 +774,8 @@ impl FaultRun<'_> {
             )?;
             return Err(error);
         }
-        let fault_active_at_ms = history.mark_fault_active_now();
+        let fault_active_at_ms =
+            known_fault_active_at_ms.unwrap_or_else(|| history.mark_fault_active_now());
         events.record(
             "wait-active",
             RunEventStatus::Succeeded,

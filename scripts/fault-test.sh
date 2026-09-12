@@ -621,7 +621,7 @@ host_storage_mutation_active() {
   owner="$(jq -r '.ownerPid // empty' "$state_file" 2>/dev/null)" || return 1
   phase="$(jq -r '.phase // empty' "$state_file" 2>/dev/null)" || return 1
   [[ "$schema" == "1" && "$token" == "$state_token" ]] || return 1
-  [[ "$phase" == "active" || "$phase" == "rollback" ]] || return 1
+  [[ "$phase" == "activating" || "$phase" == "active" || "$phase" == "rollback" ]] || return 1
   kill -0 "$owner" 2>/dev/null || return 1
   process_descends_from "$owner" "$parent"
 }

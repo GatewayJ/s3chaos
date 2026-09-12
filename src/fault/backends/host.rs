@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::host_command;
 pub use crate::fault::host_storage::{DmStatusSnapshot, DmVolumeMapping};
-use crate::fault::host_storage::{helper_pod_name, normalize_dm_table};
+use crate::fault::host_storage::{dm_tables_match, helper_pod_name};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,6 +31,7 @@ use crate::{
     fault::{
         config::FaultTestConfig,
         host_storage::{
+            DM_FILESYSTEM_CHECK_ARTIFACT, DM_FILESYSTEM_CHECK_SCHEMA_VERSION, DmFilesystemCheck,
             HOST_STORAGE_PROOF_ARTIFACT, HostStorageAllowlist, HostStorageMutationIntent,
             HostStorageMutationProof, HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
             HostStoragePostCleanupObservation, HostStorageTargetObservation,
@@ -47,6 +49,63 @@ use crate::{
 const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 const MANAGED_BY_VALUE: &str = "s3chaos";
 const CRASH_TAINT_KEY: &str = "s3chaos.rustfs.com/dm-crash";
+const DM_ATOMIC_ACTIVATION_MARKER: &str = "s3chaos-dm-activation-complete";
+const DM_ATOMIC_ACTIVATION_NOT_STARTED_MARKER: &str = "s3chaos-dm-activation-not-started";
+const DM_ATOMIC_ACTIVATION_ROLLBACK_MARKER: &str = "s3chaos-dm-activation-rollback-attempted";
+const DM_ATOMIC_ACTIVATION_SCRIPT: &str = r#"set -u
+name=$1
+expected_device=$2
+mount_path=$3
+recovery_table=$4
+fault_table=$5
+mutation_started=0
+
+rollback() {
+    /usr/sbin/dmsetup suspend --noflush --nolockfs "$name" >/dev/null 2>&1 || true
+    /usr/sbin/dmsetup load "$name" --table "$recovery_table" >/dev/null 2>&1 || true
+    /usr/sbin/dmsetup resume --noudevsync "$name" >/dev/null 2>&1 || true
+}
+
+abort_activation() {
+    printf '%s\n' "$1" >&2
+    if [ "$mutation_started" -eq 1 ]; then
+        rollback
+        printf '%s\n' 's3chaos-dm-activation-rollback-attempted'
+    else
+        printf '%s\n' 's3chaos-dm-activation-not-started'
+    fi
+    exit 1
+}
+
+actual_device=$(/usr/bin/readlink -f "/dev/mapper/$name") || abort_activation "could not resolve device-mapper target"
+[ "$actual_device" = "$expected_device" ] || abort_activation "device-mapper canonical device changed after preparation"
+mount_source=$(/usr/bin/findmnt -n --raw -o SOURCE --mountpoint "$mount_path") || abort_activation "approved device-mapper mount disappeared after preparation"
+mount_device=$(/usr/bin/readlink -f "$mount_source") || abort_activation "could not resolve approved mount source"
+[ "$mount_device" = "$expected_device" ] || abort_activation "approved mount no longer uses the prepared device-mapper target"
+state=$(/usr/sbin/dmsetup info --columns --noheadings --options suspended "$name" | /usr/bin/tr -d '[:space:]' | /usr/bin/tr '[:upper:]' '[:lower:]') || abort_activation "could not read device-mapper state"
+case "$state" in
+    active|no|n|0) ;;
+    suspended|yes|y|1) abort_activation "device-mapper target was already suspended" ;;
+    *) abort_activation "device-mapper target returned an unsupported state" ;;
+esac
+active_table=$(/usr/sbin/dmsetup table "$name") || abort_activation "could not read device-mapper table"
+[ "$active_table" = "$recovery_table" ] || abort_activation "device-mapper recovery table drifted after preparation"
+
+mutation_started=1
+/usr/sbin/dmsetup suspend --nolockfs "$name" || abort_activation "could not suspend device-mapper target"
+/usr/sbin/dmsetup load "$name" --table "$fault_table" || abort_activation "could not load device-mapper fault table"
+/usr/sbin/dmsetup resume --noudevsync "$name" || abort_activation "could not resume device-mapper fault table"
+
+state=$(/usr/sbin/dmsetup info --columns --noheadings --options suspended "$name" | /usr/bin/tr -d '[:space:]' | /usr/bin/tr '[:upper:]' '[:lower:]') || abort_activation "could not verify device-mapper state"
+case "$state" in
+    active|no|n|0) ;;
+    suspended|yes|y|1) abort_activation "device-mapper target remained suspended" ;;
+    *) abort_activation "device-mapper target returned an unsupported state" ;;
+esac
+active_table=$(/usr/sbin/dmsetup table "$name") || abort_activation "could not verify device-mapper table"
+[ "$active_table" = "$fault_table" ] || abort_activation "device-mapper fault table did not become active"
+printf '%s\n' 's3chaos-dm-activation-complete'
+"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -84,6 +143,39 @@ enum DmMountState {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmFilesystemRecoveryState {
+    NotRequired,
+    Pending,
+    Failed,
+    Verified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmUnmountExpectation {
+    FaultTableActive,
+    RecoveryTableActive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmPodDeletionMode {
+    CrashBoundary,
+    Recovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmPodReadiness {
+    Required,
+    MayBeUnready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DmInitialPodAction {
+    DeleteOriginal,
+    WaitForOriginal,
+    AlreadyQuiesced(Option<String>),
+}
+
 impl DmMountState {
     fn proves_expected_mount(self) -> bool {
         matches!(self, Self::Mounted)
@@ -116,6 +208,8 @@ trait DmTransitionPort {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum HostMutationPhase {
+    Prepared,
+    Activating,
     Active,
     Rollback,
     RecoveryRequired,
@@ -176,7 +270,7 @@ impl HostMutationLease {
                 token,
                 owner_pid: std::process::id(),
                 run_id: run_id.to_string(),
-                phase: HostMutationPhase::Active,
+                phase: HostMutationPhase::Prepared,
             },
             persisted: false,
         })
@@ -272,6 +366,7 @@ struct DmCrashBoundarySnapshot {
     old_pod_uid: String,
     replacement_pod_uid: Option<String>,
     filesystem_unmounted: bool,
+    mapper_mounts_absent: bool,
     mount_before: DmMountSnapshot,
     fault: DmStatusSnapshot,
 }
@@ -308,6 +403,7 @@ pub struct DmFlakeyGuard {
     preflight_proof: HostStorageMutationProof,
     mutation_lease: HostMutationLease,
     fault_applied: bool,
+    filesystem_recovery: DmFilesystemRecoveryState,
     restored: bool,
 }
 
@@ -340,11 +436,11 @@ pub(crate) struct HostStoragePreflightRequest<'a> {
     pub fault_name: &'a str,
 }
 
-pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<DmFlakeyGuard> {
+pub(crate) fn prepare_fault(request: &FaultApplyRequest<'_>) -> Result<DmFlakeyGuard> {
     match dm_behavior(request.injection.kind()) {
         Some(behavior) => {
             let spec = dm_flakey_spec(request.config, request.run_id, behavior)?;
-            apply_dm_flakey(
+            prepare_dm_flakey(
                 request.config,
                 &spec,
                 request.collector,
@@ -485,7 +581,13 @@ fn observe_dm_target_read_only(
     observer_namespace: &str,
     observer_pod: &str,
 ) -> Result<HostStorageTargetObservation> {
-    let mapping = verify_dm_volume_mapping(config, spec.node, rustfs_volume_path, spec.mount_path)?;
+    let mapping = verify_dm_volume_mapping(
+        config,
+        spec.node,
+        rustfs_volume_path,
+        spec.mount_path,
+        DmPodReadiness::Required,
+    )?;
     validate_observer_pod(config, spec, observer_namespace, observer_pod)?;
     let mount_source =
         observer_findmnt_field(config, observer_namespace, observer_pod, &mapping, "SOURCE")?;
@@ -535,7 +637,7 @@ fn observe_dm_target_read_only(
     );
     if spec.recovery_table.is_some() {
         ensure!(
-            normalize_dm_table(&recovery_table) == normalize_dm_table(&original_table),
+            dm_tables_match(&recovery_table, &original_table)?,
             "configured recovery table must match the active device-mapper table"
         );
     }
@@ -579,10 +681,29 @@ fn validate_observer_pod(
         .run_checked()
         .context("reading pre-provisioned host observer Pod")?;
     let pod = serde_json::from_str::<Value>(&pod.stdout).context("parse host observer Pod")?;
+    validate_observer_pod_value(&pod, spec.node)?;
+    let node = Kubectl::new(config)
+        .command(["get", "node", spec.node, "-o", "json"])
+        .run_checked()
+        .context("reading host observer target node")?;
+    let node = serde_json::from_str::<Value>(&node.stdout).context("parse host observer node")?;
     ensure!(
-        pod.pointer("/spec/nodeName").and_then(Value::as_str) == Some(spec.node),
+        !node
+            .pointer("/spec/taints")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|taint| taint.get("key").and_then(Value::as_str) == Some(CRASH_TAINT_KEY)),
+        "device-mapper target node already has the crash-containment quarantine taint"
+    );
+    Ok(())
+}
+
+fn validate_observer_pod_value(pod: &Value, expected_node: &str) -> Result<()> {
+    ensure!(
+        pod.pointer("/spec/nodeName").and_then(Value::as_str) == Some(expected_node),
         "host observer Pod is not pinned to device-mapper target node {:?}",
-        spec.node
+        expected_node
     );
     ensure!(
         pod.pointer("/metadata/labels/app.kubernetes.io~1managed-by")
@@ -593,6 +714,10 @@ fn validate_observer_pod(
                 .and_then(Value::as_str)
                 == Some("true"),
         "host observer Pod must carry s3chaos ownership and fault-host-observer labels"
+    );
+    ensure!(
+        pod.pointer("/spec/hostPID").and_then(Value::as_bool) == Some(true),
+        "host observer Pod must share the host PID namespace"
     );
     ensure!(
         pod.pointer("/status/conditions")
@@ -629,6 +754,7 @@ fn validate_observer_pod(
         .find(|mount| {
             mount.get("mountPath").and_then(Value::as_str) == Some("/host")
                 && mount.get("readOnly").and_then(Value::as_bool) == Some(true)
+                && mount.get("mountPropagation").and_then(Value::as_str) == Some("HostToContainer")
         })
         .and_then(|mount| mount.get("name").and_then(Value::as_str));
     let host_volume_name = host_volume_name.context(
@@ -645,20 +771,6 @@ fn validate_observer_pod(
                     && volume.pointer("/hostPath/type").and_then(Value::as_str) == Some("Directory")
             }),
         "host observer Pod /host mount must reference the read-only host root"
-    );
-    let node = Kubectl::new(config)
-        .command(["get", "node", spec.node, "-o", "json"])
-        .run_checked()
-        .context("reading host observer target node")?;
-    let node = serde_json::from_str::<Value>(&node.stdout).context("parse host observer node")?;
-    ensure!(
-        !node
-            .pointer("/spec/taints")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|taint| taint.get("key").and_then(Value::as_str) == Some(CRASH_TAINT_KEY)),
-        "device-mapper target node already has the crash-containment quarantine taint"
     );
     ensure!(
         pod.pointer("/spec/restartPolicy").and_then(Value::as_str) == Some("Never"),
@@ -708,18 +820,7 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    let mut command = vec![
-        "exec".to_string(),
-        observer_pod.to_string(),
-        "--".to_string(),
-        "chroot".to_string(),
-        "/host".to_string(),
-    ];
-    command.extend(args.into_iter().map(Into::into));
-    Kubectl::new(config)
-        .namespaced(observer_namespace)
-        .command(command)
-        .run_checked()
+    host_command::run_checked(config, observer_namespace, observer_pod, args)
 }
 
 fn dm_flakey_spec<'a>(
@@ -768,6 +869,27 @@ pub fn apply_dm_flakey(
     scenario: &str,
     preflight_proof: &HostStorageMutationProof,
 ) -> Result<DmFlakeyGuard> {
+    let mut guard = prepare_dm_flakey(
+        fault_config,
+        spec,
+        collector,
+        case_name,
+        scenario,
+        preflight_proof,
+    )?;
+    guard.activate()?;
+    guard.ensure_active("active")?;
+    Ok(guard)
+}
+
+pub(crate) fn prepare_dm_flakey(
+    fault_config: &FaultTestConfig,
+    spec: &DmFlakeySpec<'_>,
+    collector: &ArtifactCollector,
+    case_name: &str,
+    scenario: &str,
+    preflight_proof: &HostStorageMutationProof,
+) -> Result<DmFlakeyGuard> {
     let config = &fault_config.cluster;
     validate_dm_spec(spec)?;
     let mutation_lease = HostMutationLease::from_config(fault_config, spec.run_id)?;
@@ -776,23 +898,11 @@ pub fn apply_dm_flakey(
         spec.node,
         &fault_config.rustfs_volume_path,
         spec.mount_path,
+        DmPodReadiness::Required,
     )?;
     let helper_pod = helper_pod_name(spec.run_id);
     let manifest = dm_helper_manifest(config, &helper_pod, spec.node, spec.helper_image);
     collector.write_text(case_name, "dm-helper-manifest.yaml", &manifest)?;
-
-    let kubectl = Kubectl::new(config).namespaced(&config.test_namespace);
-    kubectl
-        .command([
-            "delete",
-            "pod",
-            &helper_pod,
-            "--ignore-not-found",
-            "--wait=true",
-        ])
-        .run_checked()?;
-    kubectl.create_yaml_command(manifest).run_checked()?;
-
     let mut guard = DmFlakeyGuard {
         config: config.clone(),
         collector: collector.clone(),
@@ -813,8 +923,24 @@ pub fn apply_dm_flakey(
         preflight_proof: preflight_proof.clone(),
         mutation_lease,
         fault_applied: false,
+        filesystem_recovery: if spec.behavior.requires_crash_boundary() {
+            DmFilesystemRecoveryState::Pending
+        } else {
+            DmFilesystemRecoveryState::NotRequired
+        },
         restored: false,
     };
+    let kubectl = Kubectl::new(config).namespaced(&config.test_namespace);
+    kubectl
+        .command([
+            "delete",
+            "pod",
+            &guard.helper_pod,
+            "--ignore-not-found",
+            "--wait=true",
+        ])
+        .run_checked()?;
+    kubectl.create_yaml_command(manifest).run_checked()?;
     guard.wait_helper_ready()?;
     // Re-resolve the complete Kubernetes ownership chain immediately before
     // reading host state so the apply proof cannot splice stale Pod/PVC/PV
@@ -824,9 +950,15 @@ pub fn apply_dm_flakey(
         spec.node,
         &fault_config.rustfs_volume_path,
         spec.mount_path,
+        DmPodReadiness::Required,
     )?;
     let mount_snapshot = guard.capture_mount_snapshot()?;
     guard.verify_mount_source(&mount_snapshot)?;
+    if spec.behavior.requires_crash_boundary() {
+        let (checker, _) = filesystem_checker(&mount_snapshot.filesystem)?;
+        guard.require_host_executable("/usr/bin/timeout")?;
+        guard.require_host_executable(checker)?;
+    }
     guard.mount_snapshot = Some(mount_snapshot);
     guard.mount_state = DmMountState::Mounted;
 
@@ -842,7 +974,7 @@ pub fn apply_dm_flakey(
     );
     if spec.recovery_table.is_some() {
         ensure!(
-            normalize_dm_table(&guard.recovery_table) == normalize_dm_table(&original_table),
+            dm_tables_match(&guard.recovery_table, &original_table)?,
             "configured recovery table must match the device-mapper table that was active before injection; configured {:?}, active {:?}",
             guard.recovery_table,
             original_table
@@ -861,49 +993,88 @@ pub fn apply_dm_flakey(
 
     guard.recovery_table = guard.preflight_proof.tables.recovery_table.clone();
     guard.fault_table = guard.preflight_proof.tables.fault_table.clone();
-    let suspend_mode = match spec.behavior {
-        DmFaultBehavior::ErrorInjection => DmSuspendMode::Default,
-        DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
-    };
-    let initial_state = <DmFlakeyGuard as DmTransitionPort>::observe(&mut guard)
-        .context("observe device-mapper state immediately before fault apply")?;
-    let proven_recovery_table = guard.recovery_table.clone();
-    require_transition_initial_state(
-        DmTransitionPolicy::Apply {
-            recovery_table: &proven_recovery_table,
-        },
-        &initial_state,
-    )?;
-    guard.mutation_lease.set_phase(HostMutationPhase::Active)?;
-    guard.fault_applied = true;
-    guard.transition_to_table_from_observed(
-        &guard.fault_table.clone(),
-        suspend_mode,
-        DmTransitionPolicy::Apply {
-            recovery_table: &proven_recovery_table,
-        },
-        initial_state,
-    )?;
-    let active = guard.snapshot("active")?;
-    ensure!(
-        normalize_dm_table(&active.table) == normalize_dm_table(&guard.fault_table),
-        "device-mapper target did not switch to the requested fault table; requested {:?}, active {:?}",
-        guard.fault_table,
-        active.table
-    );
-    collector.write_text(
-        case_name,
-        "dm-flakey-active.json",
-        &serde_json::to_string_pretty(&active)?,
-    )?;
+    guard
+        .mutation_lease
+        .set_phase(HostMutationPhase::Prepared)?;
 
     Ok(guard)
 }
 
 impl DmFlakeyGuard {
+    pub(crate) fn activate(&mut self) -> Result<u64> {
+        ensure!(
+            !self.fault_applied,
+            "device-mapper fault was already activated"
+        );
+        self.preflight_proof
+            .require_fresh_at(now_ms())
+            .context("prepared host-storage proof became stale before activation")?;
+        self.mutation_lease
+            .set_phase(HostMutationPhase::Activating)?;
+        self.fault_applied = true;
+        let activated_at_ms = if self.behavior == DmFaultBehavior::DropWritesCrash {
+            let output = self.host_command_unchecked(dm_atomic_activation_args(
+                &self.dm_name,
+                &self.preflight_proof.target.canonical_device,
+                &self.preflight_proof.target.persistent_volume_path,
+                &self.recovery_table,
+                &self.fault_table,
+            ))?;
+            if output.code != Some(0) {
+                let transaction_state = output.stdout.trim();
+                ensure!(
+                    matches!(
+                        transaction_state,
+                        DM_ATOMIC_ACTIVATION_NOT_STARTED_MARKER
+                            | DM_ATOMIC_ACTIVATION_ROLLBACK_MARKER
+                    ),
+                    "device-mapper activation transaction returned no valid failure state: {:?}",
+                    output.stdout
+                );
+                if transaction_state == DM_ATOMIC_ACTIVATION_NOT_STARTED_MARKER {
+                    self.fault_applied = false;
+                }
+                bail!(
+                    "device-mapper activation transaction failed: exit={:?}, stdout={}, stderr={}",
+                    output.code,
+                    output.stdout,
+                    output.stderr
+                );
+            }
+            ensure!(
+                output.stdout.trim() == DM_ATOMIC_ACTIVATION_MARKER,
+                "device-mapper activation transaction returned unexpected output {:?}",
+                output.stdout
+            );
+            now_ms()
+        } else {
+            let initial_state = <Self as DmTransitionPort>::observe(self)
+                .context("observe device-mapper state immediately before fault apply")?;
+            let proven_recovery_table = self.recovery_table.clone();
+            self.transition_to_table_from_observed(
+                &self.fault_table.clone(),
+                DmSuspendMode::Default,
+                DmTransitionPolicy::Apply {
+                    recovery_table: &proven_recovery_table,
+                },
+                initial_state,
+            )?;
+            now_ms()
+        };
+        self.mutation_lease.set_phase(HostMutationPhase::Active)?;
+        Ok(activated_at_ms)
+    }
+
     pub fn ensure_active(&self, stage: &str) -> Result<DmStatusSnapshot> {
         let snapshot = self.snapshot(stage)?;
         snapshot.validate_proof(&self.preflight_proof, stage, &self.fault_table)?;
+        if stage == "active" {
+            self.collector.write_text(
+                &self.case_name,
+                "dm-flakey-active.json",
+                &serde_json::to_string_pretty(&snapshot)?,
+            )?;
+        }
         Ok(snapshot)
     }
 
@@ -990,9 +1161,10 @@ impl DmFlakeyGuard {
             .context("device-mapper mount snapshot is missing")?;
 
         self.add_node_taint()?;
-        let replacement_pod_uid = self.force_delete_target_pod(timeout)?;
+        let replacement_pod_uid =
+            self.force_delete_target_pod(timeout, DmPodDeletionMode::CrashBoundary)?;
         self.ensure_active("before-crash-unmount")?;
-        self.unmount_filesystem(timeout)?;
+        self.unmount_filesystem(timeout, DmUnmountExpectation::FaultTableActive)?;
         self.crash_boundary_completed = true;
 
         let snapshot = DmCrashBoundarySnapshot {
@@ -1004,6 +1176,7 @@ impl DmFlakeyGuard {
             old_pod_uid: self.mapping.pod_uid.clone(),
             replacement_pod_uid,
             filesystem_unmounted: self.mount_state == DmMountState::Unmounted,
+            mapper_mounts_absent: true,
             mount_before,
             fault,
         };
@@ -1016,12 +1189,18 @@ impl DmFlakeyGuard {
     }
 
     pub fn restore(&mut self) -> Result<()> {
-        if self.requires_crash_boundary() {
-            ensure!(
-                self.crash_boundary_completed,
-                "refusing to complete a drop_writes durability run without force-deleting the target Pod and unmounting the filesystem while the fault table is active"
-            );
-        }
+        self.restore_with_timeout(self.config.timeout)
+    }
+
+    pub(crate) fn restore_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        let incomplete_crash_boundary =
+            self.requires_crash_boundary() && !self.crash_boundary_completed;
+        let recovery_quiescence = if incomplete_crash_boundary {
+            self.ensure_recovery_quiescence(timeout)
+                .context("quiesce storage users after an incomplete drop_writes boundary")
+        } else {
+            Ok(())
+        };
         let recovery_table = self.recovery_table.clone();
         let suspend_mode = match self.behavior {
             DmFaultBehavior::ErrorInjection => DmSuspendMode::NoFlush,
@@ -1035,7 +1214,8 @@ impl DmFlakeyGuard {
         self.transition_to_table(&recovery_table, suspend_mode, DmTransitionPolicy::Rollback)?;
         self.ensure_recovery_table_active()?;
         if self.requires_crash_boundary() {
-            self.ensure_filesystem_mounted()?;
+            recovery_quiescence?;
+            self.verify_filesystem_integrity(timeout)?;
         }
         if self.node_tainted {
             self.remove_node_taint()?;
@@ -1091,9 +1271,16 @@ impl DmFlakeyGuard {
                 &serde_json::to_string_pretty(&snapshot)?,
             )?;
         }
-        self.delete_helper()?;
         self.mutation_lease.clear()?;
+        // Storage recovery is complete before deleting the disposable helper.
+        // A lost delete response must not make Drop re-enter mapper recovery
+        // through a helper that may already be gone.
         self.restored = true;
+        self.delete_helper()?;
+        ensure!(
+            !incomplete_crash_boundary,
+            "drop_writes durability boundary did not force-delete the target Pod and unmount the filesystem while the fault table was active; storage was recovered before reporting this failure"
+        );
         Ok(())
     }
 
@@ -1319,51 +1506,44 @@ impl DmFlakeyGuard {
         format!("{CRASH_TAINT_KEY}={value}:NoSchedule")
     }
 
-    fn force_delete_target_pod(&self, timeout: Duration) -> Result<Option<String>> {
-        let current = verify_dm_volume_mapping(
-            &self.config,
+    fn force_delete_target_pod(
+        &self,
+        timeout: Duration,
+        mode: DmPodDeletionMode,
+    ) -> Result<Option<String>> {
+        match classify_initial_target_pod(
+            self.read_target_pod()?.as_ref(),
+            &self.mapping.pod,
+            &self.mapping.pod_uid,
             &self.mapping.node,
-            &self.mapping.container_mount_path,
-            &self.mapping.mount_path,
-        )?;
-        ensure!(
-            current == self.mapping,
-            "refusing to delete a RustFS Pod because its UID/PVC/PV/node mapping changed after device-mapper apply"
-        );
-        force_delete_pod_command(&self.config, &self.mapping.pod, &self.mapping.pod_uid)?
-            .run_checked()?;
+            mode,
+        )? {
+            DmInitialPodAction::AlreadyQuiesced(replacement_uid) => return Ok(replacement_uid),
+            DmInitialPodAction::WaitForOriginal => {}
+            DmInitialPodAction::DeleteOriginal => {
+                let current = verify_dm_volume_mapping(
+                    &self.config,
+                    &self.mapping.node,
+                    &self.mapping.container_mount_path,
+                    &self.mapping.mount_path,
+                    DmPodReadiness::MayBeUnready,
+                )?;
+                ensure!(
+                    current == self.mapping,
+                    "refusing to delete a RustFS Pod because its UID/PVC/PV/node mapping changed after device-mapper apply"
+                );
+                force_delete_pod_command(&self.config, &self.mapping.pod, &self.mapping.pod_uid)?
+                    .run_checked()?;
+            }
+        }
 
         let deadline = Instant::now() + timeout;
         loop {
-            let output = Kubectl::new(&self.config)
-                .namespaced(&self.config.test_namespace)
-                .command([
-                    "get",
-                    "pod",
-                    self.mapping.pod.as_str(),
-                    "-o",
-                    "json",
-                    "--ignore-not-found",
-                ])
-                .run_checked()?;
-            if output.stdout.trim().is_empty() {
+            let Some(pod) = self.read_target_pod()? else {
                 return Ok(None);
-            }
-            let pod = serde_json::from_str::<Value>(&output.stdout)
-                .context("parse replacement RustFS Pod")?;
-            let uid = pod
-                .pointer("/metadata/uid")
-                .and_then(Value::as_str)
-                .context("replacement RustFS Pod is missing metadata.uid")?;
-            if uid != self.mapping.pod_uid {
-                let node = pod.pointer("/spec/nodeName").and_then(Value::as_str);
-                ensure!(
-                    node != Some(self.mapping.node.as_str()),
-                    "replacement Pod {:?} was scheduled on tainted node {:?} before the crash boundary completed",
-                    self.mapping.pod,
-                    self.mapping.node
-                );
-                return Ok(Some(uid.to_string()));
+            };
+            if let Some(replacement_uid) = self.replacement_pod_uid(&pod)? {
+                return Ok(Some(replacement_uid));
             }
             ensure!(
                 Instant::now() < deadline,
@@ -1376,8 +1556,63 @@ impl DmFlakeyGuard {
         }
     }
 
-    fn unmount_filesystem(&mut self, timeout: Duration) -> Result<()> {
+    fn read_target_pod(&self) -> Result<Option<Value>> {
+        let output = Kubectl::new(&self.config)
+            .namespaced(&self.config.test_namespace)
+            .command([
+                "get",
+                "pod",
+                self.mapping.pod.as_str(),
+                "-o",
+                "json",
+                "--ignore-not-found",
+            ])
+            .run_checked()?;
+        if output.stdout.trim().is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str::<Value>(&output.stdout)
+            .context("parse target or replacement RustFS Pod")
+            .map(Some)
+    }
+
+    fn replacement_pod_uid(&self, pod: &Value) -> Result<Option<String>> {
+        ensure!(
+            pod.pointer("/metadata/name").and_then(Value::as_str)
+                == Some(self.mapping.pod.as_str()),
+            "target or replacement RustFS Pod response has an unexpected name"
+        );
+        let uid = pod
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .context("target or replacement RustFS Pod is missing metadata.uid")?;
+        if uid == self.mapping.pod_uid {
+            return Ok(None);
+        }
+        ensure!(
+            pod.pointer("/spec/nodeName").and_then(Value::as_str)
+                != Some(self.mapping.node.as_str()),
+            "replacement Pod {:?} was scheduled on tainted node {:?} before the crash boundary completed",
+            self.mapping.pod,
+            self.mapping.node
+        );
+        Ok(Some(uid.to_string()))
+    }
+
+    fn unmount_filesystem(
+        &mut self,
+        timeout: Duration,
+        expectation: DmUnmountExpectation,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
+        let logical_device = format!("/dev/mapper/{}", self.dm_name);
+        let canonical_device = self.preflight_proof.target.canonical_device.clone();
+        let purpose = match expectation {
+            DmUnmountExpectation::FaultTableActive => {
+                "while the drop_writes fault table remains active"
+            }
+            DmUnmountExpectation::RecoveryTableActive => "before the offline filesystem check",
+        };
         self.mount_state = DmMountState::Unmounting;
         loop {
             let command =
@@ -1389,24 +1624,31 @@ impl DmFlakeyGuard {
                 ),
                 Err(error) => format!("transport error: {error:#}"),
             };
-            match self.reconcile_mount_state() {
-                Ok(DmMountState::Unmounted) => return Ok(()),
-                Ok(DmMountState::Mounted) => {}
-                Ok(state) => bail!("unexpected reconciled mount state {state:?}"),
-                Err(observe_error) => {
-                    ensure!(
-                        Instant::now() < deadline,
-                        "timed out reconciling mount state for {:?} after forced Pod deletion while drop_writes remained active; umount {command_summary}; findmnt error: {observe_error:#}",
-                        self.mapping.mount_path
-                    );
+            let observation_summary = match self.reconcile_mount_state() {
+                Ok(DmMountState::Unmounted) => {
+                    match self.ensure_mapper_unmounted(&logical_device, &canonical_device) {
+                        Ok(()) => return Ok(()),
+                        Err(error) => format!("mapper mount check: {error:#}"),
+                    }
                 }
-            }
+                Ok(DmMountState::Mounted) => "target mount is still present".to_string(),
+                Ok(state) => bail!("unexpected reconciled mount state {state:?}"),
+                Err(error) => format!("mountpoint check: {error:#}"),
+            };
             ensure!(
                 Instant::now() < deadline,
-                "timed out unmounting {:?} after forced Pod deletion while drop_writes remained active; last umount {command_summary}",
+                "timed out fully unmounting mapper {:?} from {:?} {purpose}; last umount {command_summary}; last observation: {observation_summary}",
+                self.dm_name,
                 self.mapping.mount_path,
             );
-            self.ensure_active("waiting-for-crash-unmount")?;
+            match expectation {
+                DmUnmountExpectation::FaultTableActive => {
+                    self.ensure_active("waiting-for-crash-unmount")?;
+                }
+                DmUnmountExpectation::RecoveryTableActive => {
+                    self.ensure_recovery_table_active()?;
+                }
+            }
             sleep(Duration::from_millis(500));
         }
     }
@@ -1451,6 +1693,132 @@ impl DmFlakeyGuard {
             DmMountState::Unmounted => self.remount_filesystem(),
             state => bail!("unexpected reconciled mount state {state:?}"),
         }
+    }
+
+    fn verify_filesystem_integrity(&mut self, timeout: Duration) -> Result<()> {
+        ensure!(
+            self.requires_crash_boundary(),
+            "offline filesystem verification is only valid after a drop_writes fault"
+        );
+        self.filesystem_recovery = DmFilesystemRecoveryState::Failed;
+        self.ensure_filesystem_mounted()
+            .context("mount recovered filesystem to replay its journal")?;
+        self.unmount_filesystem(timeout, DmUnmountExpectation::RecoveryTableActive)?;
+
+        let logical_device = format!("/dev/mapper/{}", self.dm_name);
+        let (checker, checker_args) = filesystem_checker(
+            &self
+                .mount_snapshot
+                .as_ref()
+                .context("device-mapper mount snapshot is missing")?
+                .filesystem,
+        )?;
+        let timeout_seconds = timeout
+            .as_secs()
+            .saturating_add(u64::from(timeout.subsec_nanos() > 0))
+            .max(1);
+        let mut command = vec![
+            "/usr/bin/timeout".to_string(),
+            "--signal=KILL".to_string(),
+            format!("{timeout_seconds}s"),
+            checker.to_string(),
+        ];
+        command.extend(checker_args.iter().map(|argument| (*argument).to_string()));
+        command.push(logical_device.clone());
+        self.ensure_recovery_table_active()?;
+        let canonical_device = self.mapper_canonical_device()?;
+        ensure!(
+            canonical_device == self.preflight_proof.target.canonical_device,
+            "device-mapper canonical device changed before its offline filesystem check"
+        );
+        self.ensure_mapper_unmounted(&logical_device, &canonical_device)?;
+        let started_at_ms = now_ms();
+        let output = self.host_command_unchecked(command.clone());
+        let completed_at_ms = now_ms();
+        let (exit_code, stdout, stderr) = match output {
+            Ok(output) => (output.code, output.stdout, output.stderr),
+            Err(error) => (None, String::new(), format!("{error:#}")),
+        };
+        let mut check = DmFilesystemCheck {
+            schema_version: DM_FILESYSTEM_CHECK_SCHEMA_VERSION,
+            scenario: self.scenario.clone(),
+            fault_name: self.preflight_proof.fault_name.clone(),
+            run_id: self.run_id.clone(),
+            node: self.mapping.node.clone(),
+            persistent_volume: self.mapping.pv.clone(),
+            mapper_name: self.dm_name.clone(),
+            logical_device,
+            canonical_device,
+            mount_path: self.mapping.mount_path.clone(),
+            filesystem: self
+                .mount_snapshot
+                .as_ref()
+                .context("device-mapper mount snapshot is missing")?
+                .filesystem
+                .clone(),
+            checker: checker.to_string(),
+            arguments: command.into_iter().skip(4).collect(),
+            started_at_ms,
+            completed_at_ms,
+            exit_code,
+            stdout,
+            stderr,
+            clean: exit_code == Some(0),
+            mounted_for_recovery: true,
+            unmounted_for_check: true,
+            remounted_after_check: false,
+            remounted_at_ms: None,
+        };
+        self.write_filesystem_check(&check)?;
+        ensure!(
+            check.clean,
+            "offline filesystem check failed for mapper {:?}: checker={}, exit={:?}, stderr={}",
+            self.dm_name,
+            check.checker,
+            check.exit_code,
+            check.stderr
+        );
+
+        self.remount_filesystem()
+            .context("remount filesystem after a clean offline check")?;
+        check.remounted_after_check = true;
+        check.remounted_at_ms = Some(now_ms());
+        self.write_filesystem_check(&check)?;
+        self.filesystem_recovery = DmFilesystemRecoveryState::Verified;
+        Ok(())
+    }
+
+    fn ensure_recovery_quiescence(&mut self, timeout: Duration) -> Result<()> {
+        if !self.node_tainted {
+            self.add_node_taint()?;
+        }
+        self.force_delete_target_pod(timeout, DmPodDeletionMode::Recovery)?;
+        Ok(())
+    }
+
+    fn ensure_mapper_unmounted(&self, logical_device: &str, canonical_device: &str) -> Result<()> {
+        for source in [logical_device, canonical_device] {
+            let output = self.host_command_unchecked([
+                "/usr/bin/findmnt",
+                "-n",
+                "--raw",
+                "-o",
+                "TARGET",
+                "--source",
+                source,
+            ])?;
+            validate_unmounted_source(source, &output)?;
+        }
+        Ok(())
+    }
+
+    fn write_filesystem_check(&self, check: &DmFilesystemCheck) -> Result<()> {
+        self.collector.write_text(
+            &self.case_name,
+            DM_FILESYSTEM_CHECK_ARTIFACT,
+            &serde_json::to_string_pretty(check)?,
+        )?;
+        Ok(())
     }
 
     fn remount_filesystem(&mut self) -> Result<()> {
@@ -1505,23 +1873,29 @@ impl DmFlakeyGuard {
         self.host_command(command)
     }
 
+    fn require_host_executable(&self, executable: &str) -> Result<()> {
+        self.host_command([
+            "/bin/sh",
+            "-c",
+            "[ -x \"$1\" ]",
+            "s3chaos-require-host-executable",
+            executable,
+        ])
+        .with_context(|| format!("required host executable {executable:?} is unavailable"))?;
+        Ok(())
+    }
+
     fn host_command<I, S>(&self, args: I) -> Result<CommandOutput>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut command = vec![
-            "exec".to_string(),
-            self.helper_pod.clone(),
-            "--".to_string(),
-            "chroot".to_string(),
-            "/host".to_string(),
-        ];
-        command.extend(args.into_iter().map(Into::into));
-        Kubectl::new(&self.config)
-            .namespaced(&self.config.test_namespace)
-            .command(command)
-            .run_checked()
+        host_command::run_checked(
+            &self.config,
+            &self.config.test_namespace,
+            &self.helper_pod,
+            args,
+        )
     }
 
     fn host_command_unchecked<I, S>(&self, args: I) -> Result<CommandOutput>
@@ -1529,18 +1903,12 @@ impl DmFlakeyGuard {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut command = vec![
-            "exec".to_string(),
-            self.helper_pod.clone(),
-            "--".to_string(),
-            "chroot".to_string(),
-            "/host".to_string(),
-        ];
-        command.extend(args.into_iter().map(Into::into));
-        Kubectl::new(&self.config)
-            .namespaced(&self.config.test_namespace)
-            .command(command)
-            .run()
+        host_command::run(
+            &self.config,
+            &self.config.test_namespace,
+            &self.helper_pod,
+            args,
+        )
     }
 
     fn delete_helper(&self) -> Result<()> {
@@ -1605,11 +1973,58 @@ fn force_delete_pod_command(
         .stdin(serde_json::to_string(&delete_options)?))
 }
 
+fn classify_initial_target_pod(
+    pod: Option<&Value>,
+    expected_pod: &str,
+    expected_uid: &str,
+    target_node: &str,
+    mode: DmPodDeletionMode,
+) -> Result<DmInitialPodAction> {
+    let Some(pod) = pod else {
+        ensure!(
+            mode == DmPodDeletionMode::Recovery,
+            "target Pod {expected_pod:?} disappeared before the run-owned crash boundary"
+        );
+        return Ok(DmInitialPodAction::AlreadyQuiesced(None));
+    };
+    ensure!(
+        pod.pointer("/metadata/name").and_then(Value::as_str) == Some(expected_pod),
+        "target Pod response has an unexpected name"
+    );
+    let uid = pod
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .context("target or replacement RustFS Pod is missing metadata.uid")?;
+    if uid != expected_uid {
+        ensure!(
+            mode == DmPodDeletionMode::Recovery,
+            "target Pod {expected_pod:?} was replaced before the run-owned crash boundary"
+        );
+        ensure!(
+            pod.pointer("/spec/nodeName").and_then(Value::as_str) != Some(target_node),
+            "replacement Pod {expected_pod:?} was scheduled on tainted node {target_node:?} before the crash boundary completed"
+        );
+        return Ok(DmInitialPodAction::AlreadyQuiesced(Some(uid.to_string())));
+    }
+    let terminating = pod
+        .pointer("/metadata/deletionTimestamp")
+        .is_some_and(|value| !value.is_null());
+    ensure!(
+        mode == DmPodDeletionMode::Recovery || !terminating,
+        "target Pod {expected_pod:?} was already terminating before the run-owned crash boundary"
+    );
+    Ok(if terminating {
+        DmInitialPodAction::WaitForOriginal
+    } else {
+        DmInitialPodAction::DeleteOriginal
+    })
+}
+
 impl Drop for DmFlakeyGuard {
     fn drop(&mut self) {
         if !self.restored {
             let recovery_table = self.recovery_table.clone();
-            let mut storage_recovered = !self.fault_applied;
+            let mut mapper_recovered = !self.fault_applied;
             if self.fault_applied && !recovery_table.is_empty() {
                 if let Err(error) = self.mutation_lease.set_phase(HostMutationPhase::Rollback) {
                     eprintln!(
@@ -1624,44 +2039,70 @@ impl Drop for DmFlakeyGuard {
                     .transition_to_table(&recovery_table, mode, DmTransitionPolicy::Rollback)
                     .and_then(|()| self.ensure_recovery_table_active())
                 {
-                    Ok(()) => storage_recovered = true,
+                    Ok(()) => mapper_recovered = true,
                     Err(error) => {
-                        // A discarded failure here leaves the injected fault table on a
-                        // real block device; surface it so the leak is at least visible
-                        // to operators (ChaosGuard already does this for chaos CRs).
-                        eprintln!(
-                            "warning: failed to restore device-mapper target {name} to its recovery table on node {node} during guard cleanup: {error}",
-                            name = self.dm_name,
-                            node = self.mapping.node,
-                        );
+                        match self.ensure_recovery_table_active() {
+                            Ok(()) => {
+                                mapper_recovered = true;
+                                eprintln!(
+                                    "warning: device-mapper rollback reported an error but a fresh observation proved the recovery table active: {error:#}"
+                                );
+                            }
+                            Err(observe_error) => {
+                                // A discarded failure here may leave the injected fault table on
+                                // a real block device; surface both attempts so operators can
+                                // distinguish a transition failure from an observation failure.
+                                eprintln!(
+                                    "warning: failed to restore device-mapper target {name} to its recovery table on node {node} during guard cleanup: {error:#}; recovery observation: {observe_error:#}",
+                                    name = self.dm_name,
+                                    node = self.mapping.node,
+                                );
+                            }
+                        }
                     }
                 }
             }
-            if self.fault_applied && storage_recovered {
-                match self.ensure_filesystem_mounted() {
-                    Ok(()) => {}
-                    Err(error) => {
-                        storage_recovered = false;
+            let mut filesystem_recovered = mapper_recovered;
+            if self.fault_applied && mapper_recovered {
+                let recovery = match self.filesystem_recovery {
+                    DmFilesystemRecoveryState::Pending => {
+                        let timeout = self.config.timeout;
+                        self.ensure_recovery_quiescence(timeout)
+                            .and_then(|()| self.verify_filesystem_integrity(timeout))
+                    }
+                    DmFilesystemRecoveryState::Failed => {
+                        filesystem_recovered = false;
                         eprintln!(
-                            "warning: failed to remount device-mapper target {name} at {mount} during guard cleanup; node {node} remains tainted: {error}",
+                            "warning: offline filesystem verification failed for device-mapper target {name}; leaving {mount} quarantined for manual recovery",
                             name = self.dm_name,
                             mount = self.mapping.mount_path,
-                            node = self.mapping.node,
                         );
+                        Ok(())
                     }
+                    DmFilesystemRecoveryState::NotRequired
+                    | DmFilesystemRecoveryState::Verified => self.ensure_filesystem_mounted(),
+                };
+                if let Err(error) = recovery {
+                    filesystem_recovered = false;
+                    eprintln!(
+                        "warning: failed to recover device-mapper filesystem {name} at {mount} during guard cleanup; node {node} remains tainted: {error:#}",
+                        name = self.dm_name,
+                        mount = self.mapping.mount_path,
+                        node = self.mapping.node,
+                    );
                 }
             }
-            if storage_recovered
+            if filesystem_recovered
                 && self.node_tainted
                 && let Err(error) = self.remove_node_taint()
             {
-                storage_recovered = false;
+                filesystem_recovered = false;
                 eprintln!(
                     "warning: failed to remove crash-containment taint from node {node} during guard cleanup: {error}",
                     node = self.mapping.node,
                 );
             }
-            if self.fault_applied && !storage_recovered && !self.node_tainted {
+            if self.fault_applied && !filesystem_recovered && !self.node_tainted {
                 match self.add_node_taint() {
                     Ok(()) => eprintln!(
                         "warning: applied NoSchedule to node {node} after device-mapper recovery failed",
@@ -1673,7 +2114,7 @@ impl Drop for DmFlakeyGuard {
                     ),
                 }
             }
-            if storage_recovered {
+            if filesystem_recovered {
                 if let Err(error) = self.mutation_lease.clear() {
                     eprintln!(
                         "warning: failed to clear host mutation state after verified recovery: {error:#}"
@@ -1686,8 +2127,12 @@ impl Drop for DmFlakeyGuard {
                     );
                 }
             } else {
-                // NoSchedule cannot stop a Pod already using the failed mapper.
-                if let Err(error) = suspend_failed_mapper(self) {
+                // A recovered active table remains usable even if mount
+                // reconciliation failed. Re-suspending it would turn a
+                // filesystem observation error into a second storage outage.
+                if mapper_requires_containment(self.fault_applied, mapper_recovered)
+                    && let Err(error) = contain_unrecovered_mapper(self, &recovery_table)
+                {
                     eprintln!(
                         "warning: could not verify suspension of the unrecovered mapper; existing Pod I/O may continue: {error:#}"
                     );
@@ -1754,8 +2199,50 @@ fn dm_resume_args(name: &str) -> [&str; 3] {
     ["resume", "--noudevsync", name]
 }
 
-fn suspend_failed_mapper(port: &mut impl DmTransitionPort) -> Result<()> {
-    if port.observe()?.suspended {
+fn filesystem_checker(filesystem: &str) -> Result<(&'static str, &'static [&'static str])> {
+    match filesystem {
+        "ext2" | "ext3" | "ext4" => Ok(("/usr/sbin/e2fsck", &["-f", "-n"])),
+        "xfs" => Ok(("/usr/sbin/xfs_repair", &["-n"])),
+        other => bail!(
+            "drop_writes requires an offline read-only filesystem checker; unsupported filesystem {other:?}"
+        ),
+    }
+}
+
+fn mapper_requires_containment(fault_applied: bool, mapper_recovered: bool) -> bool {
+    fault_applied && !mapper_recovered
+}
+
+fn dm_atomic_activation_args(
+    name: &str,
+    canonical_device: &str,
+    mount_path: &str,
+    recovery_table: &str,
+    fault_table: &str,
+) -> Vec<String> {
+    [
+        "/bin/sh",
+        "-c",
+        DM_ATOMIC_ACTIVATION_SCRIPT,
+        "s3chaos-dm-activate",
+        name,
+        canonical_device,
+        mount_path,
+        recovery_table,
+        fault_table,
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
+
+fn contain_unrecovered_mapper(
+    port: &mut impl DmTransitionPort,
+    recovery_table: &str,
+) -> Result<()> {
+    let observed = port.observe()?;
+    if observed.suspended
+        || dm_tables_match(&observed.active_table, recovery_table).unwrap_or(false)
+    {
         return Ok(());
     }
     let suspended = port.suspend(DmSuspendMode::NoFlushNoLockFs);
@@ -1821,6 +2308,19 @@ fn classify_exact_mountpoint(
     }
 }
 
+fn validate_unmounted_source(source: &str, output: &CommandOutput) -> Result<()> {
+    ensure!(
+        output.code == Some(1)
+            && output.stdout.trim().is_empty()
+            && output.stderr.trim().is_empty(),
+        "device-mapper source {source:?} is still mounted or could not be checked before offline filesystem verification: findmnt exit={:?}, stdout={}, stderr={}",
+        output.code,
+        output.stdout,
+        output.stderr
+    );
+    Ok(())
+}
+
 fn require_transition_initial_state(
     policy: DmTransitionPolicy<'_>,
     initial: &DmObservedState,
@@ -1831,7 +2331,7 @@ fn require_transition_initial_state(
             "refusing device-mapper fault apply because the target was already suspended"
         );
         ensure!(
-            normalize_dm_table(&initial.active_table) == normalize_dm_table(recovery_table),
+            dm_tables_match(&initial.active_table, recovery_table)?,
             "refusing device-mapper fault apply because the active table drifted from the proven recovery table; active={:?}, recovery={:?}",
             initial.active_table,
             recovery_table
@@ -1858,9 +2358,14 @@ fn transition_dm_table_from_observed(
     initial: DmObservedState,
 ) -> Result<()> {
     require_transition_initial_state(policy, &initial)?;
-    if !initial.suspended
-        && normalize_dm_table(&initial.active_table) == normalize_dm_table(requested_table)
-    {
+    let already_requested = match dm_tables_match(&initial.active_table, requested_table) {
+        Ok(matches) => matches,
+        Err(_) if policy == DmTransitionPolicy::Rollback => false,
+        Err(error) => {
+            return Err(error).context("compare device-mapper table before fault apply");
+        }
+    };
+    if !initial.suspended && already_requested {
         return Ok(());
     }
 
@@ -1871,8 +2376,8 @@ fn transition_dm_table_from_observed(
             .observe()
             .context("re-observe device-mapper state after suspend attempt")?;
         if let DmTransitionPolicy::Apply { recovery_table } = policy {
-            let table_matches_recovery = normalize_dm_table(&after_suspend.active_table)
-                == normalize_dm_table(recovery_table);
+            let table_comparison = dm_tables_match(&after_suspend.active_table, recovery_table);
+            let table_matches_recovery = table_comparison.as_ref().copied().unwrap_or(false);
             if suspend_error.is_some() || !after_suspend.suspended || !table_matches_recovery {
                 let recovery_result = transition_dm_table_from_observed(
                     port,
@@ -1882,9 +2387,10 @@ fn transition_dm_table_from_observed(
                     after_suspend.clone(),
                 );
                 bail!(
-                    "device-mapper fault apply lost its proven pre-load state; suspended={}, active_table={:?}, suspend_error={:?}, recovery_result={:?}",
+                    "device-mapper fault apply lost its proven pre-load state; suspended={}, active_table={:?}, table_error={:?}, suspend_error={:?}, recovery_result={:?}",
                     after_suspend.suspended,
                     after_suspend.active_table,
+                    table_comparison.err().map(|error| format!("{error:#}")),
                     suspend_error,
                     recovery_result.map_err(|error| format!("{error:#}"))
                 );
@@ -1908,8 +2414,7 @@ fn transition_dm_table_from_observed(
         .observe()
         .context("observe device-mapper state after load/resume attempts")?;
     ensure!(
-        !final_state.suspended
-            && normalize_dm_table(&final_state.active_table) == normalize_dm_table(requested_table),
+        !final_state.suspended && dm_tables_match(&final_state.active_table, requested_table)?,
         "device-mapper transition did not reach active requested table; suspended={}, active_table={:?}, suspend_error={:?}, load_error={:?}, resume_error={:?}",
         final_state.suspended,
         final_state.active_table,
@@ -1925,6 +2430,7 @@ fn verify_dm_volume_mapping(
     node: &str,
     container_mount_path: &str,
     expected_host_mount_path: &str,
+    readiness: DmPodReadiness,
 ) -> Result<DmVolumeMapping> {
     let selector = format!("rustfs.tenant={}", config.tenant_name);
     let pods = Kubectl::new(config)
@@ -1932,7 +2438,7 @@ fn verify_dm_volume_mapping(
         .command(["get", "pod", "-l", &selector, "-o", "json"])
         .run_checked()?;
     let pods = serde_json::from_str::<Value>(&pods.stdout).context("parse RustFS pod list")?;
-    let binding = resolve_dm_pod_volume(&pods, node, container_mount_path)?;
+    let binding = resolve_dm_pod_volume(&pods, node, container_mount_path, readiness)?;
 
     let pvc_json = Kubectl::new(config)
         .namespaced(&config.test_namespace)
@@ -1968,6 +2474,7 @@ fn resolve_dm_pod_volume(
     pods: &Value,
     node: &str,
     container_mount_path: &str,
+    readiness: DmPodReadiness,
 ) -> Result<DmPodVolumeBinding> {
     let pods_on_node = pods
         .pointer("/items")
@@ -1987,17 +2494,19 @@ fn resolve_dm_pod_volume(
             .is_none_or(Value::is_null),
         "DM target Pod is terminating"
     );
-    ensure!(
-        pod.pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|condition| {
-                condition.get("type").and_then(Value::as_str) == Some("Ready")
-                    && condition.get("status").and_then(Value::as_str) == Some("True")
-            }),
-        "DM target Pod is not Ready"
-    );
+    if readiness == DmPodReadiness::Required {
+        ensure!(
+            pod.pointer("/status/conditions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|condition| {
+                    condition.get("type").and_then(Value::as_str) == Some("Ready")
+                        && condition.get("status").and_then(Value::as_str) == Some("True")
+                }),
+            "DM target Pod is not Ready"
+        );
+    }
     let pod_name = pod
         .pointer("/metadata/name")
         .and_then(Value::as_str)
@@ -2300,12 +2809,14 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DmFaultBehavior, DmFlakeySpec, DmMountState, DmObservedState, DmSuspendMode,
-        DmTransitionPolicy, DmTransitionPort, HostMutationLease, HostMutationPhase,
-        HostMutationState, classify_exact_mountpoint, complete_dm_volume_mapping, dm_flakey_spec,
-        dm_helper_manifest, dm_resume_args, dm_suspend_args, force_delete_pod_command,
-        helper_pod_name, normalize_dm_table, resolve_dm_pod_volume, supported_pv_node_selector,
-        transition_dm_table, validate_dm_spec,
+        DmFaultBehavior, DmFlakeySpec, DmInitialPodAction, DmMountState, DmObservedState,
+        DmPodDeletionMode, DmPodReadiness, DmSuspendMode, DmTransitionPolicy, DmTransitionPort,
+        HostMutationLease, HostMutationPhase, HostMutationState, classify_exact_mountpoint,
+        classify_initial_target_pod, complete_dm_volume_mapping, dm_atomic_activation_args,
+        dm_flakey_spec, dm_helper_manifest, dm_resume_args, dm_suspend_args, dm_tables_match,
+        filesystem_checker, force_delete_pod_command, helper_pod_name, mapper_requires_containment,
+        resolve_dm_pod_volume, supported_pv_node_selector, transition_dm_table, validate_dm_spec,
+        validate_observer_pod_value, validate_unmounted_source,
     };
     use crate::fault::config::FaultTestConfig;
     use crate::framework::command::CommandOutput;
@@ -2445,6 +2956,35 @@ mod tests {
         })
     }
 
+    fn observer_pod() -> Value {
+        json!({
+            "metadata": {"labels": {
+                "app.kubernetes.io/managed-by": "s3chaos",
+                "rustfs.com/fault-host-observer": "true"
+            }},
+            "spec": {
+                "nodeName": "worker-a",
+                "hostPID": true,
+                "restartPolicy": "Never",
+                "containers": [{
+                    "name": "host-tools",
+                    "securityContext": {"privileged": true},
+                    "volumeMounts": [{
+                        "name": "host-root",
+                        "mountPath": "/host",
+                        "readOnly": true,
+                        "mountPropagation": "HostToContainer"
+                    }]
+                }],
+                "volumes": [{
+                    "name": "host-root",
+                    "hostPath": {"path": "/", "type": "Directory"}
+                }]
+            },
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+        })
+    }
+
     #[test]
     fn dm_helper_is_pinned_to_one_node_and_host_root() {
         let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
@@ -2478,6 +3018,80 @@ mod tests {
         // the real block device once every kubectl exec starts failing.
         assert!(manifest.contains("while :; do sleep 3600 & wait $!; done"));
         assert!(!manifest.contains("sleep 3600 & wait\""));
+    }
+
+    #[test]
+    fn host_observer_requires_pid_and_mount_namespace_access() {
+        let valid = observer_pod();
+        validate_observer_pod_value(&valid, "worker-a").expect("valid host observer");
+
+        let mut no_host_pid = valid.clone();
+        no_host_pid["spec"]["hostPID"] = json!(false);
+        assert!(validate_observer_pod_value(&no_host_pid, "worker-a").is_err());
+
+        let mut private_mount = valid;
+        private_mount["spec"]["containers"][0]["volumeMounts"][0]["mountPropagation"] =
+            json!("None");
+        assert!(validate_observer_pod_value(&private_mount, "worker-a").is_err());
+    }
+
+    #[test]
+    fn drop_writes_activation_is_one_preconditioned_host_transaction() {
+        let recovery = "0 1024 linear 7:0 0";
+        let fault = "0 1024 flakey 7:0 0 0 86400 1 drop_writes";
+        let args = dm_atomic_activation_args(
+            "mapper-a",
+            "/dev/dm-7",
+            "/data/rustfs/dm-volume",
+            recovery,
+            fault,
+        );
+
+        assert_eq!(
+            &args[3..],
+            [
+                "s3chaos-dm-activate",
+                "mapper-a",
+                "/dev/dm-7",
+                "/data/rustfs/dm-volume",
+                recovery,
+                fault,
+            ]
+        );
+        let script = &args[2];
+        for required in [
+            "actual_device",
+            "mount_device",
+            "active_table",
+            "dmsetup suspend --nolockfs",
+            "dmsetup load \"$name\" --table \"$fault_table\"",
+            "dmsetup resume --noudevsync",
+            super::DM_ATOMIC_ACTIVATION_MARKER,
+            super::DM_ATOMIC_ACTIVATION_NOT_STARTED_MARKER,
+            super::DM_ATOMIC_ACTIVATION_ROLLBACK_MARKER,
+        ] {
+            assert!(script.contains(required), "missing {required:?}");
+        }
+    }
+
+    #[test]
+    fn drop_writes_uses_only_offline_read_only_filesystem_checkers() {
+        assert_eq!(
+            filesystem_checker("ext4").expect("ext4 checker"),
+            ("/usr/sbin/e2fsck", &["-f", "-n"][..])
+        );
+        assert_eq!(
+            filesystem_checker("xfs").expect("xfs checker"),
+            ("/usr/sbin/xfs_repair", &["-n"][..])
+        );
+        assert!(filesystem_checker("btrfs").is_err());
+    }
+
+    #[test]
+    fn recovered_mapper_is_not_suspended_for_a_filesystem_check_failure() {
+        assert!(!mapper_requires_containment(true, true));
+        assert!(mapper_requires_containment(true, false));
+        assert!(!mapper_requires_containment(false, false));
     }
 
     #[test]
@@ -2571,14 +3185,48 @@ mod tests {
     }
 
     #[test]
-    fn dm_table_comparison_uses_the_full_normalized_table() {
-        assert_eq!(
-            normalize_dm_table("0 1024  flakey   /dev/loop0 0 1 15\n"),
-            "0 1024 flakey /dev/loop0 0 1 15"
+    fn offline_check_requires_the_mapper_to_have_no_mounts() {
+        validate_unmounted_source(
+            "/dev/mapper/rustfs-fault-dm",
+            &CommandOutput {
+                code: Some(1),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        )
+        .expect("clean findmnt no-match proves no mapper mount");
+
+        for output in [
+            CommandOutput {
+                code: Some(0),
+                stdout: "/data/other-mount\n".to_string(),
+                stderr: String::new(),
+            },
+            CommandOutput {
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "findmnt failed".to_string(),
+            },
+        ] {
+            assert!(validate_unmounted_source("/dev/mapper/rustfs-fault-dm", &output).is_err());
+        }
+    }
+
+    #[test]
+    fn dm_table_comparison_uses_semantics_and_full_geometry() {
+        assert!(
+            dm_tables_match(
+                "0 1024  flakey   /dev/loop0 0 1 15\n",
+                "0 1024 flakey /dev/loop0 0 1 15 2 error_reads error_writes",
+            )
+            .expect("compare equivalent flakey tables")
         );
-        assert_ne!(
-            normalize_dm_table("0 1024 flakey /dev/loop0 0 1 15"),
-            normalize_dm_table("0 1024 flakey /dev/loop1 0 1 15")
+        assert!(
+            !dm_tables_match(
+                "0 1024 flakey /dev/loop0 0 1 15",
+                "0 1024 flakey /dev/loop1 0 1 15",
+            )
+            .expect("compare different backing devices")
         );
     }
 
@@ -2627,6 +3275,108 @@ mod tests {
             body.get("gracePeriodSeconds")
                 .and_then(|value| value.as_u64()),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn crash_boundary_requires_a_live_original_pod_but_recovery_is_idempotent() {
+        let original = json!({
+            "metadata": {"name": "rustfs-0", "uid": "uid-old"},
+            "spec": {"nodeName": "worker-a"}
+        });
+        assert_eq!(
+            classify_initial_target_pod(
+                Some(&original),
+                "rustfs-0",
+                "uid-old",
+                "worker-a",
+                DmPodDeletionMode::CrashBoundary,
+            )
+            .expect("live original Pod"),
+            DmInitialPodAction::DeleteOriginal
+        );
+
+        let mut terminating = original;
+        terminating["metadata"]["deletionTimestamp"] = json!("2026-09-11T00:00:00Z");
+        assert!(
+            classify_initial_target_pod(
+                Some(&terminating),
+                "rustfs-0",
+                "uid-old",
+                "worker-a",
+                DmPodDeletionMode::CrashBoundary,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            classify_initial_target_pod(
+                Some(&terminating),
+                "rustfs-0",
+                "uid-old",
+                "worker-a",
+                DmPodDeletionMode::Recovery,
+            )
+            .expect("recovery waits for an in-flight deletion"),
+            DmInitialPodAction::WaitForOriginal
+        );
+        assert!(
+            classify_initial_target_pod(
+                None,
+                "rustfs-0",
+                "uid-old",
+                "worker-a",
+                DmPodDeletionMode::CrashBoundary,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            classify_initial_target_pod(
+                None,
+                "rustfs-0",
+                "uid-old",
+                "worker-a",
+                DmPodDeletionMode::Recovery,
+            )
+            .expect("already absent during recovery"),
+            DmInitialPodAction::AlreadyQuiesced(None)
+        );
+
+        let replacement = json!({
+            "metadata": {"name": "rustfs-0", "uid": "uid-new"},
+            "spec": {}
+        });
+        assert!(
+            classify_initial_target_pod(
+                Some(&replacement),
+                "rustfs-0",
+                "uid-old",
+                "worker-a",
+                DmPodDeletionMode::CrashBoundary,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            classify_initial_target_pod(
+                Some(&replacement),
+                "rustfs-0",
+                "uid-old",
+                "worker-a",
+                DmPodDeletionMode::Recovery,
+            )
+            .expect("pending replacement is quiesced by the node taint"),
+            DmInitialPodAction::AlreadyQuiesced(Some("uid-new".to_string()))
+        );
+        let mut replacement_on_target = replacement;
+        replacement_on_target["spec"]["nodeName"] = json!("worker-a");
+        assert!(
+            classify_initial_target_pod(
+                Some(&replacement_on_target),
+                "rustfs-0",
+                "uid-old",
+                "worker-a",
+                DmPodDeletionMode::Recovery,
+            )
+            .is_err()
         );
     }
 
@@ -2682,8 +3432,13 @@ mod tests {
 
     #[test]
     fn dm_target_follows_the_rustfs_mount_to_the_exact_pvc() {
-        let binding = resolve_dm_pod_volume(&pod_list(true), "worker-a", "/data/rustfs0")
-            .expect("resolve data mount");
+        let binding = resolve_dm_pod_volume(
+            &pod_list(true),
+            "worker-a",
+            "/data/rustfs0",
+            DmPodReadiness::Required,
+        )
+        .expect("resolve data mount");
         assert_eq!(binding.volume_name, "data");
         assert_eq!(binding.pvc, "data-rustfs-0");
 
@@ -2707,8 +3462,13 @@ mod tests {
 
     #[test]
     fn dm_apply_mapping_detects_same_name_pvc_and_pv_recreation() {
-        let binding = resolve_dm_pod_volume(&pod_list(true), "worker-a", "/data/rustfs0")
-            .expect("resolve data mount");
+        let binding = resolve_dm_pod_volume(
+            &pod_list(true),
+            "worker-a",
+            "/data/rustfs0",
+            DmPodReadiness::Required,
+        )
+        .expect("resolve data mount");
         let original = complete_dm_volume_mapping(
             "rustfs-fault-test",
             binding.clone(),
@@ -2733,8 +3493,13 @@ mod tests {
 
     #[test]
     fn dm_mapping_rejects_claim_ref_mismatch_and_compound_topology() {
-        let binding = resolve_dm_pod_volume(&pod_list(true), "worker-a", "/data/rustfs0")
-            .expect("resolve data mount");
+        let binding = resolve_dm_pod_volume(
+            &pod_list(true),
+            "worker-a",
+            "/data/rustfs0",
+            DmPodReadiness::Required,
+        )
+        .expect("resolve data mount");
         assert!(
             complete_dm_volume_mapping(
                 "rustfs-fault-test",
@@ -2762,17 +3527,46 @@ mod tests {
     }
 
     #[test]
-    fn dm_mapping_rejects_unready_or_terminating_pod() {
-        assert!(resolve_dm_pod_volume(&pod_list(false), "worker-a", "/data/rustfs0").is_err());
+    fn dm_mapping_requires_readiness_during_proof_but_not_before_forced_delete() {
+        assert!(
+            resolve_dm_pod_volume(
+                &pod_list(false),
+                "worker-a",
+                "/data/rustfs0",
+                DmPodReadiness::Required,
+            )
+            .is_err()
+        );
+        resolve_dm_pod_volume(
+            &pod_list(false),
+            "worker-a",
+            "/data/rustfs0",
+            DmPodReadiness::MayBeUnready,
+        )
+        .expect("the proven Pod may become unready under the active fault");
+
         let mut terminating = pod_list(true);
         terminating["items"][0]["metadata"]["deletionTimestamp"] = json!("2026-09-04T00:00:00Z");
-        assert!(resolve_dm_pod_volume(&terminating, "worker-a", "/data/rustfs0").is_err());
+        assert!(
+            resolve_dm_pod_volume(
+                &terminating,
+                "worker-a",
+                "/data/rustfs0",
+                DmPodReadiness::MayBeUnready,
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn dm_mapping_requires_bound_pvc_and_pv() {
-        let binding = resolve_dm_pod_volume(&pod_list(true), "worker-a", "/data/rustfs0")
-            .expect("resolve data mount");
+        let binding = resolve_dm_pod_volume(
+            &pod_list(true),
+            "worker-a",
+            "/data/rustfs0",
+            DmPodReadiness::Required,
+        )
+        .expect("resolve data mount");
         let mut lost_pvc = pvc("pvc-uid-a");
         lost_pvc["status"]["phase"] = json!("Lost");
         assert!(
@@ -2804,8 +3598,13 @@ mod tests {
 
     #[test]
     fn dm_mapping_uses_the_node_hostname_label_and_binds_node_identity() {
-        let binding = resolve_dm_pod_volume(&pod_list(true), "worker-a", "/data/rustfs0")
-            .expect("resolve data mount");
+        let binding = resolve_dm_pod_volume(
+            &pod_list(true),
+            "worker-a",
+            "/data/rustfs0",
+            DmPodReadiness::Required,
+        )
+        .expect("resolve data mount");
         let mut matching_pv = pv("pv-uid-a", "pvc-uid-a");
         matching_pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"][0]["matchExpressions"]
             [0]["values"] = json!(["storage-host-a"]);
@@ -2939,7 +3738,7 @@ mod tests {
         assert_eq!(port.loaded_tables, [recovery]);
         assert!(!port.loaded_tables.iter().any(|table| table == fault));
         assert!(!port.suspended);
-        assert_eq!(normalize_dm_table(&port.active_table), recovery);
+        assert!(dm_tables_match(&port.active_table, recovery).expect("compare recovery table"));
     }
 
     #[test]
@@ -2973,7 +3772,69 @@ mod tests {
         assert_eq!(port.loaded_tables, [recovery]);
         assert!(!port.loaded_tables.iter().any(|table| table == fault));
         assert!(!port.suspended);
-        assert_eq!(normalize_dm_table(&port.active_table), recovery);
+        assert!(dm_tables_match(&port.active_table, recovery).expect("compare recovery table"));
+    }
+
+    #[test]
+    fn dm_apply_recovers_if_the_table_becomes_unparseable_during_suspend() {
+        let recovery = "0 1024 linear /dev/loop0 0";
+        let fault = "0 1024 flakey /dev/loop0 0 1 15";
+        let mut port = FakeDmPort {
+            suspended: false,
+            active_table: recovery.to_string(),
+            inactive_table: None,
+            active_table_after_suspend: Some("0 1024 error".to_string()),
+            fail_next_suspend_after_suspending: false,
+            fail_next_resume: false,
+            suspend_calls: 0,
+            load_calls: 0,
+            loaded_tables: Vec::new(),
+            resume_calls: 0,
+        };
+
+        assert!(
+            transition_dm_table(
+                &mut port,
+                fault,
+                DmSuspendMode::Default,
+                DmTransitionPolicy::Apply {
+                    recovery_table: recovery,
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(port.loaded_tables, [recovery]);
+        assert!(!port.suspended);
+        assert!(dm_tables_match(&port.active_table, recovery).expect("compare recovery table"));
+    }
+
+    #[test]
+    fn dm_rollback_overwrites_an_unparseable_active_table() {
+        let recovery = "0 1024 linear /dev/loop0 0";
+        let mut port = FakeDmPort {
+            suspended: false,
+            active_table: "0 1024 error".to_string(),
+            inactive_table: None,
+            active_table_after_suspend: None,
+            fail_next_suspend_after_suspending: false,
+            fail_next_resume: false,
+            suspend_calls: 0,
+            load_calls: 0,
+            loaded_tables: Vec::new(),
+            resume_calls: 0,
+        };
+
+        transition_dm_table(
+            &mut port,
+            recovery,
+            DmSuspendMode::NoFlush,
+            DmTransitionPolicy::Rollback,
+        )
+        .expect("rollback must not depend on parsing the damaged active table");
+
+        assert_eq!(port.loaded_tables, [recovery]);
+        assert!(!port.suspended);
+        assert!(dm_tables_match(&port.active_table, recovery).expect("compare recovery table"));
     }
 
     #[test]
@@ -3014,7 +3875,7 @@ mod tests {
         .expect("recover already-suspended mapper");
 
         assert!(!port.suspended);
-        assert_eq!(normalize_dm_table(&port.active_table), recovery);
+        assert!(dm_tables_match(&port.active_table, recovery).expect("compare recovery table"));
         assert_eq!(port.loaded_tables, [fault, recovery]);
         assert_eq!(
             port.suspend_calls, 1,
@@ -3031,6 +3892,13 @@ mod tests {
         config.host_mutation_state_file = Some(state_path.clone());
         config.host_mutation_state_token = Some("token-a".to_string());
         let mut lease = HostMutationLease::from_config(&config, "run-a").expect("lease");
+        lease
+            .set_phase(HostMutationPhase::Activating)
+            .expect("persist activating state");
+        let activating: HostMutationState =
+            serde_json::from_slice(&std::fs::read(&state_path).expect("read state"))
+                .expect("parse state");
+        assert_eq!(activating.phase, HostMutationPhase::Activating);
         lease
             .set_phase(HostMutationPhase::Active)
             .expect("persist active state");
@@ -3064,6 +3932,7 @@ mod tests {
 
     #[test]
     fn failed_mapper_containment_suspends_without_loading_or_resuming() {
+        let recovery = "0 1024 linear /dev/loop0 0";
         for (already_suspended, transport_error) in [(false, false), (true, false), (false, true)] {
             let mut port = FakeDmPort {
                 suspended: already_suspended,
@@ -3077,7 +3946,7 @@ mod tests {
                 loaded_tables: Vec::new(),
                 resume_calls: 0,
             };
-            super::suspend_failed_mapper(&mut port)
+            super::contain_unrecovered_mapper(&mut port, recovery)
                 .expect("suspension must be observed despite a lost command response");
             assert!(port.suspended);
             assert_eq!(port.suspend_calls, usize::from(!already_suspended));
@@ -3088,6 +3957,28 @@ mod tests {
             dm_suspend_args("mapper", DmSuspendMode::NoFlushNoLockFs),
             ["suspend", "--noflush", "--nolockfs", "mapper"]
         );
+    }
+
+    #[test]
+    fn containment_does_not_suspend_an_active_recovery_table() {
+        let recovery = "0 1024 linear /dev/loop0 0";
+        let mut port = FakeDmPort {
+            suspended: false,
+            active_table: recovery.to_string(),
+            inactive_table: None,
+            active_table_after_suspend: None,
+            fail_next_suspend_after_suspending: false,
+            fail_next_resume: false,
+            suspend_calls: 0,
+            load_calls: 0,
+            loaded_tables: Vec::new(),
+            resume_calls: 0,
+        };
+
+        super::contain_unrecovered_mapper(&mut port, recovery)
+            .expect("active recovery table is already safe from mapper containment");
+        assert!(!port.suspended);
+        assert_eq!(port.suspend_calls, 0);
     }
 
     #[test]
@@ -3110,6 +4001,9 @@ mod tests {
                 panic!("containment must not resume IO")
             }
         }
-        assert!(super::suspend_failed_mapper(&mut UnchangedMapper).is_err());
+        assert!(
+            super::contain_unrecovered_mapper(&mut UnchangedMapper, "0 1024 linear /dev/loop0 0")
+                .is_err()
+        );
     }
 }

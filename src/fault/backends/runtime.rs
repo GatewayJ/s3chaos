@@ -151,6 +151,20 @@ struct DmFlakeyFaultHandle {
     guard: Box<DmFlakeyGuard>,
 }
 
+pub(in crate::fault) struct PreparedHostFault {
+    guard: Box<DmFlakeyGuard>,
+}
+
+impl PreparedHostFault {
+    pub(in crate::fault) fn activate(mut self) -> Result<(AppliedFault, u64)> {
+        let activated_at_ms = self.guard.activate()?;
+        Ok((
+            Box::new(DmFlakeyFaultHandle { guard: self.guard }),
+            activated_at_ms,
+        ))
+    }
+}
+
 pub(in crate::fault) fn apply_fault(
     config: &FaultTestConfig,
     collector: &ArtifactCollector,
@@ -169,6 +183,30 @@ pub(in crate::fault) fn apply_fault(
         resource_name_suffix: "",
         host_storage_proof,
     })
+}
+
+pub(in crate::fault) fn prepare_host_fault(
+    config: &FaultTestConfig,
+    collector: &ArtifactCollector,
+    scenario: &FaultScenario,
+    run_id: &str,
+    host_storage_proof: &HostStorageMutationProof,
+    execution_injection: &FaultInjection,
+) -> Result<PreparedHostFault> {
+    let request = FaultApplyRequest {
+        config,
+        collector,
+        scenario,
+        injection: execution_injection,
+        run_id,
+        manifest_name: "chaos-manifest.yaml",
+        resource_name_suffix: "",
+        host_storage_proof: Some(host_storage_proof),
+    };
+    if request.injection.backend() != FaultBackend::DeviceMapper {
+        bail!("only device-mapper faults support pre-ACK preparation");
+    }
+    prepare_host_fault_backend(&request)
 }
 
 fn apply_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
@@ -225,11 +263,16 @@ fn apply_chaos_mesh_fault_backend(request: &FaultApplyRequest<'_>) -> Result<App
 }
 
 fn apply_host_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
+    prepare_host_fault_backend(request)
+        .and_then(|prepared| prepared.activate().map(|(fault, _activated_at_ms)| fault))
+}
+
+fn prepare_host_fault_backend(request: &FaultApplyRequest<'_>) -> Result<PreparedHostFault> {
     let host_storage_proof = request
         .host_storage_proof
         .context("device-mapper fault lacks a host-storage mutation proof")?;
-    Ok(Box::new(DmFlakeyFaultHandle {
-        guard: Box::new(host::apply_fault(&host::FaultApplyRequest {
+    Ok(PreparedHostFault {
+        guard: Box::new(host::prepare_fault(&host::FaultApplyRequest {
             config: request.config,
             collector: request.collector,
             scenario: request.scenario,
@@ -237,7 +280,7 @@ fn apply_host_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFa
             run_id: request.run_id,
             host_storage_proof,
         })?),
-    }))
+    })
 }
 
 impl FaultFailureArtifactSource for ChaosFaultHandle {
@@ -350,8 +393,8 @@ impl FaultLifecyclePort for DmFlakeyFaultHandle {
         self.guard.prepare_recovery_boundary(timeout, started_at_ms)
     }
 
-    fn delete(&mut self, _timeout: Duration) -> Result<()> {
-        self.guard.restore()
+    fn delete(&mut self, timeout: Duration) -> Result<()> {
+        self.guard.restore_with_timeout(timeout)
     }
 
     fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot> {

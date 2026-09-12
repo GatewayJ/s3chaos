@@ -399,13 +399,20 @@ guardrails when implementing the ordered TODO below.
   typed rollback/quarantine/post-cleanup contract. The proof persists canonical
   fault/recovery tables and executable rollback commands; apply re-observes the
   full Pod UID/PVC/PV/node/mount/table chain before loading the proven table.
-  Signal cancellation unwinds the guard. Activation and workload snapshots
-  prove the same active mapper and fault table; successful recovery binds its
-  snapshot to `host-storage-post-cleanup.json`. Failed rollback attempts to
-  suspend the mapper and retains the helper and mutation marker for manual
-  recovery; a scheduling taint alone cannot prove storage containment. PV
-  replacement, bitrot, and stale-disk flows remain non-executable catalog
-  entries and must use the same domain proof when their adapters are implemented.
+  ACK-triggered cases finish that preparation before the mutation and use one
+  host transaction after ACK to recheck the mapper, host mount, and table before
+  activation. Observer and helper commands enter PID 1's mount namespace and
+  preserve remote exit status separately from `kubectl` transport. Signal
+  cancellation unwinds the guard. Activation and workload snapshots prove the
+  same active mapper and fault table; `drop_writes` recovery also requires an
+  offline read-only filesystem check before remount and writes
+  `dm-filesystem-check.json`. Successful recovery binds its snapshot to
+  `host-storage-post-cleanup.json`. Failed mapper rollback attempts suspension
+  and retains the helper and mutation marker for manual recovery. A filesystem
+  check failure instead leaves the recovered mapper active, the filesystem
+  unmounted, and the node quarantined. PV replacement, bitrot, and stale-disk
+  flows remain non-executable catalog entries and must use the same domain proof
+  when their adapters are implemented.
 
 - [x] DONE: Make host/storage mutation preflight side-effect free.
   Meaning: host preflight reads Kubernetes metadata and fixed read-only host

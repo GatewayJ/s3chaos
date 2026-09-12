@@ -439,11 +439,15 @@ impl Recorder {
 
     pub fn mark_fault_active_now(&self) -> u64 {
         let at_ms = now_ms();
+        self.mark_fault_active_at(at_ms);
+        at_ms
+    }
+
+    pub(crate) fn mark_fault_active_at(&self, at_ms: u64) {
         let mut state = self.state();
         state.fault_window.active_at_ms = Some(at_ms);
         state.fault_window.ended_at_ms = None;
         state.durability_cohort = DurabilityCohort::FaultActive;
-        at_ms
     }
 
     pub fn mark_fault_ended_now(&self) -> u64 {

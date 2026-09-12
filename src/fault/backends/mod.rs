@@ -14,5 +14,6 @@
 
 pub mod chaos_mesh;
 pub mod host;
+mod host_command;
 
 pub(in crate::fault) mod runtime;
