@@ -17,7 +17,7 @@
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -400,6 +400,26 @@ pub(crate) async fn run_storage_recovery_case(
             && scenario.case_name == plan.case_name,
         "storage-recovery runner requires one exact destructive planned qualification"
     );
+    match plan.case {
+        StorageRecoveryCase::OnDiskBitrotAutomaticScanner
+        | StorageRecoveryCase::OnDiskBitrotAdminDeep => {
+            return crate::fault::on_disk_bitrot::run_on_disk_bitrot_case(
+                config,
+                collector,
+                scenario,
+                execution_plan,
+                plan,
+                run_id,
+                deadline,
+            )
+            .await;
+        }
+        StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement
+        | StorageRecoveryCase::FreshVolumeReplacementAdminDeep => {}
+        StorageRecoveryCase::StaleDiskReturn => {
+            bail!("stale-disk-return storage driver is not qualified in this build")
+        }
+    }
     let driver = crate::fault::fresh_volume::FreshVolumeDriver::new(
         config, collector, scenario, plan, run_id, deadline,
     )?;

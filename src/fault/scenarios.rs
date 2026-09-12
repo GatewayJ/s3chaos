@@ -1264,13 +1264,13 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::HealRegression,
         ]),
         case_name: "fault_on_disk_bitrot_is_rejected_and_healed",
-        description: "Planned on-disk bitrot flow: use a stable RustFS diagnostic mapping to mutate one proven shard, verify corrupt bytes are rejected, observe scanner or admin-deep heal, and force reads through the repaired drive.",
+        description: "Planned on-disk bitrot flow: inspect one non-inline shard through the fenced storage helper, apply a receipt-derived reversible mutation, verify corrupt bytes are rejected, observe scanner or admin-deep heal, and require the repaired shard for the final read.",
         priority: FaultPriority::P0,
         backend: FaultBackend::PlannedReliabilityWorkflow,
         status: FaultScenarioStatus::Planned,
         workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
         isolation: FaultIsolation::DedicatedLinuxBlockDevice,
-        crds: &[],
+        crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
@@ -1279,15 +1279,15 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         ci_phase: "planned",
         target: "one shard file on one dedicated host volume, selected after mapping an object version to its on-disk shard",
         target_proof: &[
-            "artifact must prove object-version to shard-file mapping through a versioned RustFS diagnostic API; S3Chaos must not infer private on-disk paths",
-            "artifact must record pre/post sha256 or byte-range evidence for the mutated shard",
-            "artifact must bind the mutation-window GET to a typed RustFS checksum-mismatch observation for that exact shard before heal",
-            "artifact must bind scanner/admin progress to a cluster-definitive observer and reject no-op heal evidence",
-            "artifact must leave exactly read quorum online so every successful verification read requires the repaired drive",
-            "current force-read adapter supports exactly one RustFS volume per server; multi-volume server topology must fail closed until per-volume runtime targeting is implemented",
+            "target proof must bind Tenant/PV/Pod/node/drive identity, the Kubernetes Lease generation, and the long-lived host flock before inspection or mutation",
+            "selection evidence must bind an explicit versionId and non-inline xl.meta inspection receipt to the exact part; the controller cannot supply an arbitrary shard path",
+            "mutation evidence must record the durable journal, controlled byte range, preimage and readback sha256, and the corruption-window GET must retain the same exact active cohort",
+            "scanner evidence must prove an interval after mutation without admin heal, while admin-deep evidence must own and bind the exact start/status/cancel token and HealResultItem",
+            "post-heal inspection, fresh mapping, cleanup receipt, and a second exact-quorum versionId GET must prove that every successful final read requires the repaired drive",
+            "only one-volume-per-server topology with a dedicated object and host volume is qualified; unsupported layouts fail closed",
         ],
         validation: "corrupt shard reads are rejected or repaired without returning bad bytes, the selected heal mode repairs the shard, forced reads match committed object hashes, and committed versions remain readable after repair",
-        observability: "shard-mutation-proof.json, heal-summary.json, heal-progress.jsonl, version-shard-mapping.json, force-read-proof.json, workload history, checker reports, RustFS logs",
+        observability: "storage target proof, selection/mutation/corruption-window/heal/cleanup receipts, exact-cohort manifests and runtime records, workload history, checker reports, post-write report, RustFS logs",
         conflict_domain: "dedicated host volume and object prefix owned by the test run; must never mutate shared data",
     },
     FaultScenarioSpec {
@@ -1468,10 +1468,15 @@ impl FaultScenario {
             )
             && spec.backend == FaultBackend::PlannedReliabilityWorkflow;
         let storage_qualification_allowed = allow_planned_storage
-            && spec.scenario == FRESH_VOLUME_REPLACEMENT_SCENARIO
+            && matches!(
+                spec.scenario,
+                FRESH_VOLUME_REPLACEMENT_SCENARIO | ON_DISK_BITROT_SCENARIO
+            )
             && config
                 .storage_recovery_case
                 .is_some_and(|case| case.scenario() == spec.scenario)
+            && (spec.scenario != ON_DISK_BITROT_SCENARIO
+                || config.storage_recovery_target_config.is_some())
             && spec.backend == FaultBackend::PlannedReliabilityWorkflow;
         if allow_planned_admin {
             ensure!(
@@ -1482,7 +1487,7 @@ impl FaultScenario {
         if allow_planned_storage {
             ensure!(
                 storage_qualification_allowed,
-                "planned storage qualification is restricted to the exact fresh-volume-replacement scenario and case"
+                "planned storage qualification requires an exact supported scenario/case and its target configuration"
             );
         }
         ensure!(
@@ -1673,9 +1678,9 @@ mod tests {
         DetectorQualification, DurabilityBugFamily, FaultDetectorContract, FaultParameterSchema,
         FaultScenario, FaultScenarioStatus, FaultScenarioWorkloadProfile, IO_EIO_SCENARIO,
         IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
-        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
-        POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO,
-        QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, ON_DISK_BITROT_SCENARIO,
+        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
+        POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
         ROLLING_RESTART_ALL_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO,
         acknowledged_mutation_kind, apply_catalog_defaults, executable_scenario_catalog,
         expected_workload_versioning_for_scenario, requires_prefault_multipart_staging,
@@ -1819,6 +1824,31 @@ mod tests {
 
         config.storage_recovery_case =
             Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAdminDeep);
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
+    }
+
+    #[test]
+    fn planned_storage_qualification_is_exact_and_separate_from_admin() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = ON_DISK_BITROT_SCENARIO.to_string();
+        config.qualify_planned_storage = true;
+        config.storage_recovery_target_config = Some("/secure/target.json".into());
+        config.storage_recovery_case =
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAutomaticScanner);
+
+        assert!(FaultScenario::from_config(&config).is_err());
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
+        config.destructive_enabled = true;
+        assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+
+        config.storage_recovery_case = Some(
+            crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
+        );
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
+
+        config.storage_recovery_case =
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAdminDeep);
+        config.qualify_planned_admin = true;
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
     }
 

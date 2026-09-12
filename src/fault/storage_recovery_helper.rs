@@ -42,6 +42,7 @@ use crate::fault::{
     storage_recovery_runtime::{
         OwnedStorageContext, STORAGE_RECOVERY_HOST_LOCK_DIRECTORY, StorageHelperInvocation,
         StorageRecoveryHostOperation, StorageRecoveryOperationReceipt, context_sha256,
+        same_storage_volume_generation,
     },
     xl2_inspector::{inspect_xl_meta, validate_format_json_drive},
 };
@@ -52,7 +53,7 @@ const FORMAT_JSON_PATH: &str = ".rustfs.sys/format.json";
 const MAX_FORMAT_JSON_BYTES: usize = 1024 * 1024;
 const MAX_XL_META_BYTES: usize = 16 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: usize = 1024 * 1024;
-const MUTATION_XOR_MASK: u8 = 0xff;
+pub const CONTROLLED_SHARD_XOR_MASK: u8 = 0xff;
 
 const RESOLVE_NO_XDEV: u64 = 0x01;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
@@ -120,12 +121,14 @@ enum JournalState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MutationJournal {
     schema_version: u8,
     operation_id: String,
     context_sha256: String,
     scope_sha256: String,
+    lease_uid: String,
+    lease_acquired_at_ms: u64,
     #[serde(default)]
     holder_identity: String,
     operation: StorageRecoveryHostOperation,
@@ -169,27 +172,27 @@ pub struct OfflineInspectedShard {
     pub original_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MutationResponse {
-    journal_operation_id: String,
-    relative_part_path: String,
-    shard_device_id: String,
-    shard_inode: u64,
-    shard_size_bytes: u64,
-    byte_offset: u64,
-    original_byte: u8,
-    mutated_byte: u8,
-    original_sha256: String,
-    mutated_sha256: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OfflineShardMutationResponse {
+    pub journal_operation_id: String,
+    pub relative_part_path: String,
+    pub shard_device_id: String,
+    pub shard_inode: u64,
+    pub shard_size_bytes: u64,
+    pub byte_offset: u64,
+    pub original_byte: u8,
+    pub mutated_byte: u8,
+    pub original_sha256: String,
+    pub mutated_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RestoreResponse {
-    mutation_operation_id: String,
-    outcome: crate::fault::storage_recovery_runtime::RestoreOutcome,
-    observed_sha256: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OfflineShardRecoveryResponse {
+    pub mutation_operation_id: String,
+    pub outcome: crate::fault::storage_recovery_runtime::RestoreOutcome,
+    pub observed_sha256: Option<String>,
 }
 
 pub struct StorageHelperSession {
@@ -301,6 +304,13 @@ impl StorageHelperSession {
                 mutation_operation_id,
                 started_at_ms,
             ),
+            StorageRecoveryHostOperation::VerifySupersededShard { .. } => verify_superseded(
+                &invocation.context,
+                &self.volume_root,
+                &self.journal_root,
+                &invocation.operation,
+                started_at_ms,
+            ),
             StorageRecoveryHostOperation::PrepareFreshVolume {
                 replacement_persistent_volume,
                 replacement_persistent_volume_claim,
@@ -351,7 +361,7 @@ fn validate_session_context(
             && owner.cluster_context == current.cluster_context
             && owner.tenant_uid == current.tenant_uid
             && owner.scope_sha256 == current.scope_sha256
-            && owner.volume == current.volume
+            && same_storage_volume_generation(&owner.volume, &current.volume)
             && owner.resource_versions == current.resource_versions
             && owner.host_generation == current.host_generation
             && owner.exclusive_access.host_flock == current.exclusive_access.host_flock
@@ -510,6 +520,9 @@ fn mutate(
             && inspection.operation_id == *inspection_operation_id
             && inspection.context_sha256 == context_sha256(context)?
             && inspection.scope_sha256 == context.scope_sha256
+            && inspection.lease_uid == context.exclusive_access.kubernetes_lease.uid
+            && inspection.lease_acquired_at_ms
+                == context.exclusive_access.kubernetes_lease.acquired_at_ms
             && inspection.holder_identity
                 == context.exclusive_access.kubernetes_lease.holder_identity
             && inspection.state == JournalState::Completed,
@@ -572,7 +585,7 @@ fn mutate(
         part.read_at(&mut original, *byte_offset)? == 1,
         "short read at shard mutation offset"
     );
-    let mutated = original[0] ^ MUTATION_XOR_MASK;
+    let mutated = original[0] ^ CONTROLLED_SHARD_XOR_MASK;
     let expected_mutated_sha256 = hash_file(&part, Some((*byte_offset, mutated)))?;
     ensure!(
         expected_mutated_sha256 != observed_original,
@@ -586,6 +599,8 @@ fn mutate(
         operation_id: operation_id.clone(),
         context_sha256: context_sha256(context)?,
         scope_sha256: context.scope_sha256.clone(),
+        lease_uid: context.exclusive_access.kubernetes_lease.uid.clone(),
+        lease_acquired_at_ms: context.exclusive_access.kubernetes_lease.acquired_at_ms,
         holder_identity: context
             .exclusive_access
             .kubernetes_lease
@@ -630,7 +645,7 @@ fn mutate(
         mutated_sha256 == expected_mutated_sha256,
         "mutated shard digest differs from the precomputed controlled mutation"
     );
-    let response = MutationResponse {
+    let response = OfflineShardMutationResponse {
         journal_operation_id: operation_id.clone(),
         relative_part_path: shard.relative_part_path.clone(),
         shard_device_id: shard.shard_device_id.clone(),
@@ -667,8 +682,11 @@ fn restore(
     ensure!(
         journal.schema_version == 1
             && journal.operation_id == mutation_operation_id
-            && journal.context_sha256 == context_sha256(context)?
             && journal.scope_sha256 == context.scope_sha256
+            && journal.lease_uid == context.exclusive_access.kubernetes_lease.uid
+            && journal.lease_acquired_at_ms
+                == context.exclusive_access.kubernetes_lease.acquired_at_ms
+            && journal.holder_identity == context.exclusive_access.kubernetes_lease.holder_identity
             && matches!(
                 journal.state,
                 JournalState::Prepared | JournalState::Mutated
@@ -708,8 +726,9 @@ fn restore(
         );
     }
     let current_sha256 = hash_file(&part, None)?;
-    if current_sha256 == original_sha256 {
+    let outcome = if current_sha256 == original_sha256 {
         journal.state = JournalState::Restored;
+        crate::fault::storage_recovery_runtime::RestoreOutcome::AlreadyRepaired
     } else if current_sha256 == mutated_sha256 {
         let mut current = [0_u8; 1];
         ensure!(
@@ -754,6 +773,7 @@ fn restore(
             );
         }
         journal.state = JournalState::Restored;
+        crate::fault::storage_recovery_runtime::RestoreOutcome::Restored
     } else {
         quarantine(
             journal_root,
@@ -768,15 +788,169 @@ fn restore(
             Some(current_sha256),
             started_at_ms,
         );
-    }
+    };
 
-    let response = RestoreResponse {
+    let response = OfflineShardRecoveryResponse {
         mutation_operation_id: mutation_operation_id.to_string(),
-        outcome: crate::fault::storage_recovery_runtime::RestoreOutcome::Restored,
+        outcome,
         observed_sha256: Some(original_sha256.to_string()),
     };
     journal.updated_at_ms = now_ms()?;
     persist_journal(journal_root, &journal)?;
+    completed_receipt(
+        context,
+        journal_root,
+        operation.clone(),
+        &response,
+        started_at_ms,
+    )
+}
+
+fn verify_superseded(
+    context: &OwnedStorageContext,
+    volume_root: &File,
+    journal_root: &File,
+    operation: &StorageRecoveryHostOperation,
+    started_at_ms: u64,
+) -> Result<StorageRecoveryOperationReceipt> {
+    let StorageRecoveryHostOperation::VerifySupersededShard {
+        mutation_operation_id,
+        post_inspection_operation_id,
+    } = operation
+    else {
+        unreachable!("verify_superseded receives only VerifySupersededShard")
+    };
+    let mut mutation = load_journal(journal_root, mutation_operation_id)?;
+    ensure!(
+        mutation.schema_version == 1
+            && mutation.operation_id == *mutation_operation_id
+            && mutation.scope_sha256 == context.scope_sha256
+            && mutation.holder_identity
+                == context.exclusive_access.kubernetes_lease.holder_identity
+            && mutation.lease_uid == context.exclusive_access.kubernetes_lease.uid
+            && mutation.lease_acquired_at_ms
+                == context.exclusive_access.kubernetes_lease.acquired_at_ms
+            && matches!(
+                mutation.state,
+                JournalState::Mutated | JournalState::Quarantined
+            ),
+        "superseded-shard source mutation is absent or not owned by this attempt"
+    );
+    let StorageRecoveryHostOperation::MutateShard {
+        inspection_operation_id,
+        part_number,
+        ..
+    } = &mutation.operation
+    else {
+        bail!("superseded-shard source journal is not a mutation")
+    };
+    let original_inspection = load_journal(journal_root, inspection_operation_id)?;
+    let post_inspection = load_journal(journal_root, post_inspection_operation_id)?;
+    ensure!(
+        original_inspection.state == JournalState::Completed
+            && post_inspection.state == JournalState::Completed
+            && post_inspection.context_sha256 == context_sha256(context)?
+            && post_inspection.scope_sha256 == context.scope_sha256
+            && post_inspection.lease_uid == context.exclusive_access.kubernetes_lease.uid
+            && post_inspection.lease_acquired_at_ms
+                == context.exclusive_access.kubernetes_lease.acquired_at_ms
+            && post_inspection.holder_identity
+                == context.exclusive_access.kubernetes_lease.holder_identity,
+        "superseded-shard post inspection is not a completed receipt for this context"
+    );
+    let original_body = required(
+        &original_inspection.response_body,
+        "original inspection response body",
+    )?;
+    let post_body = required(
+        &post_inspection.response_body,
+        "post inspection response body",
+    )?;
+    ensure!(
+        original_inspection
+            .response_sha256
+            .as_deref()
+            .is_some_and(|digest| digest == sha256_bytes(original_body.as_bytes()))
+            && post_inspection
+                .response_sha256
+                .as_deref()
+                .is_some_and(|digest| digest == sha256_bytes(post_body.as_bytes())),
+        "superseded-shard inspections are not digest-bound"
+    );
+    let original: OfflineXl2InspectResponse =
+        serde_json::from_str(original_body).context("decode original XL2 inspection")?;
+    let post: OfflineXl2InspectResponse =
+        serde_json::from_str(post_body).context("decode post-heal XL2 inspection")?;
+    let StorageRecoveryHostOperation::InspectXlMeta {
+        bucket: original_bucket,
+        object_key: original_key,
+        object_sha256: original_object_sha256,
+        version_id: original_version,
+        selected_part_number: original_part,
+        expected_mount_device_id: original_device,
+        expected_drive_uuid: original_drive,
+        ..
+    } = &original_inspection.operation
+    else {
+        bail!("superseded-shard source inspection has the wrong operation")
+    };
+    let StorageRecoveryHostOperation::InspectXlMeta {
+        bucket: post_bucket,
+        object_key: post_key,
+        object_sha256: post_object_sha256,
+        version_id: post_version,
+        selected_part_number: post_part,
+        expected_mount_device_id: post_device,
+        expected_drive_uuid: post_drive,
+        ..
+    } = &post_inspection.operation
+    else {
+        bail!("superseded-shard post inspection has the wrong operation")
+    };
+    let old_inode = mutation
+        .shard_inode
+        .context("mutation journal lacks shard inode")?;
+    let original_sha256 = required(&mutation.original_sha256, "mutation original digest")?;
+    ensure!(
+        original_bucket == post_bucket
+            && original_key == post_key
+            && original_object_sha256 == post_object_sha256
+            && original_version == post_version
+            && original_part == part_number
+            && post_part == part_number
+            && original_device == post_device
+            && original_drive == post_drive
+            && original.selected_part.part_number == *part_number
+            && post.selected_part.part_number == *part_number
+            && post.selected_part.shard_inode != old_inode
+            && post.selected_part.original_sha256 == original_sha256,
+        "post-heal inspection does not prove an exact repaired superseding shard"
+    );
+    let part = open_beneath(
+        volume_root,
+        &post.selected_part.relative_part_path,
+        libc::O_RDONLY | libc::O_CLOEXEC,
+        0,
+    )?;
+    validate_part_identity(
+        &part,
+        &post.selected_part.shard_device_id,
+        post.selected_part.shard_inode,
+        post.selected_part.shard_size_bytes,
+    )?;
+    ensure!(
+        hash_file(&part, None)? == post.selected_part.original_sha256,
+        "superseding shard changed after the sealed post-heal inspection"
+    );
+    mutation.state = JournalState::VerifiedSuperseded;
+    mutation.reason = None;
+    mutation.updated_at_ms = now_ms()?;
+    persist_journal(journal_root, &mutation)?;
+    let response = OfflineShardRecoveryResponse {
+        mutation_operation_id: mutation_operation_id.clone(),
+        outcome: crate::fault::storage_recovery_runtime::RestoreOutcome::VerifiedSuperseded,
+        observed_sha256: Some(post.selected_part.original_sha256),
+    };
     completed_receipt(
         context,
         journal_root,
@@ -795,7 +969,7 @@ fn quarantined_receipt(
     observed_sha256: Option<String>,
     started_at_ms: u64,
 ) -> Result<StorageRecoveryOperationReceipt> {
-    let response = RestoreResponse {
+    let response = OfflineShardRecoveryResponse {
         mutation_operation_id: mutation_operation_id.to_string(),
         outcome: crate::fault::storage_recovery_runtime::RestoreOutcome::Quarantined,
         observed_sha256,
@@ -842,6 +1016,8 @@ fn completed_receipt(
         operation_id: operation_id.clone(),
         context_sha256: context_sha256(context)?,
         scope_sha256: context.scope_sha256.clone(),
+        lease_uid: context.exclusive_access.kubernetes_lease.uid.clone(),
+        lease_acquired_at_ms: context.exclusive_access.kubernetes_lease.acquired_at_ms,
         holder_identity: context
             .exclusive_access
             .kubernetes_lease
@@ -1088,7 +1264,10 @@ fn ensure_no_unresolved_journals(journal_root: &File, context: &OwnedStorageCont
                 continue;
             }
             JournalState::Prepared | JournalState::Mutated
-                if journal.context_sha256 == current_context_sha256
+                if journal.lease_uid == context.exclusive_access.kubernetes_lease.uid
+                    && journal.lease_acquired_at_ms
+                        == context.exclusive_access.kubernetes_lease.acquired_at_ms
+                    && journal.context_sha256 == current_context_sha256
                     && journal.holder_identity == *current_holder => {}
             JournalState::Prepared | JournalState::Mutated => {
                 bail!(
@@ -1699,7 +1878,7 @@ mod tests {
         let mut original = [0_u8; 1];
         part.read_at(&mut original, byte_offset)
             .expect("read original");
-        let mutated_byte = original[0] ^ MUTATION_XOR_MASK;
+        let mutated_byte = original[0] ^ CONTROLLED_SHARD_XOR_MASK;
         let mutated_sha256 = hash_file(&part, Some((byte_offset, mutated_byte))).expect("hash");
         let operation_id = Uuid::new_v4().to_string();
         let journal = MutationJournal {
@@ -1707,6 +1886,8 @@ mod tests {
             operation_id: operation_id.clone(),
             context_sha256: context_sha256(&context).expect("context digest"),
             scope_sha256: context.scope_sha256.clone(),
+            lease_uid: context.exclusive_access.kubernetes_lease.uid.clone(),
+            lease_acquired_at_ms: context.exclusive_access.kubernetes_lease.acquired_at_ms,
             holder_identity: context
                 .exclusive_access
                 .kubernetes_lease

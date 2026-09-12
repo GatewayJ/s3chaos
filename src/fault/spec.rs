@@ -33,6 +33,10 @@ use crate::fault::{
     host_storage::{
         DM_FILESYSTEM_CHECK_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT,
     },
+    on_disk_bitrot::{
+        BITROT_CLEANUP_ARTIFACT, BITROT_CORRUPTION_WINDOW_ARTIFACT, BITROT_HEAL_ARTIFACT,
+        BITROT_MUTATION_ARTIFACT, BITROT_SELECTION_ARTIFACT, BITROT_WORKFLOW_ARTIFACT,
+    },
     plan::{
         ExecutionKind, ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultPlan,
         FaultSelection, FaultTarget, FaultWorkloadMode,
@@ -112,6 +116,8 @@ pub struct FaultRunScenarioSpec {
     pub validation: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub planned_qualification: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub planned_storage_qualification: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detector: Option<FaultDetectorContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,8 +290,8 @@ impl FaultRunSpec {
                 impact_policy: scenario_spec.impact_policy.as_str().to_string(),
                 boundary: scenario_spec.boundary.to_string(),
                 validation: scenario_spec.validation.to_string(),
-                planned_qualification: config.qualify_planned_admin
-                    || config.qualify_planned_storage,
+                planned_qualification: config.qualify_planned_admin,
+                planned_storage_qualification: config.qualify_planned_storage,
                 detector: Some(scenario_spec.detector.contract()),
                 ack_trigger: acknowledged_mutation_kind(&scenario.name).map(|mutation| {
                     FaultRunAckTriggerSpec {
@@ -376,17 +382,8 @@ impl FaultRunSpec {
                     "storage-recovery run-spec must not contain fault injections"
                 );
                 ensure!(
-                    *operation_timeout_seconds > 0,
-                    "storage-recovery run-spec operation timeout must be positive"
-                );
-                ensure!(
-                    case.scenario() == self.scenario.name
-                        && case.scenario() == "fresh-volume-replacement",
-                    "storage-recovery run-spec case does not match its exact planned scenario"
-                );
-                ensure!(
-                    self.scenario.planned_qualification,
-                    "storage-recovery run-spec must record explicit planned qualification"
+                    *operation_timeout_seconds > 0 && case.scenario() == self.scenario.name,
+                    "storage-recovery run-spec has the wrong case or a zero timeout"
                 );
                 Ok(ExecutionKind::StorageRecovery)
             }
@@ -490,6 +487,28 @@ impl FaultRunArtifactSpec {
                 FORCE_READ_PROOF_ARTIFACT,
                 crate::fault::fresh_volume::FRESH_VOLUME_READ_HISTORY_ARTIFACT,
                 crate::fault::fresh_volume::FRESH_VOLUME_CLEANUP_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else if scenario == crate::fault::scenarios::ON_DISK_BITROT_SCENARIO {
+            [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "checker-report.json",
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+                BITROT_SELECTION_ARTIFACT,
+                BITROT_MUTATION_ARTIFACT,
+                BITROT_CORRUPTION_WINDOW_ARTIFACT,
+                BITROT_HEAL_ARTIFACT,
+                BITROT_CLEANUP_ARTIFACT,
+                BITROT_WORKFLOW_ARTIFACT,
             ]
             .into_iter()
             .map(str::to_string)

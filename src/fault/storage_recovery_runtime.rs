@@ -391,6 +391,10 @@ pub enum StorageRecoveryHostOperation {
     RestoreShard {
         mutation_operation_id: String,
     },
+    VerifySupersededShard {
+        mutation_operation_id: String,
+        post_inspection_operation_id: String,
+    },
 }
 
 impl StorageRecoveryHostOperation {
@@ -471,6 +475,20 @@ impl StorageRecoveryHostOperation {
                     .context("storage-recovery restore operation id is not a UUID")?;
                 Ok(())
             }
+            Self::VerifySupersededShard {
+                mutation_operation_id,
+                post_inspection_operation_id,
+            } => {
+                uuid::Uuid::parse_str(mutation_operation_id)
+                    .context("storage-recovery mutation operation id is not a UUID")?;
+                uuid::Uuid::parse_str(post_inspection_operation_id)
+                    .context("storage-recovery post-inspection operation id is not a UUID")?;
+                ensure!(
+                    mutation_operation_id != post_inspection_operation_id,
+                    "superseded-shard verification requires distinct receipts"
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -479,6 +497,8 @@ impl StorageRecoveryHostOperation {
 #[serde(rename_all = "kebab-case")]
 pub enum RestoreOutcome {
     Restored,
+    AlreadyRepaired,
+    VerifiedSuperseded,
     Quarantined,
 }
 
@@ -609,6 +629,15 @@ pub fn storage_scope_sha256(context: &OwnedStorageContext) -> String {
         hasher.update([0]);
     }
     hex::encode(hasher.finalize())
+}
+
+pub(crate) fn same_storage_volume_generation(
+    left: &crate::fault::storage_recovery::StorageVolumeIdentity,
+    right: &crate::fault::storage_recovery::StorageVolumeIdentity,
+) -> bool {
+    let mut left = left.clone();
+    left.observed_at_ms = right.observed_at_ms;
+    left == *right
 }
 
 pub fn storage_lease_name(scope_sha256: &str) -> Result<String> {

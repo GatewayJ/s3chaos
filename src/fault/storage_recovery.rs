@@ -118,6 +118,22 @@ impl StorageRecoveryCase {
         }
     }
 
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FreshVolumeReplacementAutomaticReplacement => {
+                "fresh-volume-replacement-automatic-replacement"
+            }
+            Self::FreshVolumeReplacementAdminDeep => "fresh-volume-replacement-admin-deep",
+            Self::OnDiskBitrotAutomaticScanner => "on-disk-bitrot-automatic-scanner",
+            Self::OnDiskBitrotAdminDeep => "on-disk-bitrot-admin-deep",
+            Self::StaleDiskReturn => "stale-disk-return",
+        }
+    }
+
+    pub fn parse_explicit(value: &str) -> Result<Self> {
+        Self::parse(value)
+    }
+
     pub fn heal_mode(self) -> Option<HealMode> {
         match self {
             Self::FreshVolumeReplacementAutomaticReplacement => {
@@ -128,18 +144,6 @@ impl StorageRecoveryCase {
                 Some(HealMode::AdminDeep)
             }
             Self::StaleDiskReturn => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::FreshVolumeReplacementAutomaticReplacement => {
-                "fresh-volume-replacement-automatic-replacement"
-            }
-            Self::FreshVolumeReplacementAdminDeep => "fresh-volume-replacement-admin-deep",
-            Self::OnDiskBitrotAutomaticScanner => "on-disk-bitrot-automatic-scanner",
-            Self::OnDiskBitrotAdminDeep => "on-disk-bitrot-admin-deep",
-            Self::StaleDiskReturn => "stale-disk-return",
         }
     }
 

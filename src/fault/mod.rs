@@ -28,6 +28,7 @@ pub mod fixture;
 pub mod fresh_volume;
 pub mod history;
 pub(crate) mod host_storage;
+pub mod on_disk_bitrot;
 pub mod plan;
 pub mod pods;
 pub mod preflight;

@@ -47,6 +47,12 @@ pub enum StorageRecoveryCleanupProof {
     BitrotRestored {
         restore_receipt: Box<StorageRecoveryOperationReceipt>,
     },
+    BitrotAlreadyRepaired {
+        restore_receipt: Box<StorageRecoveryOperationReceipt>,
+    },
+    BitrotVerifiedSuperseded {
+        verification_receipt: Box<StorageRecoveryOperationReceipt>,
+    },
     BitrotQuarantined {
         restore_receipt: Box<StorageRecoveryOperationReceipt>,
     },
@@ -72,13 +78,16 @@ impl StorageRecoveryCleanupProof {
                         context.case,
                         StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement
                             | StorageRecoveryCase::FreshVolumeReplacementAdminDeep
+                            | StorageRecoveryCase::OnDiskBitrotAutomaticScanner
+                            | StorageRecoveryCase::OnDiskBitrotAdminDeep
                     ) && *observed_at_ms
                         >= context.exclusive_access.kubernetes_lease.acquired_at_ms,
-                    "pre-mutation abort proof is not a fresh-volume Lease-generation proof"
+                    "pre-mutation abort proof is not a supported storage Lease-generation proof"
                 );
                 Ok(())
             }
             Self::BitrotRestored { restore_receipt }
+            | Self::BitrotAlreadyRepaired { restore_receipt }
             | Self::BitrotQuarantined {
                 restore_receipt, ..
             } => {
@@ -101,10 +110,11 @@ impl StorageRecoveryCleanupProof {
                 let response: serde_json::Value =
                     serde_json::from_str(&restore_receipt.response_body)
                         .context("decode shard cleanup response")?;
-                let expected = if matches!(self, Self::BitrotRestored { .. }) {
-                    "restored"
-                } else {
-                    "quarantined"
+                let expected = match self {
+                    Self::BitrotRestored { .. } => "restored",
+                    Self::BitrotAlreadyRepaired { .. } => "already-repaired",
+                    Self::BitrotQuarantined { .. } => "quarantined",
+                    _ => unreachable!("matched a restore-receipt bitrot cleanup"),
                 };
                 ensure!(
                     response.get("outcome").and_then(serde_json::Value::as_str) == Some(expected),
@@ -115,6 +125,38 @@ impl StorageRecoveryCleanupProof {
                         "quarantined shard is durable evidence, not successful cleanup; explicit repair acknowledgement is required"
                     )
                 }
+                Ok(())
+            }
+            Self::BitrotVerifiedSuperseded {
+                verification_receipt,
+            } => {
+                ensure!(
+                    matches!(
+                        context.case,
+                        StorageRecoveryCase::OnDiskBitrotAutomaticScanner
+                            | StorageRecoveryCase::OnDiskBitrotAdminDeep
+                    ),
+                    "bitrot superseded cleanup proof is bound to another recovery case"
+                );
+                validate_receipt_operation(
+                    context,
+                    verification_receipt,
+                    |operation| {
+                        matches!(
+                            operation,
+                            StorageRecoveryHostOperation::VerifySupersededShard { .. }
+                        )
+                    },
+                    "superseded-shard verification",
+                )?;
+                let response: serde_json::Value =
+                    serde_json::from_str(&verification_receipt.response_body)
+                        .context("decode superseded-shard cleanup response")?;
+                ensure!(
+                    response.get("outcome").and_then(serde_json::Value::as_str)
+                        == Some("verified-superseded"),
+                    "superseded-shard cleanup response has the wrong terminal state"
+                );
                 Ok(())
             }
             Self::StaleDiskReattached {
@@ -202,9 +244,13 @@ impl StorageRecoveryCleanupProof {
         match self {
             Self::AbortedBeforeMutation { observed_at_ms } => *observed_at_ms,
             Self::BitrotRestored { restore_receipt }
+            | Self::BitrotAlreadyRepaired { restore_receipt }
             | Self::BitrotQuarantined {
                 restore_receipt, ..
             } => restore_receipt.completed_at_ms,
+            Self::BitrotVerifiedSuperseded {
+                verification_receipt,
+            } => verification_receipt.completed_at_ms,
             Self::StaleDiskReattached { observed_at_ms, .. }
             | Self::FreshVolumeCommitted { observed_at_ms, .. } => *observed_at_ms,
         }

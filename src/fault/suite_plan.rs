@@ -440,14 +440,10 @@ impl FaultSuitePlan {
                     operation_timeout_seconds,
                 }) => {
                     ensure!(
-                        attempt.faults.is_empty(),
-                        "fault suite plan attempt {} ({}) mixes storage recovery with fault injections",
-                        attempt.index,
-                        attempt.scenario
-                    );
-                    ensure!(
-                        case.scenario() == attempt.scenario && *operation_timeout_seconds > 0,
-                        "fault suite plan attempt {} ({}) has a mismatched storage-recovery case or timeout",
+                        attempt.faults.is_empty()
+                            && case.scenario() == attempt.scenario
+                            && *operation_timeout_seconds > 0,
+                        "fault suite plan attempt {} ({}) has an invalid storage-recovery execution",
                         attempt.index,
                         attempt.scenario
                     );
