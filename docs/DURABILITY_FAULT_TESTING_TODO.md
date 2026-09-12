@@ -568,6 +568,15 @@ Reporting only projects this typed checker result into failure-summary fields.
   pass. Terminal responses must also have no unresolved decommission entries
   or rebalance cleanup-warning entries, even if aggregate counters are clear.
 
+- [ ] PARTIAL: Add the scenario-owned `admin-decommission` operation phase.
+  Meaning: the decommission case now has a narrow staged-fixture port, bounded
+  polling and identity-safe cancel/clear sequencing, raw request/progress
+  capture, and an offline overlap contract. The contract requires a real S3
+  operation and an exact-target status request interval to intersect, rejects
+  zero movement and incomplete mutation families, and binds the version-aware
+  final checker to complete history. The catalog remains Planned until the
+  shared staged-pool executor lands and the Operator/RustFS path is qualified.
+
 - [ ] PARTIAL: Add the scenario-owned `admin-rebalance` operation phase.
   Meaning: the rebalance case now has a narrow staged-fixture port, bounded
   polling and stop-on-failure sequencing, raw request/progress capture, and an
