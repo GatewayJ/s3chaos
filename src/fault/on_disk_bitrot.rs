@@ -87,6 +87,10 @@ pub const BITROT_WORKFLOW_ARTIFACT: &str = "bitrot-workflow.json";
 pub const BITROT_ARTIFACT_SCHEMA_VERSION: u8 = 1;
 const MIN_NON_INLINE_PROBE_BYTES: u64 = 8 * 1024;
 
+fn volume_relative_object_directory(bucket: &str, object_key: &str) -> String {
+    format!("{bucket}/{object_key}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BitrotCapabilityObservation {
@@ -241,6 +245,7 @@ impl BitrotSelectionEvidence {
         self.inspection_receipt
             .validate_for(&self.context, &self.inspection_receipt.operation)?;
         let StorageRecoveryHostOperation::InspectXlMeta {
+            object_directory,
             bucket,
             object_key,
             object_sha256,
@@ -258,7 +263,9 @@ impl BitrotSelectionEvidence {
         )
         .context("decode bitrot selection inspection")?;
         ensure!(
-            bucket == &self.probe.bucket
+            object_directory
+                == &volume_relative_object_directory(&self.probe.bucket, &self.probe.object_key)
+                && bucket == &self.probe.bucket
                 && object_key == &self.probe.object_key
                 && object_sha256 == &self.probe.expected_sha256
                 && version_id == &self.probe.version_id
@@ -733,12 +740,28 @@ impl BitrotCleanupEvidence {
         validate_renewed_context(&selection.context, &self.context)?;
         self.post_inspection_receipt
             .validate_for(&self.context, &self.post_inspection_receipt.operation)?;
+        let StorageRecoveryHostOperation::InspectXlMeta {
+            object_directory,
+            bucket,
+            object_key,
+            ..
+        } = &self.post_inspection_receipt.operation
+        else {
+            bail!("bitrot post-heal receipt is not an XL2 inspection")
+        };
         let post = serde_json::from_str::<OfflineXl2InspectResponse>(
             &self.post_inspection_receipt.response_body,
         )
         .context("decode post-heal XL2 inspection")?;
         ensure!(
-            post.layout.version_id == selection.probe.version_id
+            object_directory
+                == &volume_relative_object_directory(
+                    &selection.probe.bucket,
+                    &selection.probe.object_key,
+                )
+                && bucket == &selection.probe.bucket
+                && object_key == &selection.probe.object_key
+                && post.layout.version_id == selection.probe.version_id
                 && post.drive_uuid == selection.context.volume.rustfs_drive_uuid
                 && post.selected_part.original_sha256 == mutation.original_sha256
                 && post.selected_part.original_sha256 != mutation.mutated_sha256,
@@ -862,9 +885,6 @@ pub struct BitrotLiveTargetConfig {
     pub member_pod_uids: BTreeMap<String, String>,
     pub unavailable_pods: Vec<String>,
     pub bucket: String,
-    /// Fixed RustFS bucket-data root below the helper's pre-opened volume.
-    /// The runner appends its deterministic bucket and object key.
-    pub object_directory_root: String,
     pub selected_part_number: u32,
     pub mutation_byte_offset: u64,
     pub lease_duration_seconds: u64,
@@ -997,15 +1017,8 @@ impl BitrotLiveTargetConfig {
                     .bucket
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-                && !self.object_directory_root.starts_with('/')
-                && self
-                    .object_directory_root
-                    .split('/')
-                    .all(|component| !component.is_empty()
-                        && component != "."
-                        && component != "..")
                 && self.selected_part_number > 0,
-            "bitrot object identity or contained object directory is invalid"
+            "bitrot object identity is invalid"
         );
         ensure!(
             (5..=300).contains(&self.lease_duration_seconds)
@@ -1024,6 +1037,64 @@ struct KubernetesTargetObservation {
     resource_versions: KubernetesResourceVersions,
     observed_at_ms: u64,
     target_proof_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedAdminHealAttempt {
+    path: String,
+    bucket: String,
+    object_prefix: String,
+    started_at_ms: u64,
+    client_token: Option<String>,
+}
+
+impl OwnedAdminHealAttempt {
+    fn pending(bucket: &str, started_at_ms: u64) -> Self {
+        Self {
+            path: format!("/rustfs/admin/v3/heal/{bucket}"),
+            bucket: bucket.to_string(),
+            object_prefix: String::new(),
+            started_at_ms,
+            client_token: None,
+        }
+    }
+
+    fn validate_for(&self, bucket: &str, observed_at_ms: u64) -> Result<()> {
+        ensure!(
+            self.bucket == bucket
+                && self.object_prefix.is_empty()
+                && self.path == format!("/rustfs/admin/v3/heal/{bucket}")
+                && self.started_at_ms > 0
+                && self.started_at_ms <= observed_at_ms
+                && self
+                    .client_token
+                    .as_deref()
+                    .is_none_or(|token| !token.trim().is_empty()),
+            "owned admin heal attempt is not bound to the exact bucket, prefix, and start time"
+        );
+        Ok(())
+    }
+
+    fn validate_token_cancel_response(
+        &self,
+        response: &RustfsAdminResponse,
+        observed_at_ms: u64,
+    ) -> Result<()> {
+        ensure!(
+            self.client_token.is_some() && (200..300).contains(&response.status),
+            "owned admin heal cancel lacks a token or successful HTTP response"
+        );
+        let body = serde_json::from_slice::<Value>(&response.body)
+            .context("decode owned admin heal cancel status")?;
+        ensure!(
+            matches!(
+                body.get("summary").and_then(Value::as_str),
+                Some("stopped" | "finished")
+            ) && observed_at_ms >= self.started_at_ms,
+            "owned admin heal cancel did not return a terminal status after its start"
+        );
+        Ok(())
+    }
 }
 
 fn observe_exact_kubernetes_target(
@@ -1152,7 +1223,7 @@ struct LiveOnDiskBitrotRuntime {
     heal: Option<BitrotHealEvidence>,
     cleanup: Option<BitrotCleanupEvidence>,
     baseline: Option<ExactCohortReadReceipt>,
-    admin_token: Option<String>,
+    admin_heal: Option<OwnedAdminHealAttempt>,
 }
 
 impl LiveOnDiskBitrotRuntime {
@@ -1294,7 +1365,7 @@ impl LiveOnDiskBitrotRuntime {
             heal: None,
             cleanup: None,
             baseline: None,
-            admin_token: None,
+            admin_heal: None,
         })
     }
 
@@ -1522,6 +1593,14 @@ impl LiveOnDiskBitrotRuntime {
             "scanMode": "deep"
         }))?;
         let started_at_ms = now_ms()?;
+        ensure!(
+            self.admin_heal.is_none(),
+            "admin heal ownership already exists"
+        );
+        self.admin_heal = Some(OwnedAdminHealAttempt::pending(
+            &self.target.bucket,
+            started_at_ms,
+        ));
         let response = self
             .admin
             .request(
@@ -1541,7 +1620,12 @@ impl LiveOnDiskBitrotRuntime {
             !start_body.client_token.trim().is_empty(),
             "admin heal start lacks client token"
         );
-        self.admin_token = Some(start_body.client_token.clone());
+        let owned = self
+            .admin_heal
+            .as_mut()
+            .context("admin heal start lost its pending ownership")?;
+        owned.validate_for(&self.target.bucket, completed_at_ms)?;
+        owned.client_token = Some(start_body.client_token.clone());
         loop {
             self.deadline.check()?;
             let _ = self.renew_current().await?;
@@ -1567,7 +1651,7 @@ impl LiveOnDiskBitrotRuntime {
                 .context("decode live admin heal status")?;
             match body.summary.as_str() {
                 "finished" => {
-                    self.admin_token = None;
+                    self.admin_heal = None;
                     return Ok((start, status));
                 }
                 "running" => {
@@ -1583,26 +1667,44 @@ impl LiveOnDiskBitrotRuntime {
     }
 
     async fn cancel_owned_admin(&mut self) -> Result<()> {
-        let Some(token) = self.admin_token.take() else {
+        let Some(owned) = self.admin_heal.clone() else {
             return Ok(());
         };
-        let path = format!("/rustfs/admin/v3/heal/{}", self.target.bucket);
+        owned.validate_for(&self.target.bucket, now_ms()?)?;
+        if let Some(token) = owned.client_token.as_deref() {
+            let response = self
+                .admin
+                .request(
+                    Method::POST,
+                    &owned.path,
+                    &[("forceStop", "true"), ("clientToken", token)],
+                    Vec::new(),
+                    None,
+                )
+                .await?;
+            owned.validate_token_cancel_response(&response, now_ms()?)?;
+            self.admin_heal = None;
+            return Ok(());
+        }
+
         let response = self
             .admin
             .request(
                 Method::POST,
-                &path,
-                &[("forceStop", "true"), ("clientToken", token.as_str())],
+                &owned.path,
+                &[("forceStop", "true")],
                 Vec::new(),
                 None,
             )
             .await?;
         ensure!(
             (200..300).contains(&response.status),
-            "cancel owned admin heal failed with HTTP {}",
+            "path-scoped cancel after an ambiguous admin heal start failed with HTTP {}",
             response.status
         );
-        Ok(())
+        bail!(
+            "admin heal start response was lost; exact path cancel was issued but server-token ownership cannot be reconciled"
+        )
     }
 
     async fn perform_exact_read(
@@ -1934,12 +2036,8 @@ impl OnDiskBitrotRuntimePort for LiveOnDiskBitrotRuntime {
             observation.resource_versions == context.resource_versions,
             "storage target drifted before inspection"
         );
-        let object_directory = format!(
-            "{}/{}/{}",
-            self.target.object_directory_root, probe.bucket, probe.object_key
-        );
         let operation = StorageRecoveryHostOperation::InspectXlMeta {
-            object_directory,
+            object_directory: volume_relative_object_directory(&probe.bucket, &probe.object_key),
             bucket: probe.bucket.clone(),
             object_key: probe.object_key.clone(),
             object_sha256: probe.expected_sha256.clone(),
@@ -2076,10 +2174,7 @@ impl OnDiskBitrotRuntimePort for LiveOnDiskBitrotRuntime {
         };
         let recovery_context = self.current()?.clone();
         let operation = StorageRecoveryHostOperation::InspectXlMeta {
-            object_directory: format!(
-                "{}/{}/{}",
-                self.target.object_directory_root, probe.bucket, probe.object_key
-            ),
+            object_directory: volume_relative_object_directory(&probe.bucket, &probe.object_key),
             bucket: probe.bucket.clone(),
             object_key: probe.object_key.clone(),
             object_sha256: probe.expected_sha256.clone(),
@@ -3011,6 +3106,88 @@ mod tests {
             read.classify_corruption_window(&context, &probe)
                 .expect("classification"),
             CorruptionReadVerdict::ProductFailure
+        );
+    }
+
+    #[test]
+    fn inspection_uses_the_bucket_key_below_the_exact_volume_root() {
+        let selected_context = renewed(&context(), 110);
+        let selection = selection(&selected_context);
+        let StorageRecoveryHostOperation::InspectXlMeta {
+            object_directory,
+            bucket,
+            object_key,
+            ..
+        } = &selection.inspection_receipt.operation
+        else {
+            panic!("selection must contain an XL2 inspection")
+        };
+        assert_eq!(object_directory, "bucket/object");
+        assert_eq!(
+            object_directory,
+            &volume_relative_object_directory(bucket, object_key)
+        );
+        selection.validate().expect("standard volume-relative path");
+    }
+
+    #[test]
+    fn selection_rejects_the_legacy_double_prefixed_object_root() {
+        let selected_context = renewed(&context(), 110);
+        let mut selection = selection(&selected_context);
+        let StorageRecoveryHostOperation::InspectXlMeta {
+            object_directory, ..
+        } = &mut selection.inspection_receipt.operation
+        else {
+            panic!("selection must contain an XL2 inspection")
+        };
+        *object_directory = "legacy-root/bucket/object".to_string();
+
+        let error = selection
+            .validate()
+            .expect_err("legacy double-prefixed object root must be rejected");
+        assert!(
+            error.to_string().contains("bitrot inspection is not bound"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_admin_start_retains_exact_path_cleanup_ownership() {
+        let mut owned = OwnedAdminHealAttempt::pending("s3chaos-bitrot-run-1", 100);
+        owned
+            .validate_for("s3chaos-bitrot-run-1", 101)
+            .expect("pending start is cleanup ownership");
+        assert_eq!(owned.path, "/rustfs/admin/v3/heal/s3chaos-bitrot-run-1");
+        assert!(owned.object_prefix.is_empty());
+        assert!(owned.client_token.is_none());
+        assert!(owned.validate_for("s3chaos-bitrot-run-2", 101).is_err());
+        assert!(owned.validate_for("s3chaos-bitrot-run-1", 99).is_err());
+
+        owned.client_token = Some("server-token-1".to_string());
+        owned
+            .validate_for("s3chaos-bitrot-run-1", 102)
+            .expect("received token retains the same cleanup target");
+        owned
+            .validate_token_cancel_response(
+                &RustfsAdminResponse {
+                    status: 200,
+                    request_id: Some("request-1".to_string()),
+                    body: br#"{"summary":"stopped"}"#.to_vec(),
+                },
+                103,
+            )
+            .expect("token cancel terminal status");
+        assert!(
+            owned
+                .validate_token_cancel_response(
+                    &RustfsAdminResponse {
+                        status: 200,
+                        request_id: Some("request-2".to_string()),
+                        body: br#"{"summary":"running"}"#.to_vec(),
+                    },
+                    103,
+                )
+                .is_err()
         );
     }
 
