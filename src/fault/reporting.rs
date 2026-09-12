@@ -22,7 +22,7 @@ use crate::{
         backends::lifecycle::evidence::LifecycleStatusSnapshot,
         config::FaultTestConfig,
         host_storage::DmStatusSnapshot,
-        plan::{FaultPlan, FaultSelection},
+        plan::{ExecutionPlan, FaultSelection},
         quorum::QuorumHealthObservation,
         scenarios::{FaultScenario, FaultScenarioSpec},
         workload::WorkloadPlan,
@@ -135,7 +135,7 @@ impl RunMetadata {
         config: &FaultTestConfig,
         scenario: &FaultScenario,
         spec: &FaultScenarioSpec,
-        plan: &FaultPlan,
+        plan: &ExecutionPlan,
         workload_plan: &WorkloadPlan,
         run_id: &str,
         bucket: &str,
@@ -157,20 +157,23 @@ impl RunMetadata {
             artifacts_dir: config.cluster.artifacts_dir.display().to_string(),
             fault_duration_seconds: scenario.duration.as_secs(),
             percent: plan
-                .faults()
-                .iter()
+                .injection()
+                .into_iter()
+                .flat_map(|plan| plan.faults())
                 .find_map(|fault| match fault.selection() {
                     FaultSelection::Percent(percent) => Some(percent),
                     FaultSelection::FixedTargets(_) | FaultSelection::RuntimeQuorum(_) => None,
                 }),
             fault_selection: plan
-                .faults()
-                .iter()
+                .injection()
+                .into_iter()
+                .flat_map(|plan| plan.faults())
                 .map(|fault| fault.selection().summary())
                 .collect(),
             fault_parameters: plan
-                .faults()
-                .iter()
+                .injection()
+                .into_iter()
+                .flat_map(|plan| plan.faults())
                 .map(|fault| fault.parameters().clone())
                 .collect(),
             workload_objects: workload_plan.object_count,

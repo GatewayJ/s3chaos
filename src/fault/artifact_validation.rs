@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::fault::{
     acknowledged_mutation::AcknowledgedMutationKind,
+    admin_runner::{ADMIN_WORKFLOW_ARTIFACT, AdminWorkflowEvidence},
     admin_topology::{
         ADMIN_OPERATION_ARTIFACT, ADMIN_OPERATION_PROGRESS_ARTIFACT, ADMIN_TOPOLOGY_PROOF_ARTIFACT,
         AdminAttemptIdentity, AdminAttemptWindow, AdminOperationEvidence,
@@ -46,6 +47,7 @@ use crate::fault::{
         DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS, MAX_ACK_TO_FAULT_MS,
     },
     events::{RunEvent, RunEventStatus},
+    fixture::{ADMIN_FIXTURE_ARTIFACT, AdminFixtureEvidence},
     history::{
         DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome, OperationRecord,
         validate_history_phase_boundary, validate_history_scope_and_order,
@@ -57,8 +59,8 @@ use crate::fault::{
         HostStoragePostCleanupObservation, normalized_dm_table_sha256,
     },
     plan::{
-        FaultInjection, FaultKind, FaultPlan, FaultPlanOptions, FaultSelection, FaultTarget,
-        FaultWorkloadMode,
+        ExecutionKind, ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultKind,
+        FaultPlanOptions, FaultSelection, FaultTarget, FaultWorkloadMode,
     },
     pods::fixed_volume_container_ids,
     preflight::{
@@ -638,6 +640,12 @@ fn validate_fault_artifacts_with_identity(
     identity: ArtifactIdentityPolicy<'_>,
 ) -> Result<ArtifactValidationReport> {
     let scenario_spec = scenarios::scenario_spec(&options.scenario)?;
+    if matches!(
+        options.scenario.as_str(),
+        scenarios::ADMIN_DECOMMISSION_SCENARIO | scenarios::ADMIN_REBALANCE_SCENARIO
+    ) {
+        return validate_admin_execution_artifacts(options, identity, scenario_spec.case_name);
+    }
     let ack_mutation = acknowledged_mutation_kind(&options.scenario);
     validate_conditional_recovery_stability_artifact(
         &options.artifact_root,
@@ -1168,6 +1176,163 @@ fn validate_fault_artifacts_with_identity(
     })
 }
 
+fn validate_admin_execution_artifacts(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+    case_name: &str,
+) -> Result<ArtifactValidationReport> {
+    let artifacts =
+        locate_required_artifacts(&options.artifact_root, case_name, &options.scenario)?;
+    let metadata = read_json::<RunMetadataArtifact>(required(&artifacts, "run-metadata.json")?)?;
+    ensure!(
+        metadata.scenario == options.scenario
+            && metadata.workload_objects == options.expected_workload_objects
+            && metadata.workload_concurrency == options.expected_workload_concurrency,
+        "admin run metadata does not match the selected scenario or workload"
+    );
+    if let Some(run_id) = identity.planned_run_id() {
+        ensure!(
+            metadata.run_id == run_id,
+            "admin run metadata does not match the planned attempt"
+        );
+    }
+
+    let json_spec = read_json::<FaultRunSpec>(required(&artifacts, "run-spec.json")?)?;
+    let yaml_spec = read_yaml::<FaultRunSpec>(required(&artifacts, "run-spec.yaml")?)?;
+    ensure!(
+        json_spec == yaml_spec,
+        "admin run spec JSON and YAML differ"
+    );
+    validate_run_spec(&json_spec, options)?;
+    ensure!(
+        json_spec.execution_kind()? == ExecutionKind::Admin
+            && json_spec.metadata.run_id == metadata.run_id
+            && json_spec.metadata.name == case_name,
+        "admin run spec execution or identity does not match the attempt"
+    );
+
+    let workload = read_json::<WorkloadPlan>(required(&artifacts, "workload-plan.json")?)?;
+    ensure!(
+        workload.object_count == options.expected_workload_objects
+            && workload.concurrency == options.expected_workload_concurrency
+            && workload.seed == json_spec.workload.seed,
+        "admin workload plan does not match run-spec"
+    );
+    let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
+    ensure!(!history.is_empty(), "admin history must not be empty");
+    ensure!(
+        history.iter().all(|record| {
+            record.scenario == options.scenario
+                && record
+                    .run_id
+                    .as_deref()
+                    .is_none_or(|run_id| run_id == metadata.run_id)
+        }),
+        "admin history identity does not match the attempt"
+    );
+
+    let fixture = read_json::<AdminFixtureEvidence>(required(&artifacts, ADMIN_FIXTURE_ARTIFACT)?)?;
+    fixture.validate_complete()?;
+    let workflow =
+        read_json::<AdminWorkflowEvidence>(required(&artifacts, ADMIN_WORKFLOW_ARTIFACT)?)?;
+    workflow.validate()?;
+    ensure!(
+        workflow.completed
+            && workflow.scenario == options.scenario
+            && workflow.run_id == metadata.run_id
+            && fixture.scenario == options.scenario
+            && fixture.run_id == metadata.run_id,
+        "admin fixture or workflow identity and completion do not match the attempt"
+    );
+    let proof =
+        read_json::<AdminTopologyProof>(required(&artifacts, ADMIN_TOPOLOGY_PROOF_ARTIFACT)?)?;
+    let tenant_uid = fixture
+        .observations
+        .first()
+        .map(|observation| observation.tenant_uid.clone())
+        .context("admin fixture lacks Tenant UID")?;
+    let expected_attempt = AdminAttemptIdentity {
+        run_id: metadata.run_id.clone(),
+        case_name: case_name.to_string(),
+        tenant_uid,
+    };
+    ensure!(
+        proof.attempt == expected_attempt
+            && proof
+                .tenant_pools
+                .iter()
+                .map(|pool| pool.name.as_str())
+                .collect::<BTreeSet<_>>()
+                == BTreeSet::from([
+                    fixture.plan.initial_pool_name.as_str(),
+                    fixture.plan.expansion_pool_name.as_str(),
+                ]),
+        "admin topology proof does not match the staged fixture"
+    );
+    let attempt_window = AdminAttemptWindow {
+        started_at_ms: fixture.observations[0].observed_at_ms,
+        evaluated_at_ms: workflow
+            .phases
+            .last()
+            .map(|phase| phase.ended_at_ms)
+            .context("admin workflow lacks cleanup receipt")?,
+    };
+    let case_dir = required(&artifacts, ADMIN_TOPOLOGY_PROOF_ARTIFACT)?
+        .parent()
+        .context("admin topology proof has no case directory")?;
+    validate_admin_topology_artifact_files(
+        &options.scenario,
+        &expected_attempt,
+        attempt_window,
+        case_dir,
+    )?;
+
+    let prechecker =
+        read_json::<CheckerReport>(required(&artifacts, "checker-pre-recommit-report.json")?)?;
+    validate_checker_identity("checker-pre-recommit-report.json", &prechecker, &metadata)?;
+    validate_checker_report(
+        "checker-pre-recommit-report.json",
+        &prechecker,
+        options.expected_workload_versioning,
+        &history,
+    )?;
+    let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
+    validate_checker_identity("checker-report.json", &checker, &metadata)?;
+    validate_checker_report(
+        "checker-report.json",
+        &checker,
+        options.expected_workload_versioning,
+        &history,
+    )?;
+    let recommit =
+        read_json::<RecommitReportArtifact>(required(&artifacts, "recommit-report.json")?)?;
+    ensure!(
+        recommit.failed == 0
+            && recommit.harness_errors == 0
+            && recommit.attempted == recommit.committed,
+        "admin recommit report contains unresolved writes"
+    );
+    let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
+    ensure!(
+        events
+            .iter()
+            .all(|event| { event.scenario == options.scenario && event.run_id == metadata.run_id })
+            && has_event(&events, "run", RunEventStatus::Succeeded)
+            && has_event(&events, "checker-final", RunEventStatus::Succeeded),
+        "admin run events do not prove successful completion and final checking"
+    );
+
+    Ok(ArtifactValidationReport {
+        scenario: options.scenario.clone(),
+        case_name: case_name.to_string(),
+        seed: workload.seed,
+        client_disruptions: 0,
+        recommitted: recommit.committed,
+        committed: checker.committed_puts,
+        required_artifacts: json_spec.artifacts.required,
+    })
+}
+
 fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -> Result<()> {
     ensure!(
         spec.api_version == FAULT_RUN_API_VERSION,
@@ -1189,6 +1354,14 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
         detector
             .validate()
             .context("run-spec scenario detector contract is invalid")?;
+    }
+    let execution_kind = spec.execution_kind()?;
+    let catalog = scenarios::scenario_spec(&options.scenario)?;
+    if catalog.status == crate::fault::scenarios::FaultScenarioStatus::Planned {
+        ensure!(
+            execution_kind == ExecutionKind::Admin && spec.scenario.planned_qualification,
+            "planned admin run-spec must record the explicit qualification opt-in"
+        );
     }
     validate_run_spec_catalog_contract(spec, options)?;
     ensure!(
@@ -1264,10 +1437,16 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
             == requires_filesystem_check,
         "run-spec artifacts.required filesystem-check contract does not match its fault kind"
     );
-    ensure!(
-        !spec.faults.is_empty(),
-        "run-spec must contain at least one fault"
-    );
+    if execution_kind == ExecutionKind::Admin {
+        ensure!(
+            spec.artifacts
+                .required
+                .iter()
+                .all(|name| name != "target-proof.json" && name != "fault-evidence.json"),
+            "admin run-spec must not require fabricated injection evidence"
+        );
+        return Ok(());
+    }
     for fault in &spec.faults {
         ensure!(
             fault.fault_duration_seconds > 0,
@@ -1338,33 +1517,68 @@ fn validate_run_spec_catalog_contract(
             "ACK-triggered run-spec must disable recommit and omit mixed-workload artifacts"
         );
     }
-    let artifact_fault = spec
-        .faults
-        .first()
-        .context("run-spec must contain a fault before catalog validation")?;
-    let percent = if artifact_fault.selection.kind == "percent" {
-        u8::try_from(artifact_fault.selection.value)
-            .context("run-spec percent selection exceeds u8")?
-    } else {
-        1
+    let execution_kind = spec.execution_kind()?;
+    let (duration, percent, parameters) = match execution_kind {
+        ExecutionKind::Injection => {
+            let artifact_fault = spec
+                .faults
+                .first()
+                .context("run-spec must contain a fault before catalog validation")?;
+            let percent = if artifact_fault.selection.kind == "percent" {
+                u8::try_from(artifact_fault.selection.value)
+                    .context("run-spec percent selection exceeds u8")?
+            } else {
+                1
+            };
+            (
+                artifact_fault.fault_duration_seconds,
+                percent,
+                artifact_fault.parameters.clone(),
+            )
+        }
+        ExecutionKind::Admin => {
+            let operation_timeout_seconds = match &spec.execution {
+                Some(crate::fault::spec::FaultRunExecutionSpec::Admin {
+                    operation_timeout_seconds,
+                    ..
+                }) => *operation_timeout_seconds,
+                _ => unreachable!("execution_kind validated the admin shape"),
+            };
+            (
+                operation_timeout_seconds,
+                1,
+                FaultInjectionParameters::Default,
+            )
+        }
     };
     let scenario = FaultScenario {
         name: options.scenario.clone(),
         case_name: catalog.case_name,
-        duration: Duration::from_secs(artifact_fault.fault_duration_seconds),
+        duration: Duration::from_secs(duration),
         percent,
         object_count: spec.workload.object_count,
     };
-    let plan = FaultPlan::from_scenario_with_options(
+    let plan = ExecutionPlan::from_scenario_with_options(
         &scenario,
         catalog,
         FaultPlanOptions {
             rustfs_volume_path: options.expected_rustfs_volume_path.clone(),
-            scenario_parameters: artifact_fault.parameters.clone(),
+            scenario_parameters: parameters,
         },
     )
-    .context("rebuild canonical fault plan for artifact validation")?;
-    let expected_mode = match plan.workload_mode {
+    .context("rebuild canonical execution plan for artifact validation")?;
+    ensure!(
+        plan.kind() == execution_kind,
+        "run-spec execution type does not match the catalog's canonical plan"
+    );
+    if let Some(crate::fault::spec::FaultRunExecutionSpec::Admin { topology, .. }) = &spec.execution
+    {
+        ensure!(
+            plan.admin().is_some_and(|plan| &plan.topology == topology),
+            "run-spec admin topology does not match the catalog's canonical plan"
+        );
+    }
+    let expected_mode = match plan.workload_mode() {
         FaultWorkloadMode::S3Mixed => "s3-mixed",
         FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
         FaultWorkloadMode::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
@@ -1374,12 +1588,13 @@ fn validate_run_spec_catalog_contract(
         "run-spec workload mode {:?} does not match canonical plan {expected_mode:?}",
         spec.workload.mode
     );
-    let expected_faults = plan
-        .faults()
-        .iter()
-        .enumerate()
-        .map(|(index, fault)| FaultRunFaultSpec::from_fault(index, &scenario, catalog, fault))
-        .collect::<Vec<_>>();
+    let expected_faults = plan.injection().map_or_else(Vec::new, |plan| {
+        plan.faults()
+            .iter()
+            .enumerate()
+            .map(|(index, fault)| FaultRunFaultSpec::from_fault(index, &scenario, catalog, fault))
+            .collect::<Vec<_>>()
+    });
     ensure!(
         spec.faults == expected_faults,
         "run-spec faults do not match the catalog's canonical fault plan: actual={:?} expected={expected_faults:?}",

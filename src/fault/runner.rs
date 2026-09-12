@@ -28,7 +28,7 @@ use crate::{
         events::{RunEventRecorder, RunEventStatus},
         fault_lifecycle::AppliedFault,
         history::Recorder,
-        plan::{FaultPlan, FaultPlanOptions},
+        plan::{ExecutionPlan, FaultPlan, FaultPlanOptions},
         preflight::{PreflightPhase, PreflightSummary, TargetProof},
         reporting::{
             FailureSummary, RunMetadata, write_failure_summary as persist_failure_summary,
@@ -92,9 +92,9 @@ pub(crate) async fn run_prepared_scenario_with_config_and_reference_root(
     run_id: String,
     deadline: RunDeadline,
 ) -> Result<()> {
-    let scenario = FaultScenario::from_config(&config)?;
+    let scenario = FaultScenario::from_config_for_execution(&config)?;
     let spec = scenarios::scenario_spec(&scenario.name)?;
-    let plan = FaultPlan::from_scenario_with_options(
+    let plan = ExecutionPlan::from_scenario_with_options(
         &scenario,
         spec,
         FaultPlanOptions::from_config(&config),
@@ -109,7 +109,20 @@ pub(crate) async fn run_prepared_scenario_with_config_and_reference_root(
 
     let collector =
         ArtifactCollector::with_reference_root(&config.cluster.artifacts_dir, reference_root)?;
-    let result = run_fault_case(&config, &collector, &scenario, &plan, &run_id, deadline).await;
+    let result = match &plan {
+        ExecutionPlan::Injection(fault_plan) => {
+            run_fault_case(
+                &config, &collector, &scenario, &plan, fault_plan, &run_id, deadline,
+            )
+            .await
+        }
+        ExecutionPlan::Admin(admin_plan) => {
+            crate::fault::admin_runner::run_admin_case(
+                &config, &collector, &scenario, &plan, admin_plan, &run_id, deadline,
+            )
+            .await
+        }
+    };
 
     if let Err(error) = &result {
         write_failure_summary_if_absent(
@@ -144,11 +157,19 @@ async fn run_fault_case(
     config: &FaultTestConfig,
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
+    execution_plan: &ExecutionPlan,
     plan: &FaultPlan,
     planned_run_id: &str,
     deadline: RunDeadline,
 ) -> Result<()> {
-    let context = initialize_fault_run(config, collector, scenario, plan, planned_run_id)?;
+    let context = initialize_fault_run(
+        config,
+        collector,
+        scenario,
+        execution_plan,
+        plan,
+        planned_run_id,
+    )?;
     let run = FaultRun {
         config,
         collector,
@@ -375,6 +396,7 @@ fn initialize_fault_run(
     config: &FaultTestConfig,
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
+    execution_plan: &ExecutionPlan,
     plan: &FaultPlan,
     run_id: &str,
 ) -> Result<FaultRunContext> {
@@ -402,11 +424,11 @@ fn initialize_fault_run(
         .case_dir(scenario.case_name)
         .join("run-events.jsonl");
     let events = RunEventRecorder::create(events_path, &scenario.name, &run_id)?;
-    let run_spec = FaultRunSpec::resolved(
+    let run_spec = FaultRunSpec::resolved_execution(
         config,
         scenario,
         spec,
-        plan,
+        execution_plan,
         &workload_plan,
         &run_id,
         &bucket,
@@ -422,7 +444,7 @@ fn initialize_fault_run(
             config,
             scenario,
             spec,
-            plan,
+            execution_plan,
             &workload_plan,
             &run_id,
             &bucket,

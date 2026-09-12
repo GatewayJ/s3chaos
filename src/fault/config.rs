@@ -83,6 +83,10 @@ pub struct FaultTestConfig {
     pub cluster: ClusterTestConfig,
     pub expected_context: Option<String>,
     pub destructive_enabled: bool,
+    /// Explicit single-run opt-in used to calibrate a planned admin scenario
+    /// before its catalog status is promoted. FaultSuite resolution never
+    /// consumes this flag and continues to reject every planned scenario.
+    pub qualify_planned_admin: bool,
     pub scenario: String,
     pub scenario_parameters: FaultInjectionParameters,
     pub duration: Duration,
@@ -296,6 +300,7 @@ impl FaultTestConfig {
             cluster,
             expected_context,
             destructive_enabled: env_bool(&get_env, "RUSTFS_FAULT_TEST_DESTRUCTIVE")?,
+            qualify_planned_admin: env_bool(&get_env, "RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN")?,
             scenario,
             scenario_parameters: FaultInjectionParameters::Default,
             duration: Duration::from_secs(env_u64(
@@ -772,7 +777,24 @@ mod tests {
         );
         assert_eq!(config.warp_duration, std::time::Duration::from_secs(60));
         assert!(!config.destructive_enabled);
+        assert!(!config.qualify_planned_admin);
         assert!(config.require_destructive_enabled().is_err());
+    }
+
+    #[test]
+    fn planned_admin_qualification_flag_is_explicit() {
+        let config = FaultTestConfig::from_env_with(
+            |name| match name {
+                "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("fast-csi".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN" => Some("true".to_string()),
+                _ => None,
+            },
+            "production-test-cluster".to_string(),
+        )
+        .expect("fault config");
+
+        assert!(config.qualify_planned_admin);
     }
 
     #[test]

@@ -18,11 +18,12 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::fault::{
+    admin_topology::{AdminTopologyKind, AdminTopologyPlan},
     config::{DEFAULT_RUSTFS_VOLUME_PATH, FaultTestConfig, validate_rustfs_volume_path},
     quorum::{ErasureSetShape, MAX_ERASURE_SET_SHARDS, QuorumCaseClass, QuorumVolumeBoundary},
     scenarios::{
-        CLUSTER_COLD_RESTART_SCENARIO, DISK_FULL_SCENARIO,
-        DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+        ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, CLUSTER_COLD_RESTART_SCENARIO,
+        DISK_FULL_SCENARIO, DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_SCENARIO,
@@ -53,6 +54,156 @@ pub enum FaultWorkloadMode {
     S3Mixed,
     S3MixedWithWarp,
     AckTriggeredQuietMutation,
+}
+
+/// The top-level execution route for a fault-test scenario.
+///
+/// `FaultPlan` remains the injection contract. Admin reliability cases use a
+/// distinct plan so neither the runner nor persisted artifacts need to invent
+/// a no-op fault merely to enter the common test lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionPlan {
+    Injection(FaultPlan),
+    Admin(AdminExecutionPlan),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionKind {
+    Injection,
+    Admin,
+}
+
+impl ExecutionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Injection => "injection",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminExecutionPlan {
+    pub scenario: String,
+    pub case_name: &'static str,
+    pub workload_mode: FaultWorkloadMode,
+    pub operation_timeout: Duration,
+    pub topology: AdminTopologyPlan,
+}
+
+impl ExecutionPlan {
+    pub fn from_scenario_with_options(
+        scenario: &FaultScenario,
+        spec: &FaultScenarioSpec,
+        options: FaultPlanOptions,
+    ) -> Result<Self> {
+        match scenario.name.as_str() {
+            ADMIN_DECOMMISSION_SCENARIO | ADMIN_REBALANCE_SCENARIO => {
+                ensure!(
+                    spec.backend == FaultBackend::PlannedReliabilityWorkflow,
+                    "admin scenario {} must use the planned reliability workflow backend",
+                    scenario.name
+                );
+                ensure!(
+                    scenario.name == spec.scenario,
+                    "admin scenario/spec mismatch: scenario={}, spec={}",
+                    scenario.name,
+                    spec.scenario
+                );
+                ensure!(
+                    matches!(
+                        options.scenario_parameters,
+                        FaultInjectionParameters::Default
+                    ),
+                    "admin scenario {} does not accept fault-injection parameters",
+                    scenario.name
+                );
+                Ok(Self::Admin(AdminExecutionPlan {
+                    scenario: scenario.name.clone(),
+                    case_name: scenario.case_name,
+                    workload_mode: FaultWorkloadMode::S3Mixed,
+                    operation_timeout: scenario.duration,
+                    topology: AdminTopologyPlan::for_scenario(&scenario.name)?,
+                }))
+            }
+            _ => {
+                FaultPlan::from_scenario_with_options(scenario, spec, options).map(Self::Injection)
+            }
+        }
+    }
+
+    pub fn kind(&self) -> ExecutionKind {
+        match self {
+            Self::Injection(_) => ExecutionKind::Injection,
+            Self::Admin(_) => ExecutionKind::Admin,
+        }
+    }
+
+    pub fn scenario(&self) -> &str {
+        match self {
+            Self::Injection(plan) => &plan.scenario,
+            Self::Admin(plan) => &plan.scenario,
+        }
+    }
+
+    pub fn case_name(&self) -> &'static str {
+        match self {
+            Self::Injection(plan) => plan.case_name,
+            Self::Admin(plan) => plan.case_name,
+        }
+    }
+
+    pub fn workload_mode(&self) -> FaultWorkloadMode {
+        match self {
+            Self::Injection(plan) => plan.workload_mode,
+            Self::Admin(plan) => plan.workload_mode,
+        }
+    }
+
+    pub fn injection(&self) -> Option<&FaultPlan> {
+        match self {
+            Self::Injection(plan) => Some(plan),
+            Self::Admin(_) => None,
+        }
+    }
+
+    pub fn admin(&self) -> Option<&AdminExecutionPlan> {
+        match self {
+            Self::Injection(_) => None,
+            Self::Admin(plan) => Some(plan),
+        }
+    }
+
+    pub fn requires_static_storage(&self) -> bool {
+        self.injection()
+            .is_some_and(FaultPlan::requires_static_storage)
+    }
+
+    pub fn backend_summary(&self) -> String {
+        match self {
+            Self::Injection(plan) => plan.backend_summary(),
+            Self::Admin(_) => FaultBackend::PlannedReliabilityWorkflow
+                .as_str()
+                .to_string(),
+        }
+    }
+
+    pub fn target_summary(&self) -> String {
+        match self {
+            Self::Injection(plan) => plan.target_summary(),
+            Self::Admin(plan) => match plan.topology.kind {
+                AdminTopologyKind::Decommission => format!(
+                    "owned admin pool {}",
+                    plan.topology
+                        .target_pool_name
+                        .as_deref()
+                        .expect("decommission plan has a target pool")
+                ),
+                AdminTopologyKind::Rebalance => "owned two-pool admin topology".to_string(),
+            },
+        }
+    }
 }
 
 impl FaultWorkloadMode {
@@ -1214,13 +1365,15 @@ fn resource_fault(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_RUSTFS_DATA_VOLUME, FaultInjection, FaultInjectionParameters, FaultKind, FaultPlan,
-        FaultSelection, FaultTarget, FaultWorkloadMode,
+        DEFAULT_RUSTFS_DATA_VOLUME, ExecutionKind, ExecutionPlan, FaultInjection,
+        FaultInjectionParameters, FaultKind, FaultPlan, FaultPlanOptions, FaultSelection,
+        FaultTarget, FaultWorkloadMode,
     };
     use crate::fault::{
         config::FaultTestConfig,
         quorum::{ErasureSetShape, QuorumCaseClass, QuorumVolumeBoundary},
         scenarios::{
+            ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO,
             DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
             DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
             DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
@@ -1693,5 +1846,57 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn admin_scenarios_have_a_distinct_execution_plan_without_faults() {
+        for name in [ADMIN_REBALANCE_SCENARIO, ADMIN_DECOMMISSION_SCENARIO] {
+            let spec = scenario_spec(name).expect("catalog spec");
+            let scenario = FaultScenario {
+                name: name.to_string(),
+                case_name: spec.case_name,
+                duration: Duration::from_secs(60),
+                percent: 1,
+                object_count: 40,
+            };
+
+            let plan = ExecutionPlan::from_scenario_with_options(
+                &scenario,
+                spec,
+                FaultPlanOptions::default(),
+            )
+            .expect("admin execution plan");
+
+            assert_eq!(plan.kind(), ExecutionKind::Admin);
+            assert!(plan.injection().is_none());
+            assert_eq!(plan.scenario(), name);
+            assert!(!plan.target_summary().is_empty());
+        }
+    }
+
+    #[test]
+    fn admin_plan_rejects_injection_parameters() {
+        let spec = scenario_spec(ADMIN_REBALANCE_SCENARIO).expect("catalog spec");
+        let scenario = FaultScenario {
+            name: ADMIN_REBALANCE_SCENARIO.to_string(),
+            case_name: spec.case_name,
+            duration: Duration::from_secs(60),
+            percent: 1,
+            object_count: 40,
+        };
+        let error = ExecutionPlan::from_scenario_with_options(
+            &scenario,
+            spec,
+            FaultPlanOptions {
+                scenario_parameters: FaultInjectionParameters::NetworkLoss {
+                    loss_percent: 1,
+                    correlation_percent: 0,
+                },
+                ..FaultPlanOptions::default()
+            },
+        )
+        .expect_err("admin plan must not hide injection parameters");
+
+        assert!(error.to_string().contains("does not accept"));
     }
 }
