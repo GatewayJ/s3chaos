@@ -29,6 +29,7 @@ use std::{
         unix::{fs::MetadataExt, prelude::FileExt},
     },
     path::{Path, PathBuf},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -40,9 +41,10 @@ use uuid::Uuid;
 use crate::fault::{
     storage_recovery_lease::StorageRecoveryCleanupProof,
     storage_recovery_runtime::{
-        OwnedStorageContext, STORAGE_RECOVERY_HOST_LOCK_DIRECTORY, StorageHelperInvocation,
-        StorageRecoveryHostOperation, StorageRecoveryOperationReceipt, context_sha256,
-        same_storage_volume_generation,
+        DeviceMapperCommandReceipt, OwnedStorageContext, STORAGE_RECOVERY_HOST_LOCK_DIRECTORY,
+        StaleDeviceMapperAction, StaleDeviceMapperPlan, StaleDeviceMapperTransitionResponse,
+        StorageHelperInvocation, StorageRecoveryHostOperation, StorageRecoveryOperationReceipt,
+        context_sha256, host_generation_sha256, same_storage_volume_generation,
     },
     xl2_inspector::{inspect_xl_meta, validate_format_json_drive},
 };
@@ -327,7 +329,13 @@ impl StorageHelperSession {
             ),
             StorageRecoveryHostOperation::DetachDeviceMapper { .. }
             | StorageRecoveryHostOperation::ReattachDeviceMapper { .. } => {
-                bail!("unqualified: operation has no safe storage-helper implementation")
+                self.destructive_mutation_started = true;
+                transition_device_mapper(
+                    &invocation.context,
+                    &self.journal_root,
+                    &invocation.operation,
+                    started_at_ms,
+                )
             }
         }
     }
@@ -347,6 +355,201 @@ impl StorageHelperSession {
         );
         cleanup.validate_for(context)
     }
+}
+
+fn transition_device_mapper(
+    context: &OwnedStorageContext,
+    journal_root: &File,
+    operation: &StorageRecoveryHostOperation,
+    started_at_ms: u64,
+) -> Result<StorageRecoveryOperationReceipt> {
+    ensure!(
+        context.case == crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn,
+        "device-mapper transition is restricted to stale-disk-return"
+    );
+    let (action, mapping_name, generation_sha256, recovery_table, isolation_table) = match operation
+    {
+        StorageRecoveryHostOperation::DetachDeviceMapper {
+            mapping_name,
+            expected_generation_sha256,
+            recovery_table,
+            isolation_table,
+        } => (
+            StaleDeviceMapperAction::Isolate,
+            mapping_name,
+            expected_generation_sha256,
+            recovery_table,
+            isolation_table,
+        ),
+        StorageRecoveryHostOperation::ReattachDeviceMapper {
+            mapping_name,
+            expected_generation_sha256,
+            recovery_table,
+            isolation_table,
+        } => (
+            StaleDeviceMapperAction::Reattach,
+            mapping_name,
+            expected_generation_sha256,
+            recovery_table,
+            isolation_table,
+        ),
+        _ => unreachable!("transition_device_mapper receives only DM operations"),
+    };
+    let plan = StaleDeviceMapperPlan::new(
+        mapping_name,
+        generation_sha256,
+        recovery_table,
+        isolation_table,
+    )?;
+    ensure!(
+        host_generation_sha256(&context.host_generation)? == *generation_sha256
+            && context.host_generation.device_mapper_table_sha256 == plan.recovery_table_sha256,
+        "device-mapper transition is not bound to the owned host generation"
+    );
+    let (expected_before, target_table) = match action {
+        StaleDeviceMapperAction::Isolate => (&plan.recovery_table, &plan.isolation_table),
+        StaleDeviceMapperAction::Reattach => (&plan.isolation_table, &plan.recovery_table),
+    };
+    let mut commands = Vec::with_capacity(5);
+    let before = run_dmsetup(&["table", "--showkeys", mapping_name])?;
+    let observed_before = canonical_table(&before.stdout)?;
+    commands.push(before);
+    ensure!(
+        observed_before == *expected_before,
+        "device-mapper table drifted before stale transition"
+    );
+
+    let mut transition_started = false;
+    let transition_result = (|| -> Result<()> {
+        let suspend = run_dmsetup(&["suspend", "--noflush", mapping_name])?;
+        transition_started = suspend.exit_code == 0;
+        require_dm_success(&suspend, "suspend")?;
+        commands.push(suspend);
+
+        let reload = run_dmsetup(&["reload", mapping_name, "--table", target_table])?;
+        require_dm_success(&reload, "reload")?;
+        commands.push(reload);
+
+        let resume = run_dmsetup(&["resume", mapping_name])?;
+        require_dm_success(&resume, "resume")?;
+        commands.push(resume);
+        Ok(())
+    })();
+    if let Err(primary) = transition_result {
+        if transition_started {
+            let recovery = recover_dm_linear(mapping_name, &plan.recovery_table);
+            return match recovery {
+                Ok(()) => Err(primary.context("stale DM transition failed; linear table restored")),
+                Err(recovery_error) => Err(primary.context(format!(
+                    "stale DM transition failed and bounded linear restore also failed: {recovery_error:#}"
+                ))),
+            };
+        }
+        return Err(primary);
+    }
+
+    let after = run_dmsetup(&["table", "--showkeys", mapping_name])?;
+    let observed_after = canonical_table(&after.stdout)?;
+    require_dm_success(&after, "post-transition table query")?;
+    commands.push(after);
+    if observed_after != *target_table {
+        let primary = anyhow::anyhow!("device-mapper post-transition table differs from target");
+        return match recover_dm_linear(mapping_name, &plan.recovery_table) {
+            Ok(()) => Err(primary.context("linear table restored after verification failure")),
+            Err(recovery_error) => Err(primary.context(format!(
+                "bounded linear restore failed after verification failure: {recovery_error:#}"
+            ))),
+        };
+    }
+    let response = StaleDeviceMapperTransitionResponse {
+        action,
+        mapping_name: mapping_name.clone(),
+        generation_sha256: generation_sha256.clone(),
+        before_table: observed_before.clone(),
+        before_table_sha256: sha256_bytes(observed_before.as_bytes()),
+        after_table: observed_after.clone(),
+        after_table_sha256: sha256_bytes(observed_after.as_bytes()),
+        commands,
+    };
+    completed_receipt(
+        context,
+        journal_root,
+        operation.clone(),
+        &response,
+        started_at_ms,
+    )
+}
+
+fn run_dmsetup(args: &[&str]) -> Result<DeviceMapperCommandReceipt> {
+    let started_at_ms = now_ms()?;
+    let output = Command::new("timeout")
+        .args(["--signal=KILL", "5s", "dmsetup"])
+        .args(args)
+        .output()
+        .context("execute bounded dmsetup command")?;
+    let completed_at_ms = now_ms()?;
+    Ok(DeviceMapperCommandReceipt {
+        argv: std::iter::once("dmsetup".to_string())
+            .chain(args.iter().map(|arg| (*arg).to_string()))
+            .collect(),
+        exit_code: output.status.code().unwrap_or(137),
+        stdout: String::from_utf8(output.stdout).context("dmsetup stdout is not UTF-8")?,
+        stderr: String::from_utf8(output.stderr).context("dmsetup stderr is not UTF-8")?,
+        started_at_ms,
+        completed_at_ms,
+    })
+}
+
+fn require_dm_success(receipt: &DeviceMapperCommandReceipt, action: &str) -> Result<()> {
+    ensure!(
+        receipt.exit_code == 0 && receipt.stderr.trim().is_empty(),
+        "dmsetup {action} failed: exit={} stderr={:?}",
+        receipt.exit_code,
+        receipt.stderr
+    );
+    Ok(())
+}
+
+fn canonical_table(table: &str) -> Result<String> {
+    ensure!(
+        !table.contains('\n') || table.trim_end().lines().count() == 1,
+        "device-mapper table contains multiple targets"
+    );
+    let canonical = table.split_whitespace().collect::<Vec<_>>().join(" ");
+    ensure!(!canonical.is_empty(), "device-mapper table is empty");
+    Ok(canonical)
+}
+
+fn recover_dm_linear(mapping_name: &str, recovery_table: &str) -> Result<()> {
+    let state = run_dmsetup(&[
+        "info",
+        "--columns",
+        "--noheadings",
+        "--options",
+        "suspended",
+        mapping_name,
+    ])?;
+    require_dm_success(&state, "recovery state query")?;
+    let suspended = match state.stdout.trim().to_ascii_lowercase().as_str() {
+        "suspended" | "yes" | "y" | "1" => true,
+        "active" | "no" | "n" | "0" => false,
+        other => bail!("bounded DM recovery observed unsupported state {other:?}"),
+    };
+    if !suspended {
+        let suspend = run_dmsetup(&["suspend", "--noflush", mapping_name])?;
+        require_dm_success(&suspend, "recovery suspend")?;
+    }
+    let reload = run_dmsetup(&["reload", mapping_name, "--table", recovery_table])?;
+    require_dm_success(&reload, "recovery reload")?;
+    let resume = run_dmsetup(&["resume", mapping_name])?;
+    require_dm_success(&resume, "recovery resume")?;
+    let observed = run_dmsetup(&["table", "--showkeys", mapping_name])?;
+    require_dm_success(&observed, "recovery table query")?;
+    ensure!(
+        canonical_table(&observed.stdout)? == recovery_table,
+        "bounded DM recovery did not restore the exact linear table"
+    );
+    Ok(())
 }
 
 fn validate_session_context(

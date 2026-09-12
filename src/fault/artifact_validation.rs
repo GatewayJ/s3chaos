@@ -96,9 +96,11 @@ use crate::fault::{
         FaultRunFaultSpec, FaultRunSpec, FaultRunTargetSpec,
     },
     storage_recovery::{
-        DISK_GENERATION_PROOF_ARTIFACT, FORCE_READ_PROOF_ARTIFACT, FreshVolumeReplacementProof,
-        HEAL_PROGRESS_ARTIFACT, HEAL_SUMMARY_ARTIFACT, HealProgressSample, HealSummary,
-        VERSION_SHARD_MAPPING_ARTIFACT, VersionShardMappingObservation,
+        DANGLING_CLEANUP_PROOF_ARTIFACT, DISK_GENERATION_PROOF_ARTIFACT,
+        FORCE_READ_PROOF_ARTIFACT, FreshVolumeReplacementProof, HEAL_PROGRESS_ARTIFACT,
+        HEAL_SUMMARY_ARTIFACT, HealProgressSample, HealSummary, SHARD_INVENTORY_AFTER_ARTIFACT,
+        SHARD_INVENTORY_BEFORE_ARTIFACT, ShardInventorySnapshot, StaleDiskReturnProof,
+        StorageRecoveryCase, VERSION_SHARD_MAPPING_ARTIFACT, VersionShardMappingObservation,
     },
     storage_recovery_runner::{
         STORAGE_RECOVERY_WORKFLOW_ARTIFACT, StorageRecoveryWorkflowEvidence,
@@ -678,6 +680,9 @@ fn validate_fault_artifacts_with_identity(
     }
     if options.scenario == scenarios::ON_DISK_BITROT_SCENARIO {
         return validate_on_disk_bitrot_artifacts(options, identity, scenario_spec.case_name);
+    }
+    if options.scenario == scenarios::STALE_DISK_RETURN_DETECT_SCENARIO {
+        return validate_stale_disk_execution_artifacts(options, identity, scenario_spec.case_name);
     }
     let ack_mutation = acknowledged_mutation_kind(&options.scenario);
     validate_conditional_recovery_stability_artifact(
@@ -1844,6 +1849,111 @@ fn validate_storage_recovery_execution_artifacts(
         seed: workload.seed,
         client_disruptions: 0,
         recommitted: recommit.committed,
+        committed: checker.committed_puts,
+        required_artifacts: json_spec.artifacts.required,
+    })
+}
+
+fn validate_stale_disk_execution_artifacts(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+    case_name: &str,
+) -> Result<ArtifactValidationReport> {
+    let artifacts =
+        locate_required_artifacts(&options.artifact_root, case_name, &options.scenario)?;
+    let metadata = read_json::<RunMetadataArtifact>(required(&artifacts, "run-metadata.json")?)?;
+    ensure!(
+        metadata.scenario == options.scenario
+            && metadata.workload_objects == options.expected_workload_objects
+            && metadata.workload_concurrency == options.expected_workload_concurrency,
+        "stale-disk run metadata does not match the selected scenario or workload"
+    );
+    if let Some(run_id) = identity.planned_run_id() {
+        ensure!(
+            metadata.run_id == run_id,
+            "stale-disk run metadata does not match the planned attempt"
+        );
+    }
+    let json_spec = read_json::<FaultRunSpec>(required(&artifacts, "run-spec.json")?)?;
+    let yaml_spec = read_yaml::<FaultRunSpec>(required(&artifacts, "run-spec.yaml")?)?;
+    ensure!(
+        json_spec == yaml_spec,
+        "stale-disk run spec JSON and YAML differ"
+    );
+    validate_run_spec(&json_spec, options)?;
+    ensure!(
+        matches!(
+            &json_spec.execution,
+            Some(crate::fault::spec::FaultRunExecutionSpec::StorageRecovery {
+                case: StorageRecoveryCase::StaleDiskReturn,
+                operation_timeout_seconds,
+            }) if *operation_timeout_seconds > 0
+        ) && json_spec.metadata.run_id == metadata.run_id
+            && json_spec.metadata.name == case_name,
+        "stale-disk run spec execution or identity does not match the attempt"
+    );
+    let workload = read_json::<WorkloadPlan>(required(&artifacts, "workload-plan.json")?)?;
+    ensure!(
+        workload.object_count == options.expected_workload_objects
+            && workload.concurrency == options.expected_workload_concurrency
+            && workload.seed == json_spec.workload.seed,
+        "stale-disk workload plan does not match run-spec"
+    );
+    let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
+    validate_history_scope_and_order(
+        &history,
+        &options.scenario,
+        &metadata.run_id,
+        &json_spec.metadata.bucket,
+    )?;
+    let stale =
+        read_json::<StaleDiskReturnProof>(required(&artifacts, DISK_GENERATION_PROOF_ARTIFACT)?)?;
+    stale.validate_against_history(&history)?;
+    ensure!(
+        stale.identity.run_id == metadata.run_id
+            && stale.identity.case_name == case_name
+            && stale.identity.bucket == json_spec.metadata.bucket,
+        "disk-generation proof does not match the run identity"
+    );
+    let before = read_json::<ShardInventorySnapshot>(required(
+        &artifacts,
+        SHARD_INVENTORY_BEFORE_ARTIFACT,
+    )?)?;
+    let after =
+        read_json::<ShardInventorySnapshot>(required(&artifacts, SHARD_INVENTORY_AFTER_ARTIFACT)?)?;
+    let cleanup =
+        read_json::<DanglingCleanupProof>(required(&artifacts, DANGLING_CLEANUP_PROOF_ARTIFACT)?)?;
+    cleanup.validate_against_stale_return(&stale, &before, &after, &history)?;
+    let host =
+        read_json::<HostStorageMutationProof>(required(&artifacts, HOST_STORAGE_PROOF_ARTIFACT)?)?;
+    host.validate()?;
+    ensure!(
+        host.scenario == options.scenario && host.run_id == metadata.run_id,
+        "host-storage proof does not match the stale-disk run"
+    );
+    let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
+    validate_checker_identity("checker-report.json", &checker, &metadata)?;
+    validate_checker_report(
+        "checker-report.json",
+        &checker,
+        options.expected_workload_versioning,
+        &history,
+    )?;
+    let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
+    ensure!(
+        events
+            .iter()
+            .all(|event| { event.scenario == options.scenario && event.run_id == metadata.run_id })
+            && has_event(&events, "run", RunEventStatus::Succeeded)
+            && has_event(&events, "checker-final", RunEventStatus::Succeeded),
+        "stale-disk events do not prove successful completion and final checking"
+    );
+    Ok(ArtifactValidationReport {
+        scenario: options.scenario.clone(),
+        case_name: case_name.to_string(),
+        seed: workload.seed,
+        client_disruptions: 0,
+        recommitted: 0,
         committed: checker.committed_puts,
         required_artifacts: json_spec.artifacts.required,
     })

@@ -31,11 +31,11 @@ use crate::{
     fault::{
         config::FaultTestConfig,
         host_storage::{
-            DM_FILESYSTEM_CHECK_ARTIFACT, DM_FILESYSTEM_CHECK_SCHEMA_VERSION, DmFilesystemCheck,
-            HOST_STORAGE_PROOF_ARTIFACT, HostStorageAllowlist, HostStorageMutationIntent,
-            HostStorageMutationProof, HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
-            HostStoragePostCleanupObservation, HostStorageTargetObservation,
-            normalized_dm_table_sha256,
+            DM_FILESYSTEM_CHECK_ARTIFACT, DM_FILESYSTEM_CHECK_SCHEMA_VERSION, DM_STALE_RETURN_KIND,
+            DmFilesystemCheck, HOST_STORAGE_PROOF_ARTIFACT, HostStorageAllowlist,
+            HostStorageMutationIntent, HostStorageMutationProof, HostStorageNodeSelector,
+            HostStoragePersistentVolumeClaimRef, HostStoragePostCleanupObservation,
+            HostStorageTargetObservation, normalized_dm_table_sha256,
         },
         plan::{FaultInjection, FaultKind},
         scenarios::FaultScenario,
@@ -112,6 +112,7 @@ printf '%s\n' 's3chaos-dm-activation-complete'
 enum DmFaultBehavior {
     ErrorInjection,
     DropWritesCrash,
+    StaleEio,
 }
 
 impl DmFaultBehavior {
@@ -417,6 +418,97 @@ pub struct DmFlakeySpec<'a> {
     pub fault_table: Option<&'a str>,
     pub recovery_table: Option<&'a str>,
     pub run_id: &'a str,
+}
+
+pub(crate) fn preflight_stale_disk_mutation(
+    config: &FaultTestConfig,
+    scenario: &FaultScenario,
+    run_id: &str,
+) -> Result<HostStorageMutationProof> {
+    ensure!(
+        scenario.name == crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO,
+        "stale device-mapper preflight is bound to another scenario"
+    );
+    let spec = stale_dm_spec(config, run_id)?;
+    validate_stale_config(config, &spec)?;
+    let observer_pod = config
+        .dm_observer_pod
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_POD is required")?;
+    let observer_namespace = config
+        .dm_observer_namespace
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE is required")?;
+    let observation = observe_dm_target_read_only(
+        &config.cluster,
+        &spec,
+        &config.rustfs_volume_path,
+        observer_namespace,
+        observer_pod,
+    )?;
+    HostStorageMutationProof::prove_device_mapper(
+        HostStorageMutationIntent {
+            scenario: scenario.name.clone(),
+            fault_name: "stale-disk-eio".to_string(),
+            fault_kind: DM_STALE_RETURN_KIND.to_string(),
+            run_id: run_id.to_string(),
+            context: config.cluster.context.clone(),
+            namespace: config.cluster.test_namespace.clone(),
+            tenant: config.cluster.tenant_name.clone(),
+            observer_namespace: observer_namespace.to_string(),
+            observer_pod: observer_pod.to_string(),
+            backend_specific_destructive_opt_in: config.device_mapper_destructive_enabled,
+            allowlist: HostStorageAllowlist {
+                nodes: config.host_mutation_allowed_nodes.clone(),
+                devices: config.host_mutation_allowed_devices.clone(),
+                persistent_volumes: config.host_mutation_allowed_persistent_volumes.clone(),
+            },
+            fault_table: None,
+        },
+        observation,
+    )
+}
+
+fn validate_stale_config(config: &FaultTestConfig, spec: &DmFlakeySpec<'_>) -> Result<()> {
+    ensure!(
+        config.device_mapper_destructive_enabled,
+        "stale device-mapper mutation requires RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE=1"
+    );
+    let observer_pod = config
+        .dm_observer_pod
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_POD is required")?;
+    let observer_namespace = config
+        .dm_observer_namespace
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE is required")?;
+    ensure!(
+        observer_namespace != config.cluster.test_namespace,
+        "stale storage helper must be outside the disposable Tenant namespace"
+    );
+    ensure!(
+        !observer_pod.trim().is_empty(),
+        "stale storage helper Pod name is empty"
+    );
+    require_exact_config_allowlist(
+        "RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST",
+        &config.host_mutation_allowed_nodes,
+        spec.node,
+    )?;
+    require_exact_config_allowlist(
+        "RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST",
+        &config.host_mutation_allowed_devices,
+        &format!("/dev/mapper/{}", spec.name),
+    )?;
+    ensure!(
+        config.host_mutation_allowed_persistent_volumes.len() == 1
+            && !config.host_mutation_allowed_persistent_volumes[0]
+                .trim()
+                .is_empty(),
+        "RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST must contain exactly one PV"
+    );
+    HostMutationLease::from_config(config, "stale-preflight")?;
+    Ok(())
 }
 
 pub(crate) struct FaultApplyRequest<'a> {
@@ -839,7 +931,7 @@ fn dm_flakey_spec<'a>(
                 .as_deref()
                 .context("RUSTFS_FAULT_TEST_DM_FAULT_TABLE is required for dm-flakey")?,
         ),
-        DmFaultBehavior::DropWritesCrash => None,
+        DmFaultBehavior::DropWritesCrash | DmFaultBehavior::StaleEio => None,
     };
     let node = config
         .dm_node
@@ -859,6 +951,12 @@ fn dm_flakey_spec<'a>(
         recovery_table: config.dm_recovery_table.as_deref(),
         run_id,
     })
+}
+
+fn stale_dm_spec<'a>(config: &'a FaultTestConfig, run_id: &'a str) -> Result<DmFlakeySpec<'a>> {
+    let mut spec = dm_flakey_spec(config, run_id, DmFaultBehavior::StaleEio)?;
+    spec.recovery_table = config.dm_recovery_table.as_deref();
+    Ok(spec)
 }
 
 pub fn apply_dm_flakey(
@@ -1203,7 +1301,7 @@ impl DmFlakeyGuard {
         };
         let recovery_table = self.recovery_table.clone();
         let suspend_mode = match self.behavior {
-            DmFaultBehavior::ErrorInjection => DmSuspendMode::NoFlush,
+            DmFaultBehavior::ErrorInjection | DmFaultBehavior::StaleEio => DmSuspendMode::NoFlush,
             DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
         };
         if let Err(error) = self.mutation_lease.set_phase(HostMutationPhase::Rollback) {
@@ -2032,7 +2130,9 @@ impl Drop for DmFlakeyGuard {
                     );
                 }
                 let mode = match self.behavior {
-                    DmFaultBehavior::ErrorInjection => DmSuspendMode::NoFlush,
+                    DmFaultBehavior::ErrorInjection | DmFaultBehavior::StaleEio => {
+                        DmSuspendMode::NoFlush
+                    }
                     DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
                 };
                 match self

@@ -572,6 +572,17 @@ pub enum RawDiskStateResponse {
         mount_path: String,
         canonical_device: String,
     },
+    HostIoProbe {
+        execution: HostExecutionIdentity,
+        relative_path: String,
+        openat2_resolve_flags: Vec<String>,
+        requested_bytes: usize,
+        bytes_read: usize,
+        errno: Option<i32>,
+        observed_at_ms: u64,
+        mount_path: String,
+        canonical_device: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -787,6 +798,34 @@ impl RawDiskStateEvidence {
                         && argv == expected_argv
                         && command_result_matches,
                     "raw target-node findmnt result does not prove the claimed disk state"
+                );
+            }
+            RawDiskStateResponse::HostIoProbe {
+                execution,
+                relative_path,
+                openat2_resolve_flags,
+                requested_bytes,
+                bytes_read,
+                errno,
+                observed_at_ms: raw_observed_at_ms,
+                mount_path,
+                canonical_device,
+            } => {
+                execution.validate_for(volume)?;
+                let result_matches = match state {
+                    DiskPresenceState::Present => bytes_read == 1 && errno.is_none(),
+                    DiskPresenceState::Absent => bytes_read == 0 && errno == Some(libc::EIO),
+                };
+                ensure!(
+                    cursor == self.response_sha256
+                        && raw_observed_at_ms == observed_at_ms
+                        && mount_path == volume.mount_path
+                        && canonical_device == volume.canonical_device
+                        && relative_path == ".rustfs.sys/format.json"
+                        && openat2_resolve_flags == ["NO_XDEV", "NO_SYMLINKS", "BENEATH"]
+                        && requested_bytes == 1
+                        && result_matches,
+                    "raw host-helper probe does not prove the claimed continuous EIO disk state"
                 );
             }
         }
@@ -4079,7 +4118,81 @@ pub struct DanglingCleanupProof {
     pub writes_quiesced_at_ms: u64,
     pub started_at_ms: u64,
     pub completed_at_ms: u64,
+    pub ack_loss_puts: Vec<AckLossPutEvidence>,
     pub classified_versions: Vec<ClassifiedVersionFragments>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AckLossPutEvidence {
+    pub operation_id: String,
+    pub proxy_endpoint: String,
+    pub request_count: usize,
+    pub retries_disabled: bool,
+    pub request_sha256: String,
+    pub value_sha256: String,
+    pub size_bytes: usize,
+    pub upstream_http_status: u16,
+    pub upstream_request_id: String,
+    pub upstream_version_id: String,
+    pub accepted_at_ms: u64,
+    pub upstream_completed_at_ms: u64,
+    pub client_response_bytes: usize,
+    pub connection_closed_at_ms: u64,
+}
+
+impl AckLossPutEvidence {
+    fn validate_for(
+        &self,
+        identity: &StorageRecoveryArtifactIdentity,
+        record: &OperationRecord,
+    ) -> Result<()> {
+        let endpoint = self
+            .proxy_endpoint
+            .parse::<std::net::SocketAddr>()
+            .context("ACK-loss proxy endpoint is not a socket address")?;
+        validate_sha256("ACK-loss request", &self.request_sha256)?;
+        validate_sha256("ACK-loss value", &self.value_sha256)?;
+        ensure!(
+            endpoint.ip().is_loopback()
+                && endpoint.port() > 0
+                && self.request_count == 1
+                && self.retries_disabled
+                && (200..300).contains(&self.upstream_http_status)
+                && !self.upstream_request_id.trim().is_empty()
+                && !self.upstream_version_id.trim().is_empty()
+                && self.upstream_version_id != "null"
+                && self.client_response_bytes == 0,
+            "recoverable-unknown evidence is not a one-shot localhost ACK-loss PUT"
+        );
+        ensure!(
+            self.operation_id == record.id
+                && record_matches_identity(record, identity)
+                && record.kind == OperationKind::Put
+                && matches!(
+                    record.outcome,
+                    OperationOutcome::Timeout
+                        | OperationOutcome::Unknown
+                        | OperationOutcome::Failed
+                )
+                && record.http_status.is_none()
+                && record.key.is_some()
+                && record.value_sha256.as_deref() == Some(self.value_sha256.as_str())
+                && record.size_bytes == Some(self.size_bytes)
+                && record.version_id.as_deref().is_none_or(|version_id| {
+                    version_id == "null" || version_id == self.upstream_version_id
+                }),
+            "ACK-loss receipt does not bind the ambiguous workload PUT"
+        );
+        ensure!(
+            record.started_at_ms <= self.accepted_at_ms
+                && self.accepted_at_ms <= self.upstream_completed_at_ms
+                && self.upstream_completed_at_ms <= self.connection_closed_at_ms
+                && self.connection_closed_at_ms <= record.ended_at_ms,
+            "ACK-loss proxy and workload operation intervals are not ordered"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4249,6 +4362,15 @@ impl DanglingCleanupProof {
         let mut classified_versions = BTreeSet::new();
         let mut classification_evidence_ids = BTreeSet::new();
         let mut protected_operation_ids = BTreeSet::new();
+        let ack_loss_by_operation = self
+            .ack_loss_puts
+            .iter()
+            .map(|evidence| (evidence.operation_id.as_str(), evidence))
+            .collect::<HashMap<_, _>>();
+        ensure!(
+            ack_loss_by_operation.len() == self.ack_loss_puts.len(),
+            "dangling-cleanup proof contains duplicate ACK-loss operation receipts"
+        );
         for version in &self.classified_versions {
             ensure!(
                 !version.evidence_id.trim().is_empty()
@@ -4361,6 +4483,17 @@ impl DanglingCleanupProof {
                             }),
                         "recoverable-unknown fragments are not backed by an ambiguous write outcome"
                     );
+                    ack_loss_by_operation
+                        .get(record.id.as_str())
+                        .context(
+                            "recoverable-unknown fragments lack a one-shot ACK-loss proxy receipt",
+                        )?
+                        .validate_for(&self.identity, record)?;
+                    ensure!(
+                        ack_loss_by_operation[record.id.as_str()].upstream_version_id
+                            == version.version_id,
+                        "ACK-loss upstream version does not match the classified inventory version"
+                    );
                     if record
                         .version_id
                         .as_deref()
@@ -4469,6 +4602,12 @@ impl DanglingCleanupProof {
         ensure!(
             protected_operation_ids == relevant_protected_operations,
             "fragment classifications do not exactly cover successful and ambiguous writes represented in the inventory"
+        );
+        ensure!(
+            self.ack_loss_puts.iter().all(|evidence| {
+                protected_operation_ids.contains(evidence.operation_id.as_str())
+            }),
+            "ACK-loss receipts contain an operation not protected by the inventory classification"
         );
         ensure!(
             after_response
@@ -6561,7 +6700,9 @@ mod tests {
             let mut raw =
                 serde_json::from_str::<RawDiskStateResponse>(&sample.raw_evidence.response_body)
                     .expect("raw host response");
-            let RawDiskStateResponse::HostDevice { execution, .. } = &mut raw;
+            let RawDiskStateResponse::HostDevice { execution, .. } = &mut raw else {
+                unreachable!("fixture uses host-device evidence")
+            };
             execution.node = "wrong-node".to_string();
             sample.raw_evidence.response_body =
                 serde_json::to_string(&raw).expect("raw host response");
@@ -6587,7 +6728,9 @@ mod tests {
                     &sample.raw_evidence.response_body,
                 )
                 .expect("raw host response");
-                let RawDiskStateResponse::HostDevice { execution, .. } = &mut raw;
+                let RawDiskStateResponse::HostDevice { execution, .. } = &mut raw else {
+                    unreachable!("fixture uses host-device evidence")
+                };
                 let mut helper =
                     serde_json::from_str::<serde_json::Value>(&execution.helper_pod_body)
                         .expect("raw helper Pod");
@@ -8596,6 +8739,22 @@ mod tests {
             writes_quiesced_at_ms: 540,
             started_at_ms: 600,
             completed_at_ms: 700,
+            ack_loss_puts: vec![AckLossPutEvidence {
+                operation_id: "ack-loss-1".to_string(),
+                proxy_endpoint: "127.0.0.1:39001".to_string(),
+                request_count: 1,
+                retries_disabled: true,
+                request_sha256: HASH_C.to_string(),
+                value_sha256: HASH_B.to_string(),
+                size_bytes: 1,
+                upstream_http_status: 200,
+                upstream_request_id: "request-ack-loss-1".to_string(),
+                upstream_version_id: "ack-lost-version".to_string(),
+                accepted_at_ms: 529,
+                upstream_completed_at_ms: 529,
+                client_response_bytes: 0,
+                connection_closed_at_ms: 530,
+            }],
             classified_versions: vec![
                 ClassifiedVersionFragments {
                     evidence_id: "put-1".to_string(),
@@ -8631,6 +8790,20 @@ mod tests {
                 &history,
             )
             .expect("committed and recoverable-unknown fragments retained");
+
+        let mut ordinary_unknown = proof.clone();
+        ordinary_unknown.ack_loss_puts.clear();
+        assert!(
+            ordinary_unknown
+                .validate_against_stale_return(
+                    &stale_return,
+                    &before_inventory,
+                    &after_inventory,
+                    &history,
+                )
+                .is_err(),
+            "an ordinary ambiguous SDK outcome must not count as recoverable-unknown"
+        );
 
         let mut no_cleanup_response = proof.clone();
         no_cleanup_response.cleanup_evidence = None;
@@ -8992,14 +9165,17 @@ mod tests {
         ambiguous.http_status = Some(500);
         let mut server_error_stale_return = stale_return.clone();
         server_error_stale_return.post_return_checker = post_return_checker(&server_error);
-        proof
-            .validate_against_stale_return(
-                &server_error_stale_return,
-                &before_inventory,
-                &after_inventory,
-                &server_error,
-            )
-            .expect("a failed 5xx write remains recoverable-unknown and protected");
+        assert!(
+            proof
+                .validate_against_stale_return(
+                    &server_error_stale_return,
+                    &before_inventory,
+                    &after_inventory,
+                    &server_error,
+                )
+                .is_err(),
+            "a client-observed 5xx is not a byte-dropped successful upstream ACK"
+        );
 
         let second_unknown = ShardInventoryEntry {
             fragment_id: "fragment-unknown-2".to_string(),
