@@ -1102,6 +1102,7 @@ struct LiveDecommissionState {
     admin: Option<Arc<RustfsAdminTopologyAdapter>>,
     proof: Option<AdminTopologyProof>,
     pools_before: Option<AdminPoolSnapshot>,
+    start_ownership: DecommissionStartOwnership,
     terminal: Option<DecommissionPoolStatus>,
     status_calls: Vec<AdminCall<DecommissionPoolStatus>>,
     fixture: AdminFixtureEvidence,
@@ -1110,6 +1111,18 @@ struct LiveDecommissionState {
     workload_receipt: Option<AdminDecommissionWorkloadReceipt>,
     health_baseline: Option<RecoveryHealthBaseline>,
     verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum DecommissionStartOwnership {
+    #[default]
+    NotStarted,
+    Ambiguous {
+        attempted_at_ms: u64,
+    },
+    Owned {
+        operation_id: String,
+    },
 }
 
 pub(crate) struct LiveAdminDecommissionDriver {
@@ -1156,6 +1169,7 @@ impl LiveAdminDecommissionDriver {
                 admin: None,
                 proof: None,
                 pools_before: None,
+                start_ownership: DecommissionStartOwnership::NotStarted,
                 terminal: None,
                 status_calls: Vec::new(),
                 fixture: AdminFixtureEvidence {
@@ -1395,6 +1409,17 @@ impl LiveAdminDecommissionDriver {
             .target_pool_expression
             .as_deref()
             .context("admin-decommission proof lacks a target pool expression")?;
+        let attempted_at_ms = now_ms();
+        state.s3 = Some(s3);
+        state.s3_port_forward = s3_port_forward;
+        state.s3_endpoint = Some(endpoint);
+        state.admin = Some(Arc::clone(&adapter));
+        state.proof = Some(proof.clone());
+        state.pools_before = Some(pools_before);
+        state.prefilled = prefilled;
+        state.health_baseline = Some(health_baseline);
+        state.start_ownership = DecommissionStartOwnership::Ambiguous { attempted_at_ms };
+
         let start = adapter
             .start_decommission(target_pool_id, target_expression)
             .await
@@ -1404,14 +1429,6 @@ impl LiveAdminDecommissionDriver {
             .requests
             .push(start.request);
 
-        state.s3 = Some(s3);
-        state.s3_port_forward = s3_port_forward;
-        state.s3_endpoint = Some(endpoint);
-        state.admin = Some(adapter);
-        state.proof = Some(proof);
-        state.pools_before = Some(pools_before);
-        state.prefilled = prefilled;
-        state.health_baseline = Some(health_baseline);
         self.write_transcript()?;
         Ok(())
     }
@@ -1459,6 +1476,9 @@ impl LiveAdminDecommissionDriver {
         let mut state = self.state.lock().await;
         state.status_calls.push(call.clone());
         let sample = if let Some(operation_id) = operation_id {
+            state.start_ownership = DecommissionStartOwnership::Owned {
+                operation_id: operation_id.clone(),
+            };
             let progress = state
                 .status_calls
                 .iter()
@@ -1893,11 +1913,11 @@ impl AdminCaseDriver for LiveAdminDecommissionDriver {
     }
 
     async fn cancel(&self) -> Result<AdminCancelOutcome> {
-        let (adapter, proof, operation_id) = {
+        let (adapter, proof, ownership) = {
             let state = self.state.lock().await;
-            let Some(operation_id) = transcript_state(&self.transcript).operation_id else {
+            if state.start_ownership == DecommissionStartOwnership::NotStarted {
                 return Ok(AdminCancelOutcome::NoOwnedOperation);
-            };
+            }
             (
                 state
                     .admin
@@ -1907,8 +1927,65 @@ impl AdminCaseDriver for LiveAdminDecommissionDriver {
                     .proof
                     .clone()
                     .context("decommission proof is not ready")?,
-                operation_id,
+                state.start_ownership.clone(),
             )
+        };
+        let operation_id = match ownership {
+            DecommissionStartOwnership::NotStarted => unreachable!("handled above"),
+            DecommissionStartOwnership::Owned { operation_id } => operation_id,
+            DecommissionStartOwnership::Ambiguous { attempted_at_ms } => {
+                let target_pool_id = proof.target_pool_id.context("missing target pool ID")?;
+                let target_expression = proof
+                    .target_pool_expression
+                    .as_deref()
+                    .context("missing target pool expression")?;
+                let deadline = Instant::now() + self.config.cluster.timeout;
+                loop {
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .context("timed out binding an ambiguous decommission start")?;
+                    let status = timeout(
+                        remaining,
+                        adapter.decommission_status(target_pool_id, target_expression),
+                    )
+                    .await
+                    .context("timed out reconciling an ambiguous decommission start")??;
+                    ensure!(
+                        status.request.started_at_ms >= attempted_at_ms,
+                        "ambiguous decommission status predates the start attempt"
+                    );
+                    let candidate_id = operation_id_from_status(&proof, &status)?;
+                    lock_transcript(&self.transcript)
+                        .requests
+                        .push(status.request.clone());
+                    if let Some(operation_id) = candidate_id {
+                        let sample = decommission_progress_sample(&proof, &operation_id, &status)?;
+                        {
+                            let mut transcript = lock_transcript(&self.transcript);
+                            transcript.operation_id = Some(operation_id.clone());
+                            transcript.progress.push(sample.clone());
+                        }
+                        if is_terminal_state(&sample.state) && sample.completed {
+                            self.write_transcript()?;
+                            return Ok(AdminCancelOutcome::NoOwnedOperation);
+                        }
+                        break operation_id;
+                    }
+                    let sample =
+                        decommission_progress_sample(&proof, "unbound-queued-operation", &status)?;
+                    ensure!(
+                        sample.state.eq_ignore_ascii_case("queued")
+                            && !sample.completed
+                            && !sample.failed
+                            && !sample.canceled_or_stopped,
+                        "ambiguous decommission lacks a stable owned identity"
+                    );
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .context("timed out binding an ambiguous decommission start")?;
+                    sleep(Duration::from_millis(100).min(remaining)).await;
+                }
+            }
         };
         let result = cancel_owned_decommission(
             adapter.as_ref(),
