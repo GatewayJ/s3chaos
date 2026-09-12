@@ -893,7 +893,7 @@ struct LiveRebalanceState {
     admin: Option<Arc<RustfsAdminTopologyAdapter>>,
     proof: Option<AdminTopologyProof>,
     pools_before: Option<AdminPoolSnapshot>,
-    start: Option<RebalanceStart>,
+    start_ownership: RebalanceStartOwnership,
     terminal: Option<RebalanceStatus>,
     fixture: AdminFixtureEvidence,
     prefilled: Vec<ObjectSpec>,
@@ -902,6 +902,27 @@ struct LiveRebalanceState {
     health_baseline: Option<RecoveryHealthBaseline>,
     fixture_owned: bool,
     verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum RebalanceStartOwnership {
+    #[default]
+    NotStarted,
+    Ambiguous {
+        attempted_at_ms: u64,
+    },
+    Owned {
+        operation_id: String,
+    },
+}
+
+impl RebalanceStartOwnership {
+    fn operation_id(&self) -> Option<&str> {
+        match self {
+            Self::Owned { operation_id } => Some(operation_id),
+            Self::NotStarted | Self::Ambiguous { .. } => None,
+        }
+    }
 }
 
 pub(crate) struct LiveAdminRebalanceDriver {
@@ -948,7 +969,7 @@ impl LiveAdminRebalanceDriver {
                 admin: None,
                 proof: None,
                 pools_before: None,
-                start: None,
+                start_ownership: RebalanceStartOwnership::NotStarted,
                 terminal: None,
                 fixture: AdminFixtureEvidence {
                     schema_version: 1,
@@ -1149,6 +1170,19 @@ impl LiveAdminRebalanceDriver {
             &serde_json::to_string_pretty(&preflight)?,
         )?;
 
+        let attempted_at_ms = now_ms();
+        {
+            let mut state = self.state.lock().await;
+            state.s3 = Some(s3);
+            state.s3_port_forward = s3_port_forward;
+            state.s3_endpoint = Some(endpoint);
+            state.admin = Some(Arc::clone(&adapter));
+            state.proof = Some(proof.clone());
+            state.pools_before = Some(snapshot);
+            state.start_ownership = RebalanceStartOwnership::Ambiguous { attempted_at_ms };
+            state.prefilled = prefilled;
+            state.health_baseline = Some(health_baseline);
+        }
         let start = adapter
             .start_rebalance()
             .await
@@ -1159,15 +1193,9 @@ impl LiveAdminRebalanceDriver {
         );
         {
             let mut state = self.state.lock().await;
-            state.s3 = Some(s3);
-            state.s3_port_forward = s3_port_forward;
-            state.s3_endpoint = Some(endpoint);
-            state.admin = Some(adapter);
-            state.proof = Some(proof);
-            state.pools_before = Some(snapshot);
-            state.start = Some(start.value.clone());
-            state.prefilled = prefilled;
-            state.health_baseline = Some(health_baseline);
+            state.start_ownership = RebalanceStartOwnership::Owned {
+                operation_id: start.value.id.clone(),
+            };
         }
         {
             let mut transcript = lock_transcript(&self.transcript);
@@ -1196,9 +1224,9 @@ impl LiveAdminRebalanceDriver {
                     .clone()
                     .context("rebalance proof is not ready")?,
                 state
-                    .start
-                    .as_ref()
-                    .map(|start| start.id.clone())
+                    .start_ownership
+                    .operation_id()
+                    .map(str::to_owned)
                     .context("rebalance operation is not owned")?,
             )
         };
@@ -1333,8 +1361,11 @@ impl LiveAdminRebalanceDriver {
                     .clone()
                     .context("rebalance pre-start snapshot is missing")?,
                 state
-                    .start
-                    .clone()
+                    .start_ownership
+                    .operation_id()
+                    .map(|operation_id| RebalanceStart {
+                        id: operation_id.to_string(),
+                    })
                     .context("rebalance start receipt is missing")?,
                 state
                     .terminal
@@ -1625,11 +1656,11 @@ impl AdminCaseDriver for LiveAdminRebalanceDriver {
     }
 
     async fn cancel(&self) -> Result<AdminCancelOutcome> {
-        let (adapter, proof, operation_id) = {
+        let (adapter, proof, ownership) = {
             let state = self.state.lock().await;
-            let Some(operation_id) = state.start.as_ref().map(|start| start.id.clone()) else {
+            if state.start_ownership == RebalanceStartOwnership::NotStarted {
                 return Ok(AdminCancelOutcome::NoOwnedOperation);
-            };
+            }
             (
                 state
                     .admin
@@ -1639,8 +1670,36 @@ impl AdminCaseDriver for LiveAdminRebalanceDriver {
                     .proof
                     .clone()
                     .context("rebalance proof is not ready")?,
-                operation_id,
+                state.start_ownership.clone(),
             )
+        };
+        let operation_id = match ownership {
+            RebalanceStartOwnership::NotStarted => unreachable!("handled above"),
+            RebalanceStartOwnership::Owned { operation_id } => operation_id,
+            RebalanceStartOwnership::Ambiguous { attempted_at_ms } => {
+                let status = timeout(self.config.cluster.timeout, adapter.rebalance_status())
+                    .await
+                    .context("timed out reconciling an ambiguous rebalance start")??;
+                ensure!(
+                    status.request.started_at_ms >= attempted_at_ms
+                        && !status.value.id.trim().is_empty(),
+                    "ambiguous rebalance status predates the start attempt or lacks an operation ID"
+                );
+                let operation_id = status.value.id.clone();
+                let sample = rebalance_progress_sample(&proof, &operation_id, &status)
+                    .context("ambiguous rebalance status is not bound to the proven topology")?;
+                {
+                    let mut transcript = lock_transcript(&self.transcript);
+                    transcript.operation_id = Some(operation_id.clone());
+                    transcript.requests.push(status.request);
+                    transcript.progress.push(sample.clone());
+                }
+                if sample.completed || sample.failed || sample.canceled_or_stopped {
+                    self.write_transcript()?;
+                    return Ok(AdminCancelOutcome::NoOwnedOperation);
+                }
+                operation_id
+            }
         };
         let result = stop_owned_rebalance(
             adapter.as_ref(),
