@@ -224,11 +224,12 @@ held, requires every workload operation to fail, then
 scales both back. The operator is restored when the run unwinds normally or
 on a signal; if the harness is killed outright, the annotations remain and
 the next `cluster-cold-restart` pre-cleanup or `make fault-cleanup` restores
-the operator from them. `make fault-cleanup` removes the fixture namespace
-and checks residual Chaos resources first; it then restores any paused
-operator, skipping with a warning when the context may not list Deployments
-in the operator namespace, and exits non-zero when a possible restore fails
-or a record is unreadable. The other lifecycle scenarios warn at pre-cleanup
+the operator from them. `make fault-cleanup` restores any paused operator (so a Tenant finalizer that
+needs it can complete), then removes the fixture namespace with a bounded wait
+(`RUSTFS_FAULT_TEST_NAMESPACE_DELETE_TIMEOUT`, default 600s) and checks
+residual Chaos resources; both parts always run and cleanup exits non-zero if
+either failed. The restore is skipped with a warning only on an explicit RBAC
+"no"; an unreadable record or an undeterminable permission fails. The other lifecycle scenarios warn at pre-cleanup
 when they can read a leftover pause record.
 These scenarios have not yet been calibrated on a live cluster.
 `make fault-dashboard-install` mutates the current cluster (installs/upgrades
