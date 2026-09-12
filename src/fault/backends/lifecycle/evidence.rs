@@ -417,6 +417,14 @@ impl PodTerminationEvidence {
         violations
     }
 
+    /// The replacement was never seen Ready and never seen restarting: a gap
+    /// that a lost observation fully explains, unlike a non-graceful exit or
+    /// a positive restart count, which are observed product evidence.
+    pub fn replacement_unobserved(&self) -> bool {
+        self.replacement_ready_at_ms.is_none()
+            && self.restart_count_after.is_none_or(|count| count == 0)
+    }
+
     /// The failure classification this target contributes, if it failed.
     pub fn failure_classification(&self) -> Option<&'static str> {
         if !self.classification.is_graceful() {
@@ -677,27 +685,31 @@ impl PodLifecycleEvidence {
 
     /// The failure classification a failed operation records. Precedence:
     /// a container that did not leave cleanly (`graceful_shutdown_failed`),
-    /// then a replacement that could not come back
-    /// (`product_or_environment`), then structural evidence problems
-    /// (`test_or_environment`).
+    /// then observed product evidence (`product_or_environment`: an OOM or
+    /// early kill, a replacement seen restarting, or a replacement that was
+    /// watched and never became Ready), then structural evidence problems
+    /// (`test_or_environment`). When the harness lost observation or control
+    /// (`observation_failure`), a target whose only defect is a replacement
+    /// that was never seen at all is incomplete evidence, not product
+    /// evidence; everything that was actually observed keeps its weight.
     pub fn failure_classification(&self) -> &'static str {
         let mut classification = HARNESS_CLASSIFICATION;
-        for candidate in self
-            .targets
-            .iter()
-            .filter_map(PodTerminationEvidence::failure_classification)
-        {
+        for target in &self.targets {
+            let Some(candidate) = target.failure_classification() else {
+                continue;
+            };
             if candidate == GRACEFUL_SHUTDOWN_FAILED_CLASSIFICATION {
                 return candidate;
             }
-            if candidate == REPLACEMENT_NOT_READY_CLASSIFICATION {
+            if candidate != REPLACEMENT_NOT_READY_CLASSIFICATION {
+                continue;
+            }
+            let incomplete = self.observation_failure.is_some()
+                && target.classification.is_graceful()
+                && target.replacement_unobserved();
+            if !incomplete {
                 classification = candidate;
             }
-        }
-        // A replacement the harness stopped watching is not a replacement
-        // that failed; an already fully observed grace timeout returned above.
-        if self.observation_failure.is_some() {
-            return HARNESS_CLASSIFICATION;
         }
         classification
     }
@@ -1270,6 +1282,50 @@ mod tests {
                 .violations
                 .iter()
                 .any(|v| v.contains("observation failed"))
+        );
+        // Fully observed product evidence survives a later observation blip:
+        // an OOM-killed container, and a replacement seen restarting.
+        let mut oom_then_lost = target("rustfs-1", 1, false);
+        let mut oom = terminated(137, "2026-09-11T10:05:03Z");
+        oom.reason = Some("OOMKilled".to_string());
+        oom_then_lost.terminated = Some(oom);
+        oom_then_lost.termination_duration_ms = Some(3_000);
+        oom_then_lost.classification = TerminationClassification::OomKilled;
+        oom_then_lost.replacement_ready_at_ms = None;
+        let mut report = evidence(LifecycleOperation::GracefulPod, vec![oom_then_lost]);
+        report.observation_failure = Some("kubectl: connection refused".to_string());
+        assert_eq!(
+            report.finalize().failure_classification(),
+            "product_or_environment"
+        );
+        let mut restarting_then_lost = target("rustfs-1", 1, false);
+        restarting_then_lost.replacement_ready_at_ms = None;
+        restarting_then_lost.restart_count_after = Some(2);
+        let mut report = evidence(LifecycleOperation::GracefulPod, vec![restarting_then_lost]);
+        report.observation_failure = Some("kubectl: connection refused".to_string());
+        assert_eq!(
+            report.finalize().failure_classification(),
+            "product_or_environment"
+        );
+        let mut ready_but_restarted = target("rustfs-1", 1, false);
+        ready_but_restarted.restart_count_after = Some(1);
+        let mut report = evidence(LifecycleOperation::GracefulPod, vec![ready_but_restarted]);
+        report.observation_failure = Some("kubectl: connection refused".to_string());
+        assert_eq!(
+            report.finalize().failure_classification(),
+            "product_or_environment"
+        );
+        // An observed product failure on one target is not masked by an
+        // unobserved replacement on another.
+        let mut unseen = target("rustfs-0", 0, false);
+        unseen.replacement_ready_at_ms = None;
+        let mut restarted = target("rustfs-1", 1, false);
+        restarted.restart_count_after = Some(1);
+        let mut report = evidence(LifecycleOperation::Rolling, vec![unseen, restarted]);
+        report.observation_failure = Some("kubectl: connection refused".to_string());
+        assert_eq!(
+            report.finalize().failure_classification(),
+            "product_or_environment"
         );
         let mut killed_then_lost = target("rustfs-1", 1, false);
         killed_then_lost.terminated = Some(terminated(137, "2026-09-11T10:05:30Z"));

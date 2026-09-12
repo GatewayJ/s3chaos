@@ -221,8 +221,12 @@ while the outage is held, requires every workload operation to fail, then
 scales both back. The operator is restored when the run unwinds normally or
 on a signal; if the harness is killed outright, the annotations remain and
 the next `cluster-cold-restart` pre-cleanup or `make fault-cleanup` restores
-the operator from them (an unreadable record, or a cleanup that cannot read
-the operator namespace, fails rather than reporting a clean cluster).
+the operator from them. `make fault-cleanup` removes the fixture namespace
+and checks residual Chaos resources first; it then restores any paused
+operator, skipping with a warning when the context may not list Deployments
+in the operator namespace, and exits non-zero when a possible restore fails
+or a record is unreadable. The other lifecycle scenarios warn at pre-cleanup
+when they can read a leftover pause record.
 These scenarios have not yet been calibrated on a live cluster.
 `make fault-dashboard-install` mutates the current cluster (installs/upgrades
 the Chaos Mesh release via Helm); treat it like a live run.

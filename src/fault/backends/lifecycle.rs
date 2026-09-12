@@ -86,9 +86,9 @@ use kube::{
     get_statefulset_command, get_statefulset_yaml_command, list_deployments_command,
     list_events_command, list_pods_by_selector_command, list_rustfs_pods_command,
     list_rustfs_pods_yaml_command, parse_deployment, parse_pod_list, parse_statefulset,
-    parse_watch_stream, remove_deployment_annotations_command, require_single_statefulset_owner,
-    required_permissions, run_json, scale_deployment_command, scale_statefulset_command,
-    verify_operator_identity, watch_rustfs_pods_command,
+    parse_watch_stream, paused_operator_records, remove_deployment_annotations_command,
+    require_single_statefulset_owner, required_permissions, run_json, scale_deployment_command,
+    scale_statefulset_command, verify_operator_identity, watch_rustfs_pods_command,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -257,17 +257,86 @@ impl std::fmt::Display for LifecycleObservationError {
 
 impl std::error::Error for LifecycleObservationError {}
 
-fn observed<T>(result: Result<T>) -> Result<T> {
-    result.map_err(|error| anyhow::Error::new(LifecycleObservationError(format!("{error:#}"))))
+/// A harness-side step of the operation itself failed (a delete or scale
+/// request kubectl could not issue): the Pods may be gone without the
+/// harness ever asking for their replacement, which says nothing about
+/// RustFS.
+#[derive(Debug)]
+struct LifecycleHarnessError(String);
+
+impl std::fmt::Display for LifecycleHarnessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "harness lifecycle step failed: {}", self.0)
+    }
 }
 
-/// The observation failure inside a removal error, if that is what it was.
+impl std::error::Error for LifecycleHarnessError {}
+
+fn harness_step<T>(result: Result<T>, step: &str) -> Result<T> {
+    result.map_err(|error| anyhow::Error::new(LifecycleHarnessError(format!("{step}: {error:#}"))))
+}
+
+/// Observation attempts per poll: one slow API request (each is bounded by
+/// `--request-timeout`) must not fail a multi-minute operation.
+const OBSERVATION_ATTEMPTS: usize = 3;
+
+fn observe_with_retries<T>(mut observe: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut last_error = None;
+    for attempt in 1..=OBSERVATION_ATTEMPTS {
+        match observe() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < OBSERVATION_ATTEMPTS {
+                    sleep(POLL_INTERVAL);
+                }
+            }
+        }
+    }
+    Err(anyhow::Error::new(LifecycleObservationError(format!(
+        "{OBSERVATION_ATTEMPTS} consecutive attempts failed; last: {:#}",
+        last_error.expect("at least one attempt")
+    ))))
+}
+
+/// The lost observation or harness-step failure inside a removal error, if
+/// that is what it was.
 fn observation_failure(removal: &Result<()>) -> Option<String> {
-    removal
-        .as_ref()
-        .err()
-        .and_then(|error| error.downcast_ref::<LifecycleObservationError>())
-        .map(|error| error.0.clone())
+    let error = removal.as_ref().err()?;
+    error
+        .downcast_ref::<LifecycleObservationError>()
+        .map(ToString::to_string)
+        .or_else(|| {
+            error
+                .downcast_ref::<LifecycleHarnessError>()
+                .map(ToString::to_string)
+        })
+}
+
+/// Read-only, best-effort check for the non-cold lifecycle scenarios: warn
+/// loudly when an operator Deployment still carries a cold-restart pause
+/// record. These scenarios do not need the operator namespace, so a refused
+/// or failed read is skipped silently.
+pub(in crate::fault) fn warn_on_paused_operators(config: &FaultTestConfig) {
+    let cluster = &config.cluster;
+    let Ok(command) = list_deployments_command(cluster, &cluster.operator_namespace) else {
+        return;
+    };
+    let Ok(output) = command.run() else {
+        return;
+    };
+    if output.code != Some(0) {
+        return;
+    }
+    let Ok(listing) = serde_json::from_str::<serde_json::Value>(&output.stdout) else {
+        return;
+    };
+    for (name, record) in paused_operator_records(&listing) {
+        eprintln!(
+            "WARNING: operator Deployment {}/{name} still carries the cold-restart pause record {OPERATOR_PAUSE_REPLICAS_ANNOTATION}={record}; a previous cluster-cold-restart run did not restore it, so the operator may be scaled to zero. Run make fault-cleanup before trusting this run.",
+            cluster.operator_namespace
+        );
+    }
 }
 
 pub(in crate::fault) struct StatefulSetObservation {
@@ -864,14 +933,15 @@ fn initiate_pod_delete(
     let command = delete_pod_default_grace_command(cluster, &pod.name, &pod.uid)?;
     let delete_requested_at_ms = now_ms();
     lock_state(state).begin_target(pod, delete_requested_at_ms, deferred);
-    command
-        .run_checked()
-        .with_context(|| format!("graceful delete of Pod {} (uid {})", pod.name, pod.uid))?;
+    harness_step(
+        command.run_checked(),
+        &format!("graceful delete of Pod {} (uid {})", pod.name, pod.uid),
+    )?;
     Ok(())
 }
 
 fn poll_targets(cluster: &ClusterTestConfig, state: &SharedState) -> Result<Vec<ObservedPod>> {
-    let pods = observed(observe_pods(cluster))?;
+    let pods = observe_with_retries(|| observe_pods(cluster))?;
     lock_state(state).absorb(&pods, now_ms());
     Ok(pods)
 }
@@ -1016,12 +1086,17 @@ impl RollingWorker {
                 Some(Ok(())) => return Ok(()),
                 Some(Err(_)) => {
                     // Hand the original error back so a typed observation
-                    // failure survives into the removal verdict.
+                    // failure survives into the removal verdict, and keep a
+                    // copy so a later call reports it instead of waiting on
+                    // a thread that no longer exists.
                     let error = self
                         .outcome
                         .take()
                         .and_then(Result::err)
                         .expect("polled error");
+                    self.outcome = Some(Err(anyhow::anyhow!(
+                        "rolling restart worker already failed: {error:#}"
+                    )));
                     return Err(error.context("rolling restart worker failed"));
                 }
                 None => {}
@@ -1173,7 +1248,8 @@ impl LifecycleFaultHandle {
     /// the scenario claims did not happen.
     fn sample_outage(&self) -> Result<(i64, usize)> {
         let pods = poll_targets(&self.cluster, &self.state)?;
-        let statefulset = observed(observe_statefulset(&self.cluster, &self.statefulset.name))?;
+        let statefulset =
+            observe_with_retries(|| observe_statefulset(&self.cluster, &self.statefulset.name))?;
         let observed_at_ms = now_ms();
         let mut state = lock_state(&self.state);
         state.record_replica_sample(statefulset.spec_replicas, pods.len(), observed_at_ms);
@@ -1231,9 +1307,11 @@ impl LifecycleFaultHandle {
                 outage.scale_up_requested_at_ms = Some(now_ms());
             }
         }
-        scale_statefulset_command(&self.cluster, &self.statefulset.name, replicas)?
-            .run_checked()
-            .context("scale the RustFS StatefulSet back up")?;
+        harness_step(
+            scale_statefulset_command(&self.cluster, &self.statefulset.name, replicas)
+                .and_then(|command| command.run_checked()),
+            "scale the RustFS StatefulSet back up",
+        )?;
         self.scaled_up = true;
         wait_until(
             &self.cluster,
@@ -1533,6 +1611,95 @@ mod tests {
         kube::{GracefulDeletion, ObservedPod, WatchedPod},
         plan_targets, removal_verdict,
     };
+
+    #[test]
+    fn observation_retries_tolerate_transient_failures_and_type_the_last_one() {
+        let mut calls = 0;
+        let value = super::observe_with_retries(|| {
+            calls += 1;
+            if calls < super::OBSERVATION_ATTEMPTS {
+                anyhow::bail!("request timed out")
+            }
+            Ok(calls)
+        })
+        .expect("recovers within the attempt budget");
+        assert_eq!(value, super::OBSERVATION_ATTEMPTS);
+        let mut calls = 0;
+        let error = super::observe_with_retries::<()>(|| {
+            calls += 1;
+            anyhow::bail!("request timed out {calls}")
+        })
+        .expect_err("persistent failure");
+        assert_eq!(calls, super::OBSERVATION_ATTEMPTS);
+        assert!(error.is::<super::LifecycleObservationError>());
+        assert!(
+            error.to_string().contains("request timed out 3"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn harness_steps_classify_as_harness_even_when_the_pods_are_gone() {
+        let removal = super::harness_step::<()>(
+            Err(anyhow::anyhow!(
+                "error: the server doesn't have a resource type"
+            )),
+            "scale the RustFS StatefulSet back up",
+        );
+        let recorded = super::observation_failure(&removal).expect("typed harness step");
+        assert!(
+            recorded.contains("scale the RustFS StatefulSet back up"),
+            "{recorded}"
+        );
+        // Old Pod observed gone after a clean exit, replacement never asked
+        // for: without the typed step this read as a product failure.
+        let mut evidence = evidence_with_exit(false, 0, "2026-09-11T10:05:02Z");
+        evidence.targets[0].restart_count_after = None;
+        evidence.targets[0].new_uid = None;
+        assert_eq!(
+            evidence.clone().finalize().failure_classification(),
+            "product_or_environment"
+        );
+        evidence.observation_failure = Some(recorded);
+        let evidence = evidence.finalize();
+        let error = removal_verdict(removal, &evidence).expect_err("harness step failed");
+        assert_eq!(
+            removal_failure_classification(&error),
+            "test_or_environment"
+        );
+        assert!(super::harness_step(Ok(7), "step").is_ok_and(|value| value == 7));
+    }
+
+    #[test]
+    fn a_consumed_rolling_failure_is_reported_again_instead_of_waiting() {
+        let mut worker = super::RollingWorker {
+            handle: Some(std::thread::spawn(|| {
+                Err(anyhow::Error::new(super::LifecycleObservationError(
+                    "kubectl: connection refused".to_string(),
+                )))
+            })),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            outcome: None,
+        };
+        let first = worker
+            .wait_finished(std::time::Duration::from_secs(10))
+            .expect_err("worker failed");
+        assert!(first.is::<super::LifecycleObservationError>(), "{first:#}");
+        let started = std::time::Instant::now();
+        let second = worker
+            .wait_finished(std::time::Duration::from_secs(10))
+            .expect_err("still failed");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            second.to_string().contains("rolling restart worker"),
+            "{second:#}"
+        );
+        assert!(
+            format!("{second:#}").contains("connection refused"),
+            "{second:#}"
+        );
+        assert!(worker.require_healthy().is_err());
+    }
     use crate::fault::fault_lifecycle::removal_failure_classification;
 
     fn pod(name: &str, uid: &str, ready: bool) -> ObservedPod {
@@ -1829,7 +1996,10 @@ mod tests {
         ))
         .context("waiting for replacement of Pod rustfs-1 to become Ready"));
         let recorded = super::observation_failure(&removal);
-        assert_eq!(recorded.as_deref(), Some("kubectl: connection refused"));
+        assert_eq!(
+            recorded.as_deref(),
+            Some("Pod observation failed: kubectl: connection refused")
+        );
         assert_eq!(super::observation_failure(&Ok(())), None);
         assert_eq!(
             super::observation_failure(&Err(anyhow::anyhow!("timed out"))),

@@ -1131,39 +1131,50 @@ list_scenarios() {
 
 # cluster-cold-restart records the operator pause as annotations on the
 # operator Deployment before scaling it to zero. A run that died before its
-# own restore leaves that record behind; undo it here, and refuse to guess
-# when the record cannot be read.
+# own restore leaves that record behind; undo it here. Returns non-zero only
+# when a restore was possible and did not complete; a context that may not
+# list Deployments in the operator namespace (the RBAC profile the non-cold
+# lifecycle scenarios run with) cannot restore anything and is skipped loudly.
 restore_paused_operators() {
-  local listing kubectl_stderr kubectl_error deployments name replicas
-  kubectl_stderr="$(mktemp)"
-  if ! listing="$(kubectl_ns "$OPERATOR_NAMESPACE" get deployment -o json 2>"$kubectl_stderr")"; then
-    kubectl_error="$(cat "$kubectl_stderr")"
-    rm -f "$kubectl_stderr"
-    # Only an absent operator namespace means there is nothing to restore;
-    # RBAC denials, API errors, or a wrong context must not pass as clean.
-    if [[ "$kubectl_error" == *"NotFound"* && "$kubectl_error" == *"namespaces \"$OPERATOR_NAMESPACE\""* ]]; then
-      return 0
-    fi
-    die "cannot inspect operator Deployments in namespace $OPERATOR_NAMESPACE for pause records left by a previous run; refusing to report a clean cleanup: $kubectl_error"
+  local can_list listing deployments name replicas
+  can_list="$(kubectl_ns "$OPERATOR_NAMESPACE" auth can-i list deployments --request-timeout=30s 2>/dev/null || true)"
+  if [[ "$can_list" != "yes" ]]; then
+    echo "warning: this context may not list Deployments in $OPERATOR_NAMESPACE; skipped the operator pause-record restore (run cleanup with a context that can, if a cluster-cold-restart run was killed)" >&2
+    return 0
   fi
-  rm -f "$kubectl_stderr"
-  deployments="$(printf '%s' "$listing" \
-    | jq -r --arg key "$OPERATOR_PAUSE_REPLICAS_ANNOTATION" '.items[] | select(.metadata.annotations[$key] != null) | "\(.metadata.name)\t\(.metadata.annotations[$key])"')" \
-    || die "cannot parse the operator Deployment listing for namespace $OPERATOR_NAMESPACE"
+  # Listing a namespaced resource in a namespace that does not exist returns
+  # an empty list, so any failure here is an API or transport error.
+  if ! listing="$(kubectl_ns "$OPERATOR_NAMESPACE" get deployment -o json --request-timeout=30s)"; then
+    echo "error: cannot list operator Deployments in $OPERATOR_NAMESPACE to look for pause records left by a previous run" >&2
+    return 1
+  fi
+  if ! deployments="$(printf '%s' "$listing" \
+    | jq -r --arg key "$OPERATOR_PAUSE_REPLICAS_ANNOTATION" '.items[] | select(.metadata.annotations[$key] != null) | "\(.metadata.name)\t\(.metadata.annotations[$key])"')"; then
+    echo "error: cannot parse the operator Deployment listing for $OPERATOR_NAMESPACE" >&2
+    return 1
+  fi
   [[ -n "$deployments" ]] || return 0
   while IFS=$'\t' read -r name replicas; do
     [[ -n "$name" ]] || continue
-    [[ "$replicas" =~ ^[0-9]+$ && "$replicas" -ge 1 ]] || die "operator Deployment $OPERATOR_NAMESPACE/$name carries an unreadable pause record ($OPERATOR_PAUSE_REPLICAS_ANNOTATION=$replicas); restore it manually and remove the annotation"
+    if [[ ! "$replicas" =~ ^[0-9]+$ || "$replicas" -lt 1 ]]; then
+      echo "error: operator Deployment $OPERATOR_NAMESPACE/$name carries an unreadable pause record ($OPERATOR_PAUSE_REPLICAS_ANNOTATION=$replicas); restore it manually and remove the annotation" >&2
+      return 1
+    fi
     echo "restoring operator Deployment $OPERATOR_NAMESPACE/$name left paused by a previous run to $replicas replica(s)"
-    kubectl_ns "$OPERATOR_NAMESPACE" scale deployment "$name" --replicas="$replicas"
-    kubectl_ns "$OPERATOR_NAMESPACE" rollout status deployment "$name" --timeout=300s
-    kubectl_ns "$OPERATOR_NAMESPACE" annotate deployment "$name" "${OPERATOR_PAUSE_REPLICAS_ANNOTATION}-" "${OPERATOR_PAUSE_RUN_ANNOTATION}-"
+    if ! kubectl_ns "$OPERATOR_NAMESPACE" scale deployment "$name" --replicas="$replicas" --request-timeout=30s \
+      || ! kubectl_ns "$OPERATOR_NAMESPACE" rollout status deployment "$name" --timeout=300s \
+      || ! kubectl_ns "$OPERATOR_NAMESPACE" annotate deployment "$name" "${OPERATOR_PAUSE_REPLICAS_ANNOTATION}-" "${OPERATOR_PAUSE_RUN_ANNOTATION}-" --request-timeout=30s; then
+      echo "error: failed to restore operator Deployment $OPERATOR_NAMESPACE/$name to $replicas replica(s)" >&2
+      return 1
+    fi
   done <<<"$deployments"
 }
 
 cleanup() {
+  local restore_status=0
   cleanup_managed_chaos
-  restore_paused_operators
+  # Fixture removal and the residual-Chaos check come first so a problem with
+  # the operator namespace can never leave the fault-test namespace behind.
   if kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1; then
     require_namespace_ownership
     kubectl_cluster delete namespace "$FAULT_NAMESPACE" --wait=true
@@ -1171,7 +1182,9 @@ cleanup() {
   if kubectl_ns "$CHAOS_NAMESPACE" get iochaos,podchaos,networkchaos,stresschaos -l "$MANAGER_SELECTOR" -o name 2>/dev/null | grep -q .; then
     die "managed Chaos resources remain after cleanup"
   fi
+  restore_paused_operators || restore_status=$?
   echo "managed fault-test resources cleaned; external StorageClasses, PVs, and host devices were not changed"
+  [[ "$restore_status" -eq 0 ]] || die "restoring a paused operator Deployment failed; see the errors above"
 }
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then

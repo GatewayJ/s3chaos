@@ -491,6 +491,29 @@ pub fn get_deployment_command(
         .arg(REQUEST_TIMEOUT_FLAG))
 }
 
+/// `(name, raw record)` for every Deployment in a listing that carries the
+/// cold-restart pause record, whether or not the record parses.
+pub fn paused_operator_records(listing: &Value) -> Vec<(String, String)> {
+    listing
+        .pointer("/items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let record = item
+                .pointer("/metadata/annotations")
+                .and_then(|annotations| annotations.get(OPERATOR_PAUSE_REPLICAS_ANNOTATION))?;
+            let name = item.pointer("/metadata/name").and_then(Value::as_str)?;
+            Some((
+                name.to_string(),
+                record
+                    .as_str()
+                    .map_or_else(|| record.to_string(), str::to_string),
+            ))
+        })
+        .collect()
+}
+
 pub fn list_deployments_command(
     cluster: &ClusterTestConfig,
     namespace: &str,
@@ -1234,6 +1257,25 @@ mod tests {
         cluster: &crate::framework::config::ClusterTestConfig,
     ) -> bool {
         super::list_rustfs_pods_command(cluster).is_err()
+    }
+
+    #[test]
+    fn paused_operator_records_are_found_whether_or_not_they_parse() {
+        let listing = json!({"items": [
+            {"metadata": {"name": "rustfs-operator", "annotations": {OPERATOR_PAUSE_REPLICAS_ANNOTATION: "2"}}},
+            {"metadata": {"name": "unrelated", "annotations": {"other": "x"}}},
+            {"metadata": {"name": "no-annotations"}},
+            {"metadata": {"name": "broken", "annotations": {OPERATOR_PAUSE_REPLICAS_ANNOTATION: "many"}}}
+        ]});
+        assert_eq!(
+            super::paused_operator_records(&listing),
+            [
+                ("rustfs-operator".to_string(), "2".to_string()),
+                ("broken".to_string(), "many".to_string())
+            ]
+        );
+        assert!(super::paused_operator_records(&json!({"items": []})).is_empty());
+        assert!(super::paused_operator_records(&json!({})).is_empty());
     }
 
     #[test]

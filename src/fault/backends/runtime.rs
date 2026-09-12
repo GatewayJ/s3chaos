@@ -146,11 +146,13 @@ fn cleanup_fault_backend(
         // A cold restart records its operator pause on the operator Deployment;
         // a previous run that died before restoring it is repaired here. Only
         // the cold restart holds the operator-namespace RBAC this needs, so
-        // the other lifecycle kinds leave the repair to fault-cleanup.
+        // the other lifecycle kinds only warn (read-only, best effort) and
+        // leave the repair to fault-cleanup.
         FaultBackend::KubernetesLifecycle => {
             if kind == FaultKind::RustfsServerColdRestart {
                 lifecycle::restore_paused_operators(config).map(|_| ())
             } else {
+                lifecycle::warn_on_paused_operators(config);
                 Ok(())
             }
         }
