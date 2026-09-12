@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 mod authorization_descriptors;
 mod bucket_config_descriptors;
+mod canned_policy_descriptors;
 mod compatibility_descriptors;
 mod iam_descriptors;
 mod sts_descriptors;
@@ -37,6 +38,9 @@ pub const COMPAT_MULTI_OBJECT_DELETE: &str = "compat-multi-object-delete";
 pub const COMPAT_OBJECT_COPY_SAME_BUCKET: &str = "compat-object-copy-same-bucket";
 pub const COMPAT_OBJECT_PUT_GET_DELETE: &str = "compat-object-put-get-delete";
 pub const COMPAT_VERSIONING_HEAD_REMOVAL: &str = "compat-versioning-head-removal";
+pub const DELETE_FORCE_HEADER_CONTRACT: &str = "delete-force-header-contract";
+pub const IAM_CANNED_POLICY_CONSOLE_ADMIN_DELETE: &str = "iam-canned-policy-console-admin-delete";
+pub const IAM_CANNED_POLICY_MATRIX: &str = "iam-canned-policy-matrix";
 pub const IAM_EXPLICIT_DENY_OVERRIDES_ALLOW: &str = "iam-explicit-deny-overrides-allow";
 pub const IAM_GROUP_POLICY: &str = "iam-group-policy";
 pub const IAM_USER_MANAGED_POLICY_READONLY: &str = "iam-user-managed-policy-readonly";
@@ -170,6 +174,7 @@ pub struct ProtocolCapabilityCheck {
 #[serde(rename_all = "kebab-case")]
 pub enum ProtocolExecutor {
     BucketPolicy,
+    CannedPolicy,
     Compatibility,
     Iam,
     Sts,
@@ -596,6 +601,31 @@ const fn public_access_block_case() -> ProtocolCase {
     }
 }
 
+/// Built-in canned policies (`consoleAdmin`, `readwrite`, `writeonly`, `readonly`) are attached
+/// to a harness user; the policies themselves are never created or removed.
+const fn canned_policy_case(
+    id: &'static str,
+    group: &'static str,
+    domain: ProtocolDomain,
+    tags: &'static [&'static str],
+    capabilities: &'static [ProtocolCapability],
+) -> ProtocolCase {
+    ProtocolCase {
+        id: ProtocolCaseId::new(id),
+        domain,
+        group,
+        tags,
+        isolation: ProtocolIsolation::Case,
+        capabilities,
+        serial: true,
+        executor: ProtocolExecutor::CannedPolicy,
+        lock_requirements: SERIAL_BUCKET_IDENTITY_LOCKS,
+        ownership: BUCKET_IDENTITY_OWNERSHIP,
+        cleanup_scopes: BUCKET_IDENTITY_CLEANUP,
+        variants: DEFAULT_SUCCESS_VARIANTS,
+    }
+}
+
 const fn iam_case(
     id: &'static str,
     group: &'static str,
@@ -653,6 +683,7 @@ pub fn protocol_case_catalog() -> &'static [ProtocolCase] {
         authorization_descriptors::CASES
             .iter()
             .chain(compatibility_descriptors::CASES)
+            .chain(canned_policy_descriptors::CASES)
             .chain(iam_descriptors::CASES)
             .chain(sts_descriptors::OIDC_CASES)
             .chain(bucket_config_descriptors::CASES)
@@ -980,10 +1011,12 @@ mod tests {
         BUCKET_POLICY_PREFIX_SCOPE, COMPAT_BUCKET_HEAD, COMPAT_BUCKET_LIST_CREATE_DELETE,
         COMPAT_LIST_OBJECTS_BASIC, COMPAT_MULTI_OBJECT_DELETE, COMPAT_MULTIPART_UPLOAD_SMALL,
         COMPAT_OBJECT_COPY_SAME_BUCKET, COMPAT_OBJECT_PUT_GET_DELETE,
-        COMPAT_VERSIONING_HEAD_REMOVAL, IAM_EXPLICIT_DENY_OVERRIDES_ALLOW, IAM_GROUP_POLICY,
-        IAM_USER_MANAGED_POLICY_DETACH, IAM_USER_MANAGED_POLICY_READONLY, OIDC_WEB_IDENTITY_BASIC,
-        PUBLIC_ACCESS_BLOCK_ROUND_TRIP, STS_ASSUME_ROLE_BASIC, STS_EXPIRED_TOKEN_DENIED,
-        STS_SESSION_POLICY_DENY_PUT, STS_SESSION_POLICY_NARROWS_ROLE, protocol_case_catalog,
+        COMPAT_VERSIONING_HEAD_REMOVAL, DELETE_FORCE_HEADER_CONTRACT,
+        IAM_CANNED_POLICY_CONSOLE_ADMIN_DELETE, IAM_CANNED_POLICY_MATRIX,
+        IAM_EXPLICIT_DENY_OVERRIDES_ALLOW, IAM_GROUP_POLICY, IAM_USER_MANAGED_POLICY_DETACH,
+        IAM_USER_MANAGED_POLICY_READONLY, OIDC_WEB_IDENTITY_BASIC, PUBLIC_ACCESS_BLOCK_ROUND_TRIP,
+        STS_ASSUME_ROLE_BASIC, STS_EXPIRED_TOKEN_DENIED, STS_SESSION_POLICY_DENY_PUT,
+        STS_SESSION_POLICY_NARROWS_ROLE, protocol_case_catalog,
     };
     use std::collections::BTreeSet;
 
@@ -1010,6 +1043,9 @@ mod tests {
                 COMPAT_OBJECT_COPY_SAME_BUCKET,
                 COMPAT_OBJECT_PUT_GET_DELETE,
                 COMPAT_VERSIONING_HEAD_REMOVAL,
+                DELETE_FORCE_HEADER_CONTRACT,
+                IAM_CANNED_POLICY_CONSOLE_ADMIN_DELETE,
+                IAM_CANNED_POLICY_MATRIX,
                 IAM_EXPLICIT_DENY_OVERRIDES_ALLOW,
                 IAM_GROUP_POLICY,
                 IAM_USER_MANAGED_POLICY_READONLY,
@@ -1036,6 +1072,33 @@ mod tests {
         let case = super::protocol_case(BUCKET_POLICY_AUTHENTICATED_USER_RW).expect("case");
         assert!(case.has_capability(super::ProtocolCapability::Identity));
         assert!(!case.has_capability(super::ProtocolCapability::Iam));
+    }
+
+    #[test]
+    fn canned_policy_cases_never_own_a_managed_policy_and_split_smoke_from_full() {
+        for id in [
+            IAM_CANNED_POLICY_MATRIX,
+            IAM_CANNED_POLICY_CONSOLE_ADMIN_DELETE,
+            DELETE_FORCE_HEADER_CONTRACT,
+        ] {
+            let case = super::protocol_case(id).expect("canned policy case");
+            assert_eq!(case.executor, super::ProtocolExecutor::CannedPolicy, "{id}");
+            assert!(case.has_capability(super::ProtocolCapability::Iam), "{id}");
+            assert!(case.serial, "{id}");
+            assert!(
+                case.cleanup_scopes
+                    .contains(&super::ProtocolCleanupScope::Identity),
+                "{id}"
+            );
+        }
+        let matrix = super::protocol_case(IAM_CANNED_POLICY_MATRIX).expect("matrix");
+        assert!(matrix.has_capability(super::ProtocolCapability::Versioning));
+        assert!(matrix.tags.contains(&"regression") && !matrix.tags.contains(&"smoke"));
+        let smoke = super::protocol_case(IAM_CANNED_POLICY_CONSOLE_ADMIN_DELETE).expect("smoke");
+        assert!(smoke.tags.contains(&"smoke") && !smoke.tags.contains(&"regression"));
+        let contract = super::protocol_case(DELETE_FORCE_HEADER_CONTRACT).expect("contract");
+        assert_eq!(contract.domain, super::ProtocolDomain::Authorization);
+        assert!(contract.tags.contains(&"regression"));
     }
 
     #[test]

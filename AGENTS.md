@@ -93,16 +93,18 @@ make protocol-suite-validate SUITE=...
 For fault-side or protocol-side script changes, `make fault-check` and
 `make protocol-check` each run `check` plus shell lint for their scripts;
 run at most one umbrella gate and skip the individual checks it already
-covers. `make fault-check` lints only `scripts/fault-test.sh`;
+covers. `make fault-check` also statically validates every checked-in fault
+suite and lints only `scripts/fault-test.sh`;
 `make protocol-check` lints both protocol scripts — for a diff touching
 scripts on both sides, also run `bash -n` on any touched script not covered
 by the chosen umbrella gate.
 
 Any command that mutates the cluster or a live server requires a prepared
 target and explicit user request; this includes `fault-run`, `fault-run-dm`,
-`fault-suite-run`, `fault-dashboard-install` (Helm-installs Chaos Mesh),
-`fault-cleanup`, `protocol-suite-run`, `protocol-compatibility-mint`, and
-`protocol-cleanup`. Never start one as a side effect of an unrelated task.
+`fault-chaos-run`, `fault-dm-run`, `fault-suite-run`,
+`fault-dashboard-install` (Helm-installs Chaos Mesh), `fault-cleanup`,
+`protocol-suite-run`, `protocol-compatibility-mint`, and `protocol-cleanup`.
+Never start one as a side effect of an unrelated task.
 After an authorized live run, validate artifacts before cleanup so failed or
 interrupted evidence can be investigated while live state still exists:
 
