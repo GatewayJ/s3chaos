@@ -1380,7 +1380,7 @@ mod tests {
             serde_json::from_str(&inspection.response_body).expect("inspection response");
         assert_eq!(
             inspected.layout.relative_part_paths,
-            [relative_part_path.clone()]
+            std::slice::from_ref(&relative_part_path)
         );
         assert_eq!(
             inspected.selected_part.relative_part_path,
