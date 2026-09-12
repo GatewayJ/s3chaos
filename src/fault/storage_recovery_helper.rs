@@ -291,8 +291,21 @@ impl StorageHelperSession {
                 mutation_operation_id,
                 started_at_ms,
             ),
-            StorageRecoveryHostOperation::PrepareFreshVolume { .. }
-            | StorageRecoveryHostOperation::DetachDeviceMapper { .. }
+            StorageRecoveryHostOperation::PrepareFreshVolume {
+                replacement_persistent_volume,
+                replacement_persistent_volume_claim,
+            } => completed_receipt(
+                &invocation.context,
+                &self.journal_root,
+                invocation.operation.clone(),
+                &serde_json::json!({
+                    "outcome": "prepared-by-fixture-adapter",
+                    "persistentVolume": replacement_persistent_volume,
+                    "persistentVolumeClaim": replacement_persistent_volume_claim,
+                }),
+                started_at_ms,
+            ),
+            StorageRecoveryHostOperation::DetachDeviceMapper { .. }
             | StorageRecoveryHostOperation::ReattachDeviceMapper { .. } => {
                 bail!("unqualified: operation has no safe storage-helper implementation")
             }
@@ -1205,8 +1218,8 @@ mod tests {
                 mount_id: "mount-1".to_string(),
                 mount_namespace_id: "mnt:[1]".to_string(),
                 device_major_minor: device,
-                device_mapper_uuid: "dm-uuid-1".to_string(),
-                device_mapper_table_sha256: HASH.to_string(),
+                device_mapper_uuid: Some("dm-uuid-1".to_string()),
+                device_mapper_table_sha256: Some(HASH.to_string()),
                 filesystem_uuid: "fs-1".to_string(),
                 rustfs_drive_uuid: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
             },

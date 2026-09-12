@@ -23,7 +23,7 @@ use anyhow::Result;
 use std::sync::{Arc, atomic::AtomicU64};
 use std::time::{Duration, Instant};
 
-pub(super) trait FaultLifecyclePort {
+pub(super) trait FaultLifecyclePort: Send {
     fn wait_active(&self, timeout: Duration) -> Result<()>;
     fn ensure_active(&self, stage: &str) -> Result<()>;
     fn requires_recovery_boundary(&self) -> bool {
@@ -123,9 +123,8 @@ mod tests {
     use crate::framework::artifacts::ArtifactCollector;
     use anyhow::{Result, anyhow};
     use std::{
-        cell::RefCell,
         collections::BTreeMap,
-        rc::Rc,
+        sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
 
@@ -136,7 +135,7 @@ mod tests {
         recoveries: Vec<&'static str>,
     }
 
-    type SharedRecordingFaultState = Rc<RefCell<RecordingFaultState>>;
+    type SharedRecordingFaultState = Arc<Mutex<RecordingFaultState>>;
 
     struct RecordingFault {
         name: &'static str,
@@ -161,7 +160,11 @@ mod tests {
 
     impl FaultLifecyclePort for RecordingFault {
         fn wait_active(&self, timeout: Duration) -> Result<()> {
-            self.state.borrow_mut().waits.push((self.name, timeout));
+            self.state
+                .lock()
+                .expect("state")
+                .waits
+                .push((self.name, timeout));
             Ok(())
         }
 
@@ -170,7 +173,11 @@ mod tests {
         }
 
         fn delete(&mut self, timeout: Duration) -> Result<()> {
-            self.state.borrow_mut().deletes.push((self.name, timeout));
+            self.state
+                .lock()
+                .expect("state")
+                .deletes
+                .push((self.name, timeout));
             Ok(())
         }
 
@@ -193,13 +200,13 @@ mod tests {
             &mut self,
             _request: &FaultDeleteTimeoutRecoveryRequest<'_>,
         ) -> Result<Option<FaultDeleteTimeoutRecovery>> {
-            self.state.borrow_mut().recoveries.push(self.name);
+            self.state.lock().expect("state").recoveries.push(self.name);
             Ok(None)
         }
     }
 
     fn recording_state() -> SharedRecordingFaultState {
-        Rc::new(RefCell::new(RecordingFaultState::default()))
+        Arc::new(Mutex::new(RecordingFaultState::default()))
     }
 
     fn recording_dm_snapshot(stage: &str, helper_pod: &str) -> DmStatusSnapshot {
@@ -272,11 +279,11 @@ mod tests {
         assert_eq!(snapshot.stage, "after-workload");
         fault.delete(Duration::from_secs(1)).expect("delete");
         assert_eq!(
-            state.borrow().waits,
+            state.lock().expect("state").waits,
             vec![("target", Duration::from_secs(7))]
         );
         assert_eq!(
-            state.borrow().deletes,
+            state.lock().expect("state").deletes,
             vec![("target", Duration::from_secs(1))]
         );
     }
@@ -295,7 +302,7 @@ mod tests {
                 .expect("recover")
                 .is_none()
         );
-        assert_eq!(state.borrow().recoveries, vec!["target"]);
+        assert_eq!(state.lock().expect("state").recoveries, vec!["target"]);
     }
 
     #[test]

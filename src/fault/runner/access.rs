@@ -138,7 +138,7 @@ fn stable_pod_fingerprint(
     )
 }
 
-pub(super) async fn wait_for_stable_rustfs_pods(
+pub(in crate::fault) async fn wait_for_stable_rustfs_pods(
     config: &ClusterTestConfig,
     expected_pod_count: usize,
     stable_window: Duration,
@@ -189,13 +189,17 @@ pub(super) async fn wait_for_stable_rustfs_pods(
     }
 }
 
-pub(super) async fn wait_for_ready_tenant(config: &ClusterTestConfig) -> Result<DynamicObject> {
+pub(in crate::fault) async fn wait_for_ready_tenant(
+    config: &ClusterTestConfig,
+) -> Result<DynamicObject> {
     let client = kube_client::default_client().await?;
     let tenants = kube_client::tenant_api(client, &config.test_namespace);
     wait::wait_for_tenant_ready(tenants, &config.tenant_name, config.timeout).await
 }
 
-pub(super) fn s3_access(config: &FaultTestConfig) -> Result<(String, Option<PortForwardGuard>)> {
+pub(in crate::fault) fn s3_access(
+    config: &FaultTestConfig,
+) -> Result<(String, Option<PortForwardGuard>)> {
     let cluster = &config.cluster;
     if config.use_cluster_ip {
         let service = format!("{}-io", cluster.tenant_name);
@@ -232,7 +236,7 @@ pub(super) fn s3_access(config: &FaultTestConfig) -> Result<(String, Option<Port
     Ok((endpoint, Some(spec.start_with_temp_log(&kubectl)?)))
 }
 
-pub(super) async fn ensure_s3_access(
+pub(in crate::fault) async fn ensure_s3_access(
     port_forward: &mut Option<PortForwardGuard>,
     config: &ClusterTestConfig,
     endpoint: &str,

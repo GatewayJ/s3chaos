@@ -27,16 +27,17 @@ use crate::fault::{
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_SCENARIO,
-        DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
-        FaultScenarioSpec, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO,
-        NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO,
-        NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
-        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
-        POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO,
-        QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+        DM_FLAKEY_VERSIONED_HOT_SCENARIO, FRESH_VOLUME_REPLACEMENT_SCENARIO, FaultBackend,
+        FaultParameterSchema, FaultScenario, FaultScenarioSpec, IO_EIO_SCENARIO,
+        IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, NETWORK_CORRUPT_SCENARIO,
+        NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO, NETWORK_LOSS_SCENARIO,
+        NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
+        POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
         ROLLING_RESTART_ALL_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
         WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
+    storage_recovery::StorageRecoveryCase,
 };
 
 pub const DEFAULT_RUSTFS_DATA_VOLUME: &str = DEFAULT_RUSTFS_VOLUME_PATH;
@@ -65,6 +66,7 @@ pub enum FaultWorkloadMode {
 pub enum ExecutionPlan {
     Injection(FaultPlan),
     Admin(AdminExecutionPlan),
+    StorageRecovery(StorageRecoveryExecutionPlan),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +74,7 @@ pub enum ExecutionPlan {
 pub enum ExecutionKind {
     Injection,
     Admin,
+    StorageRecovery,
 }
 
 impl ExecutionKind {
@@ -79,6 +82,7 @@ impl ExecutionKind {
         match self {
             Self::Injection => "injection",
             Self::Admin => "admin",
+            Self::StorageRecovery => "storage-recovery",
         }
     }
 }
@@ -92,6 +96,15 @@ pub struct AdminExecutionPlan {
     pub topology: AdminTopologyPlan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageRecoveryExecutionPlan {
+    pub scenario: String,
+    pub case_name: &'static str,
+    pub workload_mode: FaultWorkloadMode,
+    pub operation_timeout: Duration,
+    pub case: StorageRecoveryCase,
+}
+
 impl ExecutionPlan {
     pub fn from_scenario_with_options(
         scenario: &FaultScenario,
@@ -99,6 +112,37 @@ impl ExecutionPlan {
         options: FaultPlanOptions,
     ) -> Result<Self> {
         match scenario.name.as_str() {
+            FRESH_VOLUME_REPLACEMENT_SCENARIO => {
+                ensure!(
+                    spec.backend == FaultBackend::PlannedReliabilityWorkflow,
+                    "storage-recovery scenario {} must use the planned reliability workflow backend",
+                    scenario.name
+                );
+                ensure!(
+                    matches!(
+                        options.scenario_parameters,
+                        FaultInjectionParameters::Default
+                    ),
+                    "storage-recovery scenario {} does not accept fault-injection parameters",
+                    scenario.name
+                );
+                let case = options.storage_recovery_case.context(
+                    "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE is required for planned storage qualification",
+                )?;
+                ensure!(
+                    case.scenario() == scenario.name,
+                    "storage-recovery case {} does not belong to scenario {}",
+                    case.as_str(),
+                    scenario.name
+                );
+                Ok(Self::StorageRecovery(StorageRecoveryExecutionPlan {
+                    scenario: scenario.name.clone(),
+                    case_name: scenario.case_name,
+                    workload_mode: FaultWorkloadMode::S3Mixed,
+                    operation_timeout: scenario.duration,
+                    case,
+                }))
+            }
             ADMIN_DECOMMISSION_SCENARIO | ADMIN_REBALANCE_SCENARIO => {
                 ensure!(
                     spec.backend == FaultBackend::PlannedReliabilityWorkflow,
@@ -137,6 +181,7 @@ impl ExecutionPlan {
         match self {
             Self::Injection(_) => ExecutionKind::Injection,
             Self::Admin(_) => ExecutionKind::Admin,
+            Self::StorageRecovery(_) => ExecutionKind::StorageRecovery,
         }
     }
 
@@ -144,6 +189,7 @@ impl ExecutionPlan {
         match self {
             Self::Injection(plan) => &plan.scenario,
             Self::Admin(plan) => &plan.scenario,
+            Self::StorageRecovery(plan) => &plan.scenario,
         }
     }
 
@@ -151,6 +197,7 @@ impl ExecutionPlan {
         match self {
             Self::Injection(plan) => plan.case_name,
             Self::Admin(plan) => plan.case_name,
+            Self::StorageRecovery(plan) => plan.case_name,
         }
     }
 
@@ -158,13 +205,14 @@ impl ExecutionPlan {
         match self {
             Self::Injection(plan) => plan.workload_mode,
             Self::Admin(plan) => plan.workload_mode,
+            Self::StorageRecovery(plan) => plan.workload_mode,
         }
     }
 
     pub fn injection(&self) -> Option<&FaultPlan> {
         match self {
             Self::Injection(plan) => Some(plan),
-            Self::Admin(_) => None,
+            Self::Admin(_) | Self::StorageRecovery(_) => None,
         }
     }
 
@@ -172,18 +220,31 @@ impl ExecutionPlan {
         match self {
             Self::Injection(_) => None,
             Self::Admin(plan) => Some(plan),
+            Self::StorageRecovery(_) => None,
+        }
+    }
+
+    pub fn storage_recovery(&self) -> Option<&StorageRecoveryExecutionPlan> {
+        match self {
+            Self::StorageRecovery(plan) => Some(plan),
+            Self::Injection(_) | Self::Admin(_) => None,
         }
     }
 
     pub fn requires_static_storage(&self) -> bool {
-        self.injection()
-            .is_some_and(FaultPlan::requires_static_storage)
+        matches!(self, Self::StorageRecovery(_))
+            || self
+                .injection()
+                .is_some_and(FaultPlan::requires_static_storage)
     }
 
     pub fn backend_summary(&self) -> String {
         match self {
             Self::Injection(plan) => plan.backend_summary(),
             Self::Admin(_) => FaultBackend::PlannedReliabilityWorkflow
+                .as_str()
+                .to_string(),
+            Self::StorageRecovery(_) => FaultBackend::PlannedReliabilityWorkflow
                 .as_str()
                 .to_string(),
         }
@@ -202,6 +263,9 @@ impl ExecutionPlan {
                 ),
                 AdminTopologyKind::Rebalance => "owned two-pool admin topology".to_string(),
             },
+            Self::StorageRecovery(plan) => {
+                format!("owned static Local-PV case {}", plan.case.as_str())
+            }
         }
     }
 }
@@ -1038,6 +1102,7 @@ pub struct FaultPlan {
 pub struct FaultPlanOptions {
     pub rustfs_volume_path: String,
     pub scenario_parameters: FaultInjectionParameters,
+    pub storage_recovery_case: Option<StorageRecoveryCase>,
 }
 
 impl FaultPlanOptions {
@@ -1045,6 +1110,7 @@ impl FaultPlanOptions {
         Self {
             rustfs_volume_path: config.rustfs_volume_path.clone(),
             scenario_parameters: config.scenario_parameters.clone(),
+            storage_recovery_case: config.storage_recovery_case,
         }
     }
 }
@@ -1054,6 +1120,7 @@ impl Default for FaultPlanOptions {
         Self {
             rustfs_volume_path: DEFAULT_RUSTFS_DATA_VOLUME.to_string(),
             scenario_parameters: FaultInjectionParameters::Default,
+            storage_recovery_case: None,
         }
     }
 }
