@@ -489,7 +489,7 @@ where
     .await
 }
 
-async fn clean_attachment(
+pub(super) async fn clean_attachment(
     registry: &mut ResourceRegistry,
     admin: &impl ProtocolPolicyAdminPort,
     handle: &ResourceHandle,

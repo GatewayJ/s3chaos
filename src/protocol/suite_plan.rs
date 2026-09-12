@@ -28,7 +28,7 @@ use crate::protocol::{
     scheduler::{ProtocolLock, plan_protocol_schedule},
     suite::{
         ProtocolArtifactRetentionPolicy, ProtocolCleanupPolicy, ProtocolExecutionProfile,
-        ProtocolExecutionTimeouts, ResolvedProtocolSuite,
+        ProtocolExecutionTimeouts, ProtocolSuiteContracts, ResolvedProtocolSuite,
     },
 };
 
@@ -94,6 +94,8 @@ pub struct ProtocolSuitePlan {
     pub target: ProtocolSuitePlanTarget,
     pub preflight: ProtocolSuitePlanPreflight,
     pub execution: ProtocolSuitePlanExecution,
+    #[serde(default)]
+    pub contracts: ProtocolSuiteContracts,
     pub cases: Vec<ProtocolSuitePlanCase>,
 }
 
@@ -421,6 +423,7 @@ impl ProtocolSuitePlan {
                 product_case_retry: ProtocolProductCaseRetryPolicy::Never,
                 artifact_retention: suite.execution.artifact_retention,
             },
+            contracts: suite.contracts,
             cases,
         })
     }
@@ -520,6 +523,57 @@ mod tests {
         assert_eq!(
             json["variants"][0]["expected"]["errorCode"],
             "MalformedPolicy"
+        );
+    }
+
+    #[test]
+    fn plan_records_selected_contracts_and_legacy_plans_default_them() {
+        let yaml = crate::protocol::suite::protocol_suite_template_yaml().replace(
+            "forceDeleteHeaderSingleObject: ignore-header",
+            "forceDeleteHeaderSingleObject: reject",
+        );
+        let suite: crate::protocol::suite::ProtocolSuite =
+            serde_yaml_ng::from_str(&yaml).expect("reject suite");
+        let plan = super::ProtocolSuitePlan::build(
+            &suite.resolve().expect("resolved"),
+            TargetFingerprint::new(
+                "http://127.0.0.1:9000",
+                "us-east-1",
+                "deployment",
+                None,
+                None,
+            )
+            .expect("fingerprint"),
+            super::ProtocolSuitePlanPreflight {
+                endpoint_reachable: true,
+                admin_api_reachable: true,
+                external_identity: None,
+                capability_matrix: Vec::new(),
+                stale_buckets: Vec::new(),
+                stale_identities: Vec::new(),
+                stale_resource_policy: "record-only-phase-1".to_string(),
+                mutating_permission_probe: super::ProtocolMutatingProbeSummary::not_run(),
+            },
+            "target/protocol-tests",
+            "run",
+        )
+        .expect("plan");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&plan.to_json().expect("plan json")).expect("json value");
+        assert_eq!(
+            json["contracts"],
+            serde_json::json!({ "forceDeleteHeaderSingleObject": "reject" })
+        );
+
+        json.as_object_mut()
+            .expect("plan object")
+            .remove("contracts")
+            .expect("contracts key");
+        let legacy: super::ProtocolSuitePlan =
+            serde_json::from_value(json).expect("legacy plan without contracts");
+        assert_eq!(
+            legacy.contracts,
+            crate::protocol::suite::ProtocolSuiteContracts::default()
         );
     }
 

@@ -281,6 +281,17 @@ make protocol-validate-artifacts ARTIFACT_ROOT=target/protocol-tests/<run>  # ve
 make protocol-cleanup ARTIFACT_ROOT=target/protocol-tests/<run>             # then release fixtures
 ```
 
+Suite YAML may carry a `contracts` block for RustFS behaviors that are not
+settled yet; every key and value is validated and unknown ones fail
+`protocol-suite-validate`. Today it holds
+`forceDeleteHeaderSingleObject` (`ignore-header`, the default, or `reject`),
+asserted by `delete-force-header-contract` for a non-owner single-object
+DeleteObject that carries `X-Rustfs-Force-Delete: true`
+(rustfs/rustfs#7649). The selected value is recorded in
+`protocol-suite-plan.json`. `full-regression.yaml` pins `reject`, the
+behavior RustFS main enforces today, so the release-candidate gate is not
+permanently red; flip it to `ignore-header` once #7649 settles.
+
 Validate before cleanup: for a failed or interrupted run the artifact root is
 the only record of what happened on the server, and cleanup deletes registered
 fixtures.
@@ -291,8 +302,24 @@ fixtures.
   suites, protocol contracts, all example profiles, and shell lint. No cluster
   needed; fault suites are never executed by CI.
 - `.github/workflows/protocol-live.yml`: live RustFS suites (smoke gate,
-  native regression, expiration regression, external OIDC regression) on a
-  self-hosted runner. Full live execution is manually dispatchable. Mint is
+  native regression, expiration regression, external OIDC regression) on the
+  shared `sm-standard-4` runner. Pull requests run the smoke gate only. Full live
+  execution runs on `workflow_dispatch` (inputs `rustfs_image_digest`,
+  `rustfs_version`, and an optional `rustfs_endpoint` +
+  `rustfs_target_fingerprint` pair that redirects the run to a
+  per-candidate target) and on `repository_dispatch` with event type
+  `rustfs-release-candidate`, which the rustfs repository sends for every
+  release candidate with the same keys in `client_payload`, for example:
+  `gh api repos/rustfs/s3chaos/dispatches -f event_type=rustfs-release-candidate -f 'client_payload[rustfs_version]=1.0.0-rc.6' -f 'client_payload[rustfs_image_digest]=sha256:...'`.
+  A `validate-inputs` job gates every live job: dispatch values are
+  character-restricted, and an endpoint override is honored only when its
+  host is listed in the `PROTOCOL_LIVE_ENDPOINT_ALLOWLIST` repository
+  variable (comma-separated hosts; unset refuses all overrides). Build
+  provenance, the override host, and the allowlist decision are written to
+  the run summary and to `target-provenance.env` inside every uploaded
+  artifact; flake history under `.history/` is keyed by profile and target
+  fingerprint so a redirected run never pollutes the shared target's
+  signals. Mint is
   run by command on the independent Kubernetes test server; no Mint workflow
   or schedule is installed by this repository.
 

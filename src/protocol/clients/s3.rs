@@ -17,8 +17,11 @@ use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
     Client,
-    config::{Region, timeout::TimeoutConfig},
-    error::{ProvideErrorMetadata, SdkError},
+    config::{
+        ConfigBag, Intercept, Region, RuntimeComponents,
+        interceptors::BeforeTransmitInterceptorContextMut, timeout::TimeoutConfig,
+    },
+    error::{BoxError, ProvideErrorMetadata, SdkError},
     primitives::ByteStream,
     types::{
         BucketVersioningStatus, CompletedMultipartUpload, CompletedPart as AwsCompletedPart,
@@ -33,8 +36,8 @@ use crate::protocol::{
         ActorS3ClientFactory, ExclusiveBucketOwnership, ProtocolAuthorizationPort,
         ProtocolBucketConfigPort, ProtocolBucketPort, ProtocolCompletedPart,
         ProtocolListObjectsResult, ProtocolListingPort, ProtocolMultipartPort, ProtocolObjectPort,
-        ProtocolObjectVersion, ProtocolPublicAccessBlock, ProtocolS3CleanupPort, ProtocolS3Error,
-        ProtocolVersioningPort,
+        ProtocolObjectVersion, ProtocolPublicAccessBlock, ProtocolRequestShape,
+        ProtocolS3CleanupPort, ProtocolS3Error, ProtocolVersioningPort,
     },
 };
 
@@ -47,14 +50,46 @@ pub struct ProtocolS3Client {
 pub struct AwsS3ClientFactory {
     endpoint: String,
     region: String,
+    admin: AdminCredentials,
 }
 
 impl AwsS3ClientFactory {
-    pub fn new(endpoint: impl Into<String>, region: impl Into<String>) -> Self {
+    pub fn new(
+        endpoint: impl Into<String>,
+        region: impl Into<String>,
+        admin: AdminCredentials,
+    ) -> Self {
         Self {
             endpoint: endpoint.into(),
             region: region.into(),
+            admin,
         }
+    }
+}
+
+/// Adds the case's extra headers before signing, so they travel inside the SigV4 signed-header
+/// set the way a first-party client (for example the RustFS Console) sends them.
+#[derive(Debug)]
+struct RequestShapeInterceptor {
+    shape: ProtocolRequestShape,
+}
+
+impl Intercept for RequestShapeInterceptor {
+    fn name(&self) -> &'static str {
+        "S3ChaosRequestShape"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        let headers = context.request_mut().headers_mut();
+        for (name, value) in &self.shape.extra_headers {
+            headers.try_insert(name.clone(), value.clone())?;
+        }
+        Ok(())
     }
 }
 
@@ -64,6 +99,21 @@ impl ProtocolS3Client {
         region: &str,
         credentials: &AdminCredentials,
     ) -> Result<Self> {
+        Self::for_admin_with_shape(
+            endpoint,
+            region,
+            credentials,
+            &ProtocolRequestShape::default(),
+        )
+        .await
+    }
+
+    pub async fn for_admin_with_shape(
+        endpoint: &str,
+        region: &str,
+        credentials: &AdminCredentials,
+        shape: &ProtocolRequestShape,
+    ) -> Result<Self> {
         Self::new(
             endpoint,
             region,
@@ -71,6 +121,7 @@ impl ProtocolS3Client {
             credentials.secret_key(),
             credentials.session_token(),
             "s3chaos-protocol-admin-env",
+            shape,
         )
         .await
     }
@@ -80,6 +131,21 @@ impl ProtocolS3Client {
         region: &str,
         credential: &ActorCredential,
     ) -> Result<Self> {
+        Self::for_actor_with_shape(
+            endpoint,
+            region,
+            credential,
+            &ProtocolRequestShape::default(),
+        )
+        .await
+    }
+
+    pub async fn for_actor_with_shape(
+        endpoint: &str,
+        region: &str,
+        credential: &ActorCredential,
+        shape: &ProtocolRequestShape,
+    ) -> Result<Self> {
         Self::new(
             endpoint,
             region,
@@ -87,6 +153,7 @@ impl ProtocolS3Client {
             credential.secret_key(),
             credential.session_token(),
             "s3chaos-protocol-generated-actor",
+            shape,
         )
         .await
     }
@@ -98,7 +165,9 @@ impl ProtocolS3Client {
         secret_key: &str,
         session_token: Option<&str>,
         provider_name: &'static str,
+        shape: &ProtocolRequestShape,
     ) -> Result<Self> {
+        shape.validate()?;
         let credentials = Credentials::new(
             access_key,
             secret_key,
@@ -112,17 +181,21 @@ impl ProtocolS3Client {
             .endpoint_url(endpoint)
             .load()
             .await;
-        let config = aws_sdk_s3::config::Builder::from(&shared)
+        let mut builder = aws_sdk_s3::config::Builder::from(&shared)
             .force_path_style(true)
             .timeout_config(
                 TimeoutConfig::builder()
                     .operation_timeout(Duration::from_secs(15))
                     .operation_attempt_timeout(Duration::from_secs(10))
                     .build(),
-            )
-            .build();
+            );
+        if !shape.extra_headers.is_empty() {
+            builder = builder.interceptor(RequestShapeInterceptor {
+                shape: shape.clone(),
+            });
+        }
         Ok(Self {
-            client: Client::from_conf(config),
+            client: Client::from_conf(builder.build()),
         })
     }
 
@@ -1022,6 +1095,20 @@ impl ActorS3ClientFactory for AwsS3ClientFactory {
     async fn for_actor(&self, credential: &ActorCredential) -> Result<Self::Client> {
         ProtocolS3Client::for_actor(&self.endpoint, &self.region, credential).await
     }
+
+    async fn for_actor_with_shape(
+        &self,
+        credential: &ActorCredential,
+        shape: &ProtocolRequestShape,
+    ) -> Result<Self::Client> {
+        ProtocolS3Client::for_actor_with_shape(&self.endpoint, &self.region, credential, shape)
+            .await
+    }
+
+    async fn for_admin_with_shape(&self, shape: &ProtocolRequestShape) -> Result<Self::Client> {
+        ProtocolS3Client::for_admin_with_shape(&self.endpoint, &self.region, &self.admin, shape)
+            .await
+    }
 }
 
 fn protocol_s3_error<E>(error: &SdkError<E>) -> ProtocolS3Error
@@ -1083,7 +1170,129 @@ fn local_s3_error(code: &str) -> ProtocolS3Error {
 
 #[cfg(test)]
 mod tests {
-    use super::ProtocolS3Error;
+    use super::{ProtocolS3Client, ProtocolS3Error};
+    use crate::protocol::{credentials::ActorCredential, ports::ProtocolRequestShape};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    /// Accepts one HTTP/1.1 request, returns its head, and answers 204 so the SDK treats the
+    /// exchange as a completed DeleteObject.
+    async fn capture_one_request(listener: TcpListener) -> String {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = socket.read(&mut chunk).await.expect("read request");
+            assert!(read > 0, "client closed before sending a request head");
+            raw.extend_from_slice(&chunk[..read]);
+            if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+            .await
+            .expect("write response");
+        socket.shutdown().await.expect("shutdown");
+        String::from_utf8(raw).expect("ascii request head")
+    }
+
+    #[tokio::test]
+    async fn request_shape_headers_reach_the_wire_inside_the_signed_header_set() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let capture = tokio::spawn(capture_one_request(listener));
+        let credential =
+            ActorCredential::generated("actor", "shaped-user", "resource-1").expect("credential");
+        let shape =
+            ProtocolRequestShape::with_header("X-Rustfs-Force-Delete", "true").expect("shape");
+        let client =
+            ProtocolS3Client::for_actor_with_shape(&endpoint, "us-east-1", &credential, &shape)
+                .await
+                .expect("client");
+
+        client
+            .delete_object("bucket", "prefix/")
+            .await
+            .expect("204 completes DeleteObject");
+
+        let head = capture.await.expect("capture task");
+        let mut lines = head.lines();
+        let request_line = lines.next().expect("request line");
+        assert!(
+            request_line.starts_with("DELETE /bucket/prefix/?x-id=DeleteObject HTTP/1.1")
+                || request_line.starts_with("DELETE /bucket/prefix/ HTTP/1.1"),
+            "{request_line}"
+        );
+        let headers = lines
+            .map(|line| line.split_once(':').unwrap_or((line, "")))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            .collect::<Vec<_>>();
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "x-rustfs-force-delete" && value == "true"),
+            "force-delete header missing from wire request: {head}"
+        );
+        let authorization = headers
+            .iter()
+            .find(|(name, _)| name == "authorization")
+            .map(|(_, value)| value.as_str())
+            .expect("SigV4 authorization header");
+        let signed = authorization
+            .split("SignedHeaders=")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .expect("SignedHeaders list");
+        assert!(
+            signed
+                .split(';')
+                .any(|name| name == "x-rustfs-force-delete"),
+            "force-delete header is not signed: {authorization}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_clients_never_emit_request_shape_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let capture = tokio::spawn(capture_one_request(listener));
+        let credential =
+            ActorCredential::generated("actor", "plain-user", "resource-1").expect("credential");
+        let client = ProtocolS3Client::for_actor(&endpoint, "us-east-1", &credential)
+            .await
+            .expect("client");
+
+        client
+            .delete_object("bucket", "key")
+            .await
+            .expect("204 completes DeleteObject");
+
+        let head = capture.await.expect("capture task").to_ascii_lowercase();
+        assert!(!head.contains("x-rustfs-force-delete"), "{head}");
+        assert!(!head.contains("x-minio-force-delete"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn invalid_request_shape_is_rejected_before_any_request() {
+        let credential =
+            ActorCredential::generated("actor", "shaped-user", "resource-1").expect("credential");
+        let shape = ProtocolRequestShape {
+            extra_headers: [("authorization".to_string(), "forged".to_string())].into(),
+        };
+        assert!(
+            ProtocolS3Client::for_actor_with_shape(
+                "http://127.0.0.1:9",
+                "us-east-1",
+                &credential,
+                &shape
+            )
+            .await
+            .is_err()
+        );
+    }
 
     #[test]
     fn access_denied_requires_an_authorization_error_code() {

@@ -55,7 +55,7 @@ use crate::protocol::{
             ensure_dedicated_target_fingerprint, protocol_artifact_base,
         },
     },
-    suite::{ProtocolSuite, ProtocolSuiteSelector},
+    suite::{ProtocolSuite, ProtocolSuiteContracts, ProtocolSuiteSelector},
     suite_plan::{
         ProtocolMutatingProbeStatus, ProtocolMutatingProbeSummary, ProtocolSuitePlan,
         ProtocolSuitePlanCase, TargetFingerprint,
@@ -74,6 +74,7 @@ struct LiveProtocolCaseLifecycle<'a> {
     external_identity: Option<&'a dyn ProtocolExternalIdentityPort>,
     web_identity_sts: Option<&'a dyn ProtocolWebIdentityStsPort>,
     actor_clients: &'a AwsS3ClientFactory,
+    contracts: ProtocolSuiteContracts,
     cleanup: &'a ProtocolCleanupCoordinator<'a, RustfsAdminClient, ProtocolS3Client>,
     api_version: &'a str,
 }
@@ -253,7 +254,11 @@ async fn run_protocol_suite(
     let mut probe_forbidden_secrets = probe.forbidden_secrets;
 
     let selected_cases = plan.cases.clone();
-    let actor_clients = AwsS3ClientFactory::new(&runtime.endpoint, &runtime.suite.target.region);
+    let actor_clients = AwsS3ClientFactory::new(
+        &runtime.endpoint,
+        &runtime.suite.target.region,
+        runtime.credentials.clone(),
+    );
     let preflight_failure_message = capability_failure
         .as_ref()
         .map(|(capability, reason)| {
@@ -287,6 +292,7 @@ async fn run_protocol_suite(
             .as_ref()
             .map(|sts| sts as &dyn ProtocolWebIdentityStsPort),
         actor_clients: &actor_clients,
+        contracts: plan.contracts,
         cleanup: &cleanup,
         api_version: &runtime.suite.api_version,
     };
@@ -679,7 +685,12 @@ fn update_protocol_flake_history(
         .parent()
         .and_then(Path::parent)
         .context("protocol artifact root is missing suite/base parents")?;
-    let history_relative = Path::new(".history").join(format!("{}.json", plan.profile));
+    // Keyed by target fingerprint as well as profile so a run redirected to a per-candidate
+    // endpoint never mixes its outcomes into the shared target's flake signals.
+    let history_relative = Path::new(".history").join(format!(
+        "{}-{}.json",
+        plan.profile, plan.target.fingerprint.sha256
+    ));
     let history_path = artifact_base.join(&history_relative);
     let mut entries = if history_path.is_file() {
         let existing: ProtocolFlakeHistory =
@@ -896,6 +907,7 @@ impl ProtocolCaseLifecycle for LiveProtocolCaseLifecycle<'_> {
                 external_identity: self.external_identity,
                 web_identity_sts: self.web_identity_sts,
                 actor_clients: self.actor_clients,
+                contracts: self.contracts,
             },
         )
         .await;
@@ -1157,6 +1169,82 @@ mod tests {
         assert_eq!(cleanup.attempts.len(), 1);
         assert_eq!(cleanup.leftovers.len(), 1);
         serde_json::to_vec(&cleanup).expect("cleanup diagnostics remain serializable");
+    }
+
+    #[test]
+    fn flake_history_is_partitioned_by_target_fingerprint() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let suite: ProtocolSuite =
+            serde_yaml_ng::from_str(protocol_suite_template_yaml()).expect("template suite");
+        let resolved = suite.resolve().expect("resolved suite");
+        let preflight = || crate::protocol::suite_plan::ProtocolSuitePlanPreflight {
+            endpoint_reachable: true,
+            admin_api_reachable: true,
+            external_identity: None,
+            capability_matrix: Vec::new(),
+            stale_buckets: Vec::new(),
+            stale_identities: Vec::new(),
+            stale_resource_policy: "record-only-phase-1".to_string(),
+            mutating_permission_probe:
+                crate::protocol::suite_plan::ProtocolMutatingProbeSummary::not_run(),
+        };
+        let plan_for = |deployment: &str, run_id: &str| {
+            let fingerprint = TargetFingerprint::new(
+                "http://127.0.0.1:9000",
+                "us-east-1",
+                deployment,
+                None,
+                None,
+            )
+            .expect("fingerprint");
+            ProtocolSuitePlan::build(&resolved, fingerprint, preflight(), base.path(), run_id)
+                .expect("plan")
+        };
+        let outcome = || {
+            vec![(
+                ProtocolCaseExecution::harness_failed("case", "executor failed"),
+                ProtocolCleanupReport::empty("rustfs.com/s3chaos/v1alpha1"),
+            )]
+        };
+
+        let shared_first = plan_for("shared-target", "run-1");
+        let shared_second = plan_for("shared-target", "run-2");
+        let candidate = plan_for("candidate-target", "run-3");
+        for plan in [&shared_first, &shared_second, &candidate] {
+            super::update_protocol_flake_history(&plan.artifact_root(), plan, &outcome())
+                .expect("history update");
+        }
+
+        let history_file = |plan: &ProtocolSuitePlan| {
+            base.path().join(".history").join(format!(
+                "{}-{}.json",
+                plan.profile, plan.target.fingerprint.sha256
+            ))
+        };
+        assert_ne!(history_file(&shared_first), history_file(&candidate));
+        let shared: ProtocolFlakeHistory = serde_json::from_str(
+            &fs::read_to_string(history_file(&shared_second)).expect("shared"),
+        )
+        .expect("shared history");
+        assert_eq!(
+            shared
+                .entries
+                .iter()
+                .map(|entry| entry.run_id.as_str())
+                .collect::<Vec<_>>(),
+            ["run-1", "run-2"]
+        );
+        let isolated: ProtocolFlakeHistory =
+            serde_json::from_str(&fs::read_to_string(history_file(&candidate)).expect("candidate"))
+                .expect("candidate history");
+        assert_eq!(
+            isolated
+                .entries
+                .iter()
+                .map(|entry| entry.run_id.as_str())
+                .collect::<Vec<_>>(),
+            ["run-3"]
+        );
     }
 
     #[test]
