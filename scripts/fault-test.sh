@@ -39,6 +39,7 @@ CHAOS_NAMESPACE="${RUSTFS_FAULT_TEST_CHAOS_NAMESPACE:-chaos-mesh}"
 OPERATOR_NAMESPACE="${RUSTFS_FAULT_TEST_OPERATOR_NAMESPACE:-rustfs-system}"
 OPERATOR_PAUSE_REPLICAS_ANNOTATION="s3chaos.rustfs.com/operator-paused-replicas"
 OPERATOR_PAUSE_RUN_ANNOTATION="s3chaos.rustfs.com/operator-paused-run"
+NAMESPACE_DELETE_TIMEOUT="${RUSTFS_FAULT_TEST_NAMESPACE_DELETE_TIMEOUT:-600s}"
 ACTIVE_PID=""
 ACTIVE_ARTIFACTS=""
 ACTIVE_SCOPE=""
@@ -1313,16 +1314,24 @@ list_scenarios() {
 
 # cluster-cold-restart records the operator pause as annotations on the
 # operator Deployment before scaling it to zero. A run that died before its
-# own restore leaves that record behind; undo it here. Returns non-zero only
-# when a restore was possible and did not complete; a context that may not
-# list Deployments in the operator namespace (the RBAC profile the non-cold
-# lifecycle scenarios run with) cannot restore anything and is skipped loudly.
+# own restore leaves that record behind; undo it here. Returns non-zero when
+# a restore was possible and did not complete, or when it cannot be told
+# whether one is possible; only an explicit RBAC "no" (the profile the
+# non-cold lifecycle scenarios run with) is skipped, loudly.
 restore_paused_operators() {
-  local can_list listing deployments name replicas
-  can_list="$(kubectl_ns "$OPERATOR_NAMESPACE" auth can-i list deployments --request-timeout=30s 2>/dev/null || true)"
-  if [[ "$can_list" != "yes" ]]; then
+  local can_list can_i_rc=0 can_i_stderr listing deployments name replicas
+  can_i_stderr="$(mktemp)"
+  can_list="$(kubectl_ns "$OPERATOR_NAMESPACE" auth can-i list deployments --request-timeout=30s 2>"$can_i_stderr")" || can_i_rc=$?
+  if [[ "$can_list" == "yes" ]]; then
+    rm -f "$can_i_stderr"
+  elif [[ "$can_list" == no* ]]; then
+    rm -f "$can_i_stderr"
     echo "warning: this context may not list Deployments in $OPERATOR_NAMESPACE; skipped the operator pause-record restore (run cleanup with a context that can, if a cluster-cold-restart run was killed)" >&2
     return 0
+  else
+    echo "error: cannot determine whether this context may list Deployments in $OPERATOR_NAMESPACE (kubectl auth can-i exit $can_i_rc): $(cat "$can_i_stderr")" >&2
+    rm -f "$can_i_stderr"
+    return 1
   fi
   # Listing a namespaced resource in a namespace that does not exist returns
   # an empty list, so any failure here is an API or transport error.
@@ -1338,7 +1347,7 @@ restore_paused_operators() {
   [[ -n "$deployments" ]] || return 0
   while IFS=$'\t' read -r name replicas; do
     [[ -n "$name" ]] || continue
-    if [[ ! "$replicas" =~ ^[0-9]+$ || "$replicas" -lt 1 ]]; then
+    if [[ ! "$replicas" =~ ^[1-9][0-9]*$ ]]; then
       echo "error: operator Deployment $OPERATOR_NAMESPACE/$name carries an unreadable pause record ($OPERATOR_PAUSE_REPLICAS_ANNOTATION=$replicas); restore it manually and remove the annotation" >&2
       return 1
     fi
@@ -1352,21 +1361,35 @@ restore_paused_operators() {
   done <<<"$deployments"
 }
 
-cleanup() {
-  local restore_status=0
-  cleanup_managed_chaos
-  # Fixture removal and the residual-Chaos check come first so a problem with
-  # the operator namespace can never leave the fault-test namespace behind.
+# Fixture removal and the residual-Chaos check. Failures are returned rather
+# than ending the script so cleanup can still report the operator restore.
+cleanup_fixture() {
   if kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1; then
     require_namespace_ownership
-    kubectl_cluster delete namespace "$FAULT_NAMESPACE" --wait=true
+    if ! kubectl_cluster delete namespace "$FAULT_NAMESPACE" --wait=true --timeout="$NAMESPACE_DELETE_TIMEOUT"; then
+      echo "error: deleting namespace $FAULT_NAMESPACE did not complete within $NAMESPACE_DELETE_TIMEOUT" >&2
+      return 1
+    fi
   fi
   if kubectl_ns "$CHAOS_NAMESPACE" get iochaos,podchaos,networkchaos,stresschaos -l "$MANAGER_SELECTOR" -o name 2>/dev/null | grep -q .; then
-    die "managed Chaos resources remain after cleanup"
+    echo "error: managed Chaos resources remain after cleanup" >&2
+    return 1
   fi
+}
+
+cleanup() {
+  local fixture_status=0 restore_status=0
+  cleanup_managed_chaos
+  # The operator is restored first so a Tenant finalizer that needs it can
+  # complete during the namespace deletion. Both parts always run: the
+  # fixture steps run in a subshell so an ownership die cannot skip the
+  # summary, and each part's status is kept.
   restore_paused_operators || restore_status=$?
+  ( cleanup_fixture ) || fixture_status=$?
+  if [[ "$fixture_status" -ne 0 || "$restore_status" -ne 0 ]]; then
+    die "cleanup incomplete: fixture cleanup exit $fixture_status, operator restore exit $restore_status; see the errors above"
+  fi
   echo "managed fault-test resources cleaned; external StorageClasses, PVs, and host devices were not changed"
-  [[ "$restore_status" -eq 0 ]] || die "restoring a paused operator Deployment failed; see the errors above"
 }
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
