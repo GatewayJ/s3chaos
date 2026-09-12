@@ -115,6 +115,7 @@ enum JournalState {
     Prepared,
     Mutated,
     Restored,
+    VerifiedSuperseded,
     Quarantined,
 }
 
@@ -396,7 +397,10 @@ fn inspect(
         "contained xl.meta crossed the proven volume device"
     );
     let xl_meta = read_limited(&xl_meta_file, MAX_XL_META_BYTES, "xl.meta")?;
-    let layout = inspect_xl_meta(&xl_meta, version_id)?;
+    let mut layout = inspect_xl_meta(&xl_meta, version_id)?;
+    for relative_part_path in &mut layout.relative_part_paths {
+        *relative_part_path = format!("{object_directory}/{relative_part_path}");
+    }
     let selected_index = layout
         .part_numbers
         .iter()
@@ -1023,6 +1027,8 @@ fn load_journal(root: &File, operation_id: &str) -> Result<MutationJournal> {
 }
 
 fn ensure_no_unresolved_journals(journal_root: &File, context: &OwnedStorageContext) -> Result<()> {
+    let current_context_sha256 = context_sha256(context)?;
+    let current_holder = &context.exclusive_access.kubernetes_lease.holder_identity;
     let directory = format!("/proc/self/fd/{}", journal_root.as_raw_fd());
     for entry in std::fs::read_dir(&directory)
         .with_context(|| format!("scan pre-opened storage journal directory {directory}"))?
@@ -1048,13 +1054,15 @@ fn ensure_no_unresolved_journals(journal_root: &File, context: &OwnedStorageCont
             "existing storage journal has an unsupported schema"
         );
         match journal.state {
-            JournalState::Completed | JournalState::Restored => {}
+            JournalState::Completed | JournalState::Restored | JournalState::VerifiedSuperseded => {
+                continue;
+            }
             JournalState::Prepared | JournalState::Mutated
-                if journal.holder_identity
-                    == context.exclusive_access.kubernetes_lease.holder_identity => {}
+                if journal.context_sha256 == current_context_sha256
+                    && journal.holder_identity == *current_holder => {}
             JournalState::Prepared | JournalState::Mutated => {
                 bail!(
-                    "unresolved storage mutation belongs to another attempt; explicit recovery is required"
+                    "unresolved storage mutation does not belong to the current Lease and holder; explicit recovery is required"
                 )
             }
             JournalState::Quarantined => {
@@ -1243,6 +1251,21 @@ mod tests {
         context
     }
 
+    fn next_lease_generation(mut context: OwnedStorageContext) -> OwnedStorageContext {
+        let observed_at_ms = now_ms().expect("now");
+        context.identity.run_id = "run-2".to_string();
+        context.attempt_id = "attempt-2".to_string();
+        context.exclusive_access.kubernetes_lease.uid = "lease-uid-2".to_string();
+        context.exclusive_access.kubernetes_lease.resource_version = "21".to_string();
+        context.exclusive_access.kubernetes_lease.holder_identity = "run-2/attempt-2".to_string();
+        context.exclusive_access.kubernetes_lease.acquired_at_ms = observed_at_ms - 10;
+        context.exclusive_access.kubernetes_lease.renew_at_ms = observed_at_ms - 5;
+        context.exclusive_access.kubernetes_lease.expires_at_ms = observed_at_ms + 60_000;
+        context.exclusive_access.host_flock.acquired_at_ms = observed_at_ms - 2;
+        context.observed_at_ms = observed_at_ms;
+        context
+    }
+
     fn mutation(
         context: &OwnedStorageContext,
         roots: &StorageHelperRoots,
@@ -1299,6 +1322,99 @@ mod tests {
             part_number: 1,
             byte_offset: 1,
         }
+    }
+
+    #[test]
+    fn inspection_seals_the_volume_relative_object_shard_path() {
+        const VERSION_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+        const DATA_DIRECTORY: &str = "fedcba98-7654-3210-fedc-ba9876543210";
+
+        let (_temporary, roots) = test_roots();
+        let context = context_for(&roots);
+        let object_directory = "bucket-1/object";
+        let relative_part_path = format!("{object_directory}/{DATA_DIRECTORY}/part.1");
+        let part_path = roots.volume.join(&relative_part_path);
+        fs::create_dir_all(part_path.parent().expect("part parent")).expect("part parent");
+        let original = vec![0x5a; 1024];
+        fs::write(&part_path, &original).expect("part");
+        fs::write(
+            roots.volume.join(object_directory).join("xl.meta"),
+            crate::fault::xl2_inspector::test_fixture(VERSION_ID, Some(DATA_DIRECTORY), &[1]),
+        )
+        .expect("xl.meta");
+        fs::create_dir_all(roots.volume.join(".rustfs.sys")).expect("system directory");
+        fs::write(
+            roots.volume.join(FORMAT_JSON_PATH),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "1",
+                "format": "xl",
+                "id": context.volume.rustfs_deployment_id,
+                "xl": {
+                    "version": "3",
+                    "this": context.volume.rustfs_drive_uuid,
+                    "sets": [[context.volume.rustfs_drive_uuid]],
+                    "distributionAlgo": "SIPMOD+PARITY"
+                }
+            }))
+            .expect("format.json body"),
+        )
+        .expect("format.json");
+
+        let mut session = StorageHelperSession::begin(context.clone(), &roots).expect("session");
+        let inspection = session
+            .execute(StorageHelperInvocation {
+                context: context.clone(),
+                operation: StorageRecoveryHostOperation::InspectXlMeta {
+                    object_directory: object_directory.to_string(),
+                    bucket: context.identity.bucket.clone(),
+                    object_key: "object".to_string(),
+                    object_sha256: HASH.to_string(),
+                    version_id: VERSION_ID.to_string(),
+                    selected_part_number: 1,
+                    expected_mount_device_id: context.host_generation.device_major_minor.clone(),
+                    expected_drive_uuid: context.volume.rustfs_drive_uuid.clone(),
+                },
+            })
+            .expect("inspect real shard hierarchy");
+        let inspected: OfflineXl2InspectResponse =
+            serde_json::from_str(&inspection.response_body).expect("inspection response");
+        assert_eq!(
+            inspected.layout.relative_part_paths,
+            [relative_part_path.clone()]
+        );
+        assert_eq!(
+            inspected.selected_part.relative_part_path,
+            relative_part_path
+        );
+
+        let mutation = session
+            .execute(StorageHelperInvocation {
+                context: context.clone(),
+                operation: StorageRecoveryHostOperation::MutateShard {
+                    inspection_operation_id: inspection.operation_id,
+                    part_number: 1,
+                    byte_offset: 1,
+                },
+            })
+            .expect("mutate inspected shard");
+        assert_ne!(fs::read(&part_path).expect("mutated part"), original);
+        let restored = session
+            .execute(StorageHelperInvocation {
+                context: context.clone(),
+                operation: StorageRecoveryHostOperation::RestoreShard {
+                    mutation_operation_id: mutation.operation_id,
+                },
+            })
+            .expect("restore inspected shard");
+        session
+            .finish(
+                &context,
+                &StorageRecoveryCleanupProof::BitrotRestored {
+                    restore_receipt: Box::new(restored),
+                },
+            )
+            .expect("finish session");
+        assert_eq!(fs::read(part_path).expect("restored part"), original);
     }
 
     #[test]
@@ -1567,33 +1683,75 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_mutation_blocks_lease_takeover_by_new_attempt() {
-        let (_temporary, roots) = test_roots();
-        let part_path = roots.volume.join("bucket/object/data-dir/part.1");
-        fs::create_dir_all(part_path.parent().expect("part parent")).expect("part parent");
-        fs::write(&part_path, b"original shard payload").expect("part");
-        let context = context_for(&roots);
-        let operation = mutation(&context, &roots, part_path.to_str().expect("part path"));
-        let mut first = StorageHelperSession::begin(context.clone(), &roots).expect("first");
-        first
-            .execute(StorageHelperInvocation {
-                context: context.clone(),
-                operation,
-            })
-            .expect("mutation");
-        drop(first);
+    fn prior_lease_terminal_journals_allow_a_new_attempt() {
+        for state in [
+            JournalState::Completed,
+            JournalState::Restored,
+            JournalState::VerifiedSuperseded,
+        ] {
+            let (_temporary, roots) = test_roots();
+            let context = context_for(&roots);
+            let journal_root =
+                open_directory(&roots.journal, "journal root").expect("journal root");
+            let receipt = completed_receipt(
+                &context,
+                &journal_root,
+                StorageRecoveryHostOperation::InspectXlMeta {
+                    object_directory: "bucket-1/object".to_string(),
+                    bucket: context.identity.bucket.clone(),
+                    object_key: "object".to_string(),
+                    object_sha256: HASH.to_string(),
+                    version_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+                    selected_part_number: 1,
+                    expected_mount_device_id: context.host_generation.device_major_minor.clone(),
+                    expected_drive_uuid: context.volume.rustfs_drive_uuid.clone(),
+                },
+                &serde_json::json!({"terminal": true}),
+                now_ms().expect("now"),
+            )
+            .expect("terminal journal");
+            let mut journal =
+                load_journal(&journal_root, &receipt.operation_id).expect("load terminal journal");
+            journal.state = state;
+            persist_journal(&journal_root, &journal).expect("persist terminal journal state");
 
-        let mut next_attempt = context;
-        next_attempt.identity.run_id = "run-2".to_string();
-        next_attempt.attempt_id = "attempt-2".to_string();
-        next_attempt
-            .exclusive_access
-            .kubernetes_lease
-            .holder_identity = "run-2/attempt-2".to_string();
-        let error = StorageHelperSession::begin(next_attempt, &roots)
-            .err()
-            .expect("new attempt must not inherit unresolved mutation");
-        assert!(error.to_string().contains("another attempt"), "{error:#}");
+            StorageHelperSession::begin(next_lease_generation(context), &roots)
+                .expect("terminal journal from an old Lease generation must not fence recovery");
+        }
+    }
+
+    #[test]
+    fn unresolved_mutation_blocks_lease_takeover_by_new_attempt() {
+        for unresolved_state in [JournalState::Prepared, JournalState::Mutated] {
+            let (_temporary, roots) = test_roots();
+            let part_path = roots.volume.join("bucket/object/data-dir/part.1");
+            fs::create_dir_all(part_path.parent().expect("part parent")).expect("part parent");
+            fs::write(&part_path, b"original shard payload").expect("part");
+            let context = context_for(&roots);
+            let operation = mutation(&context, &roots, part_path.to_str().expect("part path"));
+            let mut first = StorageHelperSession::begin(context.clone(), &roots).expect("first");
+            let receipt = first
+                .execute(StorageHelperInvocation {
+                    context: context.clone(),
+                    operation,
+                })
+                .expect("mutation");
+            let journal_root =
+                open_directory(&roots.journal, "journal root").expect("journal root");
+            let mut journal =
+                load_journal(&journal_root, &receipt.operation_id).expect("mutation journal");
+            journal.state = unresolved_state;
+            persist_journal(&journal_root, &journal).expect("unresolved journal state");
+            drop(first);
+
+            let error = StorageHelperSession::begin(next_lease_generation(context), &roots)
+                .err()
+                .expect("new Lease generation must not inherit an unresolved mutation");
+            assert!(
+                error.to_string().contains("current Lease and holder"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]

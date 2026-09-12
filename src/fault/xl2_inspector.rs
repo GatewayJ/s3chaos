@@ -690,6 +690,9 @@ impl<'a> MsgpackCursor<'a> {
 }
 
 #[cfg(test)]
+pub(crate) use tests::fixture as test_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rmp::encode::{
@@ -702,7 +705,7 @@ mod tests {
     const DEPLOYMENT: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const DRIVE: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
-    fn fixture(version: &str, data_dir: Option<&str>, parts: &[u32]) -> Vec<u8> {
+    pub(crate) fn fixture(version: &str, data_dir: Option<&str>, parts: &[u32]) -> Vec<u8> {
         fixture_with_layout(version, data_dir, parts, &vec![1024; parts.len()], 0b10)
     }
 
