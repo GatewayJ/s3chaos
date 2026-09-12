@@ -159,7 +159,13 @@ pub(crate) trait AdminCaseDriver: Send + Sync {
     /// Verifies scenario-specific admin receipts and the committed S3 model.
     async fn verify(&self) -> Result<()>;
 
-    /// Stops or cancels only the operation identity captured by `start`.
+    /// Reconciles a possibly ambiguous start and stops or cancels only an
+    /// operation proven to belong to this attempt.
+    ///
+    /// The runner invokes this hook after every failed phase, including a
+    /// failed or timed-out `start`: an accepted request may lose its response.
+    /// Drivers must return [`AdminCancelOutcome::NoOwnedOperation`] when no
+    /// attempt-owned operation can be proven instead of touching ambient work.
     async fn cancel(&self) -> Result<AdminCancelOutcome>;
 
     /// Restores non-destructive runner resources and flushes pending evidence.
@@ -205,11 +211,6 @@ pub(crate) async fn execute_admin_workflow<D: AdminCaseDriver + ?Sized>(
             .await
         }
     };
-    // A failed start yields no runner-owned operation identity. Never invoke
-    // cancellation in that state: an ambient operation may belong to another
-    // administrator or test attempt.
-    let owns_operation = primary.is_none();
-
     if primary.is_none()
         && let Some(operation_deadline) = operation_deadline
     {
@@ -239,7 +240,7 @@ pub(crate) async fn execute_admin_workflow<D: AdminCaseDriver + ?Sized>(
         .await;
     }
 
-    if primary.is_some() && owns_operation {
+    if primary.is_some() {
         let cancel = tokio::time::timeout(recovery_timeout, driver.cancel())
             .await
             .map_err(|_| anyhow!("admin cancellation exceeded {recovery_timeout:?}"))
@@ -647,7 +648,8 @@ mod tests {
 
         assert!(execution.error.is_some());
         let calls = driver.calls.lock().expect("calls");
-        assert_eq!(&*calls, &["start", "cleanup"]);
+        assert_eq!(&*calls, &["start", "cancel", "cleanup"]);
+        assert!(execution.evidence.cancel_attempted);
     }
 
     #[tokio::test]
@@ -694,7 +696,7 @@ mod tests {
         assert!(!execution.evidence.cancel_attempted);
         assert_eq!(
             &*driver.0.calls.lock().expect("calls"),
-            &["start", "cleanup"]
+            &["start", "cancel", "cleanup"]
         );
     }
 }
