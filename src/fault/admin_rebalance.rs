@@ -18,7 +18,7 @@
 //! module starts only after that layer has produced a run-owned, two-pool
 //! topology proof and exposes one narrow snapshot hook for that integration.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1690,7 +1690,6 @@ impl AdminCaseDriver for LiveAdminRebalanceDriver {
                     .context("ambiguous rebalance status is not bound to the proven topology")?;
                 {
                     let mut transcript = lock_transcript(&self.transcript);
-                    transcript.operation_id = Some(operation_id.clone());
                     transcript.requests.push(status.request);
                     transcript.progress.push(sample.clone());
                 }
@@ -1698,7 +1697,10 @@ impl AdminCaseDriver for LiveAdminRebalanceDriver {
                     self.write_transcript()?;
                     return Ok(AdminCancelOutcome::NoOwnedOperation);
                 }
-                operation_id
+                self.write_transcript()?;
+                bail!(
+                    "rebalance start remains ambiguous; refusing to stop an operation without an attempt-bound server identity"
+                )
             }
         };
         let result = stop_owned_rebalance(
