@@ -59,8 +59,9 @@ concurrency:
   # One group per candidate: GitHub keeps at most one pending run per group and cancels earlier
   # pending ones, so candidates dispatched in quick succession must not share a group; validate-
   # inputs refuses dispatches without an identity. Pull request and push runs fall back to the
-  # ref. Runs that target the shared dedicated server still serialize on the single self-hosted
-  # runner.
+  # ref. Live jobs run on the shared runner pool, so runs for different candidates may overlap on
+  # the default target; fixture names carry the run id, which keeps their buckets and identities
+  # disjoint.
   group: protocol-live-${{ inputs.rustfs_version || github.event.client_payload.rustfs_version || inputs.rustfs_image_digest || github.event.client_payload.rustfs_image_digest || github.ref }}
   cancel-in-progress: false
 

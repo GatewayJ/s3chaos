@@ -302,8 +302,8 @@ fixtures.
   suites, protocol contracts, all example profiles, and shell lint. No cluster
   needed; fault suites are never executed by CI.
 - `.github/workflows/protocol-live.yml`: live RustFS suites (smoke gate,
-  native regression, expiration regression, external OIDC regression) on a
-  self-hosted runner. Pull requests run the smoke gate only. Full live
+  native regression, expiration regression, external OIDC regression) on the
+  shared `sm-standard-4` runner. Pull requests run the smoke gate only. Full live
   execution runs on `workflow_dispatch` (inputs `rustfs_image_digest`,
   `rustfs_version`, and an optional `rustfs_endpoint` +
   `rustfs_target_fingerprint` pair that redirects the run to a
