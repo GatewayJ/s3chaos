@@ -26,7 +26,7 @@ RUSTFS_POD_COUNT="${RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT:-4}"
 RUSTFS_VOLUME_PATH="${RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH:-/data/rustfs0}"
 RUSTFS_POD_STABLE_WINDOW_SECONDS="${RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS:-60}"
 HEALTH_GUARD_FAILURE_THRESHOLD="${RUSTFS_FAULT_TEST_HEALTH_GUARD_FAILURE_THRESHOLD:-1}"
-BUILD_JOBS="${RUSTFS_FAULT_TEST_BUILD_JOBS:-1}"
+BUILD_JOBS="${RUSTFS_FAULT_TEST_BUILD_JOBS:-}"
 CHAOS_MESH_VERSION="${RUSTFS_FAULT_TEST_CHAOS_MESH_VERSION:-2.8.3}"
 CHAOS_DAEMON_RUNTIME="${RUSTFS_FAULT_TEST_CHAOS_DAEMON_RUNTIME:-containerd}"
 CHAOS_DAEMON_SOCKET_PATH="${RUSTFS_FAULT_TEST_CHAOS_DAEMON_SOCKET_PATH:-/run/k3s/containerd/containerd.sock}"
@@ -38,6 +38,8 @@ FAULT_TENANT="${RUSTFS_FAULT_TEST_TENANT:-fault-test-tenant}"
 CHAOS_NAMESPACE="${RUSTFS_FAULT_TEST_CHAOS_NAMESPACE:-chaos-mesh}"
 ACTIVE_PID=""
 ACTIVE_ARTIFACTS=""
+ACTIVE_SCOPE=""
+ACTIVE_NAME=""
 ACTIVE_HOST_MUTATION_STATE_FILE=""
 ACTIVE_HOST_MUTATION_STATE_TOKEN=""
 FAULT_TEST_BINARY=""
@@ -49,12 +51,15 @@ Usage: fault-test.sh <command> [scenario]
 
 Commands:
   preflight [scenario]  Validate the current real-cluster environment.
-  run <scenario>        Run one destructive scenario with health guards.
+  run <scenario>        Run one non-DM scenario with health guards.
+  chaos-plan <file>     Plan an ordinary Chaos Mesh-only suite.
+  chaos-run <file>      Run an ordinary Chaos Mesh-only suite.
+  dm-run <scenario>     Run exactly one supervised device-mapper scenario.
   list                  List catalog scenarios.
   suite-template        Print a YAML FaultSuite template.
   suite-validate <file> Validate a YAML FaultSuite contract.
   suite-plan <file>     Render the resolved destructive FaultSuite plan.
-  suite-run <file>      Run a destructive YAML FaultSuite sequentially.
+  suite-run <file>      Run a non-static YAML FaultSuite sequentially.
   dashboard-install     Install/upgrade Chaos Mesh with Dashboard enabled.
   dashboard-port-forward [port]
                         Port-forward the Chaos Mesh Dashboard locally.
@@ -203,8 +208,10 @@ fault_catalog_json() {
 s3chaos_cli() {
   if [[ -n "$FAULT_TEST_BINARY" && -x "$FAULT_TEST_BINARY" ]]; then
     "$FAULT_TEST_BINARY" "$@"
-  else
+  elif [[ -n "$BUILD_JOBS" ]]; then
     CARGO_BUILD_JOBS="$BUILD_JOBS" cargo run --quiet --manifest-path "$MANIFEST" --bin s3chaos -- "$@"
+  else
+    cargo run --quiet --manifest-path "$MANIFEST" --bin s3chaos -- "$@"
   fi
 }
 
@@ -229,6 +236,20 @@ scenario_percent_supported() {
 
 scenario_requires_static_storage() {
   catalog_scenario_query "$1" '.[] | select(.scenario == $scenario) | .isolation == "dedicated-linux-block-device"' >/dev/null
+}
+
+require_dm_scenario() {
+  local scenario="$1"
+  require_supported_scenario "$scenario"
+  scenario_requires_static_storage "$scenario" \
+    || die "$scenario is not a device-mapper scenario; use fault-chaos-run for ordinary Chaos Mesh or fault-suite-run for Warp"
+}
+
+require_non_dm_scenario() {
+  local scenario="$1"
+  require_supported_scenario "$scenario"
+  ! scenario_requires_static_storage "$scenario" \
+    || die "$scenario is a device-mapper scenario; run it in the foreground with make fault-dm-run SCENARIO=$scenario"
 }
 
 scenario_crds() {
@@ -260,6 +281,9 @@ validate_runtime_env_contract() {
   require_absolute_non_root_path RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH "$RUSTFS_VOLUME_PATH"
   require_positive_integer RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS "$RUSTFS_POD_STABLE_WINDOW_SECONDS"
   require_positive_integer RUSTFS_FAULT_TEST_HEALTH_GUARD_FAILURE_THRESHOLD "$HEALTH_GUARD_FAILURE_THRESHOLD"
+  if [[ -n "$BUILD_JOBS" ]]; then
+    require_positive_integer RUSTFS_FAULT_TEST_BUILD_JOBS "$BUILD_JOBS"
+  fi
   timeout_seconds="$(trim_value "${RUSTFS_FAULT_TEST_TIMEOUT_SECONDS:-300}")"
   require_unsigned_integer RUSTFS_FAULT_TEST_TIMEOUT_SECONDS "$timeout_seconds"
   (( 10#$RUSTFS_POD_STABLE_WINDOW_SECONDS < 10#$timeout_seconds )) || die "RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS must be less than RUSTFS_FAULT_TEST_TIMEOUT_SECONDS"
@@ -367,31 +391,28 @@ non_fault_tenants_are_ready() {
   return 0
 }
 
-prepare_fault_binary() {
-  local scenario="$1" run_root="$2"
-  preflight "$scenario"
-  build_fault_binary "$run_root" "scenario=$scenario"
-  preflight "$scenario"
-  echo "s3chaos fault-run binary ready"
-}
-
 build_fault_binary() {
   local run_root="$1" label="$2"
   local build_messages="$run_root/fault-build.jsonl"
+  local build_jobs_label="auto"
   local -a build_command=(
     cargo build --manifest-path "$MANIFEST" --bin s3chaos
     --message-format=json-render-diagnostics
   )
 
   BUILD_JOBS="$(trim_value "$BUILD_JOBS")"
-  require_positive_integer RUSTFS_FAULT_TEST_BUILD_JOBS "$BUILD_JOBS"
+  if [[ -n "$BUILD_JOBS" ]]; then
+    require_positive_integer RUSTFS_FAULT_TEST_BUILD_JOBS "$BUILD_JOBS"
+    build_jobs_label="$BUILD_JOBS"
+    build_command=(env "CARGO_BUILD_JOBS=$BUILD_JOBS" "${build_command[@]}")
+  fi
   mkdir -p "$run_root"
-  echo "preparing s3chaos binary for $label with jobs=$BUILD_JOBS and lowest host priority"
+  echo "preparing s3chaos binary for $label with jobs=$build_jobs_label and lowest host priority"
   if command -v ionice >/dev/null 2>&1; then
-    CARGO_BUILD_JOBS="$BUILD_JOBS" nice -n 19 ionice -c3 "${build_command[@]}" \
+    nice -n 19 ionice -c3 "${build_command[@]}" \
       >"$build_messages" 2>"$run_root/fault-build.log"
   else
-    CARGO_BUILD_JOBS="$BUILD_JOBS" nice -n 19 "${build_command[@]}" \
+    nice -n 19 "${build_command[@]}" \
       >"$build_messages" 2>"$run_root/fault-build.log"
   fi
   FAULT_TEST_BINARY="$(jq -r '
@@ -641,16 +662,31 @@ cleanup_host_mutation_state() {
   ACTIVE_HOST_MUTATION_STATE_TOKEN=""
 }
 
+clear_active_run_state() {
+  ACTIVE_PID=""
+  ACTIVE_ARTIFACTS=""
+  ACTIVE_SCOPE=""
+  ACTIVE_NAME=""
+}
+
 handle_signal() {
+  trap '' INT TERM HUP
   if [[ -n "$ACTIVE_PID" ]]; then
     terminate_process_tree "$ACTIVE_PID" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN"
   fi
-  cleanup_managed_chaos
   if [[ -n "$ACTIVE_ARTIFACTS" ]]; then
-    touch "$ACTIVE_ARTIFACTS/interrupted"
-    echo 130 >"$ACTIVE_ARTIFACTS/exit-code"
-    capture_cluster_snapshot "$ACTIVE_ARTIFACTS" interrupted
-    capture_fault_logs "$ACTIVE_ARTIFACTS"
+    touch "$ACTIVE_ARTIFACTS/interrupted" \
+      || warn_artifact_write_failed "interrupted marker" "$ACTIVE_ARTIFACTS/interrupted"
+    if [[ "$ACTIVE_SCOPE" == "suite" ]]; then
+      echo 130 >"$ACTIVE_ARTIFACTS/suite-exit-code" \
+        || warn_artifact_write_failed "suite-exit-code" "$ACTIVE_ARTIFACTS/suite-exit-code"
+    else
+      echo 130 >"$ACTIVE_ARTIFACTS/exit-code" \
+        || warn_artifact_write_failed "exit-code" "$ACTIVE_ARTIFACTS/exit-code"
+    fi
+    finalize_failed_run "${ACTIVE_SCOPE:-run}" "${ACTIVE_NAME:-unknown}" "$ACTIVE_ARTIFACTS" 130 interrupted
+  else
+    cleanup_managed_chaos
   fi
   cleanup_host_mutation_state
   exit 130
@@ -812,22 +848,27 @@ health_failure_is_immediate() {
 validate_scenario_artifacts() {
   local scenario="$1" artifacts="$2" run_root="$3"
   local summary_row
-  summary_row="$(s3chaos_cli fault-validate-artifacts "$scenario" "$artifacts" --validation-summary-tsv)" \
-    || die "$scenario artifacts did not pass Rust contract validation"
+  if ! summary_row="$(s3chaos_cli fault-validate-artifacts "$scenario" "$artifacts" --validation-summary-tsv)"; then
+    echo "fault-test: $scenario artifacts did not pass Rust contract validation" >&2
+    return 1
+  fi
   printf '%s\n' "$summary_row" >>"$run_root/validation-summary.tsv"
 }
 
 write_runner_failure_summary() {
   local scenario="$1" artifacts="$2" rc="$3"
-  local health_guard_failed=false rust_failure_summary=false
-  local health_watch_last=""
+  local health_guard_failed=false artifact_validation_failed=false rust_failure_summary=false
+  local health_watch_last="" rust_failure_summary_path=""
   [[ ! -f "$artifacts/health-guard-failed" ]] || health_guard_failed=true
-  [[ ! -f "$artifacts/failure-summary.json" ]] || rust_failure_summary=true
+  [[ ! -f "$artifacts/artifact-validation-failed" ]] || artifact_validation_failed=true
+  rust_failure_summary_path="$(find "$artifacts" -type f -name failure-summary.json -print -quit 2>/dev/null || true)"
+  [[ -z "$rust_failure_summary_path" ]] || rust_failure_summary=true
   [[ ! -f "$artifacts/health-watch.log" ]] || health_watch_last="$(tail -n 1 "$artifacts/health-watch.log" 2>/dev/null || true)"
   jq -n \
     --arg scenario "$scenario" \
     --argjson exit_code "$rc" \
     --argjson health_guard_failed "$health_guard_failed" \
+    --argjson artifact_validation_failed "$artifact_validation_failed" \
     --argjson rust_failure_summary "$rust_failure_summary" \
     --arg test_log "$artifacts/test.log" \
     --arg health_watch_last "$health_watch_last" \
@@ -836,6 +877,7 @@ write_runner_failure_summary() {
       stage: "runner",
       exit_code: $exit_code,
       health_guard_failed: $health_guard_failed,
+      artifact_validation_failed: $artifact_validation_failed,
       rust_failure_summary_present: $rust_failure_summary,
       test_log: $test_log,
       health_watch_last: (if $health_watch_last == "" then null else $health_watch_last end)
@@ -845,10 +887,11 @@ write_runner_failure_summary() {
 write_suite_runner_failure_summary() {
   local suite="$1" run_root="$2" rc="$3"
   local health_guard_failed=false suite_budget_failed=false suite_summary_present=false
-  local health_watch_last=""
+  local health_watch_last="" suite_summary_path=""
   [[ ! -f "$run_root/health-guard-failed" ]] || health_guard_failed=true
   [[ ! -f "$run_root/suite-budget-failed" ]] || suite_budget_failed=true
-  [[ ! -f "$run_root/suite-summary.json" ]] || suite_summary_present=true
+  suite_summary_path="$(find "$run_root" -type f -name suite-summary.json -print -quit 2>/dev/null || true)"
+  [[ -z "$suite_summary_path" ]] || suite_summary_present=true
   [[ ! -f "$run_root/health-watch.log" ]] || health_watch_last="$(tail -n 1 "$run_root/health-watch.log" 2>/dev/null || true)"
   jq -n \
     --arg suite "$suite" \
@@ -870,6 +913,71 @@ write_suite_runner_failure_summary() {
     }' >"$run_root/runner-failure-summary.json"
 }
 
+write_failure_evidence_manifest() {
+  local scope="$1" name="$2" artifacts="$3" rc="$4" snapshot_stage="$5"
+  local diagnosis_count failure_summary_count captured_at
+  diagnosis_count="$(find "$artifacts" -type f -name diagnosis.txt -print 2>/dev/null | wc -l | tr -d '[:space:]')"
+  failure_summary_count="$(find "$artifacts" -type f \( -name failure-summary.json -o -name runner-failure-summary.json \) -print 2>/dev/null | wc -l | tr -d '[:space:]')"
+  captured_at="$(date -u +%FT%TZ)"
+
+  cat >"$artifacts/runner-diagnosis.txt" <<EOF
+Failure evidence was captured before residual managed Chaos cleanup.
+scope=$scope
+name=$name
+exitCode=$rc
+detailedRustDiagnosisFiles=$diagnosis_count
+failureSummaryFiles=$failure_summary_count
+
+Inspect runner-failure-summary.json, the case-scoped failure-summary.json and diagnosis.txt files, the $snapshot_stage cluster snapshot, and the captured RustFS logs.
+EOF
+
+  jq -n \
+    --arg captured_at "$captured_at" \
+    --arg scope "$scope" \
+    --arg name "$name" \
+    --arg snapshot_stage "$snapshot_stage" \
+    --argjson exit_code "$rc" \
+    --argjson detailed_diagnosis_files "$diagnosis_count" \
+    --argjson failure_summary_files "$failure_summary_count" \
+    '{
+      schemaVersion: 1,
+      status: "captured-before-managed-chaos-cleanup",
+      capturedAt: $captured_at,
+      scope: $scope,
+      name: $name,
+      exitCode: $exit_code,
+      snapshotStage: $snapshot_stage,
+      detailedRustDiagnosisFiles: $detailed_diagnosis_files,
+      failureSummaryFiles: $failure_summary_files,
+      runnerDiagnosis: "runner-diagnosis.txt"
+    }' >"$artifacts/failure-evidence.json"
+}
+
+finalize_failed_run() {
+  local scope="$1" name="$2" artifacts="$3" rc="$4" snapshot_stage="${5:-failed}"
+  capture_cluster_snapshot "$artifacts" "$snapshot_stage"
+  capture_fault_logs "$artifacts"
+  case "$scope" in
+    scenario)
+      write_runner_failure_summary "$name" "$artifacts" "$rc" \
+        || warn_artifact_write_failed "runner-failure-summary.json" "$artifacts/runner-failure-summary.json"
+      ;;
+    suite)
+      write_suite_runner_failure_summary "$name" "$artifacts" "$rc" \
+        || warn_artifact_write_failed "runner-failure-summary.json" "$artifacts/runner-failure-summary.json"
+      ;;
+    *)
+      jq -n --arg scope "$scope" --arg name "$name" --argjson exit_code "$rc" \
+        '{scope: $scope, name: $name, stage: "runner", exit_code: $exit_code}' \
+        >"$artifacts/runner-failure-summary.json" \
+        || warn_artifact_write_failed "runner-failure-summary.json" "$artifacts/runner-failure-summary.json"
+      ;;
+  esac
+  write_failure_evidence_manifest "$scope" "$name" "$artifacts" "$rc" "$snapshot_stage" \
+    || warn_artifact_write_failed "failure-evidence.json" "$artifacts/failure-evidence.json"
+  cleanup_managed_chaos
+}
+
 warn_artifact_write_failed() {
   local artifact="$1" path="$2"
   echo "warning: could not write $artifact: $path" >&2
@@ -881,7 +989,6 @@ run_scenario() {
   local baseline_ready_nodes baseline_tenants test_pid rc current_time health_checks require_chaos
   local health_status health_safe health_message health_reason
   local consecutive_health_failures will_abort
-  preflight "$scenario"
   mkdir -p "$artifacts"
   baseline_ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
   baseline_tenants="$artifacts/baseline-non-fault-tenants.tsv"
@@ -895,6 +1002,9 @@ run_scenario() {
   prepare_host_mutation_state "$artifacts"
 
   echo "starting scenario=$scenario artifacts=$artifacts"
+  ACTIVE_ARTIFACTS="$artifacts"
+  ACTIVE_SCOPE="scenario"
+  ACTIVE_NAME="$scenario"
   (
     set +e
     RUSTFS_FAULT_TEST_DESTRUCTIVE=1 \
@@ -914,7 +1024,6 @@ run_scenario() {
   ) &
   test_pid=$!
   ACTIVE_PID="$test_pid"
-  ACTIVE_ARTIFACTS="$artifacts"
   health_checks=0
   consecutive_health_failures=0
 
@@ -945,7 +1054,6 @@ run_scenario() {
       if [[ "$will_abort" == "true" ]]; then
         touch "$artifacts/health-guard-failed"
         terminate_process_tree "$test_pid" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN"
-        cleanup_managed_chaos
         break
       fi
     fi
@@ -955,22 +1063,31 @@ run_scenario() {
   wait "$test_pid" 2>/dev/null || true
   cleanup_host_mutation_state
   ACTIVE_PID=""
-  ACTIVE_ARTIFACTS=""
   rc=125
   [[ -f "$artifacts/test-exit-code.tmp" ]] && rc="$(cat "$artifacts/test-exit-code.tmp")"
   [[ ! -f "$artifacts/health-guard-failed" ]] || rc=90
   echo "$rc" >"$artifacts/exit-code"
-  capture_cluster_snapshot "$artifacts" after
-  capture_fault_logs "$artifacts"
 
   if [[ "$rc" -ne 0 ]]; then
-    write_runner_failure_summary "$scenario" "$artifacts" "$rc" \
-      || warn_artifact_write_failed "runner-failure-summary.json" "$artifacts/runner-failure-summary.json"
-    cleanup_managed_chaos
+    finalize_failed_run scenario "$scenario" "$artifacts" "$rc"
+    clear_active_run_state
     echo "scenario failed: $scenario rc=$rc log=$artifacts/test.log" >&2
     return "$rc"
   fi
-  validate_scenario_artifacts "$scenario" "$artifacts" "$run_root"
+  if ! validate_scenario_artifacts "$scenario" "$artifacts" "$run_root"; then
+    rc=1
+    touch "$artifacts/artifact-validation-failed" \
+      || warn_artifact_write_failed "artifact-validation-failed marker" "$artifacts/artifact-validation-failed"
+    echo "$rc" >"$artifacts/exit-code" \
+      || warn_artifact_write_failed "exit-code" "$artifacts/exit-code"
+    finalize_failed_run scenario "$scenario" "$artifacts" "$rc"
+    clear_active_run_state
+    echo "scenario failed artifact validation: $scenario log=$artifacts/test.log" >&2
+    return "$rc"
+  fi
+  capture_cluster_snapshot "$artifacts" after
+  capture_fault_logs "$artifacts"
+  clear_active_run_state
   echo "scenario passed: $scenario"
 }
 
@@ -992,25 +1109,91 @@ initialize_summary() {
 }
 
 run_one() {
-  local scenario="$1" run_root
-  require_supported_scenario "$scenario"
+  local scenario="$1" mode="${2:-ordinary}" run_root
   run_root="$(new_run_root)"
   initialize_summary "$run_root"
   run_root="$(cd "$run_root" && pwd -P)"
-  prepare_fault_binary "$scenario" "$run_root"
+  build_fault_binary "$run_root" "scenario=$scenario"
+  if [[ "$mode" == "dm" ]]; then
+    require_dm_scenario "$scenario"
+  else
+    require_non_dm_scenario "$scenario"
+  fi
+  preflight "$scenario"
+  echo "s3chaos fault-run binary ready"
   run_scenario "$scenario" "$run_root"
   echo "run artifacts: $run_root"
 }
 
+run_dm() {
+  local scenario="$1"
+  run_one "$scenario" dm
+}
+
 preflight_suite() {
-  local suite="$1" plan_path="$2" scenario
-  s3chaos_cli fault-suite-validate "$suite"
+  local suite="$1" plan_path="$2" mode="${3:-general}" scenario crd tool
   ensure_inherited_kubeconfig
   s3chaos_cli fault-suite-plan "$suite" >"$plan_path"
-  while IFS= read -r scenario; do
-    [[ -n "$scenario" ]] || continue
-    preflight "$scenario"
-  done < <(jq -r '.attempts[].scenario' "$plan_path" | sort -u)
+  if [[ "$mode" == "chaos" ]]; then
+    require_ordinary_chaos_suite_plan "$plan_path"
+  else
+    require_non_static_suite_plan "$plan_path"
+  fi
+  scenario="$(jq -r '.attempts[0].scenario // empty' "$plan_path")"
+  [[ -n "$scenario" ]] || die "fault suite plan contains no attempts: $suite"
+  preflight "$scenario"
+  while IFS= read -r crd; do
+    [[ -n "$crd" ]] || continue
+    kubectl_cluster get crd "$crd" >/dev/null
+  done < <(jq -r '.requiredCrds[]?' "$plan_path")
+  while IFS= read -r tool; do
+    [[ -n "$tool" ]] || continue
+    require_command "$tool"
+  done < <(jq -r '.requiredTools[]?' "$plan_path")
+}
+
+is_ordinary_chaos_suite_plan() {
+  local plan_path="$1"
+  jq -e '
+    .requiresChaosMesh == true
+    and .requiresStaticStorage == false
+    and (.attempts | length > 0)
+    and all(.attempts[];
+      .scenario != "warp-under-chaos"
+      and
+      .requiresChaosMesh == true
+      and .requiresStaticStorage == false
+      and (.expectedBackend | startswith("chaos-mesh-")))
+  ' "$plan_path" >/dev/null
+}
+
+require_non_static_suite_plan() {
+  local plan_path="$1"
+  jq -e '.requiresStaticStorage == false' "$plan_path" >/dev/null \
+    || die "fault-suite-run does not execute device-mapper suites; run exactly one scenario in the foreground with make fault-dm-run SCENARIO=<name>"
+}
+
+require_ordinary_chaos_suite_plan() {
+  local plan_path="$1"
+  is_ordinary_chaos_suite_plan "$plan_path" \
+    || die "fault-chaos-run accepts only ordinary Chaos Mesh scenarios; use fault-suite-run for Warp or fault-dm-run for one device-mapper scenario"
+}
+
+plan_chaos_suite() {
+  local suite="$1" plan_path
+  [[ -f "$suite" ]] || die "suite yaml file not found: $suite"
+  ensure_inherited_kubeconfig
+  plan_path="$(mktemp)"
+  if ! s3chaos_cli fault-suite-plan "$suite" >"$plan_path"; then
+    rm -f "$plan_path"
+    die "failed to plan ordinary Chaos Mesh suite: $suite"
+  fi
+  if ! is_ordinary_chaos_suite_plan "$plan_path"; then
+    rm -f "$plan_path"
+    die "fault-chaos-plan accepts only ordinary Chaos Mesh scenarios; use fault-suite-plan for Warp or device-mapper plans"
+  fi
+  cat "$plan_path"
+  rm -f "$plan_path"
 }
 
 suite_requires_chaos() {
@@ -1019,7 +1202,7 @@ suite_requires_chaos() {
 }
 
 run_suite() {
-  local suite="$1" run_root rc suite_plan suite_name
+  local suite="$1" mode="${2:-general}" run_root rc suite_plan suite_name
   local baseline_ready_nodes baseline_tenants current_time health_checks require_chaos
   local health_status health_safe health_message health_reason
   local consecutive_health_failures will_abort
@@ -1028,9 +1211,8 @@ run_suite() {
   mkdir -p "$run_root"
   run_root="$(cd "$run_root" && pwd -P)"
   suite_plan="$run_root/suite-plan-preview.json"
-  preflight_suite "$suite" "$suite_plan"
   build_fault_binary "$run_root" "fault-suite-run"
-  preflight_suite "$suite" "$suite_plan"
+  preflight_suite "$suite" "$suite_plan" "$mode"
   suite_name="$(jq -r '.suite // empty' "$suite_plan")"
   [[ -n "$suite_name" ]] || suite_name="$suite"
   baseline_ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
@@ -1046,6 +1228,8 @@ run_suite() {
 
   echo "starting suite=$suite artifacts=$run_root"
   ACTIVE_ARTIFACTS="$run_root"
+  ACTIVE_SCOPE="suite"
+  ACTIVE_NAME="$suite_name"
   (
     set +e
     RUSTFS_FAULT_TEST_DESTRUCTIVE=1 \
@@ -1087,7 +1271,6 @@ run_suite() {
       if [[ "$will_abort" == "true" ]]; then
         touch "$run_root/health-guard-failed"
         terminate_process_tree "$ACTIVE_PID" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN"
-        cleanup_managed_chaos
         break
       fi
     fi
@@ -1097,20 +1280,19 @@ run_suite() {
   wait "$ACTIVE_PID" 2>/dev/null || true
   cleanup_host_mutation_state
   ACTIVE_PID=""
-  ACTIVE_ARTIFACTS=""
   rc=125
   [[ -f "$run_root/suite-exit-code.tmp" ]] && rc="$(cat "$run_root/suite-exit-code.tmp")"
   [[ ! -f "$run_root/health-guard-failed" ]] || rc=90
   echo "$rc" >"$run_root/suite-exit-code"
-  capture_cluster_snapshot "$run_root" after
-  capture_fault_logs "$run_root"
   if [[ "$rc" -ne 0 ]]; then
-    write_suite_runner_failure_summary "$suite_name" "$run_root" "$rc" \
-      || warn_artifact_write_failed "runner-failure-summary.json" "$run_root/runner-failure-summary.json"
-    cleanup_managed_chaos
+    finalize_failed_run suite "$suite_name" "$run_root" "$rc"
+    clear_active_run_state
     echo "suite failed: $suite rc=$rc log=$run_root/suite.log" >&2
     return "$rc"
   fi
+  capture_cluster_snapshot "$run_root" after
+  capture_fault_logs "$run_root"
+  clear_active_run_state
   echo "suite passed: $suite"
   echo "run artifacts: $run_root"
 }
@@ -1146,7 +1328,23 @@ case "${1:-help}" in
     ;;
   run)
     [[ -n "${2:-}" ]] || die "scenario is required"
+    [[ -z "${3:-}" ]] || die "run accepts exactly one scenario"
     run_one "$2"
+    ;;
+  chaos-plan)
+    [[ -n "${2:-}" ]] || die "ordinary Chaos Mesh suite yaml path is required"
+    [[ -z "${3:-}" ]] || die "chaos-plan accepts exactly one suite yaml path"
+    plan_chaos_suite "$2"
+    ;;
+  chaos-run)
+    [[ -n "${2:-}" ]] || die "ordinary Chaos Mesh suite yaml path is required"
+    [[ -z "${3:-}" ]] || die "chaos-run accepts exactly one suite yaml path"
+    run_suite "$2" chaos
+    ;;
+  dm-run)
+    [[ -n "${2:-}" ]] || die "device-mapper scenario is required"
+    [[ -z "${3:-}" ]] || die "dm-run accepts exactly one scenario"
+    run_dm "$2"
     ;;
   list)
     [[ -z "${2:-}" ]] || die "list does not accept arguments; run a named scenario with: fault-test.sh run <scenario>"

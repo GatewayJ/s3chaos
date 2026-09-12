@@ -2,6 +2,7 @@ SHELL := /bin/bash
 
 SCENARIO ?=
 SUITE ?=
+CHAOS_SUITE ?= $(CURDIR)/fault/examples/chaos-mesh.yaml
 CONSOLE_ROOT ?= $(CURDIR)/target/fault-tests
 CONSOLE_ADDR ?= 127.0.0.1:0
 CONSOLE_ALLOW_NON_LOOPBACK ?=
@@ -9,7 +10,7 @@ FAULT_SCRIPT := $(CURDIR)/scripts/fault-test.sh
 PROTOCOL_SCRIPT := $(CURDIR)/scripts/protocol-test.sh
 PROTOCOL_COMPAT_SCRIPT := $(CURDIR)/scripts/protocol-compatibility.sh
 
-.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-preflight fault-run fault-run-dm fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup protocol-check protocol-list protocol-compatibility-mint protocol-mint-cleanup protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts protocol-validate-mint-session
+.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-preflight fault-run fault-run-dm fault-chaos-plan fault-chaos-run fault-dm-run fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup protocol-check protocol-list protocol-compatibility-mint protocol-mint-cleanup protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts protocol-validate-mint-session
 
 check: fmt-check clippy test
 
@@ -27,6 +28,7 @@ test:
 
 fault-check: check
 	bash -n $(FAULT_SCRIPT)
+	@for suite in $(CURDIR)/fault/examples/*.yaml; do bash $(FAULT_SCRIPT) suite-validate "$$suite"; done
 
 fault-list:
 	@bash $(FAULT_SCRIPT) list
@@ -40,7 +42,17 @@ fault-run:
 	bash $(FAULT_SCRIPT) run "$(SCENARIO)"
 
 fault-run-dm:
-	bash $(FAULT_SCRIPT) run dm-flakey
+	bash $(FAULT_SCRIPT) dm-run dm-flakey
+
+fault-chaos-plan:
+	@bash $(FAULT_SCRIPT) chaos-plan "$(CHAOS_SUITE)"
+
+fault-chaos-run:
+	bash $(FAULT_SCRIPT) chaos-run "$(CHAOS_SUITE)"
+
+fault-dm-run:
+	@test -n "$(SCENARIO)" || (echo "SCENARIO is required, for example: make fault-dm-run SCENARIO=dm-flakey" >&2; exit 1)
+	bash $(FAULT_SCRIPT) dm-run "$(SCENARIO)"
 
 fault-suite-template:
 	@bash $(FAULT_SCRIPT) suite-template

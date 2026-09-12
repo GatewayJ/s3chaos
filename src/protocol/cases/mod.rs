@@ -14,6 +14,7 @@
 
 mod authz;
 mod bucket_policy;
+mod canned_policy;
 mod compatibility;
 mod iam;
 mod oidc;
@@ -26,9 +27,10 @@ use crate::protocol::{
     fixture::{naming::ProtocolResourceNamer, registry::ResourceRegistry},
     ports::{
         ActorS3ClientFactory, ProtocolAdminCasePorts, ProtocolExternalIdentityPort,
-        ProtocolS3CasePorts, ProtocolStsPort, ProtocolWebIdentityStsPort,
+        ProtocolS3CasePorts, ProtocolStsPort, ProtocolVersioningPort, ProtocolWebIdentityStsPort,
     },
     reporting::{ProtocolCaseOutcome, ProtocolCaseReport, ProtocolCaseStatus},
+    suite::ProtocolSuiteContracts,
 };
 use std::time::Instant;
 
@@ -155,6 +157,7 @@ pub(crate) struct ProtocolCaseServices<'a, A, S, T, F> {
     pub(crate) external_identity: Option<&'a dyn ProtocolExternalIdentityPort>,
     pub(crate) web_identity_sts: Option<&'a dyn ProtocolWebIdentityStsPort>,
     pub(crate) actor_clients: &'a F,
+    pub(crate) contracts: ProtocolSuiteContracts,
 }
 
 pub(crate) async fn run_protocol_case<A, S, T, F>(
@@ -168,6 +171,7 @@ where
     S: ProtocolS3CasePorts,
     T: ProtocolStsPort,
     F: ActorS3ClientFactory,
+    F::Client: ProtocolVersioningPort,
 {
     let Some(case) = protocol_case(case_id) else {
         return ProtocolCaseExecution::not_run(case_id, "case is not present in protocol catalog");
@@ -181,6 +185,18 @@ where
                 services.admin,
                 services.admin_s3,
                 services.actor_clients,
+            )
+            .await
+        }
+        ProtocolExecutor::CannedPolicy => {
+            canned_policy::run_canned_policy_case(
+                case_id,
+                namer,
+                registry,
+                services.admin,
+                services.admin_s3,
+                services.actor_clients,
+                services.contracts,
             )
             .await
         }

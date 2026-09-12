@@ -737,9 +737,136 @@ pub trait ProtocolAdminRuntimePorts: ProtocolAdminServerPort + ProtocolAdminCase
 
 impl<T> ProtocolAdminRuntimePorts for T where T: ProtocolAdminServerPort + ProtocolAdminCasePorts {}
 
+/// Wire-level request shape applied to every request a client sends. Cases use it to reproduce
+/// client behaviors that plain SDK calls never emit, such as the Console's
+/// `X-Rustfs-Force-Delete: true` header on DeleteObject (rustfs/rustfs#7649).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtocolRequestShape {
+    /// Extra headers, keyed by lowercase name, added before the request is signed so they are
+    /// part of the SigV4 signed-header set exactly like a first-party client would send them.
+    pub extra_headers: BTreeMap<String, String>,
+}
+
+/// Headers the signer or transport own. Overriding them would not change the request shape
+/// under test; it would forge or break the request, so they are rejected up front.
+const RESERVED_REQUEST_SHAPE_HEADERS: &[&str] = &[
+    "amz-sdk-invocation-id",
+    "amz-sdk-request",
+    "authorization",
+    "content-encoding",
+    "content-length",
+    "content-md5",
+    "content-type",
+    "expect",
+    "host",
+    "transfer-encoding",
+    "x-amz-content-sha256",
+    "x-amz-date",
+    "x-amz-decoded-content-length",
+    "x-amz-security-token",
+    "x-amz-trailer",
+];
+
+impl ProtocolRequestShape {
+    pub fn with_header(name: &str, value: &str) -> anyhow::Result<Self> {
+        let mut shape = Self::default();
+        shape
+            .extra_headers
+            .insert(name.to_ascii_lowercase(), value.to_string());
+        shape.validate()?;
+        Ok(shape)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, value) in &self.extra_headers {
+            anyhow::ensure!(
+                !name.is_empty() && name == &name.to_ascii_lowercase(),
+                "request shape header name {name:?} must be non-empty lowercase"
+            );
+            anyhow::ensure!(
+                !RESERVED_REQUEST_SHAPE_HEADERS.contains(&name.as_str())
+                    && !name.starts_with("x-amz-checksum-"),
+                "request shape header {name:?} is owned by the signer or transport"
+            );
+            http::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| anyhow::anyhow!("request shape header name {name:?} is invalid"))?;
+            let parsed = http::HeaderValue::from_str(value).map_err(|_| {
+                anyhow::anyhow!("request shape header {name:?} has an invalid value")
+            })?;
+            anyhow::ensure!(
+                parsed.to_str().is_ok() && !value.is_empty(),
+                "request shape header {name:?} value must be non-empty visible ASCII"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 pub trait ActorS3ClientFactory: Send + Sync {
     type Client: ProtocolListingPort + ProtocolObjectPort;
 
     async fn for_actor(&self, credential: &ActorCredential) -> anyhow::Result<Self::Client>;
+
+    /// Client for `credential` that sends `shape` on every request. The default refuses so a
+    /// factory that never learned about request shapes fails the case instead of silently
+    /// running it with a plain client.
+    async fn for_actor_with_shape(
+        &self,
+        credential: &ActorCredential,
+        shape: &ProtocolRequestShape,
+    ) -> anyhow::Result<Self::Client> {
+        let _ = (credential, shape);
+        anyhow::bail!("this S3 client factory does not support per-case request shapes")
+    }
+
+    /// Client for the administrative credentials that sends `shape` on every request.
+    async fn for_admin_with_shape(
+        &self,
+        shape: &ProtocolRequestShape,
+    ) -> anyhow::Result<Self::Client> {
+        let _ = shape;
+        anyhow::bail!("this S3 client factory does not support per-case request shapes")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProtocolRequestShape;
+
+    #[test]
+    fn request_shape_accepts_vendor_headers_and_rejects_signer_owned_ones() {
+        let shape = ProtocolRequestShape::with_header("X-Rustfs-Force-Delete", "true")
+            .expect("vendor header");
+        assert_eq!(
+            shape
+                .extra_headers
+                .get("x-rustfs-force-delete")
+                .map(String::as_str),
+            Some("true")
+        );
+        for name in [
+            "authorization",
+            "host",
+            "x-amz-date",
+            "x-amz-content-sha256",
+            "x-amz-security-token",
+            "x-amz-checksum-crc32",
+            "content-encoding",
+            "x-amz-decoded-content-length",
+            "x-amz-trailer",
+            "expect",
+            "amz-sdk-invocation-id",
+            "amz-sdk-request",
+        ] {
+            assert!(
+                ProtocolRequestShape::with_header(name, "value").is_err(),
+                "{name} must be rejected"
+            );
+        }
+        assert!(ProtocolRequestShape::with_header("", "true").is_err());
+        assert!(ProtocolRequestShape::with_header("x-rustfs-force-delete", "").is_err());
+        assert!(ProtocolRequestShape::with_header("x-rustfs force", "true").is_err());
+        assert!(ProtocolRequestShape::with_header("x-rustfs-force-delete", "a\nb").is_err());
+    }
 }
