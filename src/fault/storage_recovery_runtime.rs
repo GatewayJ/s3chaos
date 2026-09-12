@@ -19,18 +19,31 @@
 //! immediately-current observation required before mutation, and the closed
 //! set of operations an adapter may perform.
 
-use std::time::Duration;
+use std::{process::Stdio, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout},
+};
 
 use crate::{
-    fault::storage_recovery::{
-        HealMode, StorageRecoveryArtifactIdentity, StorageRecoveryCase, StorageVolumeIdentity,
+    fault::{
+        storage_recovery::{
+            HealMode, StorageRecoveryArtifactIdentity, StorageRecoveryCase, StorageVolumeIdentity,
+        },
+        storage_recovery_helper::{StorageHelperSessionRequest, StorageHelperSessionResponse},
+        storage_recovery_lease::{
+            StorageRecoveryCleanupProof, release_owned_lease, require_current_lease,
+        },
     },
-    framework::{command::CommandSpec, config::ClusterTestConfig, kubectl::Kubectl},
+    framework::{
+        command::CommandSpec, config::ClusterTestConfig, kube_client::client_for_context,
+        kubectl::Kubectl,
+    },
 };
 
 pub const STORAGE_RECOVERY_HOST_LOCK_DIRECTORY: &str = "/var/lock/s3chaos";
@@ -109,7 +122,7 @@ impl StorageRecoveryExclusiveAccess {
         observed_at_ms: u64,
     ) -> Result<()> {
         let expected_holder = format!("{run_id}/{attempt_id}");
-        let expected_lease_name = format!("s3chaos-storage-{}", &scope_sha256[..20]);
+        let expected_lease_name = storage_lease_name(scope_sha256)?;
         let expected_lock_path =
             format!("{STORAGE_RECOVERY_HOST_LOCK_DIRECTORY}/storage-{scope_sha256}.lock");
         ensure!(
@@ -336,21 +349,22 @@ impl HostGenerationIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum StorageRecoveryHostOperation {
     InspectXlMeta {
         object_directory: String,
+        bucket: String,
+        object_key: String,
+        object_sha256: String,
         version_id: String,
+        selected_part_number: u32,
         expected_mount_device_id: String,
         expected_drive_uuid: String,
     },
     MutateShard {
-        relative_part_path: String,
-        shard_device_id: String,
-        shard_inode: u64,
-        shard_size_bytes: u64,
+        inspection_operation_id: String,
+        part_number: u32,
         byte_offset: u64,
-        original_sha256: String,
     },
     PrepareFreshVolume {
         replacement_persistent_volume: String,
@@ -364,6 +378,9 @@ pub enum StorageRecoveryHostOperation {
         mapping_name: String,
         recovery_table_sha256: String,
     },
+    RestoreShard {
+        mutation_operation_id: String,
+    },
 }
 
 impl StorageRecoveryHostOperation {
@@ -375,44 +392,39 @@ impl StorageRecoveryHostOperation {
         match self {
             Self::InspectXlMeta {
                 object_directory,
+                bucket,
+                object_key,
+                object_sha256,
                 version_id,
+                selected_part_number,
                 expected_mount_device_id,
                 expected_drive_uuid,
             } => {
                 validate_relative_path("object directory", object_directory)?;
                 validate_explicit_version(version_id)?;
+                validate_sha256(object_sha256)?;
                 ensure!(
-                    !expected_mount_device_id.trim().is_empty()
+                    !bucket.trim().is_empty()
+                        && !object_key.trim().is_empty()
+                        && *selected_part_number > 0
+                        && !expected_mount_device_id.trim().is_empty()
                         && !expected_drive_uuid.trim().is_empty(),
                     "offline XL2 inspection must bind the opened root and format.json drive identity"
                 );
                 Ok(())
             }
             Self::MutateShard {
-                relative_part_path,
-                shard_device_id,
-                shard_inode,
-                shard_size_bytes,
-                byte_offset,
-                original_sha256,
+                inspection_operation_id,
+                part_number,
+                byte_offset: _,
             } => {
-                validate_relative_path("shard", relative_part_path)?;
+                uuid::Uuid::parse_str(inspection_operation_id)
+                    .context("storage-recovery inspection operation id is not a UUID")?;
                 ensure!(
-                    relative_part_path.rsplit('/').next().is_some_and(|name| {
-                        name.strip_prefix("part.").is_some_and(|part| {
-                            !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())
-                        })
-                    }),
-                    "storage-recovery mutation target must be an exact part.N path"
+                    *part_number > 0,
+                    "storage-recovery selected part number is zero"
                 );
-                ensure!(
-                    !shard_device_id.trim().is_empty()
-                        && *shard_inode > 0
-                        && *shard_size_bytes > 0
-                        && *byte_offset < *shard_size_bytes,
-                    "storage-recovery shard identity or mutation offset is invalid"
-                );
-                validate_sha256(original_sha256)
+                Ok(())
             }
             Self::PrepareFreshVolume {
                 replacement_persistent_volume,
@@ -441,6 +453,13 @@ impl StorageRecoveryHostOperation {
                     "device-mapper operation has an unsafe mapping name"
                 );
                 validate_sha256(recovery_table_sha256)
+            }
+            Self::RestoreShard {
+                mutation_operation_id,
+            } => {
+                uuid::Uuid::parse_str(mutation_operation_id)
+                    .context("storage-recovery restore operation id is not a UUID")?;
+                Ok(())
             }
         }
     }
@@ -474,7 +493,7 @@ impl StorageRecoveryOperationReceipt {
         operation: &StorageRecoveryHostOperation,
     ) -> Result<()> {
         ensure!(
-            !self.operation_id.trim().is_empty() && self.operation == *operation,
+            uuid::Uuid::parse_str(&self.operation_id).is_ok() && self.operation == *operation,
             "storage-recovery receipt has the wrong operation identity"
         );
         let expected_context_sha256 = context_sha256(context)?;
@@ -582,6 +601,11 @@ pub fn storage_scope_sha256(context: &OwnedStorageContext) -> String {
     hex::encode(hasher.finalize())
 }
 
+pub fn storage_lease_name(scope_sha256: &str) -> Result<String> {
+    validate_sha256(scope_sha256)?;
+    Ok(format!("s3chaos-storage-{}", &scope_sha256[..20]))
+}
+
 pub fn context_sha256(context: &OwnedStorageContext) -> Result<String> {
     Ok(sha256_bytes(
         serde_json::to_vec(context)
@@ -594,17 +618,16 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StorageHelperInvocation<'a> {
-    context: &'a OwnedStorageContext,
-    operation: &'a StorageRecoveryHostOperation,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageHelperInvocation {
+    pub context: OwnedStorageContext,
+    pub operation: StorageRecoveryHostOperation,
 }
 
-/// Concrete, bounded transport for the privileged storage helper. The command
-/// is a direct `kubectl exec` of one fixed program with a typed JSON request on
-/// stdin; neither the adapter nor the helper protocol exposes a shell or an
-/// arbitrary argv surface.
+/// Concrete attempt-scoped transport for the privileged storage helper.
+/// A persistent `kubectl exec -i` child owns the host flock until typed cleanup
+/// succeeds; every operation also re-reads the Kubernetes Lease directly.
 pub struct KubectlStorageRecoveryHostAdapter {
     kubectl: Kubectl,
     namespace: String,
@@ -637,53 +660,180 @@ impl KubectlStorageRecoveryHostAdapter {
         })
     }
 
-    fn command(
-        &self,
-        context: &OwnedStorageContext,
-        operation: &StorageRecoveryHostOperation,
-    ) -> Result<CommandSpec> {
+    fn command(&self, context: &OwnedStorageContext) -> Result<CommandSpec> {
         context.validate()?;
-        operation.validate()?;
         ensure!(
             context.cluster_context == self.kubectl.context()
                 && context.volume.namespace == self.namespace
                 && context.helper_pod_name == self.helper_pod,
             "storage-recovery helper adapter is bound to another context, namespace, or Pod"
         );
-        let request = serde_json::to_string(&StorageHelperInvocation { context, operation })
-            .context("encode storage-recovery helper invocation")?;
-        Ok(self
-            .kubectl
-            .command([
-                "exec",
-                self.helper_pod.as_str(),
-                "--",
-                STORAGE_RECOVERY_HELPER_PROGRAM,
-                "execute",
-            ])
-            .stdin(request))
+        Ok(self.kubectl.command([
+            "exec",
+            "-i",
+            self.helper_pod.as_str(),
+            "--",
+            STORAGE_RECOVERY_HELPER_PROGRAM,
+        ]))
     }
 
-    pub async fn execute(
+    pub async fn begin_attempt(
         &self,
+        context: &OwnedStorageContext,
+    ) -> Result<KubectlStorageRecoveryAttemptGuard> {
+        let client = client_for_context(&context.cluster_context)
+            .await
+            .context("build Kubernetes client for storage helper session")?;
+        require_current_lease(client.clone(), context).await?;
+        let spec = self.command(context)?;
+        let mut command = tokio::process::Command::new(&spec.program);
+        command
+            .args(&spec.args)
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if let Some(cwd) = &spec.cwd {
+            command.current_dir(cwd);
+        }
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("start storage helper session: {}", spec.display()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("storage helper stdin is absent")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("storage helper stdout is absent")?;
+        let mut guard = KubectlStorageRecoveryAttemptGuard {
+            client,
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            timeout: self.timeout,
+            finished: false,
+        };
+        let response = guard
+            .exchange(&StorageHelperSessionRequest::Begin {
+                context: Box::new(context.clone()),
+            })
+            .await?;
+        ensure!(
+            matches!(
+                response,
+                StorageHelperSessionResponse::Ready { ref scope_sha256 }
+                    if scope_sha256 == &context.scope_sha256
+            ),
+            "storage helper returned the wrong session-ready response"
+        );
+        Ok(guard)
+    }
+}
+
+pub struct KubectlStorageRecoveryAttemptGuard {
+    client: kube::Client,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    timeout: Duration,
+    finished: bool,
+}
+
+impl KubectlStorageRecoveryAttemptGuard {
+    pub async fn execute(
+        &mut self,
         context: &OwnedStorageContext,
         operation: &StorageRecoveryHostOperation,
     ) -> Result<StorageRecoveryOperationReceipt> {
-        let output = self
-            .command(context, operation)?
-            .run_bounded(self.timeout)
+        operation.validate()?;
+        require_current_lease(self.client.clone(), context).await?;
+        let response = self
+            .exchange(&StorageHelperSessionRequest::Execute {
+                invocation: Box::new(StorageHelperInvocation {
+                    context: context.clone(),
+                    operation: operation.clone(),
+                }),
+            })
+            .await?;
+        match response {
+            StorageHelperSessionResponse::Receipt { receipt } => {
+                receipt.validate_for(context, operation)?;
+                Ok(*receipt)
+            }
+            StorageHelperSessionResponse::Error { message } => {
+                bail!("storage helper rejected operation: {message}")
+            }
+            _ => bail!("storage helper returned an unexpected operation response"),
+        }
+    }
+
+    pub async fn finish(
+        mut self,
+        context: &OwnedStorageContext,
+        cleanup: &StorageRecoveryCleanupProof,
+    ) -> Result<()> {
+        require_current_lease(self.client.clone(), context).await?;
+        cleanup.validate_for(context)?;
+        let response = self
+            .exchange(&StorageHelperSessionRequest::Finish {
+                context: Box::new(context.clone()),
+                cleanup: Box::new(cleanup.clone()),
+            })
+            .await?;
+        match response {
+            StorageHelperSessionResponse::Finished { scope_sha256 }
+                if scope_sha256 == context.scope_sha256 => {}
+            StorageHelperSessionResponse::Error { message } => {
+                bail!("storage helper rejected cleanup: {message}")
+            }
+            _ => bail!("storage helper returned an unexpected cleanup response"),
+        }
+        let status = tokio::time::timeout(self.timeout, self.child.wait())
             .await
-            .context("execute typed storage-recovery host helper")?;
+            .context("storage helper did not exit after cleanup")??;
         ensure!(
-            output.code == Some(0),
-            "storage-recovery host helper failed: exit={:?}, stderr={}",
-            output.code,
-            output.stderr
+            status.success(),
+            "storage helper exited unsuccessfully after cleanup"
         );
-        let receipt = serde_json::from_str::<StorageRecoveryOperationReceipt>(&output.stdout)
-            .context("decode storage-recovery host-helper receipt")?;
-        receipt.validate_for(context, operation)?;
-        Ok(receipt)
+        self.finished = true;
+        release_owned_lease(self.client.clone(), context, cleanup).await
+    }
+
+    async fn exchange(
+        &mut self,
+        request: &StorageHelperSessionRequest,
+    ) -> Result<StorageHelperSessionResponse> {
+        let mut line = serde_json::to_vec(request).context("encode storage helper request")?;
+        line.push(b'\n');
+        tokio::time::timeout(self.timeout, self.stdin.write_all(&line))
+            .await
+            .context("storage helper request write timed out")??;
+        tokio::time::timeout(self.timeout, self.stdin.flush())
+            .await
+            .context("storage helper request flush timed out")??;
+        let mut response = String::new();
+        let count = tokio::time::timeout(self.timeout, self.stdout.read_line(&mut response))
+            .await
+            .context("storage helper response timed out")??;
+        ensure!(
+            count > 0,
+            "storage helper ended before returning a response"
+        );
+        ensure!(
+            response.len() <= 4 * 1024 * 1024,
+            "storage helper response is oversized"
+        );
+        serde_json::from_str(&response).context("decode storage helper session response")
+    }
+}
+
+impl Drop for KubectlStorageRecoveryAttemptGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.child.start_kill();
+        }
     }
 }
 
@@ -918,29 +1068,180 @@ mod tests {
     fn host_operations_are_closed_and_reject_unsafe_paths() {
         StorageRecoveryHostOperation::InspectXlMeta {
             object_directory: "bucket/object".to_string(),
+            bucket: "bucket-1".to_string(),
+            object_key: "object".to_string(),
+            object_sha256: HASH.to_string(),
             version_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            selected_part_number: 1,
             expected_mount_device_id: "259:0".to_string(),
             expected_drive_uuid: "drive-1".to_string(),
         }
         .validate()
         .expect("read-only inspection");
 
-        for path in [
-            "/data/part.1",
-            "../part.1",
-            "data/link/../part.1",
-            "data/blob",
+        for operation in [
+            StorageRecoveryHostOperation::MutateShard {
+                inspection_operation_id: "not-a-uuid".to_string(),
+                part_number: 1,
+                byte_offset: 0,
+            },
+            StorageRecoveryHostOperation::MutateShard {
+                inspection_operation_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+                part_number: 0,
+                byte_offset: 0,
+            },
         ] {
-            let operation = StorageRecoveryHostOperation::MutateShard {
-                relative_part_path: path.to_string(),
-                shard_device_id: "8:1".to_string(),
+            assert!(operation.validate().is_err());
+        }
+
+        let path_injection = serde_json::json!({
+            "kind": "mutate-shard",
+            "inspection_operation_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "part_number": 1,
+            "byte_offset": 0,
+            "relative_part_path": "bucket/object/data-dir/part.2"
+        });
+        assert!(
+            serde_json::from_value::<StorageRecoveryHostOperation>(path_injection).is_err(),
+            "the controller must not be able to select a shard path"
+        );
+    }
+
+    #[test]
+    fn helper_protocol_rejects_unknown_fields() {
+        let operation = serde_json::json!({
+            "kind": "restore-shard",
+            "mutation_operation_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "argv": ["sh", "-c", "true"]
+        });
+        assert!(serde_json::from_value::<StorageRecoveryHostOperation>(operation).is_err());
+
+        let mut invocation = serde_json::to_value(StorageHelperInvocation {
+            context: context(),
+            operation: StorageRecoveryHostOperation::RestoreShard {
+                mutation_operation_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            },
+        })
+        .expect("invocation");
+        invocation
+            .as_object_mut()
+            .expect("invocation object")
+            .insert("command".to_string(), serde_json::json!("sh"));
+        assert!(serde_json::from_value::<StorageHelperInvocation>(invocation).is_err());
+    }
+
+    #[test]
+    fn offline_mapping_is_derived_from_exact_inspection_receipt() {
+        use crate::fault::{
+            quorum::{ErasureSetMember, ErasureSetMembership, ErasureSetShape},
+            storage_recovery::{
+                OfflineVersionShardMappingEvidence, ShardMappingSource,
+                VersionShardMappingObservation,
+            },
+            storage_recovery_helper::{OfflineInspectedShard, OfflineXl2InspectResponse},
+            xl2_inspector::{
+                OFFLINE_XL2_INSPECTOR_REVISION, Xl2FormatProfile, Xl2ObjectVersionLayout,
+            },
+        };
+
+        let context = context();
+        let operation = StorageRecoveryHostOperation::InspectXlMeta {
+            object_directory: "bucket-1/object".to_string(),
+            bucket: "bucket-1".to_string(),
+            object_key: "object".to_string(),
+            object_sha256: HASH.to_string(),
+            version_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            selected_part_number: 1,
+            expected_mount_device_id: "259:0".to_string(),
+            expected_drive_uuid: "drive-1".to_string(),
+        };
+        let response_body = serde_json::to_string(&OfflineXl2InspectResponse {
+            mount_device_id: "259:0".to_string(),
+            drive_uuid: "drive-1".to_string(),
+            format_json_sha256: HASH.to_string(),
+            xl_meta_sha256: HASH.to_string(),
+            layout: Xl2ObjectVersionLayout {
+                inspector_revision: OFFLINE_XL2_INSPECTOR_REVISION.to_string(),
+                profile: Xl2FormatProfile::SUPPORTED,
+                version_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+                data_directory: "fedcba98-7654-3210-fedc-ba9876543210".to_string(),
+                erasure_data_shards: 1,
+                erasure_parity_shards: 1,
+                erasure_index: 1,
+                part_numbers: vec![1],
+                part_sizes: vec![1024],
+                relative_part_paths: vec![
+                    "bucket-1/object/fedcba98-7654-3210-fedc-ba9876543210/part.1".to_string(),
+                ],
+            },
+            selected_part: OfflineInspectedShard {
+                part_number: 1,
+                relative_part_path: "bucket-1/object/fedcba98-7654-3210-fedc-ba9876543210/part.1"
+                    .to_string(),
+                shard_device_id: "259:0".to_string(),
                 shard_inode: 42,
                 shard_size_bytes: 1024,
-                byte_offset: 0,
                 original_sha256: HASH.to_string(),
-            };
-            assert!(operation.validate().is_err(), "unsafe mutation path {path}");
-        }
+            },
+        })
+        .expect("inspection response");
+        let receipt = StorageRecoveryOperationReceipt {
+            operation_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            operation,
+            context_sha256: context_sha256(&context).expect("context digest"),
+            response_sha256: sha256_bytes(response_body.as_bytes()),
+            response_body: response_body.clone(),
+            started_at_ms: 120,
+            journal_persisted_at_ms: 121,
+            completed_at_ms: 122,
+            journal_fsync_succeeded: true,
+        };
+        let observation = VersionShardMappingObservation {
+            schema_version: crate::fault::storage_recovery::STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
+            identity: context.identity.clone(),
+            observation_id: "mapping-1".to_string(),
+            source: ShardMappingSource::OfflineXl2Inspector,
+            api_revision: OFFLINE_XL2_INSPECTOR_REVISION.to_string(),
+            response_sha256: receipt.response_sha256.clone(),
+            response_body,
+            offline_evidence: Some(Box::new(OfflineVersionShardMappingEvidence {
+                context: Box::new(context),
+                inspection_receipt: Box::new(receipt),
+            })),
+            target_proof_sha256: HASH.to_string(),
+            observed_at_ms: 122,
+        };
+        let shape = ErasureSetShape {
+            pool_index: 0,
+            set_index: 0,
+            server_count: 2,
+            volumes_per_server: 1,
+            total_shards: 2,
+            payload_data_shards: 1,
+            payload_parity_shards: 1,
+        };
+        let membership = ErasureSetMembership::from_runtime(
+            &shape,
+            vec![
+                ErasureSetMember {
+                    pod_name: "rustfs-0".to_string(),
+                    server_endpoint: "http://rustfs-0:9000".to_string(),
+                    shard_ids: vec!["drive-1".to_string()],
+                },
+                ErasureSetMember {
+                    pod_name: "rustfs-1".to_string(),
+                    server_endpoint: "http://rustfs-1:9000".to_string(),
+                    shard_ids: vec!["drive-2".to_string()],
+                },
+            ],
+        )
+        .expect("membership");
+
+        let mapping = observation
+            .validated_mapping(&membership, &shape)
+            .expect("receipt-bound offline mapping");
+        assert_eq!(mapping.object_key, "object");
+        assert_eq!(mapping.shard_ids, ["drive-1", "drive-2"]);
     }
 
     struct FakeRuntime {
@@ -969,7 +1270,7 @@ mod tests {
         ) -> Result<StorageRecoveryOperationReceipt> {
             let response_body = "{}".to_string();
             Ok(StorageRecoveryOperationReceipt {
-                operation_id: "operation-1".to_string(),
+                operation_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
                 operation: operation.clone(),
                 context_sha256: context_sha256(context)?,
                 response_sha256: sha256_bytes(response_body.as_bytes()),
@@ -1013,12 +1314,9 @@ mod tests {
             observations: 0,
         };
         let destructive = StorageRecoveryHostOperation::MutateShard {
-            relative_part_path: "bucket/object/data-dir/part.1".to_string(),
-            shard_device_id: "8:1".to_string(),
-            shard_inode: 42,
-            shard_size_bytes: 1024,
+            inspection_operation_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            part_number: 1,
             byte_offset: 0,
-            original_sha256: HASH.to_string(),
         };
         execute_checked_host_operation(&mut runtime, &context, &destructive)
             .await
@@ -1027,7 +1325,11 @@ mod tests {
 
         let inspection = StorageRecoveryHostOperation::InspectXlMeta {
             object_directory: "bucket/object".to_string(),
+            bucket: "bucket-1".to_string(),
+            object_key: "object".to_string(),
+            object_sha256: HASH.to_string(),
             version_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            selected_part_number: 1,
             expected_mount_device_id: "259:0".to_string(),
             expected_drive_uuid: "drive-1".to_string(),
         };
@@ -1041,16 +1343,13 @@ mod tests {
     fn receipt_must_be_durable_and_bound_to_exact_context() {
         let context = context();
         let operation = StorageRecoveryHostOperation::MutateShard {
-            relative_part_path: "bucket/object/data-dir/part.1".to_string(),
-            shard_device_id: "259:0".to_string(),
-            shard_inode: 42,
-            shard_size_bytes: 1024,
+            inspection_operation_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            part_number: 1,
             byte_offset: 0,
-            original_sha256: HASH.to_string(),
         };
         let response_body = "{}".to_string();
         let mut receipt = StorageRecoveryOperationReceipt {
-            operation_id: "operation-1".to_string(),
+            operation_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
             operation: operation.clone(),
             context_sha256: context_sha256(&context).expect("context digest"),
             response_sha256: sha256_bytes(response_body.as_bytes()),
@@ -1082,24 +1381,16 @@ mod tests {
             Duration::from_secs(5),
         )
         .expect("adapter");
-        let operation = StorageRecoveryHostOperation::InspectXlMeta {
-            object_directory: "bucket/object".to_string(),
-            version_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
-            expected_mount_device_id: "259:0".to_string(),
-            expected_drive_uuid: "drive-1".to_string(),
-        };
-        let command = adapter
-            .command(&context, &operation)
-            .expect("typed command");
+        let command = adapter.command(&context).expect("typed session command");
 
         assert_eq!(
             command.args[4..],
             [
                 "exec",
+                "-i",
                 "s3chaos-storage-helper",
                 "--",
                 STORAGE_RECOVERY_HELPER_PROGRAM,
-                "execute",
             ]
         );
         assert!(
@@ -1108,11 +1399,6 @@ mod tests {
                 .iter()
                 .any(|arg| matches!(arg.as_str(), "sh" | "bash" | "-c"))
         );
-        assert!(
-            command
-                .stdin
-                .as_deref()
-                .is_some_and(|body| body.contains("inspect-xl-meta") && !body.contains("argv"))
-        );
+        assert!(command.stdin.is_none());
     }
 }
