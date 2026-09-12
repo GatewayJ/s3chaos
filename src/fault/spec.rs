@@ -775,6 +775,7 @@ mod tests {
             ExecutionKind::Admin
         );
         assert!(spec.scenario.planned_qualification);
+        assert!(!spec.scenario.planned_storage_qualification);
         assert!(spec.faults.is_empty());
         assert!(matches!(
             spec.execution,
@@ -830,7 +831,8 @@ mod tests {
             spec.execution_kind().expect("execution"),
             ExecutionKind::StorageRecovery
         );
-        assert!(spec.scenario.planned_qualification);
+        assert!(!spec.scenario.planned_qualification);
+        assert!(spec.scenario.planned_storage_qualification);
         assert!(spec.faults.is_empty());
         for artifact in [
             "storage-recovery-workflow.json",

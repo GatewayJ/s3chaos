@@ -1,0 +1,41 @@
+# Qualification template for the AdminDeep variant. Keep outside fault/examples
+# while the catalog entry remains Planned. Run independently from the automatic
+# scanner variant against a separately owned target and artifact root.
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-on-disk-bitrot-admin-deep-qualification
+budgets:
+  maxDuration: 90m
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 200
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: disabled
+artifacts:
+  required: strict
+workloadProfiles:
+  bounded-versioned-hot:
+    objects: 96
+    concurrency: 4
+    operationWeights:
+      put: 1
+      overwrite: 4
+      get: 1
+      list: 1
+      delete: 4
+      multipart: 1
+    payloadDistribution:
+      - sizeBytes: 4096
+        weight: 60
+      - sizeBytes: 65536
+        weight: 40
+    hotspot:
+      objectPercent: 10
+      operationPercent: 80
+scenarios:
+  - name: on-disk-bitrot
+    storageRecoveryCase: on-disk-bitrot-admin-deep
+    faultDuration: 30m
+    workloadProfile: bounded-versioned-hot

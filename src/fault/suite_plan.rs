@@ -756,6 +756,7 @@ fn scenario_config(
     config.qualify_planned_admin = false;
     config.scenario = scenario.name.clone();
     config.scenario_parameters = scenario.params.clone();
+    config.storage_recovery_case = scenario.storage_recovery_case;
     if let Some(fault_duration_seconds) = scenario.fault_duration_seconds {
         config.duration = Duration::from_secs(fault_duration_seconds);
     }
