@@ -1266,6 +1266,13 @@ mod tests {
         context
     }
 
+    fn renew_same_lease(mut context: OwnedStorageContext) -> OwnedStorageContext {
+        context.exclusive_access.kubernetes_lease.resource_version = "21".to_string();
+        context.exclusive_access.kubernetes_lease.renew_at_ms += 1;
+        context.exclusive_access.kubernetes_lease.expires_at_ms += 60_000;
+        context
+    }
+
     fn mutation(
         context: &OwnedStorageContext,
         roots: &StorageHelperRoots,
@@ -1482,6 +1489,49 @@ mod tests {
             fs::read(other_part_path).expect("other part"),
             b"other shard payload"
         );
+    }
+
+    #[test]
+    fn same_lease_renewal_preserves_unresolved_journal_and_restore_ownership() {
+        let (_temporary, roots) = test_roots();
+        let part_path = roots.volume.join("bucket/object/data-dir/part.1");
+        fs::create_dir_all(part_path.parent().expect("part parent")).expect("part parent");
+        let original = b"original shard payload";
+        fs::write(&part_path, original).expect("part");
+        let context = context_for(&roots);
+        let operation = mutation(&context, &roots, part_path.to_str().expect("part path"));
+        let mut session = StorageHelperSession::begin(context.clone(), &roots).expect("session");
+        let mutated = session
+            .execute(StorageHelperInvocation {
+                context: context.clone(),
+                operation,
+            })
+            .expect("mutate shard");
+        drop(session);
+
+        let renewed = renew_same_lease(context);
+        mutated
+            .validate_for(&renewed, &mutated.operation)
+            .expect("mutation receipt must survive Lease renewal");
+        let mut renewed_session = StorageHelperSession::begin(renewed.clone(), &roots)
+            .expect("same Lease renewal must retain unresolved journal ownership");
+        let restored = renewed_session
+            .execute(StorageHelperInvocation {
+                context: renewed.clone(),
+                operation: StorageRecoveryHostOperation::RestoreShard {
+                    mutation_operation_id: mutated.operation_id,
+                },
+            })
+            .expect("restore shard after Lease renewal");
+        renewed_session
+            .finish(
+                &renewed,
+                &StorageRecoveryCleanupProof::BitrotRestored {
+                    restore_receipt: Box::new(restored),
+                },
+            )
+            .expect("finish renewed session");
+        assert_eq!(fs::read(part_path).expect("restored part"), original);
     }
 
     #[test]

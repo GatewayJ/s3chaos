@@ -606,10 +606,44 @@ pub fn storage_lease_name(scope_sha256: &str) -> Result<String> {
     Ok(format!("s3chaos-storage-{}", &scope_sha256[..20]))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MutationOwnershipDigest<'a> {
+    schema_version: u8,
+    attempt_id: &'a str,
+    scope_sha256: &'a str,
+    volume: &'a StorageVolumeIdentity,
+    host_generation: &'a HostGenerationIdentity,
+    lease_namespace: &'a str,
+    lease_name: &'a str,
+    lease_uid: &'a str,
+    lease_holder_identity: &'a str,
+    lease_acquired_at_ms: u64,
+}
+
+/// Digests the stable ownership and physical-target identity for a host mutation.
+///
+/// Lease renewal timestamps and resource versions are deliberately excluded: they
+/// change while the same owner is preserving its Lease. The Lease UID, holder,
+/// acquisition generation, and immutable storage identities remain bound so a
+/// receipt or unresolved journal cannot cross an ownership generation.
 pub fn context_sha256(context: &OwnedStorageContext) -> Result<String> {
+    let lease = &context.exclusive_access.kubernetes_lease;
+    let ownership = MutationOwnershipDigest {
+        schema_version: 1,
+        attempt_id: &context.attempt_id,
+        scope_sha256: &context.scope_sha256,
+        volume: &context.volume,
+        host_generation: &context.host_generation,
+        lease_namespace: &context.volume.namespace,
+        lease_name: &lease.name,
+        lease_uid: &lease.uid,
+        lease_holder_identity: &lease.holder_identity,
+        lease_acquired_at_ms: lease.acquired_at_ms,
+    };
     Ok(sha256_bytes(
-        serde_json::to_vec(context)
-            .context("encode storage-recovery context for digest")?
+        serde_json::to_vec(&ownership)
+            .context("encode storage-recovery mutation ownership for digest")?
             .as_slice(),
     ))
 }
@@ -992,6 +1026,14 @@ mod tests {
         context
     }
 
+    fn renew_same_lease(context: &OwnedStorageContext) -> OwnedStorageContext {
+        let mut renewed = context.clone();
+        renewed.exclusive_access.kubernetes_lease.resource_version = "21".to_string();
+        renewed.exclusive_access.kubernetes_lease.renew_at_ms += 100;
+        renewed.exclusive_access.kubernetes_lease.expires_at_ms += 100;
+        renewed
+    }
+
     fn current(context: &OwnedStorageContext) -> CurrentStorageObservation {
         CurrentStorageObservation {
             cluster_context: context.cluster_context.clone(),
@@ -1340,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_must_be_durable_and_bound_to_exact_context() {
+    fn receipt_must_be_durable_and_bound_to_mutation_owner() {
         let context = context();
         let operation = StorageRecoveryHostOperation::MutateShard {
             inspection_operation_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
@@ -1361,13 +1403,60 @@ mod tests {
         };
         receipt
             .validate_for(&context, &operation)
-            .expect("durable exact receipt");
+            .expect("durable owner-bound receipt");
+
+        receipt
+            .validate_for(&renew_same_lease(&context), &operation)
+            .expect("same Lease renewal must preserve receipt ownership");
 
         receipt.journal_fsync_succeeded = false;
         assert!(receipt.validate_for(&context, &operation).is_err());
         receipt.journal_fsync_succeeded = true;
         receipt.context_sha256 = HASH.to_string();
         assert!(receipt.validate_for(&context, &operation).is_err());
+    }
+
+    #[test]
+    fn fresh_volume_receipt_survives_renewal_but_not_a_new_lease_generation() {
+        let context = context();
+        let operation = StorageRecoveryHostOperation::PrepareFreshVolume {
+            replacement_persistent_volume: "replacement-pv".to_string(),
+            replacement_persistent_volume_claim: "replacement-pvc".to_string(),
+        };
+        let response_body = "{}".to_string();
+        let receipt = StorageRecoveryOperationReceipt {
+            operation_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            operation: operation.clone(),
+            context_sha256: context_sha256(&context).expect("ownership digest"),
+            response_sha256: sha256_bytes(response_body.as_bytes()),
+            response_body,
+            started_at_ms: 120,
+            completed_at_ms: 122,
+            journal_persisted_at_ms: 121,
+            journal_fsync_succeeded: true,
+        };
+
+        receipt
+            .validate_for(&renew_same_lease(&context), &operation)
+            .expect("fresh-volume receipt remains valid after Lease renewal");
+
+        let mut next_generation = renew_same_lease(&context);
+        next_generation
+            .exclusive_access
+            .kubernetes_lease
+            .acquired_at_ms += 1;
+        assert!(receipt.validate_for(&next_generation, &operation).is_err());
+
+        let mut foreign_holder = renew_same_lease(&context);
+        foreign_holder
+            .exclusive_access
+            .kubernetes_lease
+            .holder_identity = "run-2/attempt-2".to_string();
+        assert!(receipt.validate_for(&foreign_holder, &operation).is_err());
+
+        let mut foreign_uid = renew_same_lease(&context);
+        foreign_uid.exclusive_access.kubernetes_lease.uid = "lease-uid-2".to_string();
+        assert!(receipt.validate_for(&foreign_uid, &operation).is_err());
     }
 
     #[test]
