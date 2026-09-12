@@ -39,6 +39,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::fault::{
+    storage_recovery::{FragmentReferenceState, RustfsShardInventoryResponse, ShardInventoryEntry},
     storage_recovery_lease::StorageRecoveryCleanupProof,
     storage_recovery_runtime::{
         DeviceMapperCommandReceipt, OwnedStorageContext, STORAGE_RECOVERY_HOST_LOCK_DIRECTORY,
@@ -56,6 +57,7 @@ const MAX_FORMAT_JSON_BYTES: usize = 1024 * 1024;
 const MAX_XL_META_BYTES: usize = 16 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: usize = 1024 * 1024;
 pub const CONTROLLED_SHARD_XOR_MASK: u8 = 0xff;
+const MAX_STALE_INVENTORY_OBJECTS: usize = 16;
 
 const RESOLVE_NO_XDEV: u64 = 0x01;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
@@ -67,6 +69,413 @@ pub struct StorageHelperRoots {
     pub volume: PathBuf,
     pub journal: PathBuf,
     pub lock: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StaleOfflineExpectedVersion {
+    pub operation_id: String,
+    pub object_key: String,
+    pub version_id: String,
+    pub object_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StaleOwnedOrphanReceipt {
+    pub run_id: String,
+    pub bucket: String,
+    pub object_key: String,
+    pub version_id: String,
+    pub relative_part_path: String,
+    pub drive_uuid: String,
+    pub fragment_id: String,
+    pub object_sha256: String,
+    pub fragment_sha256: String,
+    pub part_device_id: String,
+    pub part_inode: u64,
+    pub part_size_bytes: u64,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum StaleOfflineHelperOperation {
+    InjectOrphan {
+        object_key: String,
+        version_id: String,
+    },
+    Inventory {
+        snapshot_id: String,
+        expected_versions: Vec<StaleOfflineExpectedVersion>,
+        orphan: StaleOwnedOrphanReceipt,
+        include_orphan: bool,
+    },
+    RemoveOwnedOrphan {
+        orphan: StaleOwnedOrphanReceipt,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StaleOfflineHelperRequest {
+    pub run_id: String,
+    pub scenario: String,
+    pub volume_root: String,
+    pub deployment_id: String,
+    pub drive_uuid: String,
+    pub filesystem_uuid: String,
+    pub bucket: String,
+    pub operation: StaleOfflineHelperOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum StaleOfflineHelperResponse {
+    OrphanInjected {
+        receipt: StaleOwnedOrphanReceipt,
+    },
+    Inventory {
+        response: RustfsShardInventoryResponse,
+        expected_operation_ids: Vec<String>,
+    },
+    OrphanRemoved {
+        fragment_id: String,
+        removed_at_ms: u64,
+    },
+}
+
+pub fn execute_stale_offline_helper(
+    request: StaleOfflineHelperRequest,
+) -> Result<StaleOfflineHelperResponse> {
+    validate_stale_helper_request(&request, false)?;
+    let root = open_directory(Path::new(&request.volume_root), "stale offline volume root")?;
+    execute_stale_offline_helper_at_root(&request, &root)
+}
+
+fn validate_stale_helper_request(
+    request: &StaleOfflineHelperRequest,
+    persistent_session: bool,
+) -> Result<()> {
+    ensure!(
+        request.scenario == "stale-disk-return-detect"
+            && !request.run_id.trim().is_empty()
+            && !request.bucket.trim().is_empty()
+            && if persistent_session {
+                request.volume_root == STORAGE_HELPER_VOLUME_ROOT
+            } else {
+                request.volume_root.starts_with("/host/")
+            }
+            && !request.volume_root.contains("/../")
+            && !request.volume_root.ends_with("/.."),
+        "stale offline helper request has an invalid run scope or volume root"
+    );
+    Uuid::parse_str(&request.deployment_id)
+        .context("stale offline helper deployment id is not a UUID")?;
+    Uuid::parse_str(&request.drive_uuid).context("stale offline helper drive id is not a UUID")?;
+    ensure!(
+        !request.filesystem_uuid.trim().is_empty(),
+        "stale offline helper filesystem id is empty"
+    );
+    Ok(())
+}
+
+fn execute_stale_offline_helper_at_root(
+    request: &StaleOfflineHelperRequest,
+    root: &File,
+) -> Result<StaleOfflineHelperResponse> {
+    let format_file = open_beneath(root, FORMAT_JSON_PATH, libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
+    let format = read_limited(&format_file, MAX_FORMAT_JSON_BYTES, "format.json")?;
+    validate_format_json_drive(&format, &request.deployment_id, &request.drive_uuid)?;
+    match &request.operation {
+        StaleOfflineHelperOperation::InjectOrphan {
+            object_key,
+            version_id,
+        } => inject_stale_orphan(request, root, object_key, version_id),
+        StaleOfflineHelperOperation::Inventory {
+            snapshot_id,
+            expected_versions,
+            orphan,
+            include_orphan,
+        } => inventory_stale_scope(
+            request,
+            root,
+            snapshot_id,
+            expected_versions,
+            orphan,
+            *include_orphan,
+        ),
+        StaleOfflineHelperOperation::RemoveOwnedOrphan { orphan } => {
+            remove_stale_orphan(request, root, orphan)
+        }
+    }
+}
+
+fn validate_stale_object_key(key: &str) -> Result<()> {
+    ensure!(
+        !key.is_empty()
+            && !key.starts_with('/')
+            && !key.ends_with('/')
+            && key
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != ".."),
+        "stale offline helper object key is not a normalized relative path"
+    );
+    Ok(())
+}
+
+fn open_stale_object_dir(root: &File, bucket: &str, key: &str) -> Result<File> {
+    validate_stale_object_key(key)?;
+    open_beneath(
+        root,
+        &format!("{bucket}/{key}"),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )
+    .context("open stale offline object directory")
+}
+
+fn stale_fragment_id(drive_uuid: &str, relative_path: &str, inode: u64) -> String {
+    let digest = sha256_bytes(format!("{drive_uuid}\0{relative_path}\0{inode}").as_bytes());
+    format!("offline-{digest}")
+}
+
+fn inject_stale_orphan(
+    request: &StaleOfflineHelperRequest,
+    root: &File,
+    object_key: &str,
+    version_id: &str,
+) -> Result<StaleOfflineHelperResponse> {
+    validate_stale_object_key(object_key)?;
+    let version = Uuid::parse_str(version_id).context("stale orphan id is not a UUID")?;
+    ensure!(!version.is_nil(), "stale orphan id is nil");
+    let object = open_stale_object_dir(root, &request.bucket, object_key)?;
+    open_beneath(&object, "xl.meta", libc::O_RDONLY | libc::O_CLOEXEC, 0)
+        .context("stale orphan target object lacks xl.meta")?;
+    let directory_name = version.to_string();
+    let directory_c = CString::new(directory_name.as_str())?;
+    let created = unsafe { libc::mkdirat(object.as_raw_fd(), directory_c.as_ptr(), 0o700) };
+    if created != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("create run-owned stale orphan directory with exclusive identity");
+    }
+    let orphan = open_beneath(
+        &object,
+        &directory_name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )?;
+    let payload = format!("s3chaos-stale-orphan:{}:{version_id}", request.run_id).into_bytes();
+    let result = (|| -> Result<StaleOwnedOrphanReceipt> {
+        let mut part = open_beneath(
+            &orphan,
+            "part.1",
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o600,
+        )?;
+        part.write_all(&payload)?;
+        part.sync_all().context("fsync stale orphan part")?;
+        let metadata = part.metadata().context("stat stale orphan part")?;
+        orphan.sync_all().context("fsync stale orphan directory")?;
+        object
+            .sync_all()
+            .context("fsync stale orphan object directory")?;
+        root.sync_all().context("fsync stale orphan volume root")?;
+        let relative_part_path = format!(
+            "{}/{}/{}/part.1",
+            request.bucket, object_key, directory_name
+        );
+        let fragment_sha256 = sha256_bytes(&payload);
+        Ok(StaleOwnedOrphanReceipt {
+            run_id: request.run_id.clone(),
+            bucket: request.bucket.clone(),
+            object_key: object_key.to_string(),
+            version_id: directory_name,
+            relative_part_path: relative_part_path.clone(),
+            drive_uuid: request.drive_uuid.clone(),
+            fragment_id: stale_fragment_id(
+                &request.drive_uuid,
+                &relative_part_path,
+                metadata.ino(),
+            ),
+            object_sha256: fragment_sha256.clone(),
+            fragment_sha256,
+            part_device_id: device_id(&metadata),
+            part_inode: metadata.ino(),
+            part_size_bytes: metadata.len(),
+            created_at_ms: now_ms()?,
+        })
+    })();
+    if result.is_err() {
+        let part_c = CString::new("part.1")?;
+        let _ = unsafe { libc::unlinkat(orphan.as_raw_fd(), part_c.as_ptr(), 0) };
+        let _ =
+            unsafe { libc::unlinkat(object.as_raw_fd(), directory_c.as_ptr(), libc::AT_REMOVEDIR) };
+        let _ = object.sync_all();
+    }
+    Ok(StaleOfflineHelperResponse::OrphanInjected { receipt: result? })
+}
+
+fn inventory_stale_scope(
+    request: &StaleOfflineHelperRequest,
+    root: &File,
+    snapshot_id: &str,
+    expected_versions: &[StaleOfflineExpectedVersion],
+    orphan: &StaleOwnedOrphanReceipt,
+    include_orphan: bool,
+) -> Result<StaleOfflineHelperResponse> {
+    Uuid::parse_str(snapshot_id).context("stale inventory snapshot id is not a UUID")?;
+    ensure!(
+        !expected_versions.is_empty()
+            && expected_versions.len() <= MAX_STALE_INVENTORY_OBJECTS
+            && orphan.run_id == request.run_id
+            && orphan.bucket == request.bucket
+            && orphan.drive_uuid == request.drive_uuid,
+        "stale inventory scope or orphan receipt is invalid"
+    );
+    let scan_started_at_ms = now_ms()?;
+    let mut entries = Vec::with_capacity(expected_versions.len() + usize::from(include_orphan));
+    let mut operation_ids = Vec::with_capacity(expected_versions.len());
+    for expected in expected_versions {
+        validate_stale_object_key(&expected.object_key)?;
+        Uuid::parse_str(&expected.version_id)
+            .context("stale inventory expected version id is not a UUID")?;
+        ensure!(
+            !expected.operation_id.trim().is_empty()
+                && expected.object_sha256.len() == 64
+                && expected
+                    .object_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "stale inventory expected version identity is invalid"
+        );
+        let object = open_stale_object_dir(root, &request.bucket, &expected.object_key)?;
+        let xl_meta = open_beneath(&object, "xl.meta", libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
+        let xl_meta = read_limited(&xl_meta, MAX_XL_META_BYTES, "stale inventory xl.meta")?;
+        let layout = inspect_xl_meta(&xl_meta, &expected.version_id)?;
+        let relative = layout
+            .relative_part_paths
+            .first()
+            .context("stale inventory version has no shard part")?;
+        let part = open_beneath(&object, relative, libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
+        let metadata = part.metadata().context("stat stale inventory shard")?;
+        let bytes = read_limited(&part, MAX_XL_META_BYTES, "stale inventory shard")?;
+        let full_relative = format!("{}/{}/{}", request.bucket, expected.object_key, relative);
+        entries.push(ShardInventoryEntry {
+            fragment_id: stale_fragment_id(&request.drive_uuid, &full_relative, metadata.ino()),
+            bucket: request.bucket.clone(),
+            object_key: expected.object_key.clone(),
+            version_id: expected.version_id.clone(),
+            drive_uuid: request.drive_uuid.clone(),
+            object_sha256: expected.object_sha256.to_ascii_lowercase(),
+            sha256: sha256_bytes(&bytes),
+            reference_state: FragmentReferenceState::ReferencedVersion,
+        });
+        operation_ids.push(expected.operation_id.clone());
+    }
+    if include_orphan {
+        let part = open_beneath(
+            root,
+            &orphan.relative_part_path,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+        )?;
+        let metadata = part.metadata().context("stat run-owned stale orphan")?;
+        let bytes = read_limited(&part, MAX_XL_META_BYTES, "run-owned stale orphan")?;
+        ensure!(
+            metadata.ino() == orphan.part_inode
+                && device_id(&metadata) == orphan.part_device_id
+                && metadata.len() == orphan.part_size_bytes
+                && sha256_bytes(&bytes) == orphan.fragment_sha256,
+            "run-owned stale orphan identity changed before inventory"
+        );
+        entries.push(ShardInventoryEntry {
+            fragment_id: orphan.fragment_id.clone(),
+            bucket: orphan.bucket.clone(),
+            object_key: orphan.object_key.clone(),
+            version_id: orphan.version_id.clone(),
+            drive_uuid: orphan.drive_uuid.clone(),
+            object_sha256: orphan.object_sha256.clone(),
+            sha256: orphan.fragment_sha256.clone(),
+            reference_state: FragmentReferenceState::OrphanedUncommitted,
+        });
+    } else {
+        ensure_absent_beneath(root, &orphan.relative_part_path)?;
+    }
+    entries.sort();
+    let scan_completed_at_ms = now_ms()?.max(scan_started_at_ms + 1);
+    let response = RustfsShardInventoryResponse {
+        bucket: request.bucket.clone(),
+        drive_uuid: request.drive_uuid.clone(),
+        filesystem_uuid: request.filesystem_uuid.clone(),
+        snapshot_id: snapshot_id.to_string(),
+        scan_started_at_ms,
+        scan_completed_at_ms,
+        start_cursor: None,
+        end_cursor: sha256_bytes(serde_json::to_vec(&entries)?.as_slice()),
+        exhausted: true,
+        total_count: entries.len(),
+        entries,
+    };
+    Ok(StaleOfflineHelperResponse::Inventory {
+        response,
+        expected_operation_ids: operation_ids,
+    })
+}
+
+fn remove_stale_orphan(
+    request: &StaleOfflineHelperRequest,
+    root: &File,
+    orphan: &StaleOwnedOrphanReceipt,
+) -> Result<StaleOfflineHelperResponse> {
+    ensure!(
+        orphan.run_id == request.run_id
+            && orphan.bucket == request.bucket
+            && orphan.drive_uuid == request.drive_uuid,
+        "refusing to remove an orphan owned by another run or generation"
+    );
+    let object = open_stale_object_dir(root, &orphan.bucket, &orphan.object_key)?;
+    let directory = open_beneath(
+        &object,
+        &orphan.version_id,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )?;
+    let part = open_beneath(&directory, "part.1", libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
+    let metadata = part
+        .metadata()
+        .context("stat owned orphan before removal")?;
+    let bytes = read_limited(&part, MAX_XL_META_BYTES, "owned orphan before removal")?;
+    ensure!(
+        metadata.ino() == orphan.part_inode
+            && device_id(&metadata) == orphan.part_device_id
+            && metadata.len() == orphan.part_size_bytes
+            && sha256_bytes(&bytes) == orphan.fragment_sha256,
+        "refusing to remove an orphan whose inode, device, size, or hash changed"
+    );
+    drop(part);
+    let part_c = CString::new("part.1")?;
+    let directory_c = CString::new(orphan.version_id.as_str())?;
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), part_c.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("unlink owned stale orphan part");
+    }
+    directory
+        .sync_all()
+        .context("fsync emptied stale orphan directory")?;
+    drop(directory);
+    if unsafe { libc::unlinkat(object.as_raw_fd(), directory_c.as_ptr(), libc::AT_REMOVEDIR) } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("remove owned stale orphan directory");
+    }
+    object
+        .sync_all()
+        .context("fsync stale object after orphan removal")?;
+    root.sync_all()
+        .context("fsync stale volume after orphan removal")?;
+    Ok(StaleOfflineHelperResponse::OrphanRemoved {
+        fragment_id: orphan.fragment_id.clone(),
+        removed_at_ms: now_ms()?,
+    })
 }
 
 impl Default for StorageHelperRoots {
@@ -88,6 +497,10 @@ pub enum StorageHelperSessionRequest {
     Execute {
         invocation: Box<StorageHelperInvocation>,
     },
+    StaleExecute {
+        context: Box<OwnedStorageContext>,
+        request: Box<StaleOfflineHelperRequest>,
+    },
     Finish {
         context: Box<OwnedStorageContext>,
         cleanup: Box<StorageRecoveryCleanupProof>,
@@ -102,6 +515,9 @@ pub enum StorageHelperSessionResponse {
     },
     Receipt {
         receipt: Box<StorageRecoveryOperationReceipt>,
+    },
+    StaleResponse {
+        response: Box<StaleOfflineHelperResponse>,
     },
     Error {
         message: String,
@@ -340,6 +756,33 @@ impl StorageHelperSession {
         }
     }
 
+    pub fn execute_stale(
+        &mut self,
+        context: &OwnedStorageContext,
+        request: &StaleOfflineHelperRequest,
+    ) -> Result<StaleOfflineHelperResponse> {
+        validate_session_context(&self.owner, context)?;
+        validate_stale_helper_request(request, true)?;
+        ensure!(
+            context.case == crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn
+                && request.run_id == context.identity.run_id
+                && request.scenario == context.identity.scenario
+                && request.deployment_id == context.volume.rustfs_deployment_id
+                && request.drive_uuid == context.volume.rustfs_drive_uuid
+                && request.filesystem_uuid == context.volume.filesystem_uuid
+                && request.bucket == context.identity.bucket,
+            "stale helper request is not bound to the owned storage context"
+        );
+        if matches!(
+            &request.operation,
+            StaleOfflineHelperOperation::InjectOrphan { .. }
+                | StaleOfflineHelperOperation::RemoveOwnedOrphan { .. }
+        ) {
+            self.destructive_mutation_started = true;
+        }
+        execute_stale_offline_helper_at_root(request, &self.volume_root)
+    }
+
     pub fn finish(
         &self,
         context: &OwnedStorageContext,
@@ -403,7 +846,11 @@ fn transition_device_mapper(
     )?;
     ensure!(
         host_generation_sha256(&context.host_generation)? == *generation_sha256
-            && context.host_generation.device_mapper_table_sha256 == plan.recovery_table_sha256,
+            && context
+                .host_generation
+                .device_mapper_table_sha256
+                .as_deref()
+                == Some(plan.recovery_table_sha256.as_str()),
         "device-mapper transition is not bound to the owned host generation"
     );
     let (expected_before, target_table) = match action {
@@ -1380,6 +1827,42 @@ fn open_beneath(root: &File, relative: &str, flags: i32, mode: u32) -> Result<Fi
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+fn ensure_absent_beneath(root: &File, relative: &str) -> Result<()> {
+    ensure!(
+        !relative.is_empty()
+            && !relative.starts_with('/')
+            && relative
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != ".."),
+        "storage helper absence path is not normalized and relative"
+    );
+    let path = CString::new(relative).context("storage helper absence path contains NUL")?;
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: STORAGE_RESOLVE_FLAGS,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            path.as_ptr(),
+            &how,
+            size_of::<OpenHow>(),
+        )
+    } as i32;
+    if fd >= 0 {
+        drop(unsafe { File::from_raw_fd(fd) });
+        bail!("run-owned stale orphan remains present after cleanup")
+    }
+    let error = std::io::Error::last_os_error();
+    ensure!(
+        error.raw_os_error() == Some(libc::ENOENT),
+        "cannot prove stale orphan absence: {error}"
+    );
+    Ok(())
+}
+
 fn acquire_flock(file: &File) -> Result<()> {
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result != 0 {
@@ -1741,6 +2224,65 @@ mod tests {
             part_number: 1,
             byte_offset: 1,
         }
+    }
+
+    fn stale_request(operation: StaleOfflineHelperOperation) -> StaleOfflineHelperRequest {
+        StaleOfflineHelperRequest {
+            run_id: "run-stale-1".to_string(),
+            scenario: "stale-disk-return-detect".to_string(),
+            volume_root: "/host/var/lib/rustfs-stale".to_string(),
+            deployment_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            drive_uuid: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            filesystem_uuid: "fs-stale-1".to_string(),
+            bucket: "bucket-stale-1".to_string(),
+            operation,
+        }
+    }
+
+    #[test]
+    fn stale_orphan_injection_is_exclusive_and_removal_is_owner_bound() {
+        let (_temporary, roots) = test_roots();
+        let object = roots.volume.join("bucket-stale-1/object-1");
+        fs::create_dir_all(&object).expect("stale object directory");
+        fs::write(object.join("xl.meta"), b"sealed metadata placeholder")
+            .expect("stale object metadata");
+        let root = open_directory(&roots.volume, "stale test volume").expect("open volume");
+        let version_id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let request = stale_request(StaleOfflineHelperOperation::InjectOrphan {
+            object_key: "object-1".to_string(),
+            version_id: version_id.to_string(),
+        });
+        let receipt = match inject_stale_orphan(&request, &root, "object-1", version_id)
+            .expect("inject run-owned orphan")
+        {
+            StaleOfflineHelperResponse::OrphanInjected { receipt } => receipt,
+            response => panic!("unexpected helper response: {response:?}"),
+        };
+        assert_eq!(receipt.run_id, request.run_id);
+        assert_eq!(receipt.drive_uuid, request.drive_uuid);
+        assert!(
+            roots.volume.join(&receipt.relative_part_path).is_file(),
+            "injection must publish the exact receipt-bound part"
+        );
+        assert!(
+            inject_stale_orphan(&request, &root, "object-1", version_id).is_err(),
+            "the orphan UUID is an exclusive identity"
+        );
+
+        let mut foreign = receipt.clone();
+        foreign.run_id = "another-run".to_string();
+        assert!(remove_stale_orphan(&request, &root, &foreign).is_err());
+        assert!(roots.volume.join(&receipt.relative_part_path).is_file());
+        let removed =
+            remove_stale_orphan(&request, &root, &receipt).expect("remove exact run-owned orphan");
+        assert!(matches!(
+            removed,
+            StaleOfflineHelperResponse::OrphanRemoved { ref fragment_id, .. }
+                if fragment_id == &receipt.fragment_id
+        ));
+        ensure_absent_beneath(&root, &receipt.relative_part_path)
+            .expect("removed orphan is absent");
+        assert!(remove_stale_orphan(&request, &root, &receipt).is_err());
     }
 
     #[test]

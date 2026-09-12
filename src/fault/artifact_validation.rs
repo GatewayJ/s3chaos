@@ -96,7 +96,7 @@ use crate::fault::{
         FaultRunFaultSpec, FaultRunSpec, FaultRunTargetSpec,
     },
     storage_recovery::{
-        DANGLING_CLEANUP_PROOF_ARTIFACT, DISK_GENERATION_PROOF_ARTIFACT,
+        DANGLING_CLEANUP_PROOF_ARTIFACT, DISK_GENERATION_PROOF_ARTIFACT, DanglingCleanupProof,
         FORCE_READ_PROOF_ARTIFACT, FreshVolumeReplacementProof, HEAL_PROGRESS_ARTIFACT,
         HEAL_SUMMARY_ARTIFACT, HealProgressSample, HealSummary, SHARD_INVENTORY_AFTER_ARTIFACT,
         SHARD_INVENTORY_BEFORE_ARTIFACT, ShardInventorySnapshot, StaleDiskReturnProof,

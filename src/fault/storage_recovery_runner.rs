@@ -17,7 +17,7 @@
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -417,7 +417,16 @@ pub(crate) async fn run_storage_recovery_case(
         StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement
         | StorageRecoveryCase::FreshVolumeReplacementAdminDeep => {}
         StorageRecoveryCase::StaleDiskReturn => {
-            bail!("stale-disk-return storage driver is not qualified in this build")
+            return crate::fault::stale_disk_runner::run_stale_disk_case(
+                config,
+                collector,
+                scenario,
+                execution_plan,
+                plan,
+                run_id,
+                deadline,
+            )
+            .await;
         }
     }
     let driver = crate::fault::fresh_volume::FreshVolumeDriver::new(
@@ -446,8 +455,6 @@ pub(crate) async fn run_storage_recovery_case(
 mod tests {
     use std::sync::Mutex;
 
-    use anyhow::bail;
-
     use super::*;
     use crate::fault::plan::FaultWorkloadMode;
 
@@ -461,7 +468,7 @@ mod tests {
         fn step(&self, name: &'static str) -> Result<()> {
             self.calls.lock().expect("calls").push(name);
             if self.fail == Some(name) || (name == "cleanup" && self.cleanup_fails) {
-                bail!("primary {name}")
+                anyhow::bail!("primary {name}")
             }
             Ok(())
         }

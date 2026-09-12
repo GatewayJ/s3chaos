@@ -58,6 +58,7 @@ pub enum StorageRecoveryCleanupProof {
     },
     StaleDiskReattached {
         reattach_receipt: Box<StorageRecoveryOperationReceipt>,
+        reattach_context: Box<OwnedStorageContext>,
         post_reattach_generation: Box<HostGenerationIdentity>,
         observed_at_ms: u64,
     },
@@ -161,6 +162,7 @@ impl StorageRecoveryCleanupProof {
             }
             Self::StaleDiskReattached {
                 reattach_receipt,
+                reattach_context,
                 post_reattach_generation,
                 observed_at_ms,
             } => {
@@ -169,7 +171,7 @@ impl StorageRecoveryCleanupProof {
                     "stale-disk cleanup proof is bound to another recovery case"
                 );
                 validate_receipt_operation(
-                    context,
+                    reattach_context,
                     reattach_receipt,
                     |operation| {
                         matches!(
@@ -180,7 +182,38 @@ impl StorageRecoveryCleanupProof {
                     "device-mapper reattach",
                 )?;
                 ensure!(
-                    post_reattach_generation.as_ref() == &context.host_generation
+                    reattach_context.identity == context.identity
+                        && reattach_context.case == context.case
+                        && reattach_context.attempt_id == context.attempt_id
+                        && reattach_context.cluster_context == context.cluster_context
+                        && reattach_context.tenant_uid == context.tenant_uid
+                        && reattach_context.scope_sha256 == context.scope_sha256
+                        && crate::fault::storage_recovery_runtime::same_storage_volume_generation(
+                            &reattach_context.volume,
+                            &context.volume,
+                        )
+                        && reattach_context.resource_versions == context.resource_versions
+                        && reattach_context.host_generation == context.host_generation
+                        && reattach_context.exclusive_access.host_flock
+                            == context.exclusive_access.host_flock
+                        && reattach_context.exclusive_access.kubernetes_lease.uid
+                            == context.exclusive_access.kubernetes_lease.uid
+                        && reattach_context
+                            .exclusive_access
+                            .kubernetes_lease
+                            .acquired_at_ms
+                            == context.exclusive_access.kubernetes_lease.acquired_at_ms
+                        && reattach_context
+                            .exclusive_access
+                            .kubernetes_lease
+                            .holder_identity
+                            == context.exclusive_access.kubernetes_lease.holder_identity
+                        && reattach_context
+                            .exclusive_access
+                            .kubernetes_lease
+                            .renew_at_ms
+                            <= context.exclusive_access.kubernetes_lease.renew_at_ms
+                        && post_reattach_generation.as_ref() == &context.host_generation
                         && *observed_at_ms >= reattach_receipt.completed_at_ms,
                     "stale-disk cleanup does not prove the expected reattached generation"
                 );

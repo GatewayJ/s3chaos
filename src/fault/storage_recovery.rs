@@ -40,9 +40,10 @@ use crate::fault::{
         validate_history_phase_boundary, validate_history_scope_and_order,
         validate_successful_version_identity_uniqueness,
     },
+    host_storage::{HostStorageMutationProof, dm_tables_match},
     preflight::{PreflightStatus, TARGET_PROOF_SCHEMA_VERSION, TargetProof, TargetProofStatus},
     quorum::{ErasureSetMembership, ErasureSetShape, PersistedVersionClass, QuorumRequirements},
-    storage_recovery_helper::OfflineXl2InspectResponse,
+    storage_recovery_helper::{OfflineXl2InspectResponse, StaleOwnedOrphanReceipt},
     storage_recovery_runtime::{
         OwnedStorageContext, StorageRecoveryHostOperation, StorageRecoveryOperationReceipt,
     },
@@ -583,6 +584,20 @@ pub enum RawDiskStateResponse {
         mount_path: String,
         canonical_device: String,
     },
+    DeviceMapperTable {
+        host_storage_proof_sha256: String,
+        host_storage_proof_body: String,
+        observer_namespace: String,
+        observer_pod: String,
+        mapper_name: String,
+        argv: Vec<String>,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        suspended: bool,
+        observed_at_ms: u64,
+        canonical_device: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -828,6 +843,50 @@ impl RawDiskStateEvidence {
                     "raw host-helper probe does not prove the claimed continuous EIO disk state"
                 );
             }
+            RawDiskStateResponse::DeviceMapperTable {
+                host_storage_proof_sha256,
+                host_storage_proof_body,
+                observer_namespace,
+                observer_pod,
+                mapper_name,
+                argv,
+                exit_code,
+                stdout,
+                stderr,
+                suspended,
+                observed_at_ms: raw_observed_at_ms,
+                canonical_device,
+            } => {
+                let proof =
+                    serde_json::from_str::<HostStorageMutationProof>(&host_storage_proof_body)
+                        .context("decode captured host-storage proof for DM state")?;
+                proof.validate()?;
+                let expected_table = match state {
+                    DiskPresenceState::Present => proof.tables.recovery_table.as_str(),
+                    DiskPresenceState::Absent => proof.tables.fault_table.as_str(),
+                };
+                ensure!(
+                    cursor == self.response_sha256
+                        && host_storage_proof_sha256 == volume.host_storage_proof_sha256
+                        && host_storage_proof_sha256
+                            == sha256_bytes(host_storage_proof_body.as_bytes())
+                        && proof.target.persistent_volume == volume.persistent_volume
+                        && proof.target.persistent_volume_uid == volume.persistent_volume_uid
+                        && proof.target.canonical_device == volume.canonical_device
+                        && proof.target.container_mount_path == volume.mount_path
+                        && observer_namespace == proof.observer_namespace
+                        && observer_pod == proof.observer_pod
+                        && mapper_name == proof.target.mapper_name
+                        && argv == ["dmsetup", "table", "--showkeys", mapper_name.as_str()]
+                        && exit_code == 0
+                        && stderr.trim().is_empty()
+                        && !suspended
+                        && raw_observed_at_ms == observed_at_ms
+                        && canonical_device == volume.canonical_device
+                        && dm_tables_match(&stdout, expected_table)?,
+                    "raw device-mapper table observation does not prove the claimed present/EIO state"
+                );
+            }
         }
         Ok(())
     }
@@ -1039,11 +1098,8 @@ impl DiskAbsenceObservation {
                     && cursors.insert(sample.cursor.as_str())
                     && sample.cursor == sample.raw_evidence.cursor()?
                     && (index == 0
-                        || sample.observed_at_ms > response.samples[index - 1].observed_at_ms)
-                    && (index == 0
-                        || sample.observed_at_ms - response.samples[index - 1].observed_at_ms
-                            <= response.poll_interval_ms),
-                "host disk watch samples are duplicate, unordered, or exceed the bounded poll interval"
+                        || sample.observed_at_ms > response.samples[index - 1].observed_at_ms),
+                "host disk watch samples are duplicate or unordered"
             );
             sample.raw_evidence.validate(RawDiskStateExpectation {
                 state: sample.state,
@@ -1059,6 +1115,13 @@ impl DiskAbsenceObservation {
             .iter()
             .position(|sample| sample.state == DiskPresenceState::Absent)
             .context("host disk watch never observed the detach")?;
+        ensure!(
+            response.samples[first_absent..]
+                .windows(2)
+                .all(|window| window[1].observed_at_ms - window[0].observed_at_ms
+                    <= response.poll_interval_ms),
+            "continuous EIO samples exceed the bounded poll interval after detachment"
+        );
         ensure!(
             first.state == DiskPresenceState::Present
                 && first.observed_at_ms == response.watch_started_at_ms
@@ -4114,6 +4177,7 @@ pub struct DanglingCleanupProof {
     pub after_inventory_snapshot_id: String,
     pub after_inventory_sha256: String,
     pub cleanup_operation_id: String,
+    pub orphan_injection: StaleOwnedOrphanReceipt,
     pub cleanup_evidence: Option<DanglingCleanupEvidence>,
     pub writes_quiesced_at_ms: u64,
     pub started_at_ms: u64,
@@ -4212,6 +4276,12 @@ pub struct RustfsDanglingCleanupResponse {
     pub before_inventory_snapshot_id: String,
     pub started_at_ms: u64,
     pub completed_at_ms: u64,
+    pub deletion_authority: String,
+    pub dry_run_evidence: DanglingCleanupEvidence,
+    pub live_evidence: DanglingCleanupEvidence,
+    /// Raw admin heal output is diagnostic only. Exact deletion authority is
+    /// the stable offline inventory delta bound to `orphan_injection`.
+    #[serde(default)]
     pub removed_fragment_ids: Vec<String>,
 }
 
@@ -4261,11 +4331,22 @@ impl DanglingCleanupProof {
         let cleanup_response =
             serde_json::from_str::<RustfsDanglingCleanupResponse>(&cleanup_evidence.response_body)
                 .context("decode captured RustFS dangling-cleanup response")?;
-        validate_unique_nonempty(
-            "cleanup removed fragment id",
-            &cleanup_response.removed_fragment_ids,
-            true,
-        )?;
+        ensure!(
+            cleanup_response.removed_fragment_ids.is_empty()
+                && cleanup_response.deletion_authority
+                    == "offline-inventory-delta-and-injection-receipt",
+            "raw admin heal output must remain diagnostic-only cleanup evidence"
+        );
+        for (label, evidence) in [
+            ("dry-run heal", &cleanup_response.dry_run_evidence),
+            ("live heal", &cleanup_response.live_evidence),
+        ] {
+            validate_sha256(label, &evidence.response_sha256)?;
+            ensure!(
+                evidence.response_sha256 == sha256_bytes(evidence.response_body.as_bytes()),
+                "{label} evidence digest does not match its captured body"
+            );
+        }
         before_inventory.validate()?;
         after_inventory.validate()?;
         let before_response = before_inventory.response()?;
@@ -4622,13 +4703,25 @@ impl DanglingCleanupProof {
             .map(|fragment_id| (*fragment_id).clone())
             .collect::<BTreeSet<_>>();
         ensure!(
-            cleanup_response
-                .removed_fragment_ids
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>()
-                == removed_fragment_ids,
-            "post-cleanup inventory delta does not match the captured RustFS cleanup response"
+            self.orphan_injection.run_id == self.identity.run_id
+                && self.orphan_injection.bucket == self.identity.bucket
+                && self.orphan_injection.drive_uuid == self.returned_generation.rustfs_drive_uuid
+                && self.orphan_injection.created_at_ms > self.writes_quiesced_at_ms
+                && self.orphan_injection.created_at_ms < before_inventory.receipt.started_at_ms,
+            "orphan injection receipt is not bound and ordered within the returned generation"
+        );
+        let injected = before
+            .get(&self.orphan_injection.fragment_id)
+            .context("run-owned injected orphan is absent from the pre-cleanup inventory")?;
+        ensure!(
+            injected.bucket == self.orphan_injection.bucket
+                && injected.object_key == self.orphan_injection.object_key
+                && injected.version_id == self.orphan_injection.version_id
+                && injected.drive_uuid == self.orphan_injection.drive_uuid
+                && injected.object_sha256 == self.orphan_injection.object_sha256
+                && injected.sha256 == self.orphan_injection.fragment_sha256
+                && injected.reference_state == FragmentReferenceState::OrphanedUncommitted,
+            "pre-cleanup inventory does not bind the injected orphan receipt"
         );
         let mut removed_dangling = false;
         for version in &self.classified_versions {
@@ -4645,6 +4738,10 @@ impl DanglingCleanupProof {
                 }
             }
         }
+        ensure!(
+            removed_fragment_ids == BTreeSet::from([self.orphan_injection.fragment_id.clone()]),
+            "post-cleanup inventory delta is not exactly the run-owned injected orphan"
+        );
         ensure!(
             removed_dangling,
             "dangling-cleanup case has no proven uncommitted-dangling fragment removal signal"
@@ -8720,7 +8817,16 @@ mod tests {
             before_inventory_snapshot_id: before_inventory.receipt.snapshot_id.clone(),
             started_at_ms: 600,
             completed_at_ms: 700,
-            removed_fragment_ids: vec![dangling.fragment_id.clone()],
+            deletion_authority: "offline-inventory-delta-and-injection-receipt".to_string(),
+            dry_run_evidence: DanglingCleanupEvidence {
+                response_sha256: sha256_bytes(b"{}"),
+                response_body: "{}".to_string(),
+            },
+            live_evidence: DanglingCleanupEvidence {
+                response_sha256: sha256_bytes(b"{}"),
+                response_body: "{}".to_string(),
+            },
+            removed_fragment_ids: Vec::new(),
         })
         .expect("cleanup response");
         let proof = DanglingCleanupProof {
@@ -8732,6 +8838,21 @@ mod tests {
             after_inventory_snapshot_id: after_inventory.receipt.snapshot_id.clone(),
             after_inventory_sha256: after_inventory.entries_sha256.clone(),
             cleanup_operation_id: "cleanup-1".to_string(),
+            orphan_injection: StaleOwnedOrphanReceipt {
+                run_id: "run-1".to_string(),
+                bucket: dangling.bucket.clone(),
+                object_key: dangling.object_key.clone(),
+                version_id: dangling.version_id.clone(),
+                relative_part_path: "bucket-1/key/unknown-write/part.1".to_string(),
+                drive_uuid: dangling.drive_uuid.clone(),
+                fragment_id: dangling.fragment_id.clone(),
+                object_sha256: dangling.object_sha256.clone(),
+                fragment_sha256: dangling.sha256.clone(),
+                part_device_id: "8:1".to_string(),
+                part_inode: 42,
+                part_size_bytes: 1,
+                created_at_ms: 542,
+            },
             cleanup_evidence: Some(DanglingCleanupEvidence {
                 response_sha256: sha256_bytes(cleanup_response.as_bytes()),
                 response_body: cleanup_response,
@@ -9038,16 +9159,6 @@ mod tests {
         let mut missing = proof.clone();
         missing.after_inventory_snapshot_id = missing_after.receipt.snapshot_id.clone();
         missing.after_inventory_sha256 = missing_after.entries_sha256.clone();
-        let cleanup_evidence = missing.cleanup_evidence.as_mut().expect("cleanup evidence");
-        let mut cleanup_response =
-            serde_json::from_str::<RustfsDanglingCleanupResponse>(&cleanup_evidence.response_body)
-                .expect("cleanup response");
-        cleanup_response
-            .removed_fragment_ids
-            .push(unknown.fragment_id.clone());
-        cleanup_evidence.response_body =
-            serde_json::to_string(&cleanup_response).expect("cleanup response");
-        cleanup_evidence.response_sha256 = sha256_bytes(cleanup_evidence.response_body.as_bytes());
         let error = missing
             .validate_against_stale_return(
                 &stale_return,

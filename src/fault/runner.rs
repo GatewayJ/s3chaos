@@ -53,20 +53,20 @@ mod injection;
 mod post_recovery;
 mod recovery;
 mod setup;
-mod targets;
+pub(crate) mod targets;
 mod verification;
 use crate::fault::backends::runtime::collect_fault_artifacts;
 use crate::fault::workload::execution::{
     MixedWorkloadResult, WorkloadPlanArtifact, cleanup_staged_multipart_uploads,
 };
 
-struct FaultRunContext {
-    spec: &'static FaultScenarioSpec,
-    run_id: String,
-    workload_plan: WorkloadPlan,
-    bucket: String,
-    events: RunEventRecorder,
-    history: Recorder,
+pub(crate) struct FaultRunContext {
+    pub(crate) spec: &'static FaultScenarioSpec,
+    pub(crate) run_id: String,
+    pub(crate) workload_plan: WorkloadPlan,
+    pub(crate) bucket: String,
+    pub(crate) events: RunEventRecorder,
+    pub(crate) history: Recorder,
 }
 
 pub async fn run_selected_scenario_from_env() -> Result<()> {
@@ -174,14 +174,8 @@ async fn run_fault_case(
     planned_run_id: &str,
     deadline: RunDeadline,
 ) -> Result<()> {
-    let context = initialize_fault_run(
-        config,
-        collector,
-        scenario,
-        execution_plan,
-        plan,
-        planned_run_id,
-    )?;
+    let context =
+        initialize_fault_run(config, collector, scenario, execution_plan, planned_run_id)?;
     let run = FaultRun {
         config,
         collector,
@@ -404,12 +398,11 @@ impl FaultRun<'_> {
     }
 }
 
-fn initialize_fault_run(
+pub(crate) fn initialize_fault_run(
     config: &FaultTestConfig,
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
     execution_plan: &ExecutionPlan,
-    plan: &FaultPlan,
     run_id: &str,
 ) -> Result<FaultRunContext> {
     let spec = scenarios::scenario_spec(&scenario.name)?;
@@ -477,9 +470,9 @@ fn initialize_fault_run(
         "fault run initialized",
         Some(serde_json::json!({
             "bucket": bucket,
-            "backend": plan.backend_summary(),
-            "target": plan.target_summary(),
-            "faults": plan.faults().len(),
+            "backend": execution_plan.backend_summary(),
+            "target": execution_plan.target_summary(),
+            "faults": execution_plan.injection().map_or(0, |plan| plan.faults().len()),
         })),
     )?;
     eprintln!(
@@ -500,7 +493,7 @@ fn initialize_fault_run(
     })
 }
 
-fn write_preflight_summary(
+pub(crate) fn write_preflight_summary(
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
     config: &FaultTestConfig,

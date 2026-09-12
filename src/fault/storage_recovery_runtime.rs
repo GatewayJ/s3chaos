@@ -727,7 +727,11 @@ impl StaleDeviceMapperTransitionResponse {
         let expected_generation = host_generation_sha256(&context.host_generation)?;
         ensure!(
             expected_generation == *generation_sha256
-                && context.host_generation.device_mapper_table_sha256 == plan.recovery_table_sha256
+                && context
+                    .host_generation
+                    .device_mapper_table_sha256
+                    .as_deref()
+                    == Some(plan.recovery_table_sha256.as_str())
                 && self.action == expected_action
                 && self.mapping_name == *mapping_name
                 && self.generation_sha256 == *generation_sha256,
@@ -871,8 +875,8 @@ pub fn storage_scope_sha256(context: &OwnedStorageContext) -> String {
 }
 
 pub(crate) fn same_storage_volume_generation(
-    left: &crate::fault::storage_recovery::StorageVolumeIdentity,
-    right: &crate::fault::storage_recovery::StorageVolumeIdentity,
+    left: &StorageVolumeIdentity,
+    right: &StorageVolumeIdentity,
 ) -> bool {
     let mut left = left.clone();
     left.observed_at_ms = right.observed_at_ms;
@@ -1086,6 +1090,27 @@ impl KubectlStorageRecoveryAttemptGuard {
                 bail!("storage helper rejected operation: {message}")
             }
             _ => bail!("storage helper returned an unexpected operation response"),
+        }
+    }
+
+    pub async fn execute_stale(
+        &mut self,
+        context: &OwnedStorageContext,
+        request: &crate::fault::storage_recovery_helper::StaleOfflineHelperRequest,
+    ) -> Result<crate::fault::storage_recovery_helper::StaleOfflineHelperResponse> {
+        require_current_lease(self.client.clone(), context).await?;
+        let response = self
+            .exchange(&StorageHelperSessionRequest::StaleExecute {
+                context: Box::new(context.clone()),
+                request: Box::new(request.clone()),
+            })
+            .await?;
+        match response {
+            StorageHelperSessionResponse::StaleResponse { response } => Ok(*response),
+            StorageHelperSessionResponse::Error { message } => {
+                bail!("storage helper rejected stale operation: {message}")
+            }
+            _ => bail!("storage helper returned an unexpected stale response"),
         }
     }
 
@@ -1819,7 +1844,8 @@ mod tests {
         let mut context = context();
         context.case = StorageRecoveryCase::StaleDiskReturn;
         context.identity.scenario = context.case.scenario().to_string();
-        context.host_generation.device_mapper_table_sha256 = sha256_bytes(recovery.as_bytes());
+        context.host_generation.device_mapper_table_sha256 =
+            Some(sha256_bytes(recovery.as_bytes()));
         let generation = host_generation_sha256(&context.host_generation).expect("generation");
         let operation = StorageRecoveryHostOperation::DetachDeviceMapper {
             mapping_name: "rustfs-data".to_string(),
