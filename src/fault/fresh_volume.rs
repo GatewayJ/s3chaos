@@ -1263,8 +1263,6 @@ impl AdminHealStartState {
         receipt: &HealWireReceipt,
         status: &HealWireReceipt,
         reconciled_after_response_loss: bool,
-        pool_index: u32,
-        set_index: u32,
     ) -> Result<HealObserverIdentity> {
         let Self::Ambiguous {
             bucket,
@@ -1297,27 +1295,31 @@ impl AdminHealStartState {
             .to_string();
         let status_body: Value = serde_json::from_str(&status.response_body)
             .context("decode admin heal reconciliation status")?;
-        ensure!(
-            status_body.pointer("/startTime").and_then(Value::as_str) == Some(start_time.as_str())
-                && status_body
-                    .pointer("/settings/pool")
-                    .and_then(Value::as_u64)
-                    == Some(u64::from(pool_index))
-                && status_body.pointer("/settings/set").and_then(Value::as_u64)
-                    == Some(u64::from(set_index)),
-            "admin heal status does not echo the owned start time and exact erasure-set scope"
-        );
+        let status_time = status_body
+            .pointer("/startTime")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .context("admin heal status response lacks startTime")?;
         let parsed_start = time::OffsetDateTime::parse(
             &start_time,
             &time::format_description::well_known::Rfc3339,
         )
         .context("parse admin heal startTime")?;
+        let parsed_status = time::OffsetDateTime::parse(
+            status_time,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .context("parse admin heal status startTime")?;
         let start_ms = u64::try_from(parsed_start.unix_timestamp_nanos() / 1_000_000)
             .context("admin heal startTime precedes the Unix epoch")?;
+        let status_ms = u64::try_from(parsed_status.unix_timestamp_nanos() / 1_000_000)
+            .context("admin heal status startTime precedes the Unix epoch")?;
         ensure!(
             start_ms.saturating_add(2_000) >= *requested_at_ms
-                && start_ms <= status.observed_at_ms.saturating_add(2_000),
-            "admin heal startTime is outside the registered request/status interval"
+                && start_ms <= receipt.observed_at_ms.saturating_add(2_000)
+                && status_ms.saturating_add(2_000) >= receipt.observed_at_ms
+                && status_ms <= status.observed_at_ms.saturating_add(2_000),
+            "admin heal response times are outside the registered request/status intervals"
         );
         let observer = HealObserverIdentity::AdminOperation {
             operation_id: operation_id.clone(),
@@ -1519,8 +1521,6 @@ impl RustfsFreshHealAdapter {
                     &receipt,
                     &status,
                     reconciled_after_response_loss,
-                    self.pool_index,
-                    self.set_index,
                 )?;
                 *self.owned_observer.lock().await = Some(observer);
                 Ok(())
@@ -1762,11 +1762,6 @@ fn normalize_admin_status(
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    ensure!(
-        value.pointer("/settings/pool").and_then(Value::as_u64) == Some(u64::from(pool_index))
-            && value.pointer("/settings/set").and_then(Value::as_u64) == Some(u64::from(set_index)),
-        "owned admin heal status is not scoped to the replacement erasure set"
-    );
     let scanned = value
         .pointer("/progress/objectsScanned")
         .and_then(Value::as_u64)
@@ -1796,9 +1791,9 @@ fn normalize_admin_status(
         repaired,
         failed,
         cluster_definitive: true,
-        // The owned client token and echoed pool/set settings scope this heal
-        // to the set whose live membership already binds `expected_drive`.
-        // RustFS's v3 task status does not repeat individual drive UUIDs.
+        // The client token came from the exact bucket-scoped start request,
+        // whose body selected this pool/set. RustFS status uses default HealOpts
+        // and therefore does not echo that scope or individual drive UUIDs.
         target_drive_uuid: Some(expected_drive.to_string()),
         pool_index,
         set_index,
@@ -4537,12 +4532,12 @@ mod tests {
             path: start.path.clone(),
             status: 200,
             request_id: Some("request-2".to_string()),
-            response_body: r#"{"summary":"running","startTime":"1970-01-01T00:00:01Z","settings":{"pool":0,"set":0}}"#
+            response_body: r#"{"summary":"running","startTime":"1970-01-01T00:00:01.4Z","settings":{"recursive":false,"scanMode":0}}"#
                 .to_string(),
         };
         assert_eq!(
             state
-                .own(&start, &status, true, 0, 0)
+                .own(&start, &status, true)
                 .expect("reconciled ownership"),
             HealObserverIdentity::AdminOperation {
                 operation_id: "owned-token".to_string(),
@@ -4564,11 +4559,7 @@ mod tests {
         );
         let mut wrong_status = status;
         wrong_status.path = "/rustfs/admin/v3/heal/foreign".to_string();
-        assert!(
-            foreign_scope
-                .own(&start, &wrong_status, true, 0, 0)
-                .is_err()
-        );
+        assert!(foreign_scope.own(&start, &wrong_status, true).is_err());
         assert!(matches!(
             foreign_scope,
             AdminHealStartState::Ambiguous { .. }
@@ -4664,13 +4655,13 @@ mod tests {
     }
 
     #[test]
-    fn admin_status_uses_rustfs_progress_and_echoed_set_scope() {
+    fn admin_status_uses_rustfs_progress_without_assuming_echoed_start_settings() {
         let observation = normalize_admin_status(
             HealObserverIdentity::AdminOperation {
                 operation_id: "owned".to_string(),
             },
             10,
-            r#"{"summary":"finished","settings":{"recursive":true,"scanMode":2,"pool":0,"set":0},"items":[],"progress":{"objectsScanned":7,"objectsHealed":3,"objectsFailed":0}}"#,
+            r#"{"summary":"finished","settings":{"recursive":false,"scanMode":0},"items":[],"progress":{"objectsScanned":7,"objectsHealed":3,"objectsFailed":0}}"#,
             "drive-new",
             0,
             0,
@@ -4679,18 +4670,6 @@ mod tests {
         assert_eq!(observation.state, HealProgressState::Completed);
         assert_eq!((observation.scanned, observation.repaired), (7, 3));
         assert_eq!(observation.target_drive_uuid.as_deref(), Some("drive-new"));
-
-        assert!(
-            normalize_admin_status(
-                observation.observer,
-                11,
-                r#"{"summary":"finished","settings":{"pool":0,"set":1}}"#,
-                "drive-new",
-                0,
-                0,
-            )
-            .is_err()
-        );
     }
 
     #[test]
