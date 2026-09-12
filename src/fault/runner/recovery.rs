@@ -188,6 +188,22 @@ impl FaultRun<'_> {
             recovery_started_at_ms,
         })
     }
+    /// Re-read the fault's own evidence once the recovery gate has passed;
+    /// a failure keeps the backend's classification.
+    pub(super) fn recheck_fault_after_recovery(&self, fault: &mut AppliedFault) -> Result<()> {
+        if let Err(error) = fault.verify_after_recovery() {
+            self.record_failure(
+                "fault-recovery-recheck",
+                crate::fault::fault_lifecycle::removal_failure_classification(&error),
+                &error,
+                None,
+                Some((&*fault, "fault-recovery-recheck-failed")),
+            )?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(super) async fn recover_access(
         &self,
         prepared: &mut PreparedWorkload,

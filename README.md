@@ -205,8 +205,11 @@ SIGTERM's default action, or exits non-zero fails the run as
 `graceful_shutdown_failed`; a replacement that never becomes Ready or restarts
 before Ready fails as `product_or_environment`, and a StatefulSet whose UID
 changes fails too (`pod-lifecycle-evidence.json`). `pod-graceful-restart-one`
-and `rolling-restart-all` count the fault as active once the API server
-accepts the delete, so SIGTERM lands under load; the rolling restart goes from
+and `rolling-restart-all` issue their first delete only after the first
+fault-phase S3 request has started (checked against `history.jsonl`), so
+SIGTERM lands under load; the StatefulSet must be converged on one revision,
+every replacement must run it, and replacements are tracked past Ready and
+re-read after the recovery gate; the rolling restart goes from
 the highest ordinal down and, with a port-forward endpoint, pins all client
 traffic to the smallest-name Pod and restarts that Pod only after the
 workload. `cluster-cold-restart` runs on a fresh Tenant fixture (the scale
@@ -216,8 +219,8 @@ leaves `kubectl-scale` co-owning `spec.replicas`), requires
 `RUSTFS_FAULT_TEST_OPERATOR_NAMESPACE`; it must run an image containing
 `RUSTFS_FAULT_TEST_OPERATOR_IMAGE_MATCH`, default `rustfs/operator`) by
 recording the pause as annotations on that Deployment and scaling it to zero,
-drains every Pod before the workload, records every `spec.replicas` sample
-while the outage is held, requires every workload operation to fail, then
+drains every Pod before the workload, samples `spec.replicas` and the Pod count every second while the outage is
+held, requires every workload operation to fail, then
 scales both back. The operator is restored when the run unwinds normally or
 on a signal; if the harness is killed outright, the annotations remain and
 the next `cluster-cold-restart` pre-cleanup or `make fault-cleanup` restores

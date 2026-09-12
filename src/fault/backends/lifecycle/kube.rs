@@ -21,7 +21,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::evidence::{
     ContainerTermination, DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS, LifecycleOperation,
@@ -110,6 +110,9 @@ pub struct ObservedPod {
     pub restart_count: u64,
     pub owner: Option<PodOwner>,
     pub rustfs_terminated: Option<ContainerTermination>,
+    /// `controller-revision-hash` label: the StatefulSet revision this Pod
+    /// was created from.
+    pub revision: Option<String>,
 }
 
 impl ObservedPod {
@@ -221,6 +224,10 @@ pub fn parse_pod(pod: &Value) -> Result<ObservedPod> {
         restart_count,
         owner,
         rustfs_terminated,
+        revision: metadata
+            .pointer("/labels/controller-revision-hash")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -742,6 +749,18 @@ pub fn parse_watch_stream(raw: &str) -> WatchStream {
     WatchStream { objects, truncated }
 }
 
+/// Whether a (possibly still growing) watch stream already carries a
+/// complete document for every given Pod UID.
+pub fn watch_covers(raw: &str, uids: &BTreeSet<String>) -> bool {
+    let stream = parse_watch_stream(raw);
+    let seen = stream
+        .objects
+        .iter()
+        .filter_map(|value| value.pointer("/metadata/uid").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    uids.iter().all(|uid| seen.contains(uid.as_str()))
+}
+
 /// One Pod UID as the watch saw it: the graceful deletion metadata from the
 /// FIRST document that carried it (kubelet's final DELETED document rewrites
 /// it to now/0) and the container's terminated state from the LAST document
@@ -862,6 +881,7 @@ mod tests {
             "name": name,
             "uid": uid,
             "namespace": "rustfs-fault-test",
+            "labels": {"controller-revision-hash": "rev-1"},
         });
         if deleting {
             metadata["deletionTimestamp"] = json!("2026-09-11T10:05:30Z");
@@ -958,6 +978,36 @@ mod tests {
         assert_eq!(pod_ordinal("tenant-primary-12"), Some(12));
         assert_eq!(pod_ordinal("tenant"), None);
         assert!(parse_pod(&json!({"metadata": {"name": "x"}})).is_err());
+    }
+
+    #[test]
+    fn revision_label_and_watch_coverage_are_read() {
+        let pod = parse_pod(&pod_json("fault-test-tenant-primary-0", "uid-0", None)).expect("pod");
+        assert_eq!(pod.revision.as_deref(), Some("rev-1"));
+        let bare = parse_pod(&json!({"metadata": {"name": "solo-0", "uid": "u"}})).expect("pod");
+        assert!(bare.revision.is_none());
+
+        let uids = ["uid-0", "uid-1"]
+            .map(str::to_string)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let first =
+            serde_json::to_string(&pod_json("fault-test-tenant-primary-0", "uid-0", None)).unwrap();
+        let second =
+            serde_json::to_string(&pod_json("fault-test-tenant-primary-1", "uid-1", None)).unwrap();
+        assert!(!super::watch_covers("", &uids));
+        assert!(!super::watch_covers(&first, &uids));
+        // A document still being written does not count yet.
+        assert!(!super::watch_covers(
+            &format!("{first}\n{}", &second[..second.len() / 2]),
+            &uids
+        ));
+        assert!(super::watch_covers(&format!("{first}\n{second}\n"), &uids));
+        let listing = json!({"kind": "List", "items": [
+            pod_json("fault-test-tenant-primary-0", "uid-0", None),
+            pod_json("fault-test-tenant-primary-1", "uid-1", None)
+        ]});
+        assert!(super::watch_covers(&listing.to_string(), &uids));
     }
 
     #[test]

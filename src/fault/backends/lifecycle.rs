@@ -41,22 +41,30 @@
 //! right after the container exits and a replacement Pod carries no
 //! `lastState` for it. The grace-timeout rule lives in `evidence.rs`.
 //!
-//! Load during shutdown: the single-Pod and rolling restarts consider the
-//! fault active as soon as the graceful delete is accepted, so RustFS receives
-//! SIGTERM while the workload runs (with a port-forward endpoint the client is
-//! pinned to the smallest-name Pod, which the rolling restart therefore
-//! restarts after the workload). The cold restart drains every Pod before the
-//! workload starts because its contract is the held total outage, not a
-//! loaded shutdown.
+//! Load during shutdown: the single-Pod and rolling restarts arm at fault
+//! activation but issue their first delete only once the runner reports the
+//! first fault-phase S3 request (`load_gate`), so SIGTERM reaches RustFS
+//! while requests are in flight; the evidence records that time and the
+//! validator checks it against `history.jsonl`. With a port-forward endpoint
+//! the client is pinned to the smallest-name Pod, which the rolling restart
+//! therefore restarts after the workload. The cold restart drains every Pod
+//! before the workload starts because its contract is the held total outage,
+//! not a loaded shutdown; a sampler watches that outage for the whole
+//! fault-active window.
+//!
+//! Replacements are tracked past Ready and re-read after the recovery gate,
+//! so a replacement that crashes or is replaced again later cannot pass, and
+//! the StatefulSet must be converged on one revision that every replacement
+//! runs, so a pending rollout is never mistaken for a restart.
 
 pub(in crate::fault) mod evidence;
 pub(in crate::fault) mod kube;
 
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{JoinHandle, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -364,9 +372,8 @@ fn observe_deployment(
     .with_context(|| format!("read Deployment {namespace}/{name}"))
 }
 
-/// Bind the current tenant Pods to exactly one Ready StatefulSet. Rejects
-/// Deployments, mixed owners, missing Pods, and Pods that disagree with the
-/// template's grace period, so every later step acts on a proven topology.
+/// Bind the current tenant Pods to exactly one Ready StatefulSet converged on
+/// one revision; see `validate_topology`.
 pub(in crate::fault) fn observe_statefulset_topology(
     cluster: &ClusterTestConfig,
     expected_pods: usize,
@@ -380,6 +387,32 @@ pub(in crate::fault) fn observe_statefulset_topology(
     );
     let owner = require_single_statefulset_owner(&pods)?;
     let statefulset = observe_statefulset(cluster, &owner.name)?;
+    validate_topology(
+        &cluster.test_namespace,
+        expected_pods,
+        &owner,
+        &statefulset,
+        &pods,
+    )?;
+    Ok(StatefulSetObservation {
+        statefulset,
+        pods,
+        observed_at_ms,
+    })
+}
+
+/// Rejects mismatched owners, a StatefulSet outside the fault-test
+/// namespace, missing or unready Pods, Pods that disagree with the template's
+/// grace period, and a StatefulSet that has not converged on one revision:
+/// with a pending rollout (or `OnDelete` and an updated template) a deleted
+/// Pod comes back on a new revision, conflating an upgrade with a restart.
+pub(in crate::fault) fn validate_topology(
+    namespace: &str,
+    expected_pods: usize,
+    owner: &kube::PodOwner,
+    statefulset: &ObservedStatefulSet,
+    pods: &[ObservedPod],
+) -> Result<()> {
     ensure!(
         statefulset.identity.uid == owner.uid,
         "StatefulSet {} uid {} does not match the Pods' controller uid {}",
@@ -388,20 +421,33 @@ pub(in crate::fault) fn observe_statefulset_topology(
         owner.uid
     );
     ensure!(
-        statefulset.identity.namespace == cluster.test_namespace,
-        "StatefulSet {} lives in namespace {:?}, not the fault-test namespace {:?}",
+        statefulset.identity.namespace == namespace,
+        "StatefulSet {} lives in namespace {:?}, not the fault-test namespace {namespace:?}",
         owner.name,
-        statefulset.identity.namespace,
-        cluster.test_namespace
+        statefulset.identity.namespace
     );
     ensure!(
-        usize::try_from(statefulset.spec_replicas).ok() == Some(expected_pods),
-        "StatefulSet {} declares {} replicas but the scenario expects {expected_pods} Pods",
+        usize::try_from(statefulset.spec_replicas).ok() == Some(expected_pods)
+            && pods.len() == expected_pods,
+        "StatefulSet {} declares {} replicas and owns {} Pods but the scenario expects {expected_pods}",
         owner.name,
-        statefulset.spec_replicas
+        statefulset.spec_replicas,
+        pods.len()
     );
-    let mut ordinals = std::collections::BTreeSet::new();
-    for pod in &pods {
+    let revision = statefulset
+        .identity
+        .update_revision
+        .as_deref()
+        .filter(|revision| !revision.trim().is_empty());
+    ensure!(
+        revision.is_some() && statefulset.identity.current_revision.as_deref() == revision,
+        "StatefulSet {} has not converged on one revision (currentRevision {:?}, updateRevision {:?}); restarting now would also roll out a pending template change",
+        owner.name,
+        statefulset.identity.current_revision,
+        statefulset.identity.update_revision
+    );
+    let mut ordinals = BTreeSet::new();
+    for pod in pods {
         ensure!(
             pod.phase == "Running" && pod.ready && !pod.terminating,
             "Pod {} is not Running and Ready before the lifecycle operation (phase={}, ready={}, terminating={})",
@@ -424,12 +470,14 @@ pub(in crate::fault) fn observe_statefulset_topology(
             pod.termination_grace_period_seconds,
             statefulset.identity.termination_grace_period_seconds
         );
+        ensure!(
+            pod.revision.as_deref() == revision,
+            "Pod {} runs revision {:?}, not the StatefulSet's converged revision {revision:?}",
+            pod.name,
+            pod.revision
+        );
     }
-    Ok(StatefulSetObservation {
-        statefulset,
-        pods,
-        observed_at_ms,
-    })
+    Ok(())
 }
 
 /// Target-proof evidence: the live StatefulSet identity and its owned Pods.
@@ -605,40 +653,77 @@ impl LifecycleState {
             replacement_ready_at_ms: None,
             classification: TerminationClassification::Unobserved,
             restarted_after_workload: deferred,
+            final_uid: None,
+            old_revision: pod.revision.clone(),
+            replacement_revision: None,
         });
     }
 
-    /// Fold one Pod listing into every open target: deletion metadata and the
+    /// Fold one Pod listing into every target: deletion metadata and the
     /// container's terminated state while the old Pod still exists, then the
-    /// replacement's identity and readiness once it is gone.
+    /// first replacement's identity, revision, readiness, and latest restart
+    /// count. Targets are never frozen after Ready: a later crash or a second
+    /// replacement under the same name must still be seen.
     fn absorb(&mut self, pods: &[ObservedPod], observed_at_ms: u64) {
         for target in &mut self.targets {
-            if target.replacement_ready_at_ms.is_some() {
-                continue;
-            }
-            match pods.iter().find(|pod| pod.uid == target.old_uid) {
-                Some(old) => fold_old_pod(
+            if let Some(old) = pods.iter().find(|pod| pod.uid == target.old_uid) {
+                fold_old_pod(
                     target,
                     old.graceful_deletion().as_ref(),
                     old.rustfs_terminated.as_ref(),
                     "poll",
-                ),
-                None => {
-                    if target.old_uid_gone_at_ms.is_none() {
-                        target.old_uid_gone_at_ms = Some(observed_at_ms);
-                    }
-                    if let Some(replacement) = pods
-                        .iter()
-                        .find(|pod| pod.name == target.pod_name && pod.uid != target.old_uid)
-                    {
-                        target.new_uid = Some(replacement.uid.clone());
-                        target.restart_count_after = Some(replacement.restart_count);
-                        if replacement.ready && !replacement.terminating {
-                            target.replacement_ready_at_ms = Some(observed_at_ms);
-                        }
-                    }
-                }
+                );
+                continue;
             }
+            if target.old_uid_gone_at_ms.is_none() {
+                target.old_uid_gone_at_ms = Some(observed_at_ms);
+            }
+            if let Some(replacement) = pods
+                .iter()
+                .find(|pod| pod.name == target.pod_name && pod.uid != target.old_uid)
+            {
+                Self::fold_replacement(target, replacement, Some(observed_at_ms));
+            }
+        }
+    }
+
+    /// A listing taken after the recovery gate: only the latest identity and
+    /// restart count move; readiness and timing stay as observed during the
+    /// operation.
+    fn absorb_after_recovery(&mut self, pods: &[ObservedPod]) {
+        for target in &mut self.targets {
+            if let Some(current) = pods
+                .iter()
+                .find(|pod| pod.name == target.pod_name && pod.uid != target.old_uid)
+            {
+                Self::fold_replacement(target, current, None);
+            }
+        }
+    }
+
+    fn fold_replacement(
+        target: &mut PodTerminationEvidence,
+        replacement: &ObservedPod,
+        ready_observed_at_ms: Option<u64>,
+    ) {
+        let first = target
+            .new_uid
+            .get_or_insert_with(|| replacement.uid.clone())
+            .clone();
+        target.final_uid = Some(replacement.uid.clone());
+        if replacement.uid != first {
+            return;
+        }
+        target.restart_count_after = Some(replacement.restart_count);
+        if target.replacement_revision.is_none() {
+            target.replacement_revision = replacement.revision.clone();
+        }
+        if let Some(observed_at_ms) = ready_observed_at_ms
+            && target.replacement_ready_at_ms.is_none()
+            && replacement.ready
+            && !replacement.terminating
+        {
+            target.replacement_ready_at_ms = Some(observed_at_ms);
         }
     }
 
@@ -675,10 +760,6 @@ impl LifecycleState {
     /// gone): SIGTERM is on its way while the workload keeps running.
     fn delete_accepted(target: &PodTerminationEvidence) -> bool {
         target.deletion_timestamp.is_some() || target.old_uid_gone_at_ms.is_some()
-    }
-
-    fn any_delete_accepted(&self) -> bool {
-        self.targets.iter().any(Self::delete_accepted)
     }
 
     fn all_gone(&self) -> bool {
@@ -738,6 +819,29 @@ impl PodWatch {
         let child = watch_rustfs_pods_command(cluster)?
             .spawn_background_with_logs(&log_path, &stderr_path)?;
         Ok(Self { child, log_path })
+    }
+
+    /// Wait (bounded) until the watch stream has emitted every given Pod UID,
+    /// proving the watch is established before anything is mutated.
+    fn wait_until_covers(&mut self, uids: &BTreeSet<String>, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let raw = std::fs::read_to_string(&self.log_path).unwrap_or_default();
+            if kube::watch_covers(&raw, uids) {
+                return Ok(());
+            }
+            if let Some(status) = self.child.try_wait()? {
+                bail!(
+                    "the Pod watch exited with {status} before emitting every targeted Pod; see {}",
+                    self.log_path.display()
+                );
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "the Pod watch did not emit every targeted Pod within {timeout:?}"
+            );
+            sleep(POLL_INTERVAL);
+        }
     }
 
     fn finish(mut self) -> Result<BTreeMap<String, WatchedPod>> {
@@ -923,6 +1027,23 @@ impl Drop for OperatorPause {
     }
 }
 
+/// Attempts (one interval apart) to confirm a graceful delete whose request
+/// errored on the client side: the API server may have accepted it anyway.
+const DELETE_CONFIRM_ATTEMPTS: usize = 8;
+const DELETE_CONFIRM_INTERVAL: Duration = Duration::from_secs(1);
+/// Bound on the Pod watch emitting every targeted Pod before any mutation.
+const WATCH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cold-restart outage sampling period while the fault is active.
+const OUTAGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const UNFINISHED_OPERATION: &str = "the run ended before the lifecycle operation was removed; this report holds what was observed until then";
+
+/// The cold restart's contract is a held total outage: nothing may serve S3
+/// while it is active, so runner gates that need a reachable endpoint under
+/// the fault do not apply to it.
+pub(in crate::fault) fn expects_total_outage(kind: FaultKind) -> bool {
+    kind == FaultKind::RustfsServerColdRestart
+}
+
 /// Issue the graceful delete and register the target.
 fn initiate_pod_delete(
     cluster: &ClusterTestConfig,
@@ -933,11 +1054,57 @@ fn initiate_pod_delete(
     let command = delete_pod_default_grace_command(cluster, &pod.name, &pod.uid)?;
     let delete_requested_at_ms = now_ms();
     lock_state(state).begin_target(pod, delete_requested_at_ms, deferred);
+    match command.run_checked() {
+        Ok(_) => Ok(()),
+        Err(error) => confirm_delete_after_error(
+            state,
+            pod,
+            error,
+            || observe_pods(cluster),
+            DELETE_CONFIRM_ATTEMPTS,
+            DELETE_CONFIRM_INTERVAL,
+        ),
+    }
+}
+
+/// A delete request that errored on the client side (a request timeout, a
+/// dropped connection) may still have been accepted. Poll briefly: an
+/// accepted delete is in flight and is recorded as such rather than
+/// abandoned as an unobserved harness failure.
+fn confirm_delete_after_error(
+    state: &SharedState,
+    pod: &ObservedPod,
+    error: anyhow::Error,
+    mut observe: impl FnMut() -> Result<Vec<ObservedPod>>,
+    attempts: usize,
+    interval: Duration,
+) -> Result<()> {
+    for attempt in 1..=attempts {
+        if let Ok(pods) = observe() {
+            let mut state = lock_state(state);
+            state.absorb(&pods, now_ms());
+            if state
+                .targets
+                .iter()
+                .rev()
+                .find(|target| target.old_uid == pod.uid)
+                .is_some_and(LifecycleState::delete_accepted)
+            {
+                eprintln!(
+                    "warning: the graceful delete of Pod {} (uid {}) reported an error but the API server accepted it; continuing: {error:#}",
+                    pod.name, pod.uid
+                );
+                return Ok(());
+            }
+        }
+        if attempt < attempts {
+            sleep(interval);
+        }
+    }
     harness_step(
-        command.run_checked(),
+        Err(error),
         &format!("graceful delete of Pod {} (uid {})", pod.name, pod.uid),
-    )?;
-    Ok(())
+    )
 }
 
 fn poll_targets(cluster: &ClusterTestConfig, state: &SharedState) -> Result<Vec<ObservedPod>> {
@@ -1015,35 +1182,59 @@ fn restart_pod_blocking(
     )
 }
 
-struct RollingWorker {
+/// Block until the runner reports the first fault-phase S3 request
+/// (`gate` holds its harness timestamp), so the first delete lands while the
+/// client is issuing requests.
+fn wait_for_load(gate: &AtomicU64, cancel: &AtomicBool, timeout: Duration) -> Result<u64> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            bail!("cancelled while waiting for the first fault-phase S3 request");
+        }
+        let started = gate.load(Ordering::SeqCst);
+        if started != 0 {
+            return Ok(started);
+        }
+        if Instant::now() >= deadline {
+            return harness_step(
+                Err(anyhow::anyhow!(
+                    "no fault-phase S3 request started within {timeout:?}"
+                )),
+                "wait for load before the first delete",
+            );
+        }
+        sleep(POLL_INTERVAL);
+    }
+}
+
+/// A lifecycle step running beside the workload: the restart worker of the
+/// single-Pod and rolling restarts, or the cold-restart outage sampler.
+struct BackgroundTask {
     handle: Option<JoinHandle<Result<()>>>,
     cancel: Arc<AtomicBool>,
     outcome: Option<Result<()>>,
 }
 
-impl RollingWorker {
-    fn spawn(
-        cluster: ClusterTestConfig,
-        state: SharedState,
-        pods: Vec<ObservedPod>,
-        timeout: Duration,
-    ) -> Self {
+fn join_outcome(handle: JoinHandle<Result<()>>) -> Result<()> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(panic) => Err(anyhow::anyhow!(
+            "lifecycle background task panicked: {}",
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "non-string panic payload".to_string())
+        )),
+    }
+}
+
+impl BackgroundTask {
+    fn spawn(task: impl FnOnce(&AtomicBool) -> Result<()> + Send + 'static) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
-        let handle = std::thread::spawn(move || {
-            pods.iter().try_for_each(|pod| {
-                restart_pod_blocking(
-                    &cluster,
-                    &state,
-                    pod,
-                    timeout,
-                    Some(worker_cancel.as_ref()),
-                    false,
-                )
-            })
-        });
+        let task_cancel = Arc::clone(&cancel);
         Self {
-            handle: Some(handle),
+            handle: Some(std::thread::spawn(move || task(&task_cancel))),
             cancel,
             outcome: None,
         }
@@ -1052,29 +1243,16 @@ impl RollingWorker {
     /// Collect the thread's result once it has finished; a panic is an error
     /// like any other so it can never pass silently.
     fn poll(&mut self) -> Option<&Result<()>> {
-        if self.outcome.is_none()
-            && let Some(handle) = &self.handle
-            && handle.is_finished()
-        {
-            let outcome = match self.handle.take().expect("handle present").join() {
-                Ok(result) => result,
-                Err(panic) => Err(anyhow::anyhow!(
-                    "rolling restart worker panicked: {}",
-                    panic
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                        .unwrap_or_else(|| "non-string panic payload".to_string())
-                )),
-            };
-            self.outcome = Some(outcome);
+        if self.outcome.is_none() && self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            let handle = self.handle.take().expect("handle present");
+            self.outcome = Some(join_outcome(handle));
         }
         self.outcome.as_ref()
     }
 
     fn require_healthy(&mut self) -> Result<()> {
         if let Some(Err(error)) = self.poll() {
-            bail!("rolling restart worker failed: {error:#}");
+            bail!("lifecycle background task failed: {error:#}");
         }
         Ok(())
     }
@@ -1085,36 +1263,103 @@ impl RollingWorker {
             match self.poll() {
                 Some(Ok(())) => return Ok(()),
                 Some(Err(_)) => {
-                    // Hand the original error back so a typed observation
-                    // failure survives into the removal verdict, and keep a
-                    // copy so a later call reports it instead of waiting on
-                    // a thread that no longer exists.
+                    // Hand the original error back so a typed observation or
+                    // harness failure survives into the removal verdict, and
+                    // keep a copy so a later call reports it instead of
+                    // waiting on a thread that no longer exists.
                     let error = self
                         .outcome
                         .take()
                         .and_then(Result::err)
                         .expect("polled error");
                     self.outcome = Some(Err(anyhow::anyhow!(
-                        "rolling restart worker already failed: {error:#}"
+                        "lifecycle background task already failed: {error:#}"
                     )));
-                    return Err(error.context("rolling restart worker failed"));
+                    return Err(error.context("lifecycle background task failed"));
                 }
                 None => {}
             }
             ensure!(
                 Instant::now() < deadline,
-                "rolling restart did not finish within {timeout:?}"
+                "lifecycle background task did not finish within {timeout:?}"
             );
             sleep(POLL_INTERVAL);
         }
     }
+
+    /// Stop a task that runs until cancelled (the outage sampler) and return
+    /// its outcome.
+    fn stop(mut self) -> Result<()> {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            self.outcome = Some(join_outcome(handle));
+        }
+        self.outcome.take().unwrap_or(Ok(()))
+    }
 }
 
-impl Drop for RollingWorker {
+impl Drop for BackgroundTask {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+/// One outage poll: fold Pod states in and prove `spec.replicas` is still
+/// zero and the StatefulSet is the proven one. Any other value means
+/// something else wrote the scale; the outage the scenario claims did not
+/// happen.
+fn sample_outage_state(
+    cluster: &ClusterTestConfig,
+    statefulset: &StatefulSetIdentity,
+    state: &SharedState,
+) -> Result<(i64, usize)> {
+    let pods = poll_targets(cluster, state)?;
+    let observed = observe_with_retries(|| observe_statefulset(cluster, &statefulset.name))?;
+    let observed_at_ms = now_ms();
+    lock_state(state).record_replica_sample(observed.spec_replicas, pods.len(), observed_at_ms);
+    ensure!(
+        observed.spec_replicas == 0,
+        "StatefulSet {} spec.replicas is {} while the cold-restart outage should be held at zero; something else wrote the scale",
+        statefulset.name,
+        observed.spec_replicas
+    );
+    ensure!(
+        observed.identity.uid == statefulset.uid,
+        "StatefulSet {} uid changed from {} to {} during the outage",
+        statefulset.name,
+        statefulset.uid,
+        observed.identity.uid
+    );
+    Ok((observed.spec_replicas, pods.len()))
+}
+
+/// Sample the held outage for the whole fault-active window, so a transient
+/// scale-up and back down during the workload cannot go unnoticed; any Pod
+/// or non-zero replica count ends the sampler with an error.
+fn sample_outage_until_cancelled(
+    cluster: &ClusterTestConfig,
+    statefulset: &StatefulSetIdentity,
+    state: &SharedState,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let (_, pods) = sample_outage_state(cluster, statefulset, state)?;
+        ensure!(
+            pods == 0,
+            "{pods} RustFS Pod(s) appeared while the cold-restart outage was held"
+        );
+        let resume_at = Instant::now() + OUTAGE_SAMPLE_INTERVAL;
+        while Instant::now() < resume_at {
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            sleep(POLL_INTERVAL);
         }
     }
 }
@@ -1134,7 +1379,11 @@ struct LifecycleFaultHandle {
     target_pods_during_workload: Vec<String>,
     deferred: Option<ObservedPod>,
     watch: Option<PodWatch>,
-    worker: Mutex<Option<RollingWorker>>,
+    /// Harness time of the first fault-phase S3 request, filled by the
+    /// runner; zero until then. The restart worker deletes only after it.
+    load_gate: Arc<AtomicU64>,
+    worker: Mutex<Option<BackgroundTask>>,
+    outage_sampler: Mutex<Option<BackgroundTask>>,
     operator_pause: Option<OperatorPause>,
     scaled_up: bool,
     evidence: Option<PodLifecycleEvidence>,
@@ -1149,10 +1398,22 @@ pub(in crate::fault) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<A
     let case_dir = request.collector.case_dir(request.scenario.case_name);
     std::fs::create_dir_all(&case_dir)
         .with_context(|| format!("create case dir {}", case_dir.display()))?;
-    let watch = PodWatch::start(
+    let mut watch = PodWatch::start(
         cluster,
         case_dir.join(POD_LIFECYCLE_WATCH_ARTIFACT),
         case_dir.join(POD_LIFECYCLE_WATCH_STDERR_ARTIFACT),
+    )?;
+    // Nothing is mutated before the watch has emitted every Pod: otherwise a
+    // prompt exit can vanish between the first mutation and the first watch
+    // document, leaving an unobserved termination.
+    let uids = observation
+        .pods
+        .iter()
+        .map(|pod| pod.uid.clone())
+        .collect::<BTreeSet<_>>();
+    harness_step(
+        watch.wait_until_covers(&uids, WATCH_ESTABLISH_TIMEOUT),
+        "establish the Pod watch before the lifecycle operation",
     )?;
     let state: SharedState = Arc::new(Mutex::new(LifecycleState::default()));
     let plan = plan_targets(&observation.pods, operation, config.use_cluster_ip)?;
@@ -1169,22 +1430,36 @@ pub(in crate::fault) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<A
         target_pods_during_workload: plan.during.iter().map(|pod| pod.name.clone()).collect(),
         deferred: plan.deferred,
         watch: Some(watch),
+        load_gate: Arc::new(AtomicU64::new(0)),
         worker: Mutex::new(None),
+        outage_sampler: Mutex::new(None),
         operator_pause: None,
         scaled_up: false,
         evidence: None,
     };
     match operation {
-        LifecycleOperation::GracefulPod => {
-            initiate_pod_delete(cluster, &state, &plan.during[0], false)?;
-        }
-        LifecycleOperation::Rolling => {
-            handle.worker = Mutex::new(Some(RollingWorker::spawn(
-                cluster.clone(),
-                Arc::clone(&state),
-                plan.during,
-                cluster.timeout,
-            )));
+        LifecycleOperation::GracefulPod | LifecycleOperation::Rolling => {
+            let worker_cluster = cluster.clone();
+            let worker_state = Arc::clone(&state);
+            let gate = Arc::clone(&handle.load_gate);
+            let pods = plan.during;
+            let timeout = cluster.timeout;
+            // Endpoint pinning and the access checks between activation and
+            // the first request are each bounded by the cluster timeout.
+            let load_timeout = cluster.timeout.saturating_mul(3);
+            handle.worker = Mutex::new(Some(BackgroundTask::spawn(move |cancel| {
+                wait_for_load(&gate, cancel, load_timeout)?;
+                pods.iter().try_for_each(|pod| {
+                    restart_pod_blocking(
+                        &worker_cluster,
+                        &worker_state,
+                        pod,
+                        timeout,
+                        Some(cancel),
+                        false,
+                    )
+                })
+            })));
         }
         LifecycleOperation::Cold => {
             // The scale leaves kubectl-scale co-owning spec.replicas of the
@@ -1232,41 +1507,28 @@ pub(in crate::fault) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<A
     Ok(Box::new(handle))
 }
 
+fn with_task<T>(
+    slot: &Mutex<Option<BackgroundTask>>,
+    what: &str,
+    f: impl FnOnce(&mut BackgroundTask) -> Result<T>,
+) -> Result<T> {
+    let mut task = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(task
+        .as_mut()
+        .with_context(|| format!("{what} is not running"))?)
+}
+
 impl LifecycleFaultHandle {
-    fn with_worker<T>(&self, f: impl FnOnce(&mut RollingWorker) -> Result<T>) -> Result<T> {
-        let mut worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        f(worker
-            .as_mut()
-            .context("rolling restart worker is missing")?)
+    fn with_worker<T>(&self, f: impl FnOnce(&mut BackgroundTask) -> Result<T>) -> Result<T> {
+        with_task(&self.worker, "the lifecycle restart worker", f)
     }
 
-    /// One outage poll: fold Pod states in and prove `spec.replicas` is still
-    /// zero. Any other value means something else wrote the scale; the outage
-    /// the scenario claims did not happen.
+    fn with_sampler<T>(&self, f: impl FnOnce(&mut BackgroundTask) -> Result<T>) -> Result<T> {
+        with_task(&self.outage_sampler, "the cold-restart outage sampler", f)
+    }
+
     fn sample_outage(&self) -> Result<(i64, usize)> {
-        let pods = poll_targets(&self.cluster, &self.state)?;
-        let statefulset =
-            observe_with_retries(|| observe_statefulset(&self.cluster, &self.statefulset.name))?;
-        let observed_at_ms = now_ms();
-        let mut state = lock_state(&self.state);
-        state.record_replica_sample(statefulset.spec_replicas, pods.len(), observed_at_ms);
-        ensure!(
-            statefulset.spec_replicas == 0,
-            "StatefulSet {} spec.replicas is {} while the cold-restart outage should be held at zero; something else wrote the scale",
-            self.statefulset.name,
-            statefulset.spec_replicas
-        );
-        ensure!(
-            statefulset.identity.uid == self.statefulset.uid,
-            "StatefulSet {} uid changed from {} to {} during the outage",
-            self.statefulset.name,
-            self.statefulset.uid,
-            statefulset.identity.uid
-        );
-        Ok((statefulset.spec_replicas, pods.len()))
+        sample_outage_state(&self.cluster, &self.statefulset, &self.state)
     }
 
     fn require_outage_held(&self, stage: &str) -> Result<()> {
@@ -1297,6 +1559,28 @@ impl LifecycleFaultHandle {
             );
             sleep(POLL_INTERVAL);
         }
+    }
+
+    fn start_outage_sampler(&self) {
+        let cluster = self.cluster.clone();
+        let statefulset = self.statefulset.clone();
+        let state = Arc::clone(&self.state);
+        *self
+            .outage_sampler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(BackgroundTask::spawn(move |cancel| {
+                sample_outage_until_cancelled(&cluster, &statefulset, &state, cancel)
+            }));
+    }
+
+    fn stop_outage_sampler(&self) -> Result<()> {
+        self.outage_sampler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .context("the cold-restart outage sampler was never started")?
+            .stop()
     }
 
     fn scale_back_up(&mut self, timeout: Duration) -> Result<()> {
@@ -1330,31 +1614,12 @@ impl LifecycleFaultHandle {
 
     fn remove_inner(&mut self, timeout: Duration) -> Result<()> {
         match self.operation {
-            LifecycleOperation::GracefulPod => {
-                let name = self.target_pods_during_workload[0].clone();
-                wait_for_target(
-                    &self.cluster,
-                    &self.state,
-                    timeout,
-                    None,
-                    &name,
-                    &format!("Pod {name} to terminate"),
-                    |target| target.old_uid_gone_at_ms.is_some(),
-                )?;
-                wait_for_target(
-                    &self.cluster,
-                    &self.state,
-                    timeout,
-                    None,
-                    &name,
-                    &format!("replacement of Pod {name} to become Ready"),
-                    |target| target.replacement_ready_at_ms.is_some(),
-                )
-            }
-            LifecycleOperation::Rolling => {
-                let targets = u32::try_from(self.target_pods_during_workload.len())?;
+            LifecycleOperation::GracefulPod | LifecycleOperation::Rolling => {
+                // Each Pod waits up to `timeout` to terminate and again for
+                // its replacement to become Ready.
+                let targets = u32::try_from(self.target_pods_during_workload.len())?.max(1);
                 self.with_worker(|worker| {
-                    worker.wait_finished(timeout.saturating_mul(targets.max(1)))
+                    worker.wait_finished(timeout.saturating_mul(targets.saturating_mul(2)))
                 })?;
                 if let Some(deferred) = self.deferred.clone() {
                     restart_pod_blocking(
@@ -1370,6 +1635,7 @@ impl LifecycleFaultHandle {
             }
             LifecycleOperation::Cold => {
                 self.require_outage_held("fault-delete")?;
+                self.stop_outage_sampler()?;
                 self.scale_back_up(timeout)?;
                 if let Some(pause) = &mut self.operator_pause {
                     pause.resume(timeout)?;
@@ -1379,11 +1645,23 @@ impl LifecycleFaultHandle {
         }
     }
 
+    fn write_evidence(&mut self, evidence: PodLifecycleEvidence) -> Result<PodLifecycleEvidence> {
+        std::fs::write(
+            self.case_dir.join(POD_LIFECYCLE_EVIDENCE_ARTIFACT),
+            serde_json::to_string_pretty(&evidence)?,
+        )
+        .with_context(|| format!("write {POD_LIFECYCLE_EVIDENCE_ARTIFACT}"))?;
+        self.evidence = Some(evidence.clone());
+        Ok(evidence)
+    }
+
     /// Stop the watch, merge its final Pod states with the polled samples,
-    /// classify every termination, and persist the artifact.
+    /// classify every termination, and persist the artifact. The StatefulSet
+    /// is re-read only on the normal path; `Drop` must not block on the API.
     fn finalize_evidence(
         &mut self,
         observation_failure: Option<String>,
+        reread_statefulset: bool,
     ) -> Result<PodLifecycleEvidence> {
         if let Some(evidence) = &self.evidence {
             return Ok(evidence.clone());
@@ -1396,14 +1674,19 @@ impl LifecycleFaultHandle {
                 }
             }
         }
-        let statefulset_uid_after = observe_statefulset(&self.cluster, &self.statefulset.name)
-            .map(|statefulset| statefulset.identity.uid)
-            .ok();
+        let statefulset_uid_after = if reread_statefulset {
+            observe_statefulset(&self.cluster, &self.statefulset.name)
+                .map(|statefulset| statefulset.identity.uid)
+                .ok()
+        } else {
+            None
+        };
         let (targets, outage) = {
             let mut state = lock_state(&self.state);
             state.classify_all();
             (state.targets.clone(), state.outage.clone())
         };
+        let load_started = self.load_gate.load(Ordering::SeqCst);
         let evidence = PodLifecycleEvidence {
             scenario: self.scenario.clone(),
             run_id: self.run_id.clone(),
@@ -1417,19 +1700,32 @@ impl LifecycleFaultHandle {
             targets,
             outage,
             observation_failure,
+            load_started_at_ms: (load_started != 0).then_some(load_started),
+            recovery_rechecked_at_ms: None,
             started_at_ms: self.started_at_ms,
             completed_at_ms: now_ms(),
             violations: Vec::new(),
             passed: false,
         }
         .finalize();
-        std::fs::write(
-            self.case_dir.join(POD_LIFECYCLE_EVIDENCE_ARTIFACT),
-            serde_json::to_string_pretty(&evidence)?,
-        )
-        .with_context(|| format!("write {POD_LIFECYCLE_EVIDENCE_ARTIFACT}"))?;
-        self.evidence = Some(evidence.clone());
-        Ok(evidence)
+        self.write_evidence(evidence)
+    }
+
+    /// Fold a Pod listing taken after the recovery gate into the finalized
+    /// evidence: a replacement that crashed or was replaced again between
+    /// Ready and recovery fails it.
+    fn recheck_after_recovery(&mut self, pods: &[ObservedPod]) -> Result<PodLifecycleEvidence> {
+        let mut evidence = self
+            .evidence
+            .clone()
+            .context("lifecycle evidence was not finalized before the recovery re-check")?;
+        evidence.targets = {
+            let mut state = lock_state(&self.state);
+            state.absorb_after_recovery(pods);
+            state.targets.clone()
+        };
+        evidence.recovery_rechecked_at_ms = Some(now_ms());
+        self.write_evidence(evidence.finalize())
     }
 
     fn status_snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot> {
@@ -1465,71 +1761,79 @@ impl LifecycleFaultHandle {
 }
 
 impl FaultLifecyclePort for LifecycleFaultHandle {
-    /// Active means the shutdown is under way, not finished: the single-Pod
-    /// and rolling restarts return as soon as the API server accepted the
-    /// graceful delete so SIGTERM lands while the workload runs; the cold
-    /// restart waits for every Pod to be gone because its contract is the
-    /// held outage.
+    /// The single-Pod and rolling restarts are armed at activation and
+    /// delete once the first fault-phase S3 request starts (`load_gate`), so
+    /// activation only proves the worker is alive. The cold restart waits for
+    /// every Pod to be gone because its contract is the held outage, then
+    /// samples that outage for the whole fault-active window.
     fn wait_active(&self, timeout: Duration) -> Result<()> {
         match self.operation {
-            LifecycleOperation::GracefulPod => {
-                let name = self.target_pods_during_workload[0].clone();
-                wait_for_target(
-                    &self.cluster,
-                    &self.state,
-                    timeout,
-                    None,
-                    &name,
-                    &format!("the graceful delete of Pod {name} to be accepted"),
-                    LifecycleState::delete_accepted,
-                )
+            LifecycleOperation::GracefulPod | LifecycleOperation::Rolling => {
+                self.with_worker(BackgroundTask::require_healthy)
             }
-            LifecycleOperation::Rolling => {
-                let deadline = Instant::now() + timeout;
-                loop {
-                    self.with_worker(RollingWorker::require_healthy)?;
-                    if lock_state(&self.state).any_delete_accepted() {
-                        return Ok(());
-                    }
-                    ensure!(
-                        Instant::now() < deadline,
-                        "timed out after {timeout:?} waiting for the first rolling-restart delete to be accepted"
-                    );
-                    sleep(POLL_INTERVAL);
-                }
+            LifecycleOperation::Cold => {
+                self.wait_outage(timeout)?;
+                self.start_outage_sampler();
+                Ok(())
             }
-            LifecycleOperation::Cold => self.wait_outage(timeout),
         }
     }
 
-    /// Lifecycle operations are not held states (except the cold-restart
-    /// outage): a restart that already completed is still the fault under
-    /// test, so this only proves the operation was started and has not failed.
+    /// Checked after the workload: the restart must have started under load
+    /// and its first Pod must be gone (the shutdown overlapped the requests);
+    /// the cold-restart outage must still be held and its sampler healthy.
     fn ensure_active(&self, stage: &str) -> Result<()> {
         match self.operation {
-            LifecycleOperation::GracefulPod => {
-                let name = &self.target_pods_during_workload[0];
+            LifecycleOperation::GracefulPod | LifecycleOperation::Rolling => {
+                self.with_worker(BackgroundTask::require_healthy)?;
                 ensure!(
-                    lock_state(&self.state)
-                        .target(name)
-                        .is_some_and(LifecycleState::delete_accepted),
-                    "graceful delete of Pod {name} was not accepted at stage {stage:?}"
+                    self.load_gate.load(Ordering::SeqCst) != 0,
+                    "no fault-phase S3 request was seen by stage {stage:?}, so the restart never started"
+                );
+                ensure!(
+                    lock_state(&self.state).targets.iter().any(|target| {
+                        !target.restarted_after_workload && target.old_uid_gone_at_ms.is_some()
+                    }),
+                    "the first restarted Pod was still present at stage {stage:?}; its shutdown did not overlap the load"
                 );
                 Ok(())
             }
-            LifecycleOperation::Rolling => self.with_worker(RollingWorker::require_healthy),
-            LifecycleOperation::Cold => self.require_outage_held(stage),
+            LifecycleOperation::Cold => {
+                self.require_outage_held(stage)?;
+                self.with_sampler(BackgroundTask::require_healthy)
+            }
         }
     }
 
     fn delete(&mut self, timeout: Duration) -> Result<()> {
         let removal = self.remove_inner(timeout);
-        let evidence = self.finalize_evidence(observation_failure(&removal))?;
+        let evidence = self.finalize_evidence(observation_failure(&removal), true)?;
         removal_verdict(removal, &evidence)
     }
 
     fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot> {
         self.status_snapshot(stage)
+    }
+
+    fn load_gate(&self) -> Option<Arc<AtomicU64>> {
+        matches!(
+            self.operation,
+            LifecycleOperation::GracefulPod | LifecycleOperation::Rolling
+        )
+        .then(|| Arc::clone(&self.load_gate))
+    }
+
+    fn verify_after_recovery(&mut self) -> Result<()> {
+        let pods = observe_with_retries(|| observe_pods(&self.cluster))?;
+        let evidence = self.recheck_after_recovery(&pods)?;
+        if let Err(error) = evidence.require_success() {
+            return Err(ClassifiedFaultFailure {
+                classification: evidence.failure_classification(),
+                message: format!("{error:#}"),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     fn failure_artifacts(&self) -> Option<&dyn FaultFailureArtifactSource> {
@@ -1573,11 +1877,27 @@ impl FaultFailureArtifactSource for LifecycleFaultHandle {
 
 impl Drop for LifecycleFaultHandle {
     fn drop(&mut self) {
-        // Stop the worker before touching shared state; its Drop cancels it.
+        // Stop the background steps before touching shared state; their Drop
+        // cancels and joins them.
         self.worker
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
+        self.outage_sampler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        // A run that failed before fault removal (endpoint setup, the probes,
+        // the workload) still leaves the typed termination and replacement
+        // evidence it gathered.
+        if self.evidence.is_none()
+            && let Err(error) =
+                self.finalize_evidence(Some(UNFINISHED_OPERATION.to_string()), false)
+        {
+            eprintln!(
+                "warning: could not persist {POD_LIFECYCLE_EVIDENCE_ARTIFACT} for the unfinished lifecycle operation: {error:#}"
+            );
+        }
         if self.operation == LifecycleOperation::Cold && !self.scaled_up {
             match u32::try_from(self.expected_pods)
                 .map_err(anyhow::Error::from)
@@ -1672,7 +1992,7 @@ mod tests {
 
     #[test]
     fn a_consumed_rolling_failure_is_reported_again_instead_of_waiting() {
-        let mut worker = super::RollingWorker {
+        let mut worker = super::BackgroundTask {
             handle: Some(std::thread::spawn(|| {
                 Err(anyhow::Error::new(super::LifecycleObservationError(
                     "kubectl: connection refused".to_string(),
@@ -1691,7 +2011,7 @@ mod tests {
             .expect_err("still failed");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert!(
-            second.to_string().contains("rolling restart worker"),
+            second.to_string().contains("lifecycle background task"),
             "{second:#}"
         );
         assert!(
@@ -1701,6 +2021,242 @@ mod tests {
         assert!(worker.require_healthy().is_err());
     }
     use crate::fault::fault_lifecycle::removal_failure_classification;
+
+    fn statefulset(update: &str, current: &str) -> super::ObservedStatefulSet {
+        super::ObservedStatefulSet {
+            identity: StatefulSetIdentity {
+                name: "tenant-primary".to_string(),
+                uid: "sts-uid".to_string(),
+                namespace: "rustfs-fault-test".to_string(),
+                replicas: 2,
+                pod_management_policy: Some("Parallel".to_string()),
+                update_strategy: Some("OnDelete".to_string()),
+                pvc_retention_when_scaled: None,
+                pvc_retention_when_deleted: None,
+                termination_grace_period_seconds: 30,
+                current_revision: Some(current.to_string()),
+                update_revision: Some(update.to_string()),
+            },
+            spec_replicas: 2,
+            status_replicas: 2,
+            ready_replicas: 2,
+        }
+    }
+
+    #[test]
+    fn topology_requires_a_converged_revision_that_every_pod_runs() {
+        let owner = super::kube::PodOwner {
+            kind: "StatefulSet".to_string(),
+            name: "tenant-primary".to_string(),
+            uid: "sts-uid".to_string(),
+        };
+        let pods = vec![
+            pod("tenant-primary-0", "u0", true),
+            pod("tenant-primary-1", "u1", true),
+        ];
+        let validate = |sts: &super::ObservedStatefulSet, pods: &[ObservedPod]| {
+            super::validate_topology("rustfs-fault-test", 2, &owner, sts, pods)
+        };
+        validate(&statefulset("rev-1", "rev-1"), &pods).expect("converged topology");
+        // A pending rollout (OnDelete with an updated template) is refused.
+        let error = validate(&statefulset("rev-2", "rev-1"), &pods).expect_err("pending rollout");
+        assert!(error.to_string().contains("has not converged"), "{error}");
+        let mut stale = pods.clone();
+        stale[1].revision = Some("rev-0".to_string());
+        let error = validate(&statefulset("rev-1", "rev-1"), &stale).expect_err("stale Pod");
+        assert!(error.to_string().contains("runs revision"), "{error}");
+        let mut unlabeled = pods.clone();
+        unlabeled[0].revision = None;
+        assert!(validate(&statefulset("rev-1", "rev-1"), &unlabeled).is_err());
+        assert!(validate(&statefulset("rev-1", "rev-1"), &pods[..1]).is_err());
+        let mut unready = pods.clone();
+        unready[0].ready = false;
+        assert!(validate(&statefulset("rev-1", "rev-1"), &unready).is_err());
+    }
+
+    #[test]
+    fn replacements_are_tracked_after_ready_and_after_recovery() {
+        let mut state = LifecycleState::default();
+        state.begin_target(&pod("rustfs-1", "old-1", true), 1_000, false);
+        state.absorb(&[], 2_000);
+        let mut replacement = pod("rustfs-1", "new-1", true);
+        state.absorb(&[replacement.clone()], 3_000);
+        assert_eq!(state.targets[0].replacement_ready_at_ms, Some(3_000));
+        assert_eq!(state.targets[0].restart_count_after, Some(0));
+        assert_eq!(
+            state.targets[0].replacement_revision.as_deref(),
+            Some("rev-1")
+        );
+        assert_eq!(state.targets[0].old_revision.as_deref(), Some("rev-1"));
+        // A crash after Ready is still counted.
+        replacement.restart_count = 2;
+        state.absorb(&[replacement.clone()], 4_000);
+        assert_eq!(state.targets[0].restart_count_after, Some(2));
+        assert_eq!(state.targets[0].replacement_ready_at_ms, Some(3_000));
+        // After recovery a second replacement under the same name is seen.
+        state.absorb_after_recovery(&[pod("rustfs-1", "newer-1", true)]);
+        assert_eq!(state.targets[0].new_uid.as_deref(), Some("new-1"));
+        assert_eq!(state.targets[0].final_uid.as_deref(), Some("newer-1"));
+        assert!(state.targets[0].replaced_again());
+        assert_eq!(state.targets[0].restart_count_after, Some(2));
+    }
+
+    #[test]
+    fn the_load_gate_holds_the_first_delete_until_a_request_starts() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let gate = std::sync::Arc::new(AtomicU64::new(0));
+        let cancel = AtomicBool::new(false);
+        let setter = std::sync::Arc::clone(&gate);
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            setter.store(42, Ordering::SeqCst);
+        });
+        assert_eq!(
+            super::wait_for_load(&gate, &cancel, std::time::Duration::from_secs(10))
+                .expect("gate fires"),
+            42
+        );
+        thread.join().expect("setter");
+        let idle = AtomicU64::new(0);
+        let error = super::wait_for_load(&idle, &cancel, std::time::Duration::from_millis(10))
+            .expect_err("no request ever started");
+        assert!(error.is::<super::LifecycleHarnessError>(), "{error:#}");
+        cancel.store(true, Ordering::SeqCst);
+        let error = super::wait_for_load(&idle, &cancel, std::time::Duration::from_secs(10))
+            .expect_err("cancelled");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+    }
+
+    #[test]
+    fn background_tasks_stop_on_cancel_and_report_failures() {
+        let sampler = super::BackgroundTask::spawn(|cancel| {
+            while !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(())
+        });
+        sampler.stop().expect("clean stop");
+        let failing = super::BackgroundTask::spawn(|_| anyhow::bail!("2 RustFS Pod(s) appeared"));
+        let error = failing.stop().expect_err("sampler failure");
+        assert!(error.to_string().contains("appeared"), "{error}");
+    }
+
+    #[test]
+    fn an_accepted_delete_is_recorded_despite_a_client_side_error() {
+        let state: super::SharedState =
+            std::sync::Arc::new(std::sync::Mutex::new(LifecycleState::default()));
+        let old = pod("rustfs-1", "old-1", true);
+        super::lock_state(&state).begin_target(&old, 1_000, false);
+        let mut deleting = old.clone();
+        deleting.deletion_timestamp = Some("2026-09-11T10:05:30Z".to_string());
+        deleting.deletion_grace_period_seconds = Some(30);
+        let mut polls = 0;
+        super::confirm_delete_after_error(
+            &state,
+            &old,
+            anyhow::anyhow!("request timed out"),
+            || {
+                polls += 1;
+                Ok(if polls < 2 {
+                    vec![old.clone()]
+                } else {
+                    vec![deleting.clone()]
+                })
+            },
+            5,
+            std::time::Duration::from_millis(1),
+        )
+        .expect("accepted delete");
+        assert_eq!(polls, 2);
+        assert!(
+            super::lock_state(&state).targets[0]
+                .deletion_timestamp
+                .is_some()
+        );
+
+        let state: super::SharedState =
+            std::sync::Arc::new(std::sync::Mutex::new(LifecycleState::default()));
+        super::lock_state(&state).begin_target(&old, 1_000, false);
+        let error = super::confirm_delete_after_error(
+            &state,
+            &old,
+            anyhow::anyhow!("request timed out"),
+            || Ok(vec![old.clone()]),
+            3,
+            std::time::Duration::from_millis(1),
+        )
+        .expect_err("never accepted");
+        assert!(error.is::<super::LifecycleHarnessError>(), "{error:#}");
+        let error = super::confirm_delete_after_error(
+            &state,
+            &old,
+            anyhow::anyhow!("request timed out"),
+            || anyhow::bail!("API unavailable"),
+            2,
+            std::time::Duration::from_millis(1),
+        )
+        .expect_err("unobservable");
+        assert!(error.to_string().contains("request timed out"), "{error:#}");
+    }
+
+    #[test]
+    fn unfinished_operations_persist_their_evidence_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state: super::SharedState =
+            std::sync::Arc::new(std::sync::Mutex::new(LifecycleState::default()));
+        super::lock_state(&state).begin_target(&pod("rustfs-1", "old-1", true), 1_000, false);
+        let handle = super::LifecycleFaultHandle {
+            operation: LifecycleOperation::GracefulPod,
+            cluster: crate::fault::config::FaultTestConfig::for_test("real-cluster", "fast-csi")
+                .cluster,
+            scenario: "pod-graceful-restart-one".to_string(),
+            run_id: "run-1".to_string(),
+            case_dir: dir.path().to_path_buf(),
+            statefulset: statefulset("rev-1", "rev-1").identity,
+            expected_pods: 2,
+            started_at_ms: 500,
+            state,
+            target_pods_during_workload: vec!["rustfs-1".to_string()],
+            deferred: None,
+            watch: None,
+            load_gate: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            worker: std::sync::Mutex::new(None),
+            outage_sampler: std::sync::Mutex::new(None),
+            operator_pause: None,
+            scaled_up: false,
+            evidence: None,
+        };
+        drop(handle);
+        let written: PodLifecycleEvidence = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(super::POD_LIFECYCLE_EVIDENCE_ARTIFACT))
+                .expect("evidence written on drop"),
+        )
+        .expect("evidence json");
+        assert!(!written.passed);
+        assert_eq!(written.targets.len(), 1);
+        assert!(
+            written
+                .observation_failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("ended before"))
+        );
+        assert_eq!(written.failure_classification(), "test_or_environment");
+    }
+
+    #[test]
+    fn only_the_cold_restart_expects_a_total_outage() {
+        use crate::fault::plan::FaultKind;
+        assert!(super::expects_total_outage(
+            FaultKind::RustfsServerColdRestart
+        ));
+        assert!(!super::expects_total_outage(
+            FaultKind::RustfsServerRollingRestart
+        ));
+        assert!(!super::expects_total_outage(
+            FaultKind::RustfsServerPodGracefulRestart
+        ));
+        assert!(!super::expects_total_outage(FaultKind::RustfsServerPodKill));
+    }
 
     fn pod(name: &str, uid: &str, ready: bool) -> ObservedPod {
         ObservedPod {
@@ -1716,6 +2272,7 @@ mod tests {
             restart_count: 0,
             owner: None,
             rustfs_terminated: None,
+            revision: Some("rev-1".to_string()),
         }
     }
 
@@ -1736,7 +2293,7 @@ mod tests {
         let mut state = LifecycleState::default();
         let old = pod("rustfs-3", "old-3", true);
         state.begin_target(&old, 1_000, false);
-        assert!(!state.any_delete_accepted());
+        assert!(!state.targets.iter().any(LifecycleState::delete_accepted));
 
         let mut terminating = old.clone();
         terminating.terminating = true;
@@ -1748,7 +2305,10 @@ mod tests {
             Some(super::evidence::parse_rfc3339_ms("2026-09-11T10:05:00Z").unwrap())
         );
         assert!(state.targets[0].terminated.is_none());
-        assert!(state.any_delete_accepted(), "SIGTERM is under way");
+        assert!(
+            state.targets.iter().any(LifecycleState::delete_accepted),
+            "SIGTERM is under way"
+        );
         assert!(!state.all_gone());
 
         let mut exited_pod = terminating.clone();
@@ -1901,6 +2461,17 @@ mod tests {
         evidence_with_exit(replacement_ready, 0, "2026-09-11T10:05:02Z")
     }
 
+    /// The old Pod exited cleanly and vanished; no replacement was ever seen.
+    fn evidence_without_replacement() -> PodLifecycleEvidence {
+        let mut evidence = passing_evidence(false);
+        let target = &mut evidence.targets[0];
+        target.new_uid = None;
+        target.final_uid = None;
+        target.restart_count_after = None;
+        target.replacement_revision = None;
+        evidence.finalize()
+    }
+
     fn evidence_with_exit(
         replacement_ready: bool,
         exit_code: i64,
@@ -1934,14 +2505,16 @@ mod tests {
                 pvc_retention_when_scaled: None,
                 pvc_retention_when_deleted: None,
                 termination_grace_period_seconds: 30,
-                current_revision: None,
-                update_revision: None,
+                current_revision: Some("rev-1".to_string()),
+                update_revision: Some("rev-1".to_string()),
             },
             statefulset_uid_after: Some("sts".to_string()),
             operator_pause: None,
             targets: state.targets,
             outage: None,
             observation_failure: None,
+            load_started_at_ms: Some(sigterm - 200),
+            recovery_rechecked_at_ms: None,
             started_at_ms: sigterm - 500,
             completed_at_ms: sigterm + 30_000,
             violations: Vec::new(),
@@ -2005,7 +2578,7 @@ mod tests {
             super::observation_failure(&Err(anyhow::anyhow!("timed out"))),
             None
         );
-        let mut lost = passing_evidence(false);
+        let mut lost = evidence_without_replacement();
         lost.observation_failure = recorded;
         let lost = lost.finalize();
         let error = removal_verdict(removal, &lost).expect_err("lost observation");

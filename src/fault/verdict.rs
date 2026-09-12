@@ -707,6 +707,7 @@ impl FailurePhase {
             | "s3-access-after-recovery"
             | "recovery-health"
             | "recovery-evidence"
+            | "fault-recovery-recheck"
             | "post-recovery-write"
             | "recommit-unconfirmed" => Self::Recovery,
             "availability-endpoint" | "availability-read-probe" | "availability" => Self::Workload,

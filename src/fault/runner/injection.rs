@@ -299,36 +299,55 @@ impl FaultRun<'_> {
         } else {
             None
         };
-        events.record(
-            "s3-access-under-fault",
-            RunEventStatus::Started,
-            "checking S3 access while faults are active",
-            Some(serde_json::json!({ "endpoint": endpoint })),
-        )?;
-        if let Err(error) = self
-            .deadline
-            .run(ensure_s3_access(port_forward, cluster, endpoint))
-            .await
-        {
-            self.record_failure(
+        if crate::fault::backends::lifecycle::expects_total_outage(plan.fault().kind()) {
+            // Every RustFS Pod is held down: an unreachable endpoint is the
+            // fault's contract, and the workload must then see every request
+            // fail (require_total_outage_effect), so the access gate would
+            // only ever abort the run here.
+            events.record(
                 "s3-access-under-fault",
-                "environment_or_workload",
-                &error,
+                RunEventStatus::Observed,
+                "skipped: the fault is an intentional total outage, so S3 must be unreachable while it is active",
                 Some(serde_json::json!({ "endpoint": endpoint })),
-                Some((fault, "port-forward-failed")),
             )?;
-            return Err(error);
+        } else {
+            events.record(
+                "s3-access-under-fault",
+                RunEventStatus::Started,
+                "checking S3 access while faults are active",
+                Some(serde_json::json!({ "endpoint": endpoint })),
+            )?;
+            if let Err(error) = self
+                .deadline
+                .run(ensure_s3_access(port_forward, cluster, endpoint))
+                .await
+            {
+                self.record_failure(
+                    "s3-access-under-fault",
+                    "environment_or_workload",
+                    &error,
+                    Some(serde_json::json!({ "endpoint": endpoint })),
+                    Some((fault, "port-forward-failed")),
+                )?;
+                return Err(error);
+            }
+            events.record(
+                "s3-access-under-fault",
+                RunEventStatus::Succeeded,
+                "S3 endpoint is reachable while faults are active",
+                Some(serde_json::json!({ "endpoint": endpoint })),
+            )?;
         }
-        events.record(
-            "s3-access-under-fault",
-            RunEventStatus::Succeeded,
-            "S3 endpoint is reachable while faults are active",
-            Some(serde_json::json!({ "endpoint": endpoint })),
-        )?;
 
         self.run_warp_workload(endpoint, port_forward, fault)
             .await?;
         history.set_durability_cohort(DurabilityCohort::FaultActive);
+        // A backend that must disrupt under load is released by the first
+        // fault-phase S3 request; the trigger stops when this scope ends.
+        let _load_trigger = fault.load_gate().map(|gate| {
+            let recorder = history.clone();
+            LoadTrigger::arm(move || recorder.next_event_sequence(), gate)
+        });
         if plan.scenario == QUORUM_P_IO_FAULT_SCENARIO {
             let class = plan.fault().parameters().quorum_case()?;
             events.record(
@@ -1198,6 +1217,76 @@ fn surviving_pod_name(pods_before: &[PodIdentity], targets: &BTreeSet<String>) -
         .filter(|name| !targets.contains(name))
         .min()
         .context("every proven RustFS Pod is a fault target; no surviving Pod can serve the availability contract")
+}
+
+const LOAD_TRIGGER_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Stores the harness time at which the history recorder first moves past
+/// its baseline (the first fault-phase S3 request began) into a backend's
+/// load gate. Aborted on drop.
+struct LoadTrigger(tokio::task::JoinHandle<()>);
+
+impl LoadTrigger {
+    fn arm(
+        sequence: impl Fn() -> u64 + Send + 'static,
+        gate: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        let baseline = sequence();
+        Self(tokio::spawn(async move {
+            while sequence() <= baseline {
+                tokio::time::sleep(LOAD_TRIGGER_POLL).await;
+            }
+            gate.store(now_ms().max(1), std::sync::atomic::Ordering::SeqCst);
+        }))
+    }
+}
+
+impl Drop for LoadTrigger {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod load_trigger_tests {
+    use super::LoadTrigger;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn the_gate_opens_only_once_a_fault_phase_request_begins() {
+        let sequence = Arc::new(AtomicU64::new(7));
+        let gate = Arc::new(AtomicU64::new(0));
+        let source = Arc::clone(&sequence);
+        let _trigger = LoadTrigger::arm(move || source.load(Ordering::SeqCst), Arc::clone(&gate));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gate.load(Ordering::SeqCst), 0, "no request has begun yet");
+        let before = super::now_ms();
+        sequence.fetch_add(1, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "gate never opened");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(gate.load(Ordering::SeqCst) >= before);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_trigger_never_opens_the_gate() {
+        let sequence = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(AtomicU64::new(0));
+        let source = Arc::clone(&sequence);
+        drop(LoadTrigger::arm(
+            move || source.load(Ordering::SeqCst),
+            Arc::clone(&gate),
+        ));
+        sequence.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gate.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[cfg(test)]

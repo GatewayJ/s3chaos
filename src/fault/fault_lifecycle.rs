@@ -20,6 +20,7 @@ use crate::{
     framework::artifacts::ArtifactCollector,
 };
 use anyhow::Result;
+use std::sync::{Arc, atomic::AtomicU64};
 use std::time::{Duration, Instant};
 
 pub(super) trait FaultLifecyclePort {
@@ -33,6 +34,18 @@ pub(super) trait FaultLifecyclePort {
     }
     fn delete(&mut self, timeout: Duration) -> Result<()>;
     fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot>;
+
+    /// Harness-time slot the runner fills when the first fault-phase S3
+    /// request starts; a backend whose disruption must land under load waits
+    /// on it before acting.
+    fn load_gate(&self) -> Option<Arc<AtomicU64>> {
+        None
+    }
+
+    /// Re-read the fault's own evidence once the recovery gate has passed.
+    fn verify_after_recovery(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     fn recovery_dm_snapshot(&self) -> Option<DmStatusSnapshot> {
         None

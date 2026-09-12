@@ -1329,7 +1329,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::RecoveryAvailabilityRegression,
         ]),
         case_name: "fault_pod_graceful_restart_one_exits_cleanly_and_preserves_committed_objects",
-        description: "Delete one RustFS Pod with its default grace period while the workload runs (the fault counts as active once the API server accepts the delete, so SIGTERM lands under load) and verify RustFS exits cleanly within the grace period, the StatefulSet replacement becomes Ready without container restarts, and committed S3 objects survive.",
+        description: "Delete one RustFS Pod with its default grace period while the workload runs (the delete is issued only after the first fault-phase S3 request has started, so SIGTERM lands under load) and verify RustFS exits cleanly within the grace period, the StatefulSet replacement becomes Ready without container restarts, and committed S3 objects survive.",
         priority: FaultPriority::P0,
         backend: FaultBackend::KubernetesLifecycle,
         status: FaultScenarioStatus::Executable,

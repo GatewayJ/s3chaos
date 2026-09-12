@@ -940,7 +940,14 @@ fn validate_fault_artifacts_with_identity(
             identity,
             &evidence,
             &json_spec,
-            scenario_spec.impact_policy.requires_availability(),
+            LifecycleValidationInputs {
+                history: &history,
+                statefulset_proof: target_proof
+                    .faults
+                    .iter()
+                    .find_map(|fault| fault.statefulset.as_ref()),
+                requires_availability: scenario_spec.impact_policy.requires_availability(),
+            },
         )?;
     }
 
@@ -3430,14 +3437,35 @@ fn validate_availability_artifact(
 /// run's Pod evidence and fault window. The active snapshot must name the
 /// same under-workload targets so the availability endpoint pinning was
 /// computed from the Pods that actually restarted.
+/// Run artifacts the lifecycle report is bound to besides fault evidence.
+struct LifecycleValidationInputs<'a> {
+    history: &'a [OperationRecord],
+    statefulset_proof: Option<&'a crate::fault::preflight::TargetStatefulSetProof>,
+    requires_availability: bool,
+}
+
 fn validate_pod_lifecycle_artifact(
     artifacts: &BTreeMap<String, PathBuf>,
     metadata: &RunMetadataArtifact,
     identity: ArtifactIdentityPolicy<'_>,
     evidence: &FaultEvidenceArtifact,
     spec: &FaultRunSpec,
-    requires_availability: bool,
+    inputs: LifecycleValidationInputs<'_>,
 ) -> Result<()> {
+    let LifecycleValidationInputs {
+        history,
+        statefulset_proof,
+        requires_availability,
+    } = inputs;
+    let proof = statefulset_proof
+        .context("target-proof.json carries no StatefulSet proof for the lifecycle fault")?;
+    ensure!(
+        proof.update_revision.is_some() && proof.current_revision == proof.update_revision,
+        "target-proof.json StatefulSet {} was not proven converged on one revision (current {:?}, update {:?})",
+        proof.name,
+        proof.current_revision,
+        proof.update_revision
+    );
     let report =
         read_json::<PodLifecycleEvidence>(required(artifacts, POD_LIFECYCLE_EVIDENCE_ARTIFACT)?)?;
     validate_optional_identity_fields(
@@ -3466,6 +3494,9 @@ fn validate_pod_lifecycle_artifact(
     } else {
         None
     };
+    let fault_active_at_ms = evidence
+        .fault_active_at_ms
+        .context("fault-evidence.json fault_active_at_ms is required")?;
     let pods_before = evidence
         .pods_before
         .iter()
@@ -3483,9 +3514,7 @@ fn validate_pod_lifecycle_artifact(
         fault_apply_started_at_ms: evidence
             .fault_apply_started_at_ms
             .context("fault-evidence.json fault_apply_started_at_ms is required")?,
-        fault_active_at_ms: evidence
-            .fault_active_at_ms
-            .context("fault-evidence.json fault_active_at_ms is required")?,
+        fault_active_at_ms,
         workload_started_at_ms: evidence
             .workload_started_at_ms
             .context("fault-evidence.json workload_started_at_ms is required")?,
@@ -3496,6 +3525,13 @@ fn validate_pod_lifecycle_artifact(
             .recovery_ended_at_ms
             .context("fault-evidence.json recovery_ended_at_ms is required")?,
         served_by_pod: served_by_pod.as_deref(),
+        first_fault_request_at_ms: history
+            .iter()
+            .map(|record| record.started_at_ms)
+            .filter(|started| *started >= fault_active_at_ms)
+            .min(),
+        proven_statefulset_uid: &proof.uid,
+        proven_revision: proof.update_revision.as_deref(),
     })?;
     let active_targets = evidence
         .active_snapshots
@@ -13742,10 +13778,14 @@ mod tests {
                 "replicas": 4,
                 "podManagementPolicy": "Parallel",
                 "pvcRetentionWhenScaled": "Retain",
-                "terminationGracePeriodSeconds": 30
+                "terminationGracePeriodSeconds": 30,
+                "currentRevision": "rev",
+                "updateRevision": "rev"
             },
             "statefulsetUidAfter": "sts-uid",
             "targets": targets,
+            "loadStartedAtMs": 23,
+            "recoveryRecheckedAtMs": 50_100,
             "startedAtMs": 10,
             "completedAtMs": 60_000,
             "violations": [],
@@ -13763,7 +13803,7 @@ mod tests {
         let sigterm =
             crate::fault::backends::lifecycle::evidence::parse_rfc3339_ms("2026-09-11T10:05:00Z")
                 .unwrap();
-        let delete_requested = if deferred { 40_500 } else { 11 };
+        let delete_requested = if deferred { 40_500 } else { 25 };
         json!({
             "podName": name,
             "ordinal": ordinal,
@@ -13779,11 +13819,58 @@ mod tests {
             "terminationDurationMs": 6_000,
             "oldUidGoneAtMs": delete_requested + 100,
             "newUid": new_uid,
+            "finalUid": new_uid,
+            "oldRevision": "rev",
+            "replacementRevision": "rev",
             "restartCountAfter": 0,
             "replacementReadyAtMs": delete_requested + 5_000,
             "classification": "graceful_exit",
             "restartedAfterWorkload": deferred
         })
+    }
+
+    /// Fault-phase `history.jsonl` requests starting at the given times.
+    fn lifecycle_history(started: &[u64]) -> Vec<OperationRecord> {
+        started
+            .iter()
+            .enumerate()
+            .map(|(index, started_at_ms)| OperationRecord {
+                id: format!("get-{index}"),
+                scenario: "rolling-restart-all".to_string(),
+                run_id: None,
+                kind: OperationKind::Get,
+                bucket: "bucket".to_string(),
+                key: Some(format!("key-{index}")),
+                value_sha256: None,
+                size_bytes: None,
+                version_id: None,
+                listed_keys: None,
+                listed_versions: None,
+                payload_ref: None,
+                range: None,
+                started_sequence: None,
+                ended_sequence: None,
+                started_at_ms: *started_at_ms,
+                ended_at_ms: started_at_ms + 5,
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                durability_cohort: None,
+                fault_window_relation: None,
+            })
+            .collect()
+    }
+
+    fn lifecycle_inputs<'a>(
+        history: &'a [OperationRecord],
+        proof: Option<&'a crate::fault::preflight::TargetStatefulSetProof>,
+        requires_availability: bool,
+    ) -> super::LifecycleValidationInputs<'a> {
+        super::LifecycleValidationInputs {
+            history,
+            statefulset_proof: proof,
+            requires_availability,
+        }
     }
 
     fn lifecycle_fault_evidence(
@@ -13880,6 +13967,8 @@ mod tests {
             ("p-2", "new-2"),
             ("p-3", "new-3"),
         ];
+        let history = lifecycle_history(&[22]);
+        let proof = statefulset_proof(&before);
         let report = lifecycle_evidence_json(
             run_id,
             scenario,
@@ -13923,7 +14012,7 @@ mod tests {
             ArtifactIdentityPolicy::LegacyCompatible,
             &evidence,
             &run_spec,
-            true,
+            lifecycle_inputs(&history, Some(&proof), true),
         )
         .expect("consistent rolling restart evidence");
 
@@ -13935,7 +14024,7 @@ mod tests {
             ArtifactIdentityPolicy::LegacyCompatible,
             &drifted,
             &run_spec,
-            true,
+            lifecycle_inputs(&history, Some(&proof), true),
         )
         .expect_err("snapshot target drift");
         assert!(
@@ -13953,7 +14042,7 @@ mod tests {
             ArtifactIdentityPolicy::LegacyCompatible,
             &evidence,
             &run_spec,
-            true,
+            lifecycle_inputs(&history, Some(&proof), true),
         )
         .expect_err("grace timeout");
         assert!(error.to_string().contains("does not follow"), "{error:#}");
@@ -13968,7 +14057,7 @@ mod tests {
                 ArtifactIdentityPolicy::LegacyCompatible,
                 &evidence,
                 &run_spec,
-                true,
+                lifecycle_inputs(&history, Some(&proof), true),
             )
             .is_err()
         );
@@ -13990,10 +14079,87 @@ mod tests {
                 ArtifactIdentityPolicy::LegacyCompatible,
                 &stale,
                 &run_spec,
-                true,
+                lifecycle_inputs(&history, Some(&proof), true),
             )
             .is_err()
         );
+
+        // The first delete must follow the first fault-phase S3 request.
+        let validate_with =
+            |report: &serde_json::Value,
+             history: &[OperationRecord],
+             proof: Option<&crate::fault::preflight::TargetStatefulSetProof>| {
+                validate_pod_lifecycle_artifact(
+                    &write(report, &availability),
+                    &metadata,
+                    ArtifactIdentityPolicy::LegacyCompatible,
+                    &evidence,
+                    &run_spec,
+                    lifecycle_inputs(history, proof, true),
+                )
+            };
+        for (history, why) in [
+            (lifecycle_history(&[30]), "request after the delete"),
+            (
+                lifecycle_history(&[5]),
+                "request before the fault was active",
+            ),
+            (Vec::new(), "no request at all"),
+        ] {
+            let error = validate_with(&report, &history, Some(&proof)).expect_err(why);
+            assert!(
+                error
+                    .to_string()
+                    .contains("SIGTERM did not land under load"),
+                "{why}: {error:#}"
+            );
+        }
+        let mut late_load = report.clone();
+        late_load["loadStartedAtMs"] = json!(30);
+        assert!(validate_with(&late_load, &history, Some(&proof)).is_err());
+
+        // The StatefulSet and its revision must be the ones target-proof.json proved.
+        let mut other_revision = proof.clone();
+        other_revision.current_revision = Some("rev-2".to_string());
+        other_revision.update_revision = Some("rev-2".to_string());
+        let error =
+            validate_with(&report, &history, Some(&other_revision)).expect_err("revision drift");
+        assert!(
+            error.to_string().contains("proven in target-proof.json"),
+            "{error:#}"
+        );
+        let mut unconverged = proof.clone();
+        unconverged.current_revision = Some("rev-0".to_string());
+        let error =
+            validate_with(&report, &history, Some(&unconverged)).expect_err("pending rollout");
+        assert!(error.to_string().contains("converged"), "{error:#}");
+        let mut other_uid = proof.clone();
+        other_uid.uid = "other-sts".to_string();
+        assert!(validate_with(&report, &history, Some(&other_uid)).is_err());
+        let error = validate_with(&report, &history, None).expect_err("no StatefulSet proof");
+        assert!(
+            error.to_string().contains("no StatefulSet proof"),
+            "{error:#}"
+        );
+        let mut new_revision = report.clone();
+        new_revision["targets"][1]["replacementRevision"] = json!("rev-9");
+        assert!(validate_with(&new_revision, &history, Some(&proof)).is_err());
+
+        // Replacements must be re-read after recovery and still be the first replacement.
+        let mut unchecked = report.clone();
+        unchecked
+            .as_object_mut()
+            .expect("report object")
+            .remove("recoveryRecheckedAtMs");
+        let error =
+            validate_with(&unchecked, &history, Some(&proof)).expect_err("no recovery recheck");
+        assert!(error.to_string().contains("recovery gate"), "{error:#}");
+        let mut replaced = report.clone();
+        replaced["targets"][0]["finalUid"] = json!("newer-3");
+        assert!(validate_with(&replaced, &history, Some(&proof)).is_err());
+        let mut crashed = report.clone();
+        crashed["targets"][0]["restartCountAfter"] = json!(1);
+        assert!(validate_with(&crashed, &history, Some(&proof)).is_err());
 
         // Missing artifact fails closed.
         assert!(
@@ -14003,7 +14169,7 @@ mod tests {
                 ArtifactIdentityPolicy::LegacyCompatible,
                 &evidence,
                 &run_spec,
-                true,
+                lifecycle_inputs(&history, Some(&proof), true),
             )
             .is_err()
         );
@@ -14039,6 +14205,8 @@ mod tests {
             ("p-2", "new-2"),
             ("p-3", "new-3"),
         ];
+        let history = lifecycle_history(&[22]);
+        let proof = statefulset_proof(&before);
         let mut report = lifecycle_evidence_json(
             run_id,
             scenario,
@@ -14053,6 +14221,8 @@ mod tests {
                         false,
                     );
                     target["replacementReadyAtMs"] = json!(45_000);
+                    target["deleteRequestedAtMs"] = json!(11);
+                    target["oldUidGoneAtMs"] = json!(111);
                     target
                 })
                 .collect(),
@@ -14123,7 +14293,7 @@ mod tests {
             ArtifactIdentityPolicy::LegacyCompatible,
             &evidence,
             &run_spec,
-            false,
+            lifecycle_inputs(&history, Some(&proof), false),
         )
         .expect("held outage");
         let error = validate_pod_lifecycle_artifact(
@@ -14132,7 +14302,7 @@ mod tests {
             ArtifactIdentityPolicy::LegacyCompatible,
             &evidence,
             &run_spec,
-            false,
+            lifecycle_inputs(&history, Some(&proof), false),
         )
         .expect_err("a served GET during a total outage");
         assert!(error.to_string().contains("was not total"), "{error:#}");
@@ -14144,7 +14314,7 @@ mod tests {
             ArtifactIdentityPolicy::LegacyCompatible,
             &evidence,
             &run_spec,
-            false,
+            lifecycle_inputs(&history, Some(&proof), false),
         )
         .expect_err("a 404 during a total outage");
         assert!(error.to_string().contains("deletes answered"), "{error:#}");
@@ -14157,7 +14327,7 @@ mod tests {
             ArtifactIdentityPolicy::LegacyCompatible,
             &evidence,
             &run_spec,
-            false,
+            lifecycle_inputs(&history, Some(&proof), false),
         )
         .expect_err("family never attempted");
         assert!(error.to_string().contains("never attempted"), "{error:#}");
@@ -14170,7 +14340,7 @@ mod tests {
                 ArtifactIdentityPolicy::LegacyCompatible,
                 &evidence,
                 &run_spec,
-                false,
+                lifecycle_inputs(&history, Some(&proof), false),
             )
             .is_err()
         );
