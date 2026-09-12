@@ -48,7 +48,9 @@ use crate::fault::{
         StorageHelperInvocation, StorageRecoveryHostOperation, StorageRecoveryOperationReceipt,
         context_sha256, host_generation_sha256, same_storage_volume_generation,
     },
-    xl2_inspector::{inspect_all_xl_meta, inspect_xl_meta, validate_format_json_drive},
+    xl2_inspector::{
+        Xl2InventoryVersionKind, inspect_all_xl_meta, inspect_xl_meta, validate_format_json_drive,
+    },
 };
 
 pub const STORAGE_HELPER_VOLUME_ROOT: &str = "/target";
@@ -456,21 +458,52 @@ fn scan_stale_bucket(
             0,
         )?;
         let xl_meta_file = open_beneath(&object, "xl.meta", libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
+        let xl_meta_inode = xl_meta_file
+            .metadata()
+            .context("stat stale inventory xl.meta")?
+            .ino();
         let xl_meta = read_limited(&xl_meta_file, MAX_XL_META_BYTES, "stale inventory xl.meta")?;
         let layouts = inspect_all_xl_meta(&xl_meta)?;
         let mut declared = BTreeMap::new();
-        for layout in layouts {
-            discovered_versions.insert((object_key.clone(), layout.version_id.clone()));
+        for inventory_layout in layouts {
+            discovered_versions.insert((object_key.clone(), inventory_layout.version_id.clone()));
             let expected_hash = expected
-                .get(&(object_key.clone(), layout.version_id.clone()))
+                .get(&(object_key.clone(), inventory_layout.version_id.clone()))
                 .cloned();
-            for relative in layout.relative_part_paths {
-                ensure!(
-                    declared
-                        .insert(relative, (layout.version_id.clone(), expected_hash.clone()))
-                        .is_none(),
-                    "XL2 layouts declare the same shard path more than once"
+            if let Some(layout) = inventory_layout.shard_layout {
+                for relative in layout.relative_part_paths {
+                    ensure!(
+                        declared
+                            .insert(relative, (layout.version_id.clone(), expected_hash.clone()))
+                            .is_none(),
+                        "XL2 layouts declare the same shard path more than once"
+                    );
+                }
+            } else if inventory_layout.kind == Xl2InventoryVersionKind::Inline {
+                let full_relative = format!(
+                    "{}/{object_key}/xl.meta#{}",
+                    request.bucket, inventory_layout.version_id
                 );
+                entries.push(ShardInventoryEntry {
+                    fragment_id: stale_fragment_id(
+                        &request.drive_uuid,
+                        &full_relative,
+                        xl_meta_inode,
+                    ),
+                    bucket: request.bucket.clone(),
+                    object_key: object_key.clone(),
+                    version_id: inventory_layout.version_id,
+                    drive_uuid: request.drive_uuid.clone(),
+                    object_sha256: expected_hash
+                        .clone()
+                        .unwrap_or_else(|| sha256_bytes(&xl_meta)),
+                    sha256: sha256_bytes(&xl_meta),
+                    reference_state: if expected_hash.is_some() {
+                        FragmentReferenceState::ReferencedVersion
+                    } else {
+                        FragmentReferenceState::Unclassified
+                    },
+                });
             }
         }
         scan_stale_object_parts(
@@ -2276,7 +2309,9 @@ fn now_ms() -> Result<u64> {
 mod tests {
     use super::*;
     use crate::fault::storage_recovery_runtime::*;
-    use crate::fault::xl2_inspector::test_fixture as xl2_fixture;
+    use crate::fault::xl2_inspector::{
+        test_fixture as xl2_fixture, test_inline_fixture as xl2_inline_fixture,
+    };
     use std::{fs, os::unix::fs::symlink};
     use tempfile::TempDir;
 
@@ -2667,6 +2702,16 @@ mod tests {
             )
             .expect("XL2 metadata");
         }
+        let inline_version = "77777777-7777-7777-7777-777777777777";
+        let inline_object = roots
+            .volume
+            .join("bucket-stale-1/fault-test/run-stale-1/inline");
+        fs::create_dir_all(&inline_object).expect("inline object directory");
+        fs::write(
+            inline_object.join("xl.meta"),
+            xl2_inline_fixture(inline_version),
+        )
+        .expect("inline XL2 metadata");
         let root = open_directory(&roots.volume, "stale test volume").expect("open volume");
         let request = stale_request(StaleOfflineHelperOperation::InjectOrphan {
             object_key: "fault-test/run-stale-1/expected".to_string(),
@@ -2689,16 +2734,25 @@ mod tests {
         fs::create_dir(&extra_orphan).expect("extra orphan directory");
         fs::write(extra_orphan.join("part.1"), b"unexpected orphan").expect("extra orphan part");
 
-        let response = inventory_stale_scope(
-            &request,
-            &root,
-            "77777777-7777-7777-7777-777777777777",
-            &[StaleOfflineExpectedVersion {
+        let expected_versions = [
+            StaleOfflineExpectedVersion {
                 operation_id: "put-expected".to_string(),
                 object_key: "fault-test/run-stale-1/expected".to_string(),
                 version_id: expected_version.to_string(),
                 object_sha256: HASH.to_string(),
-            }],
+            },
+            StaleOfflineExpectedVersion {
+                operation_id: "put-inline".to_string(),
+                object_key: "fault-test/run-stale-1/inline".to_string(),
+                version_id: inline_version.to_string(),
+                object_sha256: HASH.to_string(),
+            },
+        ];
+        let response = inventory_stale_scope(
+            &request,
+            &root,
+            "99999999-9999-9999-9999-999999999999",
+            &expected_versions,
             &orphan,
             true,
         )
@@ -2707,7 +2761,12 @@ mod tests {
             panic!("unexpected inventory response")
         };
         assert!(response.exhausted);
-        assert_eq!(response.entries.len(), 4);
+        assert_eq!(response.entries.len(), 5);
+        assert!(response.entries.iter().any(|entry| {
+            entry.object_key == "fault-test/run-stale-1/inline"
+                && entry.version_id == inline_version
+                && entry.reference_state == FragmentReferenceState::ReferencedVersion
+        }));
         assert!(response.entries.iter().any(|entry| {
             entry.object_key == "fault-test/run-stale-1/unlisted"
                 && entry.version_id == extra_version

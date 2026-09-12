@@ -80,6 +80,22 @@ pub struct Xl2ObjectVersionLayout {
     pub relative_part_paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Xl2InventoryVersionKind {
+    ShardParts,
+    Inline,
+    DeleteMarker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Xl2InventoryVersionLayout {
+    pub version_id: String,
+    pub kind: Xl2InventoryVersionKind,
+    pub shard_layout: Option<Xl2ObjectVersionLayout>,
+}
+
 /// Validates the drive identity that must be read from the same opened volume
 /// root as `xl.meta`. This binds an offline mapping to the deployment and exact
 /// drive generation instead of trusting a path supplied by the controller.
@@ -165,13 +181,15 @@ pub fn inspect_xl_meta(bytes: &[u8], requested_version_id: &str) -> Result<Xl2Ob
         matched.next().is_none(),
         "requested XL2 version is duplicated"
     );
-    Ok(layout)
+    layout
+        .shard_layout
+        .context("requested object version is inline and has no shard part path")
 }
 
-/// Enumerates every non-inline object version and all of its declared shard
-/// parts from one supported `xl.meta`. Delete markers have no shard parts and
-/// are validated but intentionally omitted from the returned layouts.
-pub fn inspect_all_xl_meta(bytes: &[u8]) -> Result<Vec<Xl2ObjectVersionLayout>> {
+/// Enumerates every object version from one supported `xl.meta`. Non-inline
+/// versions include their declared shard parts; inline versions and delete
+/// markers retain their identity without inventing an external part path.
+pub fn inspect_all_xl_meta(bytes: &[u8]) -> Result<Vec<Xl2InventoryVersionLayout>> {
     ensure!(
         !bytes.is_empty() && bytes.len() <= MAX_XL_META_BYTES,
         "xl.meta size must be between 1 and {MAX_XL_META_BYTES} bytes"
@@ -204,6 +222,15 @@ pub fn inspect_all_xl_meta(bytes: &[u8]) -> Result<Vec<Xl2ObjectVersionLayout>> 
             "XL2 metadata contains a duplicate version id"
         );
         if parsed_header.version_type == 2 {
+            ensure!(
+                parsed_header.flags & 0b110 == 0 && parse_version_type(body)? == 2,
+                "XL2 delete-marker header, flags, and body disagree"
+            );
+            layouts.push(Xl2InventoryVersionLayout {
+                version_id: parsed_header.version_id.to_string(),
+                kind: Xl2InventoryVersionKind::DeleteMarker,
+                shard_layout: None,
+            });
             continue;
         }
         ensure!(
@@ -216,20 +243,38 @@ pub fn inspect_all_xl_meta(bytes: &[u8]) -> Result<Vec<Xl2ObjectVersionLayout>> 
             "XL2 version header and object body disagree"
         );
         ensure!(
-            parsed_header.flags & 0b10 != 0 && parsed_header.flags & 0b100 == 0,
-            "requested XL2 version is inline or does not use a data directory"
-        );
-        ensure!(
             parsed_header.erasure_data_shards == u64::from(object.erasure_data_shards)
                 && parsed_header.erasure_parity_shards == u64::from(object.erasure_parity_shards),
             "XL2 version header and object erasure geometry disagree"
         );
-        layouts.push(object_layout(
-            profile,
-            revision,
-            parsed_header.version_id,
-            object,
-        )?);
+        let uses_data_directory = parsed_header.flags & 0b10 != 0;
+        let inline = parsed_header.flags & 0b100 != 0;
+        ensure!(
+            uses_data_directory ^ inline,
+            "XL2 object version must use exactly one inline or shard-part storage form"
+        );
+        let (kind, shard_layout) = if inline {
+            ensure!(
+                object.data_directory.is_none(),
+                "inline XL2 object unexpectedly declares a data directory"
+            );
+            (Xl2InventoryVersionKind::Inline, None)
+        } else {
+            (
+                Xl2InventoryVersionKind::ShardParts,
+                Some(object_layout(
+                    profile,
+                    revision,
+                    parsed_header.version_id,
+                    object,
+                )?),
+            )
+        };
+        layouts.push(Xl2InventoryVersionLayout {
+            version_id: parsed_header.version_id.to_string(),
+            kind,
+            shard_layout,
+        });
     }
     ensure!(
         cursor.is_finished(),
@@ -237,6 +282,29 @@ pub fn inspect_all_xl_meta(bytes: &[u8]) -> Result<Vec<Xl2ObjectVersionLayout>> 
     );
 
     Ok(layouts)
+}
+
+fn parse_version_type(bytes: &[u8]) -> Result<u64> {
+    let mut cursor = MsgpackCursor::new(bytes);
+    let fields = cursor.read_map_len("version metadata")?;
+    let mut version_type = None;
+    for _ in 0..fields {
+        let key = cursor.read_str("version metadata field")?;
+        if key == "Type" {
+            set_once(
+                &mut version_type,
+                cursor.read_u64("version metadata type")?,
+                "Type",
+            )?;
+        } else {
+            cursor.skip_value(0)?;
+        }
+    }
+    ensure!(
+        cursor.is_finished(),
+        "XL2 version metadata has trailing bytes"
+    );
+    version_type.context("XL2 version metadata lacks Type")
 }
 
 fn object_layout(
@@ -729,7 +797,7 @@ impl<'a> MsgpackCursor<'a> {
 }
 
 #[cfg(test)]
-pub(crate) use tests::fixture as test_fixture;
+pub(crate) use tests::{fixture as test_fixture, inline_fixture as test_inline_fixture};
 
 #[cfg(test)]
 mod tests {
@@ -746,6 +814,10 @@ mod tests {
 
     pub(crate) fn fixture(version: &str, data_dir: Option<&str>, parts: &[u32]) -> Vec<u8> {
         fixture_with_layout(version, data_dir, parts, &vec![1024; parts.len()], 0b10)
+    }
+
+    pub(crate) fn inline_fixture(version: &str) -> Vec<u8> {
+        fixture_with_layout(version, None, &[1], &[4096], 0b100)
     }
 
     fn fixture_with_layout(
@@ -859,6 +931,16 @@ mod tests {
             layout.relative_part_paths,
             [format!("{DATA_DIR}/part.1"), format!("{DATA_DIR}/part.3")]
         );
+    }
+
+    #[test]
+    fn inventory_preserves_inline_version_without_inventing_a_part_path() {
+        let layouts = inspect_all_xl_meta(&inline_fixture(VERSION)).expect("inspect inline XL2");
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[0].version_id, VERSION);
+        assert_eq!(layouts[0].kind, Xl2InventoryVersionKind::Inline);
+        assert!(layouts[0].shard_layout.is_none());
+        assert!(inspect_xl_meta(&inline_fixture(VERSION), VERSION).is_err());
     }
 
     #[test]

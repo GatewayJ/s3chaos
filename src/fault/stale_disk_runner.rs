@@ -18,7 +18,7 @@ use std::{
     net::SocketAddr,
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -623,10 +623,34 @@ impl StaleWatchGuard {
     }
 
     fn cancel_and_finish(&mut self, timeout: Duration) -> Result<Vec<StaleDmTableSample>> {
-        self.cancel
+        let cancel = self
+            .cancel
             .take()
-            .context("stale device-mapper watch cancellation was already requested")?()?;
-        let result = match self.result.recv_timeout(timeout) {
+            .context("stale device-mapper watch cancellation was already requested")?;
+        let deadline = Instant::now() + timeout;
+        let (cancel_sender, cancel_result) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("s3chaos-stale-dm-watch-cancel".to_string())
+            .spawn(move || {
+                let _ = cancel_sender.send(cancel());
+            })
+            .context("start bounded stale device-mapper watch cancellation")?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("stale device-mapper watch cancellation deadline elapsed")?;
+        match cancel_result.recv_timeout(remaining) {
+            Ok(result) => result?,
+            Err(RecvTimeoutError::Timeout) => {
+                bail!("stale device-mapper watch cancellation exceeded its deadline")
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("stale device-mapper watch cancellation exited without a result")
+            }
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("stale device-mapper watch finish deadline elapsed")?;
+        let result = match self.result.recv_timeout(remaining) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
                 bail!("stale device-mapper watch did not stop before its cancellation deadline")
@@ -1834,37 +1858,6 @@ pub(crate) async fn run_stale_disk_case(
         .into_iter()
         .max()
         .context("stale mutation window has no operations")?;
-        let watch_samples = watch
-            .as_mut()
-            .context("stale device-mapper watch is unavailable")?
-            .cancel_and_finish(Duration::from_secs(3))?;
-        let absence_observation_id = uuid::Uuid::new_v4().to_string();
-        let absence = watch_observation(
-            &identity,
-            &volume,
-            &prepared_proof,
-            absence_observation_id.clone(),
-            detach_operation_id.clone(),
-            (&first_snapshot, watch_started_at_ms, first_binding),
-            watch_samples,
-        )?;
-
-        // Persist everything known while the EIO table is still active. If
-        // reattachment fails, this artifact remains available before Drop's
-        // bounded recovery attempt starts.
-        collector.write_text(
-            scenario.case_name,
-            "stale-active-operations.json",
-            &serde_json::to_string_pretty(&serde_json::json!({
-                "runId": context.run_id,
-                "activatedAtMs": activated_at_ms,
-                "overwrite": overwrite_record,
-                "deleteMarker": delete_record,
-                "ackLoss": ack_loss,
-                "absence": absence,
-            }))?,
-        )?;
-
         renew_stale_ownership(
             stale_ownership_environment(config, collector, scenario, &volume, &lease),
             &mut disk,
@@ -1889,6 +1882,32 @@ pub(crate) async fn run_stale_disk_case(
         disk.accept_stale_helper_reattach()?;
         reattach_owned_context = Some(storage_reattach_context);
         reattach_storage_receipt = Some(storage_reattach.clone());
+        let watch_samples = watch
+            .as_mut()
+            .context("stale device-mapper watch is unavailable")?
+            .cancel_and_finish(Duration::from_secs(3))?;
+        let absence_observation_id = uuid::Uuid::new_v4().to_string();
+        let absence = watch_observation(
+            &identity,
+            &volume,
+            &prepared_proof,
+            absence_observation_id.clone(),
+            detach_operation_id.clone(),
+            (&first_snapshot, watch_started_at_ms, first_binding),
+            watch_samples,
+        )?;
+        collector.write_text(
+            scenario.case_name,
+            "stale-active-operations.json",
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "runId": context.run_id,
+                "activatedAtMs": activated_at_ms,
+                "overwrite": overwrite_record,
+                "deleteMarker": delete_record,
+                "ackLoss": ack_loss,
+                "absence": absence,
+            }))?,
+        )?;
         let recovery_snapshot = disk
             .recovery_snapshot()
             .context("stale disk restore lacks its recovery snapshot")?;
@@ -2762,6 +2781,27 @@ mod tests {
             events.lock().expect("events").as_slice(),
             ["reattach", "cancel", "joined"]
         );
+    }
+
+    #[test]
+    fn stale_watch_deadline_bounds_a_hung_cancel_command() {
+        let mut watch = StaleWatchGuard::spawn(
+            || {
+                thread::sleep(Duration::from_millis(300));
+                Ok(())
+            },
+            || {
+                thread::sleep(Duration::from_millis(300));
+                Ok(Vec::new())
+            },
+        )
+        .expect("watch guard");
+        let started = Instant::now();
+        let error = watch
+            .cancel_and_finish(Duration::from_millis(20))
+            .expect_err("slow cancellation must time out");
+        assert!(error.to_string().contains("cancellation exceeded"));
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
