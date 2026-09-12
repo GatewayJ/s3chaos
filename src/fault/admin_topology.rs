@@ -954,6 +954,30 @@ impl RustfsAdminTopologyAdapter {
         probe_runtime_binding(&self.transport, endpoint).await
     }
 
+    /// Capture the fresh Kubernetes Tenant, RustFS deployment, and pools/list
+    /// receipts needed to bind one admin attempt to this adapter's live
+    /// port-forward target.
+    pub async fn capture_pool_snapshot(
+        &self,
+        run_id: impl Into<String>,
+        case_name: impl Into<String>,
+    ) -> Result<AdminPoolSnapshot> {
+        let runtime = self.probe_runtime_binding().await?;
+        let tenant_response_body = runtime.target.endpoint.tenant_response_body.clone();
+        let tenant_started_at_ms = runtime.target.endpoint.tenant_started_at_ms;
+        let tenant_observed_at_ms = runtime.target.endpoint.tenant_observed_at_ms;
+        let pools = self.list_pools().await?;
+        AdminPoolSnapshot::from_list(
+            run_id,
+            case_name,
+            tenant_response_body.as_bytes(),
+            runtime,
+            tenant_started_at_ms,
+            tenant_observed_at_ms,
+            pools,
+        )
+    }
+
     async fn ensure_request_target(
         &self,
         method: &Method,

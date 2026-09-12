@@ -28,23 +28,56 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::time::{Instant, sleep, timeout};
+use tokio::{
+    sync::Mutex as AsyncMutex,
+    time::{Instant, sleep, timeout},
+};
 
 use crate::fault::{
+    admin_runner::{AdminCancelOutcome, AdminCaseDriver, AdminWorkflowObservation},
     admin_topology::{
         ADMIN_OPERATION_ARTIFACT, ADMIN_OPERATION_PROGRESS_ARTIFACT, ADMIN_TOPOLOGY_PROOF_ARTIFACT,
         AdminAttemptIdentity, AdminAttemptWindow, AdminOperationEvidence,
-        AdminOperationProgressSample, AdminPoolSnapshot, AdminRequestEvidence, AdminTopologyPort,
-        AdminTopologyProof, RebalanceStart, RebalanceStatus, rebalance_progress_sample,
+        AdminOperationProgressSample, AdminPoolSnapshot, AdminRequestEvidence,
+        AdminTopologyBuildContext, AdminTopologyPort, AdminTopologyProof, RebalanceStart,
+        RebalanceStatus, RustfsAdminTopologyAdapter, rebalance_progress_sample,
         validate_admin_operation_progress, validate_admin_pre_start_snapshot,
     },
     checker::{self, CheckerReport},
-    history::{OperationKind, OperationOutcome, OperationRecord, validate_history_scope_and_order},
-    scenarios::ADMIN_REBALANCE_SCENARIO,
+    config::FaultTestConfig,
+    events::RunEventStatus,
+    fixture::{
+        ADMIN_FIXTURE_ARTIFACT, AdminFixtureEvidence, AdminFixturePhase, AdminFixturePlan,
+        apply_admin_tenant_stage, capture_admin_fixture_observation, reset_tenant_resources,
+    },
+    history::{
+        DurabilityCohort, OperationKind, OperationOutcome, OperationRecord,
+        validate_history_scope_and_order,
+    },
+    plan::AdminExecutionPlan,
+    pods::rustfs_pod_identities,
+    preflight::{PreflightCheck, PreflightPhase, PreflightSummary},
+    recovery_health::{RECOVERY_HEALTH_ARTIFACT, RecoveryHealthBaseline},
+    reporting::ResponsibilityDomain,
+    runner::{
+        FaultRunContext, POST_RECOVERY_SEED_SALT, ensure_s3_access, initialize_fault_run,
+        observe_recovery_health, s3_access, tenant_port_forward, wait_for_ready_tenant,
+        wait_for_stable_rustfs_pods, wait_for_tenant_s3,
+    },
+    scenarios::{ADMIN_REBALANCE_SCENARIO, FaultScenario},
+    shutdown::RunDeadline,
+    workload::execution::{
+        MixedWorkloadRequest, MixedWorkloadResult, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+        POST_RECOVERY_WRITE_REPORT_ARTIFACT, PostRecoveryWriteRequest, post_recovery_object_count,
+        prefill_objects, recommit_unconfirmed_objects, run_mixed_workload,
+        run_post_recovery_write_probe,
+    },
+    workload::{ObjectSpec, S3WorkloadClient},
 };
-use crate::framework::artifacts::ArtifactCollector;
+use crate::framework::{artifacts::ArtifactCollector, port_forward::PortForwardGuard, resources};
 
 pub const ADMIN_REBALANCE_OVERLAP_ARTIFACT: &str = "admin-rebalance-overlap.json";
+pub const ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT: &str = "admin-rebalance-transcript.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdminRebalanceLimits {
@@ -279,11 +312,28 @@ impl AdminRebalanceExecution {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AdminRebalanceTranscript {
     pub operation_id: Option<String>,
     pub requests: Vec<AdminRequestEvidence>,
     pub progress: Vec<AdminOperationProgressSample>,
+}
+
+impl AdminRebalanceTranscript {
+    pub fn validate(
+        &self,
+        operation: &AdminOperationEvidence,
+        progress: &[AdminOperationProgressSample],
+    ) -> Result<()> {
+        ensure!(
+            self.operation_id.as_deref() == Some(operation.operation_id.as_str())
+                && self.requests == operation.requests
+                && self.progress == progress,
+            "rebalance transcript does not match the persisted operation receipts"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -835,9 +885,908 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+struct LiveRebalanceState {
+    context: Option<FaultRunContext>,
+    s3: Option<S3WorkloadClient>,
+    s3_port_forward: Option<PortForwardGuard>,
+    s3_endpoint: Option<String>,
+    admin: Option<Arc<RustfsAdminTopologyAdapter>>,
+    proof: Option<AdminTopologyProof>,
+    pools_before: Option<AdminPoolSnapshot>,
+    start: Option<RebalanceStart>,
+    terminal: Option<RebalanceStatus>,
+    fixture: AdminFixtureEvidence,
+    prefilled: Vec<ObjectSpec>,
+    workload: Option<MixedWorkloadResult>,
+    workload_receipt: Option<AdminRebalanceWorkloadReceipt>,
+    health_baseline: Option<RecoveryHealthBaseline>,
+    fixture_owned: bool,
+    verified: bool,
+}
+
+pub(crate) struct LiveAdminRebalanceDriver {
+    config: FaultTestConfig,
+    collector: ArtifactCollector,
+    scenario: FaultScenario,
+    plan: AdminExecutionPlan,
+    run_id: String,
+    deadline: RunDeadline,
+    transcript: Arc<Mutex<AdminRebalanceTranscript>>,
+    state: AsyncMutex<LiveRebalanceState>,
+}
+
+impl LiveAdminRebalanceDriver {
+    pub(crate) fn new(
+        config: &FaultTestConfig,
+        collector: &ArtifactCollector,
+        scenario: &FaultScenario,
+        plan: &AdminExecutionPlan,
+        run_id: &str,
+        deadline: RunDeadline,
+    ) -> Result<Self> {
+        ensure!(
+            scenario.name == ADMIN_REBALANCE_SCENARIO
+                && plan.scenario == scenario.name
+                && plan.case_name == scenario.case_name,
+            "live rebalance driver requires the canonical admin-rebalance plan"
+        );
+        let fixture_plan =
+            AdminFixturePlan::for_scenario(&scenario.name, config.expected_rustfs_pod_count)?;
+        Ok(Self {
+            config: config.clone(),
+            collector: collector.clone(),
+            scenario: scenario.clone(),
+            plan: plan.clone(),
+            run_id: run_id.to_string(),
+            deadline,
+            transcript: Arc::new(Mutex::new(AdminRebalanceTranscript::default())),
+            state: AsyncMutex::new(LiveRebalanceState {
+                context: None,
+                s3: None,
+                s3_port_forward: None,
+                s3_endpoint: None,
+                admin: None,
+                proof: None,
+                pools_before: None,
+                start: None,
+                terminal: None,
+                fixture: AdminFixtureEvidence {
+                    schema_version: 1,
+                    scenario: scenario.name.clone(),
+                    run_id: run_id.to_string(),
+                    tenant: config.cluster.tenant_name.clone(),
+                    plan: fixture_plan,
+                    observations: Vec::new(),
+                },
+                prefilled: Vec::new(),
+                workload: None,
+                workload_receipt: None,
+                health_baseline: None,
+                fixture_owned: false,
+                verified: false,
+            }),
+        })
+    }
+
+    async fn start_inner(&self) -> Result<()> {
+        let execution_plan = crate::fault::plan::ExecutionPlan::Admin(self.plan.clone());
+        let context = initialize_fault_run(
+            &self.config,
+            &self.collector,
+            &self.scenario,
+            &execution_plan,
+            &self.run_id,
+        )?;
+        let mut fixture = {
+            let mut state = self.state.lock().await;
+            state.context = Some(context.clone());
+            state.fixture.clone()
+        };
+        self.write_fixture(&fixture)?;
+
+        reset_tenant_resources(&self.config.cluster)
+            .context("reset run-owned Tenant before admin rebalance")?;
+        self.state.lock().await.fixture_owned = true;
+        apply_admin_tenant_stage(&self.config.cluster, &fixture.plan, false)
+            .context("apply primary admin Tenant pool")?;
+        wait_for_ready_tenant(&self.config.cluster)
+            .await
+            .context("wait for primary admin Tenant pool")?;
+        wait_for_stable_rustfs_pods(
+            &self.config.cluster,
+            fixture.plan.servers_per_pool,
+            self.config.rustfs_pod_stable_window,
+        )
+        .await
+        .context("wait for stable primary admin Tenant pool")?;
+        fixture.observations.push(capture_admin_fixture_observation(
+            &self.config.cluster,
+            AdminFixturePhase::PrimaryReady,
+            None,
+        )?);
+        self.persist_fixture(&fixture).await?;
+
+        let (endpoint, mut s3_port_forward) = s3_access(&self.config)?;
+        ensure_s3_access(&mut s3_port_forward, &self.config.cluster, &endpoint).await?;
+        let (access_key, secret_key) = resources::test_credentials();
+        let s3 = S3WorkloadClient::new(
+            &endpoint,
+            &context.bucket,
+            access_key,
+            secret_key,
+            self.config.request_timeout,
+        )
+        .await?;
+        let history = &context.history;
+        ensure!(
+            s3.create_bucket(history).await? == OperationOutcome::Ok,
+            "admin rebalance workload bucket creation failed"
+        );
+        ensure!(
+            self.config.workload_versioning,
+            "admin rebalance requires a versioned workload"
+        );
+        ensure!(
+            s3.enable_bucket_versioning(history).await? == OperationOutcome::Ok,
+            "admin rebalance workload bucket versioning failed"
+        );
+        let prefilled = prefill_objects(
+            &s3,
+            history,
+            &self.run_id,
+            &context.workload_plan,
+            self.scenario.prefill_count(),
+            self.config.prefill_concurrency,
+            self.config.workload_directory_marker_percent,
+        )
+        .await
+        .context("prefill primary admin Tenant pool")?;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        fixture.observations.push(capture_admin_fixture_observation(
+            &self.config.cluster,
+            AdminFixturePhase::PrefillComplete,
+            Some(prefilled.len()),
+        )?);
+        self.persist_fixture(&fixture).await?;
+
+        apply_admin_tenant_stage(&self.config.cluster, &fixture.plan, true)
+            .context("apply admin Tenant expansion pool")?;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        fixture.observations.push(capture_admin_fixture_observation(
+            &self.config.cluster,
+            AdminFixturePhase::ExpansionApplied,
+            None,
+        )?);
+        self.persist_fixture(&fixture).await?;
+        wait_for_ready_tenant(&self.config.cluster)
+            .await
+            .context("wait for expanded admin Tenant")?;
+        let expanded_pod_count = fixture
+            .plan
+            .servers_per_pool
+            .checked_mul(2)
+            .context("expanded admin Tenant pod count overflowed")?;
+        wait_for_stable_rustfs_pods(
+            &self.config.cluster,
+            expanded_pod_count,
+            self.config.rustfs_pod_stable_window,
+        )
+        .await
+        .context("wait for stable two-pool admin Tenant")?;
+        ensure_s3_access(&mut s3_port_forward, &self.config.cluster, &endpoint)
+            .await
+            .context("restore S3 access after admin Tenant expansion")?;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        fixture.observations.push(capture_admin_fixture_observation(
+            &self.config.cluster,
+            AdminFixturePhase::TopologyStable,
+            None,
+        )?);
+        fixture.validate_complete()?;
+        self.persist_fixture(&fixture).await?;
+
+        let layout =
+            crate::rustfs::read_erasure_layout(&endpoint, "us-east-1", access_key, secret_key)
+                .await
+                .context("capture healthy two-pool RustFS layout")?;
+        let health_baseline = RecoveryHealthBaseline::from_layout(&layout, now_ms())
+            .context("two-pool RustFS layout is not healthy before rebalance")?;
+        context.events.record(
+            "recovery-health-baseline",
+            RunEventStatus::Succeeded,
+            "healthy two-pool RustFS baseline captured before rebalance",
+            Some(serde_json::to_value(&health_baseline)?),
+        )?;
+
+        let (admin_endpoint, mut admin_forward) = tenant_port_forward(&self.config.cluster)?;
+        wait_for_tenant_s3(
+            &mut admin_forward,
+            &admin_endpoint,
+            self.config.cluster.timeout,
+        )
+        .await?;
+        let adapter = Arc::new(
+            RustfsAdminTopologyAdapter::connect(admin_forward, "us-east-1", access_key, secret_key)
+                .await
+                .context("connect fresh RustFS admin topology adapter")?,
+        );
+        let snapshot = adapter
+            .capture_pool_snapshot(&self.run_id, self.scenario.case_name)
+            .await
+            .context("capture initial rebalance pool snapshot")?;
+        let tenant = serde_json::from_str(&snapshot.tenant_get.response_body)
+            .context("decode authenticated Tenant receipt for topology proof")?;
+        let topology_context = AdminTopologyBuildContext::new(
+            &self.run_id,
+            self.scenario.case_name,
+            &context.workload_plan,
+            snapshot.runtime.clone(),
+        )?;
+        let proof = AdminTopologyProof::build(
+            &self.plan.topology,
+            &self.scenario.name,
+            &tenant,
+            snapshot.pools.clone(),
+            &topology_context,
+        )?;
+        validate_admin_pre_start_snapshot(&proof, &snapshot, now_ms())?;
+        let preflight = PreflightSummary::single_run(
+            &self.config,
+            &self.scenario.name,
+            &self.run_id,
+            vec![PreflightPhase::new(
+                "admin-topology",
+                vec![PreflightCheck::passed(
+                    "owned_two_pool_topology",
+                    "fresh Tenant, deployment, and pools/list receipts bind the owned two-pool topology",
+                    ResponsibilityDomain::Harness,
+                )],
+            )],
+        );
+        self.collector.write_text(
+            self.scenario.case_name,
+            "preflight-summary.json",
+            &serde_json::to_string_pretty(&preflight)?,
+        )?;
+
+        let start = adapter
+            .start_rebalance()
+            .await
+            .context("start RustFS rebalance through the bound adapter")?;
+        ensure!(
+            !start.value.id.trim().is_empty(),
+            "RustFS rebalance start receipt has no operation ID"
+        );
+        {
+            let mut state = self.state.lock().await;
+            state.s3 = Some(s3);
+            state.s3_port_forward = s3_port_forward;
+            state.s3_endpoint = Some(endpoint);
+            state.admin = Some(adapter);
+            state.proof = Some(proof);
+            state.pools_before = Some(snapshot);
+            state.start = Some(start.value.clone());
+            state.prefilled = prefilled;
+            state.health_baseline = Some(health_baseline);
+        }
+        {
+            let mut transcript = lock_transcript(&self.transcript);
+            transcript.operation_id = Some(start.value.id.clone());
+            transcript.requests.push(start.request.clone());
+        }
+        self.write_transcript()?;
+        Ok(())
+    }
+
+    async fn persist_fixture(&self, fixture: &AdminFixtureEvidence) -> Result<()> {
+        self.state.lock().await.fixture = fixture.clone();
+        self.write_fixture(fixture)
+    }
+
+    async fn observe_inner(&self) -> Result<AdminWorkflowObservation> {
+        let (adapter, proof, operation_id) = {
+            let state = self.state.lock().await;
+            (
+                state
+                    .admin
+                    .clone()
+                    .context("rebalance adapter is not ready")?,
+                state
+                    .proof
+                    .clone()
+                    .context("rebalance proof is not ready")?,
+                state
+                    .start
+                    .as_ref()
+                    .map(|start| start.id.clone())
+                    .context("rebalance operation is not owned")?,
+            )
+        };
+        let call = adapter.rebalance_status().await?;
+        let sample = rebalance_progress_sample(&proof, &operation_id, &call)?;
+        let terminal = sample.completed || sample.failed || sample.canceled_or_stopped;
+        {
+            let mut transcript = lock_transcript(&self.transcript);
+            transcript.requests.push(call.request.clone());
+            transcript.progress.push(sample.clone());
+        }
+        self.write_transcript()?;
+        if terminal {
+            self.state.lock().await.terminal = Some(call.value);
+            ensure!(
+                sample.completed && !sample.failed && !sample.canceled_or_stopped,
+                "RustFS rebalance reached an unsuccessful terminal state"
+            );
+            Ok(AdminWorkflowObservation::Completed)
+        } else {
+            Ok(AdminWorkflowObservation::Running)
+        }
+    }
+
+    async fn run_workload_inner(&self) -> Result<()> {
+        let (s3, history, plan, prefilled, events) = {
+            let state = self.state.lock().await;
+            let context = state
+                .context
+                .as_ref()
+                .context("rebalance run is not initialized")?;
+            (
+                state
+                    .s3
+                    .clone()
+                    .context("rebalance S3 client is not ready")?,
+                context.history.clone(),
+                context.workload_plan.clone(),
+                state.prefilled.clone(),
+                context.events.clone(),
+            )
+        };
+        events.record(
+            "mixed-workload",
+            RunEventStatus::Started,
+            "running bounded S3 workload during RustFS rebalance",
+            Some(serde_json::json!({
+                "object_count": self.scenario.mixed_workload_count(),
+                "concurrency": plan.concurrency,
+            })),
+        )?;
+        history.set_durability_cohort(DurabilityCohort::FaultActive);
+        let first_event_sequence = history.next_event_sequence();
+        let started_at_ms = now_ms();
+        let workload = run_mixed_workload(&MixedWorkloadRequest {
+            s3: &s3,
+            history: &history,
+            scenario: &self.scenario.name,
+            run_id: &self.run_id,
+            plan: &plan,
+            prefilled: &prefilled,
+            start_index: self.scenario.prefill_count(),
+            count: self.scenario.mixed_workload_count(),
+            ranged_get_percent: self.config.workload_ranged_get_percent,
+            staged_multipart_uploads: None,
+            deadline: self.deadline,
+        })
+        .await?;
+        let ended_at_ms = now_ms();
+        let last_event_sequence = history
+            .next_event_sequence()
+            .checked_sub(1)
+            .context("bounded rebalance workload recorded no completed operation")?;
+        let receipt = AdminRebalanceWorkloadReceipt {
+            started_at_ms,
+            ended_at_ms,
+            first_event_sequence,
+            last_event_sequence,
+            history: history.records(),
+        };
+        workload_records(&receipt)?;
+        events.record(
+            "mixed-workload",
+            RunEventStatus::Succeeded,
+            "bounded S3 workload completed during RustFS rebalance",
+            Some(serde_json::json!({ "disruptions": workload.summary.disrupted() })),
+        )?;
+        self.collector.write_text(
+            self.scenario.case_name,
+            "workload-summary.json",
+            &serde_json::to_string_pretty(&workload.summary)?,
+        )?;
+        let mut state = self.state.lock().await;
+        state.workload = Some(workload);
+        state.workload_receipt = Some(receipt);
+        Ok(())
+    }
+
+    async fn verify_inner(&self) -> Result<()> {
+        let (
+            adapter,
+            proof,
+            pools_before,
+            start,
+            terminal,
+            workload_receipt,
+            s3,
+            endpoint,
+            baseline,
+            history,
+            workload_plan,
+            events,
+            mut workload,
+            attempt_started_at_ms,
+        ) = {
+            let mut state = self.state.lock().await;
+            let context = state
+                .context
+                .as_ref()
+                .context("rebalance run is not initialized")?;
+            (
+                state
+                    .admin
+                    .clone()
+                    .context("rebalance adapter is not ready")?,
+                state
+                    .proof
+                    .clone()
+                    .context("rebalance proof is not ready")?,
+                state
+                    .pools_before
+                    .clone()
+                    .context("rebalance pre-start snapshot is missing")?,
+                state
+                    .start
+                    .clone()
+                    .context("rebalance start receipt is missing")?,
+                state
+                    .terminal
+                    .clone()
+                    .context("rebalance terminal receipt is missing")?,
+                state
+                    .workload_receipt
+                    .clone()
+                    .context("rebalance workload receipt is missing")?,
+                state
+                    .s3
+                    .clone()
+                    .context("rebalance S3 client is not ready")?,
+                state
+                    .s3_endpoint
+                    .clone()
+                    .context("rebalance S3 endpoint is missing")?,
+                state
+                    .health_baseline
+                    .clone()
+                    .context("rebalance health baseline is missing")?,
+                context.history.clone(),
+                context.workload_plan.clone(),
+                context.events.clone(),
+                state
+                    .workload
+                    .take()
+                    .context("rebalance workload result is missing")?,
+                state
+                    .fixture
+                    .observations
+                    .first()
+                    .map(|observation| observation.observed_at_ms)
+                    .context("rebalance fixture has no initial observation")?,
+            )
+        };
+        history.set_durability_cohort(DurabilityCohort::PostRecovery);
+        let pools_after = adapter
+            .capture_pool_snapshot(&self.run_id, self.scenario.case_name)
+            .await?;
+        let transcript = transcript_state(&self.transcript);
+        let attempt_window = AdminAttemptWindow {
+            started_at_ms: attempt_started_at_ms,
+            evaluated_at_ms: now_ms(),
+        };
+        let operation = AdminOperationEvidence::from_rebalance(
+            &proof,
+            pools_before,
+            &start,
+            terminal,
+            transcript.requests,
+            pools_after,
+        )?;
+        operation.require_success(attempt_window)?;
+        validate_admin_operation_progress(&operation, &transcript.progress, attempt_window)?;
+        let overlap = AdminRebalanceOverlapEvidence::from_history(
+            &operation,
+            &transcript.progress,
+            &workload_receipt,
+        )?;
+        let execution = AdminRebalanceExecution {
+            proof,
+            operation,
+            progress: transcript.progress,
+            overlap,
+            attempt_window,
+            workload_history: workload_receipt.history,
+        };
+        execution.write_artifacts(&self.collector)?;
+
+        wait_for_stable_rustfs_pods(
+            &self.config.cluster,
+            self.config
+                .expected_rustfs_pod_count
+                .checked_mul(2)
+                .context("expanded admin Tenant pod count overflowed")?,
+            self.config.rustfs_pod_stable_window,
+        )
+        .await?;
+        let pods = rustfs_pod_identities(&self.config.cluster)?;
+        events.record(
+            "recovery-health",
+            RunEventStatus::Started,
+            "validating RustFS health after rebalance",
+            None,
+        )?;
+        let report = self
+            .deadline
+            .run(observe_recovery_health(
+                &self.config.cluster,
+                &endpoint,
+                &baseline,
+                &pods,
+                &self.scenario.name,
+                &self.run_id,
+                &|report| {
+                    self.collector
+                        .write_text(
+                            self.scenario.case_name,
+                            RECOVERY_HEALTH_ARTIFACT,
+                            &serde_json::to_string_pretty(report)?,
+                        )
+                        .map(|_| ())
+                },
+            ))
+            .await?;
+        self.collector.write_text(
+            self.scenario.case_name,
+            RECOVERY_HEALTH_ARTIFACT,
+            &serde_json::to_string_pretty(&report)?,
+        )?;
+        report.require_success()?;
+        events.record(
+            "recovery-health",
+            RunEventStatus::Succeeded,
+            "RustFS health remained stable after rebalance",
+            None,
+        )?;
+
+        self.run_post_recovery_probe(&s3, &workload_plan, &events)
+            .await?;
+        workload.seal_recommit_candidates(&s3, &history)?;
+        self.collector.write_text(
+            self.scenario.case_name,
+            "workload-summary.json",
+            &serde_json::to_string_pretty(&workload.summary)?,
+        )?;
+        let prechecker =
+            checker::check_s3_history(&s3, &history, true, workload_plan.concurrency, true).await?;
+        self.collector.write_text(
+            self.scenario.case_name,
+            "checker-pre-recommit-report.json",
+            &serde_json::to_string_pretty(&prechecker)?,
+        )?;
+        prechecker.require_success()?;
+
+        let recommit = recommit_unconfirmed_objects(
+            &s3,
+            &history,
+            &workload.unconfirmed_puts,
+            workload_plan.concurrency,
+            self.deadline,
+        )
+        .await;
+        self.collector.write_text(
+            self.scenario.case_name,
+            "recommit-report.json",
+            &serde_json::to_string_pretty(&recommit)?,
+        )?;
+        ensure!(!recommit.has_failures(), "{}", recommit.failure_message());
+        workload.summary.recommitted_after_recovery = recommit.committed;
+        self.collector.write_text(
+            self.scenario.case_name,
+            "workload-summary.json",
+            &serde_json::to_string_pretty(&workload.summary)?,
+        )?;
+
+        events.record(
+            "checker-final",
+            RunEventStatus::Started,
+            "checking the final object model after rebalance",
+            None,
+        )?;
+        let checker =
+            checker::check_s3_history(&s3, &history, true, workload_plan.concurrency, true).await?;
+        self.collector.write_text(
+            self.scenario.case_name,
+            "checker-report.json",
+            &serde_json::to_string_pretty(&checker)?,
+        )?;
+        checker.require_success()?;
+        validate_admin_rebalance_evidence(
+            &execution.operation,
+            &execution.progress,
+            &execution.overlap,
+            &history.records(),
+            &checker,
+        )?;
+        events.record(
+            "checker-final",
+            RunEventStatus::Succeeded,
+            "final rebalance object model check passed",
+            None,
+        )?;
+        self.state.lock().await.verified = true;
+        Ok(())
+    }
+
+    async fn run_post_recovery_probe(
+        &self,
+        s3: &S3WorkloadClient,
+        workload_plan: &crate::fault::workload::WorkloadPlan,
+        events: &crate::fault::events::RunEventRecorder,
+    ) -> Result<()> {
+        let history = crate::fault::history::Recorder::create(
+            self.collector
+                .case_dir(self.scenario.case_name)
+                .join(POST_RECOVERY_WRITE_HISTORY_ARTIFACT),
+            &self.scenario.name,
+            &self.run_id,
+        )?;
+        history.set_durability_cohort(DurabilityCohort::PostRecovery);
+        let object_count = post_recovery_object_count(workload_plan.object_count);
+        events.record(
+            "post-recovery-write",
+            RunEventStatus::Started,
+            "probing fresh writes after rebalance",
+            Some(serde_json::json!({ "objects": object_count })),
+        )?;
+        let report = run_post_recovery_write_probe(&PostRecoveryWriteRequest {
+            s3,
+            history: &history,
+            run_id: &self.run_id,
+            seed: workload_plan.seed ^ POST_RECOVERY_SEED_SALT,
+            object_count,
+            concurrency: workload_plan.concurrency,
+            deadline: self.deadline,
+        })
+        .await?;
+        self.collector.write_text(
+            self.scenario.case_name,
+            POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+            &serde_json::to_string_pretty(&report)?,
+        )?;
+        report.require_success()?;
+        events.record(
+            "post-recovery-write",
+            RunEventStatus::Succeeded,
+            "fresh writes succeeded after rebalance",
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn write_fixture(&self, fixture: &AdminFixtureEvidence) -> Result<()> {
+        self.collector.write_text(
+            self.scenario.case_name,
+            ADMIN_FIXTURE_ARTIFACT,
+            &serde_json::to_string_pretty(fixture)?,
+        )?;
+        Ok(())
+    }
+
+    fn write_transcript(&self) -> Result<()> {
+        self.collector.write_text(
+            self.scenario.case_name,
+            ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+            &serde_json::to_string_pretty(&transcript_state(&self.transcript))?,
+        )?;
+        Ok(())
+    }
+
+    async fn preserve_evidence(&self, result: Result<()>) -> Result<()> {
+        let fixture = self.state.lock().await.fixture.clone();
+        let persisted = self
+            .write_fixture(&fixture)
+            .and_then(|_| self.write_transcript());
+        combine_primary_and_secondary(result, persisted, "persist rebalance transcript")
+    }
+}
+
+#[async_trait(?Send)]
+impl AdminCaseDriver for LiveAdminRebalanceDriver {
+    async fn start(&self) -> Result<()> {
+        let result = self.start_inner().await;
+        self.preserve_evidence(result).await
+    }
+
+    async fn observe(&self) -> Result<AdminWorkflowObservation> {
+        let result = self.observe_inner().await;
+        match result {
+            Ok(observation) => Ok(observation),
+            Err(error) => match self.preserve_evidence(Err(error)).await {
+                Err(error) => Err(error),
+                Ok(()) => unreachable!("preserving a failed observation cannot make it succeed"),
+            },
+        }
+    }
+
+    async fn run_workload(&self) -> Result<()> {
+        let result = self.run_workload_inner().await;
+        self.preserve_evidence(result).await
+    }
+
+    async fn verify(&self) -> Result<()> {
+        let result = self.verify_inner().await;
+        self.preserve_evidence(result).await
+    }
+
+    async fn cancel(&self) -> Result<AdminCancelOutcome> {
+        let (adapter, proof, operation_id) = {
+            let state = self.state.lock().await;
+            let Some(operation_id) = state.start.as_ref().map(|start| start.id.clone()) else {
+                return Ok(AdminCancelOutcome::NoOwnedOperation);
+            };
+            (
+                state
+                    .admin
+                    .clone()
+                    .context("rebalance adapter is not ready")?,
+                state
+                    .proof
+                    .clone()
+                    .context("rebalance proof is not ready")?,
+                operation_id,
+            )
+        };
+        let result = stop_owned_rebalance(
+            adapter.as_ref(),
+            &proof,
+            &operation_id,
+            AdminRebalanceLimits {
+                poll_interval: Duration::from_secs(5),
+                operation_timeout: self.plan.operation_timeout,
+                stop_timeout: self.config.cluster.timeout,
+            },
+            &self.transcript,
+        )
+        .await;
+        combine_primary_and_secondary(
+            result,
+            self.write_transcript(),
+            "persist cancel transcript",
+        )?;
+        Ok(AdminCancelOutcome::CanceledOwnedOperation)
+    }
+
+    async fn cleanup(&self) -> Result<()> {
+        let (fixture, events, verified, fixture_owned, admin, s3_port_forward) = {
+            let mut state = self.state.lock().await;
+            (
+                state.fixture.clone(),
+                state.context.as_ref().map(|context| context.events.clone()),
+                state.verified,
+                state.fixture_owned,
+                state.admin.take(),
+                state.s3_port_forward.take(),
+            )
+        };
+        drop((admin, s3_port_forward));
+        let transcript = transcript_state(&self.transcript);
+        let cleanup = persist_then_reset_owned_fixture(
+            &self.collector,
+            self.scenario.case_name,
+            &fixture,
+            &transcript,
+            fixture_owned,
+            || reset_tenant_resources(&self.config.cluster),
+        );
+        let event = if let Some(events) = events {
+            events.record(
+                "run",
+                if verified && cleanup.is_ok() {
+                    RunEventStatus::Succeeded
+                } else {
+                    RunEventStatus::Failed
+                },
+                if verified && cleanup.is_ok() {
+                    "admin rebalance run completed successfully"
+                } else if cleanup.is_err() {
+                    "admin rebalance run-owned fixture cleanup failed"
+                } else {
+                    "admin rebalance run ended before successful verification"
+                },
+                None,
+            )
+        } else {
+            Ok(())
+        };
+        combine_primary_and_secondary(cleanup, event, "record fixture cleanup outcome")
+    }
+}
+
+fn persist_then_reset_owned_fixture(
+    collector: &ArtifactCollector,
+    case_name: &str,
+    fixture: &AdminFixtureEvidence,
+    transcript: &AdminRebalanceTranscript,
+    fixture_owned: bool,
+    reset: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    collector.write_text(
+        case_name,
+        ADMIN_FIXTURE_ARTIFACT,
+        &serde_json::to_string_pretty(fixture)?,
+    )?;
+    collector.write_text(
+        case_name,
+        ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+        &serde_json::to_string_pretty(transcript)?,
+    )?;
+    if fixture_owned {
+        reset().context("reset run-owned admin Tenant fixture")?;
+    }
+    Ok(())
+}
+
+fn combine_primary_and_secondary(
+    primary: Result<()>,
+    secondary: Result<()>,
+    secondary_label: &str,
+) -> Result<()> {
+    match (primary, secondary) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(secondary)) => Err(secondary.context(secondary_label.to_string())),
+        (Err(primary), Err(secondary)) => {
+            Err(primary.context(format!("{secondary_label} also failed: {secondary:#}")))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_persists_raw_evidence_before_reset_and_preserves_primary_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector = ArtifactCollector::new(dir.path());
+        let fixture = AdminFixtureEvidence {
+            schema_version: 1,
+            scenario: ADMIN_REBALANCE_SCENARIO.to_string(),
+            run_id: "run-cleanup".to_string(),
+            tenant: "owned-tenant".to_string(),
+            plan: AdminFixturePlan::for_scenario(ADMIN_REBALANCE_SCENARIO, 4)
+                .expect("fixture plan"),
+            observations: Vec::new(),
+        };
+        let case_dir = collector.case_dir("admin-rebalance");
+        let cleanup = persist_then_reset_owned_fixture(
+            &collector,
+            "admin-rebalance",
+            &fixture,
+            &AdminRebalanceTranscript::default(),
+            true,
+            || {
+                assert!(case_dir.join(ADMIN_FIXTURE_ARTIFACT).is_file());
+                assert!(case_dir.join(ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT).is_file());
+                Err(anyhow::anyhow!("owned fixture reset failed"))
+            },
+        );
+        let result = combine_primary_and_secondary(
+            Err(anyhow::anyhow!("verification failed")),
+            cleanup,
+            "fixture cleanup",
+        );
+        let error = format!("{:#}", result.expect_err("combined failure"));
+
+        assert!(error.contains("verification failed"));
+        assert!(error.contains("owned fixture reset failed"));
+    }
 
     fn record(
         id: &str,

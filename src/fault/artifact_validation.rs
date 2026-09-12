@@ -25,11 +25,11 @@ use uuid::Uuid;
 
 use crate::fault::{
     acknowledged_mutation::AcknowledgedMutationKind,
-    admin_runner::{ADMIN_WORKFLOW_ARTIFACT, AdminWorkflowEvidence},
     admin_rebalance::{
-        ADMIN_REBALANCE_OVERLAP_ARTIFACT, AdminRebalanceOverlapEvidence,
-        validate_admin_rebalance_evidence,
+        ADMIN_REBALANCE_OVERLAP_ARTIFACT, ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+        AdminRebalanceOverlapEvidence, AdminRebalanceTranscript, validate_admin_rebalance_evidence,
     },
+    admin_runner::{ADMIN_WORKFLOW_ARTIFACT, AdminWorkflowEvidence},
     admin_topology::{
         ADMIN_OPERATION_ARTIFACT, ADMIN_OPERATION_PROGRESS_ARTIFACT, ADMIN_TOPOLOGY_PROOF_ARTIFACT,
         AdminAttemptIdentity, AdminAttemptWindow, AdminOperationEvidence,
@@ -164,6 +164,11 @@ pub fn validate_admin_topology_artifact_files(
             read_jsonl::<OperationRecord>(&bound_case_artifact(&case_dir, "history.jsonl")?)?;
         let checker =
             read_json::<CheckerReport>(&bound_case_artifact(&case_dir, "checker-report.json")?)?;
+        let transcript = read_json::<AdminRebalanceTranscript>(&bound_case_artifact(
+            &case_dir,
+            ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+        )?)?;
+        transcript.validate(&operation, &progress)?;
         validate_admin_rebalance_evidence(&operation, &progress, &overlap, &history, &checker)?;
     }
     Ok(())

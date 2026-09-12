@@ -22,6 +22,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::fault::{
+    admin_rebalance::{ADMIN_REBALANCE_OVERLAP_ARTIFACT, ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT},
     admin_runner::ADMIN_WORKFLOW_ARTIFACT,
     admin_topology::{
         ADMIN_OPERATION_ARTIFACT, ADMIN_OPERATION_PROGRESS_ARTIFACT, ADMIN_TOPOLOGY_PROOF_ARTIFACT,
@@ -451,6 +452,15 @@ impl FaultRunArtifactSpec {
         };
         if scenario_spec(scenario).is_ok_and(|spec| spec.impact_policy.requires_availability()) {
             names.push(AVAILABILITY_REPORT_ARTIFACT.to_string());
+        }
+        if scenario == crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO {
+            names.extend(
+                [
+                    ADMIN_REBALANCE_OVERLAP_ARTIFACT,
+                    ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+                ]
+                .map(str::to_string),
+            );
         }
         if scenario_spec(scenario).is_ok_and(|spec| {
             spec.backend == crate::fault::scenarios::FaultBackend::KubernetesLifecycle

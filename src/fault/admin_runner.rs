@@ -145,7 +145,7 @@ pub(crate) struct AdminWorkflowExecution {
     pub(crate) error: Option<anyhow::Error>,
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 pub(crate) trait AdminCaseDriver: Send + Sync {
     /// Starts the typed RustFS admin operation and retains its raw receipt.
     async fn start(&self) -> Result<()>;
@@ -441,7 +441,8 @@ pub(crate) async fn run_admin_case(
             && execution_plan.case_name() == scenario.case_name,
         "admin runner received a mismatched typed execution plan"
     );
-    let driver = concrete_admin_case_driver(config, collector, scenario, admin_plan, run_id)?;
+    let driver =
+        concrete_admin_case_driver(config, collector, scenario, admin_plan, run_id, deadline)?;
     let execution = execute_admin_workflow(
         &scenario.name,
         run_id,
@@ -456,15 +457,33 @@ pub(crate) async fn run_admin_case(
 }
 
 fn concrete_admin_case_driver(
-    _config: &FaultTestConfig,
-    _collector: &ArtifactCollector,
-    _scenario: &FaultScenario,
+    config: &FaultTestConfig,
+    collector: &ArtifactCollector,
+    scenario: &FaultScenario,
     admin_plan: &AdminExecutionPlan,
-    _run_id: &str,
+    run_id: &str,
+    deadline: RunDeadline,
 ) -> Result<Box<dyn AdminCaseDriver>> {
+    match concrete_admin_case_kind(&scenario.name)? {
+        ConcreteAdminCaseKind::Rebalance => Ok(Box::new(
+            crate::fault::admin_rebalance::LiveAdminRebalanceDriver::new(
+                config, collector, scenario, admin_plan, run_id, deadline,
+            )?,
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcreteAdminCaseKind {
+    Rebalance,
+}
+
+fn concrete_admin_case_kind(scenario: &str) -> Result<ConcreteAdminCaseKind> {
+    if scenario == crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO {
+        return Ok(ConcreteAdminCaseKind::Rebalance);
+    }
     bail!(
-        "admin scenario {:?} has a typed execution plan but no concrete case driver; keep it Planned until its scenario implementation is live-qualified",
-        admin_plan.scenario
+        "admin scenario {scenario:?} has a typed execution plan but no concrete case driver; keep it Planned until its scenario implementation is live-qualified"
     )
 }
 
@@ -472,6 +491,16 @@ fn concrete_admin_case_driver(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn concrete_dispatch_selects_only_live_rebalance_driver() {
+        assert_eq!(
+            concrete_admin_case_kind(crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO)
+                .expect("rebalance dispatch"),
+            ConcreteAdminCaseKind::Rebalance
+        );
+        assert!(concrete_admin_case_kind("admin-decommission").is_err());
+    }
 
     #[derive(Default)]
     struct FakeDriver {
@@ -497,7 +526,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl AdminCaseDriver for FakeDriver {
         async fn start(&self) -> Result<()> {
             self.call("start")
@@ -641,7 +670,7 @@ mod tests {
     async fn primary_error_survives_cancel_and_cleanup_failures() {
         struct FailingCleanupDriver(FakeDriver);
 
-        #[async_trait]
+        #[async_trait(?Send)]
         impl AdminCaseDriver for FailingCleanupDriver {
             async fn start(&self) -> Result<()> {
                 self.0.start().await
@@ -693,7 +722,7 @@ mod tests {
 
         struct PendingDriver(FakeDriver);
 
-        #[async_trait]
+        #[async_trait(?Send)]
         impl AdminCaseDriver for PendingDriver {
             async fn start(&self) -> Result<()> {
                 self.0.start().await
@@ -759,7 +788,7 @@ mod tests {
     async fn failed_start_cannot_cancel_without_an_owned_operation() {
         struct NoOwnedOperationDriver(FakeDriver);
 
-        #[async_trait]
+        #[async_trait(?Send)]
         impl AdminCaseDriver for NoOwnedOperationDriver {
             async fn start(&self) -> Result<()> {
                 self.0.call("start")?;
