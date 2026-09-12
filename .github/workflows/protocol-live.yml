@@ -162,7 +162,9 @@ jobs:
     needs: validate-inputs
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: sm-standard-4
-    environment: rustfs-protocol-test
+    environment:
+      name: rustfs-protocol-test
+      deployment: false
     timeout-minutes: 20
     env:
       RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ inputs.rustfs_endpoint || github.event.client_payload.rustfs_endpoint || secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
@@ -208,7 +210,9 @@ jobs:
     needs: [validate-inputs, smoke]
     if: github.event_name != 'pull_request'
     runs-on: sm-standard-4
-    environment: rustfs-protocol-test
+    environment:
+      name: rustfs-protocol-test
+      deployment: false
     timeout-minutes: 60
     env:
       RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ inputs.rustfs_endpoint || github.event.client_payload.rustfs_endpoint || secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
@@ -259,7 +263,9 @@ jobs:
     needs: [validate-inputs, native-regression]
     if: ${{ github.event_name != 'pull_request' && always() && needs.validate-inputs.result == 'success' }}
     runs-on: sm-standard-4
-    environment: rustfs-protocol-test
+    environment:
+      name: rustfs-protocol-test
+      deployment: false
     timeout-minutes: 30
     env:
       RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ inputs.rustfs_endpoint || github.event.client_payload.rustfs_endpoint || secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
@@ -310,7 +316,9 @@ jobs:
     needs: [validate-inputs, native-regression]
     if: ${{ github.event_name != 'pull_request' && always() && needs.validate-inputs.result == 'success' }}
     runs-on: sm-standard-4
-    environment: rustfs-protocol-test
+    environment:
+      name: rustfs-protocol-test
+      deployment: false
     timeout-minutes: 45
     env:
       RUSTFS_PROTOCOL_TEST_ENDPOINT: ${{ inputs.rustfs_endpoint || github.event.client_payload.rustfs_endpoint || secrets.RUSTFS_PROTOCOL_TEST_ENDPOINT }}
