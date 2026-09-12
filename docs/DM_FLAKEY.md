@@ -1,16 +1,16 @@
-# dm-flakey Operations
+# Device-mapper Operations
 
 This runbook prepares and tears down the host device-mapper and Kubernetes
-storage required by the `dm-flakey` and `dm-flakey-versioned-hot` scenarios.
+storage required by the seven `dm-*` scenarios.
 Use only dedicated lab hosts and storage. Verify every node, device, mount,
 PersistentVolume, and path before applying or removing resources.
 
-`dm-flakey` and `dm-flakey-versioned-hot` are explicit scenarios that need a
-dedicated static Local PV setup and privileged helper access on the fault
-namespace.
+Every device-mapper scenario needs a dedicated static Local PV setup and
+privileged helper access on the fault namespace.
 
 There is no Make target that installs this environment. Prepare the host storage
-and Kubernetes Local PVs first, then use `fault-preflight` to verify them.
+and Kubernetes Local PVs first; `fault-dm-run` performs preflight as part of the
+single foreground run.
 
 ## dm-flakey Host Storage
 
@@ -193,7 +193,7 @@ the command sees the same mount namespace as PID 1. The host must provide
 read-only checker for the mounted filesystem: `/usr/sbin/e2fsck` for ext2/3/4
 or `/usr/sbin/xfs_repair` for XFS.
 
-## dm-flakey Run
+## Device-mapper Run
 
 Required variables on the machine that runs the s3chaos command:
 
@@ -232,8 +232,7 @@ export RUSTFS_FAULT_TEST_MAX_ACK_TO_FAULT_MS=1000
 Run:
 
 ```bash
-make fault-preflight SCENARIO=dm-flakey
-make fault-run-dm
+make fault-dm-run SCENARIO=dm-flakey
 ```
 
 Run the soft-power-loss proxy with the same host/PV variables but without a
@@ -241,22 +240,28 @@ fault-table variable:
 
 ```bash
 unset RUSTFS_FAULT_TEST_DM_FAULT_TABLE
-make fault-preflight SCENARIO=dm-flakey-versioned-hot
-make fault-run SCENARIO=dm-flakey-versioned-hot
+make fault-dm-run SCENARIO=dm-flakey-versioned-hot
 ```
 
-Run one true ACK-then-activate detector by selecting its typed scenario:
+Run one true ACK-then-activate detector by selecting one typed scenario, for
+example:
 
 ```bash
-make fault-run SCENARIO=dm-drop-writes-after-ack-put
-make fault-run SCENARIO=dm-drop-writes-after-ack-overwrite
-make fault-run SCENARIO=dm-drop-writes-after-ack-delete-marker
-make fault-run SCENARIO=dm-drop-writes-after-ack-zero-byte-put
-make fault-run SCENARIO=dm-drop-writes-after-ack-multipart-complete
+make fault-dm-run SCENARIO=dm-drop-writes-after-ack-put
 ```
 
+The other typed names are `dm-drop-writes-after-ack-overwrite`,
+`dm-drop-writes-after-ack-delete-marker`,
+`dm-drop-writes-after-ack-zero-byte-put`, and
+`dm-drop-writes-after-ack-multipart-complete`. Do not loop over these names.
+Keep the command in the foreground, inspect the emitted artifact root, and
+verify the mapper, mount, rollback or quarantine state, and static PV state
+before preparing a fresh fixture for another DM run. Multi-attempt DM suites are
+rejected because the retained static PVs are not automatically reset between
+Tenant lifecycles.
+
 These five cases share the same DeviceMapper actuator but remain independent
-catalog entries and suite attempts. Each prepares only its required baseline,
+catalog entries and supervised runs. Each prepares only its required baseline,
 proves the host-storage target, and prepares the helper and exact mapper
 transaction before issuing the typed mutation. After a definite 2xx response
 with a non-null version ID, one preconditioned host command starts
@@ -326,7 +331,7 @@ The Rust test reads the original `dmsetup table` as the recovery table when
 restores that table, but operators must still verify host storage manually after
 the run.
 
-## dm-flakey Cleanup
+## Device-mapper Cleanup
 
 `fault-cleanup` removes the owned Kubernetes namespace and managed Chaos
 resources only. It does not remove the static StorageClass, PVs, loop devices,

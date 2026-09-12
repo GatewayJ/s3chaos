@@ -1583,6 +1583,35 @@ scenarios:
     }
 
     #[test]
+    fn canonical_chaos_mesh_example_fits_its_budget() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+            "../../fault/examples/chaos-mesh.yaml"
+        ))
+        .expect("canonical Chaos Mesh example")
+        .resolve()
+        .expect("resolved canonical Chaos Mesh example");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(42);
+
+        let expansion =
+            build_fault_suite_plan_expansion(suite, base, "chaos-suite-test".to_string())
+                .expect("canonical Chaos Mesh suite plan");
+
+        assert_eq!(expansion.plan.attempts.len(), 19);
+        assert!(expansion.plan.requires_chaos_mesh);
+        assert!(!expansion.plan.requires_static_storage);
+        assert!(expansion.plan.required_tools.is_empty());
+        assert!(
+            expansion.plan.budgets.minimum_required_seconds
+                <= expansion
+                    .plan
+                    .budgets
+                    .max_duration_seconds
+                    .expect("canonical suite maxDuration")
+        );
+    }
+
+    #[test]
     fn warp_example_rejects_duration_without_post_warp_headroom() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
             "../../fault/examples/warp-performance.yaml"

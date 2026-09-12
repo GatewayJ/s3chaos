@@ -399,6 +399,7 @@ impl FaultSuite {
                 ResolvedFaultSuiteScenario::from_suite_scenario(scenario, &workload_profiles)
             })
             .collect::<Result<Vec<_>>>()?;
+        validate_static_storage_supervision(&scenarios)?;
 
         Ok(ResolvedFaultSuite {
             api_version: self.api_version.clone(),
@@ -431,6 +432,19 @@ impl FaultSuite {
         );
         Ok(())
     }
+}
+
+fn validate_static_storage_supervision(scenarios: &[ResolvedFaultSuiteScenario]) -> Result<()> {
+    if let Some(static_scenario) = scenarios
+        .iter()
+        .find(|scenario| scenario.requires_static_storage)
+    {
+        ensure!(
+            scenarios.len() == 1 && static_scenario.repetitions == 1,
+            "device-mapper scenarios require a suite containing exactly one scenario with one repetition"
+        );
+    }
+    Ok(())
 }
 
 impl ResolvedFaultSuite {
@@ -793,9 +807,10 @@ mod tests {
         reporting::{FailureClassification, FailureSeverity, ResponsibilityDomain},
         scenarios::{
             ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, DetectorQualification,
-            FaultScenarioStatus,
+            FaultScenarioStatus, WARP_UNDER_CHAOS_SCENARIO, executable_scenario_catalog,
         },
     };
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn resolves_valid_fault_suite() {
@@ -852,6 +867,93 @@ scenarios:
             }
         );
         assert!(resolved.scenarios[0].requires_chaos_mesh);
+    }
+
+    #[test]
+    fn canonical_chaos_mesh_suite_contains_only_ordinary_attempts() {
+        let canonical = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+            "../../fault/examples/chaos-mesh.yaml"
+        ))
+        .expect("chaos mesh suite yaml");
+        let focused = [
+            serde_yaml_ng::from_str::<FaultSuite>(include_str!("../../fault/examples/smoke.yaml"))
+                .expect("smoke suite yaml"),
+            serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+                "../../fault/examples/regression.yaml"
+            ))
+            .expect("regression suite yaml"),
+            serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+                "../../fault/examples/quorum-reliability.yaml"
+            ))
+            .expect("quorum suite yaml"),
+        ];
+        let expected_profiles = focused
+            .iter()
+            .flat_map(|suite| suite.workload_profiles.clone())
+            .collect::<BTreeMap<_, _>>();
+        let expected_scenarios = focused
+            .iter()
+            .flat_map(|suite| suite.scenarios.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(&canonical.workload_profiles, &expected_profiles);
+        assert_eq!(&canonical.scenarios, &expected_scenarios);
+
+        let suite = canonical.resolve().expect("resolved chaos mesh suite");
+
+        assert_eq!(
+            suite
+                .scenarios
+                .iter()
+                .map(|scenario| scenario.repetitions)
+                .sum::<usize>(),
+            19
+        );
+        assert!(
+            suite.scenarios.iter().all(|scenario| {
+                scenario.requires_chaos_mesh && !scenario.requires_static_storage
+            })
+        );
+        let expected = executable_scenario_catalog()
+            .filter(|scenario| {
+                scenario.requires_chaos_mesh() && scenario.scenario != WARP_UNDER_CHAOS_SCENARIO
+            })
+            .map(|scenario| scenario.scenario)
+            .collect::<BTreeSet<_>>();
+        let actual = suite
+            .scenarios
+            .iter()
+            .map(|scenario| scenario.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn device_mapper_suite_requires_one_supervised_attempt() {
+        let single = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: dm-single
+scenarios:
+  - name: dm-flakey
+"#,
+        )
+        .expect("single DM suite yaml");
+        single.resolve().expect("single supervised DM attempt");
+
+        for scenarios in [
+            "  - name: dm-flakey\n    repetitions: 2\n",
+            "  - name: dm-flakey\n  - name: dm-flakey-versioned-hot\n",
+            "  - name: io-eio\n  - name: dm-flakey\n",
+        ] {
+            let suite = serde_yaml_ng::from_str::<FaultSuite>(&format!(
+                "apiVersion: rustfs.com/s3chaos/v1alpha1\nkind: FaultSuite\nmetadata:\n  name: dm-unsupervised\nscenarios:\n{scenarios}"
+            ))
+            .expect("unsupervised DM suite yaml");
+            let error = suite.resolve().expect_err("unsupervised DM suite");
+            assert!(error.to_string().contains("exactly one scenario"));
+        }
     }
 
     #[test]

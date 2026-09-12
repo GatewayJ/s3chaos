@@ -73,7 +73,7 @@ fn active_dm_termination_past_grace_never_escalates_to_sigkill() {
 
 #[cfg(unix)]
 #[test]
-fn mixed_suite_ordinary_attempt_past_grace_escalates_to_sigkill() {
+fn ordinary_fault_termination_past_grace_escalates_to_sigkill() {
     let output = fault_supervision_output(false);
 
     assert!(output.status.success());
@@ -167,6 +167,121 @@ cleanup_host_mutation_state
                 .contains("preserving unresolved host mutation state")
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_run_captures_evidence_before_managed_chaos_cleanup() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let case_dir = temporary.path().join("case");
+    std::fs::create_dir(&case_dir).expect("case directory");
+    std::fs::write(case_dir.join("diagnosis.txt"), "diagnosis\n").expect("diagnosis");
+    std::fs::write(case_dir.join("failure-summary.json"), "{}\n").expect("failure summary");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+manifest_function="$(declare -f write_failure_evidence_manifest)"
+eval "${manifest_function/write_failure_evidence_manifest/write_failure_evidence_manifest_real}"
+summary_function="$(declare -f write_runner_failure_summary)"
+eval "${summary_function/write_runner_failure_summary/write_runner_failure_summary_real}"
+capture_cluster_snapshot() { printf 'snapshot:%s\n' "$2"; }
+capture_fault_logs() { printf 'logs\n'; }
+write_runner_failure_summary() {
+  printf 'summary:%s:%s\n' "$1" "$3"
+  write_runner_failure_summary_real "$@"
+}
+write_failure_evidence_manifest() {
+  printf 'manifest:%s:%s\n' "$1" "$5"
+  write_failure_evidence_manifest_real "$@"
+}
+cleanup_managed_chaos() { printf 'cleanup\n'; }
+finalize_failed_run scenario io-eio "$2" 42 failed
+"#,
+            "fault-failure-finalization-test",
+            script,
+            temporary.path().to_str().expect("temporary path"),
+        ])
+        .output()
+        .expect("run fault failure finalization shell test");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "snapshot:failed\nlogs\nsummary:io-eio:42\nmanifest:scenario:failed\ncleanup\n"
+    );
+    let manifest = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(temporary.path().join("failure-evidence.json"))
+            .expect("failure evidence"),
+    )
+    .expect("failure evidence json");
+    assert_eq!(manifest["status"], "captured-before-managed-chaos-cleanup");
+    assert_eq!(manifest["scope"], "scenario");
+    assert_eq!(manifest["name"], "io-eio");
+    assert_eq!(manifest["exitCode"], 42);
+    assert_eq!(manifest["snapshotStage"], "failed");
+    assert_eq!(manifest["detailedRustDiagnosisFiles"], 1);
+    assert_eq!(manifest["failureSummaryFiles"], 2);
+    assert!(temporary.path().join("runner-diagnosis.txt").is_file());
+    let summary = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(temporary.path().join("runner-failure-summary.json"))
+            .expect("runner failure summary"),
+    )
+    .expect("runner failure summary json");
+    assert_eq!(summary["rust_failure_summary_present"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_chaos_suite_gate_rejects_static_and_warp_plans() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let valid = temporary.path().join("valid.json");
+    let static_storage = temporary.path().join("static.json");
+    let warp = temporary.path().join("warp.json");
+    std::fs::write(
+        &valid,
+        r#"{"requiresChaosMesh":true,"requiresStaticStorage":false,"attempts":[{"scenario":"io-eio","requiresChaosMesh":true,"requiresStaticStorage":false,"expectedBackend":"chaos-mesh-io"}]}"#,
+    )
+    .expect("valid plan");
+    std::fs::write(
+        &static_storage,
+        r#"{"requiresChaosMesh":false,"requiresStaticStorage":true,"attempts":[{"scenario":"dm-flakey","requiresChaosMesh":false,"requiresStaticStorage":true,"expectedBackend":"host-device-mapper"}]}"#,
+    )
+    .expect("static plan");
+    std::fs::write(
+        &warp,
+        r#"{"requiresChaosMesh":true,"requiresStaticStorage":false,"attempts":[{"scenario":"warp-under-chaos","requiresChaosMesh":true,"requiresStaticStorage":false,"expectedBackend":"chaos-mesh-io"}]}"#,
+    )
+    .expect("warp plan");
+
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+is_ordinary_chaos_suite_plan "$2"
+! is_ordinary_chaos_suite_plan "$3"
+! is_ordinary_chaos_suite_plan "$4"
+require_non_static_suite_plan "$2"
+! (require_non_static_suite_plan "$3") 2>/dev/null
+"#,
+            "fault-chaos-suite-gate-test",
+            script,
+            valid.to_str().expect("valid path"),
+            static_storage.to_str().expect("static path"),
+            warp.to_str().expect("warp path"),
+        ])
+        .output()
+        .expect("run ordinary Chaos suite gate shell test");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
