@@ -986,6 +986,19 @@ scenarios:
     }
 
     #[test]
+    fn planned_admin_rebalance_template_is_well_formed_but_not_runnable() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+            "../../fault/planned/admin-rebalance.yaml"
+        ))
+        .expect("planned admin-rebalance suite syntax");
+
+        let error = suite
+            .resolve()
+            .expect_err("planned admin-rebalance must retain the execution gate");
+        assert!(error.to_string().contains("not executable"));
+    }
+
+    #[test]
     fn accepts_explicit_continue_on_severities() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
             r#"

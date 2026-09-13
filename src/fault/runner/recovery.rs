@@ -516,14 +516,14 @@ impl FaultRun<'_> {
     }
 }
 
-async fn observe_recovery_health(
+pub(crate) async fn observe_recovery_health(
     cluster: &crate::framework::config::ClusterTestConfig,
     endpoint: &str,
     baseline: &RecoveryHealthBaseline,
     pods: &[PodIdentity],
     scenario: &str,
     run_id: &str,
-    persist: &dyn Fn(&RecoveryHealthReport) -> Result<()>,
+    persist: &(dyn Fn(&RecoveryHealthReport) -> Result<()> + Sync),
 ) -> Result<RecoveryHealthReport> {
     let (access_key, secret_key) = resources::test_credentials();
     let started_at_ms = now_ms();

@@ -1233,11 +1233,11 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::HealRegression,
         ]),
         case_name: "fault_admin_rebalance_preserves_object_model",
-        description: "Planned scenario-owned RustFS admin flow: run rebalance under one finite, byte-bounded S3 workload in a fresh multi-pool Tenant.",
+        description: "Scenario-owned RustFS admin flow: rebalance a staged two-pool Tenant under one finite, byte-bounded, version-aware S3 workload.",
         priority: FaultPriority::P1,
         backend: FaultBackend::PlannedReliabilityWorkflow,
         status: FaultScenarioStatus::Planned,
-        workload_profile: FaultScenarioWorkloadProfile::Default,
+        workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
         isolation: FaultIsolation::FreshTenant,
         crds: &[],
         required_tools: &[],
@@ -1252,6 +1252,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             "preflight and a fresh pools/list observation immediately before start must prove the same healthy idle pool identities, sufficient bounded-workload capacity, and no concurrent decommission/rebalance",
             "raw Tenant GETs, Kubernetes context/cluster/service UID port-forward identity, and pre/post /rustfs/admin/v3/info deploymentID observations must bind every start/status request and pool list to one RustFS deployment",
             "the complete finite workload-plan.json must derive a conservative byte bound that charges every PUT, hot-key overwrite version, multipart completion, and aborted multipart body",
+            "admin-rebalance-overlap.json must bind the exact workload history sequence to a rebalance status request interval and at least one S3 operation interval that overlap the operation window",
         ],
         validation: "every participating rebalance pool reaches successful completion, nonparticipants remain terminal, no stop/error/cleanup warning occurs, pool identities remain stable before/after, and bounded S3 history/checker evidence preserves the committed object model",
         observability: "admin-topology-proof.json, admin-operation.json, monotonic admin-operation-progress.jsonl, workload history, checker reports, RustFS logs",
@@ -1587,6 +1588,12 @@ pub fn apply_catalog_defaults(config: &mut FaultTestConfig) -> Result<()> {
             _ => {}
         }
     }
+    if config.scenario == ADMIN_REBALANCE_SCENARIO {
+        // The staged single-pool prefill must include a deterministic
+        // zero-byte cohort. Nonzero PUT and multipart bodies are still issued
+        // by the mixed workload after the second pool joins.
+        config.workload_directory_marker_percent = 100;
+    }
     Ok(())
 }
 
@@ -1831,6 +1838,23 @@ mod tests {
             WorkloadOperationMix::default()
         );
         assert!(FaultScenario::from_config(&config).is_ok());
+    }
+
+    #[test]
+    fn planned_admin_rebalance_uses_versioned_zero_byte_prefill() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = ADMIN_REBALANCE_SCENARIO.to_string();
+
+        apply_catalog_defaults(&mut config).expect("admin rebalance defaults");
+
+        assert!(config.workload_versioning);
+        assert_eq!(config.workload_directory_marker_percent, 100);
+        assert_eq!(
+            scenario_spec(ADMIN_REBALANCE_SCENARIO)
+                .expect("admin rebalance scenario")
+                .status,
+            FaultScenarioStatus::Planned
+        );
     }
 
     #[test]

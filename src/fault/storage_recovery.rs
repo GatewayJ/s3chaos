@@ -14,10 +14,10 @@
 
 //! Evidence contracts for RustFS storage-recovery scenarios.
 //!
-//! These types deliberately stop short of discovering RustFS's private
-//! on-disk layout. A future runtime adapter may execute replacement, bitrot,
-//! and stale-generation workflows only after RustFS supplies a stable mapping
-//! hook and the adapter can populate these proofs from observed identities.
+//! Mapping evidence may come from a RustFS diagnostic API or the bounded,
+//! read-only XL2 inspector. Offline evidence remains receipt-bound and derives
+//! membership from authenticated runtime topology rather than impersonating a
+//! diagnostic API response.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -42,6 +42,11 @@ use crate::fault::{
     },
     preflight::{PreflightStatus, TARGET_PROOF_SCHEMA_VERSION, TargetProof, TargetProofStatus},
     quorum::{ErasureSetMembership, ErasureSetShape, PersistedVersionClass, QuorumRequirements},
+    storage_recovery_helper::OfflineXl2InspectResponse,
+    storage_recovery_runtime::{
+        OwnedStorageContext, StorageRecoveryHostOperation, StorageRecoveryOperationReceipt,
+    },
+    xl2_inspector::OFFLINE_XL2_INSPECTOR_REVISION,
 };
 
 pub const STORAGE_RECOVERY_PROOF_SCHEMA_VERSION: u8 = 1;
@@ -1700,6 +1705,23 @@ impl StaleDiskReturnProof {
 #[serde(rename_all = "kebab-case")]
 pub enum ShardMappingSource {
     RustfsDiagnosticApi,
+    OfflineXl2Inspector,
+}
+
+impl ShardMappingSource {
+    fn validate_revision(self, revision: &str) -> Result<()> {
+        match self {
+            Self::RustfsDiagnosticApi => ensure!(
+                !revision.trim().is_empty(),
+                "RustFS diagnostic mapping API revision is empty"
+            ),
+            Self::OfflineXl2Inspector => ensure!(
+                revision == OFFLINE_XL2_INSPECTOR_REVISION,
+                "offline XL2 mapping has an unsupported inspector revision"
+            ),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1843,6 +1865,8 @@ impl ShardMutationProof {
         );
         self.volume.validate()?;
         let mutation_target_proof = self.mutation_target_proof()?;
+        self.mapping_source
+            .validate_revision(&self.mapping_api_revision)?;
         for (field, value) in [
             ("mapping API revision", self.mapping_api_revision.as_str()),
             ("object key", self.object_key.as_str()),
@@ -2461,6 +2485,13 @@ pub struct ForcedReadProbe {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OfflineVersionShardMappingEvidence {
+    pub context: Box<OwnedStorageContext>,
+    pub inspection_receipt: Box<StorageRecoveryOperationReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VersionShardMappingObservation {
     pub schema_version: u8,
     pub identity: StorageRecoveryArtifactIdentity,
@@ -2469,6 +2500,8 @@ pub struct VersionShardMappingObservation {
     pub api_revision: String,
     pub response_sha256: String,
     pub response_body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_evidence: Option<Box<OfflineVersionShardMappingEvidence>>,
     pub target_proof_sha256: String,
     pub observed_at_ms: u64,
 }
@@ -2483,6 +2516,133 @@ pub struct RustfsVersionShardMappingResponse {
     pub pool_index: u32,
     pub set_index: u32,
     pub shard_ids: Vec<String>,
+}
+
+impl VersionShardMappingObservation {
+    pub fn validated_mapping(
+        &self,
+        membership: &ErasureSetMembership,
+        shape: &ErasureSetShape,
+    ) -> Result<RustfsVersionShardMappingResponse> {
+        self.source.validate_revision(&self.api_revision)?;
+        validate_sha256("version-shard mapping response", &self.response_sha256)?;
+        validate_sha256(
+            "version-shard mapping target proof",
+            &self.target_proof_sha256,
+        )?;
+        ensure!(
+            self.response_sha256 == sha256_bytes(self.response_body.as_bytes())
+                && self.observed_at_ms > 0,
+            "version-shard mapping source body or observation timestamp is invalid"
+        );
+        match self.source {
+            ShardMappingSource::RustfsDiagnosticApi => {
+                ensure!(
+                    self.offline_evidence.is_none(),
+                    "RustFS diagnostic mapping must not carry offline inspector evidence"
+                );
+                serde_json::from_str(&self.response_body)
+                    .context("decode captured RustFS version-shard mapping response")
+            }
+            ShardMappingSource::OfflineXl2Inspector => {
+                let evidence = self.offline_evidence.as_deref().context(
+                    "offline version-shard mapping lacks its helper receipt and context",
+                )?;
+                let context = evidence.context.as_ref();
+                let receipt = evidence.inspection_receipt.as_ref();
+                context.validate()?;
+                receipt.validate_for(context, &receipt.operation)?;
+                let StorageRecoveryHostOperation::InspectXlMeta {
+                    bucket,
+                    object_key,
+                    object_sha256,
+                    version_id,
+                    selected_part_number,
+                    expected_mount_device_id,
+                    expected_drive_uuid,
+                    ..
+                } = &receipt.operation
+                else {
+                    anyhow::bail!("offline version-shard mapping receipt is not an XL2 inspection")
+                };
+                ensure!(
+                    context.identity == self.identity
+                        && context.identity.scenario == context.case.scenario()
+                        && context.volume.target_proof_sha256 == self.target_proof_sha256
+                        && receipt.completed_at_ms == self.observed_at_ms
+                        && receipt.response_sha256 == self.response_sha256
+                        && receipt.response_body == self.response_body,
+                    "offline version-shard mapping is not bound to its exact context and helper receipt"
+                );
+                let response =
+                    serde_json::from_str::<OfflineXl2InspectResponse>(&receipt.response_body)
+                        .context("decode receipt-bound offline XL2 inspection response")?;
+                validate_sha256("offline format.json", &response.format_json_sha256)?;
+                validate_sha256("offline xl.meta", &response.xl_meta_sha256)?;
+                ensure!(
+                    bucket == &self.identity.bucket
+                        && version_id == &response.layout.version_id
+                        && response.layout.inspector_revision == self.api_revision
+                        && expected_mount_device_id == &response.mount_device_id
+                        && expected_mount_device_id == &context.host_generation.device_major_minor
+                        && expected_drive_uuid == &response.drive_uuid
+                        && expected_drive_uuid == &context.volume.rustfs_drive_uuid
+                        && response.selected_part.part_number == *selected_part_number
+                        && response.selected_part.shard_device_id
+                            == context.host_generation.device_major_minor
+                        && response.selected_part.shard_inode > 0
+                        && response.selected_part.shard_size_bytes > 0
+                        && context.volume.pool_index == shape.pool_index
+                        && context.volume.set_index == shape.set_index,
+                    "offline XL2 receipt does not identify the mapped object, drive, or erasure set"
+                );
+                validate_sha256(
+                    "offline selected shard preimage",
+                    &response.selected_part.original_sha256,
+                )?;
+                let selected_path = response
+                    .layout
+                    .part_numbers
+                    .iter()
+                    .position(|part| part == selected_part_number)
+                    .and_then(|index| response.layout.relative_part_paths.get(index));
+                ensure!(
+                    selected_path == Some(&response.selected_part.relative_part_path),
+                    "offline XL2 receipt selected shard is not present in the inspected layout"
+                );
+                let shard_ids = membership
+                    .members
+                    .iter()
+                    .flat_map(|member| member.shard_ids.iter().cloned())
+                    .collect::<Vec<_>>();
+                let total = response
+                    .layout
+                    .erasure_data_shards
+                    .checked_add(response.layout.erasure_parity_shards)
+                    .context("offline XL2 erasure width overflow")?;
+                ensure!(
+                    usize::try_from(total)? == shard_ids.len()
+                        && response.layout.erasure_index > 0
+                        && response.layout.erasure_index <= total
+                        && shard_ids
+                            .iter()
+                            .filter(|id| *id == &response.drive_uuid)
+                            .count()
+                            == 1,
+                    "offline XL2 layout does not match authenticated runtime membership"
+                );
+                Ok(RustfsVersionShardMappingResponse {
+                    bucket: bucket.clone(),
+                    object_key: object_key.clone(),
+                    version_id: version_id.clone(),
+                    object_sha256: object_sha256.clone(),
+                    pool_index: context.volume.pool_index,
+                    set_index: context.volume.set_index,
+                    shard_ids,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2736,28 +2896,25 @@ impl ForceReadThroughProof {
                 "version-shard mapping has a mismatched schema/identity or duplicate observation id"
             );
             ensure!(
-                mapping.source == ShardMappingSource::RustfsDiagnosticApi
-                    && !mapping.api_revision.trim().is_empty()
-                    && mapping.target_proof_sha256 == self.target_proof_sha256
+                mapping.target_proof_sha256 == self.target_proof_sha256
                     && mapping.observed_at_ms > 0
                     && mapping.observed_at_ms >= runtime.target_proof.generated_at_ms
                     && mapping.observed_at_ms < self.fault_active_from_ms
                     && self.fault_active_from_ms - mapping.observed_at_ms
                         <= STORAGE_OBSERVATION_MAX_AGE_MS,
-                "version-shard mapping is not a fresh pre-fault RustFS diagnostic observation"
+                "version-shard mapping is not a fresh pre-fault observation"
             );
+            mapping.source.validate_revision(&mapping.api_revision)?;
             validate_sha256("version-shard mapping response", &mapping.response_sha256)?;
             ensure!(
                 mapping.response_sha256 == sha256_bytes(mapping.response_body.as_bytes()),
-                "version-shard mapping response digest does not match the captured RustFS response body"
+                "version-shard mapping response digest does not match the captured source body"
             );
             validate_sha256(
                 "version-shard mapping target proof",
                 &mapping.target_proof_sha256,
             )?;
-            let response =
-                serde_json::from_str::<RustfsVersionShardMappingResponse>(&mapping.response_body)
-                    .context("decode captured RustFS version-shard mapping response")?;
+            let response = mapping.validated_mapping(membership, &self.shape)?;
             ensure!(
                 !response.object_key.trim().is_empty()
                     && !response.version_id.trim().is_empty()
@@ -3695,6 +3852,23 @@ pub enum FragmentReferenceState {
 #[serde(rename_all = "kebab-case")]
 pub enum ShardInventorySource {
     RustfsDiagnosticApi,
+    OfflineXl2Inspector,
+}
+
+impl ShardInventorySource {
+    fn validate_revision(self, revision: &str) -> Result<()> {
+        match self {
+            Self::RustfsDiagnosticApi => ensure!(
+                !revision.trim().is_empty(),
+                "RustFS diagnostic inventory API revision is empty"
+            ),
+            Self::OfflineXl2Inspector => ensure!(
+                revision == OFFLINE_XL2_INSPECTOR_REVISION,
+                "offline XL2 inventory has an unsupported inspector revision"
+            ),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3800,10 +3974,11 @@ impl ShardInventorySnapshot {
         );
         self.identity.validate()?;
         self.volume.validate()?;
+        self.receipt
+            .source
+            .validate_revision(&self.receipt.api_revision)?;
         ensure!(
             !self.receipt.snapshot_id.trim().is_empty()
-                && self.receipt.source == ShardInventorySource::RustfsDiagnosticApi
-                && !self.receipt.api_revision.trim().is_empty()
                 && self.receipt.started_at_ms > 0
                 && self.receipt.started_at_ms < self.receipt.completed_at_ms
                 && self.receipt.completed_at_ms == self.receipt.observed_at_ms
@@ -6731,6 +6906,18 @@ mod tests {
             .validate_against_history(&history)
             .expect("valid bitrot proof");
 
+        let mut offline_mapping = proof.clone();
+        offline_mapping.mapping_source = ShardMappingSource::OfflineXl2Inspector;
+        offline_mapping.mapping_api_revision = OFFLINE_XL2_INSPECTOR_REVISION.to_string();
+        offline_mapping
+            .validate_against_history(&history)
+            .expect("offline XL2 mapping source");
+        offline_mapping.mapping_api_revision = "unknown-xl2-profile".to_string();
+        assert!(
+            offline_mapping.validate_against_history(&history).is_err(),
+            "offline mapping evidence must name the supported capability profile"
+        );
+
         let mut wrong_host_node = proof.clone();
         let host_evidence = wrong_host_node
             .host_mutation_evidence
@@ -7316,6 +7503,7 @@ mod tests {
             api_revision: "v1".to_string(),
             response_sha256: sha256_bytes(mapping_response.as_bytes()),
             response_body: mapping_response,
+            offline_evidence: None,
             target_proof_sha256: target_proof_sha256.clone(),
             observed_at_ms: 299,
         }];
@@ -7495,6 +7683,23 @@ mod tests {
                 &mapping_observations,
             )
             .expect("valid forced read");
+
+        let mut synthesized_offline_mapping = mapping_observations.clone();
+        synthesized_offline_mapping[0].source = ShardMappingSource::OfflineXl2Inspector;
+        synthesized_offline_mapping[0].api_revision = OFFLINE_XL2_INSPECTOR_REVISION.to_string();
+        let error = proof
+            .validate_against_runtime(
+                &membership,
+                &runtime_contract,
+                "drive-7",
+                &history,
+                &synthesized_offline_mapping,
+            )
+            .expect_err("offline mapping without helper receipt must fail");
+        assert!(
+            error.to_string().contains("lacks its helper receipt"),
+            "{error:#}"
+        );
 
         {
             let mut bitrot_target = serde_json::from_str::<serde_json::Value>(&target_proof_body)
@@ -8185,6 +8390,7 @@ mod tests {
                 api_revision: "v1".to_string(),
                 response_sha256: sha256_bytes(response.as_bytes()),
                 response_body: response,
+                offline_evidence: None,
                 target_proof_sha256: target_proof_sha256.clone(),
                 observed_at_ms: 299,
             });
@@ -8312,6 +8518,17 @@ mod tests {
             "cursor-before",
             550,
             vec![committed.clone(), unknown.clone(), dangling.clone()],
+        );
+        let mut offline_inventory = before_inventory.clone();
+        offline_inventory.receipt.source = ShardInventorySource::OfflineXl2Inspector;
+        offline_inventory.receipt.api_revision = OFFLINE_XL2_INSPECTOR_REVISION.to_string();
+        offline_inventory
+            .validate()
+            .expect("offline XL2 inventory source");
+        offline_inventory.receipt.api_revision = "unknown-xl2-profile".to_string();
+        assert!(
+            offline_inventory.validate().is_err(),
+            "offline inventory evidence must name the supported capability profile"
         );
         let after_inventory = inventory(
             "inventory-after",
