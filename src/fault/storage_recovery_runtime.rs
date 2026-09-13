@@ -305,8 +305,10 @@ pub struct HostGenerationIdentity {
     pub mount_id: String,
     pub mount_namespace_id: String,
     pub device_major_minor: String,
-    pub device_mapper_uuid: String,
-    pub device_mapper_table_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_mapper_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_mapper_table_sha256: Option<String>,
     pub filesystem_uuid: String,
     pub rustfs_drive_uuid: String,
 }
@@ -317,11 +319,6 @@ impl HostGenerationIdentity {
             ("mount id", self.mount_id.as_str()),
             ("mount namespace id", self.mount_namespace_id.as_str()),
             ("device major:minor", self.device_major_minor.as_str()),
-            ("device-mapper UUID", self.device_mapper_uuid.as_str()),
-            (
-                "device-mapper table digest",
-                self.device_mapper_table_sha256.as_str(),
-            ),
             ("filesystem UUID", self.filesystem_uuid.as_str()),
             ("RustFS drive UUID", self.rustfs_drive_uuid.as_str()),
         ] {
@@ -330,7 +327,20 @@ impl HostGenerationIdentity {
                 "storage-recovery {field} is empty"
             );
         }
-        validate_sha256(&self.device_mapper_table_sha256)?;
+        match (
+            self.device_mapper_uuid.as_deref(),
+            self.device_mapper_table_sha256.as_deref(),
+        ) {
+            (Some(uuid), Some(table)) => {
+                ensure!(
+                    !uuid.trim().is_empty(),
+                    "storage-recovery device-mapper UUID is empty"
+                );
+                validate_sha256(table)?;
+            }
+            (None, None) => {}
+            _ => bail!("storage-recovery device-mapper identity is partial"),
+        }
         ensure!(
             self.mount_namespace_id == volume.target_mount_namespace_id
                 && self.filesystem_uuid == volume.filesystem_uuid
@@ -985,8 +995,8 @@ mod tests {
                 mount_id: "mount-1".to_string(),
                 mount_namespace_id: "mnt:[1]".to_string(),
                 device_major_minor: "259:0".to_string(),
-                device_mapper_uuid: "dm-uuid-1".to_string(),
-                device_mapper_table_sha256: HASH.to_string(),
+                device_mapper_uuid: Some("dm-uuid-1".to_string()),
+                device_mapper_table_sha256: Some(HASH.to_string()),
                 filesystem_uuid: "fs-1".to_string(),
                 rustfs_drive_uuid: "drive-1".to_string(),
             },
@@ -1086,7 +1096,7 @@ mod tests {
 
         let mut changed_table = current(&context);
         changed_table.host_generation.device_mapper_table_sha256 =
-            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string();
+            Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string());
         assert!(context.require_current(&changed_table).is_err());
     }
 

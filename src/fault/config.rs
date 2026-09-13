@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use crate::fault::{
     plan::FaultInjectionParameters,
+    storage_recovery::StorageRecoveryCase,
     workload::{WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadDistribution},
 };
 use crate::framework::{command::CommandSpec, config::ClusterTestConfig, kubectl::Kubectl};
@@ -87,6 +88,16 @@ pub struct FaultTestConfig {
     /// before its catalog status is promoted. FaultSuite resolution never
     /// consumes this flag and continues to reject every planned scenario.
     pub qualify_planned_admin: bool,
+    /// Explicit single-run opt-in for one exact planned storage-recovery case.
+    /// Ordinary suite resolution never consumes this flag.
+    pub qualify_planned_storage: bool,
+    pub storage_recovery_case: Option<StorageRecoveryCase>,
+    /// Closed JSON description of run-owned Local PVs. The final entry is the
+    /// held-back replacement; all preceding entries seed the dedicated Tenant.
+    pub storage_local_pvs_json: Option<String>,
+    /// Image containing `/usr/local/bin/s3chaos-storage-helper`; mandatory
+    /// only for explicit storage qualification.
+    pub storage_recovery_helper_image: Option<String>,
     pub scenario: String,
     pub scenario_parameters: FaultInjectionParameters,
     pub duration: Duration,
@@ -301,6 +312,24 @@ impl FaultTestConfig {
             expected_context,
             destructive_enabled: env_bool(&get_env, "RUSTFS_FAULT_TEST_DESTRUCTIVE")?,
             qualify_planned_admin: env_bool(&get_env, "RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN")?,
+            qualify_planned_storage: env_bool(
+                &get_env,
+                "RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE",
+            )?,
+            storage_recovery_case: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE",
+            )
+            .map(|value| StorageRecoveryCase::parse(&value))
+            .transpose()?,
+            storage_local_pvs_json: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON",
+            ),
+            storage_recovery_helper_image: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_STORAGE_HELPER_IMAGE",
+            ),
             scenario,
             scenario_parameters: FaultInjectionParameters::Default,
             duration: Duration::from_secs(env_u64(

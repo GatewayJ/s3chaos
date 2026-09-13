@@ -29,6 +29,7 @@ use crate::fault::{
     },
     config::{DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, FaultTestConfig},
     fixture::ADMIN_FIXTURE_ARTIFACT,
+    fresh_volume::{FRESH_VOLUME_FIXTURE_ARTIFACT, FRESH_VOLUME_HEAL_TRANSCRIPT_ARTIFACT},
     host_storage::{
         DM_FILESYSTEM_CHECK_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT,
     },
@@ -37,9 +38,14 @@ use crate::fault::{
         FaultSelection, FaultTarget, FaultWorkloadMode,
     },
     scenarios::{
-        FaultDetectorContract, FaultScenario, FaultScenarioSpec, acknowledged_mutation_kind,
-        scenario_spec,
+        FRESH_VOLUME_REPLACEMENT_SCENARIO, FaultDetectorContract, FaultScenario, FaultScenarioSpec,
+        acknowledged_mutation_kind, scenario_spec,
     },
+    storage_recovery::{
+        DISK_GENERATION_PROOF_ARTIFACT, FORCE_READ_PROOF_ARTIFACT, HEAL_PROGRESS_ARTIFACT,
+        HEAL_SUMMARY_ARTIFACT, VERSION_SHARD_MAPPING_ARTIFACT,
+    },
+    storage_recovery_runner::STORAGE_RECOVERY_WORKFLOW_ARTIFACT,
     workload::WorkloadPlan,
 };
 
@@ -69,6 +75,10 @@ pub enum FaultRunExecutionSpec {
     Injection,
     Admin {
         topology: AdminTopologyPlan,
+        operation_timeout_seconds: u64,
+    },
+    StorageRecovery {
+        case: crate::fault::storage_recovery::StorageRecoveryCase,
         operation_timeout_seconds: u64,
     },
 }
@@ -234,7 +244,10 @@ impl FaultRunSpec {
             required: FaultRunArtifactSpec::required_names_for_scenario(&scenario.name),
             event_stream: "run-events.jsonl".to_string(),
         };
-        if plan.requires_static_storage() {
+        if plan
+            .injection()
+            .is_some_and(FaultPlan::requires_static_storage)
+        {
             artifacts.required.extend(
                 [HOST_STORAGE_PROOF_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT].map(str::to_string),
             );
@@ -271,7 +284,8 @@ impl FaultRunSpec {
                 impact_policy: scenario_spec.impact_policy.as_str().to_string(),
                 boundary: scenario_spec.boundary.to_string(),
                 validation: scenario_spec.validation.to_string(),
-                planned_qualification: config.qualify_planned_admin,
+                planned_qualification: config.qualify_planned_admin
+                    || config.qualify_planned_storage,
                 detector: Some(scenario_spec.detector.contract()),
                 ack_trigger: acknowledged_mutation_kind(&scenario.name).map(|mutation| {
                     FaultRunAckTriggerSpec {
@@ -307,6 +321,10 @@ impl FaultRunSpec {
                 ExecutionPlan::Injection(_) => FaultRunExecutionSpec::Injection,
                 ExecutionPlan::Admin(plan) => FaultRunExecutionSpec::Admin {
                     topology: plan.topology.clone(),
+                    operation_timeout_seconds: plan.operation_timeout.as_secs(),
+                },
+                ExecutionPlan::StorageRecovery(plan) => FaultRunExecutionSpec::StorageRecovery {
+                    case: plan.case,
                     operation_timeout_seconds: plan.operation_timeout.as_secs(),
                 },
             }),
@@ -348,6 +366,29 @@ impl FaultRunSpec {
                     "admin run-spec operation timeout must be positive"
                 );
                 Ok(ExecutionKind::Admin)
+            }
+            Some(FaultRunExecutionSpec::StorageRecovery {
+                case,
+                operation_timeout_seconds,
+            }) => {
+                ensure!(
+                    self.faults.is_empty(),
+                    "storage-recovery run-spec must not contain fault injections"
+                );
+                ensure!(
+                    *operation_timeout_seconds > 0,
+                    "storage-recovery run-spec operation timeout must be positive"
+                );
+                ensure!(
+                    case.scenario() == self.scenario.name
+                        && case.scenario() == "fresh-volume-replacement",
+                    "storage-recovery run-spec case does not match its exact planned scenario"
+                );
+                ensure!(
+                    self.scenario.planned_qualification,
+                    "storage-recovery run-spec must record explicit planned qualification"
+                );
+                Ok(ExecutionKind::StorageRecovery)
             }
             None => {
                 ensure!(
@@ -419,6 +460,36 @@ impl FaultRunArtifactSpec {
                 ADMIN_TOPOLOGY_PROOF_ARTIFACT,
                 ADMIN_OPERATION_ARTIFACT,
                 ADMIN_OPERATION_PROGRESS_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else if scenario == FRESH_VOLUME_REPLACEMENT_SCENARIO {
+            [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "workload-summary.json",
+                "recommit-report.json",
+                "checker-pre-recommit-report.json",
+                "checker-report.json",
+                RECOVERY_HEALTH_ARTIFACT,
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+                FRESH_VOLUME_FIXTURE_ARTIFACT,
+                FRESH_VOLUME_HEAL_TRANSCRIPT_ARTIFACT,
+                STORAGE_RECOVERY_WORKFLOW_ARTIFACT,
+                DISK_GENERATION_PROOF_ARTIFACT,
+                VERSION_SHARD_MAPPING_ARTIFACT,
+                HEAL_SUMMARY_ARTIFACT,
+                HEAL_PROGRESS_ARTIFACT,
+                FORCE_READ_PROOF_ARTIFACT,
+                crate::fault::fresh_volume::FRESH_VOLUME_READ_HISTORY_ARTIFACT,
+                crate::fault::fresh_volume::FRESH_VOLUME_CLEANUP_ARTIFACT,
             ]
             .into_iter()
             .map(str::to_string)
@@ -704,6 +775,54 @@ mod tests {
                 .required
                 .contains(&"admin-workflow.json".to_string())
         );
+    }
+
+    #[test]
+    fn fresh_volume_spec_is_typed_and_requires_raw_recovery_artifacts() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+        config.scenario = crate::fault::scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO.to_string();
+        config.qualify_planned_storage = true;
+        config.destructive_enabled = true;
+        config.storage_recovery_case = Some(
+            crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
+        );
+        let scenario = FaultScenario::from_config_for_execution(&config).expect("qualification");
+        let catalog = scenario_spec(crate::fault::scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO)
+            .expect("catalog");
+        let plan = ExecutionPlan::from_scenario_with_options(
+            &scenario,
+            catalog,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("storage plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let spec = FaultRunSpec::resolved_execution(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+
+        assert_eq!(
+            spec.execution_kind().expect("execution"),
+            ExecutionKind::StorageRecovery
+        );
+        assert!(spec.scenario.planned_qualification);
+        assert!(spec.faults.is_empty());
+        for artifact in [
+            "storage-recovery-workflow.json",
+            "disk-generation-proof.json",
+            "version-shard-mapping.json",
+            "force-read-proof.json",
+            "force-read-history.jsonl",
+            "fresh-volume-cleanup.json",
+        ] {
+            assert!(spec.artifacts.required.contains(&artifact.to_string()));
+        }
     }
 
     #[test]

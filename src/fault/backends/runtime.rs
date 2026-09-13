@@ -208,6 +208,30 @@ pub(in crate::fault) fn apply_fault(
     })
 }
 
+/// Apply a bounded auxiliary fault with an attempt-specific resource identity.
+/// Storage-recovery workflows use this only for exact-quorum read probes and
+/// still validate the controller's per-container records before issuing S3.
+pub(in crate::fault) fn apply_fault_named(
+    config: &FaultTestConfig,
+    collector: &ArtifactCollector,
+    scenario: &FaultScenario,
+    run_id: &str,
+    execution_injection: &FaultInjection,
+    manifest_name: &str,
+    resource_name_suffix: &str,
+) -> Result<AppliedFault> {
+    apply_fault_backend(&FaultApplyRequest {
+        config,
+        collector,
+        scenario,
+        injection: execution_injection,
+        run_id,
+        manifest_name,
+        resource_name_suffix,
+        host_storage_proof: None,
+    })
+}
+
 pub(in crate::fault) fn prepare_host_fault(
     config: &FaultTestConfig,
     collector: &ArtifactCollector,
