@@ -19,9 +19,10 @@ use std::path::Path;
 
 use crate::{
     fault::{
+        backends::lifecycle::evidence::LifecycleStatusSnapshot,
         config::FaultTestConfig,
         host_storage::DmStatusSnapshot,
-        plan::{FaultPlan, FaultSelection},
+        plan::{ExecutionPlan, FaultSelection},
         quorum::QuorumHealthObservation,
         scenarios::{FaultScenario, FaultScenarioSpec},
         workload::WorkloadPlan,
@@ -36,6 +37,8 @@ pub(crate) struct FaultStatusSnapshot {
     pub(crate) resource_name: Option<String>,
     pub(crate) chaos_status: Option<serde_json::Value>,
     pub(crate) dm_status: Option<DmStatusSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) lifecycle_status: Option<LifecycleStatusSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -132,7 +135,7 @@ impl RunMetadata {
         config: &FaultTestConfig,
         scenario: &FaultScenario,
         spec: &FaultScenarioSpec,
-        plan: &FaultPlan,
+        plan: &ExecutionPlan,
         workload_plan: &WorkloadPlan,
         run_id: &str,
         bucket: &str,
@@ -154,20 +157,23 @@ impl RunMetadata {
             artifacts_dir: config.cluster.artifacts_dir.display().to_string(),
             fault_duration_seconds: scenario.duration.as_secs(),
             percent: plan
-                .faults()
-                .iter()
+                .injection()
+                .into_iter()
+                .flat_map(|plan| plan.faults())
                 .find_map(|fault| match fault.selection() {
                     FaultSelection::Percent(percent) => Some(percent),
                     FaultSelection::FixedTargets(_) | FaultSelection::RuntimeQuorum(_) => None,
                 }),
             fault_selection: plan
-                .faults()
-                .iter()
+                .injection()
+                .into_iter()
+                .flat_map(|plan| plan.faults())
                 .map(|fault| fault.selection().summary())
                 .collect(),
             fault_parameters: plan
-                .faults()
-                .iter()
+                .injection()
+                .into_iter()
+                .flat_map(|plan| plan.faults())
                 .map(|fault| fault.parameters().clone())
                 .collect(),
             workload_objects: workload_plan.object_count,
@@ -760,6 +766,7 @@ mod tests {
             "environment_or_workload",
             "workload_or_product",
             "no_signal",
+            "graceful_shutdown_failed",
         ]);
         let mut names = BTreeSet::new();
         for classification in FailureClassification::ALL {

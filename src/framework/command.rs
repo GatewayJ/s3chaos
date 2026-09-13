@@ -161,6 +161,41 @@ impl CommandSpec {
         })
     }
 
+    /// Like `spawn_background_with_log` but with stderr in its own file, for
+    /// commands whose stdout is a machine-readable stream.
+    pub fn spawn_background_with_logs(
+        &self,
+        stdout_path: impl AsRef<Path>,
+        stderr_path: impl AsRef<Path>,
+    ) -> Result<Child> {
+        if self.stdin.is_some() {
+            bail!(
+                "background command stdin is not supported: {}",
+                self.display()
+            );
+        }
+        let open = |path: &Path| {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("open command log {}", path.display()))
+        };
+        let stdout = open(stdout_path.as_ref())?;
+        let stderr = open(stderr_path.as_ref())?;
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .with_context(|| format!("failed to start background command: {}", self.display()))
+    }
+
     pub fn spawn_background_with_log(&self, log_path: impl AsRef<Path>) -> Result<Child> {
         if self.stdin.is_some() {
             bail!(

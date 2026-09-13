@@ -28,7 +28,7 @@ use crate::{
         events::{RunEventRecorder, RunEventStatus},
         fault_lifecycle::AppliedFault,
         history::Recorder,
-        plan::{FaultPlan, FaultPlanOptions},
+        plan::{ExecutionPlan, FaultPlan, FaultPlanOptions},
         preflight::{PreflightPhase, PreflightSummary, TargetProof},
         reporting::{
             FailureSummary, RunMetadata, write_failure_summary as persist_failure_summary,
@@ -47,26 +47,33 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-mod access;
+pub(in crate::fault) mod access;
 mod ack;
 mod injection;
 mod post_recovery;
 mod recovery;
 mod setup;
-mod targets;
+pub(crate) mod targets;
 mod verification;
 use crate::fault::backends::runtime::collect_fault_artifacts;
 use crate::fault::workload::execution::{
     MixedWorkloadResult, WorkloadPlanArtifact, cleanup_staged_multipart_uploads,
 };
+pub(crate) use access::{
+    ensure_s3_access, s3_access, tenant_port_forward, wait_for_ready_tenant,
+    wait_for_stable_rustfs_pods, wait_for_tenant_s3,
+};
+pub(crate) use post_recovery::POST_RECOVERY_SEED_SALT;
+pub(crate) use recovery::observe_recovery_health;
 
-struct FaultRunContext {
-    spec: &'static FaultScenarioSpec,
-    run_id: String,
-    workload_plan: WorkloadPlan,
-    bucket: String,
-    events: RunEventRecorder,
-    history: Recorder,
+#[derive(Clone)]
+pub(crate) struct FaultRunContext {
+    pub(crate) spec: &'static FaultScenarioSpec,
+    pub(crate) run_id: String,
+    pub(crate) workload_plan: WorkloadPlan,
+    pub(crate) bucket: String,
+    pub(crate) events: RunEventRecorder,
+    pub(crate) history: Recorder,
 }
 
 pub async fn run_selected_scenario_from_env() -> Result<()> {
@@ -92,9 +99,9 @@ pub(crate) async fn run_prepared_scenario_with_config_and_reference_root(
     run_id: String,
     deadline: RunDeadline,
 ) -> Result<()> {
-    let scenario = FaultScenario::from_config(&config)?;
+    let scenario = FaultScenario::from_config_for_execution(&config)?;
     let spec = scenarios::scenario_spec(&scenario.name)?;
-    let plan = FaultPlan::from_scenario_with_options(
+    let plan = ExecutionPlan::from_scenario_with_options(
         &scenario,
         spec,
         FaultPlanOptions::from_config(&config),
@@ -109,7 +116,32 @@ pub(crate) async fn run_prepared_scenario_with_config_and_reference_root(
 
     let collector =
         ArtifactCollector::with_reference_root(&config.cluster.artifacts_dir, reference_root)?;
-    let result = run_fault_case(&config, &collector, &scenario, &plan, &run_id, deadline).await;
+    let result = match &plan {
+        ExecutionPlan::Injection(fault_plan) => {
+            run_fault_case(
+                &config, &collector, &scenario, &plan, fault_plan, &run_id, deadline,
+            )
+            .await
+        }
+        ExecutionPlan::Admin(admin_plan) => {
+            crate::fault::admin_runner::run_admin_case(
+                &config, &collector, &scenario, &plan, admin_plan, &run_id, deadline,
+            )
+            .await
+        }
+        ExecutionPlan::StorageRecovery(storage_plan) => {
+            crate::fault::storage_recovery_runner::run_storage_recovery_case(
+                &config,
+                &collector,
+                &scenario,
+                &plan,
+                storage_plan,
+                &run_id,
+                deadline,
+            )
+            .await
+        }
+    };
 
     if let Err(error) = &result {
         write_failure_summary_if_absent(
@@ -144,11 +176,13 @@ async fn run_fault_case(
     config: &FaultTestConfig,
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
+    execution_plan: &ExecutionPlan,
     plan: &FaultPlan,
     planned_run_id: &str,
     deadline: RunDeadline,
 ) -> Result<()> {
-    let context = initialize_fault_run(config, collector, scenario, plan, planned_run_id)?;
+    let context =
+        initialize_fault_run(config, collector, scenario, execution_plan, planned_run_id)?;
     let run = FaultRun {
         config,
         collector,
@@ -195,6 +229,10 @@ async fn run_fault_case(
             let recovered = run
                 .recover_access(&mut prepared, &target, &mut staged_multipart_uploads)
                 .await?;
+            // A fault whose evidence can still change after removal (a
+            // lifecycle replacement that crashes after Ready) is re-read once
+            // the recovery gate has passed.
+            run.recheck_fault_after_recovery(&mut active.fault)?;
             // The lifecycle evidence is complete once recovery finished, so it
             // is persisted before the write gate: a product failure found by
             // the probe must still leave fault-evidence.json behind for the
@@ -367,11 +405,11 @@ impl FaultRun<'_> {
     }
 }
 
-fn initialize_fault_run(
+pub(crate) fn initialize_fault_run(
     config: &FaultTestConfig,
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
-    plan: &FaultPlan,
+    execution_plan: &ExecutionPlan,
     run_id: &str,
 ) -> Result<FaultRunContext> {
     let spec = scenarios::scenario_spec(&scenario.name)?;
@@ -398,11 +436,11 @@ fn initialize_fault_run(
         .case_dir(scenario.case_name)
         .join("run-events.jsonl");
     let events = RunEventRecorder::create(events_path, &scenario.name, &run_id)?;
-    let run_spec = FaultRunSpec::resolved(
+    let run_spec = FaultRunSpec::resolved_execution(
         config,
         scenario,
         spec,
-        plan,
+        execution_plan,
         &workload_plan,
         &run_id,
         &bucket,
@@ -418,7 +456,7 @@ fn initialize_fault_run(
             config,
             scenario,
             spec,
-            plan,
+            execution_plan,
             &workload_plan,
             &run_id,
             &bucket,
@@ -439,9 +477,9 @@ fn initialize_fault_run(
         "fault run initialized",
         Some(serde_json::json!({
             "bucket": bucket,
-            "backend": plan.backend_summary(),
-            "target": plan.target_summary(),
-            "faults": plan.faults().len(),
+            "backend": execution_plan.backend_summary(),
+            "target": execution_plan.target_summary(),
+            "faults": execution_plan.injection().map_or(0, |plan| plan.faults().len()),
         })),
     )?;
     eprintln!(
@@ -462,7 +500,7 @@ fn initialize_fault_run(
     })
 }
 
-fn write_preflight_summary(
+pub(crate) fn write_preflight_summary(
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
     config: &FaultTestConfig,

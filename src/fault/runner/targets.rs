@@ -46,20 +46,20 @@ pub(super) fn plan_requires_volume_bindings(plan: &FaultPlan) -> bool {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ObservedErasureSet {
-    pub(super) source: &'static str,
-    pub(super) deployment_id: String,
-    pub(super) shape: ErasureSetShape,
-    pub(super) health: ErasureSetHealth,
-    pub(super) membership: ErasureSetMembership,
-    pub(super) observed_at_ms: u64,
+pub(crate) struct ObservedErasureSet {
+    pub(crate) source: &'static str,
+    pub(crate) deployment_id: String,
+    pub(crate) shape: ErasureSetShape,
+    pub(crate) health: ErasureSetHealth,
+    pub(crate) membership: ErasureSetMembership,
+    pub(crate) observed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ObservedVolumeQuorum {
-    pub(super) topology: ObservedErasureSet,
-    pub(super) volume_quorum: QuorumVolumeTargetProof,
+pub(crate) struct ObservedVolumeQuorum {
+    pub(crate) topology: ObservedErasureSet,
+    pub(crate) volume_quorum: QuorumVolumeTargetProof,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +119,7 @@ pub(super) async fn require_write_quorum_loss_topology(
     })
 }
 
-pub(super) async fn require_volume_quorum_topology(
+pub(crate) async fn require_volume_quorum_topology(
     config: &FaultTestConfig,
     endpoint: &str,
     access_key: &str,

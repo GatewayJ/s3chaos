@@ -13,6 +13,9 @@
 // limitations under the License.
 
 pub mod acknowledged_mutation;
+pub mod admin_decommission;
+pub mod admin_rebalance;
+pub mod admin_runner;
 pub mod admin_topology;
 pub mod artifact_validation;
 pub mod backends;
@@ -24,8 +27,10 @@ pub mod events;
 mod fault_artifacts;
 mod fault_lifecycle;
 pub mod fixture;
+pub mod fresh_volume;
 pub mod history;
 pub(crate) mod host_storage;
+pub mod on_disk_bitrot;
 pub mod plan;
 pub mod pods;
 pub mod preflight;
@@ -36,10 +41,16 @@ pub mod runner;
 pub mod scenarios;
 pub mod shutdown;
 pub mod spec;
+pub mod stale_disk_runner;
 pub mod storage_recovery;
+pub mod storage_recovery_helper;
+pub mod storage_recovery_lease;
+pub mod storage_recovery_runner;
+pub mod storage_recovery_runtime;
 pub mod suite;
 pub mod suite_plan;
 pub mod suite_runner;
 pub mod workload;
+pub mod xl2_inspector;
 
 mod verdict;

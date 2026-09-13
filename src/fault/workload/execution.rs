@@ -1450,6 +1450,31 @@ impl WorkloadSummary {
         self.require_rejected_write_mutations(&mutations)
     }
 
+    /// A held total outage serves nothing: every operation family must have
+    /// been attempted and none may have succeeded or answered 404.
+    pub(in crate::fault) fn require_total_outage_effect(&self) -> Result<()> {
+        for (family, counts) in [
+            ("puts", &self.puts),
+            ("gets", &self.gets),
+            ("deletes", &self.deletes),
+            ("lists", &self.lists),
+            ("multipart_completes", &self.multipart_completes),
+            ("multipart_aborts", &self.multipart_aborts),
+        ] {
+            if let Some(violation) =
+                crate::fault::backends::lifecycle::evidence::total_outage_violation(
+                    family,
+                    counts.ok,
+                    counts.not_found,
+                    counts.total(),
+                )
+            {
+                bail!("{violation}");
+            }
+        }
+        Ok(())
+    }
+
     fn require_rejected_write_mutations(&self, mutations: &[(&str, &OutcomeCounts)]) -> Result<()> {
         ensure!(
             mutations.iter().all(|(_, counts)| counts.total() > 0),

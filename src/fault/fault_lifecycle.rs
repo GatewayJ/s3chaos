@@ -20,9 +20,10 @@ use crate::{
     framework::artifacts::ArtifactCollector,
 };
 use anyhow::Result;
+use std::sync::{Arc, atomic::AtomicU64};
 use std::time::{Duration, Instant};
 
-pub(super) trait FaultLifecyclePort {
+pub(super) trait FaultLifecyclePort: Send {
     fn wait_active(&self, timeout: Duration) -> Result<()>;
     fn ensure_active(&self, stage: &str) -> Result<()>;
     fn requires_recovery_boundary(&self) -> bool {
@@ -33,6 +34,18 @@ pub(super) trait FaultLifecyclePort {
     }
     fn delete(&mut self, timeout: Duration) -> Result<()>;
     fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot>;
+
+    /// Harness-time slot the runner fills when the first fault-phase S3
+    /// request starts; a backend whose disruption must land under load waits
+    /// on it before acting.
+    fn load_gate(&self) -> Option<Arc<AtomicU64>> {
+        None
+    }
+
+    /// Re-read the fault's own evidence once the recovery gate has passed.
+    fn verify_after_recovery(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     fn recovery_dm_snapshot(&self) -> Option<DmStatusSnapshot> {
         None
@@ -51,6 +64,33 @@ pub(super) trait FaultLifecyclePort {
 }
 
 pub(super) type AppliedFault = Box<dyn FaultLifecyclePort>;
+
+/// A fault-removal error that carries its own failure classification. The
+/// runner classifies removal failures as environment/backend problems by
+/// default; a backend that observed a product defect while removing the
+/// fault (for example a RustFS container SIGKILLed at grace expiry) reports it
+/// through this type so the verdict is not misattributed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ClassifiedFaultFailure {
+    pub(super) classification: &'static str,
+    pub(super) message: String,
+}
+
+impl std::fmt::Display for ClassifiedFaultFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClassifiedFaultFailure {}
+
+pub(super) fn removal_failure_classification(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<ClassifiedFaultFailure>()
+        .map_or("environment_or_fault_backend", |failure| {
+            failure.classification
+        })
+}
 
 pub(super) struct FaultDeleteTimeoutRecoveryRequest<'a> {
     pub(super) config: &'a FaultTestConfig,
@@ -83,9 +123,8 @@ mod tests {
     use crate::framework::artifacts::ArtifactCollector;
     use anyhow::{Result, anyhow};
     use std::{
-        cell::RefCell,
         collections::BTreeMap,
-        rc::Rc,
+        sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
 
@@ -96,7 +135,7 @@ mod tests {
         recoveries: Vec<&'static str>,
     }
 
-    type SharedRecordingFaultState = Rc<RefCell<RecordingFaultState>>;
+    type SharedRecordingFaultState = Arc<Mutex<RecordingFaultState>>;
 
     struct RecordingFault {
         name: &'static str,
@@ -121,7 +160,11 @@ mod tests {
 
     impl FaultLifecyclePort for RecordingFault {
         fn wait_active(&self, timeout: Duration) -> Result<()> {
-            self.state.borrow_mut().waits.push((self.name, timeout));
+            self.state
+                .lock()
+                .expect("state")
+                .waits
+                .push((self.name, timeout));
             Ok(())
         }
 
@@ -130,7 +173,11 @@ mod tests {
         }
 
         fn delete(&mut self, timeout: Duration) -> Result<()> {
-            self.state.borrow_mut().deletes.push((self.name, timeout));
+            self.state
+                .lock()
+                .expect("state")
+                .deletes
+                .push((self.name, timeout));
             Ok(())
         }
 
@@ -141,6 +188,7 @@ mod tests {
                 resource_name: Some(self.name.to_string()),
                 chaos_status: None,
                 dm_status: None,
+                lifecycle_status: None,
             })
         }
 
@@ -152,13 +200,13 @@ mod tests {
             &mut self,
             _request: &FaultDeleteTimeoutRecoveryRequest<'_>,
         ) -> Result<Option<FaultDeleteTimeoutRecovery>> {
-            self.state.borrow_mut().recoveries.push(self.name);
+            self.state.lock().expect("state").recoveries.push(self.name);
             Ok(None)
         }
     }
 
     fn recording_state() -> SharedRecordingFaultState {
-        Rc::new(RefCell::new(RecordingFaultState::default()))
+        Arc::new(Mutex::new(RecordingFaultState::default()))
     }
 
     fn recording_dm_snapshot(stage: &str, helper_pod: &str) -> DmStatusSnapshot {
@@ -231,11 +279,11 @@ mod tests {
         assert_eq!(snapshot.stage, "after-workload");
         fault.delete(Duration::from_secs(1)).expect("delete");
         assert_eq!(
-            state.borrow().waits,
+            state.lock().expect("state").waits,
             vec![("target", Duration::from_secs(7))]
         );
         assert_eq!(
-            state.borrow().deletes,
+            state.lock().expect("state").deletes,
             vec![("target", Duration::from_secs(1))]
         );
     }
@@ -254,7 +302,31 @@ mod tests {
                 .expect("recover")
                 .is_none()
         );
-        assert_eq!(state.borrow().recoveries, vec!["target"]);
+        assert_eq!(state.lock().expect("state").recoveries, vec!["target"]);
+    }
+
+    #[test]
+    fn removal_failures_keep_their_backend_classification_through_context() {
+        let plain = anyhow!("kubectl timed out");
+        assert_eq!(
+            super::removal_failure_classification(&plain),
+            "environment_or_fault_backend"
+        );
+        let classified: anyhow::Error = super::ClassifiedFaultFailure {
+            classification: "graceful_shutdown_failed",
+            message: "Pod exited 137".to_string(),
+        }
+        .into();
+        assert_eq!(
+            super::removal_failure_classification(&classified),
+            "graceful_shutdown_failed"
+        );
+        let wrapped = classified.context("removing applied faults");
+        assert_eq!(
+            super::removal_failure_classification(&wrapped),
+            "graceful_shutdown_failed"
+        );
+        assert!(wrapped.to_string().contains("removing applied faults"));
     }
 
     #[test]

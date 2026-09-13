@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -60,6 +60,9 @@ pub const ADMIN_DECOMMISSION_SCENARIO: &str = "admin-decommission";
 pub const ADMIN_REBALANCE_SCENARIO: &str = "admin-rebalance";
 pub const ON_DISK_BITROT_SCENARIO: &str = "on-disk-bitrot";
 pub const STALE_DISK_RETURN_DETECT_SCENARIO: &str = "stale-disk-return-detect";
+pub const POD_GRACEFUL_RESTART_ONE_SCENARIO: &str = "pod-graceful-restart-one";
+pub const ROLLING_RESTART_ALL_SCENARIO: &str = "rolling-restart-all";
+pub const CLUSTER_COLD_RESTART_SCENARIO: &str = "cluster-cold-restart";
 
 const IOCHAOS_CRD: &str = "iochaos.chaos-mesh.org";
 const PODCHAOS_CRD: &str = "podchaos.chaos-mesh.org";
@@ -181,6 +184,10 @@ pub enum FaultBackend {
     DeviceMapper,
     MinioWarpWithChaos,
     PlannedReliabilityWorkflow,
+    /// kubectl-driven Pod lifecycle operations against the Tenant StatefulSet
+    /// (graceful delete, ordered rolling restart, scale to zero and back);
+    /// no Chaos Mesh CRD is involved.
+    KubernetesLifecycle,
 }
 
 impl FaultBackend {
@@ -193,6 +200,7 @@ impl FaultBackend {
             Self::DeviceMapper => "device-mapper",
             Self::MinioWarpWithChaos => "minio-warp-with-chaos",
             Self::PlannedReliabilityWorkflow => "planned-reliability-workflow",
+            Self::KubernetesLifecycle => "kubernetes-lifecycle",
         }
     }
 
@@ -1194,11 +1202,11 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::HealRegression,
         ]),
         case_name: "fault_admin_decommission_preserves_object_model",
-        description: "Planned scenario-owned RustFS admin flow: decommission the named, runtime-bound target pool under one finite, byte-bounded S3 workload in a fresh multi-pool Tenant.",
+        description: "Scenario-owned RustFS admin flow: decommission the named, populated source pool under one finite, byte-bounded, version-aware S3 workload.",
         priority: FaultPriority::P1,
         backend: FaultBackend::PlannedReliabilityWorkflow,
         status: FaultScenarioStatus::Planned,
-        workload_profile: FaultScenarioWorkloadProfile::Default,
+        workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
         isolation: FaultIsolation::FreshTenant,
         crds: &[],
         required_tools: &[],
@@ -1213,9 +1221,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             "preflight and a fresh pools/list observation immediately before start must prove the same healthy idle pool identities, no concurrent decommission/rebalance, and remaining capacity covering 130% of target used bytes plus the bounded workload budget",
             "raw Tenant GETs, Kubernetes context/cluster/service UID port-forward identity, and pre/post /rustfs/admin/v3/info deploymentID observations must bind every exact start/status request and pool list to one RustFS deployment",
             "the complete finite workload-plan.json must derive a conservative byte bound that charges every PUT, hot-key overwrite version, multipart completion, and aborted multipart body",
+            "admin-decommission-overlap.json must bind the exact workload history sequence to a target status request interval and at least one S3 operation interval that overlap the operation window",
         ],
         validation: "decommission reaches successful completion without failed moves or cancellation, before/after topology proves the target absent or terminal, and bounded S3 history/checker evidence preserves the committed object model",
-        observability: "admin-topology-proof.json, admin-operation.json, monotonic admin-operation-progress.jsonl, workload history, checker reports, RustFS logs",
+        observability: "admin-topology-proof.json, admin-operation.json, monotonic admin-operation-progress.jsonl, admin-decommission-transcript.json, workload history, checker reports, RustFS logs",
         conflict_domain: "fresh multi-pool Tenant fixture; must not decommission shared or pre-existing resources",
     },
     FaultScenarioSpec {
@@ -1225,11 +1234,11 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::HealRegression,
         ]),
         case_name: "fault_admin_rebalance_preserves_object_model",
-        description: "Planned scenario-owned RustFS admin flow: run rebalance under one finite, byte-bounded S3 workload in a fresh multi-pool Tenant.",
+        description: "Scenario-owned RustFS admin flow: rebalance a staged two-pool Tenant under one finite, byte-bounded, version-aware S3 workload.",
         priority: FaultPriority::P1,
         backend: FaultBackend::PlannedReliabilityWorkflow,
         status: FaultScenarioStatus::Planned,
-        workload_profile: FaultScenarioWorkloadProfile::Default,
+        workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
         isolation: FaultIsolation::FreshTenant,
         crds: &[],
         required_tools: &[],
@@ -1244,6 +1253,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             "preflight and a fresh pools/list observation immediately before start must prove the same healthy idle pool identities, sufficient bounded-workload capacity, and no concurrent decommission/rebalance",
             "raw Tenant GETs, Kubernetes context/cluster/service UID port-forward identity, and pre/post /rustfs/admin/v3/info deploymentID observations must bind every start/status request and pool list to one RustFS deployment",
             "the complete finite workload-plan.json must derive a conservative byte bound that charges every PUT, hot-key overwrite version, multipart completion, and aborted multipart body",
+            "admin-rebalance-overlap.json must bind the exact workload history sequence to a rebalance status request interval and at least one S3 operation interval that overlap the operation window",
         ],
         validation: "every participating rebalance pool reaches successful completion, nonparticipants remain terminal, no stop/error/cleanup warning occurs, pool identities remain stable before/after, and bounded S3 history/checker evidence preserves the committed object model",
         observability: "admin-topology-proof.json, admin-operation.json, monotonic admin-operation-progress.jsonl, workload history, checker reports, RustFS logs",
@@ -1256,13 +1266,13 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::HealRegression,
         ]),
         case_name: "fault_on_disk_bitrot_is_rejected_and_healed",
-        description: "Planned on-disk bitrot flow: use a stable RustFS diagnostic mapping to mutate one proven shard, verify corrupt bytes are rejected, observe scanner or admin-deep heal, and force reads through the repaired drive.",
+        description: "Planned on-disk bitrot flow: inspect one non-inline shard through the fenced storage helper, apply a receipt-derived reversible mutation, verify corrupt bytes are rejected, observe scanner or admin-deep heal, and require the repaired shard for the final read.",
         priority: FaultPriority::P0,
         backend: FaultBackend::PlannedReliabilityWorkflow,
         status: FaultScenarioStatus::Planned,
         workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
         isolation: FaultIsolation::DedicatedLinuxBlockDevice,
-        crds: &[],
+        crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
@@ -1271,15 +1281,15 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         ci_phase: "planned",
         target: "one shard file on one dedicated host volume, selected after mapping an object version to its on-disk shard",
         target_proof: &[
-            "artifact must prove object-version to shard-file mapping through a versioned RustFS diagnostic API; S3Chaos must not infer private on-disk paths",
-            "artifact must record pre/post sha256 or byte-range evidence for the mutated shard",
-            "artifact must bind the mutation-window GET to a typed RustFS checksum-mismatch observation for that exact shard before heal",
-            "artifact must bind scanner/admin progress to a cluster-definitive observer and reject no-op heal evidence",
-            "artifact must leave exactly read quorum online so every successful verification read requires the repaired drive",
-            "current force-read adapter supports exactly one RustFS volume per server; multi-volume server topology must fail closed until per-volume runtime targeting is implemented",
+            "target proof must bind Tenant/PV/Pod/node/drive identity, the Kubernetes Lease generation, and the long-lived host flock before inspection or mutation",
+            "selection evidence must bind an explicit versionId and non-inline xl.meta inspection receipt to the exact part; the controller cannot supply an arbitrary shard path",
+            "mutation evidence must record the durable journal, controlled byte range, preimage and readback sha256, and the corruption-window GET must retain the same exact active cohort",
+            "scanner evidence must prove an interval after mutation without admin heal, while admin-deep evidence must own and bind the exact start/status/cancel token and HealResultItem",
+            "post-heal inspection, fresh mapping, cleanup receipt, and a second exact-quorum versionId GET must prove that every successful final read requires the repaired drive",
+            "only one-volume-per-server topology with a dedicated object and host volume is qualified; unsupported layouts fail closed",
         ],
         validation: "corrupt shard reads are rejected or repaired without returning bad bytes, the selected heal mode repairs the shard, forced reads match committed object hashes, and committed versions remain readable after repair",
-        observability: "shard-mutation-proof.json, heal-summary.json, heal-progress.jsonl, version-shard-mapping.json, force-read-proof.json, workload history, checker reports, RustFS logs",
+        observability: "storage target proof, selection/mutation/corruption-window/heal/cleanup receipts, exact-cohort manifests and runtime records, workload history, checker reports, post-write report, RustFS logs",
         conflict_domain: "dedicated host volume and object prefix owned by the test run; must never mutate shared data",
     },
     FaultScenarioSpec {
@@ -1314,6 +1324,96 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         observability: "disk-generation-proof.json, shard-inventory-before.json, shard-inventory-after.json, dangling-cleanup-proof.json, workload history, version-aware checker reports, Kubernetes snapshots, RustFS logs",
         conflict_domain: "dedicated host volume and fresh Tenant owned by the run; no other fault or cleanup may touch the detached generation",
     },
+    FaultScenarioSpec {
+        scenario: POD_GRACEFUL_RESTART_ONE_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
+        case_name: "fault_pod_graceful_restart_one_exits_cleanly_and_preserves_committed_objects",
+        description: "Delete one RustFS Pod with its default grace period while the workload runs (the delete is issued only after the first fault-phase S3 request has started, so SIGTERM lands under load) and verify RustFS exits cleanly within the grace period, the StatefulSet replacement becomes Ready without container restarts, and committed S3 objects survive.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::KubernetesLifecycle,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
+        boundary: "rustfs-workload/graceful-pod-restart",
+        ci_phase: "faults",
+        target: "the highest-ordinal RustFS Pod of the Tenant StatefulSet, deleted with its default terminationGracePeriodSeconds",
+        target_proof: &[
+            "target-proof.json must bind every RustFS Pod to exactly one controlling StatefulSet with its UID, replica count, grace period, and PVC retention policy before the delete",
+            "pod-lifecycle-evidence.json must record the deleted Pod's old and new UID, restart counts, the API server deletion timestamp, and the RustFS container's final terminated exit code, reason, and timestamps",
+        ],
+        validation: "the RustFS container exits with code 0 within terminationGracePeriodSeconds of the graceful delete (a SIGKILL at grace expiry is a product failure classified graceful_shutdown_failed), the replacement Pod reaches Ready with zero container restarts, every committed object remains readable during the restart and the mixed workload meets the availability floor, RustFS reports every drive ok and every Pod ready after recovery, fresh post-recovery writes succeed, and committed PUTs remain readable with matching hashes",
+        observability: "pod-lifecycle-evidence.json, pod-lifecycle-watch.json, history.jsonl, workload-summary.json, availability-report.json, checker-report.json, recovery-health.json, StatefulSet and Pod snapshots, RustFS logs",
+        conflict_domain: "one Tenant StatefulSet Pod; can reuse a ready Tenant after the prior scenario has cleaned up",
+    },
+    FaultScenarioSpec {
+        scenario: ROLLING_RESTART_ALL_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
+        case_name: "fault_rolling_restart_all_keeps_serving_and_preserves_committed_objects",
+        description: "Restart every RustFS Pod one at a time from the highest ordinal down with default grace periods while the workload runs, waiting for each replacement to become Ready, and verify every Pod exits cleanly, the service keeps serving, and committed objects survive.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::KubernetesLifecycle,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
+        boundary: "rustfs-workload/rolling-restart",
+        ci_phase: "faults",
+        target: "every RustFS Pod of the Tenant StatefulSet, deleted one at a time with the default grace period in descending ordinal order while the workload runs; with a port-forward endpoint all client traffic is pinned to the smallest-name Pod, which is restarted only after the workload",
+        target_proof: &[
+            "target-proof.json must bind every RustFS Pod to exactly one controlling StatefulSet with its UID, replica count, grace period, and PVC retention policy before the first delete",
+            "pod-lifecycle-evidence.json must record every Pod's old and new UID, restart counts, deletion timestamp, and the RustFS container's final terminated state, and must mark the Pod restarted after the workload when a port-forward endpoint was pinned to it",
+        ],
+        validation: "every RustFS container exits with code 0 within its grace period, every replacement reaches Ready with zero container restarts before the next Pod is deleted, the StatefulSet UID is unchanged, every committed object remains readable during the rollout and the mixed workload meets the availability floor, RustFS reports every drive ok and every Pod ready after recovery, fresh post-recovery writes succeed, and committed PUTs remain readable with matching hashes",
+        observability: "pod-lifecycle-evidence.json, pod-lifecycle-watch.json, history.jsonl, workload-summary.json, availability-report.json, checker-report.json, recovery-health.json, StatefulSet and Pod snapshots, RustFS logs",
+        conflict_domain: "every Tenant StatefulSet Pod in sequence; can reuse a ready Tenant after the prior scenario has cleaned up",
+    },
+    FaultScenarioSpec {
+        scenario: CLUSTER_COLD_RESTART_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
+        case_name: "fault_cluster_cold_restart_recovers_and_preserves_committed_objects",
+        description: "Pause the RustFS operator, scale the fresh Tenant StatefulSet to zero, drain every Pod before the workload starts, hold the total outage while the workload runs, scale back to the full replica count, resume the operator, and verify every Pod exited cleanly, the cluster comes back healthy, and committed objects survive; SIGTERM under load is covered by the other two lifecycle scenarios.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::KubernetesLifecycle,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        // kubectl scale leaves kubectl-scale co-owning spec.replicas of the
+        // fixture StatefulSet (server-side apply field management); only a
+        // fixture the next run recreates may carry that residue.
+        isolation: FaultIsolation::FreshTenant,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        boundary: "rustfs-workload/cluster-cold-restart",
+        ci_phase: "faults",
+        target: "the whole fresh Tenant StatefulSet (podManagementPolicy Parallel, claims retained on scale-down) scaled to zero replicas and back, with the RustFS operator Deployment named by RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT paused so its server-side apply cannot race or conflict with the scale",
+        target_proof: &[
+            "target-proof.json must bind every RustFS Pod to exactly one controlling StatefulSet with its UID, replica count, grace period, and a PVC retention policy that retains claims on scale-down",
+            "pod-lifecycle-evidence.json must record the operator pause and resume, every spec.replicas sample taken while the outage was held, every Pod's terminated state, and the new Pod UIDs after scale-up",
+        ],
+        validation: "every RustFS container exits with code 0 within its grace period on scale-down, spec.replicas stays zero and no RustFS Pod exists for the whole workload so every workload operation fails (any success proves the outage was not held), after scale-up every Pod reaches Ready with zero container restarts, RustFS reports every drive ok and every Pod ready, fresh post-recovery writes succeed, and committed PUTs remain readable with matching hashes",
+        observability: "pod-lifecycle-evidence.json, pod-lifecycle-watch.json, history.jsonl, workload-summary.json, checker-report.json, recovery-health.json, StatefulSet, Pod and operator Deployment snapshots, RustFS logs",
+        conflict_domain: "the whole Tenant StatefulSet plus the RustFS operator Deployment while paused; nothing else may reconcile the Tenant during the run",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1327,9 +1427,77 @@ pub struct FaultScenario {
 
 impl FaultScenario {
     pub fn from_config(config: &FaultTestConfig) -> Result<Self> {
-        let spec = scenario_spec(&config.scenario)?;
+        Self::from_config_with_planned_qualification(config, false, false)
+    }
+
+    pub(crate) fn from_config_for_execution(config: &FaultTestConfig) -> Result<Self> {
         ensure!(
-            spec.status.is_executable(),
+            !(config.qualify_planned_admin && config.qualify_planned_storage),
+            "planned admin and storage qualification cannot be enabled together"
+        );
+        if config.qualify_planned_storage {
+            ensure!(
+                config.destructive_enabled,
+                "planned storage qualification requires RUSTFS_FAULT_TEST_DESTRUCTIVE=1"
+            );
+            let case = config.storage_recovery_case.context(
+                "planned storage qualification requires RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE",
+            )?;
+            ensure!(
+                case.scenario() == config.scenario,
+                "planned storage qualification case {} does not belong to exact scenario {}",
+                case.as_str(),
+                config.scenario
+            );
+        }
+        Self::from_config_with_planned_qualification(
+            config,
+            config.qualify_planned_admin,
+            config.qualify_planned_storage,
+        )
+    }
+
+    fn from_config_with_planned_qualification(
+        config: &FaultTestConfig,
+        allow_planned_admin: bool,
+        allow_planned_storage: bool,
+    ) -> Result<Self> {
+        let spec = scenario_spec(&config.scenario)?;
+        let admin_qualification_allowed = allow_planned_admin
+            && matches!(
+                spec.scenario,
+                ADMIN_DECOMMISSION_SCENARIO | ADMIN_REBALANCE_SCENARIO
+            )
+            && spec.backend == FaultBackend::PlannedReliabilityWorkflow;
+        let storage_qualification_allowed = allow_planned_storage
+            && matches!(
+                spec.scenario,
+                FRESH_VOLUME_REPLACEMENT_SCENARIO
+                    | ON_DISK_BITROT_SCENARIO
+                    | STALE_DISK_RETURN_DETECT_SCENARIO
+            )
+            && config
+                .storage_recovery_case
+                .is_some_and(|case| case.scenario() == spec.scenario)
+            && (spec.scenario != ON_DISK_BITROT_SCENARIO
+                || config.storage_recovery_target_config.is_some())
+            && spec.backend == FaultBackend::PlannedReliabilityWorkflow;
+        if allow_planned_admin {
+            ensure!(
+                admin_qualification_allowed,
+                "planned admin qualification is restricted to the exact admin-decommission and admin-rebalance scenarios"
+            );
+        }
+        if allow_planned_storage {
+            ensure!(
+                storage_qualification_allowed,
+                "planned storage qualification requires an exact supported scenario/case and its target configuration"
+            );
+        }
+        ensure!(
+            spec.status.is_executable()
+                || admin_qualification_allowed
+                || storage_qualification_allowed,
             "fault scenario {:?} is cataloged as {:?} but is not executable yet; case {}, backend {:?}, validation: {}",
             config.scenario,
             spec.status,
@@ -1466,6 +1634,14 @@ pub fn apply_catalog_defaults(config: &mut FaultTestConfig) -> Result<()> {
             _ => {}
         }
     }
+    if matches!(
+        config.scenario.as_str(),
+        ADMIN_DECOMMISSION_SCENARIO | ADMIN_REBALANCE_SCENARIO
+    ) {
+        // The staged single-pool prefill includes a deterministic zero-byte
+        // cohort before the mixed workload starts on the two-pool topology.
+        config.workload_directory_marker_percent = 100;
+    }
     Ok(())
 }
 
@@ -1506,6 +1682,7 @@ pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
 #[cfg(test)]
 mod tests {
     use super::{
+        ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, CLUSTER_COLD_RESTART_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
@@ -1513,13 +1690,13 @@ mod tests {
         DetectorQualification, DurabilityBugFamily, FaultDetectorContract, FaultParameterSchema,
         FaultScenario, FaultScenarioStatus, FaultScenarioWorkloadProfile, IO_EIO_SCENARIO,
         IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
-        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
-        POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
-        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO,
-        WARP_UNDER_CHAOS_SCENARIO, acknowledged_mutation_kind, apply_catalog_defaults,
-        executable_scenario_catalog, expected_workload_versioning_for_scenario,
-        requires_prefault_multipart_staging, scenario_catalog, scenario_catalog_json,
-        scenario_spec,
+        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, ON_DISK_BITROT_SCENARIO,
+        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
+        POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+        ROLLING_RESTART_ALL_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO,
+        acknowledged_mutation_kind, apply_catalog_defaults, executable_scenario_catalog,
+        expected_workload_versioning_for_scenario, requires_prefault_multipart_staging,
+        scenario_catalog, scenario_catalog_json, scenario_spec,
     };
     use crate::fault::acknowledged_mutation::AcknowledgedMutationKind;
     use crate::fault::config::{FaultTestConfig, FaultWorkloadProfile};
@@ -1598,8 +1775,8 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 25);
-        assert_eq!(scenario_catalog().len(), 30);
+        assert_eq!(executable_scenario_catalog().count(), 28);
+        assert_eq!(scenario_catalog().len(), 33);
         assert_eq!(
             scenario_catalog()
                 .iter()
@@ -1628,6 +1805,65 @@ mod tests {
                 .status,
             FaultScenarioStatus::Planned
         );
+    }
+
+    #[test]
+    fn planned_admin_qualification_requires_the_dedicated_entrypoint_and_flag() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.qualify_planned_admin = true;
+
+        for scenario in [ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO] {
+            config.scenario = scenario.to_string();
+            assert!(FaultScenario::from_config(&config).is_err());
+            assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+        }
+
+        config.scenario = STALE_DISK_RETURN_DETECT_SCENARIO.to_string();
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
+    }
+
+    #[test]
+    fn planned_storage_qualification_requires_exact_destructive_case() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+        config.scenario = super::FRESH_VOLUME_REPLACEMENT_SCENARIO.to_string();
+        config.qualify_planned_storage = true;
+        config.storage_recovery_case = Some(
+            crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
+        );
+
+        assert!(FaultScenario::from_config(&config).is_err());
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
+        config.destructive_enabled = true;
+        assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+
+        config.storage_recovery_case =
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAdminDeep);
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
+    }
+
+    #[test]
+    fn planned_storage_qualification_is_exact_and_separate_from_admin() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = ON_DISK_BITROT_SCENARIO.to_string();
+        config.qualify_planned_storage = true;
+        config.storage_recovery_target_config = Some("/secure/target.json".into());
+        config.storage_recovery_case =
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAutomaticScanner);
+
+        assert!(FaultScenario::from_config(&config).is_err());
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
+        config.destructive_enabled = true;
+        assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+
+        config.storage_recovery_case = Some(
+            crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
+        );
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
+
+        config.storage_recovery_case =
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAdminDeep);
+        config.qualify_planned_admin = true;
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
     }
 
     #[test]
@@ -1696,6 +1932,23 @@ mod tests {
             WorkloadOperationMix::default()
         );
         assert!(FaultScenario::from_config(&config).is_ok());
+    }
+
+    #[test]
+    fn planned_admin_cases_use_versioned_zero_byte_prefill() {
+        for scenario in [ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO] {
+            let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+            config.scenario = scenario.to_string();
+
+            apply_catalog_defaults(&mut config).expect("admin defaults");
+
+            assert!(config.workload_versioning);
+            assert_eq!(config.workload_directory_marker_percent, 100);
+            assert_eq!(
+                scenario_spec(scenario).expect("admin scenario").status,
+                FaultScenarioStatus::Planned
+            );
+        }
     }
 
     #[test]
@@ -1919,6 +2172,79 @@ mod tests {
             super::FaultImpactPolicy::AvailabilityRequired.as_str(),
             "availability-required"
         );
+    }
+
+    #[test]
+    fn lifecycle_scenarios_use_the_kubectl_backend_without_chaos_mesh() {
+        for name in [
+            POD_GRACEFUL_RESTART_ONE_SCENARIO,
+            ROLLING_RESTART_ALL_SCENARIO,
+            CLUSTER_COLD_RESTART_SCENARIO,
+        ] {
+            let spec = scenario_spec(name).expect("lifecycle scenario");
+            assert_eq!(spec.status, FaultScenarioStatus::Executable, "{name}");
+            assert_eq!(
+                spec.backend,
+                super::FaultBackend::KubernetesLifecycle,
+                "{name}"
+            );
+            assert!(!spec.requires_chaos_mesh(), "{name}");
+            assert!(!spec.requires_static_storage(), "{name}");
+            assert!(!spec.percent_supported, "{name}");
+            assert_eq!(spec.priority, super::FaultPriority::P0, "{name}");
+        }
+        // The fault-test script's Chaos Mesh gate keys off these fields.
+        let json: serde_json::Value =
+            serde_json::from_str(&scenario_catalog_json().expect("catalog json")).expect("json");
+        let lifecycle_entries = json
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter(|entry| entry["backend"] == "kubernetes-lifecycle")
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle_entries.len(), 3);
+        for entry in lifecycle_entries {
+            assert_eq!(entry["crds"], serde_json::json!([]), "{entry}");
+            assert_eq!(entry["required_tools"], serde_json::json!([]), "{entry}");
+        }
+        assert_eq!(
+            scenario_spec(CLUSTER_COLD_RESTART_SCENARIO)
+                .expect("scenario")
+                .isolation,
+            super::FaultIsolation::FreshTenant,
+            "the scale residue must not survive into another scenario"
+        );
+        assert_eq!(
+            scenario_spec(ROLLING_RESTART_ALL_SCENARIO)
+                .expect("scenario")
+                .isolation,
+            super::FaultIsolation::ReusableTenant
+        );
+        assert!(
+            scenario_spec(POD_GRACEFUL_RESTART_ONE_SCENARIO)
+                .expect("scenario")
+                .impact_policy
+                .requires_availability()
+        );
+        assert!(
+            scenario_spec(ROLLING_RESTART_ALL_SCENARIO)
+                .expect("scenario")
+                .impact_policy
+                .requires_availability()
+        );
+        // A held total outage must disrupt clients; availability cannot be
+        // claimed for a cluster with zero Pods.
+        assert!(
+            scenario_spec(CLUSTER_COLD_RESTART_SCENARIO)
+                .expect("scenario")
+                .impact_policy
+                .requires_client_disruption()
+        );
+        assert_eq!(
+            super::FaultBackend::KubernetesLifecycle.as_str(),
+            "kubernetes-lifecycle"
+        );
+        assert!(!super::FaultBackend::KubernetesLifecycle.accepts_percent());
     }
 
     #[test]

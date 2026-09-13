@@ -564,7 +564,7 @@ pub struct AdminRequestTarget {
 }
 
 impl AdminRequestTarget {
-    fn require_same_runtime_identity(&self, current: &Self) -> Result<()> {
+    pub(crate) fn require_same_runtime_identity(&self, current: &Self) -> Result<()> {
         self.endpoint.require_same_live_target(&current.endpoint)?;
         ensure!(
             self.deployment_id == current.deployment_id,
@@ -629,7 +629,7 @@ impl AdminRuntimeBinding {
         Ok(())
     }
 
-    fn require_same_runtime(&self, current: &Self) -> Result<()> {
+    pub(crate) fn require_same_runtime(&self, current: &Self) -> Result<()> {
         self.validate()?;
         current.validate()?;
         self.target.require_same_runtime_identity(&current.target)?;
@@ -642,7 +642,7 @@ impl AdminRuntimeBinding {
 }
 
 impl AdminRequestEvidence {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         self.target.endpoint.validate()?;
         ensure!(
             !self.target.deployment_id.trim().is_empty()
@@ -895,6 +895,34 @@ impl RustfsAdminTopologyAdapter {
     ) -> Result<Self> {
         let endpoint = AdminEndpointIdentity::from_live_port_forward(&mut port_forward)?;
         Self::connect_bound(endpoint, region, access_key, secret_key, Some(port_forward)).await
+    }
+
+    /// Capture the fresh Kubernetes Tenant, RustFS deployment, and pools/list
+    /// receipts bound to this adapter's live port-forward target.
+    pub async fn capture_pool_snapshot(
+        &self,
+        run_id: impl Into<String>,
+        case_name: impl Into<String>,
+    ) -> Result<AdminPoolSnapshot> {
+        let runtime = self.probe_runtime_binding().await?;
+        let tenant_endpoint = self.ensure_port_forward_target()?;
+        runtime
+            .target
+            .endpoint
+            .require_same_live_target(&tenant_endpoint)?;
+        let tenant_response_body = tenant_endpoint.tenant_response_body;
+        let tenant_started_at_ms = tenant_endpoint.tenant_started_at_ms;
+        let tenant_observed_at_ms = tenant_endpoint.tenant_observed_at_ms;
+        let pools = self.list_pools().await?;
+        AdminPoolSnapshot::from_list(
+            run_id,
+            case_name,
+            tenant_response_body.as_bytes(),
+            runtime,
+            tenant_started_at_ms,
+            tenant_observed_at_ms,
+            pools,
+        )
     }
 
     async fn connect_bound(
@@ -1236,6 +1264,40 @@ pub struct AdminTopologyProof {
 }
 
 impl AdminTopologyProof {
+    pub(crate) fn require_cluster_scope(
+        &self,
+        kubernetes_context: &str,
+        namespace: &str,
+        tenant: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.tenant == tenant
+                && self.namespace == namespace
+                && self.runtime.target.endpoint.kubernetes_context == kubernetes_context
+                && self.runtime.target.endpoint.namespace == namespace
+                && self.runtime.target.endpoint.tenant_name == tenant,
+            "admin topology proof does not match the configured Kubernetes context, namespace, and Tenant"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn expected_pod_names(&self) -> Result<BTreeSet<String>> {
+        let mut names = BTreeSet::new();
+        for pool in &self.tenant_pools {
+            for ordinal in 0..pool.servers {
+                ensure!(
+                    names.insert(format!("{}-{ordinal}", pool.stateful_set_name)),
+                    "admin topology proof contains duplicate RustFS Pod identity"
+                );
+            }
+        }
+        ensure!(
+            !names.is_empty(),
+            "admin topology proof contains no RustFS Pod identity"
+        );
+        Ok(names)
+    }
+
     pub fn build(
         plan: &AdminTopologyPlan,
         scenario: &str,
@@ -1753,8 +1815,39 @@ fn validate_pre_start_snapshot(
     snapshot: &AdminPoolSnapshot,
     operation_requests: &[AdminRequestEvidence],
 ) -> Result<()> {
-    snapshot.validate_list_request()?;
     validate_request_targets(operation_requests, &proof.runtime.target)?;
+    let (start_started_at_ms, _, _) =
+        validate_start_before_status(operation_requests, &proof.scenario, proof.target_pool_id)?;
+    validate_admin_pre_start_snapshot(proof, snapshot, start_started_at_ms)?;
+    let (start_path, _) = admin_request_paths(&proof.scenario)?;
+    let start_runtime_probe = operation_requests
+        .iter()
+        .find(|request| request.method == "POST" && request.path == start_path)
+        .and_then(|request| request.runtime_probe.as_ref())
+        .context("admin start request lacks its fresh RustFS runtime probe")?;
+    ensure!(
+        snapshot.runtime.observed_at_ms < snapshot.tenant_get.started_at_ms
+            && snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
+            && snapshot.request.observed_at_ms
+                < start_runtime_probe.target.endpoint.cluster_started_at_ms
+            && start_runtime_probe.observed_at_ms <= start_started_at_ms
+            && snapshot.tenant_get.observed_at_ms < start_started_at_ms
+            && start_started_at_ms - snapshot.tenant_get.observed_at_ms
+                <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS
+            && start_started_at_ms - snapshot.observed_at_ms <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS,
+        "pre-start Tenant GET and pools/list intervals are stale, overlapping, or not complete before admin start"
+    );
+    Ok(())
+}
+
+/// Revalidate a fresh pool snapshot before issuing an admin topology mutation.
+pub fn validate_admin_pre_start_snapshot(
+    proof: &AdminTopologyProof,
+    snapshot: &AdminPoolSnapshot,
+    evaluated_at_ms: u64,
+) -> Result<()> {
+    proof.require_satisfied()?;
+    snapshot.validate_list_request()?;
     ensure!(
         snapshot.attempt == proof.attempt,
         "pre-start pool snapshot does not belong to the current run/case/Tenant attempt"
@@ -1780,25 +1873,13 @@ fn validate_pre_start_snapshot(
         capacity.target_pool_expression == proof.target_pool_expression,
         "pre-start pool snapshot target identity drifted after preflight"
     );
-    let (start_started_at_ms, _, _) =
-        validate_start_before_status(operation_requests, &proof.scenario, proof.target_pool_id)?;
-    let (start_path, _) = admin_request_paths(&proof.scenario)?;
-    let start_runtime_probe = operation_requests
-        .iter()
-        .find(|request| request.method == "POST" && request.path == start_path)
-        .and_then(|request| request.runtime_probe.as_ref())
-        .context("admin start request lacks its fresh RustFS runtime probe")?;
     ensure!(
-        snapshot.runtime.observed_at_ms < snapshot.tenant_get.started_at_ms
-            && snapshot.tenant_get.observed_at_ms < snapshot.request.started_at_ms
-            && snapshot.request.observed_at_ms
-                < start_runtime_probe.target.endpoint.cluster_started_at_ms
-            && start_runtime_probe.observed_at_ms <= start_started_at_ms
-            && snapshot.tenant_get.observed_at_ms < start_started_at_ms
-            && start_started_at_ms - snapshot.tenant_get.observed_at_ms
-                <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS
-            && start_started_at_ms - snapshot.observed_at_ms <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS,
-        "pre-start Tenant GET and pools/list intervals are stale, overlapping, or not complete before admin start"
+        evaluated_at_ms >= snapshot.observed_at_ms
+            && evaluated_at_ms >= snapshot.tenant_get.observed_at_ms
+            && evaluated_at_ms - snapshot.observed_at_ms <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS
+            && evaluated_at_ms - snapshot.tenant_get.observed_at_ms
+                <= ADMIN_PRE_START_SNAPSHOT_MAX_AGE_MS,
+        "pre-start Tenant GET or pools/list snapshot is stale or was observed after evaluation"
     );
     Ok(())
 }
@@ -2535,6 +2616,119 @@ fn project_decommission_status(
     })
 }
 
+/// Build one progress sample directly from a captured RustFS status response.
+///
+/// A live decommission driver may learn the operation identity only after the
+/// first running status response. Passing that identity back through this
+/// constructor keeps every queued/running/terminal sample derived from its raw
+/// response while sharing the offline validator's fail-closed projection.
+pub fn decommission_progress_sample(
+    proof: &AdminTopologyProof,
+    operation_id: &str,
+    call: &AdminCall<DecommissionPoolStatus>,
+) -> Result<AdminOperationProgressSample> {
+    proof.require_satisfied()?;
+    ensure!(
+        proof.scenario == ADMIN_DECOMMISSION_SCENARIO,
+        "decommission progress requires an admin-decommission topology proof"
+    );
+    let target_pool_id = proof
+        .target_pool_id
+        .context("decommission topology proof has no target pool ID")?;
+    let target_pool_expression = proof
+        .target_pool_expression
+        .as_deref()
+        .context("decommission topology proof has no target expression")?;
+    call.request.validate()?;
+    proof
+        .runtime
+        .target
+        .require_same_runtime_identity(&call.request.target)?;
+    ensure!(
+        call.request.method == Method::GET.as_str()
+            && call.request.path == format!("{ADMIN_PREFIX}/decommission/status")
+            && has_exact_operation_query(
+                &call.request,
+                ADMIN_DECOMMISSION_SCENARIO,
+                Some(target_pool_id),
+            )
+            && (200..300).contains(&call.request.status),
+        "decommission progress source is not a successful status request for the proven pool"
+    );
+    let wire_status = parse_captured_json_response::<DecommissionPoolStatus>(
+        &call.request,
+        "RustFS decommission status response",
+    )?;
+    ensure!(
+        wire_status == call.value,
+        "decommission status fields do not match the captured RustFS response"
+    );
+    let projection = project_decommission_status(
+        &call.value,
+        target_pool_id,
+        target_pool_expression,
+        operation_id,
+    )?;
+    let status_request_id = call
+        .request
+        .request_id
+        .clone()
+        .filter(|request_id| !request_id.trim().is_empty())
+        .context("decommission status response lacks a request ID")?;
+    Ok(AdminOperationProgressSample {
+        attempt: proof.attempt.clone(),
+        operation_id: operation_id.to_string(),
+        status_request_id,
+        observed_at_ms: call.request.observed_at_ms,
+        state: projection.state,
+        completed: projection.completed,
+        failed: projection.failed,
+        canceled_or_stopped: projection.canceled,
+        objects_moved: Some(projection.objects_moved),
+        versions_moved: None,
+        bytes_moved: Some(projection.bytes_moved),
+    })
+}
+
+/// Validate a successful decommission control receipt for the proven target.
+pub fn validate_decommission_control_call(
+    proof: &AdminTopologyProof,
+    expected_path: &str,
+    call: &AdminCall<()>,
+) -> Result<()> {
+    proof.require_satisfied()?;
+    ensure!(
+        proof.scenario == ADMIN_DECOMMISSION_SCENARIO
+            && matches!(
+                expected_path,
+                "/rustfs/admin/v3/pools/decommission"
+                    | "/rustfs/admin/v3/pools/cancel"
+                    | "/rustfs/admin/v3/pools/clear"
+            ),
+        "decommission control validation received an unsupported scenario or path"
+    );
+    let target_pool_id = proof
+        .target_pool_id
+        .context("decommission topology proof has no target pool ID")?;
+    call.request.validate()?;
+    proof
+        .runtime
+        .target
+        .require_same_runtime_identity(&call.request.target)?;
+    ensure!(
+        call.request.method == Method::POST.as_str()
+            && call.request.path == expected_path
+            && has_exact_operation_query(
+                &call.request,
+                ADMIN_DECOMMISSION_SCENARIO,
+                Some(target_pool_id),
+            )
+            && (200..300).contains(&call.request.status),
+        "decommission control receipt is not a successful request for the proven target"
+    );
+    Ok(())
+}
+
 #[derive(Debug)]
 struct RebalanceStatusProjection {
     state: &'static str,
@@ -2660,6 +2854,66 @@ fn project_rebalance_status(
         objects_moved,
         versions_moved,
         bytes_moved,
+    })
+}
+
+/// Build one progress sample directly from a captured RustFS status response.
+///
+/// Scenario runners use this while polling so the live decision and the
+/// offline validator share the same fail-closed status projection.
+pub fn rebalance_progress_sample(
+    proof: &AdminTopologyProof,
+    operation_id: &str,
+    call: &AdminCall<RebalanceStatus>,
+) -> Result<AdminOperationProgressSample> {
+    proof.require_satisfied()?;
+    ensure!(
+        proof.scenario == ADMIN_REBALANCE_SCENARIO,
+        "rebalance progress requires an admin-rebalance topology proof"
+    );
+    ensure!(
+        !operation_id.trim().is_empty() && call.value.id == operation_id,
+        "rebalance status response belongs to a different operation"
+    );
+    call.request.validate()?;
+    proof
+        .runtime
+        .target
+        .require_same_runtime_identity(&call.request.target)?;
+    ensure!(
+        call.request.method == Method::GET.as_str()
+            && call.request.path == format!("{ADMIN_PREFIX}/rebalance/status")
+            && call.request.query.is_empty()
+            && (200..300).contains(&call.request.status),
+        "rebalance progress source is not a successful status request"
+    );
+    let wire_status = parse_captured_json_response::<RebalanceStatus>(
+        &call.request,
+        "RustFS rebalance status response",
+    )?;
+    ensure!(
+        wire_status == call.value,
+        "rebalance status fields do not match the captured RustFS response"
+    );
+    let projection = project_rebalance_status(&call.value, &proof.runtime_pools, false)?;
+    let status_request_id = call
+        .request
+        .request_id
+        .clone()
+        .filter(|request_id| !request_id.trim().is_empty())
+        .context("rebalance status response lacks a request ID")?;
+    Ok(AdminOperationProgressSample {
+        attempt: proof.attempt.clone(),
+        operation_id: operation_id.to_string(),
+        status_request_id,
+        observed_at_ms: call.request.observed_at_ms,
+        state: projection.state.to_string(),
+        completed: projection.completed,
+        failed: projection.failed,
+        canceled_or_stopped: projection.stopped,
+        objects_moved: Some(projection.objects_moved),
+        versions_moved: Some(projection.versions_moved),
+        bytes_moved: Some(projection.bytes_moved),
     })
 }
 
@@ -4124,6 +4378,38 @@ mod tests {
         assert_eq!(proof.remaining_free_bytes, 1_500);
         assert_eq!(proof.target_used_bytes, 200);
         assert_eq!(proof.required_remaining_free_bytes, 360);
+        let expected_pods = proof.expected_pod_names().expect("proven Pod names");
+        assert_eq!(expected_pods.len(), 8);
+        assert!(expected_pods.contains("fault-tenant-decommission-target-3"));
+        assert!(expected_pods.contains("fault-tenant-primary-3"));
+    }
+
+    #[test]
+    fn topology_proof_must_match_configured_cluster_scope() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_DECOMMISSION_SCENARIO),
+        )
+        .expect("proof");
+
+        proof
+            .require_cluster_scope("kind-admin-test", "fault-ns", "fault-tenant")
+            .expect("matching cluster scope");
+        for (context, namespace, tenant) in [
+            ("kind-other", "fault-ns", "fault-tenant"),
+            ("kind-admin-test", "other-ns", "fault-tenant"),
+            ("kind-admin-test", "fault-ns", "other-tenant"),
+        ] {
+            assert!(
+                proof
+                    .require_cluster_scope(context, namespace, tenant)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -5225,6 +5511,24 @@ mod tests {
             ),
         )
         .unwrap();
+        let start_call = AdminCall {
+            value: (),
+            request: operation.requests[0].clone(),
+        };
+        validate_decommission_control_call(
+            &proof,
+            "/rustfs/admin/v3/pools/decommission",
+            &start_call,
+        )
+        .expect("exact target start receipt");
+        assert!(
+            validate_decommission_control_call(
+                &proof,
+                "/rustfs/admin/v3/pools/clear",
+                &start_call,
+            )
+            .is_err()
+        );
         let mut samples = [
             ("queued", false, 110, 0, 0, "decommission-status-request-1"),
             (
@@ -5263,6 +5567,30 @@ mod tests {
             },
         )
         .collect::<Vec<_>>();
+
+        for (expected, request) in samples
+            .iter()
+            .zip(operation.requests.iter().filter(|request| {
+                request.method == "GET"
+                    && request.path == format!("{ADMIN_PREFIX}/decommission/status")
+            }))
+        {
+            let call = AdminCall {
+                value: serde_json::from_str(
+                    request
+                        .response_body
+                        .as_deref()
+                        .expect("captured decommission status body"),
+                )
+                .expect("decode captured decommission status"),
+                request: request.clone(),
+            };
+            assert_eq!(
+                decommission_progress_sample(&proof, &operation.operation_id, &call)
+                    .expect("derive live progress sample"),
+                *expected
+            );
+        }
 
         validate_admin_operation_progress(&operation, &samples, attempt_window())
             .expect("valid decommission state progression");
@@ -5821,6 +6149,36 @@ mod tests {
         evidence
             .require_success(attempt_window())
             .expect("successful rebalance");
+    }
+
+    #[test]
+    fn rebalance_progress_sample_is_derived_from_raw_status_receipt() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_REBALANCE_SCENARIO).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_REBALANCE_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_REBALANCE_SCENARIO),
+        )
+        .unwrap();
+        let status = completed_rebalance_status("rebalance-1");
+        let request = rebalance_requests().remove(1);
+        let sample = rebalance_progress_sample(
+            &proof,
+            "rebalance-1",
+            &AdminCall {
+                value: status,
+                request,
+            },
+        )
+        .expect("progress sample from captured status");
+
+        assert_eq!(sample.state, "completed");
+        assert!(sample.completed);
+        assert_eq!(sample.objects_moved, Some(2));
+        assert_eq!(sample.versions_moved, Some(3));
+        assert_eq!(sample.bytes_moved, Some(128));
     }
 
     #[test]

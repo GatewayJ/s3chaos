@@ -14,10 +14,10 @@
 
 //! Evidence contracts for RustFS storage-recovery scenarios.
 //!
-//! These types deliberately stop short of discovering RustFS's private
-//! on-disk layout. A future runtime adapter may execute replacement, bitrot,
-//! and stale-generation workflows only after RustFS supplies a stable mapping
-//! hook and the adapter can populate these proofs from observed identities.
+//! Mapping evidence may come from a RustFS diagnostic API or the bounded,
+//! read-only XL2 inspector. Offline evidence remains receipt-bound and derives
+//! membership from authenticated runtime topology rather than impersonating a
+//! diagnostic API response.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -40,8 +40,14 @@ use crate::fault::{
         validate_history_phase_boundary, validate_history_scope_and_order,
         validate_successful_version_identity_uniqueness,
     },
+    host_storage::{HostStorageMutationProof, dm_tables_match},
     preflight::{PreflightStatus, TARGET_PROOF_SCHEMA_VERSION, TargetProof, TargetProofStatus},
     quorum::{ErasureSetMembership, ErasureSetShape, PersistedVersionClass, QuorumRequirements},
+    storage_recovery_helper::{OfflineXl2InspectResponse, StaleOwnedOrphanReceipt},
+    storage_recovery_runtime::{
+        OwnedStorageContext, StorageRecoveryHostOperation, StorageRecoveryOperationReceipt,
+    },
+    xl2_inspector::OFFLINE_XL2_INSPECTOR_REVISION,
 };
 
 pub const STORAGE_RECOVERY_PROOF_SCHEMA_VERSION: u8 = 1;
@@ -113,6 +119,22 @@ impl StorageRecoveryCase {
         }
     }
 
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FreshVolumeReplacementAutomaticReplacement => {
+                "fresh-volume-replacement-automatic-replacement"
+            }
+            Self::FreshVolumeReplacementAdminDeep => "fresh-volume-replacement-admin-deep",
+            Self::OnDiskBitrotAutomaticScanner => "on-disk-bitrot-automatic-scanner",
+            Self::OnDiskBitrotAdminDeep => "on-disk-bitrot-admin-deep",
+            Self::StaleDiskReturn => "stale-disk-return",
+        }
+    }
+
+    pub fn parse_explicit(value: &str) -> Result<Self> {
+        Self::parse(value)
+    }
+
     pub fn heal_mode(self) -> Option<HealMode> {
         match self {
             Self::FreshVolumeReplacementAutomaticReplacement => {
@@ -124,6 +146,13 @@ impl StorageRecoveryCase {
             }
             Self::StaleDiskReturn => None,
         }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|case| case.as_str() == value)
+            .with_context(|| format!("unknown storage-recovery case {value:?}"))
     }
 }
 
@@ -221,7 +250,6 @@ impl StorageVolumeIdentity {
             && self.node == other.node
             && self.node_uid == other.node_uid
             && self.storage_class == other.storage_class
-            && self.local_volume_path == other.local_volume_path
             && self.mount_path == other.mount_path
             && self.pool_index == other.pool_index
             && self.set_index == other.set_index
@@ -480,6 +508,7 @@ impl FreshVolumeReplacementProof {
         );
         ensure!(
             self.original.persistent_volume_uid != self.replacement.persistent_volume_uid
+                && self.original.canonical_device != self.replacement.canonical_device
                 && self.original.filesystem_uuid != self.replacement.filesystem_uuid
                 && self.original.rustfs_drive_uuid != self.replacement.rustfs_drive_uuid,
             "fresh replacement must have new PV, filesystem, and RustFS drive generations"
@@ -542,6 +571,31 @@ pub enum RawDiskStateResponse {
         stderr: String,
         observed_at_ms: u64,
         mount_path: String,
+        canonical_device: String,
+    },
+    HostIoProbe {
+        execution: HostExecutionIdentity,
+        relative_path: String,
+        openat2_resolve_flags: Vec<String>,
+        requested_bytes: usize,
+        bytes_read: usize,
+        errno: Option<i32>,
+        observed_at_ms: u64,
+        mount_path: String,
+        canonical_device: String,
+    },
+    DeviceMapperTable {
+        host_storage_proof_sha256: String,
+        host_storage_proof_body: String,
+        observer_namespace: String,
+        observer_pod: String,
+        mapper_name: String,
+        argv: Vec<String>,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        suspended: bool,
+        observed_at_ms: u64,
         canonical_device: String,
     },
 }
@@ -761,6 +815,78 @@ impl RawDiskStateEvidence {
                     "raw target-node findmnt result does not prove the claimed disk state"
                 );
             }
+            RawDiskStateResponse::HostIoProbe {
+                execution,
+                relative_path,
+                openat2_resolve_flags,
+                requested_bytes,
+                bytes_read,
+                errno,
+                observed_at_ms: raw_observed_at_ms,
+                mount_path,
+                canonical_device,
+            } => {
+                execution.validate_for(volume)?;
+                let result_matches = match state {
+                    DiskPresenceState::Present => bytes_read == 1 && errno.is_none(),
+                    DiskPresenceState::Absent => bytes_read == 0 && errno == Some(libc::EIO),
+                };
+                ensure!(
+                    cursor == self.response_sha256
+                        && raw_observed_at_ms == observed_at_ms
+                        && mount_path == volume.mount_path
+                        && canonical_device == volume.canonical_device
+                        && relative_path == ".rustfs.sys/format.json"
+                        && openat2_resolve_flags == ["NO_XDEV", "NO_SYMLINKS", "BENEATH"]
+                        && requested_bytes == 1
+                        && result_matches,
+                    "raw host-helper probe does not prove the claimed continuous EIO disk state"
+                );
+            }
+            RawDiskStateResponse::DeviceMapperTable {
+                host_storage_proof_sha256,
+                host_storage_proof_body,
+                observer_namespace,
+                observer_pod,
+                mapper_name,
+                argv,
+                exit_code,
+                stdout,
+                stderr,
+                suspended,
+                observed_at_ms: raw_observed_at_ms,
+                canonical_device,
+            } => {
+                let proof =
+                    serde_json::from_str::<HostStorageMutationProof>(&host_storage_proof_body)
+                        .context("decode captured host-storage proof for DM state")?;
+                proof.validate()?;
+                let expected_table = match state {
+                    DiskPresenceState::Present => proof.tables.recovery_table.as_str(),
+                    DiskPresenceState::Absent => proof.tables.fault_table.as_str(),
+                };
+                ensure!(
+                    cursor == self.response_sha256
+                        && host_storage_proof_sha256 == volume.host_storage_proof_sha256
+                        && host_storage_proof_sha256
+                            == sha256_bytes(host_storage_proof_body.as_bytes())
+                        && proof.target.persistent_volume == volume.persistent_volume
+                        && proof.target.persistent_volume_uid == volume.persistent_volume_uid
+                        && proof.target.canonical_device == volume.canonical_device
+                        && proof.target.container_mount_path == volume.mount_path
+                        && observer_namespace == proof.observer_namespace
+                        && observer_pod == proof.observer_pod
+                        && mapper_name == proof.target.mapper_name
+                        && argv == ["dmsetup", "table", "--showkeys", mapper_name.as_str()]
+                        && exit_code == 0
+                        && stderr.trim().is_empty()
+                        && !suspended
+                        && raw_observed_at_ms == observed_at_ms
+                        && canonical_device == volume.canonical_device
+                        && dm_tables_match(&stdout, expected_table)?,
+                    "raw device-mapper table observation does not prove the claimed present/EIO state"
+                );
+            }
         }
         Ok(())
     }
@@ -972,11 +1098,8 @@ impl DiskAbsenceObservation {
                     && cursors.insert(sample.cursor.as_str())
                     && sample.cursor == sample.raw_evidence.cursor()?
                     && (index == 0
-                        || sample.observed_at_ms > response.samples[index - 1].observed_at_ms)
-                    && (index == 0
-                        || sample.observed_at_ms - response.samples[index - 1].observed_at_ms
-                            <= response.poll_interval_ms),
-                "host disk watch samples are duplicate, unordered, or exceed the bounded poll interval"
+                        || sample.observed_at_ms > response.samples[index - 1].observed_at_ms),
+                "host disk watch samples are duplicate or unordered"
             );
             sample.raw_evidence.validate(RawDiskStateExpectation {
                 state: sample.state,
@@ -992,6 +1115,13 @@ impl DiskAbsenceObservation {
             .iter()
             .position(|sample| sample.state == DiskPresenceState::Absent)
             .context("host disk watch never observed the detach")?;
+        ensure!(
+            response.samples[first_absent..]
+                .windows(2)
+                .all(|window| window[1].observed_at_ms - window[0].observed_at_ms
+                    <= response.poll_interval_ms),
+            "continuous EIO samples exceed the bounded poll interval after detachment"
+        );
         ensure!(
             first.state == DiskPresenceState::Present
                 && first.observed_at_ms == response.watch_started_at_ms
@@ -1700,6 +1830,23 @@ impl StaleDiskReturnProof {
 #[serde(rename_all = "kebab-case")]
 pub enum ShardMappingSource {
     RustfsDiagnosticApi,
+    OfflineXl2Inspector,
+}
+
+impl ShardMappingSource {
+    fn validate_revision(self, revision: &str) -> Result<()> {
+        match self {
+            Self::RustfsDiagnosticApi => ensure!(
+                !revision.trim().is_empty(),
+                "RustFS diagnostic mapping API revision is empty"
+            ),
+            Self::OfflineXl2Inspector => ensure!(
+                revision == OFFLINE_XL2_INSPECTOR_REVISION,
+                "offline XL2 mapping has an unsupported inspector revision"
+            ),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1843,6 +1990,8 @@ impl ShardMutationProof {
         );
         self.volume.validate()?;
         let mutation_target_proof = self.mutation_target_proof()?;
+        self.mapping_source
+            .validate_revision(&self.mapping_api_revision)?;
         for (field, value) in [
             ("mapping API revision", self.mapping_api_revision.as_str()),
             ("object key", self.object_key.as_str()),
@@ -2208,9 +2357,16 @@ pub enum HealMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum HealObserverIdentity {
-    ReplacementTask { task_id: String, generation: u64 },
-    ScannerStatus { status_cursor: String },
-    AdminOperation { operation_id: String },
+    ReplacementTask {
+        task_id: String,
+        generation: Option<String>,
+    },
+    ScannerStatus {
+        status_cursor: String,
+    },
+    AdminOperation {
+        operation_id: String,
+    },
 }
 
 impl HealObserverIdentity {
@@ -2223,8 +2379,11 @@ impl HealObserverIdentity {
                     generation,
                 },
             ) => ensure!(
-                !task_id.trim().is_empty() && *generation > 0,
-                "automatic replacement requires a task id and positive generation"
+                !task_id.trim().is_empty()
+                    && generation
+                        .as_deref()
+                        .is_some_and(|generation| !generation.trim().is_empty()),
+                "automatic replacement requires a task id and captured generation"
             ),
             (HealMode::AutomaticScanner, Self::ScannerStatus { status_cursor }) => ensure!(
                 !status_cursor.trim().is_empty(),
@@ -2461,6 +2620,13 @@ pub struct ForcedReadProbe {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OfflineVersionShardMappingEvidence {
+    pub context: Box<OwnedStorageContext>,
+    pub inspection_receipt: Box<StorageRecoveryOperationReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VersionShardMappingObservation {
     pub schema_version: u8,
     pub identity: StorageRecoveryArtifactIdentity,
@@ -2469,6 +2635,8 @@ pub struct VersionShardMappingObservation {
     pub api_revision: String,
     pub response_sha256: String,
     pub response_body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_evidence: Option<Box<OfflineVersionShardMappingEvidence>>,
     pub target_proof_sha256: String,
     pub observed_at_ms: u64,
 }
@@ -2483,6 +2651,133 @@ pub struct RustfsVersionShardMappingResponse {
     pub pool_index: u32,
     pub set_index: u32,
     pub shard_ids: Vec<String>,
+}
+
+impl VersionShardMappingObservation {
+    pub fn validated_mapping(
+        &self,
+        membership: &ErasureSetMembership,
+        shape: &ErasureSetShape,
+    ) -> Result<RustfsVersionShardMappingResponse> {
+        self.source.validate_revision(&self.api_revision)?;
+        validate_sha256("version-shard mapping response", &self.response_sha256)?;
+        validate_sha256(
+            "version-shard mapping target proof",
+            &self.target_proof_sha256,
+        )?;
+        ensure!(
+            self.response_sha256 == sha256_bytes(self.response_body.as_bytes())
+                && self.observed_at_ms > 0,
+            "version-shard mapping source body or observation timestamp is invalid"
+        );
+        match self.source {
+            ShardMappingSource::RustfsDiagnosticApi => {
+                ensure!(
+                    self.offline_evidence.is_none(),
+                    "RustFS diagnostic mapping must not carry offline inspector evidence"
+                );
+                serde_json::from_str(&self.response_body)
+                    .context("decode captured RustFS version-shard mapping response")
+            }
+            ShardMappingSource::OfflineXl2Inspector => {
+                let evidence = self.offline_evidence.as_deref().context(
+                    "offline version-shard mapping lacks its helper receipt and context",
+                )?;
+                let context = evidence.context.as_ref();
+                let receipt = evidence.inspection_receipt.as_ref();
+                context.validate()?;
+                receipt.validate_for(context, &receipt.operation)?;
+                let StorageRecoveryHostOperation::InspectXlMeta {
+                    bucket,
+                    object_key,
+                    object_sha256,
+                    version_id,
+                    selected_part_number,
+                    expected_mount_device_id,
+                    expected_drive_uuid,
+                    ..
+                } = &receipt.operation
+                else {
+                    anyhow::bail!("offline version-shard mapping receipt is not an XL2 inspection")
+                };
+                ensure!(
+                    context.identity == self.identity
+                        && context.identity.scenario == context.case.scenario()
+                        && context.volume.target_proof_sha256 == self.target_proof_sha256
+                        && receipt.completed_at_ms == self.observed_at_ms
+                        && receipt.response_sha256 == self.response_sha256
+                        && receipt.response_body == self.response_body,
+                    "offline version-shard mapping is not bound to its exact context and helper receipt"
+                );
+                let response =
+                    serde_json::from_str::<OfflineXl2InspectResponse>(&receipt.response_body)
+                        .context("decode receipt-bound offline XL2 inspection response")?;
+                validate_sha256("offline format.json", &response.format_json_sha256)?;
+                validate_sha256("offline xl.meta", &response.xl_meta_sha256)?;
+                ensure!(
+                    bucket == &self.identity.bucket
+                        && version_id == &response.layout.version_id
+                        && response.layout.inspector_revision == self.api_revision
+                        && expected_mount_device_id == &response.mount_device_id
+                        && expected_mount_device_id == &context.host_generation.device_major_minor
+                        && expected_drive_uuid == &response.drive_uuid
+                        && expected_drive_uuid == &context.volume.rustfs_drive_uuid
+                        && response.selected_part.part_number == *selected_part_number
+                        && response.selected_part.shard_device_id
+                            == context.host_generation.device_major_minor
+                        && response.selected_part.shard_inode > 0
+                        && response.selected_part.shard_size_bytes > 0
+                        && context.volume.pool_index == shape.pool_index
+                        && context.volume.set_index == shape.set_index,
+                    "offline XL2 receipt does not identify the mapped object, drive, or erasure set"
+                );
+                validate_sha256(
+                    "offline selected shard preimage",
+                    &response.selected_part.original_sha256,
+                )?;
+                let selected_path = response
+                    .layout
+                    .part_numbers
+                    .iter()
+                    .position(|part| part == selected_part_number)
+                    .and_then(|index| response.layout.relative_part_paths.get(index));
+                ensure!(
+                    selected_path == Some(&response.selected_part.relative_part_path),
+                    "offline XL2 receipt selected shard is not present in the inspected layout"
+                );
+                let shard_ids = membership
+                    .members
+                    .iter()
+                    .flat_map(|member| member.shard_ids.iter().cloned())
+                    .collect::<Vec<_>>();
+                let total = response
+                    .layout
+                    .erasure_data_shards
+                    .checked_add(response.layout.erasure_parity_shards)
+                    .context("offline XL2 erasure width overflow")?;
+                ensure!(
+                    usize::try_from(total)? == shard_ids.len()
+                        && response.layout.erasure_index > 0
+                        && response.layout.erasure_index <= total
+                        && shard_ids
+                            .iter()
+                            .filter(|id| *id == &response.drive_uuid)
+                            .count()
+                            == 1,
+                    "offline XL2 layout does not match authenticated runtime membership"
+                );
+                Ok(RustfsVersionShardMappingResponse {
+                    bucket: bucket.clone(),
+                    object_key: object_key.clone(),
+                    version_id: version_id.clone(),
+                    object_sha256: object_sha256.clone(),
+                    pool_index: context.volume.pool_index,
+                    set_index: context.volume.set_index,
+                    shard_ids,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2736,28 +3031,25 @@ impl ForceReadThroughProof {
                 "version-shard mapping has a mismatched schema/identity or duplicate observation id"
             );
             ensure!(
-                mapping.source == ShardMappingSource::RustfsDiagnosticApi
-                    && !mapping.api_revision.trim().is_empty()
-                    && mapping.target_proof_sha256 == self.target_proof_sha256
+                mapping.target_proof_sha256 == self.target_proof_sha256
                     && mapping.observed_at_ms > 0
                     && mapping.observed_at_ms >= runtime.target_proof.generated_at_ms
                     && mapping.observed_at_ms < self.fault_active_from_ms
                     && self.fault_active_from_ms - mapping.observed_at_ms
                         <= STORAGE_OBSERVATION_MAX_AGE_MS,
-                "version-shard mapping is not a fresh pre-fault RustFS diagnostic observation"
+                "version-shard mapping is not a fresh pre-fault observation"
             );
+            mapping.source.validate_revision(&mapping.api_revision)?;
             validate_sha256("version-shard mapping response", &mapping.response_sha256)?;
             ensure!(
                 mapping.response_sha256 == sha256_bytes(mapping.response_body.as_bytes()),
-                "version-shard mapping response digest does not match the captured RustFS response body"
+                "version-shard mapping response digest does not match the captured source body"
             );
             validate_sha256(
                 "version-shard mapping target proof",
                 &mapping.target_proof_sha256,
             )?;
-            let response =
-                serde_json::from_str::<RustfsVersionShardMappingResponse>(&mapping.response_body)
-                    .context("decode captured RustFS version-shard mapping response")?;
+            let response = mapping.validated_mapping(membership, &self.shape)?;
             ensure!(
                 !response.object_key.trim().is_empty()
                     && !response.version_id.trim().is_empty()
@@ -3689,12 +3981,32 @@ pub struct ShardInventoryEntry {
 pub enum FragmentReferenceState {
     ReferencedVersion,
     OrphanedUncommitted,
+    /// A fragment discovered by the closed offline traversal that cannot be
+    /// reconciled to the captured S3/history model.
+    Unclassified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ShardInventorySource {
     RustfsDiagnosticApi,
+    OfflineXl2Inspector,
+}
+
+impl ShardInventorySource {
+    fn validate_revision(self, revision: &str) -> Result<()> {
+        match self {
+            Self::RustfsDiagnosticApi => ensure!(
+                !revision.trim().is_empty(),
+                "RustFS diagnostic inventory API revision is empty"
+            ),
+            Self::OfflineXl2Inspector => ensure!(
+                revision == OFFLINE_XL2_INSPECTOR_REVISION,
+                "offline XL2 inventory has an unsupported inspector revision"
+            ),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3800,10 +4112,11 @@ impl ShardInventorySnapshot {
         );
         self.identity.validate()?;
         self.volume.validate()?;
+        self.receipt
+            .source
+            .validate_revision(&self.receipt.api_revision)?;
         ensure!(
             !self.receipt.snapshot_id.trim().is_empty()
-                && self.receipt.source == ShardInventorySource::RustfsDiagnosticApi
-                && !self.receipt.api_revision.trim().is_empty()
                 && self.receipt.started_at_ms > 0
                 && self.receipt.started_at_ms < self.receipt.completed_at_ms
                 && self.receipt.completed_at_ms == self.receipt.observed_at_ms
@@ -3867,11 +4180,86 @@ pub struct DanglingCleanupProof {
     pub after_inventory_snapshot_id: String,
     pub after_inventory_sha256: String,
     pub cleanup_operation_id: String,
+    pub orphan_injection: StaleOwnedOrphanReceipt,
     pub cleanup_evidence: Option<DanglingCleanupEvidence>,
     pub writes_quiesced_at_ms: u64,
     pub started_at_ms: u64,
     pub completed_at_ms: u64,
+    pub ack_loss_puts: Vec<AckLossPutEvidence>,
     pub classified_versions: Vec<ClassifiedVersionFragments>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AckLossPutEvidence {
+    pub operation_id: String,
+    pub proxy_endpoint: String,
+    pub request_count: usize,
+    pub retries_disabled: bool,
+    pub request_sha256: String,
+    pub value_sha256: String,
+    pub size_bytes: usize,
+    pub upstream_http_status: u16,
+    pub upstream_request_id: String,
+    pub upstream_version_id: String,
+    pub accepted_at_ms: u64,
+    pub upstream_completed_at_ms: u64,
+    pub client_response_bytes: usize,
+    pub connection_closed_at_ms: u64,
+}
+
+impl AckLossPutEvidence {
+    fn validate_for(
+        &self,
+        identity: &StorageRecoveryArtifactIdentity,
+        record: &OperationRecord,
+    ) -> Result<()> {
+        let endpoint = self
+            .proxy_endpoint
+            .parse::<std::net::SocketAddr>()
+            .context("ACK-loss proxy endpoint is not a socket address")?;
+        validate_sha256("ACK-loss request", &self.request_sha256)?;
+        validate_sha256("ACK-loss value", &self.value_sha256)?;
+        ensure!(
+            endpoint.ip().is_loopback()
+                && endpoint.port() > 0
+                && self.request_count == 1
+                && self.retries_disabled
+                && (200..300).contains(&self.upstream_http_status)
+                && !self.upstream_request_id.trim().is_empty()
+                && !self.upstream_version_id.trim().is_empty()
+                && self.upstream_version_id != "null"
+                && self.client_response_bytes == 0,
+            "recoverable-unknown evidence is not a one-shot localhost ACK-loss PUT"
+        );
+        ensure!(
+            self.operation_id == record.id
+                && record_matches_identity(record, identity)
+                && record.kind == OperationKind::Put
+                && matches!(
+                    record.outcome,
+                    OperationOutcome::Timeout
+                        | OperationOutcome::Unknown
+                        | OperationOutcome::Failed
+                )
+                && record.http_status.is_none()
+                && record.key.is_some()
+                && record.value_sha256.as_deref() == Some(self.value_sha256.as_str())
+                && record.size_bytes == Some(self.size_bytes)
+                && record.version_id.as_deref().is_none_or(|version_id| {
+                    version_id == "null" || version_id == self.upstream_version_id
+                }),
+            "ACK-loss receipt does not bind the ambiguous workload PUT"
+        );
+        ensure!(
+            record.started_at_ms <= self.accepted_at_ms
+                && self.accepted_at_ms <= self.upstream_completed_at_ms
+                && self.upstream_completed_at_ms <= self.connection_closed_at_ms
+                && self.connection_closed_at_ms <= record.ended_at_ms,
+            "ACK-loss proxy and workload operation intervals are not ordered"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3891,6 +4279,12 @@ pub struct RustfsDanglingCleanupResponse {
     pub before_inventory_snapshot_id: String,
     pub started_at_ms: u64,
     pub completed_at_ms: u64,
+    pub deletion_authority: String,
+    pub dry_run_evidence: DanglingCleanupEvidence,
+    pub live_evidence: DanglingCleanupEvidence,
+    /// Raw admin heal output is diagnostic only. Exact deletion authority is
+    /// the stable offline inventory delta bound to `orphan_injection`.
+    #[serde(default)]
     pub removed_fragment_ids: Vec<String>,
 }
 
@@ -3940,11 +4334,22 @@ impl DanglingCleanupProof {
         let cleanup_response =
             serde_json::from_str::<RustfsDanglingCleanupResponse>(&cleanup_evidence.response_body)
                 .context("decode captured RustFS dangling-cleanup response")?;
-        validate_unique_nonempty(
-            "cleanup removed fragment id",
-            &cleanup_response.removed_fragment_ids,
-            true,
-        )?;
+        ensure!(
+            cleanup_response.removed_fragment_ids.is_empty()
+                && cleanup_response.deletion_authority
+                    == "offline-inventory-delta-and-injection-receipt",
+            "raw admin heal output must remain diagnostic-only cleanup evidence"
+        );
+        for (label, evidence) in [
+            ("dry-run heal", &cleanup_response.dry_run_evidence),
+            ("live heal", &cleanup_response.live_evidence),
+        ] {
+            validate_sha256(label, &evidence.response_sha256)?;
+            ensure!(
+                evidence.response_sha256 == sha256_bytes(evidence.response_body.as_bytes()),
+                "{label} evidence digest does not match its captured body"
+            );
+        }
         before_inventory.validate()?;
         after_inventory.validate()?;
         let before_response = before_inventory.response()?;
@@ -4041,6 +4446,15 @@ impl DanglingCleanupProof {
         let mut classified_versions = BTreeSet::new();
         let mut classification_evidence_ids = BTreeSet::new();
         let mut protected_operation_ids = BTreeSet::new();
+        let ack_loss_by_operation = self
+            .ack_loss_puts
+            .iter()
+            .map(|evidence| (evidence.operation_id.as_str(), evidence))
+            .collect::<HashMap<_, _>>();
+        ensure!(
+            ack_loss_by_operation.len() == self.ack_loss_puts.len(),
+            "dangling-cleanup proof contains duplicate ACK-loss operation receipts"
+        );
         for version in &self.classified_versions {
             ensure!(
                 !version.evidence_id.trim().is_empty()
@@ -4153,6 +4567,17 @@ impl DanglingCleanupProof {
                             }),
                         "recoverable-unknown fragments are not backed by an ambiguous write outcome"
                     );
+                    ack_loss_by_operation
+                        .get(record.id.as_str())
+                        .context(
+                            "recoverable-unknown fragments lack a one-shot ACK-loss proxy receipt",
+                        )?
+                        .validate_for(&self.identity, record)?;
+                    ensure!(
+                        ack_loss_by_operation[record.id.as_str()].upstream_version_id
+                            == version.version_id,
+                        "ACK-loss upstream version does not match the classified inventory version"
+                    );
                     if record
                         .version_id
                         .as_deref()
@@ -4263,6 +4688,12 @@ impl DanglingCleanupProof {
             "fragment classifications do not exactly cover successful and ambiguous writes represented in the inventory"
         );
         ensure!(
+            self.ack_loss_puts.iter().all(|evidence| {
+                protected_operation_ids.contains(evidence.operation_id.as_str())
+            }),
+            "ACK-loss receipts contain an operation not protected by the inventory classification"
+        );
+        ensure!(
             after_response
                 .entries
                 .iter()
@@ -4275,13 +4706,25 @@ impl DanglingCleanupProof {
             .map(|fragment_id| (*fragment_id).clone())
             .collect::<BTreeSet<_>>();
         ensure!(
-            cleanup_response
-                .removed_fragment_ids
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>()
-                == removed_fragment_ids,
-            "post-cleanup inventory delta does not match the captured RustFS cleanup response"
+            self.orphan_injection.run_id == self.identity.run_id
+                && self.orphan_injection.bucket == self.identity.bucket
+                && self.orphan_injection.drive_uuid == self.returned_generation.rustfs_drive_uuid
+                && self.orphan_injection.created_at_ms > self.writes_quiesced_at_ms
+                && self.orphan_injection.created_at_ms < before_inventory.receipt.started_at_ms,
+            "orphan injection receipt is not bound and ordered within the returned generation"
+        );
+        let injected = before
+            .get(&self.orphan_injection.fragment_id)
+            .context("run-owned injected orphan is absent from the pre-cleanup inventory")?;
+        ensure!(
+            injected.bucket == self.orphan_injection.bucket
+                && injected.object_key == self.orphan_injection.object_key
+                && injected.version_id == self.orphan_injection.version_id
+                && injected.drive_uuid == self.orphan_injection.drive_uuid
+                && injected.object_sha256 == self.orphan_injection.object_sha256
+                && injected.sha256 == self.orphan_injection.fragment_sha256
+                && injected.reference_state == FragmentReferenceState::OrphanedUncommitted,
+            "pre-cleanup inventory does not bind the injected orphan receipt"
         );
         let mut removed_dangling = false;
         for version in &self.classified_versions {
@@ -4298,6 +4741,10 @@ impl DanglingCleanupProof {
                 }
             }
         }
+        ensure!(
+            removed_fragment_ids == BTreeSet::from([self.orphan_injection.fragment_id.clone()]),
+            "post-cleanup inventory delta is not exactly the run-owned injected orphan"
+        );
         ensure!(
             removed_dangling,
             "dangling-cleanup case has no proven uncommitted-dangling fragment removal signal"
@@ -6353,7 +6800,9 @@ mod tests {
             let mut raw =
                 serde_json::from_str::<RawDiskStateResponse>(&sample.raw_evidence.response_body)
                     .expect("raw host response");
-            let RawDiskStateResponse::HostDevice { execution, .. } = &mut raw;
+            let RawDiskStateResponse::HostDevice { execution, .. } = &mut raw else {
+                unreachable!("fixture uses host-device evidence")
+            };
             execution.node = "wrong-node".to_string();
             sample.raw_evidence.response_body =
                 serde_json::to_string(&raw).expect("raw host response");
@@ -6379,7 +6828,9 @@ mod tests {
                     &sample.raw_evidence.response_body,
                 )
                 .expect("raw host response");
-                let RawDiskStateResponse::HostDevice { execution, .. } = &mut raw;
+                let RawDiskStateResponse::HostDevice { execution, .. } = &mut raw else {
+                    unreachable!("fixture uses host-device evidence")
+                };
                 let mut helper =
                     serde_json::from_str::<serde_json::Value>(&execution.helper_pod_body)
                         .expect("raw helper Pod");
@@ -6730,6 +7181,18 @@ mod tests {
         proof
             .validate_against_history(&history)
             .expect("valid bitrot proof");
+
+        let mut offline_mapping = proof.clone();
+        offline_mapping.mapping_source = ShardMappingSource::OfflineXl2Inspector;
+        offline_mapping.mapping_api_revision = OFFLINE_XL2_INSPECTOR_REVISION.to_string();
+        offline_mapping
+            .validate_against_history(&history)
+            .expect("offline XL2 mapping source");
+        offline_mapping.mapping_api_revision = "unknown-xl2-profile".to_string();
+        assert!(
+            offline_mapping.validate_against_history(&history).is_err(),
+            "offline mapping evidence must name the supported capability profile"
+        );
 
         let mut wrong_host_node = proof.clone();
         let host_evidence = wrong_host_node
@@ -7316,6 +7779,7 @@ mod tests {
             api_revision: "v1".to_string(),
             response_sha256: sha256_bytes(mapping_response.as_bytes()),
             response_body: mapping_response,
+            offline_evidence: None,
             target_proof_sha256: target_proof_sha256.clone(),
             observed_at_ms: 299,
         }];
@@ -7495,6 +7959,23 @@ mod tests {
                 &mapping_observations,
             )
             .expect("valid forced read");
+
+        let mut synthesized_offline_mapping = mapping_observations.clone();
+        synthesized_offline_mapping[0].source = ShardMappingSource::OfflineXl2Inspector;
+        synthesized_offline_mapping[0].api_revision = OFFLINE_XL2_INSPECTOR_REVISION.to_string();
+        let error = proof
+            .validate_against_runtime(
+                &membership,
+                &runtime_contract,
+                "drive-7",
+                &history,
+                &synthesized_offline_mapping,
+            )
+            .expect_err("offline mapping without helper receipt must fail");
+        assert!(
+            error.to_string().contains("lacks its helper receipt"),
+            "{error:#}"
+        );
 
         {
             let mut bitrot_target = serde_json::from_str::<serde_json::Value>(&target_proof_body)
@@ -8185,6 +8666,7 @@ mod tests {
                 api_revision: "v1".to_string(),
                 response_sha256: sha256_bytes(response.as_bytes()),
                 response_body: response,
+                offline_evidence: None,
                 target_proof_sha256: target_proof_sha256.clone(),
                 observed_at_ms: 299,
             });
@@ -8313,6 +8795,17 @@ mod tests {
             550,
             vec![committed.clone(), unknown.clone(), dangling.clone()],
         );
+        let mut offline_inventory = before_inventory.clone();
+        offline_inventory.receipt.source = ShardInventorySource::OfflineXl2Inspector;
+        offline_inventory.receipt.api_revision = OFFLINE_XL2_INSPECTOR_REVISION.to_string();
+        offline_inventory
+            .validate()
+            .expect("offline XL2 inventory source");
+        offline_inventory.receipt.api_revision = "unknown-xl2-profile".to_string();
+        assert!(
+            offline_inventory.validate().is_err(),
+            "offline inventory evidence must name the supported capability profile"
+        );
         let after_inventory = inventory(
             "inventory-after",
             "cursor-after",
@@ -8327,7 +8820,16 @@ mod tests {
             before_inventory_snapshot_id: before_inventory.receipt.snapshot_id.clone(),
             started_at_ms: 600,
             completed_at_ms: 700,
-            removed_fragment_ids: vec![dangling.fragment_id.clone()],
+            deletion_authority: "offline-inventory-delta-and-injection-receipt".to_string(),
+            dry_run_evidence: DanglingCleanupEvidence {
+                response_sha256: sha256_bytes(b"{}"),
+                response_body: "{}".to_string(),
+            },
+            live_evidence: DanglingCleanupEvidence {
+                response_sha256: sha256_bytes(b"{}"),
+                response_body: "{}".to_string(),
+            },
+            removed_fragment_ids: Vec::new(),
         })
         .expect("cleanup response");
         let proof = DanglingCleanupProof {
@@ -8339,6 +8841,21 @@ mod tests {
             after_inventory_snapshot_id: after_inventory.receipt.snapshot_id.clone(),
             after_inventory_sha256: after_inventory.entries_sha256.clone(),
             cleanup_operation_id: "cleanup-1".to_string(),
+            orphan_injection: StaleOwnedOrphanReceipt {
+                run_id: "run-1".to_string(),
+                bucket: dangling.bucket.clone(),
+                object_key: dangling.object_key.clone(),
+                version_id: dangling.version_id.clone(),
+                relative_part_path: "bucket-1/key/unknown-write/part.1".to_string(),
+                drive_uuid: dangling.drive_uuid.clone(),
+                fragment_id: dangling.fragment_id.clone(),
+                object_sha256: dangling.object_sha256.clone(),
+                fragment_sha256: dangling.sha256.clone(),
+                part_device_id: "8:1".to_string(),
+                part_inode: 42,
+                part_size_bytes: 1,
+                created_at_ms: 542,
+            },
             cleanup_evidence: Some(DanglingCleanupEvidence {
                 response_sha256: sha256_bytes(cleanup_response.as_bytes()),
                 response_body: cleanup_response,
@@ -8346,6 +8863,22 @@ mod tests {
             writes_quiesced_at_ms: 540,
             started_at_ms: 600,
             completed_at_ms: 700,
+            ack_loss_puts: vec![AckLossPutEvidence {
+                operation_id: "ack-loss-1".to_string(),
+                proxy_endpoint: "127.0.0.1:39001".to_string(),
+                request_count: 1,
+                retries_disabled: true,
+                request_sha256: HASH_C.to_string(),
+                value_sha256: HASH_B.to_string(),
+                size_bytes: 1,
+                upstream_http_status: 200,
+                upstream_request_id: "request-ack-loss-1".to_string(),
+                upstream_version_id: "ack-lost-version".to_string(),
+                accepted_at_ms: 529,
+                upstream_completed_at_ms: 529,
+                client_response_bytes: 0,
+                connection_closed_at_ms: 530,
+            }],
             classified_versions: vec![
                 ClassifiedVersionFragments {
                     evidence_id: "put-1".to_string(),
@@ -8381,6 +8914,20 @@ mod tests {
                 &history,
             )
             .expect("committed and recoverable-unknown fragments retained");
+
+        let mut ordinary_unknown = proof.clone();
+        ordinary_unknown.ack_loss_puts.clear();
+        assert!(
+            ordinary_unknown
+                .validate_against_stale_return(
+                    &stale_return,
+                    &before_inventory,
+                    &after_inventory,
+                    &history,
+                )
+                .is_err(),
+            "an ordinary ambiguous SDK outcome must not count as recoverable-unknown"
+        );
 
         let mut no_cleanup_response = proof.clone();
         no_cleanup_response.cleanup_evidence = None;
@@ -8615,16 +9162,6 @@ mod tests {
         let mut missing = proof.clone();
         missing.after_inventory_snapshot_id = missing_after.receipt.snapshot_id.clone();
         missing.after_inventory_sha256 = missing_after.entries_sha256.clone();
-        let cleanup_evidence = missing.cleanup_evidence.as_mut().expect("cleanup evidence");
-        let mut cleanup_response =
-            serde_json::from_str::<RustfsDanglingCleanupResponse>(&cleanup_evidence.response_body)
-                .expect("cleanup response");
-        cleanup_response
-            .removed_fragment_ids
-            .push(unknown.fragment_id.clone());
-        cleanup_evidence.response_body =
-            serde_json::to_string(&cleanup_response).expect("cleanup response");
-        cleanup_evidence.response_sha256 = sha256_bytes(cleanup_evidence.response_body.as_bytes());
         let error = missing
             .validate_against_stale_return(
                 &stale_return,
@@ -8742,14 +9279,50 @@ mod tests {
         ambiguous.http_status = Some(500);
         let mut server_error_stale_return = stale_return.clone();
         server_error_stale_return.post_return_checker = post_return_checker(&server_error);
-        proof
-            .validate_against_stale_return(
-                &server_error_stale_return,
-                &before_inventory,
-                &after_inventory,
-                &server_error,
-            )
-            .expect("a failed 5xx write remains recoverable-unknown and protected");
+        assert!(
+            proof
+                .validate_against_stale_return(
+                    &server_error_stale_return,
+                    &before_inventory,
+                    &after_inventory,
+                    &server_error,
+                )
+                .is_err(),
+            "a client-observed 5xx is not a byte-dropped successful upstream ACK"
+        );
+
+        let extra_unclassified = ShardInventoryEntry {
+            fragment_id: "fragment-unlisted-version".to_string(),
+            version_id: "unlisted-version".to_string(),
+            reference_state: FragmentReferenceState::Unclassified,
+            ..unknown.clone()
+        };
+        let mut unclassified_entries = before_inventory
+            .response()
+            .expect("inventory response")
+            .entries;
+        unclassified_entries.push(extra_unclassified);
+        let unclassified_before = inventory(
+            "inventory-unclassified",
+            "cursor-unclassified",
+            550,
+            unclassified_entries,
+        );
+        let mut unclassified_proof = proof.clone();
+        unclassified_proof.before_inventory_snapshot_id =
+            unclassified_before.receipt.snapshot_id.clone();
+        unclassified_proof.before_inventory_sha256 = unclassified_before.entries_sha256.clone();
+        assert!(
+            unclassified_proof
+                .validate_against_stale_return(
+                    &stale_return,
+                    &unclassified_before,
+                    &after_inventory,
+                    &history,
+                )
+                .is_err(),
+            "an exhaustively discovered unlisted version must deny cleanup authority"
+        );
 
         let second_unknown = ShardInventoryEntry {
             fragment_id: "fragment-unknown-2".to_string(),

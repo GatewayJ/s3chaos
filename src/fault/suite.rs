@@ -21,7 +21,10 @@ use std::path::Path;
 use crate::fault::{
     plan::FaultInjectionParameters,
     reporting::{FailureClassification, FailureSeverity, ResponsibilityDomain},
-    scenarios::{FaultDetectorContract, FaultScenarioStatus, scenario_spec},
+    scenarios::{
+        FaultDetectorContract, FaultScenarioStatus, ON_DISK_BITROT_SCENARIO, scenario_spec,
+    },
+    storage_recovery::StorageRecoveryCase,
     workload::{WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadDistribution},
 };
 
@@ -76,6 +79,11 @@ pub struct FaultSuiteBudgets {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaultSuiteScenario {
     pub name: String,
+    /// Closed planned-case selector. Parsing it keeps qualification suites
+    /// reviewable while ordinary suite resolution still rejects Planned
+    /// catalog entries before any execution plan is produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_recovery_case: Option<StorageRecoveryCase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<FaultInjectionParameters>,
     #[serde(default = "default_repetitions")]
@@ -293,6 +301,9 @@ pub struct ResolvedFaultSuiteBudgets {
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedFaultSuiteScenario {
     pub name: String,
+    pub execution_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_recovery_case: Option<StorageRecoveryCase>,
     pub params: FaultInjectionParameters,
     pub repetitions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -490,9 +501,23 @@ impl ResolvedFaultSuiteScenario {
         workload_profiles: &BTreeMap<String, ResolvedFaultSuiteWorkloadOverride>,
     ) -> Result<Self> {
         let spec = scenario_spec(&scenario.name)?;
+        if let Some(case) = scenario.storage_recovery_case {
+            ensure!(
+                case.scenario() == scenario.name,
+                "scenario {} storageRecoveryCase {} belongs to {}",
+                scenario.name,
+                case.as_str(),
+                case.scenario()
+            );
+        }
         ensure!(
             spec.status == FaultScenarioStatus::Executable,
             "scenario {} is not executable",
+            scenario.name
+        );
+        ensure!(
+            scenario.storage_recovery_case.is_none(),
+            "scenario {} cannot use storageRecoveryCase outside explicit Planned qualification",
             scenario.name
         );
         ensure!(
@@ -563,6 +588,19 @@ impl ResolvedFaultSuiteScenario {
 
         Ok(Self {
             name: scenario.name.clone(),
+            execution_type: if matches!(
+                scenario.name.as_str(),
+                crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO
+                    | crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO
+            ) {
+                "admin"
+            } else if scenario.name == ON_DISK_BITROT_SCENARIO {
+                "storage-recovery"
+            } else {
+                "injection"
+            }
+            .to_string(),
+            storage_recovery_case: scenario.storage_recovery_case,
             params,
             repetitions: scenario.repetitions,
             fault_duration_seconds,
@@ -825,8 +863,10 @@ mod tests {
         reporting::{FailureClassification, FailureSeverity, ResponsibilityDomain},
         scenarios::{
             ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, DetectorQualification,
-            FaultScenarioStatus, WARP_UNDER_CHAOS_SCENARIO, executable_scenario_catalog,
+            FaultScenarioStatus, ON_DISK_BITROT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO,
+            executable_scenario_catalog,
         },
+        storage_recovery::StorageRecoveryCase,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -972,6 +1012,19 @@ scenarios:
             let error = suite.resolve().expect_err("unsupervised DM suite");
             assert!(error.to_string().contains("exactly one scenario"));
         }
+    }
+
+    #[test]
+    fn planned_admin_rebalance_template_is_well_formed_but_not_runnable() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+            "../../fault/planned/admin-rebalance.yaml"
+        ))
+        .expect("planned admin-rebalance suite syntax");
+
+        let error = suite
+            .resolve()
+            .expect_err("planned admin-rebalance must retain the execution gate");
+        assert!(error.to_string().contains("not executable"));
     }
 
     #[test]
@@ -1472,6 +1525,11 @@ scenarios:
         assert!(planned.contains(&ADMIN_DECOMMISSION_SCENARIO));
         assert!(planned.contains(&ADMIN_REBALANCE_SCENARIO));
         for scenario in planned {
+            let storage_recovery_case = if scenario == ON_DISK_BITROT_SCENARIO {
+                "    storageRecoveryCase: on-disk-bitrot-automatic-scanner\n"
+            } else {
+                ""
+            };
             let suite = serde_yaml_ng::from_str::<FaultSuite>(&format!(
                 r#"
 apiVersion: rustfs.com/s3chaos/v1alpha1
@@ -1480,6 +1538,7 @@ metadata:
   name: rustfs-smoke
 scenarios:
   - name: {scenario}
+{storage_recovery_case}
 "#
             ))
             .expect("suite yaml");
@@ -1488,6 +1547,82 @@ scenarios:
 
             assert!(error.to_string().contains("not executable"));
         }
+    }
+
+    #[test]
+    fn planned_admin_decommission_template_is_well_formed_but_not_runnable() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+            "../../fault/planned/admin-decommission.yaml"
+        ))
+        .expect("planned admin-decommission suite syntax");
+
+        let error = suite
+            .resolve()
+            .expect_err("planned admin-decommission must retain the execution gate");
+        assert!(error.to_string().contains("not executable"));
+    }
+
+    #[test]
+    fn planned_bitrot_templates_parse_both_cases_but_retain_execution_gate() {
+        for (yaml, expected_case) in [
+            (
+                include_str!("../../fault/planned/on-disk-bitrot.yaml"),
+                StorageRecoveryCase::OnDiskBitrotAutomaticScanner,
+            ),
+            (
+                include_str!("../../fault/planned/on-disk-bitrot-admin-deep.yaml"),
+                StorageRecoveryCase::OnDiskBitrotAdminDeep,
+            ),
+        ] {
+            let suite = serde_yaml_ng::from_str::<FaultSuite>(yaml)
+                .expect("planned on-disk-bitrot suite syntax");
+            assert_eq!(suite.scenarios.len(), 1);
+            assert_eq!(suite.scenarios[0].name, ON_DISK_BITROT_SCENARIO);
+            assert_eq!(
+                suite.scenarios[0].storage_recovery_case,
+                Some(expected_case)
+            );
+
+            let error = suite
+                .resolve()
+                .expect_err("planned on-disk-bitrot must retain the execution gate");
+            assert!(error.to_string().contains("not executable"));
+        }
+    }
+
+    #[test]
+    fn planned_bitrot_template_rejects_unknown_or_cross_scenario_case() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: invalid-bitrot
+scenarios:
+  - name: on-disk-bitrot
+    storageRecoveryCase: stale-disk-return
+"#,
+        )
+        .expect("cross-scenario case is still valid YAML");
+        let error = suite
+            .resolve()
+            .expect_err("bitrot suite rejects a case from another scenario");
+        assert!(error.to_string().contains("storageRecoveryCase"));
+        assert!(!error.to_string().contains("not executable"));
+
+        let error = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: invalid-bitrot
+scenarios:
+  - name: on-disk-bitrot
+    storageRecoveryCase: arbitrary-shell
+"#,
+        )
+        .expect_err("storageRecoveryCase must remain a closed enum");
+        assert!(error.to_string().contains("unknown variant"));
     }
 
     #[test]
@@ -1813,6 +1948,31 @@ scenarios:
         let error = suite.resolve().expect_err("unimplemented artifact mode");
 
         assert!(error.to_string().contains("artifacts.required=default"));
+    }
+
+    #[test]
+    fn planned_fresh_volume_suites_are_case_unique_and_ordinary_resolution_is_blocked() {
+        for (path, expected) in [
+            (
+                "fault/planned/fresh-volume-replacement-automatic.yaml",
+                crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement,
+            ),
+            (
+                "fault/planned/fresh-volume-replacement-admin-deep.yaml",
+                crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
+            ),
+        ] {
+            let suite = FaultSuite::from_yaml_path(path)
+                .expect("planned suite must remain statically parseable");
+            let [scenario] = suite.scenarios.as_slice() else {
+                panic!("each qualification suite must contain exactly one case")
+            };
+            assert_eq!(scenario.storage_recovery_case, Some(expected));
+            let error = suite
+                .resolve()
+                .expect_err("ordinary suite resolution must reject Planned scenarios");
+            assert!(error.to_string().contains("is not executable"));
+        }
     }
 
     #[test]

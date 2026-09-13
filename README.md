@@ -82,14 +82,16 @@ starting the suite. Override the canonical suite with
 Warp plans. The generic `fault-suite-*` targets remain available for custom
 non-static suites and the separate Warp campaign.
 
-Runnable scenario families (25 executable entries): I/O faults (`io-eio`,
+Runnable scenario families (28 executable entries): I/O faults (`io-eio`,
 `io-read-mistake`, `io-latency`, `disk-full`, `dm-flakey*`, and the five
 typed `dm-drop-writes-after-ack-*` cases), network faults
 (`network-partition-one`, `network-partition-write-quorum-loss`,
 `network-delay/loss/corrupt/duplicate`), pod faults (`pod-kill-one`,
-`pod-failure`, `pod-crash-versioned-hot`), stress (`stress-cpu`,
-`stress-memory`), typed volume quorum (`quorum-p-io-fault`,
-`quorum-p-plus-one-io-fault`), and the `warp-under-chaos` benchmark campaign.
+`pod-failure`, `pod-crash-versioned-hot`), kubectl-driven lifecycle restarts
+(`pod-graceful-restart-one`, `rolling-restart-all`, `cluster-cold-restart`),
+stress (`stress-cpu`, `stress-memory`), typed volume quorum
+(`quorum-p-io-fault`, `quorum-p-plus-one-io-fault`), and the
+`warp-under-chaos` benchmark campaign.
 Each typed volume quorum run captures bounded RustFS admin health samples before
 its probes/workload and after the workload/controller recheck; both samples
 require every non-target drive to be healthy and do not claim continuous health.
@@ -116,6 +118,7 @@ execution environments and verdicts separate:
 | `smoke.yaml` | Six short correctness and recovery checks across I/O, pod, and network faults | Dedicated cluster with Chaos Mesh |
 | `regression.yaml` | Remaining ordinary Chaos Mesh scenarios, including the write-quorum boundary | Reference four-server single-erasure-set topology for `network-partition-write-quorum-loss` |
 | `quorum-reliability.yaml` | Four payload/metadata checks at the P and P+1 volume boundaries | Reference four-server single-erasure-set topology |
+| `restart.yaml` | Graceful single-Pod restart, ordered rolling restart, and held cold restart driven through kubectl (no Chaos Mesh, so run it with `make fault-suite-run`; `fault-chaos-run` rejects it) | StatefulSet-managed Tenant; `cluster-cold-restart` also needs `RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT` naming the RustFS operator Deployment it pauses |
 | `warp-performance.yaml` | Performance-only Warp-under-chaos campaign; correctness still comes from the normal checker | `warp` on `PATH`; Warp defaults to 60 seconds |
 
 The Rust runner owns `budgets.maxDuration` for both `make fault-suite-run`
@@ -200,6 +203,49 @@ Mesh controller did not target once the fault is active, so the contract
 measures a client attached to a healthy node; ClusterIP endpoints need no
 pinning. These contracts are not yet calibrated on a live cluster; treat the
 first live runs as calibration.
+The lifecycle scenarios (`kubernetes-lifecycle` backend) restart RustFS
+through kubectl instead of Chaos Mesh. The RustFS operator writes the Tenant
+StatefulSet with server-side apply and owns `spec.replicas` and the Pod
+template annotations, so a `kubectl scale` or `rollout restart` makes kubectl
+a co-owner of those fields and the operator's next apply conflicts
+(`StatefulSetApplyFailed`) instead of converging. The scenarios therefore
+delete Pods with the default `terminationGracePeriodSeconds` and capture each
+RustFS container's final `terminated` state from a streaming Pod watch
+(`pod-lifecycle-watch.json`, kubectl stderr in
+`pod-lifecycle-watch.stderr.log`); the SIGTERM reference is the graceful
+delete's `deletionTimestamp - deletionGracePeriodSeconds`, never kubelet's
+final grace-0 rewrite. A container that is SIGKILLed at grace expiry, dies to
+SIGTERM's default action, or exits non-zero fails the run as
+`graceful_shutdown_failed`; a replacement that never becomes Ready or restarts
+before Ready fails as `product_or_environment`, and a StatefulSet whose UID
+changes fails too (`pod-lifecycle-evidence.json`). `pod-graceful-restart-one`
+and `rolling-restart-all` issue their first delete only after the first
+fault-phase S3 request has started (checked against `history.jsonl`), so
+SIGTERM lands under load; the StatefulSet must be converged on one revision,
+every replacement must run it, and replacements are tracked past Ready and
+re-read after the recovery gate; the rolling restart goes from
+the highest ordinal down and, with a port-forward endpoint, pins all client
+traffic to the smallest-name Pod and restarts that Pod only after the
+workload. `cluster-cold-restart` runs on a fresh Tenant fixture (the scale
+leaves `kubectl-scale` co-owning `spec.replicas`), requires
+`podManagementPolicy: Parallel`, pauses the operator Deployment named by
+`RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT` (in
+`RUSTFS_FAULT_TEST_OPERATOR_NAMESPACE`; it must run an image containing
+`RUSTFS_FAULT_TEST_OPERATOR_IMAGE_MATCH`, default `rustfs/operator`) by
+recording the pause as annotations on that Deployment and scaling it to zero,
+drains every Pod before the workload, samples `spec.replicas` and the Pod count every second while the outage is
+held, requires every workload operation to fail, then
+scales both back. The operator is restored when the run unwinds normally or
+on a signal; if the harness is killed outright, the annotations remain and
+the next `cluster-cold-restart` pre-cleanup or `make fault-cleanup` restores
+the operator from them. `make fault-cleanup` restores any paused operator (so a Tenant finalizer that
+needs it can complete), then removes the fixture namespace with a bounded wait
+(`RUSTFS_FAULT_TEST_NAMESPACE_DELETE_TIMEOUT`, default 600s) and checks
+residual Chaos resources; both parts always run and cleanup exits non-zero if
+either failed. The restore is skipped with a warning only on an explicit RBAC
+"no"; an unreadable record or an undeterminable permission fails. The other lifecycle scenarios warn at pre-cleanup
+when they can read a leftover pause record.
+These scenarios have not yet been calibrated on a live cluster.
 `make fault-dashboard-install` mutates the current cluster (installs/upgrades
 the Chaos Mesh release via Helm); treat it like a live run.
 `make fault-cleanup` is scoped by the current Kubernetes context, namespace,

@@ -843,6 +843,14 @@ fn build_fault_spec(
                 injection.kind().as_str()
             )
         }
+        FaultKind::RustfsServerPodGracefulRestart
+        | FaultKind::RustfsServerRollingRestart
+        | FaultKind::RustfsServerColdRestart => {
+            bail!(
+                "fault kind {} must be applied by the Kubernetes lifecycle backend",
+                injection.kind().as_str()
+            )
+        }
     }
 }
 
@@ -882,6 +890,9 @@ pub struct IoChaosSpec {
     pub action: IoChaosAction,
     pub percent: u8,
     pub targets: Option<u32>,
+    /// Closed Pod-name selector used by exact-cohort storage recovery cases.
+    /// Ordinary fault cases keep using the Tenant label selector.
+    pub pod_names: Option<Vec<String>>,
     pub duration: Duration,
 }
 
@@ -1001,6 +1012,7 @@ impl IoChaosSpec {
             action: IoChaosAction::Fault { errno: 5 },
             percent,
             targets: None,
+            pod_names: None,
             duration,
         })
     }
@@ -1044,6 +1056,7 @@ impl IoChaosSpec {
             },
             percent,
             targets: None,
+            pod_names: None,
             duration,
         })
     }
@@ -1090,6 +1103,7 @@ impl IoChaosSpec {
             },
             percent: parameters.percent,
             targets: None,
+            pod_names: None,
             duration,
         })
     }
@@ -1129,6 +1143,7 @@ impl IoChaosSpec {
             action: IoChaosAction::Fault { errno: 28 },
             percent,
             targets: None,
+            pod_names: None,
             duration,
         })
     }
@@ -1141,6 +1156,31 @@ impl IoChaosSpec {
             );
         }
         self.targets = targets;
+        Ok(self)
+    }
+
+    pub(crate) fn with_exact_pods(mut self, pod_names: Vec<String>) -> Result<Self> {
+        ensure!(
+            !pod_names.is_empty()
+                && pod_names.len() <= usize::try_from(MAX_ERASURE_SET_SHARDS)?
+                && pod_names.iter().all(|name| {
+                    !name.is_empty()
+                        && name.len() <= 253
+                        && name.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'-' | b'.')
+                        })
+                }),
+            "IOChaos exact Pod selector is empty, oversized, or invalid"
+        );
+        let unique = pod_names.iter().collect::<BTreeSet<_>>();
+        ensure!(
+            unique.len() == pod_names.len(),
+            "IOChaos exact Pod selector contains duplicates"
+        );
+        self.targets = Some(u32::try_from(pod_names.len())?);
+        self.pod_names = Some(pod_names);
         Ok(self)
     }
 
@@ -1163,6 +1203,21 @@ impl IoChaosSpec {
             None => ("one", String::new()),
         };
 
+        let selector = match &self.pod_names {
+            Some(pods) => {
+                let names = pods
+                    .iter()
+                    .map(|name| format!("        - {name}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("    pods:\n      {}:\n{names}", self.target_namespace)
+            }
+            None => format!(
+                "    namespaces:\n      - {}\n    labelSelectors:\n      rustfs.tenant: {}",
+                self.target_namespace, self.tenant_name
+            ),
+        };
+
         format!(
             r#"apiVersion: chaos-mesh.org/v1alpha1
 kind: IOChaos
@@ -1177,10 +1232,7 @@ spec:
 {action}
   mode: {mode}
 {value}  selector:
-    namespaces:
-      - {target_namespace}
-    labelSelectors:
-      rustfs.tenant: {tenant_name}
+{selector}
   containerNames:
     - {container_name}
   volumePath: {volume_path}
@@ -1198,8 +1250,7 @@ spec:
             scenario = self.scenario,
             managed_by_label = MANAGED_BY_LABEL,
             managed_by_value = MANAGED_BY_VALUE,
-            target_namespace = self.target_namespace,
-            tenant_name = self.tenant_name,
+            selector = selector,
             container_name = self.container_name,
             volume_path = self.volume_path,
             methods = methods,
@@ -1771,6 +1822,30 @@ mod tests {
         assert!(manifest.contains("percent: 20"));
         assert!(manifest.contains("\n  mode: one\n"));
         assert!(!manifest.contains("\n  value:"));
+    }
+
+    #[test]
+    fn exact_pod_selector_replaces_the_tenant_label_selector() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let spec = IoChaosSpec::eio_on_rustfs_volume(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "on-disk-bitrot",
+            "/data/rustfs0",
+            100,
+            Duration::from_secs(60),
+        )
+        .expect("valid io chaos")
+        .with_exact_pods(vec!["rustfs-1".to_string(), "rustfs-2".to_string()])
+        .expect("exact Pod selector");
+        let manifest = spec.manifest();
+
+        assert!(manifest.contains("\n  mode: fixed\n  value: \"2\"\n"));
+        assert!(manifest.contains(
+            "    pods:\n      rustfs-fault-test:\n        - rustfs-1\n        - rustfs-2"
+        ));
+        assert!(!manifest.contains("labelSelectors:"));
     }
 
     #[test]

@@ -396,6 +396,25 @@ guardrails when implementing the ordered TODO below.
   a pre-calibration margin; live runs must calibrate it before it gates a
   release.
 
+- [x] DONE: Shutdown and restart coverage through a kubectl lifecycle backend.
+  Meaning: `pod-graceful-restart-one`, `rolling-restart-all`, and
+  `cluster-cold-restart` use `FaultBackend::KubernetesLifecycle`
+  (rustfs/backlog#2446). Pods are deleted with their default grace period:
+  the operator applies the StatefulSet server-side and owns `spec.replicas`
+  and the template annotations, so `rollout restart` and bare scaling would
+  make kubectl a field co-owner and turn every later operator apply into a
+  conflict. The final container `terminated` state is captured from a Pod
+  watch and classified by the documented grace-timeout rule
+  (`graceful_shutdown_failed` is a product failure; a replacement that never
+  becomes Ready is `product_or_environment`). Cold restart runs on a fresh
+  Tenant (the scale leaves `kubectl-scale` co-owning `spec.replicas`), pauses
+  the identity-checked operator Deployment named by
+  `RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT` with an annotation record that
+  `fault-cleanup` can restore from, holds `spec.replicas` at zero, requires
+  the workload to fail entirely, and restores both. All three reuse the
+  recovery-health gate, the post-recovery write probe, and (for the first
+  two) the availability contract. Live calibration is still pending.
+
 - [x] DONE: Add host/storage mutation preflight.
   Meaning: executable device-mapper scenarios now require exact singleton
   node/device/PV allowlists, a separate device-mapper destructive opt-in, and a
@@ -549,15 +568,33 @@ Reporting only projects this typed checker result into failure-summary fields.
   pass. Terminal responses must also have no unresolved decommission entries
   or rebalance cleanup-warning entries, even if aggregate counters are clear.
 
-- [ ] BLOCKED: Keep `admin-decommission` and `admin-rebalance` Planned until the
-  runner supports scenario-owned operation phases.
-  Meaning: the current run plan and artifact validator require one generic
-  `FaultInjection`; marking either admin workflow Executable would claim an
-  end-to-end path that cannot run. Runner integration must create the fresh
-  multi-pool Tenant, keep the S3 workload active while polling, invoke
-  cancel/stop during rollback, persist all three admin artifacts, run the final
-  checker, and receive live RustFS API calibration before an executable suite is
-  added.
+- [ ] PARTIAL: Add the scenario-owned `admin-decommission` operation phase.
+  Meaning: the decommission case now reaches the shared admin executor through
+  the dedicated Planned-admin qualification flag. It stages an attempt-owned
+  two-pool Tenant, runs the bounded versioned S3 workload, polls through the
+  signed RustFS admin adapter, persists raw request/progress/overlap evidence,
+  and performs identity-safe cancel/clear and Tenant cleanup on failure. The
+  contract requires a real S3 operation and an exact-target status request
+  interval to intersect, rejects zero movement and incomplete mutation
+  families, and binds the version-aware final checker to complete history. The
+  catalog remains Planned until the Operator/RustFS path is live-qualified.
+
+- [ ] PARTIAL: Add the scenario-owned `admin-rebalance` operation phase.
+  Meaning: the rebalance case now has a narrow staged-fixture port, bounded
+  polling and stop-on-failure sequencing, raw request/progress capture, and an
+  offline overlap contract. The contract requires a real S3 operation and a
+  rebalance status request interval to intersect, rejects zero movement and
+  incomplete mutation families, and binds the version-aware final checker to
+  the complete history. The catalog remains Planned until the Operator/RustFS
+  path is live-qualified.
+
+- [ ] PARTIAL: Keep `admin-decommission` and `admin-rebalance` Planned until
+  their production drivers are live-qualified.
+  Meaning: typed admin dispatch and the shared phase executor no longer invent
+  a generic `FaultInjection`; both cases have concrete drivers. They remain
+  behind the exact Planned-admin qualification flag until staged Tenant
+  identity, overlap, rollback, artifact, and final-checker receipts pass
+  against live Operator and RustFS revisions.
 
 ### 11. Add Stale Disk, Dangling Cleanup, And Campaign Scenarios
 

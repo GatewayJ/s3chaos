@@ -32,7 +32,7 @@ use kube::core::DynamicObject;
 use std::time::{Duration, Instant};
 use tokio::time::sleep as async_sleep;
 
-pub(super) fn prepare_fault_fixture(
+pub(crate) fn prepare_fault_fixture(
     config: &ClusterTestConfig,
     isolation: FaultIsolation,
 ) -> Result<()> {
@@ -138,7 +138,7 @@ fn stable_pod_fingerprint(
     )
 }
 
-pub(super) async fn wait_for_stable_rustfs_pods(
+pub(crate) async fn wait_for_stable_rustfs_pods(
     config: &ClusterTestConfig,
     expected_pod_count: usize,
     stable_window: Duration,
@@ -189,13 +189,13 @@ pub(super) async fn wait_for_stable_rustfs_pods(
     }
 }
 
-pub(super) async fn wait_for_ready_tenant(config: &ClusterTestConfig) -> Result<DynamicObject> {
+pub(crate) async fn wait_for_ready_tenant(config: &ClusterTestConfig) -> Result<DynamicObject> {
     let client = kube_client::default_client().await?;
     let tenants = kube_client::tenant_api(client, &config.test_namespace);
     wait::wait_for_tenant_ready(tenants, &config.tenant_name, config.timeout).await
 }
 
-pub(super) fn s3_access(config: &FaultTestConfig) -> Result<(String, Option<PortForwardGuard>)> {
+pub(crate) fn s3_access(config: &FaultTestConfig) -> Result<(String, Option<PortForwardGuard>)> {
     let cluster = &config.cluster;
     if config.use_cluster_ip {
         let service = format!("{}-io", cluster.tenant_name);
@@ -232,7 +232,17 @@ pub(super) fn s3_access(config: &FaultTestConfig) -> Result<(String, Option<Port
     Ok((endpoint, Some(spec.start_with_temp_log(&kubectl)?)))
 }
 
-pub(super) async fn ensure_s3_access(
+pub(crate) fn tenant_port_forward(
+    config: &ClusterTestConfig,
+) -> Result<(String, PortForwardGuard)> {
+    let spec =
+        PortForwardSpec::tenant_io_on_available_port(&config.test_namespace, &config.tenant_name)?;
+    let endpoint = spec.local_base_url();
+    let guard = spec.start_with_temp_log(&Kubectl::new(config))?;
+    Ok((endpoint, guard))
+}
+
+pub(crate) async fn ensure_s3_access(
     port_forward: &mut Option<PortForwardGuard>,
     config: &ClusterTestConfig,
     endpoint: &str,
@@ -273,7 +283,7 @@ impl std::fmt::Display for PortForwardLost {
 /// checked before every poll, so a forward that exits mid-wait (for example
 /// an API server connection drop) fails at once as [`PortForwardLost`]
 /// instead of running out the timeout as an endpoint that never answered.
-pub(super) async fn wait_for_tenant_s3(
+pub(crate) async fn wait_for_tenant_s3(
     port_forward: &mut PortForwardGuard,
     endpoint: &str,
     timeout: Duration,

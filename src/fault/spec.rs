@@ -12,27 +12,49 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::fault::backends::lifecycle::evidence::POD_LIFECYCLE_EVIDENCE_ARTIFACT;
 use crate::fault::recovery_health::RECOVERY_HEALTH_ARTIFACT;
 use crate::fault::workload::execution::{
     AVAILABILITY_REPORT_ARTIFACT, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
     POST_RECOVERY_WRITE_REPORT_ARTIFACT,
 };
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::fault::{
+    admin_decommission::{
+        ADMIN_DECOMMISSION_OVERLAP_ARTIFACT, ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
+    },
+    admin_rebalance::{ADMIN_REBALANCE_OVERLAP_ARTIFACT, ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT},
+    admin_runner::ADMIN_WORKFLOW_ARTIFACT,
+    admin_topology::{
+        ADMIN_OPERATION_ARTIFACT, ADMIN_OPERATION_PROGRESS_ARTIFACT, ADMIN_TOPOLOGY_PROOF_ARTIFACT,
+        AdminTopologyPlan,
+    },
     config::{DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, FaultTestConfig},
+    fixture::ADMIN_FIXTURE_ARTIFACT,
+    fresh_volume::{FRESH_VOLUME_FIXTURE_ARTIFACT, FRESH_VOLUME_HEAL_TRANSCRIPT_ARTIFACT},
     host_storage::{
         DM_FILESYSTEM_CHECK_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT,
     },
+    on_disk_bitrot::{
+        BITROT_CLEANUP_ARTIFACT, BITROT_CORRUPTION_WINDOW_ARTIFACT, BITROT_HEAL_ARTIFACT,
+        BITROT_MUTATION_ARTIFACT, BITROT_SELECTION_ARTIFACT, BITROT_WORKFLOW_ARTIFACT,
+    },
     plan::{
-        FaultInjection, FaultInjectionParameters, FaultPlan, FaultSelection, FaultTarget,
-        FaultWorkloadMode,
+        ExecutionKind, ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultPlan,
+        FaultSelection, FaultTarget, FaultWorkloadMode,
     },
     scenarios::{
-        FaultDetectorContract, FaultScenario, FaultScenarioSpec, acknowledged_mutation_kind,
-        scenario_spec,
+        FRESH_VOLUME_REPLACEMENT_SCENARIO, FaultDetectorContract, FaultScenario, FaultScenarioSpec,
+        acknowledged_mutation_kind, scenario_spec,
     },
+    storage_recovery::{
+        DANGLING_CLEANUP_PROOF_ARTIFACT, DISK_GENERATION_PROOF_ARTIFACT, FORCE_READ_PROOF_ARTIFACT,
+        HEAL_PROGRESS_ARTIFACT, HEAL_SUMMARY_ARTIFACT, SHARD_INVENTORY_AFTER_ARTIFACT,
+        SHARD_INVENTORY_BEFORE_ARTIFACT, VERSION_SHARD_MAPPING_ARTIFACT,
+    },
+    storage_recovery_runner::STORAGE_RECOVERY_WORKFLOW_ARTIFACT,
     workload::WorkloadPlan,
 };
 
@@ -49,8 +71,25 @@ pub struct FaultRunSpec {
     pub scenario: FaultRunScenarioSpec,
     pub workload: FaultRunWorkloadSpec,
     pub recovery: FaultRunRecoverySpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<FaultRunExecutionSpec>,
+    #[serde(default)]
     pub faults: Vec<FaultRunFaultSpec>,
     pub artifacts: FaultRunArtifactSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum FaultRunExecutionSpec {
+    Injection,
+    Admin {
+        topology: AdminTopologyPlan,
+        operation_timeout_seconds: u64,
+    },
+    StorageRecovery {
+        case: crate::fault::storage_recovery::StorageRecoveryCase,
+        operation_timeout_seconds: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +119,10 @@ pub struct FaultRunScenarioSpec {
     pub impact_policy: String,
     pub boundary: String,
     pub validation: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub planned_qualification: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub planned_storage_qualification: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detector: Option<FaultDetectorContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,16 +231,41 @@ impl FaultRunSpec {
         run_id: &str,
         bucket: &str,
     ) -> Self {
+        Self::resolved_execution(
+            config,
+            scenario,
+            scenario_spec,
+            &ExecutionPlan::Injection(plan.clone()),
+            workload_plan,
+            run_id,
+            bucket,
+        )
+    }
+
+    pub fn resolved_execution(
+        config: &FaultTestConfig,
+        scenario: &FaultScenario,
+        scenario_spec: &FaultScenarioSpec,
+        plan: &ExecutionPlan,
+        workload_plan: &WorkloadPlan,
+        run_id: &str,
+        bucket: &str,
+    ) -> Self {
         let mut artifacts = FaultRunArtifactSpec {
             required: FaultRunArtifactSpec::required_names_for_scenario(&scenario.name),
             event_stream: "run-events.jsonl".to_string(),
         };
-        if plan.requires_static_storage() {
+        if plan
+            .injection()
+            .is_some_and(FaultPlan::requires_static_storage)
+        {
             artifacts.required.extend(
                 [HOST_STORAGE_PROOF_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT].map(str::to_string),
             );
         }
-        if plan.fault().kind() == crate::fault::plan::FaultKind::RustfsBlockDeviceDropWritesCrash {
+        if plan.injection().is_some_and(|plan| {
+            plan.fault().kind() == crate::fault::plan::FaultKind::RustfsBlockDeviceDropWritesCrash
+        }) {
             artifacts
                 .required
                 .push(DM_FILESYSTEM_CHECK_ARTIFACT.to_string());
@@ -227,6 +295,8 @@ impl FaultRunSpec {
                 impact_policy: scenario_spec.impact_policy.as_str().to_string(),
                 boundary: scenario_spec.boundary.to_string(),
                 validation: scenario_spec.validation.to_string(),
+                planned_qualification: config.qualify_planned_admin,
+                planned_storage_qualification: config.qualify_planned_storage,
                 detector: Some(scenario_spec.detector.contract()),
                 ack_trigger: acknowledged_mutation_kind(&scenario.name).map(|mutation| {
                     FaultRunAckTriggerSpec {
@@ -237,7 +307,7 @@ impl FaultRunSpec {
                 }),
             },
             workload: FaultRunWorkloadSpec {
-                mode: workload_mode_name(plan.workload_mode).to_string(),
+                mode: workload_mode_name(plan.workload_mode()).to_string(),
                 object_count: workload_plan.object_count,
                 concurrency: workload_plan.concurrency,
                 catalog_profile: scenario_spec
@@ -258,15 +328,77 @@ impl FaultRunSpec {
                 recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
                 recommit_unconfirmed_writes: acknowledged_mutation_kind(&scenario.name).is_none(),
             },
-            faults: plan
-                .faults()
-                .iter()
-                .enumerate()
-                .map(|(index, fault)| {
-                    FaultRunFaultSpec::from_fault(index, scenario, scenario_spec, fault)
-                })
-                .collect(),
+            execution: Some(match plan {
+                ExecutionPlan::Injection(_) => FaultRunExecutionSpec::Injection,
+                ExecutionPlan::Admin(plan) => FaultRunExecutionSpec::Admin {
+                    topology: plan.topology.clone(),
+                    operation_timeout_seconds: plan.operation_timeout.as_secs(),
+                },
+                ExecutionPlan::StorageRecovery(plan) => FaultRunExecutionSpec::StorageRecovery {
+                    case: plan.case,
+                    operation_timeout_seconds: plan.operation_timeout.as_secs(),
+                },
+            }),
+            faults: plan.injection().map_or_else(Vec::new, |plan| {
+                plan.faults()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, fault)| {
+                        FaultRunFaultSpec::from_fault(index, scenario, scenario_spec, fault)
+                    })
+                    .collect()
+            }),
             artifacts,
+        }
+    }
+
+    /// Legacy run specs predate the explicit execution discriminator. They
+    /// remain injection plans only when they carry the historical non-empty
+    /// fault list; an empty or mixed shape fails closed.
+    pub fn execution_kind(&self) -> Result<ExecutionKind> {
+        match &self.execution {
+            Some(FaultRunExecutionSpec::Injection) => {
+                ensure!(
+                    !self.faults.is_empty(),
+                    "injection run-spec must contain at least one fault"
+                );
+                Ok(ExecutionKind::Injection)
+            }
+            Some(FaultRunExecutionSpec::Admin {
+                operation_timeout_seconds,
+                ..
+            }) => {
+                ensure!(
+                    self.faults.is_empty(),
+                    "admin run-spec must not contain fault injections"
+                );
+                ensure!(
+                    *operation_timeout_seconds > 0,
+                    "admin run-spec operation timeout must be positive"
+                );
+                Ok(ExecutionKind::Admin)
+            }
+            Some(FaultRunExecutionSpec::StorageRecovery {
+                case,
+                operation_timeout_seconds,
+            }) => {
+                ensure!(
+                    self.faults.is_empty(),
+                    "storage-recovery run-spec must not contain fault injections"
+                );
+                ensure!(
+                    *operation_timeout_seconds > 0 && case.scenario() == self.scenario.name,
+                    "storage-recovery run-spec has the wrong case or a zero timeout"
+                );
+                Ok(ExecutionKind::StorageRecovery)
+            }
+            None => {
+                ensure!(
+                    !self.faults.is_empty(),
+                    "legacy run-spec without execution must contain at least one fault"
+                );
+                Ok(ExecutionKind::Injection)
+            }
         }
     }
 
@@ -305,7 +437,112 @@ impl FaultRunArtifactSpec {
     }
 
     pub fn required_names_for_scenario(scenario: &str) -> Vec<String> {
-        let mut names = if acknowledged_mutation_kind(scenario).is_none() {
+        let mut names = if scenario == crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO {
+            [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "target-proof.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "workload-summary.json",
+                "checker-report.json",
+                RECOVERY_HEALTH_ARTIFACT,
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+                DISK_GENERATION_PROOF_ARTIFACT,
+                SHARD_INVENTORY_BEFORE_ARTIFACT,
+                SHARD_INVENTORY_AFTER_ARTIFACT,
+                DANGLING_CLEANUP_PROOF_ARTIFACT,
+                HOST_STORAGE_PROOF_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else if matches!(
+            scenario,
+            crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO
+                | crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO
+        ) {
+            [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "workload-summary.json",
+                "recommit-report.json",
+                "checker-pre-recommit-report.json",
+                "checker-report.json",
+                RECOVERY_HEALTH_ARTIFACT,
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+                ADMIN_FIXTURE_ARTIFACT,
+                ADMIN_WORKFLOW_ARTIFACT,
+                ADMIN_TOPOLOGY_PROOF_ARTIFACT,
+                ADMIN_OPERATION_ARTIFACT,
+                ADMIN_OPERATION_PROGRESS_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else if scenario == FRESH_VOLUME_REPLACEMENT_SCENARIO {
+            [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "workload-summary.json",
+                "recommit-report.json",
+                "checker-pre-recommit-report.json",
+                "checker-report.json",
+                RECOVERY_HEALTH_ARTIFACT,
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+                FRESH_VOLUME_FIXTURE_ARTIFACT,
+                FRESH_VOLUME_HEAL_TRANSCRIPT_ARTIFACT,
+                STORAGE_RECOVERY_WORKFLOW_ARTIFACT,
+                DISK_GENERATION_PROOF_ARTIFACT,
+                VERSION_SHARD_MAPPING_ARTIFACT,
+                HEAL_SUMMARY_ARTIFACT,
+                HEAL_PROGRESS_ARTIFACT,
+                FORCE_READ_PROOF_ARTIFACT,
+                crate::fault::fresh_volume::FRESH_VOLUME_READ_HISTORY_ARTIFACT,
+                crate::fault::fresh_volume::FRESH_VOLUME_CLEANUP_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else if scenario == crate::fault::scenarios::ON_DISK_BITROT_SCENARIO {
+            [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "checker-report.json",
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+                BITROT_SELECTION_ARTIFACT,
+                BITROT_MUTATION_ARTIFACT,
+                BITROT_CORRUPTION_WINDOW_ARTIFACT,
+                BITROT_HEAL_ARTIFACT,
+                BITROT_CLEANUP_ARTIFACT,
+                BITROT_WORKFLOW_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else if acknowledged_mutation_kind(scenario).is_none() {
             Self::required_names()
         } else {
             [
@@ -333,6 +570,29 @@ impl FaultRunArtifactSpec {
         };
         if scenario_spec(scenario).is_ok_and(|spec| spec.impact_policy.requires_availability()) {
             names.push(AVAILABILITY_REPORT_ARTIFACT.to_string());
+        }
+        if scenario == crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO {
+            names.extend(
+                [
+                    ADMIN_REBALANCE_OVERLAP_ARTIFACT,
+                    ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+                ]
+                .map(str::to_string),
+            );
+        }
+        if scenario == crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO {
+            names.extend(
+                [
+                    ADMIN_DECOMMISSION_OVERLAP_ARTIFACT,
+                    ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
+                ]
+                .map(str::to_string),
+            );
+        }
+        if scenario_spec(scenario).is_ok_and(|spec| {
+            spec.backend == crate::fault::scenarios::FaultBackend::KubernetesLifecycle
+        }) {
+            names.push(POD_LIFECYCLE_EVIDENCE_ARTIFACT.to_string());
         }
         names
     }
@@ -400,6 +660,10 @@ impl FaultRunTargetSpec {
                 kind: "dedicated-block-device".to_string(),
                 path: None,
             },
+            FaultTarget::RustfsServerStatefulSet => Self {
+                kind: "rustfs-server-statefulset".to_string(),
+                path: None,
+            },
         }
     }
 }
@@ -432,13 +696,15 @@ fn workload_mode_name(mode: FaultWorkloadMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{FAULT_RUN_API_VERSION, FaultRunSpec};
+    use super::{FAULT_RUN_API_VERSION, FaultRunExecutionSpec, FaultRunSpec};
     use crate::fault::{
         acknowledged_mutation::AcknowledgedMutationKind,
         config::FaultTestConfig,
-        plan::{FaultInjectionParameters, FaultPlan, FaultPlanOptions},
+        plan::{
+            ExecutionKind, ExecutionPlan, FaultInjectionParameters, FaultPlan, FaultPlanOptions,
+        },
         scenarios::{
-            DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO, FaultScenario,
+            ADMIN_REBALANCE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO, FaultScenario,
             NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, apply_catalog_defaults, scenario_spec,
         },
         workload::WorkloadPlan,
@@ -470,6 +736,10 @@ mod tests {
 
         assert_eq!(spec.api_version, FAULT_RUN_API_VERSION);
         assert_eq!(spec.faults.len(), 1);
+        assert_eq!(
+            spec.execution_kind().expect("execution"),
+            ExecutionKind::Injection
+        );
         assert_eq!(spec.faults[0].target.path.as_deref(), Some("/data/rustfs0"));
         assert!(spec.faults[0].target_proof.required);
         assert_eq!(spec.faults[0].target_proof.artifact, "target-proof.json");
@@ -514,6 +784,192 @@ mod tests {
             decoded.workload.plan.size_distribution,
             spec.workload.plan.size_distribution
         );
+    }
+
+    #[test]
+    fn admin_spec_is_typed_and_contains_no_fabricated_fault() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.qualify_planned_admin = true;
+        let catalog = scenario_spec(ADMIN_REBALANCE_SCENARIO).expect("catalog");
+        let scenario = FaultScenario {
+            name: ADMIN_REBALANCE_SCENARIO.to_string(),
+            case_name: catalog.case_name,
+            duration: std::time::Duration::from_secs(600),
+            percent: 1,
+            object_count: config.workload.object_count,
+        };
+        let plan = ExecutionPlan::from_scenario_with_options(
+            &scenario,
+            catalog,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("admin plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+
+        let spec = FaultRunSpec::resolved_execution(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+
+        assert_eq!(
+            spec.execution_kind().expect("execution"),
+            ExecutionKind::Admin
+        );
+        assert!(spec.scenario.planned_qualification);
+        assert!(!spec.scenario.planned_storage_qualification);
+        assert!(spec.faults.is_empty());
+        assert!(matches!(
+            spec.execution,
+            Some(FaultRunExecutionSpec::Admin {
+                operation_timeout_seconds: 600,
+                ..
+            })
+        ));
+        assert!(
+            !spec
+                .artifacts
+                .required
+                .contains(&"fault-evidence.json".to_string())
+        );
+        assert!(
+            spec.artifacts
+                .required
+                .contains(&"admin-workflow.json".to_string())
+        );
+    }
+
+    #[test]
+    fn fresh_volume_spec_is_typed_and_requires_raw_recovery_artifacts() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+        config.scenario = crate::fault::scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO.to_string();
+        config.qualify_planned_storage = true;
+        config.destructive_enabled = true;
+        config.storage_recovery_case = Some(
+            crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
+        );
+        let scenario = FaultScenario::from_config_for_execution(&config).expect("qualification");
+        let catalog = scenario_spec(crate::fault::scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO)
+            .expect("catalog");
+        let plan = ExecutionPlan::from_scenario_with_options(
+            &scenario,
+            catalog,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("storage plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let spec = FaultRunSpec::resolved_execution(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+
+        assert_eq!(
+            spec.execution_kind().expect("execution"),
+            ExecutionKind::StorageRecovery
+        );
+        assert!(!spec.scenario.planned_qualification);
+        assert!(spec.scenario.planned_storage_qualification);
+        assert!(spec.faults.is_empty());
+        for artifact in [
+            "storage-recovery-workflow.json",
+            "disk-generation-proof.json",
+            "version-shard-mapping.json",
+            "force-read-proof.json",
+            "force-read-history.jsonl",
+            "fresh-volume-cleanup.json",
+        ] {
+            assert!(spec.artifacts.required.contains(&artifact.to_string()));
+        }
+    }
+
+    #[test]
+    fn stale_storage_spec_is_typed_and_requires_physical_proofs() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+        config.scenario = crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO.to_string();
+        config.qualify_planned_storage = true;
+        config.destructive_enabled = true;
+        config.storage_recovery_case =
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn);
+        let scenario = FaultScenario::from_config_for_execution(&config).expect("qualification");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = ExecutionPlan::from_scenario_with_options(
+            &scenario,
+            catalog,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("storage plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let spec = FaultRunSpec::resolved_execution(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+
+        assert_eq!(
+            spec.execution_kind().expect("execution"),
+            ExecutionKind::StorageRecovery
+        );
+        assert!(!spec.scenario.planned_qualification);
+        assert!(spec.scenario.planned_storage_qualification);
+        assert!(matches!(
+            spec.execution,
+            Some(FaultRunExecutionSpec::StorageRecovery {
+                case: crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn,
+                ..
+            })
+        ));
+        for artifact in [
+            "host-storage-proof.json",
+            "disk-generation-proof.json",
+            "shard-inventory-before.json",
+            "shard-inventory-after.json",
+            "dangling-cleanup-proof.json",
+        ] {
+            assert!(spec.artifacts.required.contains(&artifact.to_string()));
+        }
+    }
+
+    #[test]
+    fn legacy_execution_inference_is_injection_only_and_fails_closed_when_empty() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario(&scenario, catalog).expect("plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let mut spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-legacy",
+            "bucket-legacy",
+        );
+
+        spec.execution = None;
+        assert_eq!(
+            spec.execution_kind().expect("legacy injection"),
+            ExecutionKind::Injection
+        );
+        spec.faults.clear();
+        assert!(spec.execution_kind().is_err());
     }
 
     #[test]

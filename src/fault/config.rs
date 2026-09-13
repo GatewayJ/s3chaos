@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use crate::fault::{
     plan::FaultInjectionParameters,
+    storage_recovery::StorageRecoveryCase,
     workload::{WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadDistribution},
 };
 use crate::framework::{command::CommandSpec, config::ClusterTestConfig, kubectl::Kubectl};
@@ -27,6 +28,7 @@ pub const DEFAULT_FAULT_NAMESPACE: &str = "rustfs-fault-test";
 pub const DEFAULT_FAULT_TENANT: &str = "fault-test-tenant";
 pub const DEFAULT_CHAOS_NAMESPACE: &str = "chaos-mesh";
 pub const DEFAULT_OPERATOR_NAMESPACE: &str = "rustfs-system";
+pub const DEFAULT_OPERATOR_IMAGE_MATCH: &str = "rustfs/operator";
 pub const DEFAULT_WORKLOAD_OBJECTS: usize = 40_000;
 pub const DEFAULT_WORKLOAD_CONCURRENCY: usize = 80;
 pub const DEFAULT_PREFILL_CONCURRENCY: usize = 16;
@@ -82,6 +84,23 @@ pub struct FaultTestConfig {
     pub cluster: ClusterTestConfig,
     pub expected_context: Option<String>,
     pub destructive_enabled: bool,
+    /// Explicit single-run opt-in used to calibrate a planned admin scenario
+    /// before its catalog status is promoted. FaultSuite resolution never
+    /// consumes this flag and continues to reject every planned scenario.
+    pub qualify_planned_admin: bool,
+    /// Explicit single-run opt-in for one exact planned storage-recovery case.
+    /// Ordinary suite resolution never consumes this flag.
+    pub qualify_planned_storage: bool,
+    pub storage_recovery_case: Option<StorageRecoveryCase>,
+    /// Closed JSON description of run-owned Local PVs. The final entry is the
+    /// held-back replacement; all preceding entries seed the dedicated Tenant.
+    pub storage_local_pvs_json: Option<String>,
+    /// Image containing `/usr/local/bin/s3chaos-storage-helper`; mandatory
+    /// only for explicit storage qualification.
+    pub storage_recovery_helper_image: Option<String>,
+    /// Strict, operator-reviewed target description for planned storage cases.
+    /// The runner re-reads every named Kubernetes generation before use.
+    pub storage_recovery_target_config: Option<PathBuf>,
     pub scenario: String,
     pub scenario_parameters: FaultInjectionParameters,
     pub duration: Duration,
@@ -115,6 +134,13 @@ pub struct FaultTestConfig {
     /// impact policy requires availability. The default leaves a small margin
     /// for port-forward reconnects; live calibration may tighten it to 100.
     pub min_availability_percent: u8,
+    /// RustFS operator Deployment (in `cluster.operator_namespace`) that
+    /// `cluster-cold-restart` scales to zero while it holds the outage, so
+    /// the operator cannot reconcile the StatefulSet replica count back.
+    pub operator_deployment: Option<String>,
+    /// Substring a container image of that Deployment must contain before
+    /// it is paused, so a mistyped name can never scale a foreign workload.
+    pub operator_image_match: String,
     pub dm_name: Option<String>,
     pub dm_node: Option<String>,
     pub dm_mount_path: Option<String>,
@@ -288,6 +314,30 @@ impl FaultTestConfig {
             cluster,
             expected_context,
             destructive_enabled: env_bool(&get_env, "RUSTFS_FAULT_TEST_DESTRUCTIVE")?,
+            qualify_planned_admin: env_bool(&get_env, "RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN")?,
+            qualify_planned_storage: env_bool(
+                &get_env,
+                "RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE",
+            )?,
+            storage_recovery_case: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE",
+            )
+            .map(|value| StorageRecoveryCase::parse(&value))
+            .transpose()?,
+            storage_local_pvs_json: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON",
+            ),
+            storage_recovery_helper_image: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_STORAGE_HELPER_IMAGE",
+            ),
+            storage_recovery_target_config: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG",
+            )
+            .map(PathBuf::from),
             scenario,
             scenario_parameters: FaultInjectionParameters::Default,
             duration: Duration::from_secs(env_u64(
@@ -347,6 +397,12 @@ impl FaultTestConfig {
                 );
                 percent
             },
+            operator_deployment: env_optional(&get_env, "RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT"),
+            operator_image_match: env_or(
+                &get_env,
+                "RUSTFS_FAULT_TEST_OPERATOR_IMAGE_MATCH",
+                DEFAULT_OPERATOR_IMAGE_MATCH,
+            ),
             workload_ranged_get_percent: {
                 let percent = env_u8(&get_env, "RUSTFS_FAULT_TEST_WORKLOAD_RANGED_GET_PERCENT", 0)?;
                 ensure!(
@@ -758,7 +814,57 @@ mod tests {
         );
         assert_eq!(config.warp_duration, std::time::Duration::from_secs(60));
         assert!(!config.destructive_enabled);
+        assert!(!config.qualify_planned_admin);
+        assert!(!config.qualify_planned_storage);
+        assert!(config.storage_recovery_case.is_none());
+        assert!(config.storage_recovery_target_config.is_none());
         assert!(config.require_destructive_enabled().is_err());
+    }
+
+    #[test]
+    fn planned_admin_qualification_flag_is_explicit() {
+        let config = FaultTestConfig::from_env_with(
+            |name| match name {
+                "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("fast-csi".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN" => Some("true".to_string()),
+                _ => None,
+            },
+            "production-test-cluster".to_string(),
+        )
+        .expect("fault config");
+
+        assert!(config.qualify_planned_admin);
+    }
+
+    #[test]
+    fn planned_storage_qualification_requires_a_typed_case() {
+        let config = FaultTestConfig::from_env_with(
+            |name| match name {
+                "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("fast-csi".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE" => Some("true".to_string()),
+                "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE" => {
+                    Some("on-disk-bitrot-admin-deep".to_string())
+                }
+                "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG" => {
+                    Some("/secure/bitrot-target.json".to_string())
+                }
+                _ => None,
+            },
+            "production-test-cluster".to_string(),
+        )
+        .expect("fault config");
+
+        assert!(config.qualify_planned_storage);
+        assert_eq!(
+            config.storage_recovery_case,
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAdminDeep)
+        );
+        assert_eq!(
+            config.storage_recovery_target_config.as_deref(),
+            Some(std::path::Path::new("/secure/bitrot-target.json"))
+        );
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub const HOST_STORAGE_PROOF_MAX_AGE_MS: u64 = 60_000;
 
 const DM_FLAKEY_KIND: &str = "rustfs_block_device_flakey";
 const DM_DROP_WRITES_KIND: &str = "rustfs_block_device_drop_writes_crash";
+pub const DM_STALE_RETURN_KIND: &str = "rustfs_block_device_stale_return";
 const DM_CRASH_TAINT_KEY: &str = "s3chaos.rustfs.com/dm-crash";
 const READ_ONLY_PREFLIGHT_SCOPE: &str = "read-only Kubernetes and host metadata observation plus proof artifact write; no disk, PV, PVC, object, or power mutation";
 
@@ -580,6 +581,22 @@ fn canonical_table_contract(
             }
             expected
         }
+        DM_STALE_RETURN_KIND => {
+            let expected = format!(
+                "{} {} flakey {} {} 0 86400 2 error_reads error_writes",
+                recovery.start_sector,
+                recovery.length_sectors,
+                recovery.backing_device,
+                recovery.backing_offset_sector
+            );
+            if let Some(configured) = configured_fault_table {
+                ensure!(
+                    normalize_table(configured) == expected,
+                    "stale-return fault table is not the continuous EIO table derived from recovery state"
+                );
+            }
+            expected
+        }
         other => bail!("fault kind {other:?} is not a supported device-mapper mutation"),
     };
     Ok(DeviceMapperTableContract {
@@ -844,7 +861,7 @@ fn canonical_recovery_contract(
     tables: &DeviceMapperTableContract,
 ) -> Result<HostStorageRecoveryContract> {
     let suspend_mode = match fault_kind {
-        DM_FLAKEY_KIND => "noflush",
+        DM_FLAKEY_KIND | DM_STALE_RETURN_KIND => "noflush",
         DM_DROP_WRITES_KIND => "nolockfs",
         other => bail!("fault kind {other:?} is not a host-storage mutation"),
     };
@@ -912,7 +929,7 @@ fn ensure_sha256(label: &str, value: &str) -> Result<()> {
 
 fn ensure_supported_dm_kind(fault_kind: &str) -> Result<()> {
     match fault_kind {
-        DM_FLAKEY_KIND | DM_DROP_WRITES_KIND => Ok(()),
+        DM_FLAKEY_KIND | DM_DROP_WRITES_KIND | DM_STALE_RETURN_KIND => Ok(()),
         other => bail!("fault kind {other:?} is not a supported device-mapper mutation"),
     }
 }
@@ -1095,8 +1112,8 @@ fn canonical_flakey_table(fields: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostStorageAllowlist, HostStorageMutationIntent, HostStorageMutationProof,
-        HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
+        DM_STALE_RETURN_KIND, HostStorageAllowlist, HostStorageMutationIntent,
+        HostStorageMutationProof, HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
         HostStoragePostCleanupObservation, HostStorageTargetObservation, dm_tables_match,
     };
     use std::collections::BTreeMap;
@@ -1293,6 +1310,22 @@ mod tests {
             "0 1024 flakey /dev/loop0 0 0 86400 1 drop_writes"
         );
         assert_eq!(proof.recovery.rollback.suspend_mode, "nolockfs");
+    }
+
+    #[test]
+    fn stale_return_table_is_continuous_eio_and_not_user_selected() {
+        let mut stale_intent = intent();
+        stale_intent.scenario = "stale-disk-return-detect".to_string();
+        stale_intent.fault_kind = DM_STALE_RETURN_KIND.to_string();
+        stale_intent.fault_table = None;
+        let proof = HostStorageMutationProof::prove_device_mapper(stale_intent, observation())
+            .expect("stale-return proof");
+
+        assert_eq!(
+            proof.tables.fault_table,
+            "0 1024 flakey /dev/loop0 0 0 86400 2 error_reads error_writes"
+        );
+        assert_eq!(proof.recovery.rollback.suspend_mode, "noflush");
     }
 
     #[test]

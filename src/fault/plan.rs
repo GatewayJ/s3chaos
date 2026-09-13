@@ -18,22 +18,27 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::fault::{
+    admin_topology::{AdminTopologyKind, AdminTopologyPlan},
     config::{DEFAULT_RUSTFS_VOLUME_PATH, FaultTestConfig, validate_rustfs_volume_path},
     quorum::{ErasureSetShape, MAX_ERASURE_SET_SHARDS, QuorumCaseClass, QuorumVolumeBoundary},
     scenarios::{
+        ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, CLUSTER_COLD_RESTART_SCENARIO,
         DISK_FULL_SCENARIO, DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_SCENARIO,
-        DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
-        FaultScenarioSpec, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO,
-        NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO,
-        NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
-        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
-        POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
-        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
+        DM_FLAKEY_VERSIONED_HOT_SCENARIO, FRESH_VOLUME_REPLACEMENT_SCENARIO, FaultBackend,
+        FaultParameterSchema, FaultScenario, FaultScenarioSpec, IO_EIO_SCENARIO,
+        IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, NETWORK_CORRUPT_SCENARIO,
+        NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO, NETWORK_LOSS_SCENARIO,
+        NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+        ON_DISK_BITROT_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO,
+        POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, ROLLING_RESTART_ALL_SCENARIO,
+        STALE_DISK_RETURN_DETECT_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
         WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
+    storage_recovery::StorageRecoveryCase,
 };
 
 pub const DEFAULT_RUSTFS_DATA_VOLUME: &str = DEFAULT_RUSTFS_VOLUME_PATH;
@@ -51,6 +56,218 @@ pub enum FaultWorkloadMode {
     S3Mixed,
     S3MixedWithWarp,
     AckTriggeredQuietMutation,
+}
+
+/// The top-level execution route for a fault-test scenario.
+///
+/// `FaultPlan` remains the injection contract. Admin reliability cases use a
+/// distinct plan so neither the runner nor persisted artifacts need to invent
+/// a no-op fault merely to enter the common test lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionPlan {
+    Injection(FaultPlan),
+    Admin(AdminExecutionPlan),
+    StorageRecovery(StorageRecoveryExecutionPlan),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionKind {
+    Injection,
+    Admin,
+    StorageRecovery,
+}
+
+impl ExecutionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Injection => "injection",
+            Self::Admin => "admin",
+            Self::StorageRecovery => "storage-recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminExecutionPlan {
+    pub scenario: String,
+    pub case_name: &'static str,
+    pub workload_mode: FaultWorkloadMode,
+    pub operation_timeout: Duration,
+    pub topology: AdminTopologyPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageRecoveryExecutionPlan {
+    pub scenario: String,
+    pub case_name: &'static str,
+    pub workload_mode: FaultWorkloadMode,
+    pub operation_timeout: Duration,
+    pub case: StorageRecoveryCase,
+}
+
+impl ExecutionPlan {
+    pub fn from_scenario_with_options(
+        scenario: &FaultScenario,
+        spec: &FaultScenarioSpec,
+        options: FaultPlanOptions,
+    ) -> Result<Self> {
+        match scenario.name.as_str() {
+            FRESH_VOLUME_REPLACEMENT_SCENARIO
+            | ON_DISK_BITROT_SCENARIO
+            | STALE_DISK_RETURN_DETECT_SCENARIO => {
+                ensure!(
+                    spec.backend == FaultBackend::PlannedReliabilityWorkflow,
+                    "storage-recovery scenario {} must use the planned reliability workflow backend",
+                    scenario.name
+                );
+                ensure!(
+                    matches!(
+                        options.scenario_parameters,
+                        FaultInjectionParameters::Default
+                    ),
+                    "storage-recovery scenario {} does not accept fault-injection parameters",
+                    scenario.name
+                );
+                let case = options.storage_recovery_case.context(
+                    "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE is required for planned storage qualification",
+                )?;
+                ensure!(
+                    case.scenario() == scenario.name,
+                    "storage-recovery case {} does not belong to scenario {}",
+                    case.as_str(),
+                    scenario.name
+                );
+                Ok(Self::StorageRecovery(StorageRecoveryExecutionPlan {
+                    scenario: scenario.name.clone(),
+                    case_name: scenario.case_name,
+                    workload_mode: FaultWorkloadMode::S3Mixed,
+                    operation_timeout: scenario.duration,
+                    case,
+                }))
+            }
+            ADMIN_DECOMMISSION_SCENARIO | ADMIN_REBALANCE_SCENARIO => {
+                ensure!(
+                    spec.backend == FaultBackend::PlannedReliabilityWorkflow,
+                    "admin scenario {} must use the planned reliability workflow backend",
+                    scenario.name
+                );
+                ensure!(
+                    scenario.name == spec.scenario,
+                    "admin scenario/spec mismatch: scenario={}, spec={}",
+                    scenario.name,
+                    spec.scenario
+                );
+                ensure!(
+                    matches!(
+                        options.scenario_parameters,
+                        FaultInjectionParameters::Default
+                    ),
+                    "admin scenario {} does not accept fault-injection parameters",
+                    scenario.name
+                );
+                Ok(Self::Admin(AdminExecutionPlan {
+                    scenario: scenario.name.clone(),
+                    case_name: scenario.case_name,
+                    workload_mode: FaultWorkloadMode::S3Mixed,
+                    operation_timeout: scenario.duration,
+                    topology: AdminTopologyPlan::for_scenario(&scenario.name)?,
+                }))
+            }
+            _ => {
+                FaultPlan::from_scenario_with_options(scenario, spec, options).map(Self::Injection)
+            }
+        }
+    }
+
+    pub fn kind(&self) -> ExecutionKind {
+        match self {
+            Self::Injection(_) => ExecutionKind::Injection,
+            Self::Admin(_) => ExecutionKind::Admin,
+            Self::StorageRecovery(_) => ExecutionKind::StorageRecovery,
+        }
+    }
+
+    pub fn scenario(&self) -> &str {
+        match self {
+            Self::Injection(plan) => &plan.scenario,
+            Self::Admin(plan) => &plan.scenario,
+            Self::StorageRecovery(plan) => &plan.scenario,
+        }
+    }
+
+    pub fn case_name(&self) -> &'static str {
+        match self {
+            Self::Injection(plan) => plan.case_name,
+            Self::Admin(plan) => plan.case_name,
+            Self::StorageRecovery(plan) => plan.case_name,
+        }
+    }
+
+    pub fn workload_mode(&self) -> FaultWorkloadMode {
+        match self {
+            Self::Injection(plan) => plan.workload_mode,
+            Self::Admin(plan) => plan.workload_mode,
+            Self::StorageRecovery(plan) => plan.workload_mode,
+        }
+    }
+
+    pub fn injection(&self) -> Option<&FaultPlan> {
+        match self {
+            Self::Injection(plan) => Some(plan),
+            Self::Admin(_) | Self::StorageRecovery(_) => None,
+        }
+    }
+
+    pub fn admin(&self) -> Option<&AdminExecutionPlan> {
+        match self {
+            Self::Injection(_) => None,
+            Self::Admin(plan) => Some(plan),
+            Self::StorageRecovery(_) => None,
+        }
+    }
+
+    pub fn storage_recovery(&self) -> Option<&StorageRecoveryExecutionPlan> {
+        match self {
+            Self::StorageRecovery(plan) => Some(plan),
+            Self::Injection(_) | Self::Admin(_) => None,
+        }
+    }
+
+    pub fn requires_static_storage(&self) -> bool {
+        matches!(self, Self::StorageRecovery(_))
+            || self
+                .injection()
+                .is_some_and(FaultPlan::requires_static_storage)
+    }
+
+    pub fn backend_summary(&self) -> String {
+        match self {
+            Self::Injection(plan) => plan.backend_summary(),
+            Self::Admin(_) | Self::StorageRecovery(_) => FaultBackend::PlannedReliabilityWorkflow
+                .as_str()
+                .to_string(),
+        }
+    }
+
+    pub fn target_summary(&self) -> String {
+        match self {
+            Self::Injection(plan) => plan.target_summary(),
+            Self::Admin(plan) => match plan.topology.kind {
+                AdminTopologyKind::Decommission => format!(
+                    "owned admin pool {}",
+                    plan.topology
+                        .target_pool_name
+                        .as_deref()
+                        .expect("decommission plan has a target pool")
+                ),
+                AdminTopologyKind::Rebalance => "owned two-pool admin topology".to_string(),
+            },
+            Self::StorageRecovery(plan) => {
+                format!("owned storage recovery case {}", plan.case.as_str())
+            }
+        }
+    }
 }
 
 impl FaultWorkloadMode {
@@ -76,6 +293,9 @@ pub enum FaultKind {
     RustfsServerMemoryStress,
     RustfsBlockDeviceFlakey,
     RustfsBlockDeviceDropWritesCrash,
+    RustfsServerPodGracefulRestart,
+    RustfsServerRollingRestart,
+    RustfsServerColdRestart,
 }
 
 impl FaultKind {
@@ -96,17 +316,26 @@ impl FaultKind {
             Self::RustfsServerMemoryStress => "rustfs_server_memory_stress",
             Self::RustfsBlockDeviceFlakey => "rustfs_block_device_flakey",
             Self::RustfsBlockDeviceDropWritesCrash => "rustfs_block_device_drop_writes_crash",
+            Self::RustfsServerPodGracefulRestart => "rustfs_server_pod_graceful_restart",
+            Self::RustfsServerRollingRestart => "rustfs_server_rolling_restart",
+            Self::RustfsServerColdRestart => "rustfs_server_cold_restart",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FaultTarget {
-    RustfsVolume { path: String },
+    RustfsVolume {
+        path: String,
+    },
     RustfsServerPod,
     RustfsServerPeerNetwork,
     RustfsServerResource,
     DedicatedBlockDevice,
+    /// The whole Tenant StatefulSet: every RustFS server Pod in turn or at
+    /// once. Plans select it as `FixedTargets(1)`, meaning one StatefulSet;
+    /// the Pod set is proven live from that StatefulSet at apply time.
+    RustfsServerStatefulSet,
 }
 
 impl FaultTarget {
@@ -121,6 +350,9 @@ impl FaultTarget {
                 "one RustFS server Pod under resource pressure".to_string()
             }
             Self::DedicatedBlockDevice => "one dedicated block-device-backed PV".to_string(),
+            Self::RustfsServerStatefulSet => {
+                "every RustFS server Pod of the Tenant StatefulSet".to_string()
+            }
         }
     }
 }
@@ -766,6 +998,11 @@ fn fault_kind_accepts_backend(kind: FaultKind, backend: FaultBackend) -> bool {
         ) | (
             FaultKind::RustfsBlockDeviceFlakey | FaultKind::RustfsBlockDeviceDropWritesCrash,
             FaultBackend::DeviceMapper
+        ) | (
+            FaultKind::RustfsServerPodGracefulRestart
+                | FaultKind::RustfsServerRollingRestart
+                | FaultKind::RustfsServerColdRestart,
+            FaultBackend::KubernetesLifecycle
         )
     )
 }
@@ -810,6 +1047,15 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
             FaultSelection::Percent(_) => false,
             FaultSelection::RuntimeQuorum(_) => false,
         },
+        // One Pod, or one whole StatefulSet: the backend proves the exact
+        // Pod set at apply time from the live StatefulSet.
+        FaultKind::RustfsServerPodGracefulRestart
+        | FaultKind::RustfsServerRollingRestart
+        | FaultKind::RustfsServerColdRestart => match selection {
+            FaultSelection::FixedTargets(count) => count == 1,
+            FaultSelection::Percent(_) => false,
+            FaultSelection::RuntimeQuorum(_) => false,
+        },
     }
 }
 
@@ -835,6 +1081,12 @@ fn fault_kind_accepts_target(kind: FaultKind, target: &FaultTarget) -> bool {
         FaultKind::RustfsBlockDeviceFlakey | FaultKind::RustfsBlockDeviceDropWritesCrash => {
             matches!(target, FaultTarget::DedicatedBlockDevice)
         }
+        FaultKind::RustfsServerPodGracefulRestart => {
+            matches!(target, FaultTarget::RustfsServerPod)
+        }
+        FaultKind::RustfsServerRollingRestart | FaultKind::RustfsServerColdRestart => {
+            matches!(target, FaultTarget::RustfsServerStatefulSet)
+        }
     }
 }
 
@@ -850,6 +1102,7 @@ pub struct FaultPlan {
 pub struct FaultPlanOptions {
     pub rustfs_volume_path: String,
     pub scenario_parameters: FaultInjectionParameters,
+    pub storage_recovery_case: Option<StorageRecoveryCase>,
 }
 
 impl FaultPlanOptions {
@@ -857,6 +1110,7 @@ impl FaultPlanOptions {
         Self {
             rustfs_volume_path: config.rustfs_volume_path.clone(),
             scenario_parameters: config.scenario_parameters.clone(),
+            storage_recovery_case: config.storage_recovery_case,
         }
     }
 }
@@ -866,6 +1120,7 @@ impl Default for FaultPlanOptions {
         Self {
             rustfs_volume_path: DEFAULT_RUSTFS_DATA_VOLUME.to_string(),
             scenario_parameters: FaultInjectionParameters::Default,
+            storage_recovery_case: None,
         }
     }
 }
@@ -1062,6 +1317,27 @@ impl FaultPlan {
                     parameters,
                 )?
             }
+            POD_GRACEFUL_RESTART_ONE_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsServerPodGracefulRestart,
+                spec.backend,
+                FaultTarget::RustfsServerPod,
+                FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
+            ROLLING_RESTART_ALL_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsServerRollingRestart,
+                spec.backend,
+                FaultTarget::RustfsServerStatefulSet,
+                FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
+            CLUSTER_COLD_RESTART_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsServerColdRestart,
+                spec.backend,
+                FaultTarget::RustfsServerStatefulSet,
+                FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
             other => bail!("scenario {other:?} has no fault plan mapping"),
         };
 
@@ -1156,13 +1432,15 @@ fn resource_fault(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_RUSTFS_DATA_VOLUME, FaultInjection, FaultInjectionParameters, FaultKind, FaultPlan,
-        FaultSelection, FaultTarget, FaultWorkloadMode,
+        DEFAULT_RUSTFS_DATA_VOLUME, ExecutionKind, ExecutionPlan, FaultInjection,
+        FaultInjectionParameters, FaultKind, FaultPlan, FaultPlanOptions, FaultSelection,
+        FaultTarget, FaultWorkloadMode,
     };
     use crate::fault::{
         config::FaultTestConfig,
         quorum::{ErasureSetShape, QuorumCaseClass, QuorumVolumeBoundary},
         scenarios::{
+            ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO,
             DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
             DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
             DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
@@ -1193,6 +1471,82 @@ mod tests {
             &FaultTarget::RustfsVolume {
                 path: DEFAULT_RUSTFS_DATA_VOLUME.to_string()
             }
+        );
+    }
+
+    #[test]
+    fn lifecycle_scenarios_map_to_the_kubectl_backend_and_statefulset_targets() {
+        use crate::fault::scenarios::{
+            CLUSTER_COLD_RESTART_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
+            ROLLING_RESTART_ALL_SCENARIO,
+        };
+        for (name, kind, target) in [
+            (
+                POD_GRACEFUL_RESTART_ONE_SCENARIO,
+                FaultKind::RustfsServerPodGracefulRestart,
+                FaultTarget::RustfsServerPod,
+            ),
+            (
+                ROLLING_RESTART_ALL_SCENARIO,
+                FaultKind::RustfsServerRollingRestart,
+                FaultTarget::RustfsServerStatefulSet,
+            ),
+            (
+                CLUSTER_COLD_RESTART_SCENARIO,
+                FaultKind::RustfsServerColdRestart,
+                FaultTarget::RustfsServerStatefulSet,
+            ),
+        ] {
+            let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+            config.scenario = name.to_string();
+            let scenario = FaultScenario::from_config(&config).expect("scenario");
+            let spec = scenario_spec(name).expect("spec");
+            let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan");
+            assert_eq!(plan.workload_mode, FaultWorkloadMode::S3Mixed, "{name}");
+            assert_eq!(
+                plan.required_backends(),
+                vec![FaultBackend::KubernetesLifecycle],
+                "{name}"
+            );
+            assert!(!plan.requires_static_storage());
+            assert_eq!(plan.faults()[0].kind(), kind, "{name}");
+            assert_eq!(plan.faults()[0].target(), &target, "{name}");
+            assert_eq!(
+                plan.faults()[0].selection(),
+                FaultSelection::FixedTargets(1)
+            );
+            // Lifecycle kinds never run through a Chaos Mesh backend or with a
+            // blast radius other than the proven StatefulSet.
+            assert!(
+                FaultInjection::new(
+                    kind,
+                    FaultBackend::ChaosMeshPodChaos,
+                    target.clone(),
+                    FaultSelection::FixedTargets(1),
+                    Duration::from_secs(60),
+                )
+                .is_err()
+            );
+            assert!(
+                FaultInjection::new(
+                    kind,
+                    FaultBackend::KubernetesLifecycle,
+                    target,
+                    FaultSelection::Percent(100),
+                    Duration::from_secs(60),
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            FaultInjection::new(
+                FaultKind::RustfsServerRollingRestart,
+                FaultBackend::KubernetesLifecycle,
+                FaultTarget::RustfsServerPod,
+                FaultSelection::FixedTargets(1),
+                Duration::from_secs(60),
+            )
+            .is_err()
         );
     }
 
@@ -1559,5 +1913,57 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn admin_scenarios_have_a_distinct_execution_plan_without_faults() {
+        for name in [ADMIN_REBALANCE_SCENARIO, ADMIN_DECOMMISSION_SCENARIO] {
+            let spec = scenario_spec(name).expect("catalog spec");
+            let scenario = FaultScenario {
+                name: name.to_string(),
+                case_name: spec.case_name,
+                duration: Duration::from_secs(60),
+                percent: 1,
+                object_count: 40,
+            };
+
+            let plan = ExecutionPlan::from_scenario_with_options(
+                &scenario,
+                spec,
+                FaultPlanOptions::default(),
+            )
+            .expect("admin execution plan");
+
+            assert_eq!(plan.kind(), ExecutionKind::Admin);
+            assert!(plan.injection().is_none());
+            assert_eq!(plan.scenario(), name);
+            assert!(!plan.target_summary().is_empty());
+        }
+    }
+
+    #[test]
+    fn admin_plan_rejects_injection_parameters() {
+        let spec = scenario_spec(ADMIN_REBALANCE_SCENARIO).expect("catalog spec");
+        let scenario = FaultScenario {
+            name: ADMIN_REBALANCE_SCENARIO.to_string(),
+            case_name: spec.case_name,
+            duration: Duration::from_secs(60),
+            percent: 1,
+            object_count: 40,
+        };
+        let error = ExecutionPlan::from_scenario_with_options(
+            &scenario,
+            spec,
+            FaultPlanOptions {
+                scenario_parameters: FaultInjectionParameters::NetworkLoss {
+                    loss_percent: 1,
+                    correlation_percent: 0,
+                },
+                ..FaultPlanOptions::default()
+            },
+        )
+        .expect_err("admin plan must not hide injection parameters");
+
+        assert!(error.to_string().contains("does not accept"));
     }
 }
