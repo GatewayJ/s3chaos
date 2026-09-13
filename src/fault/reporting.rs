@@ -19,6 +19,7 @@ use std::path::Path;
 
 use crate::{
     fault::{
+        backends::lifecycle::evidence::LifecycleStatusSnapshot,
         config::FaultTestConfig,
         host_storage::DmStatusSnapshot,
         plan::{FaultPlan, FaultSelection},
@@ -36,6 +37,8 @@ pub(crate) struct FaultStatusSnapshot {
     pub(crate) resource_name: Option<String>,
     pub(crate) chaos_status: Option<serde_json::Value>,
     pub(crate) dm_status: Option<DmStatusSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) lifecycle_status: Option<LifecycleStatusSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -760,6 +763,7 @@ mod tests {
             "environment_or_workload",
             "workload_or_product",
             "no_signal",
+            "graceful_shutdown_failed",
         ]);
         let mut names = BTreeSet::new();
         for classification in FailureClassification::ALL {

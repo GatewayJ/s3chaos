@@ -21,7 +21,8 @@ use crate::fault::{
     config::{DEFAULT_RUSTFS_VOLUME_PATH, FaultTestConfig, validate_rustfs_volume_path},
     quorum::{ErasureSetShape, MAX_ERASURE_SET_SHARDS, QuorumCaseClass, QuorumVolumeBoundary},
     scenarios::{
-        DISK_FULL_SCENARIO, DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+        CLUSTER_COLD_RESTART_SCENARIO, DISK_FULL_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_SCENARIO,
@@ -30,8 +31,9 @@ use crate::fault::{
         NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO,
         NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
-        POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
-        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
+        POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO,
+        QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+        ROLLING_RESTART_ALL_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
         WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
 };
@@ -76,6 +78,9 @@ pub enum FaultKind {
     RustfsServerMemoryStress,
     RustfsBlockDeviceFlakey,
     RustfsBlockDeviceDropWritesCrash,
+    RustfsServerPodGracefulRestart,
+    RustfsServerRollingRestart,
+    RustfsServerColdRestart,
 }
 
 impl FaultKind {
@@ -96,17 +101,26 @@ impl FaultKind {
             Self::RustfsServerMemoryStress => "rustfs_server_memory_stress",
             Self::RustfsBlockDeviceFlakey => "rustfs_block_device_flakey",
             Self::RustfsBlockDeviceDropWritesCrash => "rustfs_block_device_drop_writes_crash",
+            Self::RustfsServerPodGracefulRestart => "rustfs_server_pod_graceful_restart",
+            Self::RustfsServerRollingRestart => "rustfs_server_rolling_restart",
+            Self::RustfsServerColdRestart => "rustfs_server_cold_restart",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FaultTarget {
-    RustfsVolume { path: String },
+    RustfsVolume {
+        path: String,
+    },
     RustfsServerPod,
     RustfsServerPeerNetwork,
     RustfsServerResource,
     DedicatedBlockDevice,
+    /// The whole Tenant StatefulSet: every RustFS server Pod in turn or at
+    /// once. Plans select it as `FixedTargets(1)`, meaning one StatefulSet;
+    /// the Pod set is proven live from that StatefulSet at apply time.
+    RustfsServerStatefulSet,
 }
 
 impl FaultTarget {
@@ -121,6 +135,9 @@ impl FaultTarget {
                 "one RustFS server Pod under resource pressure".to_string()
             }
             Self::DedicatedBlockDevice => "one dedicated block-device-backed PV".to_string(),
+            Self::RustfsServerStatefulSet => {
+                "every RustFS server Pod of the Tenant StatefulSet".to_string()
+            }
         }
     }
 }
@@ -766,6 +783,11 @@ fn fault_kind_accepts_backend(kind: FaultKind, backend: FaultBackend) -> bool {
         ) | (
             FaultKind::RustfsBlockDeviceFlakey | FaultKind::RustfsBlockDeviceDropWritesCrash,
             FaultBackend::DeviceMapper
+        ) | (
+            FaultKind::RustfsServerPodGracefulRestart
+                | FaultKind::RustfsServerRollingRestart
+                | FaultKind::RustfsServerColdRestart,
+            FaultBackend::KubernetesLifecycle
         )
     )
 }
@@ -810,6 +832,15 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
             FaultSelection::Percent(_) => false,
             FaultSelection::RuntimeQuorum(_) => false,
         },
+        // One Pod, or one whole StatefulSet: the backend proves the exact
+        // Pod set at apply time from the live StatefulSet.
+        FaultKind::RustfsServerPodGracefulRestart
+        | FaultKind::RustfsServerRollingRestart
+        | FaultKind::RustfsServerColdRestart => match selection {
+            FaultSelection::FixedTargets(count) => count == 1,
+            FaultSelection::Percent(_) => false,
+            FaultSelection::RuntimeQuorum(_) => false,
+        },
     }
 }
 
@@ -834,6 +865,12 @@ fn fault_kind_accepts_target(kind: FaultKind, target: &FaultTarget) -> bool {
         }
         FaultKind::RustfsBlockDeviceFlakey | FaultKind::RustfsBlockDeviceDropWritesCrash => {
             matches!(target, FaultTarget::DedicatedBlockDevice)
+        }
+        FaultKind::RustfsServerPodGracefulRestart => {
+            matches!(target, FaultTarget::RustfsServerPod)
+        }
+        FaultKind::RustfsServerRollingRestart | FaultKind::RustfsServerColdRestart => {
+            matches!(target, FaultTarget::RustfsServerStatefulSet)
         }
     }
 }
@@ -1062,6 +1099,27 @@ impl FaultPlan {
                     parameters,
                 )?
             }
+            POD_GRACEFUL_RESTART_ONE_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsServerPodGracefulRestart,
+                spec.backend,
+                FaultTarget::RustfsServerPod,
+                FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
+            ROLLING_RESTART_ALL_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsServerRollingRestart,
+                spec.backend,
+                FaultTarget::RustfsServerStatefulSet,
+                FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
+            CLUSTER_COLD_RESTART_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsServerColdRestart,
+                spec.backend,
+                FaultTarget::RustfsServerStatefulSet,
+                FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
             other => bail!("scenario {other:?} has no fault plan mapping"),
         };
 
@@ -1193,6 +1251,82 @@ mod tests {
             &FaultTarget::RustfsVolume {
                 path: DEFAULT_RUSTFS_DATA_VOLUME.to_string()
             }
+        );
+    }
+
+    #[test]
+    fn lifecycle_scenarios_map_to_the_kubectl_backend_and_statefulset_targets() {
+        use crate::fault::scenarios::{
+            CLUSTER_COLD_RESTART_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
+            ROLLING_RESTART_ALL_SCENARIO,
+        };
+        for (name, kind, target) in [
+            (
+                POD_GRACEFUL_RESTART_ONE_SCENARIO,
+                FaultKind::RustfsServerPodGracefulRestart,
+                FaultTarget::RustfsServerPod,
+            ),
+            (
+                ROLLING_RESTART_ALL_SCENARIO,
+                FaultKind::RustfsServerRollingRestart,
+                FaultTarget::RustfsServerStatefulSet,
+            ),
+            (
+                CLUSTER_COLD_RESTART_SCENARIO,
+                FaultKind::RustfsServerColdRestart,
+                FaultTarget::RustfsServerStatefulSet,
+            ),
+        ] {
+            let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+            config.scenario = name.to_string();
+            let scenario = FaultScenario::from_config(&config).expect("scenario");
+            let spec = scenario_spec(name).expect("spec");
+            let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan");
+            assert_eq!(plan.workload_mode, FaultWorkloadMode::S3Mixed, "{name}");
+            assert_eq!(
+                plan.required_backends(),
+                vec![FaultBackend::KubernetesLifecycle],
+                "{name}"
+            );
+            assert!(!plan.requires_static_storage());
+            assert_eq!(plan.faults()[0].kind(), kind, "{name}");
+            assert_eq!(plan.faults()[0].target(), &target, "{name}");
+            assert_eq!(
+                plan.faults()[0].selection(),
+                FaultSelection::FixedTargets(1)
+            );
+            // Lifecycle kinds never run through a Chaos Mesh backend or with a
+            // blast radius other than the proven StatefulSet.
+            assert!(
+                FaultInjection::new(
+                    kind,
+                    FaultBackend::ChaosMeshPodChaos,
+                    target.clone(),
+                    FaultSelection::FixedTargets(1),
+                    Duration::from_secs(60),
+                )
+                .is_err()
+            );
+            assert!(
+                FaultInjection::new(
+                    kind,
+                    FaultBackend::KubernetesLifecycle,
+                    target,
+                    FaultSelection::Percent(100),
+                    Duration::from_secs(60),
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            FaultInjection::new(
+                FaultKind::RustfsServerRollingRestart,
+                FaultBackend::KubernetesLifecycle,
+                FaultTarget::RustfsServerPod,
+                FaultSelection::FixedTargets(1),
+                Duration::from_secs(60),
+            )
+            .is_err()
         );
     }
 

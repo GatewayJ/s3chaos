@@ -17,6 +17,7 @@ use crate::{
         backends::{
             chaos_mesh::{self, ChaosGuard},
             host::{self, DmFlakeyGuard, DmStatusSnapshot},
+            lifecycle,
         },
         config::FaultTestConfig,
         fault_artifacts::FaultFailureArtifactSource,
@@ -25,7 +26,7 @@ use crate::{
             FaultLifecyclePort,
         },
         host_storage::HostStorageMutationProof,
-        plan::{FaultInjection, FaultPlan},
+        plan::{FaultInjection, FaultKind, FaultPlan},
         pods::{wait_for_rustfs_pod_deletion, wait_for_rustfs_pod_replacement},
         reporting::{FaultStatusSnapshot, PodIdentity},
         scenarios::{FaultBackend, FaultScenario},
@@ -46,7 +47,7 @@ pub(in crate::fault) fn require_fault_backends(
     config: &FaultTestConfig,
     plan: &FaultPlan,
 ) -> Result<()> {
-    require_fault_backend(config, plan.fault().backend())?;
+    require_fault_backend(config, plan.fault().backend(), plan.fault().kind())?;
     for fault in plan
         .faults()
         .iter()
@@ -80,7 +81,11 @@ pub(in crate::fault) fn preflight_host_storage_mutation(
     .map(Some)
 }
 
-fn require_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Result<()> {
+fn require_fault_backend(
+    config: &FaultTestConfig,
+    backend: FaultBackend,
+    kind: FaultKind,
+) -> Result<()> {
     let cluster = &config.cluster;
     match backend {
         FaultBackend::ChaosMeshIoChaos => chaos_mesh::require_iochaos_crd(cluster),
@@ -95,6 +100,7 @@ fn require_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Res
         FaultBackend::PlannedReliabilityWorkflow => {
             bail!("planned reliability workflow scenarios are catalog-only and cannot execute yet")
         }
+        FaultBackend::KubernetesLifecycle => lifecycle::require_backend(config, kind),
     }
 }
 
@@ -114,11 +120,15 @@ pub(in crate::fault) fn cleanup_fault_backends(
     config: &FaultTestConfig,
     plan: &FaultPlan,
 ) -> Result<()> {
-    cleanup_fault_backend(config, plan.fault().backend())?;
+    cleanup_fault_backend(config, plan.fault().backend(), plan.fault().kind())?;
     Ok(())
 }
 
-fn cleanup_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Result<()> {
+fn cleanup_fault_backend(
+    config: &FaultTestConfig,
+    backend: FaultBackend,
+    kind: FaultKind,
+) -> Result<()> {
     match backend {
         FaultBackend::ChaosMeshIoChaos
         | FaultBackend::MinioWarpWithChaos
@@ -133,6 +143,19 @@ fn cleanup_fault_backend(config: &FaultTestConfig, backend: FaultBackend) -> Res
         }
         FaultBackend::DeviceMapper => Ok(()),
         FaultBackend::PlannedReliabilityWorkflow => Ok(()),
+        // A cold restart records its operator pause on the operator Deployment;
+        // a previous run that died before restoring it is repaired here. Only
+        // the cold restart holds the operator-namespace RBAC this needs, so
+        // the other lifecycle kinds only warn (read-only, best effort) and
+        // leave the repair to fault-cleanup.
+        FaultBackend::KubernetesLifecycle => {
+            if kind == FaultKind::RustfsServerColdRestart {
+                lifecycle::restore_paused_operators(config).map(|_| ())
+            } else {
+                lifecycle::warn_on_paused_operators(config);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -219,6 +242,15 @@ fn apply_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> 
         | FaultBackend::MinioWarpWithChaos => apply_chaos_mesh_fault_backend(request),
         FaultBackend::PlannedReliabilityWorkflow => {
             bail!("planned reliability workflow scenarios are catalog-only and cannot execute yet")
+        }
+        FaultBackend::KubernetesLifecycle => {
+            lifecycle::apply_fault(&lifecycle::FaultApplyRequest {
+                config: request.config,
+                collector: request.collector,
+                scenario: request.scenario,
+                injection: request.injection,
+                run_id: request.run_id,
+            })
         }
     }
 }
@@ -407,6 +439,7 @@ impl FaultLifecyclePort for DmFlakeyFaultHandle {
                 "active" | "after-workload" => self.guard.ensure_active(stage)?,
                 _ => self.guard.snapshot(stage)?,
             }),
+            lifecycle_status: None,
         })
     }
 
@@ -422,6 +455,7 @@ fn chaos_fault_snapshot(guard: &ChaosGuard, stage: &str) -> Result<FaultStatusSn
         resource_name: Some(guard.name().to_string()),
         chaos_status: Some(serde_json::from_str(&guard.json()?)?),
         dm_status: None,
+        lifecycle_status: None,
     })
 }
 
@@ -877,7 +911,7 @@ fn is_managed_iochaos_finalizer(finalizer: &str) -> bool {
     MANAGED_IOCHAOS_FINALIZERS.contains(&finalizer)
 }
 
-fn capture_command_artifact(
+pub(super) fn capture_command_artifact(
     collector: &ArtifactCollector,
     case_name: &str,
     file_name: &str,
@@ -1143,6 +1177,7 @@ mod tests {
                 resource_name: Some(self.name.to_string()),
                 chaos_status: None,
                 dm_status: None,
+                lifecycle_status: None,
             })
         }
 

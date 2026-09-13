@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::fault::backends::lifecycle::evidence::POD_LIFECYCLE_EVIDENCE_ARTIFACT;
 use crate::fault::recovery_health::RECOVERY_HEALTH_ARTIFACT;
 use crate::fault::workload::execution::{
     AVAILABILITY_REPORT_ARTIFACT, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
@@ -334,6 +335,11 @@ impl FaultRunArtifactSpec {
         if scenario_spec(scenario).is_ok_and(|spec| spec.impact_policy.requires_availability()) {
             names.push(AVAILABILITY_REPORT_ARTIFACT.to_string());
         }
+        if scenario_spec(scenario).is_ok_and(|spec| {
+            spec.backend == crate::fault::scenarios::FaultBackend::KubernetesLifecycle
+        }) {
+            names.push(POD_LIFECYCLE_EVIDENCE_ARTIFACT.to_string());
+        }
         names
     }
 }
@@ -398,6 +404,10 @@ impl FaultRunTargetSpec {
             },
             FaultTarget::DedicatedBlockDevice => Self {
                 kind: "dedicated-block-device".to_string(),
+                path: None,
+            },
+            FaultTarget::RustfsServerStatefulSet => Self {
+                kind: "rustfs-server-statefulset".to_string(),
                 path: None,
             },
         }

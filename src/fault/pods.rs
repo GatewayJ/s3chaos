@@ -116,7 +116,7 @@ fn pod_identities_from_items(
     Ok(pods)
 }
 
-fn rustfs_tenant_selector(config: &ClusterTestConfig) -> String {
+pub(crate) fn rustfs_tenant_selector(config: &ClusterTestConfig) -> String {
     format!("rustfs.tenant={}", config.tenant_name)
 }
 
@@ -258,7 +258,7 @@ pub(crate) fn fixed_volume_container_ids(
     Ok(containers)
 }
 
-fn pod_is_ready(pod: &Value) -> bool {
+pub(crate) fn pod_is_ready(pod: &Value) -> bool {
     pod.pointer("/metadata/deletionTimestamp").is_none()
         && pod
             .pointer("/status/conditions")

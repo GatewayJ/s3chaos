@@ -708,6 +708,56 @@ impl FaultRun<'_> {
                 Some(serde_json::to_value(&observation)?),
             )?;
         }
+        if plan.fault().backend() == FaultBackend::KubernetesLifecycle {
+            events.record(
+                "statefulset-ownership-proof",
+                RunEventStatus::Started,
+                "binding every RustFS Pod to its controlling StatefulSet before the lifecycle operation",
+                None,
+            )?;
+            let proven = crate::fault::backends::lifecycle::prove_statefulset_ownership(
+                cluster,
+                config.expected_rustfs_pod_count,
+            )
+            .and_then(|proof| target_proof.clone().with_statefulset_proven(proof));
+            match proven {
+                Ok(proof) => target_proof = proof,
+                Err(error) => {
+                    preflight_phases.push(PreflightPhase::new(
+                        "statefulset-ownership-proof",
+                        vec![PreflightCheck::failed(
+                            "statefulset_ownership",
+                            error.to_string(),
+                            crate::fault::reporting::ResponsibilityDomain::Environment,
+                        )],
+                    ));
+                    write_preflight_summary(collector, scenario, config, run_id, preflight_phases)
+                        .ok();
+                    self.record_failure(
+                        "statefulset-ownership-proof",
+                        "preflight_failed",
+                        &error,
+                        None,
+                        None,
+                    )?;
+                    return Err(error);
+                }
+            }
+            preflight_phases.push(PreflightPhase::new(
+                "statefulset-ownership-proof",
+                vec![PreflightCheck::passed(
+                    "statefulset_ownership",
+                    "every RustFS Pod is owned by one Ready StatefulSet",
+                    crate::fault::reporting::ResponsibilityDomain::Harness,
+                )],
+            ));
+            events.record(
+                "statefulset-ownership-proof",
+                RunEventStatus::Succeeded,
+                "StatefulSet ownership proven for the lifecycle operation",
+                None,
+            )?;
+        }
         let host_storage_proof = self.prove_host_storage(preflight_phases).await?;
         collector.write_text(
             scenario.case_name,
