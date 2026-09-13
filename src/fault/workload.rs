@@ -828,6 +828,44 @@ impl S3WorkloadClient {
         secret_key: impl Into<String>,
         request_timeout: Duration,
     ) -> Result<Self> {
+        Self::new_with_retry_policy(
+            endpoint,
+            bucket,
+            access_key,
+            secret_key,
+            request_timeout,
+            aws_sdk_s3::config::retry::RetryConfig::standard()
+                .with_max_attempts(S3_WORKLOAD_MUTATION_MAX_ATTEMPTS),
+        )
+        .await
+    }
+
+    pub async fn new_without_retries(
+        endpoint: impl Into<String>,
+        bucket: impl Into<String>,
+        access_key: impl Into<String>,
+        secret_key: impl Into<String>,
+        request_timeout: Duration,
+    ) -> Result<Self> {
+        Self::new_with_retry_policy(
+            endpoint,
+            bucket,
+            access_key,
+            secret_key,
+            request_timeout,
+            aws_sdk_s3::config::retry::RetryConfig::disabled(),
+        )
+        .await
+    }
+
+    async fn new_with_retry_policy(
+        endpoint: impl Into<String>,
+        bucket: impl Into<String>,
+        access_key: impl Into<String>,
+        secret_key: impl Into<String>,
+        request_timeout: Duration,
+        retry_config: aws_sdk_s3::config::retry::RetryConfig,
+    ) -> Result<Self> {
         let credentials = Credentials::new(
             access_key.into(),
             secret_key.into(),
@@ -843,10 +881,7 @@ impl S3WorkloadClient {
             .await;
         let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
             .force_path_style(true)
-            .retry_config(
-                aws_sdk_s3::config::retry::RetryConfig::standard()
-                    .with_max_attempts(S3_WORKLOAD_MUTATION_MAX_ATTEMPTS),
-            )
+            .retry_config(retry_config)
             .build();
 
         Ok(Self {

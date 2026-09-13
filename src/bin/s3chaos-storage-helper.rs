@@ -17,13 +17,18 @@ use std::io::{BufRead, BufReader, Read, Write};
 use anyhow::{Context, Result, bail, ensure};
 use s3chaos::fault::fresh_volume::{FreshVolumeHostProbeRequest, run_fresh_volume_host_probe};
 use s3chaos::fault::storage_recovery_helper::{
-    StorageHelperSession, StorageHelperSessionRequest, StorageHelperSessionResponse,
+    StaleOfflineHelperRequest, StorageHelperSession, StorageHelperSessionRequest,
+    StorageHelperSessionResponse, execute_stale_offline_helper,
 };
 
 const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
 
 fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.as_slice().get(1).map(String::as_str) == Some("--stale-one-shot") {
+        ensure!(args.len() == 2, "stale one-shot accepts no extra arguments");
+        return run_stale_one_shot();
+    }
     if args.as_slice().get(1).map(String::as_str) == Some("hold") {
         ensure!(args.len() == 2, "storage helper hold accepts no arguments");
         loop {
@@ -45,7 +50,7 @@ fn main() -> Result<()> {
     }
     ensure!(
         args.len() == 1,
-        "storage helper accepts only closed hold and probe-fresh-volume operations"
+        "storage helper accepts only closed hold, probe-fresh-volume, and stale one-shot operations"
     );
     let stdin = std::io::stdin();
     let mut input = BufReader::new(stdin.lock());
@@ -81,6 +86,17 @@ fn main() -> Result<()> {
                     Err(error) => write_error(&mut output, &format!("{error:#}"))?,
                 }
             }
+            StorageHelperSessionRequest::StaleExecute { context, request } => {
+                match session.execute_stale(&context, &request) {
+                    Ok(response) => write_response(
+                        &mut output,
+                        &StorageHelperSessionResponse::StaleResponse {
+                            response: Box::new(response),
+                        },
+                    )?,
+                    Err(error) => write_error(&mut output, &format!("{error:#}"))?,
+                }
+            }
             StorageHelperSessionRequest::Finish { context, cleanup } => {
                 match session.finish(&context, &cleanup) {
                     Ok(()) => {
@@ -97,6 +113,24 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+fn run_stale_one_shot() -> Result<()> {
+    let mut body = Vec::new();
+    std::io::stdin()
+        .take(MAX_REQUEST_BYTES + 1)
+        .read_to_end(&mut body)
+        .context("read stale offline helper request")?;
+    ensure!(
+        !body.is_empty() && body.len() <= MAX_REQUEST_BYTES as usize,
+        "stale offline helper request is empty or oversized"
+    );
+    let request = serde_json::from_slice::<StaleOfflineHelperRequest>(&body)
+        .context("decode stale offline helper request")?;
+    let response = execute_stale_offline_helper(request)?;
+    serde_json::to_writer(std::io::stdout().lock(), &response)
+        .context("write stale offline helper response")?;
+    Ok(())
 }
 
 fn read_request(input: &mut impl BufRead) -> Result<Option<StorageHelperSessionRequest>> {

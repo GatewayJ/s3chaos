@@ -400,6 +400,35 @@ pub(crate) async fn run_storage_recovery_case(
             && scenario.case_name == plan.case_name,
         "storage-recovery runner requires one exact destructive planned qualification"
     );
+    match plan.case {
+        StorageRecoveryCase::OnDiskBitrotAutomaticScanner
+        | StorageRecoveryCase::OnDiskBitrotAdminDeep => {
+            return crate::fault::on_disk_bitrot::run_on_disk_bitrot_case(
+                config,
+                collector,
+                scenario,
+                execution_plan,
+                plan,
+                run_id,
+                deadline,
+            )
+            .await;
+        }
+        StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement
+        | StorageRecoveryCase::FreshVolumeReplacementAdminDeep => {}
+        StorageRecoveryCase::StaleDiskReturn => {
+            return crate::fault::stale_disk_runner::run_stale_disk_case(
+                config,
+                collector,
+                scenario,
+                execution_plan,
+                plan,
+                run_id,
+                deadline,
+            )
+            .await;
+        }
+    }
     let driver = crate::fault::fresh_volume::FreshVolumeDriver::new(
         config, collector, scenario, plan, run_id, deadline,
     )?;
@@ -426,8 +455,6 @@ pub(crate) async fn run_storage_recovery_case(
 mod tests {
     use std::sync::Mutex;
 
-    use anyhow::bail;
-
     use super::*;
     use crate::fault::plan::FaultWorkloadMode;
 
@@ -441,7 +468,7 @@ mod tests {
         fn step(&self, name: &'static str) -> Result<()> {
             self.calls.lock().expect("calls").push(name);
             if self.fail == Some(name) || (name == "cleanup" && self.cleanup_fails) {
-                bail!("primary {name}")
+                anyhow::bail!("primary {name}")
             }
             Ok(())
         }

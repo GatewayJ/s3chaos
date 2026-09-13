@@ -31,8 +31,8 @@ use crate::{
 };
 
 pub(crate) struct RustfsTargetInventory {
-    pub identities: Vec<PodIdentity>,
-    pub pod_proofs: Vec<TargetResolvedPodProof>,
+    pub(crate) identities: Vec<PodIdentity>,
+    pub(crate) pod_proofs: Vec<TargetResolvedPodProof>,
 }
 
 pub(crate) fn rustfs_pod_identities(config: &ClusterTestConfig) -> Result<Vec<PodIdentity>> {

@@ -74,6 +74,13 @@ use crate::fault::{
         HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT, HostStorageMutationProof,
         HostStoragePostCleanupObservation, normalized_dm_table_sha256,
     },
+    on_disk_bitrot::{
+        BITROT_CLEANUP_ARTIFACT, BITROT_CORRUPTION_WINDOW_ARTIFACT, BITROT_HEAL_ARTIFACT,
+        BITROT_MUTATION_ARTIFACT, BITROT_SELECTION_ARTIFACT, BITROT_WORKFLOW_ARTIFACT,
+        BitrotCleanupEvidence, BitrotCorruptionWindowProof, BitrotHealEvidence,
+        BitrotMutationEvidence, BitrotSelectionEvidence, OnDiskBitrotEvidenceSet,
+        OnDiskBitrotWorkflowEvidence, validate_on_disk_bitrot_evidence,
+    },
     plan::{
         ExecutionKind, ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultKind,
         FaultPlanOptions, FaultSelection, FaultTarget, FaultWorkloadMode,
@@ -101,9 +108,11 @@ use crate::fault::{
         FaultRunFaultSpec, FaultRunSpec, FaultRunTargetSpec,
     },
     storage_recovery::{
-        DISK_GENERATION_PROOF_ARTIFACT, FORCE_READ_PROOF_ARTIFACT, FreshVolumeReplacementProof,
-        HEAL_PROGRESS_ARTIFACT, HEAL_SUMMARY_ARTIFACT, HealProgressSample, HealSummary,
-        VERSION_SHARD_MAPPING_ARTIFACT, VersionShardMappingObservation,
+        DANGLING_CLEANUP_PROOF_ARTIFACT, DISK_GENERATION_PROOF_ARTIFACT, DanglingCleanupProof,
+        FORCE_READ_PROOF_ARTIFACT, FreshVolumeReplacementProof, HEAL_PROGRESS_ARTIFACT,
+        HEAL_SUMMARY_ARTIFACT, HealProgressSample, HealSummary, SHARD_INVENTORY_AFTER_ARTIFACT,
+        SHARD_INVENTORY_BEFORE_ARTIFACT, ShardInventorySnapshot, StaleDiskReturnProof,
+        StorageRecoveryCase, VERSION_SHARD_MAPPING_ARTIFACT, VersionShardMappingObservation,
     },
     storage_recovery_runner::{
         STORAGE_RECOVERY_WORKFLOW_ARTIFACT, StorageRecoveryWorkflowEvidence,
@@ -1296,6 +1305,12 @@ fn validate_fault_artifacts_with_identity(
             scenario_spec.case_name,
         );
     }
+    if options.scenario == scenarios::ON_DISK_BITROT_SCENARIO {
+        return validate_on_disk_bitrot_artifacts(options, identity, scenario_spec.case_name);
+    }
+    if options.scenario == scenarios::STALE_DISK_RETURN_DETECT_SCENARIO {
+        return validate_stale_disk_execution_artifacts(options, identity, scenario_spec.case_name);
+    }
     let ack_mutation = acknowledged_mutation_kind(&options.scenario);
     validate_conditional_recovery_stability_artifact(
         &options.artifact_root,
@@ -1826,6 +1841,130 @@ fn validate_fault_artifacts_with_identity(
     })
 }
 
+fn validate_on_disk_bitrot_artifacts(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+    case_name: &str,
+) -> Result<ArtifactValidationReport> {
+    let artifacts =
+        locate_required_artifacts(&options.artifact_root, case_name, &options.scenario)?;
+    let metadata = read_json::<RunMetadataArtifact>(required(&artifacts, "run-metadata.json")?)?;
+    ensure!(
+        metadata.scenario == options.scenario
+            && metadata.workload_objects == options.expected_workload_objects
+            && metadata.workload_concurrency == options.expected_workload_concurrency,
+        "bitrot run metadata does not match the selected scenario or workload"
+    );
+    if let Some(run_id) = identity.planned_run_id() {
+        ensure!(
+            metadata.run_id == run_id,
+            "bitrot run metadata does not match the planned attempt"
+        );
+    }
+    let json_spec = read_json::<FaultRunSpec>(required(&artifacts, "run-spec.json")?)?;
+    let yaml_spec = read_yaml::<FaultRunSpec>(required(&artifacts, "run-spec.yaml")?)?;
+    ensure!(
+        json_spec == yaml_spec,
+        "bitrot run spec JSON and YAML differ"
+    );
+    validate_run_spec(&json_spec, options)?;
+    ensure!(
+        json_spec.execution_kind()? == ExecutionKind::StorageRecovery
+            && json_spec.metadata.run_id == metadata.run_id
+            && json_spec.metadata.name == case_name,
+        "bitrot run spec execution or identity does not match the attempt"
+    );
+    let workload = read_json::<WorkloadPlan>(required(&artifacts, "workload-plan.json")?)?;
+    ensure!(
+        workload.object_count == options.expected_workload_objects
+            && workload.concurrency == options.expected_workload_concurrency
+            && workload.seed == json_spec.workload.seed,
+        "bitrot workload plan does not match run-spec"
+    );
+    let preflight = read_json::<PreflightSummary>(required(&artifacts, "preflight-summary.json")?)?;
+    validate_preflight_summary(&preflight, options)?;
+    let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
+    ensure!(
+        events
+            .iter()
+            .all(|event| { event.scenario == options.scenario && event.run_id == metadata.run_id })
+            && has_event(&events, "run", RunEventStatus::Started)
+            && has_event(&events, "run", RunEventStatus::Succeeded)
+            && has_event(&events, "checker-final", RunEventStatus::Succeeded),
+        "bitrot run events do not prove successful completion and final checking"
+    );
+    let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
+    ensure!(!history.is_empty(), "bitrot history is empty");
+    validate_history_scope_and_order(
+        &history,
+        &options.scenario,
+        &metadata.run_id,
+        &json_spec.metadata.bucket,
+    )?;
+
+    let selection =
+        read_json::<BitrotSelectionEvidence>(required(&artifacts, BITROT_SELECTION_ARTIFACT)?)?;
+    let mutation =
+        read_json::<BitrotMutationEvidence>(required(&artifacts, BITROT_MUTATION_ARTIFACT)?)?;
+    let corruption_window = read_json::<BitrotCorruptionWindowProof>(required(
+        &artifacts,
+        BITROT_CORRUPTION_WINDOW_ARTIFACT,
+    )?)?;
+    let heal = read_json::<BitrotHealEvidence>(required(&artifacts, BITROT_HEAL_ARTIFACT)?)?;
+    let cleanup =
+        read_json::<BitrotCleanupEvidence>(required(&artifacts, BITROT_CLEANUP_ARTIFACT)?)?;
+    let workflow =
+        read_json::<OnDiskBitrotWorkflowEvidence>(required(&artifacts, BITROT_WORKFLOW_ARTIFACT)?)?;
+    let checker_path = required(&artifacts, "checker-report.json")?;
+    let checker_body =
+        fs::read_to_string(checker_path).context("read bitrot final checker report")?;
+    let checker = serde_json::from_str::<CheckerReport>(&checker_body)
+        .context("decode bitrot final checker report")?;
+    validate_checker_identity("checker-report.json", &checker, &metadata)?;
+    validate_checker_report(
+        "checker-report.json",
+        &checker,
+        options.expected_workload_versioning,
+        &history,
+    )?;
+    let post_write_path = required(&artifacts, POST_RECOVERY_WRITE_REPORT_ARTIFACT)?;
+    let post_write_body =
+        fs::read_to_string(post_write_path).context("read bitrot post-write report")?;
+    let post_write = serde_json::from_str::<PostRecoveryWriteReport>(&post_write_body)
+        .context("decode bitrot post-write report")?;
+    ensure!(
+        post_write.scenario == options.scenario && post_write.run_id == metadata.run_id,
+        "bitrot post-write report identity mismatch"
+    );
+    post_write.require_success()?;
+    validate_on_disk_bitrot_evidence(&OnDiskBitrotEvidenceSet {
+        workflow: &workflow,
+        selection: &selection,
+        mutation: &mutation,
+        corruption_window: &corruption_window,
+        heal: &heal,
+        cleanup: &cleanup,
+        checker_report_body: &checker_body,
+        post_write_report_body: &post_write_body,
+    })?;
+    ensure!(
+        workflow.identity.run_id == metadata.run_id
+            && workflow.identity.scenario == metadata.scenario
+            && workflow.identity.case_name == case_name
+            && workflow.identity.bucket == json_spec.metadata.bucket,
+        "bitrot workflow identity does not match run metadata and spec"
+    );
+    Ok(ArtifactValidationReport {
+        scenario: options.scenario.clone(),
+        case_name: case_name.to_string(),
+        seed: workload.seed,
+        client_disruptions: 0,
+        recommitted: 0,
+        committed: checker.committed_puts,
+        required_artifacts: json_spec.artifacts.required,
+    })
+}
+
 fn validate_admin_execution_artifacts(
     options: &ArtifactValidationOptions,
     identity: ArtifactIdentityPolicy<'_>,
@@ -2342,6 +2481,111 @@ fn validate_storage_recovery_execution_artifacts(
     })
 }
 
+fn validate_stale_disk_execution_artifacts(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+    case_name: &str,
+) -> Result<ArtifactValidationReport> {
+    let artifacts =
+        locate_required_artifacts(&options.artifact_root, case_name, &options.scenario)?;
+    let metadata = read_json::<RunMetadataArtifact>(required(&artifacts, "run-metadata.json")?)?;
+    ensure!(
+        metadata.scenario == options.scenario
+            && metadata.workload_objects == options.expected_workload_objects
+            && metadata.workload_concurrency == options.expected_workload_concurrency,
+        "stale-disk run metadata does not match the selected scenario or workload"
+    );
+    if let Some(run_id) = identity.planned_run_id() {
+        ensure!(
+            metadata.run_id == run_id,
+            "stale-disk run metadata does not match the planned attempt"
+        );
+    }
+    let json_spec = read_json::<FaultRunSpec>(required(&artifacts, "run-spec.json")?)?;
+    let yaml_spec = read_yaml::<FaultRunSpec>(required(&artifacts, "run-spec.yaml")?)?;
+    ensure!(
+        json_spec == yaml_spec,
+        "stale-disk run spec JSON and YAML differ"
+    );
+    validate_run_spec(&json_spec, options)?;
+    ensure!(
+        matches!(
+            &json_spec.execution,
+            Some(crate::fault::spec::FaultRunExecutionSpec::StorageRecovery {
+                case: StorageRecoveryCase::StaleDiskReturn,
+                operation_timeout_seconds,
+            }) if *operation_timeout_seconds > 0
+        ) && json_spec.metadata.run_id == metadata.run_id
+            && json_spec.metadata.name == case_name,
+        "stale-disk run spec execution or identity does not match the attempt"
+    );
+    let workload = read_json::<WorkloadPlan>(required(&artifacts, "workload-plan.json")?)?;
+    ensure!(
+        workload.object_count == options.expected_workload_objects
+            && workload.concurrency == options.expected_workload_concurrency
+            && workload.seed == json_spec.workload.seed,
+        "stale-disk workload plan does not match run-spec"
+    );
+    let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
+    validate_history_scope_and_order(
+        &history,
+        &options.scenario,
+        &metadata.run_id,
+        &json_spec.metadata.bucket,
+    )?;
+    let stale =
+        read_json::<StaleDiskReturnProof>(required(&artifacts, DISK_GENERATION_PROOF_ARTIFACT)?)?;
+    stale.validate_against_history(&history)?;
+    ensure!(
+        stale.identity.run_id == metadata.run_id
+            && stale.identity.case_name == case_name
+            && stale.identity.bucket == json_spec.metadata.bucket,
+        "disk-generation proof does not match the run identity"
+    );
+    let before = read_json::<ShardInventorySnapshot>(required(
+        &artifacts,
+        SHARD_INVENTORY_BEFORE_ARTIFACT,
+    )?)?;
+    let after =
+        read_json::<ShardInventorySnapshot>(required(&artifacts, SHARD_INVENTORY_AFTER_ARTIFACT)?)?;
+    let cleanup =
+        read_json::<DanglingCleanupProof>(required(&artifacts, DANGLING_CLEANUP_PROOF_ARTIFACT)?)?;
+    cleanup.validate_against_stale_return(&stale, &before, &after, &history)?;
+    let host =
+        read_json::<HostStorageMutationProof>(required(&artifacts, HOST_STORAGE_PROOF_ARTIFACT)?)?;
+    host.validate()?;
+    ensure!(
+        host.scenario == options.scenario && host.run_id == metadata.run_id,
+        "host-storage proof does not match the stale-disk run"
+    );
+    let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
+    validate_checker_identity("checker-report.json", &checker, &metadata)?;
+    validate_checker_report(
+        "checker-report.json",
+        &checker,
+        options.expected_workload_versioning,
+        &history,
+    )?;
+    let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
+    ensure!(
+        events
+            .iter()
+            .all(|event| { event.scenario == options.scenario && event.run_id == metadata.run_id })
+            && has_event(&events, "run", RunEventStatus::Succeeded)
+            && has_event(&events, "checker-final", RunEventStatus::Succeeded),
+        "stale-disk events do not prove successful completion and final checking"
+    );
+    Ok(ArtifactValidationReport {
+        scenario: options.scenario.clone(),
+        case_name: case_name.to_string(),
+        seed: workload.seed,
+        client_disruptions: 0,
+        recommitted: 0,
+        committed: checker.committed_puts,
+        required_artifacts: json_spec.artifacts.required,
+    })
+}
+
 fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -> Result<()> {
     ensure!(
         spec.api_version == FAULT_RUN_API_VERSION,
@@ -2367,13 +2611,19 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
     let execution_kind = spec.execution_kind()?;
     let catalog = scenarios::scenario_spec(&options.scenario)?;
     if catalog.status == crate::fault::scenarios::FaultScenarioStatus::Planned {
-        ensure!(
-            matches!(
-                execution_kind,
-                ExecutionKind::Admin | ExecutionKind::StorageRecovery
-            ) && spec.scenario.planned_qualification,
-            "planned run-spec must record an explicit typed qualification opt-in"
-        );
+        match execution_kind {
+            ExecutionKind::Admin => ensure!(
+                spec.scenario.planned_qualification && !spec.scenario.planned_storage_qualification,
+                "planned admin run-spec must record only the explicit admin qualification opt-in"
+            ),
+            ExecutionKind::StorageRecovery => ensure!(
+                spec.scenario.planned_storage_qualification && !spec.scenario.planned_qualification,
+                "planned storage run-spec must record only the explicit storage qualification opt-in"
+            ),
+            ExecutionKind::Injection => {
+                bail!("planned run-spec cannot use the injection execution route")
+            }
+        }
     }
     validate_run_spec_catalog_contract(spec, options)?;
     ensure!(
@@ -2449,16 +2699,13 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
             == requires_filesystem_check,
         "run-spec artifacts.required filesystem-check contract does not match its fault kind"
     );
-    if matches!(
-        execution_kind,
-        ExecutionKind::Admin | ExecutionKind::StorageRecovery
-    ) {
+    if execution_kind != ExecutionKind::Injection {
         ensure!(
             spec.artifacts
                 .required
                 .iter()
                 .all(|name| name != "target-proof.json" && name != "fault-evidence.json"),
-            "admin run-spec must not require fabricated injection evidence"
+            "non-injection run-spec must not require fabricated injection evidence"
         );
         return Ok(());
     }
@@ -2616,7 +2863,7 @@ fn validate_run_spec_catalog_contract(
     {
         ensure!(
             plan.storage_recovery()
-                .is_some_and(|plan| &plan.case == case),
+                .is_some_and(|plan| plan.case == *case),
             "run-spec storage-recovery case does not match the catalog's canonical plan"
         );
     }

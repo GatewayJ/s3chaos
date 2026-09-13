@@ -53,7 +53,7 @@ mod injection;
 mod post_recovery;
 mod recovery;
 mod setup;
-mod targets;
+pub(crate) mod targets;
 mod verification;
 use crate::fault::backends::runtime::collect_fault_artifacts;
 use crate::fault::workload::execution::{
@@ -500,7 +500,7 @@ pub(crate) fn initialize_fault_run(
     })
 }
 
-fn write_preflight_summary(
+pub(crate) fn write_preflight_summary(
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
     config: &FaultTestConfig,
