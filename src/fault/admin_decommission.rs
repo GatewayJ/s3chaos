@@ -1295,7 +1295,7 @@ impl LiveAdminDecommissionDriver {
         })
     }
 
-    async fn start_inner(&self) -> Result<()> {
+    async fn start_inner(&self) -> Result<Instant> {
         let execution_plan = crate::fault::plan::ExecutionPlan::Admin(self.plan.clone());
         let context = initialize_fault_run(
             &self.config,
@@ -1515,6 +1515,7 @@ impl LiveAdminDecommissionDriver {
             .target_pool_expression
             .as_deref()
             .context("admin-decommission proof lacks a target pool expression")?;
+        let started_at = Instant::now();
         let attempted_at_ms = now_ms();
         state.s3 = Some(s3);
         state.s3_port_forward = s3_port_forward;
@@ -1536,7 +1537,7 @@ impl LiveAdminDecommissionDriver {
             .push(start.request);
 
         self.write_transcript()?;
-        Ok(())
+        Ok(started_at)
     }
 
     async fn observe_inner(&self) -> Result<AdminWorkflowObservation> {
@@ -1979,7 +1980,7 @@ impl LiveAdminDecommissionDriver {
         Ok(())
     }
 
-    async fn preserve_evidence(&self, result: Result<()>) -> Result<()> {
+    async fn preserve_evidence<T>(&self, result: Result<T>) -> Result<T> {
         let fixture = self.state.lock().await.fixture.clone();
         combine_primary_and_secondary(
             result,
@@ -2043,7 +2044,7 @@ impl LiveAdminDecommissionDriver {
 
 #[async_trait(?Send)]
 impl AdminCaseDriver for LiveAdminDecommissionDriver {
-    async fn start(&self) -> Result<()> {
+    async fn start(&self) -> Result<Instant> {
         let result = self.start_inner().await;
         self.preserve_evidence(result).await
     }
@@ -2053,7 +2054,7 @@ impl AdminCaseDriver for LiveAdminDecommissionDriver {
         match result {
             Ok(observation) => Ok(observation),
             Err(error) => self
-                .preserve_evidence(Err(error))
+                .preserve_evidence::<AdminWorkflowObservation>(Err(error))
                 .await
                 .and(Ok(AdminWorkflowObservation::Running)),
         }
@@ -2217,14 +2218,14 @@ impl AdminCaseDriver for LiveAdminDecommissionDriver {
     }
 }
 
-fn combine_primary_and_secondary(
-    primary: Result<()>,
+fn combine_primary_and_secondary<T>(
+    primary: Result<T>,
     secondary: Result<()>,
     secondary_label: &str,
-) -> Result<()> {
+) -> Result<T> {
     match (primary, secondary) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(primary), Err(secondary)) => {
             Err(primary.context(format!("{secondary_label} also failed: {secondary:#}")))
         }
