@@ -149,10 +149,33 @@ impl AdminRebalanceOverlapEvidence {
         progress: &[AdminOperationProgressSample],
         workload: &AdminRebalanceWorkloadReceipt,
     ) -> Result<Self> {
-        let (rebalance_started_at_ms, rebalance_completed_at_ms) = rebalance_window(operation)?;
+        ensure!(
+            operation.scenario == ADMIN_REBALANCE_SCENARIO,
+            "operation is not admin-rebalance"
+        );
+        let evidence = Self::from_receipts(
+            &operation.attempt,
+            &operation.operation_id,
+            &operation.requests,
+            progress,
+            workload,
+        )?;
+        evidence.validate(operation, progress, &workload.history)?;
+        Ok(evidence)
+    }
+
+    fn from_receipts(
+        attempt: &AdminAttemptIdentity,
+        operation_id: &str,
+        requests: &[AdminRequestEvidence],
+        progress: &[AdminOperationProgressSample],
+        workload: &AdminRebalanceWorkloadReceipt,
+    ) -> Result<Self> {
+        validate_overlap_progress_receipts(requests, progress)?;
+        let (rebalance_started_at_ms, rebalance_completed_at_ms) = rebalance_window(requests)?;
         let workload_records = workload_records(workload)?;
         let overlapping_status_request_ids = overlapping_status_request_ids(
-            operation,
+            requests,
             progress,
             workload.started_at_ms,
             workload.ended_at_ms,
@@ -166,8 +189,8 @@ impl AdminRebalanceOverlapEvidence {
             .map(|record| record.id.clone())
             .collect();
         let evidence = Self {
-            attempt: operation.attempt.clone(),
-            operation_id: operation.operation_id.clone(),
+            attempt: attempt.clone(),
+            operation_id: operation_id.to_string(),
             rebalance_started_at_ms,
             rebalance_completed_at_ms,
             workload_started_at_ms: workload.started_at_ms,
@@ -181,7 +204,7 @@ impl AdminRebalanceOverlapEvidence {
             overlapping_operation_ids,
             overlapping_status_request_ids,
         };
-        evidence.validate(operation, progress, &workload.history)?;
+        evidence.validate_receipts(requests, progress, &workload.history)?;
         Ok(evidence)
     }
 
@@ -197,15 +220,44 @@ impl AdminRebalanceOverlapEvidence {
                 && self.operation_id == operation.operation_id,
             "rebalance overlap identity does not match the admin operation"
         );
+        self.validate_receipts(&operation.requests, progress, history)
+    }
+
+    fn validate_receipts(
+        &self,
+        requests: &[AdminRequestEvidence],
+        progress: &[AdminOperationProgressSample],
+        history: &[OperationRecord],
+    ) -> Result<()> {
+        ensure!(
+            !self.operation_id.trim().is_empty()
+                && !progress.is_empty()
+                && progress.iter().all(|sample| {
+                    sample.attempt == self.attempt && sample.operation_id == self.operation_id
+                })
+                && progress[..progress.len().saturating_sub(1)]
+                    .iter()
+                    .all(|sample| {
+                        !sample.completed && !sample.failed && !sample.canceled_or_stopped
+                    })
+                && progress.last().is_some_and(|sample| {
+                    sample.completed && !sample.failed && !sample.canceled_or_stopped
+                })
+                && progress
+                    .windows(2)
+                    .all(|pair| pair[0].observed_at_ms <= pair[1].observed_at_ms),
+            "rebalance overlap progress is not bound to one successful terminal operation"
+        );
+        validate_overlap_progress_receipts(requests, progress)?;
         ensure!(
             !history.is_empty()
                 && history.iter().all(|record| {
                     record.scenario == ADMIN_REBALANCE_SCENARIO
-                        && record.run_id.as_deref() == Some(operation.attempt.run_id.as_str())
+                        && record.run_id.as_deref() == Some(self.attempt.run_id.as_str())
                 }),
             "rebalance overlap history does not belong to the current scenario attempt"
         );
-        let (rebalance_started_at_ms, rebalance_completed_at_ms) = rebalance_window(operation)?;
+        let (rebalance_started_at_ms, rebalance_completed_at_ms) = rebalance_window(requests)?;
         ensure!(
             self.rebalance_started_at_ms == rebalance_started_at_ms
                 && self.rebalance_completed_at_ms == rebalance_completed_at_ms
@@ -246,7 +298,7 @@ impl AdminRebalanceOverlapEvidence {
             "no complete S3 operation interval overlaps the observed rebalance window"
         );
         let status_request_ids = overlapping_status_request_ids(
-            operation,
+            requests,
             progress,
             self.workload_started_at_ms,
             self.workload_ended_at_ms,
@@ -809,20 +861,14 @@ fn validate_workload_families(
     Ok(())
 }
 
-fn rebalance_window(operation: &AdminOperationEvidence) -> Result<(u64, u64)> {
-    ensure!(
-        operation.scenario == ADMIN_REBALANCE_SCENARIO,
-        "operation is not admin-rebalance"
-    );
-    let start = operation
-        .requests
+fn rebalance_window(requests: &[AdminRequestEvidence]) -> Result<(u64, u64)> {
+    let start = requests
         .iter()
         .find(|request| {
             request.method == "POST" && request.path == "/rustfs/admin/v3/rebalance/start"
         })
         .context("admin-rebalance operation lacks its start receipt")?;
-    let terminal = operation
-        .requests
+    let terminal = requests
         .iter()
         .rev()
         .find(|request| {
@@ -837,17 +883,16 @@ fn rebalance_window(operation: &AdminOperationEvidence) -> Result<(u64, u64)> {
 }
 
 fn overlapping_status_request_ids(
-    operation: &AdminOperationEvidence,
+    requests: &[AdminRequestEvidence],
     progress: &[AdminOperationProgressSample],
     workload_started_at_ms: u64,
     workload_ended_at_ms: u64,
 ) -> Result<Vec<String>> {
-    let progress_ids = progress
+    let progress_receipts = progress
         .iter()
-        .map(|sample| sample.status_request_id.as_str())
+        .map(|sample| (sample.status_request_id.as_str(), sample.observed_at_ms))
         .collect::<BTreeSet<_>>();
-    let request_ids = operation
-        .requests
+    let request_ids = requests
         .iter()
         .filter(|request| {
             request.method == "GET"
@@ -859,11 +904,38 @@ fn overlapping_status_request_ids(
             request
                 .request_id
                 .clone()
-                .filter(|request_id| progress_ids.contains(request_id.as_str()))
+                .filter(|request_id| {
+                    progress_receipts.contains(&(request_id.as_str(), request.observed_at_ms))
+                })
                 .context("overlapping rebalance status request lacks its progress sample")
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(request_ids)
+}
+
+fn validate_overlap_progress_receipts(
+    requests: &[AdminRequestEvidence],
+    progress: &[AdminOperationProgressSample],
+) -> Result<()> {
+    let status_requests = requests
+        .iter()
+        .filter(|request| {
+            request.method == "GET" && request.path == "/rustfs/admin/v3/rebalance/status"
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        status_requests.len() == progress.len()
+            && status_requests
+                .iter()
+                .zip(progress)
+                .all(|(request, sample)| {
+                    (200..300).contains(&request.status)
+                        && request.request_id.as_deref() == Some(sample.status_request_id.as_str())
+                        && request.observed_at_ms == sample.observed_at_ms
+                }),
+        "rebalance overlap progress is not exactly bound to the ordered status receipts"
+    );
+    Ok(())
 }
 
 fn lock_transcript(
@@ -1625,6 +1697,48 @@ impl LiveAdminRebalanceDriver {
             .and_then(|_| self.write_transcript());
         combine_primary_and_secondary(result, persisted, "persist rebalance transcript")
     }
+
+    async fn verify_completed_overlap_inner(&self) -> Result<()> {
+        let (proof, operation_id, workload) = {
+            let state = self.state.lock().await;
+            ensure!(
+                state.terminal.is_some(),
+                "fast-completed rebalance lacks its terminal status receipt"
+            );
+            let operation_id = state
+                .start_ownership
+                .operation_id()
+                .context("fast-completed rebalance is not owned by this attempt")?;
+            (
+                state
+                    .proof
+                    .clone()
+                    .context("rebalance topology proof is not ready")?,
+                operation_id.to_string(),
+                state
+                    .workload_receipt
+                    .clone()
+                    .context("fast-completed rebalance lacks its completed workload receipt")?,
+            )
+        };
+        proof.require_satisfied()?;
+        let transcript = transcript_state(&self.transcript);
+        ensure!(
+            transcript.operation_id.as_deref() == Some(operation_id.as_str())
+                && transcript.requests.iter().all(|request| {
+                    request.target == proof.runtime.target && (200..300).contains(&request.status)
+                }),
+            "fast-completed rebalance transcript is not bound to the proven runtime target"
+        );
+        AdminRebalanceOverlapEvidence::from_receipts(
+            &proof.attempt,
+            &operation_id,
+            &transcript.requests,
+            &transcript.progress,
+            &workload,
+        )?;
+        Ok(())
+    }
 }
 
 #[async_trait(?Send)]
@@ -1647,6 +1761,11 @@ impl AdminCaseDriver for LiveAdminRebalanceDriver {
 
     async fn run_workload(&self) -> Result<()> {
         let result = self.run_workload_inner().await;
+        self.preserve_evidence(result).await
+    }
+
+    async fn verify_completed_overlap(&self) -> Result<()> {
+        let result = self.verify_completed_overlap_inner().await;
         self.preserve_evidence(result).await
     }
 
@@ -1811,6 +1930,7 @@ fn combine_primary_and_secondary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn cleanup_persists_raw_evidence_before_reset_and_preserves_primary_error() {
@@ -1950,6 +2070,141 @@ mod tests {
                 15,
             ),
         ]
+    }
+
+    fn admin_request(
+        method: &str,
+        path: &str,
+        request_id: &str,
+        started_at_ms: u64,
+        observed_at_ms: u64,
+    ) -> AdminRequestEvidence {
+        serde_json::from_value(json!({
+            "target": {
+                "endpoint": {
+                    "kubernetesContext": "kind-admin-test",
+                    "clusterUid": "cluster-uid",
+                    "portForwardCommand": "kubectl port-forward",
+                    "portForwardStartedAtMs": 1,
+                    "clusterStartedAtMs": 2,
+                    "clusterObservedAtMs": 3,
+                    "clusterResponseSha256": "cluster-sha",
+                    "clusterResponseBody": "{}",
+                    "namespace": "fault-ns",
+                    "serviceName": "fault-tenant-io",
+                    "serviceUid": "service-uid",
+                    "serviceResourceVersion": "service-rv",
+                    "serviceStartedAtMs": 4,
+                    "serviceObservedAtMs": 5,
+                    "serviceResponseSha256": "service-sha",
+                    "serviceResponseBody": "{}",
+                    "tenantName": "fault-tenant",
+                    "tenantUid": "tenant-uid",
+                    "tenantResourceVersion": "tenant-rv",
+                    "tenantStartedAtMs": 6,
+                    "tenantObservedAtMs": 7,
+                    "tenantResponseSha256": "tenant-sha",
+                    "tenantResponseBody": "{}",
+                    "localEndpoint": "http://127.0.0.1:19000",
+                    "remotePort": 9000
+                },
+                "deploymentId": "deployment-1"
+            },
+            "method": method,
+            "path": path,
+            "query": {},
+            "status": 200,
+            "startedAtMs": started_at_ms,
+            "observedAtMs": observed_at_ms,
+            "requestId": request_id
+        }))
+        .expect("admin request")
+    }
+
+    #[test]
+    fn fast_completion_requires_concrete_s3_and_status_receipt_overlap() {
+        let attempt = AdminAttemptIdentity {
+            run_id: "run-rebalance".to_string(),
+            case_name: ADMIN_REBALANCE_SCENARIO.to_string(),
+            tenant_uid: "tenant-uid".to_string(),
+        };
+        let requests = vec![
+            admin_request(
+                "POST",
+                "/rustfs/admin/v3/rebalance/start",
+                "start",
+                100,
+                106,
+            ),
+            admin_request(
+                "GET",
+                "/rustfs/admin/v3/rebalance/status",
+                "terminal-status",
+                107,
+                109,
+            ),
+        ];
+        let progress = vec![AdminOperationProgressSample {
+            attempt: attempt.clone(),
+            operation_id: "rebalance-1".to_string(),
+            status_request_id: "terminal-status".to_string(),
+            observed_at_ms: 109,
+            state: "completed".to_string(),
+            completed: true,
+            failed: false,
+            canceled_or_stopped: false,
+            objects_moved: Some(1),
+            versions_moved: Some(1),
+            bytes_moved: Some(4),
+        }];
+        let workload = AdminRebalanceWorkloadReceipt {
+            started_at_ms: 107,
+            ended_at_ms: 117,
+            first_event_sequence: 7,
+            last_event_sequence: 16,
+            history: versioned_history(),
+        };
+
+        let evidence = AdminRebalanceOverlapEvidence::from_receipts(
+            &attempt,
+            "rebalance-1",
+            &requests,
+            &progress,
+            &workload,
+        )
+        .expect("real fast-completion overlap");
+        assert_eq!(evidence.overlapping_operation_ids, ["put", "overwrite"]);
+        assert_eq!(evidence.overlapping_status_request_ids, ["terminal-status"]);
+
+        let mut mismatched_progress = progress.clone();
+        mismatched_progress[0].observed_at_ms = 110;
+        let error = AdminRebalanceOverlapEvidence::from_receipts(
+            &attempt,
+            "rebalance-1",
+            &requests,
+            &mismatched_progress,
+            &workload,
+        )
+        .expect_err("progress must be bound to its exact status receipt");
+        assert!(error.to_string().contains("ordered status receipts"));
+
+        let mut status_after_workload = requests;
+        status_after_workload[1].started_at_ms = 118;
+        status_after_workload[1].observed_at_ms = 119;
+        let mut progress_after_workload = progress;
+        progress_after_workload[0].observed_at_ms = 119;
+        let error = AdminRebalanceOverlapEvidence::from_receipts(
+            &attempt,
+            "rebalance-1",
+            &status_after_workload,
+            &progress_after_workload,
+            &workload,
+        )
+        .expect_err("status outside workload must not prove overlap");
+        assert!(
+            error.to_string().contains("status request receipt"),
+            "{error:#}"
+        );
     }
 
     #[test]

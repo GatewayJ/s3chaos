@@ -621,7 +621,7 @@ mod tests {
     async fn workflow_accepts_receipt_proof_for_fast_completed_operation() {
         struct ReceiptOverlapDriver(FakeDriver);
 
-        #[async_trait]
+        #[async_trait(?Send)]
         impl AdminCaseDriver for ReceiptOverlapDriver {
             async fn start(&self) -> Result<()> {
                 self.0.start().await
