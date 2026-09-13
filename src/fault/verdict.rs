@@ -179,10 +179,14 @@ pub enum FailureClassification {
     EnvironmentOrWorkload,
     WorkloadOrProduct,
     NoSignal,
+    /// A RustFS container did not leave cleanly on SIGTERM within its grace
+    /// period (SIGKILLed at expiry, died to the signal's default action, or
+    /// exited non-zero) during a Kubernetes lifecycle scenario.
+    GracefulShutdownFailed,
 }
 
 impl FailureClassification {
-    pub(crate) const ALL: [Self; 36] = [
+    pub(crate) const ALL: [Self; 37] = [
         Self::RecoveryTailReadLatency,
         Self::CommittedObjectUnavailable,
         Self::CommittedVersionMissing,
@@ -219,6 +223,7 @@ impl FailureClassification {
         Self::EnvironmentOrWorkload,
         Self::WorkloadOrProduct,
         Self::NoSignal,
+        Self::GracefulShutdownFailed,
     ];
 
     pub(crate) fn from_name(name: &str) -> Option<Self> {
@@ -265,6 +270,7 @@ impl FailureClassification {
             Self::EnvironmentOrWorkload => "environment_or_workload",
             Self::WorkloadOrProduct => "workload_or_product",
             Self::NoSignal => "no_signal",
+            Self::GracefulShutdownFailed => "graceful_shutdown_failed",
         }
     }
 
@@ -308,7 +314,8 @@ impl FailureClassification {
             | Self::AmbiguousWriteMaterialized
             | Self::RecoveryHealthDegraded
             | Self::PostRecoveryWriteFailed
-            | Self::AvailabilityRegression => ResponsibilityDomain::Product,
+            | Self::AvailabilityRegression
+            | Self::GracefulShutdownFailed => ResponsibilityDomain::Product,
             Self::HarnessError
             | Self::TestHarness
             | Self::WorkloadExecutionError
@@ -337,7 +344,8 @@ impl FailureClassification {
             | Self::ListUnavailableOrUnknown
             | Self::RecoveryHealthDegraded
             | Self::PostRecoveryWriteFailed
-            | Self::AvailabilityRegression => FailureSeverity::FailAvailability,
+            | Self::AvailabilityRegression
+            | Self::GracefulShutdownFailed => FailureSeverity::FailAvailability,
             Self::CommittedVersionMissing
             | Self::VersionHashMismatch
             | Self::DeleteMarkerMissing
@@ -699,6 +707,7 @@ impl FailurePhase {
             | "s3-access-after-recovery"
             | "recovery-health"
             | "recovery-evidence"
+            | "fault-recovery-recheck"
             | "post-recovery-write"
             | "recommit-unconfirmed" => Self::Recovery,
             "availability-endpoint" | "availability-read-probe" | "availability" => Self::Workload,
@@ -811,7 +820,8 @@ impl FailureClassificationDetails {
             },
             FailureClassification::RecoveryHealthDegraded
             | FailureClassification::PostRecoveryWriteFailed
-            | FailureClassification::AvailabilityRegression => Self {
+            | FailureClassification::AvailabilityRegression
+            | FailureClassification::GracefulShutdownFailed => Self {
                 data_correctness: DataCorrectnessStatus::Unknown,
                 availability: AvailabilityStatus::ServiceDegraded,
                 data_loss: None,

@@ -24,7 +24,7 @@ use crate::fault::{
     plan::{FaultPlan, FaultTarget},
     quorum::{ErasureSetHealth, ErasureSetMembership, ErasureSetShape, QuorumVolumeTargetProof},
     reporting::ResponsibilityDomain,
-    scenarios::{FaultScenario, FaultScenarioSpec},
+    scenarios::{FaultBackend, FaultScenario, FaultScenarioSpec},
 };
 
 const PREFLIGHT_SUMMARY_SCHEMA_VERSION: u8 = 1;
@@ -128,6 +128,42 @@ pub struct TargetProofFault {
     pub host_target: Option<TargetHostProof>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub erasure_set: Option<TargetErasureSetProof>,
+    /// Live StatefulSet ownership proof for Kubernetes lifecycle faults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statefulset: Option<TargetStatefulSetProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetStatefulSetProof {
+    pub name: String,
+    pub uid: String,
+    pub namespace: String,
+    pub replicas: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_management_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc_retention_when_scaled: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc_retention_when_deleted: Option<String>,
+    pub termination_grace_period_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_revision: Option<String>,
+    pub owned_pods: Vec<TargetStatefulSetPodProof>,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetStatefulSetPodProof {
+    pub name: String,
+    pub uid: String,
+    pub ordinal: u32,
+    pub restart_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +404,7 @@ impl TargetProof {
                 volume_path: volume_path(fault.target()),
                 host_target: host_target_proof(config, fault.target()),
                 erasure_set: erasure_set_proof(spec),
+                statefulset: None,
             })
             .collect::<Vec<_>>();
         let mut requirements = target_requirements(config, spec, plan);
@@ -376,6 +413,17 @@ impl TargetProof {
                 name: ERASURE_SET_PROOF_REQUIREMENT.to_string(),
                 status: PreflightStatus::Failed,
                 message: "same-erasure-set runtime observation is pending".to_string(),
+            });
+        }
+        if plan
+            .faults()
+            .iter()
+            .any(|fault| fault.backend() == FaultBackend::KubernetesLifecycle)
+        {
+            requirements.push(TargetProofRequirement {
+                name: STATEFULSET_OWNERSHIP_REQUIREMENT.to_string(),
+                status: PreflightStatus::Failed,
+                message: STATEFULSET_OWNERSHIP_PENDING_NOTE.to_string(),
             });
         }
         let status = if requirements
@@ -518,6 +566,69 @@ impl TargetProof {
             if requirement.name == ERASURE_SET_PROOF_REQUIREMENT {
                 requirement.status = PreflightStatus::Passed;
                 requirement.message = ERASURE_SET_PROOF_RESOLVED_NOTE.to_string();
+            }
+        }
+        self.generated_at_ms = now_ms();
+        self.status = if self
+            .requirements
+            .iter()
+            .any(|requirement| requirement.status == PreflightStatus::Failed)
+        {
+            TargetProofStatus::Missing
+        } else {
+            TargetProofStatus::Satisfied
+        };
+        Ok(self)
+    }
+
+    /// Records the live StatefulSet ownership observation for Kubernetes
+    /// lifecycle faults. The observation itself runs in the runner after the
+    /// fixture is Ready; this binds it to every lifecycle fault and clears the
+    /// fail-closed requirement.
+    pub fn with_statefulset_proven(mut self, proof: TargetStatefulSetProof) -> Result<Self> {
+        anyhow::ensure!(
+            !proof.uid.trim().is_empty() && !proof.name.trim().is_empty(),
+            "StatefulSet proof lacks identity"
+        );
+        anyhow::ensure!(
+            proof.replicas > 0
+                && usize::try_from(proof.replicas).ok() == Some(proof.owned_pods.len()),
+            "StatefulSet proof replicas {} do not match {} owned Pods",
+            proof.replicas,
+            proof.owned_pods.len()
+        );
+        let resolved = self
+            .resolved_pods
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let owned = proof
+            .owned_pods
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str()))
+            .collect::<std::collections::BTreeSet<_>>();
+        anyhow::ensure!(
+            resolved == owned,
+            "StatefulSet-owned Pods {owned:?} do not match the resolved target Pods {resolved:?}"
+        );
+        let mut bound = false;
+        for fault in &mut self.faults {
+            if fault.backend == FaultBackend::KubernetesLifecycle.as_str() {
+                fault.statefulset = Some(proof.clone());
+                bound = true;
+            }
+        }
+        anyhow::ensure!(
+            bound,
+            "target proof has no Kubernetes lifecycle fault to bind the StatefulSet proof to"
+        );
+        for requirement in &mut self.requirements {
+            if requirement.name == STATEFULSET_OWNERSHIP_REQUIREMENT {
+                requirement.status = PreflightStatus::Passed;
+                requirement.message = format!(
+                    "StatefulSet {} ({}) owns all {} resolved RustFS Pods",
+                    proof.name, proof.uid, proof.replicas
+                );
             }
         }
         self.generated_at_ms = now_ms();
@@ -976,6 +1087,7 @@ fn target_kind(target: &FaultTarget) -> &'static str {
         FaultTarget::RustfsServerPeerNetwork => "rustfs-server-peer-network",
         FaultTarget::RustfsServerResource => "rustfs-server-resource",
         FaultTarget::DedicatedBlockDevice => "dedicated-block-device",
+        FaultTarget::RustfsServerStatefulSet => "rustfs-server-statefulset",
     }
 }
 
@@ -987,7 +1099,8 @@ fn pod_selector_proof(
         FaultTarget::RustfsVolume { .. }
         | FaultTarget::RustfsServerPod
         | FaultTarget::RustfsServerPeerNetwork
-        | FaultTarget::RustfsServerResource => Some(TargetPodSelectorProof {
+        | FaultTarget::RustfsServerResource
+        | FaultTarget::RustfsServerStatefulSet => Some(TargetPodSelectorProof {
             namespace: config.cluster.test_namespace.clone(),
             tenant: config.cluster.tenant_name.clone(),
             selector: format!("rustfs.tenant={}", config.cluster.tenant_name),
@@ -1004,7 +1117,8 @@ fn volume_path(target: &FaultTarget) -> Option<String> {
         FaultTarget::RustfsServerPod
         | FaultTarget::RustfsServerPeerNetwork
         | FaultTarget::RustfsServerResource
-        | FaultTarget::DedicatedBlockDevice => None,
+        | FaultTarget::DedicatedBlockDevice
+        | FaultTarget::RustfsServerStatefulSet => None,
     }
 }
 
@@ -1042,6 +1156,9 @@ const ERASURE_SET_PROOF_PENDING_NOTE: &str =
 const ERASURE_SET_PROOF_RESOLVED_NOTE: &str =
     "same-erasure-set topology proven from RustFS admin runtime geometry before fault apply";
 pub const ERASURE_SET_PROOF_REQUIREMENT: &str = "same_erasure_set_target_proof";
+pub const STATEFULSET_OWNERSHIP_REQUIREMENT: &str = "statefulset_ownership_proven";
+const STATEFULSET_OWNERSHIP_PENDING_NOTE: &str =
+    "live StatefulSet ownership observation is pending for this lifecycle scenario";
 
 fn now_ms() -> u64 {
     SystemTime::now()

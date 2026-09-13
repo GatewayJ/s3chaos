@@ -636,6 +636,11 @@ impl FaultSuitePlanTarget {
                 summary: target.summary(),
                 path: None,
             },
+            FaultTarget::RustfsServerStatefulSet => Self {
+                kind: "rustfs-server-statefulset".to_string(),
+                summary: target.summary(),
+                path: None,
+            },
         }
     }
 }

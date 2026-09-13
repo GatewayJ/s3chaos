@@ -1,0 +1,33 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-fault-restart
+budgets:
+  maxDuration: 3h
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  # cluster-cold-restart expects every mixed-workload operation to fail while
+  # the StatefulSet is held at zero replicas; size the disruption budget for a
+  # whole workload rather than for stray reconnects.
+  maxClientDisruptions: 6000
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: optional
+artifacts:
+  required: strict
+workloadProfiles:
+  restart:
+    objects: 1200
+    concurrency: 30
+scenarios:
+  - name: pod-graceful-restart-one
+    faultDuration: 15m
+    workloadProfile: restart
+  - name: rolling-restart-all
+    faultDuration: 15m
+    workloadProfile: restart
+  # Requires RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT so the harness can pause
+  # the RustFS operator while the StatefulSet is scaled to zero.
+  - name: cluster-cold-restart
+    faultDuration: 15m
+    workloadProfile: restart

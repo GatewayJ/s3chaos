@@ -195,6 +195,10 @@ async fn run_fault_case(
             let recovered = run
                 .recover_access(&mut prepared, &target, &mut staged_multipart_uploads)
                 .await?;
+            // A fault whose evidence can still change after removal (a
+            // lifecycle replacement that crashes after Ready) is re-read once
+            // the recovery gate has passed.
+            run.recheck_fault_after_recovery(&mut active.fault)?;
             // The lifecycle evidence is complete once recovery finished, so it
             // is persisted before the write gate: a product failure found by
             // the probe must still leave fault-evidence.json behind for the

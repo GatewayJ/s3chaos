@@ -843,6 +843,14 @@ fn build_fault_spec(
                 injection.kind().as_str()
             )
         }
+        FaultKind::RustfsServerPodGracefulRestart
+        | FaultKind::RustfsServerRollingRestart
+        | FaultKind::RustfsServerColdRestart => {
+            bail!(
+                "fault kind {} must be applied by the Kubernetes lifecycle backend",
+                injection.kind().as_str()
+            )
+        }
     }
 }
 
