@@ -293,6 +293,7 @@ pub struct ResolvedFaultSuiteBudgets {
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedFaultSuiteScenario {
     pub name: String,
+    pub execution_type: String,
     pub params: FaultInjectionParameters,
     pub repetitions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -563,6 +564,16 @@ impl ResolvedFaultSuiteScenario {
 
         Ok(Self {
             name: scenario.name.clone(),
+            execution_type: if matches!(
+                scenario.name.as_str(),
+                crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO
+                    | crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO
+            ) {
+                "admin"
+            } else {
+                "injection"
+            }
+            .to_string(),
             params,
             repetitions: scenario.repetitions,
             fault_duration_seconds,

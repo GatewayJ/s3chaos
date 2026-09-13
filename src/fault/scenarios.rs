@@ -1425,9 +1425,32 @@ pub struct FaultScenario {
 
 impl FaultScenario {
     pub fn from_config(config: &FaultTestConfig) -> Result<Self> {
+        Self::from_config_with_planned_admin(config, false)
+    }
+
+    pub(crate) fn from_config_for_execution(config: &FaultTestConfig) -> Result<Self> {
+        Self::from_config_with_planned_admin(config, config.qualify_planned_admin)
+    }
+
+    fn from_config_with_planned_admin(
+        config: &FaultTestConfig,
+        allow_planned_admin: bool,
+    ) -> Result<Self> {
         let spec = scenario_spec(&config.scenario)?;
+        let qualification_allowed = allow_planned_admin
+            && matches!(
+                spec.scenario,
+                ADMIN_DECOMMISSION_SCENARIO | ADMIN_REBALANCE_SCENARIO
+            )
+            && spec.backend == FaultBackend::PlannedReliabilityWorkflow;
+        if allow_planned_admin {
+            ensure!(
+                qualification_allowed,
+                "planned admin qualification is restricted to the exact admin-decommission and admin-rebalance scenarios"
+            );
+        }
         ensure!(
-            spec.status.is_executable(),
+            spec.status.is_executable() || qualification_allowed,
             "fault scenario {:?} is cataloged as {:?} but is not executable yet; case {}, backend {:?}, validation: {}",
             config.scenario,
             spec.status,
@@ -1604,7 +1627,8 @@ pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLUSTER_COLD_RESTART_SCENARIO, DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+        ADMIN_REBALANCE_SCENARIO, CLUSTER_COLD_RESTART_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO,
@@ -1726,6 +1750,19 @@ mod tests {
                 .status,
             FaultScenarioStatus::Planned
         );
+    }
+
+    #[test]
+    fn planned_admin_qualification_requires_the_dedicated_entrypoint_and_flag() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = ADMIN_REBALANCE_SCENARIO.to_string();
+        config.qualify_planned_admin = true;
+
+        assert!(FaultScenario::from_config(&config).is_err());
+        assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+
+        config.scenario = STALE_DISK_RETURN_DETECT_SCENARIO.to_string();
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
     }
 
     #[test]

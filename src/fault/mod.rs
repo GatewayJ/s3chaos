@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod acknowledged_mutation;
+pub mod admin_runner;
 pub mod admin_topology;
 pub mod artifact_validation;
 pub mod backends;

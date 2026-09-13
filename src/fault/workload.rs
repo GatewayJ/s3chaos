@@ -454,6 +454,12 @@ impl WorkloadPlan {
         self.sizes[index]
     }
 
+    pub(crate) fn multipart_part_count_at(&self, index: usize) -> usize {
+        self.size_at(index)
+            .max(1)
+            .div_ceil(MULTIPART_PART_SIZE_BYTES as usize)
+    }
+
     pub fn existing_object_offset(&self, offset: usize, existing_count: usize) -> usize {
         let Some(hotspot) = self.hotspot else {
             return offset % existing_count;

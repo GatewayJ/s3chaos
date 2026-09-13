@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::fault::{
     config::{FaultTestConfig, FaultWorkloadProfile, default_percent_for_scenario},
     plan::{
-        FaultInjection, FaultInjectionParameters, FaultPlan, FaultPlanOptions, FaultSelection,
+        ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultPlanOptions, FaultSelection,
         FaultTarget, FaultWorkloadMode,
     },
     reporting::FailureSeverity,
@@ -30,7 +30,7 @@ use crate::fault::{
         FaultDetectorContract, FaultScenario, FaultScenarioSpec, acknowledged_mutation_kind,
         apply_catalog_defaults, scenario_spec,
     },
-    spec::{FaultRunAckTriggerSpec, FaultRunArtifactSpec},
+    spec::{FaultRunAckTriggerSpec, FaultRunArtifactSpec, FaultRunExecutionSpec},
     suite::{
         FaultExpectedFailure, ResolvedFaultSuite, ResolvedFaultSuiteScenario,
         ResolvedFaultSuiteWorkloadOverride, resolve_fault_suite_yaml,
@@ -110,6 +110,9 @@ pub struct FaultSuitePlanAttempt {
     pub expected_failure: Option<FaultExpectedFailure>,
     pub fault_duration_seconds: u64,
     pub workload: FaultSuitePlanWorkload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<FaultRunExecutionSpec>,
+    #[serde(default)]
     pub faults: Vec<FaultSuitePlanFault>,
     pub requires_chaos_mesh: bool,
     pub requires_static_storage: bool,
@@ -228,7 +231,7 @@ struct FaultSuitePlanAttemptInput<'a> {
     repetition: usize,
     config: &'a FaultTestConfig,
     spec: &'a FaultScenarioSpec,
-    fault_plan: &'a FaultPlan,
+    execution_plan: &'a ExecutionPlan,
     attempt_dir: &'a Path,
     budget: FaultSuitePlanBudgetImpact,
 }
@@ -293,11 +296,16 @@ pub(crate) fn build_fault_suite_plan_expansion(
                     )
                 })?;
             }
-            let fault_plan = FaultPlan::from_scenario_with_options(
+            let execution_plan = ExecutionPlan::from_scenario_with_options(
                 &fault_scenario,
                 spec,
                 FaultPlanOptions::from_config(&config),
             )?;
+            ensure!(
+                execution_plan.kind().as_str() == scenario.execution_type,
+                "resolved suite scenario {} execution type does not match its canonical plan",
+                scenario.name
+            );
             let required = attempt_minimum_required_seconds(&config)?;
             let remaining_before = remaining;
             let remaining_after = match remaining {
@@ -337,7 +345,7 @@ pub(crate) fn build_fault_suite_plan_expansion(
                 repetition,
                 config: &config,
                 spec,
-                fault_plan: &fault_plan,
+                execution_plan: &execution_plan,
                 attempt_dir: &attempt_dir,
                 budget,
             })?;
@@ -394,6 +402,40 @@ impl FaultSuitePlan {
         );
         let mut run_ids = BTreeSet::new();
         for attempt in &self.attempts {
+            match &attempt.execution {
+                Some(FaultRunExecutionSpec::Injection) | None => ensure!(
+                    !attempt.faults.is_empty(),
+                    "fault suite plan attempt {} ({}) declares injection execution without faults",
+                    attempt.index,
+                    attempt.scenario
+                ),
+                Some(FaultRunExecutionSpec::Admin {
+                    topology,
+                    operation_timeout_seconds,
+                }) => {
+                    ensure!(
+                        attempt.faults.is_empty(),
+                        "fault suite plan attempt {} ({}) mixes admin execution with fault injections",
+                        attempt.index,
+                        attempt.scenario
+                    );
+                    ensure!(
+                        *topology
+                            == crate::fault::admin_topology::AdminTopologyPlan::for_scenario(
+                                &attempt.scenario
+                            )?,
+                        "fault suite plan attempt {} ({}) has the wrong admin topology plan",
+                        attempt.index,
+                        attempt.scenario
+                    );
+                    ensure!(
+                        *operation_timeout_seconds > 0,
+                        "fault suite plan attempt {} ({}) has a zero admin timeout",
+                        attempt.index,
+                        attempt.scenario
+                    );
+                }
+            }
             let run_id = attempt.run_id.as_deref().with_context(|| {
                 format!(
                     "current fault suite plan attempt {} ({}) is missing runId",
@@ -479,14 +521,22 @@ impl FaultSuitePlanAttempt {
             .context("suite attempt workload seed must be resolved during planning")?;
         let case_dir = input.attempt_dir.join(input.spec.case_name);
         let faults = input
-            .fault_plan
-            .faults()
-            .iter()
-            .enumerate()
-            .map(|(fault_index, fault)| {
-                FaultSuitePlanFault::from_fault(fault_index, input.scenario, input.spec, fault)
-            })
-            .collect();
+            .execution_plan
+            .injection()
+            .map_or_else(Vec::new, |plan| {
+                plan.faults()
+                    .iter()
+                    .enumerate()
+                    .map(|(fault_index, fault)| {
+                        FaultSuitePlanFault::from_fault(
+                            fault_index,
+                            input.scenario,
+                            input.spec,
+                            fault,
+                        )
+                    })
+                    .collect()
+            });
 
         let workload_plan = WorkloadPlan::seeded_with_profile(
             seed,
@@ -526,7 +576,7 @@ impl FaultSuitePlanAttempt {
             expected_failure: input.scenario.expected_failure.clone(),
             fault_duration_seconds: input.config.duration.as_secs(),
             workload: FaultSuitePlanWorkload {
-                mode: workload_mode_name(input.fault_plan.workload_mode).to_string(),
+                mode: workload_mode_name(input.execution_plan.workload_mode()).to_string(),
                 objects: input.config.workload.object_count,
                 concurrency: input.config.workload.concurrency,
                 versioning: input.config.workload_versioning,
@@ -543,6 +593,13 @@ impl FaultSuitePlanAttempt {
                 request_timeout_seconds: input.config.request_timeout.as_secs(),
                 seed,
             },
+            execution: Some(match input.execution_plan {
+                ExecutionPlan::Injection(_) => FaultRunExecutionSpec::Injection,
+                ExecutionPlan::Admin(plan) => FaultRunExecutionSpec::Admin {
+                    topology: plan.topology.clone(),
+                    operation_timeout_seconds: plan.operation_timeout.as_secs(),
+                },
+            }),
             faults,
             requires_chaos_mesh: input.spec.requires_chaos_mesh(),
             requires_static_storage: input.spec.requires_static_storage(),
@@ -676,6 +733,10 @@ fn scenario_config(
     attempt_dir: &Path,
 ) -> Result<FaultTestConfig> {
     let mut config = base.clone();
+    // Planned-admin qualification is a single-run opt-in. A suite expands
+    // ordinary catalog scenarios from the same process environment and must
+    // never inherit that authorization into its attempts.
+    config.qualify_planned_admin = false;
     config.scenario = scenario.name.clone();
     config.scenario_parameters = scenario.params.clone();
     if let Some(fault_duration_seconds) = scenario.fault_duration_seconds {
@@ -898,8 +959,23 @@ mod tests {
         let target_proof = json!([
             "run artifacts must include the selected Kubernetes object or host device identity before the fault is activated"
         ]);
+        assert!(
+            plan["attempts"]
+                .as_array()
+                .expect("attempts")
+                .iter()
+                .all(|attempt| attempt["execution"] == json!({"type": "injection"})),
+            "new suite-plan writers must persist the explicit injection route"
+        );
+        let mut legacy_shape = plan.clone();
+        for attempt in legacy_shape["attempts"].as_array_mut().expect("attempts") {
+            attempt
+                .as_object_mut()
+                .expect("attempt object")
+                .remove("execution");
+        }
         assert_eq!(
-            plan,
+            legacy_shape,
             json!({
                 "apiVersion": "rustfs.com/s3chaos/v1alpha1",
                 "kind": "FaultSuitePlan",
@@ -1409,6 +1485,31 @@ scenarios:
         assert_eq!(config.prefill_concurrency, 8);
         assert_eq!(config.rustfs_pod_stable_window, Duration::from_secs(30));
         assert_eq!(config.cluster.artifacts_dir, attempt_dir);
+    }
+
+    #[test]
+    fn scenario_config_clears_single_run_admin_qualification() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.qualify_planned_admin = true;
+        let attempt_dir = PathBuf::from("target/fault-tests/suite/attempt-1");
+
+        let config = scenario_config(&base, &suite, &suite.scenarios[0], 1, 1, &attempt_dir)
+            .expect("scenario config");
+
+        assert!(!config.qualify_planned_admin);
     }
 
     #[test]
