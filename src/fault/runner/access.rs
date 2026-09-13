@@ -14,7 +14,10 @@
 
 use crate::{
     fault::{
-        config::FaultTestConfig, fixture, scenarios::FaultIsolation, workload::wait_for_s3_endpoint,
+        config::FaultTestConfig,
+        fixture,
+        scenarios::FaultIsolation,
+        workload::{wait_for_s3_endpoint, wait_for_s3_endpoint_while},
     },
     framework::{
         config::ClusterTestConfig,
@@ -254,27 +257,165 @@ pub(super) async fn ensure_s3_access(
     wait_for_s3_endpoint(endpoint, config.timeout).await
 }
 
-async fn wait_for_tenant_s3(
+/// Context marking an error as the S3 port-forward process having exited.
+/// Callers use it to keep a lost transport out of product verdicts: RustFS
+/// cannot answer through a forward that is no longer running.
+#[derive(Debug)]
+pub(super) struct PortForwardLost;
+
+impl std::fmt::Display for PortForwardLost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("S3 port-forward process is no longer running")
+    }
+}
+
+/// Wait for S3 through the tenant port-forward. The forward's liveness is
+/// checked before every poll, so a forward that exits mid-wait (for example
+/// an API server connection drop) fails at once as [`PortForwardLost`]
+/// instead of running out the timeout as an endpoint that never answered.
+pub(super) async fn wait_for_tenant_s3(
     port_forward: &mut PortForwardGuard,
     endpoint: &str,
     timeout: Duration,
 ) -> Result<()> {
-    port_forward.ensure_running()?;
-    wait_for_s3_endpoint(endpoint, timeout)
-        .await
-        .with_context(|| {
-            format!(
-                "S3 port-forward was not ready; command: {}; log {}:\n{}",
-                port_forward.command_display(),
-                port_forward.log_path().display(),
-                port_forward.log_contents()
-            )
-        })
+    port_forward.ensure_running().context(PortForwardLost)?;
+    let waited = wait_for_s3_endpoint_while(endpoint, timeout, || {
+        port_forward.ensure_running().context(PortForwardLost)
+    })
+    .await;
+    waited.with_context(|| {
+        format!(
+            "S3 port-forward was not ready; command: {}; log {}:\n{}",
+            port_forward.command_display(),
+            port_forward.log_path().display(),
+            port_forward.log_contents()
+        )
+    })
+}
+
+/// Prove a freshly spawned port-forward is established: its process is still
+/// alive and the local port accepts a TCP connection. `kubectl port-forward`
+/// only spawns; bind conflicts, kubeconfig and API server errors exit
+/// asynchronously, so `alive` is polled before every connect attempt and its
+/// error is returned verbatim. Neither outcome says anything about RustFS:
+/// callers classify a failure here as harness, not product.
+pub(super) async fn wait_for_local_forward(
+    local_port: u16,
+    bound: Duration,
+    mut alive: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        alive()?;
+        let connect = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(("127.0.0.1", local_port)),
+        )
+        .await;
+        if matches!(connect, Ok(Ok(_))) {
+            return Ok(());
+        }
+        if started.elapsed() >= bound {
+            bail!(
+                "port-forward process is running but 127.0.0.1:{local_port} did not accept a TCP connection within {}s",
+                bound.as_secs_f64()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn released_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        listener.local_addr().expect("addr").port()
+    }
+
+    fn forward_running(seconds: u32) -> PortForwardGuard {
+        let child = std::process::Command::new("sh")
+            .args(["-c", &format!("sleep {seconds}")])
+            .spawn()
+            .expect("stand-in forward process");
+        PortForwardGuard::for_test(child, std::path::PathBuf::from("/nonexistent/forward.log"))
+    }
+
+    #[tokio::test]
+    async fn forward_exiting_mid_wait_is_a_lost_forward_not_an_unready_endpoint() {
+        // The forward is alive when the wait starts and exits a second later
+        // while S3 (nothing listening) is still being polled.
+        let mut guard = forward_running(1);
+        let endpoint = format!("http://127.0.0.1:{}", released_port());
+        let started = Instant::now();
+
+        let error = wait_for_tenant_s3(&mut guard, &endpoint, Duration::from_secs(60))
+            .await
+            .expect_err("a dead forward cannot serve S3");
+
+        assert!(error.is::<PortForwardLost>(), "{error:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the lost forward must fail the wait instead of running out its timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_forward_whose_endpoint_never_answers_times_out_as_unready() {
+        let mut guard = forward_running(60);
+        let endpoint = format!("http://127.0.0.1:{}", released_port());
+
+        let error = wait_for_tenant_s3(&mut guard, &endpoint, Duration::from_secs(2))
+            .await
+            .expect_err("nothing serves S3 behind the live forward");
+
+        assert!(!error.is::<PortForwardLost>(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("timed out waiting for S3 endpoint"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_forward_is_established_once_the_port_accepts_connections() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        wait_for_local_forward(port, Duration::from_secs(5), || Ok(()))
+            .await
+            .expect("a listening port is an established forward");
+    }
+
+    #[tokio::test]
+    async fn dead_forward_process_is_reported_before_the_port_is_probed() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        let error = wait_for_local_forward(port, Duration::from_secs(5), || {
+            bail!("port-forward exited early with exit status: 1; unable to listen on any of the requested ports")
+        })
+        .await
+        .expect_err("an exited kubectl is a harness failure even when something listens");
+        assert!(
+            error.to_string().contains("port-forward exited early"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_port_times_out_as_a_harness_failure() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let error = wait_for_local_forward(port, Duration::from_millis(300), || Ok(()))
+            .await
+            .expect_err("nothing listens on the released port");
+        assert!(
+            error
+                .to_string()
+                .contains("did not accept a TCP connection within"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn stable_pod_fingerprint_requires_four_ready_unchanged_pods() {

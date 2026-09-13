@@ -380,14 +380,17 @@ guardrails when implementing the ordered TODO below.
   (`post-recovery-write-report.json`, rustfs/backlog#2444). The final checker
   reports listed keys that GET cannot read (`listed_key_unreadable`) and
   readable listed keys no write explains (`unexpected_listed_object`);
-  failed-but-materialized writes are recorded and tolerated.
+  failed-but-materialized writes are tolerated only when GET returns the
+  bytes one of the failed attempts sent.
 
 - [x] DONE: Availability contract for in-redundancy faults.
   Meaning: `pod-kill-one`, `pod-failure`, and `network-partition-one` use the
   `availability-required` impact policy (rustfs/backlog#2445): a fault-active
   read probe over the prefilled cohort must verify every object and each
   workload family must meet `RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT`
-  (floors below 100 tolerate at least one disrupted operation per family).
+  (catalog floor 99, which the variable may only raise; floors below 100
+  tolerate one disrupted operation per family; families under 20 operations
+  fail closed as unexercised).
   The port-forward is re-pinned to a surviving Pod after activation because a
   Service forward stays attached to the Pod it started on. The 99% default is
   a pre-calibration margin; live runs must calibrate it before it gates a

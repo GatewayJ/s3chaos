@@ -17,7 +17,7 @@ use crate::fault::reporting::PodIdentity;
 use crate::fault::{reporting::FaultStatusSnapshot, workload::StagedMultipartUpload};
 use crate::framework::{
     kubectl::Kubectl,
-    port_forward::{PortForwardGuard, PortForwardSpec},
+    port_forward::{PortForwardGuard, PortForwardSpec, replace_port_forward},
 };
 use crate::{
     fault::{
@@ -35,7 +35,13 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::access::ensure_s3_access;
+use super::access::{
+    PortForwardLost, ensure_s3_access, wait_for_local_forward, wait_for_tenant_s3,
+};
+
+/// How long a re-pinned `kubectl port-forward` gets to bind its local port
+/// and start accepting connections; only the harness side of the endpoint.
+const PORT_FORWARD_ESTABLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 use super::targets::{
     FixedVolumeTargets, observe_volume_quorum_health, require_active_fixed_volume_targets,
     require_active_write_quorum_partition, volume_quorum_boundary,
@@ -239,8 +245,9 @@ impl FaultRun<'_> {
             prefilled,
         } = prepared;
         let fault = &active.fault;
-        let served_by_pod =
-            self.pin_availability_endpoint(target, active, endpoint, port_forward)?;
+        let served_by_pod = self
+            .pin_availability_endpoint(target, active, endpoint, port_forward)
+            .await?;
         let volume_quorum_scenario = matches!(
             plan.scenario.as_str(),
             QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
@@ -811,7 +818,7 @@ impl FaultRun<'_> {
     /// attached to a surviving node, so once the fault is active the forward
     /// is re-established to a Pod the controller did not target. A ClusterIP
     /// endpoint balances per connection and needs no pinning.
-    fn pin_availability_endpoint(
+    async fn pin_availability_endpoint(
         &self,
         target: &ProvenTarget,
         active: &ActiveFault,
@@ -823,7 +830,7 @@ impl FaultRun<'_> {
         if !self.context.spec.impact_policy.requires_availability() {
             return Ok(None);
         }
-        let Some(guard) = port_forward else {
+        if port_forward.is_none() {
             events.record(
                 "availability-endpoint",
                 RunEventStatus::Observed,
@@ -831,24 +838,51 @@ impl FaultRun<'_> {
                 Some(serde_json::json!({ "endpoint": endpoint })),
             )?;
             return Ok(None);
-        };
-        let pinned = injected_source_pod_names(&active.active_snapshots).and_then(|targets| {
-            let survivor = surviving_pod_name(&target.pods_before, &targets)?;
+        }
+        let pinned = async {
+            let targets = injected_source_pod_names(&active.active_snapshots)
+                .map_err(AvailabilityEndpointFailure::Harness)?;
+            let survivor = surviving_pod_name(&target.pods_before, &targets)
+                .map_err(AvailabilityEndpointFailure::Harness)?;
             let local_port = endpoint
                 .rsplit_once(':')
                 .and_then(|(_, port)| port.parse::<u16>().ok())
-                .context("parse local S3 port-forward endpoint")?;
+                .context("parse local S3 port-forward endpoint")
+                .map_err(AvailabilityEndpointFailure::Harness)?;
             let spec = PortForwardSpec {
                 namespace: cluster.test_namespace.clone(),
                 service: format!("pod/{survivor}"),
                 local_port,
                 remote_port: RUSTFS_CONTAINER_PORT,
             };
-            // Replacing the guard drops the Service forward first so the
-            // local port is free for the Pod forward.
-            *guard = spec.start_with_temp_log(&Kubectl::new(cluster))?;
-            Ok((survivor, targets))
-        });
+            // The Service forward is killed before the Pod forward spawns so
+            // they never race for the local port, and the Pod forward must
+            // answer S3 before the verdict measures anything through it.
+            let guard = replace_port_forward(port_forward, || {
+                spec.start_with_temp_log(&Kubectl::new(cluster))
+            })
+            .map_err(AvailabilityEndpointFailure::Harness)?;
+            // `kubectl port-forward` only spawns: a bind conflict or API
+            // server error exits asynchronously. Prove the process is alive
+            // and the local port accepts TCP before anything that fails is
+            // attributed to the survivor.
+            self.deadline
+                .run(wait_for_local_forward(
+                    local_port,
+                    PORT_FORWARD_ESTABLISH_TIMEOUT,
+                    || guard.ensure_running(),
+                ))
+                .await
+                .map_err(AvailabilityEndpointFailure::Harness)?;
+            self.deadline
+                .run(wait_for_tenant_s3(guard, endpoint, cluster.timeout))
+                .await
+                .map_err(|error| {
+                    AvailabilityEndpointFailure::from_survivor_wait(&survivor, error)
+                })?;
+            Ok::<_, AvailabilityEndpointFailure>((survivor, targets))
+        }
+        .await;
         match pinned {
             Ok((survivor, targets)) => {
                 events.record(
@@ -863,12 +897,15 @@ impl FaultRun<'_> {
                 )?;
                 Ok(Some(survivor))
             }
-            Err(error) => {
+            Err(failure) => {
+                let classification = failure.classification();
+                let details = failure.details();
+                let error = failure.into_error();
                 self.record_failure(
                     "availability-endpoint",
-                    "environment_or_fault_backend",
+                    classification,
                     &error,
-                    None,
+                    details,
                     Some((&active.fault, "availability-endpoint-failed")),
                 )?;
                 Err(error)
@@ -1074,6 +1111,70 @@ fn injected_source_pod_names(snapshots: &[FaultStatusSnapshot]) -> Result<BTreeS
     Ok(targets)
 }
 
+/// Why the S3 endpoint could not be re-pinned to a surviving Pod. The two
+/// causes carry different verdicts: the harness failing to resolve the target
+/// or to run `kubectl port-forward` says nothing about RustFS, whereas a
+/// forward that is up while the untargeted survivor never answers S3 within
+/// the recovery timeout is exactly the loss of availability the scenario
+/// exists to detect.
+#[derive(Debug)]
+enum AvailabilityEndpointFailure {
+    Harness(anyhow::Error),
+    SurvivorUnready { pod: String, error: anyhow::Error },
+}
+
+impl AvailabilityEndpointFailure {
+    fn survivor_unready(pod: &str, error: anyhow::Error) -> Self {
+        Self::SurvivorUnready {
+            pod: pod.to_string(),
+            error,
+        }
+    }
+
+    /// A failed S3 wait through the established forward is the survivor's
+    /// only while the forward stayed up; a forward lost mid-wait is harness.
+    fn from_survivor_wait(pod: &str, error: anyhow::Error) -> Self {
+        if error.is::<PortForwardLost>() {
+            Self::Harness(error)
+        } else {
+            Self::survivor_unready(pod, error)
+        }
+    }
+
+    fn classification(&self) -> &'static str {
+        match self {
+            // The suite budget running out while waiting is a harness limit,
+            // not evidence about the forward or the survivor.
+            Self::Harness(error) | Self::SurvivorUnready { error, .. }
+                if error.is::<crate::fault::shutdown::SuiteDeadlineExceeded>() =>
+            {
+                "test_or_environment"
+            }
+            Self::Harness(_) => "environment_or_fault_backend",
+            Self::SurvivorUnready { .. } => "availability_regression",
+        }
+    }
+
+    fn details(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Harness(_) => None,
+            Self::SurvivorUnready { pod, .. } => Some(serde_json::json!({
+                "served_by_pod": pod,
+                "port_forward": "established",
+            })),
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Harness(error) => error.context("re-pin the S3 port-forward to a surviving Pod"),
+            Self::SurvivorUnready { pod, error } => error.context(format!(
+                "surviving RustFS Pod {pod} did not serve S3 through its port-forward while the fault was active"
+            )),
+        }
+    }
+}
+
 fn surviving_pod_name(pods_before: &[PodIdentity], targets: &BTreeSet<String>) -> Result<String> {
     ensure!(
         targets
@@ -1091,9 +1192,102 @@ fn surviving_pod_name(pods_before: &[PodIdentity], targets: &BTreeSet<String>) -
 
 #[cfg(test)]
 mod availability_endpoint_tests {
-    use super::{injected_source_pod_names, surviving_pod_name};
-    use crate::fault::reporting::{FaultStatusSnapshot, PodIdentity};
+    use super::{AvailabilityEndpointFailure, injected_source_pod_names, surviving_pod_name};
+    use crate::fault::reporting::{
+        FailurePhase, FailureSeverity, FailureSummary, FaultStatusSnapshot, PodIdentity,
+        ResponsibilityDomain,
+    };
     use std::collections::BTreeSet;
+
+    #[test]
+    fn a_forward_lost_during_the_survivor_wait_is_harness_not_product() {
+        use super::PortForwardLost;
+        use anyhow::Context;
+
+        // The shape `wait_for_tenant_s3` produces when the forward exits
+        // mid-wait: the lost-forward marker under its readiness context.
+        let lost = Err::<(), _>(anyhow::anyhow!(
+            "port-forward exited early with exit status: 1"
+        ))
+        .context(PortForwardLost)
+        .context("S3 port-forward was not ready; command: kubectl port-forward")
+        .unwrap_err();
+        let failure = AvailabilityEndpointFailure::from_survivor_wait("rustfs-1", lost);
+        assert!(
+            matches!(failure, AvailabilityEndpointFailure::Harness(_)),
+            "{failure:?}"
+        );
+        assert_eq!(failure.classification(), "environment_or_fault_backend");
+
+        let unready = AvailabilityEndpointFailure::from_survivor_wait(
+            "rustfs-1",
+            anyhow::anyhow!("timed out waiting for S3 endpoint http://127.0.0.1:19000"),
+        );
+        assert_eq!(unready.classification(), "availability_regression");
+    }
+
+    #[test]
+    fn survivor_not_serving_s3_is_a_product_availability_failure() {
+        let harness = AvailabilityEndpointFailure::Harness(anyhow::anyhow!(
+            "failed to start background command: kubectl port-forward"
+        ));
+        assert_eq!(harness.classification(), "environment_or_fault_backend");
+        assert!(harness.details().is_none());
+        assert!(
+            harness
+                .into_error()
+                .to_string()
+                .contains("re-pin the S3 port-forward")
+        );
+
+        let unready = AvailabilityEndpointFailure::survivor_unready(
+            "rustfs-1",
+            anyhow::anyhow!("S3 port-forward was not ready; command: kubectl ..."),
+        );
+        assert_eq!(unready.classification(), "availability_regression");
+        assert_eq!(
+            unready.details().expect("details")["served_by_pod"],
+            "rustfs-1"
+        );
+        let error = unready.into_error();
+        assert!(error.to_string().contains("rustfs-1 did not serve S3"));
+        let summary = FailureSummary::new(
+            "pod-failure",
+            "availability-endpoint",
+            "availability_regression",
+            error.to_string(),
+        )
+        .expect("allowlisted classification");
+        assert_eq!(summary.phase(), Some(FailurePhase::Workload));
+        assert_eq!(
+            summary.responsibility_domain(),
+            Some(ResponsibilityDomain::Product)
+        );
+        assert_eq!(summary.severity(), FailureSeverity::FailAvailability);
+        summary
+            .validate_classification_projection()
+            .expect("consistent projection");
+
+        // A suite budget running out mid-wait is not product evidence.
+        let deadline = AvailabilityEndpointFailure::survivor_unready(
+            "rustfs-1",
+            crate::fault::shutdown::RunDeadline::new(Some(0))
+                .expect("deadline")
+                .check()
+                .expect_err("expired"),
+        );
+        assert_eq!(deadline.classification(), "test_or_environment");
+
+        // An asynchronously exiting kubectl (bind conflict, kubeconfig, API
+        // server) surfaces through the establishment check as harness.
+        let bind_conflict = AvailabilityEndpointFailure::Harness(anyhow::anyhow!(
+            "port-forward exited early with exit status: 1; unable to listen on any of the requested ports"
+        ));
+        assert_eq!(
+            bind_conflict.classification(),
+            "environment_or_fault_backend"
+        );
+    }
 
     fn pods() -> Vec<PodIdentity> {
         (0..4)

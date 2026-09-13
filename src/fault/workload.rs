@@ -226,6 +226,18 @@ pub struct VerifiedWriteResult {
     pub verified: bool,
 }
 
+/// Which timeout an AbortMultipartUpload request runs under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbortBound {
+    /// A probe or workload abort is a mutation like any other: capped by the
+    /// client's mutation deadline, recorded as `Timeout` and never sent once
+    /// that deadline has passed.
+    Mutation,
+    /// Best-effort cleanup of a staged upload keeps the full request timeout
+    /// even after a quiet mutation or the suite budget has expired.
+    Cleanup,
+}
+
 struct RecordedDelete {
     record: OperationRecord,
     is_delete_marker: Option<bool>,
@@ -844,7 +856,7 @@ impl S3WorkloadClient {
     }
 
     pub(crate) fn for_quiet_mutation(&self, deadline: Instant) -> Self {
-        let mut client = self.clone();
+        let mut client = self.with_mutation_deadline(deadline);
         client.client = Client::from_conf(
             self.client
                 .config()
@@ -852,6 +864,15 @@ impl S3WorkloadClient {
                 .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
                 .build(),
         );
+        client
+    }
+
+    /// A client whose every mutation is additionally capped to `deadline`,
+    /// keeping the shared retry policy. Requests still finish their history
+    /// record on expiry (as `Timeout`), so a caller that must not be
+    /// cancellation-wrapped can await this client to a bounded end instead.
+    pub(crate) fn with_mutation_deadline(&self, deadline: Instant) -> Self {
+        let mut client = self.clone();
         client.mutation_deadline = Some(deadline);
         client
     }
@@ -1554,7 +1575,12 @@ impl S3WorkloadClient {
     ) -> Result<()> {
         // Cleanup keeps its request timeout even after a quiet mutation expires.
         let outcome = self
-            .abort_multipart_upload(&staged.spec.key, &staged.upload_id, recorder)
+            .abort_multipart_upload(
+                &staged.spec.key,
+                &staged.upload_id,
+                recorder,
+                AbortBound::Cleanup,
+            )
             .await
             .with_context(|| {
                 format!(
@@ -1583,7 +1609,7 @@ impl S3WorkloadClient {
         else {
             return Ok(OperationOutcome::Unknown);
         };
-        self.abort_multipart_upload(&object.spec.key, &upload_id, recorder)
+        self.abort_multipart_upload(&object.spec.key, &upload_id, recorder, AbortBound::Mutation)
             .await
     }
 
@@ -1719,6 +1745,7 @@ impl S3WorkloadClient {
         key: &str,
         upload_id: &str,
         recorder: &Recorder,
+        bound: AbortBound,
     ) -> Result<OperationOutcome> {
         let record = recorder.begin(
             OperationKind::AbortMultipartUpload,
@@ -1727,16 +1754,17 @@ impl S3WorkloadClient {
             None,
             None,
         );
-        let result = timeout(
-            self.request_timeout,
-            self.client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .send(),
-        )
-        .await;
+        let request = self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send();
+        let result = match bound {
+            AbortBound::Mutation => self.mutation_request(request).await,
+            AbortBound::Cleanup => timeout(self.request_timeout, request).await.map_err(|_| ()),
+        };
 
         match result {
             Ok(Ok(_)) => {
@@ -1987,6 +2015,18 @@ pub fn sha256_hex(body: &[u8]) -> String {
 }
 
 pub async fn wait_for_s3_endpoint(endpoint: &str, timeout_duration: Duration) -> Result<()> {
+    wait_for_s3_endpoint_while(endpoint, timeout_duration, || Ok(())).await
+}
+
+/// [`wait_for_s3_endpoint`] that also calls `alive` before every attempt and
+/// returns its error verbatim, so a transport the endpoint depends on (a
+/// `kubectl port-forward`) dying mid-wait fails immediately as that error
+/// instead of surfacing later as an endpoint that never answered.
+pub(crate) async fn wait_for_s3_endpoint_while(
+    endpoint: &str,
+    timeout_duration: Duration,
+    mut alive: impl FnMut() -> Result<()>,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -1994,6 +2034,7 @@ pub async fn wait_for_s3_endpoint(endpoint: &str, timeout_duration: Duration) ->
     let start = std::time::Instant::now();
 
     loop {
+        alive()?;
         if client.get(endpoint).send().await.is_ok() {
             return Ok(());
         }
@@ -2069,6 +2110,68 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn probe_abort_is_capped_by_the_mutation_deadline_while_cleanup_still_sends() {
+        use crate::fault::history::{OperationKind, OperationOutcome, Recorder};
+
+        let client = super::S3WorkloadClient::new(
+            "http://127.0.0.1:1",
+            "bucket",
+            "test-access",
+            "test-secret",
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("client");
+        // Retries disabled and the mutation deadline already passed.
+        let expired = client.for_quiet_mutation(tokio::time::Instant::now());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Recorder::create(dir.path().join("history.jsonl"), "io-eio", "run-1")
+            .expect("recorder");
+
+        // A normal abort is a mutation: past the deadline it is recorded as a
+        // Timeout without being sent. Had it been sent, the refused
+        // connection would come back as a dispatch failure (Unknown).
+        let outcome = expired
+            .abort_multipart_upload(
+                "probe-key",
+                "upload-1",
+                &recorder,
+                super::AbortBound::Mutation,
+            )
+            .await
+            .expect("recorded abort");
+        assert_eq!(outcome, OperationOutcome::Timeout);
+        let records = recorder.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, OperationKind::AbortMultipartUpload);
+        assert_eq!(records[0].outcome, OperationOutcome::Timeout);
+        assert_eq!(
+            records[0].error.as_deref(),
+            Some("abort multipart upload timed out")
+        );
+
+        // Best-effort cleanup of a staged upload is unchanged: it keeps the
+        // request timeout and still sends after the budget expired.
+        let staged = super::StagedMultipartUpload {
+            spec: ObjectSpec::prepare_seeded("run-1", 0, 16, 7).spec,
+            upload_id: "upload-2".to_string(),
+            completed_parts: Vec::new(),
+        };
+        let error = expired
+            .abort_staged_multipart_object(&staged, &recorder)
+            .await
+            .expect_err("nothing listens behind the endpoint");
+        assert!(
+            error.to_string().contains("ended with Unknown"),
+            "{error:#}"
+        );
+        let records = recorder.records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].kind, OperationKind::AbortMultipartUpload);
+        assert_eq!(records[1].outcome, OperationOutcome::Unknown);
+    }
+
+    #[tokio::test]
     async fn quiet_deadline_does_not_poll_another_request_or_change_the_shared_client() {
         let client = super::S3WorkloadClient::new(
             "http://127.0.0.1:1",
@@ -2107,6 +2210,40 @@ mod tests {
                 .expect("quiet retries")
                 .max_attempts(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_deadline_caps_requests_without_dropping_workload_retries() {
+        let client = super::S3WorkloadClient::new(
+            "http://127.0.0.1:1",
+            "bucket",
+            "test-access",
+            "test-secret",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("client");
+        let bounded = client.with_mutation_deadline(tokio::time::Instant::now());
+        let polled = std::cell::Cell::new(false);
+        let result = bounded
+            .mutation_request(async {
+                polled.set(true);
+            })
+            .await;
+
+        assert!(result.is_err(), "an expired deadline refuses the mutation");
+        assert!(!polled.get());
+        assert!(client.mutation_deadline.is_none());
+        assert_eq!(
+            bounded
+                .client
+                .config()
+                .retry_config()
+                .expect("bounded retries")
+                .max_attempts(),
+            S3_WORKLOAD_MUTATION_MAX_ATTEMPTS,
+            "the post-recovery probe keeps the workload retry policy"
         );
     }
 

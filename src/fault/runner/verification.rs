@@ -166,6 +166,14 @@ impl FaultRun<'_> {
         let workload_plan = &self.context.workload_plan;
         let events = &self.context.events;
         let history = &self.context.history;
+        // Awaited directly rather than under `RunDeadline::run`: a cancelled
+        // re-PUT could be applied by RustFS without a finished history record,
+        // so each mutation is instead capped to the remaining suite budget and
+        // the recommit collects every attempt before returning.
+        let bounded_s3 = match self.deadline.instant()? {
+            Some(deadline) => s3.with_mutation_deadline(deadline),
+            None => s3.clone(),
+        };
         events.record(
             "recommit-unconfirmed",
             RunEventStatus::Started,
@@ -173,10 +181,11 @@ impl FaultRun<'_> {
             Some(serde_json::json!({ "attempted": workload.unconfirmed_puts.len() })),
         )?;
         let recommit_report = recommit_unconfirmed_objects(
-            s3,
+            &bounded_s3,
             history,
             &workload.unconfirmed_puts,
             workload_plan.concurrency,
+            self.deadline,
         )
         .await;
         collector.write_text(
@@ -190,6 +199,22 @@ impl FaultRun<'_> {
             "workload-summary.json",
             &serde_json::to_string_pretty(&workload.summary)?,
         )?;
+        // A budget exhausted before or during the recommit leaves capped
+        // Timeout attempts and unreached candidates behind; that is the suite
+        // deadline, not a product recommit failure.
+        if let Err(error) = self.deadline.check() {
+            self.record_failure(
+                "recommit-unconfirmed",
+                "test_or_environment",
+                &error,
+                Some(serde_json::json!({
+                    "attempted": recommit_report.attempted,
+                    "candidates": workload.unconfirmed_puts.len(),
+                })),
+                None,
+            )?;
+            return Err(error);
+        }
         if recommit_report.has_failures() {
             let message = recommit_report.failure_message();
             events

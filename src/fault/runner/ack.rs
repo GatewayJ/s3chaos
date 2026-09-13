@@ -105,11 +105,11 @@ impl FaultRun<'_> {
             let recovered = self
                 .recover_access(prepared, &target, &mut no_staged_uploads)
                 .await?;
-            self.deadline
-                .run(self.probe_post_recovery_writes(&prepared.s3))
-                .await?;
+            // Persist the completed lifecycle before the write gate so a
+            // probe-detected product failure still leaves fault-evidence.json.
             let mut evidence =
                 self.write_ack_recovery_evidence(&target, &active, &removal, &recovered)?;
+            self.probe_post_recovery_writes(&prepared.s3).await?;
             self.deadline
                 .run(self.verify_recovered_without_recommit(&prepared.s3))
                 .await?;
@@ -503,6 +503,16 @@ impl FaultRun<'_> {
             self.scenario.case_name,
             "fault-evidence.json",
             &serde_json::to_string_pretty(&evidence)?,
+        )?;
+        // Ordered before the post-recovery write probe; see
+        // `write_recovery_evidence`.
+        self.context.events.record(
+            "recovery-evidence",
+            RunEventStatus::Succeeded,
+            "fault-evidence.json persisted with the completed quiet-mutation lifecycle",
+            Some(serde_json::json!({
+                "recovery_ended_at_ms": evidence.recovery_ended_at_ms,
+            })),
         )?;
         Ok(evidence)
     }

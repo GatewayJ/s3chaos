@@ -65,7 +65,7 @@ use crate::fault::{
         QuorumHealthObservation, QuorumMutationClass, QuorumVolumeBoundary,
         require_fresh_runtime_observation,
     },
-    recovery_health::{RECOVERY_HEALTH_ARTIFACT, RecoveryHealthReport},
+    recovery_health::{RECOVERY_HEALTH_ARTIFACT, RecoveryHealthBaseline, RecoveryHealthReport},
     reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
     scenarios::{
         self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario, acknowledged_mutation_kind,
@@ -75,8 +75,9 @@ use crate::fault::{
         FaultRunFaultSpec, FaultRunSpec, FaultRunTargetSpec,
     },
     workload::execution::{
-        AVAILABILITY_REPORT_ARTIFACT, AvailabilityReport, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
-        POST_RECOVERY_WRITE_REPORT_ARTIFACT, PostRecoveryWriteReport,
+        AVAILABILITY_REPORT_ARTIFACT, AvailabilityReport, FamilyAvailability,
+        POST_RECOVERY_WRITE_HISTORY_ARTIFACT, POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+        PostRecoveryWriteReport, post_recovery_object_count,
     },
     workload::{
         WorkloadPlan,
@@ -918,23 +919,16 @@ fn validate_fault_artifacts_with_identity(
             &json_spec.metadata.bucket,
         )?;
     }
-    validate_recovery_health_artifact(&artifacts, &metadata, identity, &evidence)?;
+    validate_recovery_health_artifact(&artifacts, &metadata, identity, &evidence, &events)?;
     validate_post_recovery_write_artifacts(
         &artifacts,
         &metadata,
         identity,
         &evidence,
+        &events,
         &json_spec.metadata.bucket,
+        post_recovery_object_count(workload_plan.object_count),
     )?;
-    if scenario_spec.impact_policy.requires_availability() {
-        validate_availability_artifact(
-            &artifacts,
-            &metadata,
-            identity,
-            &evidence,
-            workload_plan.object_count,
-        )?;
-    }
 
     let ack_checker_expectation = if let Some(expected_mutation) = ack_mutation {
         Some(validate_ack_triggered_dm_artifacts(
@@ -1055,6 +1049,17 @@ fn validate_fault_artifacts_with_identity(
         summary.disrupted()? == evidence.client_disruptions,
         "fault-evidence.json client_disruptions does not match workload-summary.json"
     );
+    if let Some(catalog_floor_percent) = scenario_spec.impact_policy.availability_floor_percent() {
+        validate_availability_artifact(
+            &artifacts,
+            &metadata,
+            identity,
+            &evidence,
+            &summary,
+            workload_plan.object_count,
+            catalog_floor_percent,
+        )?;
+    }
     if matches!(
         options.scenario.as_str(),
         scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
@@ -2927,6 +2932,7 @@ fn validate_recovery_health_artifact(
     metadata: &RunMetadataArtifact,
     identity: ArtifactIdentityPolicy<'_>,
     evidence: &FaultEvidenceArtifact,
+    events: &[RunEvent],
 ) -> Result<()> {
     let report = read_json::<RecoveryHealthReport>(required(artifacts, RECOVERY_HEALTH_ARTIFACT)?)?;
     validate_optional_identity_fields(
@@ -2936,9 +2942,36 @@ fn validate_recovery_health_artifact(
         metadata,
         identity,
     )?;
+    // `require_success` re-validates the embedded baseline's geometry and
+    // identity invariants; binding it to the pre-fault event proves the
+    // report compares against the layout the runner actually captured.
     report
         .require_success()
         .with_context(|| format!("{RECOVERY_HEALTH_ARTIFACT} did not pass"))?;
+    let baseline_event = events
+        .iter()
+        .find(|event| {
+            event.stage == "recovery-health-baseline" && event.status == RunEventStatus::Succeeded
+        })
+        .context("run-events.jsonl lacks a successful recovery-health-baseline event")?;
+    let recorded_baseline = baseline_event
+        .details
+        .clone()
+        .map(serde_json::from_value::<RecoveryHealthBaseline>)
+        .transpose()
+        .context("recovery-health-baseline event details are not a baseline")?
+        .context("recovery-health-baseline event carries no baseline")?;
+    ensure!(
+        recorded_baseline == report.baseline,
+        "{RECOVERY_HEALTH_ARTIFACT} baseline does not match the recovery-health-baseline run event"
+    );
+    ensure!(
+        report.baseline.observed_at_ms <= baseline_event.at_ms
+            && evidence
+                .fault_apply_started_at_ms
+                .is_some_and(|apply_started| baseline_event.at_ms <= apply_started),
+        "recovery-health-baseline event was not recorded between the baseline observation and fault activation"
+    );
     let recovery_started = evidence
         .recovery_started_at_ms
         .context("fault-evidence.json recovery_started_at_ms is required")?;
@@ -2964,7 +2997,9 @@ fn validate_post_recovery_write_artifacts(
     metadata: &RunMetadataArtifact,
     identity: ArtifactIdentityPolicy<'_>,
     evidence: &FaultEvidenceArtifact,
+    events: &[RunEvent],
     expected_bucket: &str,
+    expected_objects: usize,
 ) -> Result<()> {
     let report = read_json::<PostRecoveryWriteReport>(required(
         artifacts,
@@ -2977,9 +3012,32 @@ fn validate_post_recovery_write_artifacts(
         metadata,
         identity,
     )?;
+    ensure!(
+        report.objects == expected_objects,
+        "{POST_RECOVERY_WRITE_REPORT_ARTIFACT} probed {} objects but the workload plan sizes the probe at {expected_objects}",
+        report.objects
+    );
     report
         .require_success()
         .with_context(|| format!("{POST_RECOVERY_WRITE_REPORT_ARTIFACT} did not pass"))?;
+    // The lifecycle evidence must have been persisted before the write gate
+    // could fail the run; the runner records both as ordered events.
+    let evidence_persisted = events
+        .iter()
+        .position(|event| {
+            event.stage == "recovery-evidence" && event.status == RunEventStatus::Succeeded
+        })
+        .context("run-events.jsonl lacks a successful recovery-evidence event")?;
+    let probe_started = events
+        .iter()
+        .position(|event| {
+            event.stage == "post-recovery-write" && event.status == RunEventStatus::Started
+        })
+        .context("run-events.jsonl lacks a post-recovery-write started event")?;
+    ensure!(
+        evidence_persisted < probe_started,
+        "run-events.jsonl shows the post-recovery write probe started before fault-evidence.json was persisted"
+    );
     let recovery_ended = evidence
         .recovery_ended_at_ms
         .context("fault-evidence.json recovery_ended_at_ms is required")?;
@@ -3021,16 +3079,196 @@ fn validate_post_recovery_write_artifacts(
             record.id
         );
     }
-    let acknowledged_puts = history
-        .iter()
-        .filter(|record| {
-            record.kind == OperationKind::Put && record.outcome == OperationOutcome::Ok
-        })
-        .count();
+    validate_post_recovery_probe_history(&history, &report, &metadata.run_id)
+}
+
+/// Every counter the probe report claims must be evidenced by its dedicated
+/// history, in the order the probe issues its requests: each plain object a
+/// PUT ok, a hash- and size-matching GET, a DELETE ok, then a GET 404; the
+/// multipart key its completion, matching GET, DELETE, and 404; the abort
+/// key its abort; and exactly two prefix LISTs, the first returning every
+/// live probe key after the writes and before any DELETE, the second empty
+/// after the last DELETE. Records outside that shape are not tolerated.
+fn validate_post_recovery_probe_history(
+    history: &[OperationRecord],
+    report: &PostRecoveryWriteReport,
+    run_id: &str,
+) -> Result<()> {
+    use crate::fault::workload::ObjectSpec;
+
+    let artifact = POST_RECOVERY_WRITE_HISTORY_ARTIFACT;
+    let prefix = ObjectSpec::post_recovery_key_prefix(run_id);
+    let plain_keys = (0..report.objects)
+        .map(|index| ObjectSpec::post_recovery_key(run_id, index))
+        .collect::<Vec<_>>();
+    let multipart_key = ObjectSpec::post_recovery_key(run_id, report.objects);
+    let abort_key = ObjectSpec::post_recovery_key(run_id, report.objects + 1);
+
+    for record in history {
+        let key = record.key.as_deref().unwrap_or_default();
+        let allowed = if key == prefix {
+            matches!(record.kind, OperationKind::List)
+        } else if key == multipart_key {
+            matches!(
+                record.kind,
+                OperationKind::CreateMultipartUpload
+                    | OperationKind::UploadPart
+                    | OperationKind::CompleteMultipartUpload
+                    | OperationKind::Get
+                    | OperationKind::Delete
+            )
+        } else if key == abort_key {
+            matches!(
+                record.kind,
+                OperationKind::CreateMultipartUpload | OperationKind::AbortMultipartUpload
+            )
+        } else if plain_keys.iter().any(|plain| plain == key) {
+            matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::Get | OperationKind::Delete
+            )
+        } else {
+            false
+        };
+        ensure!(
+            allowed,
+            "{artifact} record {} is a {:?} on {key:?}, which the probe never issues",
+            record.id,
+            record.kind
+        );
+        ensure!(
+            record.outcome == OperationOutcome::Ok
+                || (record.kind == OperationKind::Get
+                    && record.outcome == OperationOutcome::NotFound),
+            "{artifact} record {} ({:?} {key:?}) ended {:?}; a passed probe has no failed requests",
+            record.id,
+            record.kind,
+            record.outcome
+        );
+    }
+
+    let sequences = |record: &OperationRecord| -> Result<(u64, u64)> {
+        Ok((
+            record.started_sequence.with_context(|| {
+                format!("{artifact} record {} has no start sequence", record.id)
+            })?,
+            record
+                .ended_sequence
+                .with_context(|| format!("{artifact} record {} has no end sequence", record.id))?,
+        ))
+    };
+    let records_for = |key: &str, kind: OperationKind| {
+        let mut records = history
+            .iter()
+            .filter(|record| record.kind == kind && record.key.as_deref() == Some(key))
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| record.started_sequence);
+        records
+    };
+    let exactly_one = |key: &str, kind: OperationKind| -> Result<&OperationRecord> {
+        let records = records_for(key, kind);
+        ensure!(
+            records.len() == 1,
+            "{artifact} must hold exactly one acknowledged {kind:?} for {key:?}, found {}",
+            records.len()
+        );
+        Ok(records[0])
+    };
+    // Returns the verify-GET end and the DELETE start/end sequences so the
+    // LISTs can be placed relative to the writes and deletes.
+    let object_lifecycle = |key: &str, write_kind: OperationKind| -> Result<(u64, u64, u64)> {
+        let write = exactly_one(key, write_kind)?;
+        let (_, write_ended) = sequences(write)?;
+        let written_sha256 = write.value_sha256.as_deref().with_context(|| {
+            format!("{artifact} {write_kind:?} for {key:?} records no payload hash")
+        })?;
+        let delete = exactly_one(key, OperationKind::Delete)?;
+        let (delete_started, delete_ended) = sequences(delete)?;
+        let gets = records_for(key, OperationKind::Get);
+        ensure!(
+            gets.len() == 2,
+            "{artifact} must hold exactly two GETs for {key:?} (verify, then absence), found {}",
+            gets.len()
+        );
+        let (verify, absent) = (gets[0], gets[1]);
+        let (verify_started, verify_ended) = sequences(verify)?;
+        ensure!(
+            verify.outcome == OperationOutcome::Ok
+                && verify.http_status == Some(200)
+                && verify.value_sha256.as_deref() == Some(written_sha256)
+                && verify.size_bytes == write.size_bytes
+                && verify_started > write_ended,
+            "{artifact} GET {} does not read back the acknowledged {write_kind:?} of {key:?} with its hash and size",
+            verify.id
+        );
+        ensure!(
+            delete_started > verify_ended,
+            "{artifact} DELETE {} of {key:?} did not follow its verified read",
+            delete.id
+        );
+        let (absent_started, _) = sequences(absent)?;
+        ensure!(
+            absent.outcome == OperationOutcome::NotFound
+                && absent.http_status == Some(404)
+                && absent_started > delete_ended,
+            "{artifact} GET {} does not prove {key:?} absent after its acknowledged DELETE",
+            absent.id
+        );
+        Ok((verify_ended, delete_started, delete_ended))
+    };
+
+    let mut last_verify_ended = 0;
+    let mut first_delete_started = u64::MAX;
+    let mut last_delete_ended = 0;
+    for key in plain_keys.iter().chain(std::iter::once(&multipart_key)) {
+        let write_kind = if key == &multipart_key {
+            OperationKind::CompleteMultipartUpload
+        } else {
+            OperationKind::Put
+        };
+        let (verify_ended, delete_started, delete_ended) = object_lifecycle(key, write_kind)?;
+        last_verify_ended = last_verify_ended.max(verify_ended);
+        first_delete_started = first_delete_started.min(delete_started);
+        last_delete_ended = last_delete_ended.max(delete_ended);
+    }
+    exactly_one(&multipart_key, OperationKind::CreateMultipartUpload)?;
+    exactly_one(&abort_key, OperationKind::CreateMultipartUpload)?;
+    exactly_one(&abort_key, OperationKind::AbortMultipartUpload)?;
+
+    let lists = records_for(&prefix, OperationKind::List);
     ensure!(
-        acknowledged_puts >= report.objects,
-        "{POST_RECOVERY_WRITE_HISTORY_ARTIFACT} holds {acknowledged_puts} acknowledged PUTs but the report claims {} verified objects",
-        report.objects
+        lists.len() == 2,
+        "{artifact} must hold exactly two prefix LISTs, found {}",
+        lists.len()
+    );
+    let (live_list, empty_list) = (lists[0], lists[1]);
+    let mut expected_live = plain_keys.clone();
+    expected_live.push(multipart_key.clone());
+    expected_live.sort();
+    let mut listed = live_list
+        .listed_keys
+        .clone()
+        .with_context(|| format!("{artifact} LIST {} captured no keys", live_list.id))?;
+    listed.sort();
+    let (live_started, live_ended) = sequences(live_list)?;
+    ensure!(
+        live_list.http_status == Some(200)
+            && listed == expected_live
+            && live_started > last_verify_ended
+            && live_ended < first_delete_started,
+        "{artifact} LIST {} does not show exactly the live probe objects between the verified writes and the first DELETE",
+        live_list.id
+    );
+    let (empty_started, _) = sequences(empty_list)?;
+    ensure!(
+        empty_list.http_status == Some(200)
+            && empty_list
+                .listed_keys
+                .as_ref()
+                .is_some_and(|keys| keys.is_empty())
+            && empty_started > last_delete_ended,
+        "{artifact} LIST {} does not prove the prefix empty after the last DELETE",
+        empty_list.id
     );
     Ok(())
 }
@@ -3040,7 +3278,9 @@ fn validate_availability_artifact(
     metadata: &RunMetadataArtifact,
     identity: ArtifactIdentityPolicy<'_>,
     evidence: &FaultEvidenceArtifact,
+    summary: &WorkloadSummaryArtifact,
     workload_object_count: usize,
+    catalog_floor_percent: u8,
 ) -> Result<()> {
     let report =
         read_json::<AvailabilityReport>(required(artifacts, AVAILABILITY_REPORT_ARTIFACT)?)?;
@@ -3051,6 +3291,22 @@ fn validate_availability_artifact(
         metadata,
         identity,
     )?;
+    // The floor the run was configured with is persisted in run-metadata.json
+    // and may only tighten the catalog floor; a report claiming a laxer floor
+    // than either is not evidence.
+    let configured_floor = metadata.min_availability_percent.context(
+        "run-metadata.json min_availability_percent is required for availability scenarios",
+    )?;
+    ensure!(
+        report.min_success_percent == configured_floor,
+        "{AVAILABILITY_REPORT_ARTIFACT} min_success_percent {} does not match run-metadata.json min_availability_percent {configured_floor}",
+        report.min_success_percent
+    );
+    ensure!(
+        report.min_success_percent >= catalog_floor_percent,
+        "{AVAILABILITY_REPORT_ARTIFACT} min_success_percent {} is below the catalog availability floor {catalog_floor_percent}",
+        report.min_success_percent
+    );
     report
         .require_success()
         .with_context(|| format!("{AVAILABILITY_REPORT_ARTIFACT} did not pass"))?;
@@ -3060,8 +3316,40 @@ fn validate_availability_artifact(
             && report.read_probe.failures.is_empty(),
         "{AVAILABILITY_REPORT_ARTIFACT} read probe did not verify the complete prefilled cohort"
     );
-    let disrupted = report
-        .workload
+    // Every family is recomputed from workload-summary.json and must equal
+    // the report's, so disruptions cannot be shifted from a small family
+    // that would violate the floor into a large one that tolerates them, and
+    // the floor verdict is re-derived rather than trusted.
+    let expected_families = summary.family_availability()?;
+    ensure!(
+        report.workload.len() == expected_families.len(),
+        "{AVAILABILITY_REPORT_ARTIFACT} lists {} workload families but workload-summary.json defines {}",
+        report.workload.len(),
+        expected_families.len()
+    );
+    for (family, expected) in report.workload.iter().zip(&expected_families) {
+        ensure!(
+            family == expected,
+            "{AVAILABILITY_REPORT_ARTIFACT} family {:?} ({} of {} disrupted, {}%) does not match workload-summary.json {} ({} of {} disrupted, {}%)",
+            family.family,
+            family.disrupted,
+            family.total,
+            family.success_percent,
+            expected.family,
+            expected.disrupted,
+            expected.total,
+            expected.success_percent
+        );
+        ensure!(
+            expected.meets_floor(report.min_success_percent),
+            "{AVAILABILITY_REPORT_ARTIFACT} family {} ({} of {} disrupted) does not meet the {}% floor recomputed from workload-summary.json",
+            expected.family,
+            expected.disrupted,
+            expected.total,
+            report.min_success_percent
+        );
+    }
+    let disrupted = expected_families
         .iter()
         .map(|family| family.disrupted)
         .sum::<usize>();
@@ -3069,13 +3357,6 @@ fn validate_availability_artifact(
         disrupted == evidence.client_disruptions,
         "{AVAILABILITY_REPORT_ARTIFACT} workload disruptions {disrupted} do not match fault-evidence.json client_disruptions {}",
         evidence.client_disruptions
-    );
-    ensure!(
-        report
-            .workload
-            .iter()
-            .all(|family| family.meets_floor(report.min_success_percent)),
-        "{AVAILABILITY_REPORT_ARTIFACT} workload families contradict its passed verdict"
     );
     Ok(())
 }
@@ -4977,6 +5258,10 @@ struct RunMetadataArtifact {
     require_client_disruption: bool,
     #[serde(default = "default_recovery_stability_reread_seconds")]
     recovery_stability_reread_seconds: u64,
+    /// Configured availability floor; required for availability scenarios,
+    /// absent in artifacts written before the contract existed.
+    #[serde(default)]
+    min_availability_percent: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5237,6 +5522,28 @@ impl WorkloadSummaryArtifact {
                 .checked_add(counts.disrupted()?)
                 .context("workload-summary.json disrupted count overflowed")
         })
+    }
+
+    /// The per-family availability the runtime report must contain, rebuilt
+    /// through the same constructor and in the same order it emits them.
+    fn family_availability(&self) -> Result<Vec<FamilyAvailability>> {
+        [
+            ("put", &self.puts),
+            ("get", &self.gets),
+            ("delete", &self.deletes),
+            ("list", &self.lists),
+            ("multipart_complete", &self.multipart_completes),
+            ("multipart_abort", &self.multipart_aborts),
+        ]
+        .into_iter()
+        .map(|(family, counts)| {
+            Ok(FamilyAvailability::new(
+                family,
+                counts.total(),
+                counts.disrupted()?,
+            ))
+        })
+        .collect()
     }
 
     fn require_write_quorum_loss_effect(
@@ -11778,10 +12085,22 @@ mod tests {
             serde_yaml_ng::to_string(&run_spec).expect("yaml"),
         )
         .expect("write yaml");
+        let health_baseline = json!({
+            "observedAtMs": 5,
+            "deploymentId": "deployment-1",
+            "standardParity": 2,
+            "totalSets": [1],
+            "drivesPerSet": [4],
+            "serverEndpoints": ["http://p0:9000", "http://p1:9000", "http://p2:9000", "http://p3:9000"],
+            "driveUuids": ["d0", "d1", "d2", "d3"]
+        });
         fs::write(
             case_dir.join("run-events.jsonl"),
             [
                 json!({"at_ms":1,"scenario":scenario,"run_id":run_id,"stage":"run","status":"started","message":"started"}).to_string(),
+                json!({"at_ms":6,"scenario":scenario,"run_id":run_id,"stage":"recovery-health-baseline","status":"succeeded","message":"healthy RustFS baseline captured","details":health_baseline}).to_string(),
+                json!({"at_ms":70,"scenario":scenario,"run_id":run_id,"stage":"recovery-evidence","status":"succeeded","message":"fault-evidence.json persisted"}).to_string(),
+                json!({"at_ms":71,"scenario":scenario,"run_id":run_id,"stage":"post-recovery-write","status":"started","message":"probing fresh writes"}).to_string(),
                 json!({"at_ms":2,"scenario":scenario,"run_id":run_id,"stage":"checker-final","status":"succeeded","message":"checked"}).to_string(),
                 json!({"at_ms":3,"scenario":scenario,"run_id":run_id,"stage":"run","status":"succeeded","message":"done"}).to_string(),
             ].join("\n"),
@@ -11887,6 +12206,7 @@ mod tests {
                 "prefill_concurrency": 4,
                 "request_timeout_seconds": 30,
                 "recovery_stability_reread_seconds": 60,
+                "min_availability_percent": 99,
                 "use_cluster_ip": false,
                 "require_client_disruption": true,
                 "chaos_namespace": "chaos-mesh"
@@ -12216,15 +12536,7 @@ mod tests {
             &json!({
                 "scenario": scenario,
                 "runId": run_id,
-                "baseline": {
-                    "observedAtMs": 5,
-                    "deploymentId": "deployment-1",
-                    "standardParity": 2,
-                    "totalSets": [1],
-                    "drivesPerSet": [4],
-                    "serverEndpoints": ["http://p0:9000", "http://p1:9000", "http://p2:9000", "http://p3:9000"],
-                    "driveUuids": ["d0", "d1", "d2", "d3"]
-                },
+                "baseline": health_baseline,
                 "startedAtMs": 61,
                 "completedAtMs": 69,
                 "timeoutSeconds": 300,
@@ -12259,57 +12571,118 @@ mod tests {
             }),
         );
         let probe_prefix = format!("fault-test-post-recovery/{run_id}/");
-        let probe_history = (0..8)
-            .flat_map(|index| {
-                let key = format!("{probe_prefix}object-{index:06}");
-                let base = 72 + index as u64 * 2;
-                [
-                    json!({
-                        "id": format!("op-{:06}", index * 2 + 1),
-                        "scenario": scenario,
-                        "run_id": run_id,
-                        "kind": "put",
-                        "bucket": "bucket",
-                        "key": key,
-                        "value_sha256": "probe-sha",
-                        "size_bytes": 4096,
-                        "started_at_ms": base,
-                        "ended_at_ms": base,
-                        "started_sequence": index * 4 + 1,
-                        "ended_sequence": index * 4 + 2,
-                        "outcome": "ok",
-                        "http_status": 200,
-                        "error": null,
-                        "durability_cohort": "post_recovery",
-                        "fault_window_relation": "after_fault"
-                    }),
-                    json!({
-                        "id": format!("op-{:06}", index * 2 + 2),
-                        "scenario": scenario,
-                        "run_id": run_id,
-                        "kind": "get",
-                        "bucket": "bucket",
-                        "key": key,
-                        "value_sha256": "probe-sha",
-                        "size_bytes": 4096,
-                        "started_at_ms": base + 1,
-                        "ended_at_ms": base + 1,
-                        "started_sequence": index * 4 + 3,
-                        "ended_sequence": index * 4 + 4,
-                        "outcome": "ok",
-                        "http_status": 200,
-                        "error": null,
-                        "durability_cohort": "post_recovery",
-                        "fault_window_relation": "after_fault"
-                    }),
-                ]
-            })
-            .map(|record| record.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let probe_key = |index: usize| format!("{probe_prefix}object-{index:06}");
+        // The complete probe lifecycle in recorder order: PUT+GET per object,
+        // multipart complete+GET, multipart abort, live LIST, DELETE+GET 404
+        // per object, empty LIST. Sequences form one complete monotonic range.
+        let mut probe_history = Vec::<serde_json::Value>::new();
+        let mut probe_record = |kind: &str,
+                                key: String,
+                                sha: Option<&str>,
+                                outcome: &str,
+                                status: u16,
+                                listed: Option<Vec<String>>| {
+            let ordinal = probe_history.len() as u64 + 1;
+            let mut record = json!({
+                "id": format!("op-{ordinal:06}"),
+                "scenario": scenario,
+                "run_id": run_id,
+                "kind": kind,
+                "bucket": "bucket",
+                "key": key,
+                "value_sha256": sha,
+                "size_bytes": sha.map(|_| 4096),
+                "started_at_ms": 71 + ordinal,
+                "ended_at_ms": 71 + ordinal,
+                "started_sequence": ordinal * 2 - 1,
+                "ended_sequence": ordinal * 2,
+                "outcome": outcome,
+                "http_status": status,
+                "error": null,
+                "durability_cohort": "post_recovery",
+                "fault_window_relation": "after_fault"
+            });
+            if let Some(listed) = listed {
+                record["listed_keys"] = json!(listed);
+            }
+            probe_history.push(record);
+        };
+        for index in 0..8 {
+            let sha = format!("probe-sha-{index}");
+            probe_record("put", probe_key(index), Some(&sha), "ok", 200, None);
+            probe_record("get", probe_key(index), Some(&sha), "ok", 200, None);
+        }
+        probe_record(
+            "create_multipart_upload",
+            probe_key(8),
+            None,
+            "ok",
+            200,
+            None,
+        );
+        probe_record("upload_part", probe_key(8), None, "ok", 200, None);
+        probe_record(
+            "complete_multipart_upload",
+            probe_key(8),
+            Some("probe-multipart-sha"),
+            "ok",
+            200,
+            None,
+        );
+        probe_record(
+            "get",
+            probe_key(8),
+            Some("probe-multipart-sha"),
+            "ok",
+            200,
+            None,
+        );
+        probe_record(
+            "create_multipart_upload",
+            probe_key(9),
+            None,
+            "ok",
+            200,
+            None,
+        );
+        probe_record(
+            "abort_multipart_upload",
+            probe_key(9),
+            None,
+            "ok",
+            204,
+            None,
+        );
+        probe_record(
+            "list",
+            probe_prefix.clone(),
+            None,
+            "ok",
+            200,
+            Some((0..9).map(probe_key).collect()),
+        );
+        for index in 0..9 {
+            probe_record("delete", probe_key(index), None, "ok", 204, None);
+            probe_record("get", probe_key(index), None, "not_found", 404, None);
+        }
+        probe_record(
+            "list",
+            probe_prefix.clone(),
+            None,
+            "ok",
+            200,
+            Some(Vec::new()),
+        );
         fs::write(
             case_dir.join(POST_RECOVERY_WRITE_HISTORY_ARTIFACT),
-            format!("{probe_history}\n"),
+            format!(
+                "{}\n",
+                probe_history
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
         )
         .expect("probe history");
         write_json(
@@ -12320,7 +12693,7 @@ mod tests {
                 "run_id": run_id,
                 "key_prefix": probe_prefix,
                 "started_at_ms": 71,
-                "completed_at_ms": 95,
+                "completed_at_ms": 200,
                 "objects": 8,
                 "puts_verified": 8,
                 "deletes_verified_absent": 8,
@@ -12436,6 +12809,328 @@ mod tests {
     }
 
     #[test]
+    fn post_recovery_probe_history_must_evidence_every_claimed_transition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        validate_fault_artifacts(&success_options(dir.path())).expect("complete probe history");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let history_path = case_dir.join(POST_RECOVERY_WRITE_HISTORY_ARTIFACT);
+        let records = fs::read_to_string(&history_path)
+            .expect("history")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("record"))
+            .collect::<Vec<_>>();
+        let prefix = "fault-test-post-recovery/run-00000000-0000-4000-8000-000000000001/";
+        let position = |kind: &str, key: &str, outcome: &str| {
+            records
+                .iter()
+                .position(|record| {
+                    record["kind"] == kind && record["key"] == key && record["outcome"] == outcome
+                })
+                .expect("fixture record")
+        };
+        let reject = |mutate: &dyn Fn(&mut Vec<serde_json::Value>), expected: &str| {
+            let mut edited = records.clone();
+            mutate(&mut edited);
+            // Recorder sequences follow file position, so a reordered or
+            // appended record keeps the history a complete monotonic range and
+            // only the probe-level ordering check can reject it.
+            for (index, record) in edited.iter_mut().enumerate() {
+                let ordinal = index as u64 + 1;
+                record["started_sequence"] = json!(ordinal * 2 - 1);
+                record["ended_sequence"] = json!(ordinal * 2);
+                record["started_at_ms"] = json!(71 + ordinal);
+                record["ended_at_ms"] = json!(71 + ordinal);
+            }
+            fs::write(
+                &history_path,
+                format!(
+                    "{}\n",
+                    edited
+                        .iter()
+                        .map(serde_json::Value::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            )
+            .expect("rewrite history");
+            let error = validate_fault_artifacts(&success_options(dir.path()))
+                .expect_err("edited probe history must not validate");
+            assert!(error.to_string().contains(expected), "{error:#}");
+        };
+
+        // The report counts a DELETE that history says failed.
+        let failed_delete = position("delete", &format!("{prefix}object-000000"), "ok");
+        reject(
+            &|records| {
+                records[failed_delete]["outcome"] = json!("failed");
+                records[failed_delete]["http_status"] = json!(503);
+            },
+            "a passed probe has no failed requests",
+        );
+        // The verifying GET returned different bytes than the PUT sent.
+        let verify_get = position("get", &format!("{prefix}object-000001"), "ok");
+        reject(
+            &|records| records[verify_get]["value_sha256"] = json!("tampered"),
+            "does not read back the acknowledged Put",
+        );
+        // The multipart completion was never read back with its bytes.
+        let multipart_get = position("get", &format!("{prefix}object-000008"), "ok");
+        reject(
+            &|records| records[multipart_get]["size_bytes"] = json!(1),
+            "does not read back the acknowledged CompleteMultipartUpload",
+        );
+        // The live LIST omitted a probe object.
+        let live_list = position("list", prefix, "ok");
+        reject(
+            &|records| {
+                records[live_list]["listed_keys"]
+                    .as_array_mut()
+                    .expect("listed keys")
+                    .pop();
+            },
+            "does not show exactly the live probe objects",
+        );
+        // The final LIST still advertised a deleted key.
+        let empty_list = records.len() - 1;
+        reject(
+            &|records| {
+                records[empty_list]["listed_keys"] = json!([format!("{prefix}object-000000")]);
+            },
+            "does not prove the prefix empty",
+        );
+        // A DELETE the report claims is missing from history entirely.
+        let missing_delete = position("delete", &format!("{prefix}object-000002"), "ok");
+        reject(
+            &|records| records[missing_delete]["kind"] = json!("head"),
+            "which the probe never issues",
+        );
+        // The multipart abort was not evidenced.
+        let abort = position(
+            "abort_multipart_upload",
+            &format!("{prefix}object-000009"),
+            "ok",
+        );
+        reject(
+            &|records| {
+                records[abort]["kind"] = json!("upload_part");
+                records[abort]["key"] = json!(format!("{prefix}object-000008"));
+            },
+            "exactly one acknowledged AbortMultipartUpload",
+        );
+        // The post-delete GET did not observe absence.
+        let absent_get = position("get", &format!("{prefix}object-000003"), "not_found");
+        reject(
+            &|records| {
+                records[absent_get]["outcome"] = json!("ok");
+                records[absent_get]["http_status"] = json!(200);
+                records[absent_get]["value_sha256"] = json!("probe-sha-3");
+                records[absent_get]["size_bytes"] = json!(4096);
+            },
+            "does not prove",
+        );
+
+        // Ordering tampers: the records stay individually valid but move.
+        let move_record = |records: &mut Vec<serde_json::Value>, from: usize, to: usize| {
+            let record = records.remove(from);
+            records.insert(to, record);
+        };
+        // A DELETE issued before its verifying GET.
+        let delete_zero = position("delete", &format!("{prefix}object-000000"), "ok");
+        let verify_zero = position("get", &format!("{prefix}object-000000"), "ok");
+        reject(
+            &|records| move_record(records, delete_zero, verify_zero),
+            "did not follow its verified read",
+        );
+        // The live LIST taken after the first DELETE.
+        reject(
+            &|records| move_record(records, live_list, delete_zero),
+            "does not show exactly the live probe objects",
+        );
+        // The empty LIST taken before the last DELETE.
+        let delete_last = position("delete", &format!("{prefix}object-000008"), "ok");
+        reject(
+            &|records| move_record(records, empty_list, delete_last),
+            "does not prove the prefix empty",
+        );
+        // A third GET for one object.
+        let mut duplicate_get = records[verify_zero].clone();
+        duplicate_get["id"] = json!(format!("op-{:06}", records.len() + 1));
+        reject(
+            &|records| records.push(duplicate_get.clone()),
+            "exactly two GETs",
+        );
+        // A PUT that recorded no payload hash cannot be read back.
+        let put_zero = position("put", &format!("{prefix}object-000000"), "ok");
+        reject(
+            &|records| records[put_zero]["value_sha256"] = json!(null),
+            "records no payload hash",
+        );
+
+        // The report's object count is bound to the workload plan.
+        fs::write(
+            &history_path,
+            format!(
+                "{}\n",
+                records
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )
+        .expect("restore history");
+        let report_path = case_dir.join(POST_RECOVERY_WRITE_REPORT_ARTIFACT);
+        let mut report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&report_path).expect("report")).expect("json");
+        report["objects"] = json!(7);
+        report["puts_verified"] = json!(7);
+        report["deletes_verified_absent"] = json!(7);
+        write_json(&case_dir, POST_RECOVERY_WRITE_REPORT_ARTIFACT, &report);
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("fewer objects than the plan sizes the probe at");
+        assert!(
+            error
+                .to_string()
+                .contains("the workload plan sizes the probe at 8"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recovery_health_baseline_must_bind_to_the_pre_fault_event_and_its_geometry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let path = case_dir.join(RECOVERY_HEALTH_ARTIFACT);
+        let report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("report")).expect("json");
+
+        // Baseline and observation agree on three drives while the declared
+        // geometry still implies four: the report is internally consistent
+        // but describes a cluster that silently lost a drive.
+        let mut dropped = report.clone();
+        dropped["baseline"]["driveUuids"] = json!(["d0", "d1", "d2"]);
+        dropped["baseline"]["serverEndpoints"] =
+            json!(["http://p0:9000", "http://p1:9000", "http://p2:9000"]);
+        dropped["observation"]["drives"]
+            .as_array_mut()
+            .expect("drives")
+            .pop();
+        dropped["observation"]["onlineDrives"] = json!(3);
+        write_json(&case_dir, RECOVERY_HEALTH_ARTIFACT, &dropped);
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("a dropped drive cannot certify recovery");
+        assert!(
+            format!("{error:#}").contains("lists 3 drives but the erasure layout declares 4"),
+            "{error:#}"
+        );
+
+        // A consistent report whose baseline is not the one the runner
+        // captured before the fault.
+        let mut foreign = report.clone();
+        foreign["baseline"]["deploymentId"] = json!("deployment-2");
+        foreign["observation"]["deploymentId"] = json!("deployment-2");
+        write_json(&case_dir, RECOVERY_HEALTH_ARTIFACT, &foreign);
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("baseline must match the pre-fault event");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the recovery-health-baseline run event"),
+            "{error:#}"
+        );
+
+        // The pre-fault event itself is required.
+        write_json(&case_dir, RECOVERY_HEALTH_ARTIFACT, &report);
+        let events_path = case_dir.join("run-events.jsonl");
+        let without_baseline = fs::read_to_string(&events_path)
+            .expect("events")
+            .lines()
+            .filter(|line| !line.contains("recovery-health-baseline"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&events_path, without_baseline).expect("rewrite events");
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("missing baseline event");
+        assert!(
+            error
+                .to_string()
+                .contains("lacks a successful recovery-health-baseline event"),
+            "{error:#}"
+        );
+
+        // The event must sit between the baseline observation (5) and fault
+        // activation (10); an event stamped outside that window cannot be
+        // the capture the runner made before the fault.
+        write_success_artifacts(dir.path(), "io-eio");
+        let events = fs::read_to_string(&events_path).expect("events");
+        for (at_ms, reason) in [
+            (4, "before the baseline observation"),
+            (11, "after fault apply"),
+        ] {
+            let stamped = events.replace("\"at_ms\":6,", &format!("\"at_ms\":{at_ms},"));
+            assert_ne!(stamped, events, "fixture event must be re-stamped");
+            fs::write(&events_path, stamped).expect("rewrite events");
+            let error = validate_fault_artifacts(&success_options(dir.path())).expect_err(reason);
+            assert!(
+                error.to_string().contains(
+                    "was not recorded between the baseline observation and fault activation"
+                ),
+                "{reason}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_recovery_write_probe_must_start_after_lifecycle_evidence_is_persisted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let events_path = case_dir.join("run-events.jsonl");
+        let events = fs::read_to_string(&events_path).expect("events");
+        let lines = events.lines().collect::<Vec<_>>();
+        let evidence = lines
+            .iter()
+            .position(|line| line.contains("\"stage\":\"recovery-evidence\""))
+            .expect("fixture evidence event");
+        let probe = lines
+            .iter()
+            .position(|line| line.contains("\"stage\":\"post-recovery-write\""))
+            .expect("fixture probe event");
+        assert!(evidence < probe);
+
+        // The probe started before fault-evidence.json existed: the runner
+        // ordering this validator enforces was violated.
+        let mut swapped = lines.clone();
+        swapped.swap(evidence, probe);
+        fs::write(&events_path, swapped.join("\n")).expect("rewrite events");
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("probe started before evidence was persisted");
+        assert!(
+            error
+                .to_string()
+                .contains("started before fault-evidence.json was persisted"),
+            "{error:#}"
+        );
+
+        let without_evidence = lines
+            .iter()
+            .filter(|line| !line.contains("\"stage\":\"recovery-evidence\""))
+            .copied()
+            .collect::<Vec<_>>();
+        fs::write(&events_path, without_evidence.join("\n")).expect("rewrite events");
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("missing evidence event");
+        assert!(
+            error
+                .to_string()
+                .contains("lacks a successful recovery-evidence event"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn availability_artifact_must_bind_to_the_cohort_and_workload_disruptions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = "run-00000000-0000-4000-8000-000000000001";
@@ -12449,6 +13144,7 @@ mod tests {
             workload_concurrency: 4,
             require_client_disruption: false,
             recovery_stability_reread_seconds: 60,
+            min_availability_percent: Some(99),
         };
         let evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
             "scenario": "pod-failure",
@@ -12464,6 +13160,25 @@ mod tests {
             "workload_snapshots": []
         }))
         .expect("evidence");
+        let counts = |ok: usize, failed: usize| json!({"ok": ok, "not_found": 0, "failed": failed, "timeout": 0, "unknown": 0});
+        let summary_with = |put: (usize, usize), get: (usize, usize), delete: (usize, usize)| {
+            serde_json::from_value::<WorkloadSummaryArtifact>(json!({
+                "scenario": "pod-failure",
+                "run_id": run_id,
+                "seed": 42,
+                "object_count": 12,
+                "concurrency": 4,
+                "recommitted_after_recovery": 0,
+                "puts": counts(put.0, put.1),
+                "gets": counts(get.0, get.1),
+                "deletes": counts(delete.0, delete.1),
+                "lists": counts(100, 0),
+                "multipart_completes": counts(100, 0),
+                "multipart_aborts": counts(100, 0)
+            }))
+            .expect("workload summary")
+        };
+        let summary = summary_with((199, 1), (199, 1), (99, 1));
         let family = |name: &str, total: usize, disrupted: usize| {
             json!({
                 "family": name,
@@ -12495,26 +13210,69 @@ mod tests {
                 dir.path().join(AVAILABILITY_REPORT_ARTIFACT),
             )])
         };
+        let validate = |report: &serde_json::Value,
+                        metadata: &RunMetadataArtifact,
+                        summary: &WorkloadSummaryArtifact| {
+            validate_availability_artifact(
+                &write(report),
+                metadata,
+                ArtifactIdentityPolicy::LegacyCompatible,
+                &evidence,
+                summary,
+                12,
+                99,
+            )
+        };
 
-        validate_availability_artifact(
-            &write(&report),
-            &metadata,
-            ArtifactIdentityPolicy::LegacyCompatible,
-            &evidence,
-            12,
-        )
-        .expect("consistent availability report");
+        validate(&report, &metadata, &summary).expect("consistent availability report");
+
+        // A family whose counts match but whose stated percentage does not
+        // is not the report the runtime would have written.
+        report["workload"][0]["success_percent"] = json!(100);
+        let error = validate(&report, &metadata, &summary).expect_err("wrong success percentage");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match workload-summary.json put"),
+            "{error:#}"
+        );
+        report["workload"][0]["success_percent"] = json!(99);
+
+        // A run cannot validate against a floor below the catalog's, even
+        // when its own metadata agrees with the report.
+        let mut lowered_metadata = RunMetadataArtifact {
+            scenario: "pod-failure".to_string(),
+            run_id: run_id.to_string(),
+            context: "real-cluster".to_string(),
+            storage_class: "fast-csi".to_string(),
+            rustfs_image: "rustfs:test".to_string(),
+            workload_objects: 12,
+            workload_concurrency: 4,
+            require_client_disruption: false,
+            recovery_stability_reread_seconds: 60,
+            min_availability_percent: Some(98),
+        };
+        report["min_success_percent"] = json!(98);
+        let error = validate(&report, &lowered_metadata, &summary)
+            .expect_err("floor below the catalog floor");
+        assert!(
+            error
+                .to_string()
+                .contains("is below the catalog availability floor 99"),
+            "{error:#}"
+        );
+        // Tightening the floor is allowed and re-derived per family.
+        lowered_metadata.min_availability_percent = Some(100);
+        report["min_success_percent"] = json!(100);
+        let error = validate(&report, &lowered_metadata, &summary)
+            .expect_err("a 100% floor tolerates no disruption");
+        assert!(error.to_string().contains("did not pass"), "{error:#}");
+        report["min_success_percent"] = json!(99);
 
         report["read_probe"]["objects"] = json!(5);
         report["read_probe"]["verified"] = json!(5);
-        let error = validate_availability_artifact(
-            &write(&report),
-            &metadata,
-            ArtifactIdentityPolicy::LegacyCompatible,
-            &evidence,
-            12,
-        )
-        .expect_err("probe smaller than the prefilled cohort");
+        let error = validate(&report, &metadata, &summary)
+            .expect_err("probe smaller than the prefilled cohort");
         assert!(
             error.to_string().contains("complete prefilled cohort"),
             "{error:#}"
@@ -12523,31 +13281,67 @@ mod tests {
         report["read_probe"]["objects"] = json!(6);
         report["read_probe"]["verified"] = json!(6);
         report["workload"][2] = family("delete", 100, 0);
-        let error = validate_availability_artifact(
-            &write(&report),
-            &metadata,
-            ArtifactIdentityPolicy::LegacyCompatible,
-            &evidence,
-            12,
-        )
-        .expect_err("disruption count drift from fault-evidence.json");
+        let error = validate(&report, &metadata, &summary)
+            .expect_err("family drift from workload-summary.json");
         assert!(
-            error.to_string().contains("client_disruptions"),
+            error
+                .to_string()
+                .contains("does not match workload-summary.json delete"),
             "{error:#}"
         );
 
         report["workload"][2] = family("delete", 100, 1);
         report["workload"][0] = family("put", 100, 2);
         report["workload"][1] = family("get", 200, 0);
-        let error = validate_availability_artifact(
-            &write(&report),
-            &metadata,
-            ArtifactIdentityPolicy::LegacyCompatible,
-            &evidence,
-            12,
-        )
-        .expect_err("a family below the floor cannot pass");
+        let error = validate(&report, &metadata, &summary)
+            .expect_err("a family below the floor cannot pass");
         assert!(error.to_string().contains("did not pass"), "{error:#}");
+
+        // Two failures moved from a 50-operation PUT family (where they break
+        // the 99% floor) into a 1000-operation GET family (where they pass)
+        // keep the total at 3 but no longer describe the workload that ran.
+        let shifted_summary = summary_with((48, 2), (999, 1), (100, 0));
+        report["workload"][0] = family("put", 50, 0);
+        report["workload"][1] = family("get", 1000, 3);
+        report["workload"][2] = family("delete", 100, 0);
+        let error = validate(&report, &metadata, &shifted_summary)
+            .expect_err("disruptions shifted between families");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match workload-summary.json put"),
+            "{error:#}"
+        );
+        report["workload"][0] = family("put", 50, 2);
+        report["workload"][1] = family("get", 1000, 1);
+        let error = validate(&report, &metadata, &shifted_summary)
+            .expect_err("the honest per-family numbers fail the floor");
+        assert!(error.to_string().contains("did not pass"), "{error:#}");
+
+        // The floor itself is bound to run-metadata.json.
+        report["workload"][0] = family("put", 200, 1);
+        report["workload"][1] = family("get", 200, 1);
+        report["workload"][2] = family("delete", 100, 1);
+        report["min_success_percent"] = json!(90);
+        let error =
+            validate(&report, &metadata, &summary).expect_err("laxer floor than configured");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match run-metadata.json min_availability_percent 99"),
+            "{error:#}"
+        );
+        report["min_success_percent"] = json!(99);
+        let mut legacy_metadata = metadata;
+        legacy_metadata.min_availability_percent = None;
+        let error = validate(&report, &legacy_metadata, &summary)
+            .expect_err("availability scenarios require the persisted floor");
+        assert!(
+            error
+                .to_string()
+                .contains("min_availability_percent is required"),
+            "{error:#}"
+        );
     }
 
     #[test]

@@ -195,17 +195,17 @@ async fn run_fault_case(
             let recovered = run
                 .recover_access(&mut prepared, &target, &mut staged_multipart_uploads)
                 .await?;
-            deadline
-                .run(run.probe_post_recovery_writes(&prepared.s3))
-                .await?;
+            // The lifecycle evidence is complete once recovery finished, so it
+            // is persisted before the write gate: a product failure found by
+            // the probe must still leave fault-evidence.json behind for the
+            // suite's failed-attempt accounting.
             let mut evidence =
                 run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
+            run.probe_post_recovery_writes(&prepared.s3).await?;
             deadline
                 .run(run.verify_recovered(&prepared.s3, &mut workload.workload))
                 .await?;
-            deadline
-                .run(run.recommit(&prepared.s3, &mut workload.workload))
-                .await?;
+            run.recommit(&prepared.s3, &mut workload.workload).await?;
             deadline
                 .run(run.verify_final(&prepared.s3, &workload.workload, &mut evidence))
                 .await
@@ -375,6 +375,13 @@ fn initialize_fault_run(
     run_id: &str,
 ) -> Result<FaultRunContext> {
     let spec = scenarios::scenario_spec(&scenario.name)?;
+    if spec.impact_policy.requires_availability() {
+        crate::fault::workload::execution::require_availability_family_totals(
+            &scenario.name,
+            scenario.object_count,
+            config.workload_operation_mix,
+        )?;
+    }
     let run_id = run_id.to_string();
     let workload_seed = config.workload_seed.unwrap_or_else(generated_seed);
     let workload_plan = WorkloadPlan::seeded_with_profile(

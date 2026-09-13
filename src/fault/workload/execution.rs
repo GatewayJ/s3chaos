@@ -21,14 +21,15 @@ use crate::fault::{
     quorum::{QuorumCaseClass, QuorumMutationClass},
     workload::{
         GetObjectResult, ObjectSpec, S3WorkloadClient, StagedMultipartUpload, WorkloadOperation,
-        WorkloadPlan, sha256_hex,
+        WorkloadOperationMix, WorkloadPlan, sha256_hex,
     },
 };
 use crate::framework::{artifacts::ArtifactCollector, command::CommandSpec};
 use anyhow::{Context, Result, bail, ensure};
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, future, stream};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
@@ -859,11 +860,17 @@ fn ranged_get_range(percent: u8, seed: u64, index: usize, size_bytes: usize) -> 
     Some(ByteRange { offset, length })
 }
 
+/// Re-PUT every unconfirmed candidate. The suite deadline is consulted only
+/// before a candidate starts (per key and at the task source), never by
+/// cancelling a request in flight, so every started re-PUT finishes its
+/// history record; candidates not reached are simply absent from the report
+/// and the caller surfaces the exhausted budget.
 pub(in crate::fault) async fn recommit_unconfirmed_objects(
     s3: &S3WorkloadClient,
     history: &Recorder,
     objects: &[RecommitCandidate],
     concurrency: usize,
+    deadline: RunDeadline,
 ) -> RecommitReport {
     let tasks = unconfirmed_objects_by_key(objects)
         .into_iter()
@@ -873,6 +880,9 @@ pub(in crate::fault) async fn recommit_unconfirmed_objects(
             async move {
                 let mut attempts = Vec::with_capacity(objects.len());
                 for candidate in objects {
+                    if deadline.check().is_err() {
+                        break;
+                    }
                     let prepared = candidate.object.prepare();
                     let attempt = match s3.put_object_record(&prepared, &history).await {
                         Ok(record) => {
@@ -897,7 +907,8 @@ pub(in crate::fault) async fn recommit_unconfirmed_objects(
             }
         });
     let mut attempts = stream::iter(tasks)
-        .buffer_unordered(concurrency)
+        .take_while(|_| future::ready(deadline.check().is_ok()))
+        .buffer_unordered(concurrency.max(1))
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -2365,6 +2376,7 @@ mod tests {
                 },
             ],
             2,
+            crate::fault::shutdown::RunDeadline::default(),
         )
         .await;
         assert_eq!(report.attempted, 2);
@@ -2743,10 +2755,85 @@ pub(in crate::fault) struct FamilyAvailability {
     pub(in crate::fault) success_percent: u8,
 }
 
+/// Fewest operations a family must have issued under the fault before its
+/// success ratio counts as availability evidence. Below this a single
+/// disruption swings the ratio by more than any floor tolerates (one failure
+/// in a one-operation family is 0% served), so the family fails closed as
+/// "not exercised" instead of passing on the one-disruption allowance.
+pub(in crate::fault) const MIN_AVAILABILITY_FAMILY_TOTAL: usize = 20;
+
+/// Operations the mixed workload will issue per summary family under the
+/// fault for `object_count` objects: half the objects are prefilled and the
+/// rest drive `operation_at`; each Multipart operation completes one upload
+/// and aborts another. PUT/DELETE verification GETs are not counted, so these
+/// are lower bounds on the totals the availability report will see.
+pub(crate) fn planned_family_totals(
+    object_count: usize,
+    operation_mix: WorkloadOperationMix,
+) -> [(&'static str, usize); 6] {
+    let mixed_count = object_count - object_count / 2;
+    let (mut puts, mut gets, mut lists, mut deletes, mut multiparts) = (0, 0, 0, 0, 0);
+    for offset in 0..mixed_count {
+        match operation_mix.operation_at(offset) {
+            WorkloadOperation::Put | WorkloadOperation::Overwrite => puts += 1,
+            WorkloadOperation::Get => gets += 1,
+            WorkloadOperation::List => lists += 1,
+            WorkloadOperation::Delete => deletes += 1,
+            WorkloadOperation::Multipart => multiparts += 1,
+        }
+    }
+    [
+        ("put", puts),
+        ("get", gets),
+        ("delete", deletes),
+        ("list", lists),
+        ("multipart_complete", multiparts),
+        ("multipart_abort", multiparts),
+    ]
+}
+
+/// Plan-time gate for availability scenarios: a plan whose mixed workload
+/// cannot reach [`MIN_AVAILABILITY_FAMILY_TOTAL`] in every family would only
+/// fail after the whole fault window, so it is rejected before anything runs,
+/// naming an object count that satisfies the configured operation mix.
+pub(crate) fn require_availability_family_totals(
+    scenario: &str,
+    object_count: usize,
+    operation_mix: WorkloadOperationMix,
+) -> Result<()> {
+    let short = planned_family_totals(object_count, operation_mix)
+        .into_iter()
+        .filter(|(_, total)| *total < MIN_AVAILABILITY_FAMILY_TOTAL)
+        .map(|(family, total)| format!("{total} {family}"))
+        .collect::<Vec<_>>();
+    if short.is_empty() {
+        return Ok(());
+    }
+    let lightest_weight = [
+        operation_mix.put + operation_mix.overwrite,
+        operation_mix.get,
+        operation_mix.list,
+        operation_mix.delete,
+        operation_mix.multipart,
+    ]
+    .into_iter()
+    .min()
+    .map_or(1, |weight| usize::try_from(weight).unwrap_or(1).max(1));
+    let required_mixed = MIN_AVAILABILITY_FAMILY_TOTAL.div_ceil(lightest_weight)
+        * usize::try_from(operation_mix.total_weight()).unwrap_or(usize::MAX);
+    let required_objects = required_mixed.saturating_mul(2);
+    bail!(
+        "availability scenario {scenario} plans only {} operation(s) under the fault with {object_count} workload objects; every family needs at least {MIN_AVAILABILITY_FAMILY_TOTAL} for an availability verdict, so set workload objects to at least {required_objects} for this operation mix",
+        short.join(", ")
+    )
+}
+
 impl FamilyAvailability {
     /// Disruptions the floor tolerates. Percent floors below 100 always allow
     /// at least one disrupted operation so small rehearsal plans are not
-    /// failed by a single port-forward reconnect; 100 stays strict.
+    /// failed by a single port-forward reconnect; 100 stays strict. The
+    /// allowance only applies once the family reaches
+    /// [`MIN_AVAILABILITY_FAMILY_TOTAL`] (see [`Self::meets_floor`]).
     pub(in crate::fault) fn allowed_disruptions(total: usize, min_success_percent: u8) -> usize {
         let proportional = total * usize::from(100 - min_success_percent.min(100)) / 100;
         if min_success_percent < 100 {
@@ -2756,24 +2843,36 @@ impl FamilyAvailability {
         }
     }
 
+    /// The floor verdict derived purely from `(total, disrupted, floor)`, so
+    /// the artifact validator recomputes exactly this from the workload
+    /// summary instead of trusting the report's own verdict.
     pub(in crate::fault) fn meets_floor(&self, min_success_percent: u8) -> bool {
-        self.total > 0
+        self.total >= MIN_AVAILABILITY_FAMILY_TOTAL
             && self.disrupted <= self.total
             && self.disrupted <= Self::allowed_disruptions(self.total, min_success_percent)
     }
 
-    fn from_counts(family: &str, counts: &OutcomeCounts) -> Self {
-        let total = counts.total();
-        let disrupted = counts.disrupted();
-        let success_percent = ((total - disrupted) * 100)
-            .checked_div(total)
-            .map_or(100, |percent| u8::try_from(percent).unwrap_or(0));
+    /// Success percentage is rounded down so a single failure never rounds
+    /// up to 100; an empty family reports 100 and is rejected by the minimum
+    /// total instead.
+    pub(in crate::fault) fn new(family: &str, total: usize, disrupted: usize) -> Self {
+        let success_percent = total
+            .checked_sub(disrupted)
+            .map(|served| served * 100)
+            .and_then(|scaled| scaled.checked_div(total))
+            .map_or(if total == 0 { 100 } else { 0 }, |percent| {
+                u8::try_from(percent).unwrap_or(0)
+            });
         Self {
             family: family.to_string(),
             total,
             disrupted,
             success_percent,
         }
+    }
+
+    fn from_counts(family: &str, counts: &OutcomeCounts) -> Self {
+        Self::new(family, counts.total(), counts.disrupted())
     }
 }
 
@@ -2861,10 +2960,10 @@ impl WorkloadSummary {
         }
         let workload = self.family_availability();
         for family in &workload {
-            if family.total == 0 {
+            if family.total < MIN_AVAILABILITY_FAMILY_TOTAL {
                 violations.push(format!(
-                    "workload family {} was not exercised under the fault",
-                    family.family
+                    "workload family {} issued only {} operation(s) under the fault; at least {MIN_AVAILABILITY_FAMILY_TOTAL} are required for an availability verdict",
+                    family.family, family.total
                 ));
             } else if !family.meets_floor(min_success_percent) {
                 violations.push(format!(
@@ -2986,6 +3085,39 @@ fn get_failure_reason(get: &GetObjectResult) -> String {
     )
 }
 
+/// Run `operations` with bounded concurrency so that every started operation
+/// runs to completion. The suite deadline is consulted only at the source,
+/// when the next operation would start; nothing inside the concurrent set
+/// can short-circuit its siblings, and results are collected rather than
+/// folded so one operation's error surfaces only after the others finished.
+/// A started S3 mutation therefore always finishes its history record (the
+/// client caps it to the remaining budget); a deadline reached mid-phase is
+/// reported after the in-flight operations finalize, never by dropping them.
+async fn finalize_bounded<T, F>(
+    deadline: RunDeadline,
+    concurrency: usize,
+    operations: impl ExactSizeIterator<Item = F>,
+) -> Result<Vec<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    let planned = operations.len();
+    let results = stream::iter(operations)
+        .take_while(|_| future::ready(deadline.check().is_ok()))
+        .buffer_unordered(concurrency.max(1))
+        .collect::<Vec<Result<T>>>()
+        .await;
+    let completed = results.into_iter().collect::<Result<Vec<T>>>()?;
+    if completed.len() < planned {
+        deadline.check()?;
+        bail!(
+            "bounded phase started {} of {planned} operations without a deadline error",
+            completed.len()
+        );
+    }
+    Ok(completed)
+}
+
 /// Write, read back, list, and delete fresh objects after recovery. Every
 /// step must succeed: a recovered cluster that still rejects writes (the
 /// rustfs/rustfs#7361 shape) or lists stale keys fails here even though every
@@ -3026,9 +3158,10 @@ pub(in crate::fault) async fn run_post_recovery_write_probe(
             )
         })
         .collect::<Vec<_>>();
-    let puts_verified = stream::iter(objects.iter())
-        .map(|object| async {
-            deadline.check()?;
+    let puts_verified = finalize_bounded(
+        *deadline,
+        (*concurrency).clamp(1, 8),
+        objects.iter().map(|object| async {
             let put = s3.put_object_record(object, history).await?;
             if put.outcome != OperationOutcome::Ok {
                 record_failure(format!(
@@ -3066,12 +3199,12 @@ pub(in crate::fault) async fn run_post_recovery_write_probe(
                     Ok(false)
                 }
             }
-        })
-        .buffer_unordered((*concurrency).clamp(1, 8))
-        .try_fold(0usize, |verified, ok| async move {
-            Ok(verified + usize::from(ok))
-        })
-        .await?;
+        }),
+    )
+    .await?
+    .into_iter()
+    .filter(|verified| *verified)
+    .count();
 
     // Phase 2: one multipart completion and one multipart abort.
     deadline.check()?;
@@ -3182,9 +3315,10 @@ pub(in crate::fault) async fn run_post_recovery_write_probe(
     if multipart_completes_verified == 1 {
         delete_targets.push(multipart.spec.key.clone());
     }
-    let deletes_verified_absent = stream::iter(delete_targets.iter())
-        .map(|key| async move {
-            deadline.check()?;
+    let deletes_verified_absent = finalize_bounded(
+        *deadline,
+        (*concurrency).clamp(1, 8),
+        delete_targets.iter().map(|key| async move {
             let delete = s3.delete_object_record(key, history).await?;
             if delete.outcome != OperationOutcome::Ok {
                 record_failure(format!(
@@ -3210,12 +3344,12 @@ pub(in crate::fault) async fn run_post_recovery_write_probe(
                 .await;
                 Ok(false)
             }
-        })
-        .buffer_unordered((*concurrency).clamp(1, 8))
-        .try_fold(0usize, |verified, ok| async move {
-            Ok(verified + usize::from(ok))
-        })
-        .await?;
+        }),
+    )
+    .await?
+    .into_iter()
+    .filter(|verified| *verified)
+    .count();
     // Count only the plain objects toward the object contract; the multipart
     // key is verified through its own counter.
     let deletes_verified_absent =
@@ -3260,8 +3394,9 @@ pub(in crate::fault) async fn run_post_recovery_write_probe(
 #[cfg(test)]
 mod post_recovery_tests {
     use super::{
-        AvailabilityReport, FamilyAvailability, OutcomeCounts, PostRecoveryWriteReport,
-        ReadProbeSummary, post_recovery_object_count, post_recovery_object_size,
+        AvailabilityReport, FamilyAvailability, MIN_AVAILABILITY_FAMILY_TOTAL, OutcomeCounts,
+        PostRecoveryWriteReport, ReadProbeSummary, WorkloadSummary, post_recovery_object_count,
+        post_recovery_object_size,
     };
     use crate::fault::history::OperationOutcome;
 
@@ -3306,6 +3441,273 @@ mod post_recovery_tests {
         assert!(!FamilyAvailability::from_counts("put", &counts(48, 0, 2, 0)).meets_floor(99));
         assert!(!FamilyAvailability::from_counts("put", &counts(49, 0, 1, 0)).meets_floor(100));
         assert!(!FamilyAvailability::from_counts("put", &counts(0, 0, 0, 0)).meets_floor(99));
+    }
+
+    #[test]
+    fn availability_floor_boundaries_are_exact_and_small_families_fail_closed() {
+        let meets = |total: usize, disrupted: usize, floor: u8| {
+            FamilyAvailability::new("put", total, disrupted).meets_floor(floor)
+        };
+        // Exactly at the proportional allowance on both sides of rounding.
+        assert!(meets(100, 1, 99));
+        assert!(!meets(100, 2, 99));
+        assert!(meets(199, 1, 99)); // 199 * 1 / 100 rounds down to 1
+        assert!(!meets(199, 2, 99));
+        assert!(meets(200, 2, 99));
+        assert!(!meets(200, 3, 99));
+        assert!(meets(1000, 10, 99));
+        assert!(!meets(1000, 11, 99));
+        assert!(meets(1000, 100, 90));
+        assert!(!meets(1000, 101, 90));
+        // The one-disruption allowance applies only above the minimum total.
+        assert!(meets(MIN_AVAILABILITY_FAMILY_TOTAL, 1, 99));
+        assert!(!meets(MIN_AVAILABILITY_FAMILY_TOTAL, 2, 99));
+        assert!(!meets(MIN_AVAILABILITY_FAMILY_TOTAL - 1, 0, 99));
+        assert!(!meets(1, 1, 99), "0% served can never satisfy a 99% floor");
+        assert!(
+            !meets(1, 0, 99),
+            "one operation is not availability evidence"
+        );
+        // A 100% floor tolerates nothing.
+        assert!(meets(MIN_AVAILABILITY_FAMILY_TOTAL, 0, 100));
+        assert!(!meets(1000, 1, 100));
+        // Rounded-down percentages and the report's own verdict agree.
+        let family = FamilyAvailability::new("get", 199, 2);
+        assert_eq!(family.success_percent, 98);
+        assert_eq!(FamilyAvailability::new("get", 200, 2).success_percent, 99);
+        assert_eq!(FamilyAvailability::new("get", 1, 1).success_percent, 0);
+        assert_eq!(FamilyAvailability::new("get", 5, 6).success_percent, 0);
+        let report = WorkloadSummary {
+            scenario: "pod-failure".to_string(),
+            run_id: "run-1".to_string(),
+            seed: 1,
+            object_count: 12,
+            concurrency: 4,
+            total_payload_bytes: 0,
+            puts: counts(19, 0, 0, 0),
+            gets: counts(197, 0, 2, 0),
+            deletes: counts(100, 0, 0, 0),
+            lists: counts(100, 0, 0, 0),
+            multipart_completes: counts(100, 0, 0, 0),
+            multipart_aborts: counts(100, 0, 0, 0),
+            recommit_candidates: None,
+            recommitted_after_recovery: 0,
+        }
+        .availability_report(
+            ReadProbeSummary {
+                objects: 6,
+                verified: 6,
+                failures: Vec::new(),
+            },
+            99,
+            None,
+        );
+        assert!(!report.passed);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.contains("put issued only 19 operation(s)")),
+            "{:?}",
+            report.violations
+        );
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.contains("get succeeded 98%")),
+            "{:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn availability_plans_below_the_family_minimum_are_rejected_before_running() {
+        use super::{planned_family_totals, require_availability_family_totals};
+        use crate::fault::workload::WorkloadOperationMix;
+
+        let uniform = WorkloadOperationMix::default();
+        assert_eq!(
+            planned_family_totals(240, uniform)
+                .iter()
+                .map(|(_, total)| *total)
+                .min(),
+            Some(MIN_AVAILABILITY_FAMILY_TOTAL),
+            "240 objects is the exact minimum for six equal-weight families"
+        );
+        require_availability_family_totals("pod-kill-one", 240, uniform)
+            .expect("240 objects plan 20 operations per family");
+        let error = require_availability_family_totals("pod-kill-one", 64, uniform)
+            .expect_err("64 objects cannot reach the family minimum");
+        let message = error.to_string();
+        assert!(message.contains("12 put"), "{message}");
+        assert!(message.contains("5 get"), "{message}");
+        assert!(message.contains("5 multipart_abort"), "{message}");
+        assert!(
+            message.contains("set workload objects to at least 240"),
+            "{message}"
+        );
+        // 239 objects still plan 120 mixed operations; 238 plan 119, leaving
+        // the last family (multipart) at 19.
+        require_availability_family_totals("pod-failure", 239, uniform).expect("still 20 each");
+        assert!(require_availability_family_totals("pod-failure", 238, uniform).is_err());
+
+        // A skewed mix needs proportionally more objects for its lightest family.
+        let skewed = WorkloadOperationMix {
+            multipart: 10,
+            ..WorkloadOperationMix::default()
+        };
+        let error = require_availability_family_totals("pod-failure", 240, skewed)
+            .expect_err("the light families fall below the minimum");
+        assert!(error.to_string().contains("at least 600"), "{error:#}");
+        require_availability_family_totals("pod-failure", 600, skewed).expect("600 objects");
+    }
+
+    #[tokio::test]
+    async fn recommit_starts_no_candidate_once_the_suite_budget_is_exhausted() {
+        use super::{RecommitCandidate, recommit_unconfirmed_objects};
+        use crate::fault::{history::Recorder, shutdown::RunDeadline, workload::ObjectSpec};
+
+        let client = crate::fault::workload::S3WorkloadClient::new(
+            "http://127.0.0.1:1",
+            "bucket",
+            "test-access",
+            "test-secret",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = Recorder::create(dir.path().join("history.jsonl"), "io-eio", "run-1")
+            .expect("recorder");
+        let candidates = (0..3)
+            .map(|index| RecommitCandidate {
+                object: ObjectSpec::prepare_seeded("run-1", index, 16, 7).spec,
+                source_operation_id: format!("op-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let exhausted = RunDeadline::new(Some(0)).expect("deadline");
+
+        let report =
+            recommit_unconfirmed_objects(&client, &history, &candidates, 2, exhausted).await;
+
+        assert_eq!(report.attempted, 0, "no re-PUT starts after the budget");
+        assert!(
+            history.records().is_empty(),
+            "no history record without a started request"
+        );
+        assert!(
+            !report.has_failures(),
+            "an exhausted budget is not a product recommit failure"
+        );
+        assert!(exhausted.check().is_err());
+    }
+
+    /// Records whether an operation that began was polled to completion or
+    /// dropped mid-flight, standing in for a mutation's history record. The
+    /// deadline test below proves the source-side cut (only the concurrent
+    /// set starts); the never-drops property is proven by the sibling-error
+    /// test, where an early error would otherwise cancel the others.
+    struct Started {
+        index: usize,
+        finished: bool,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Drop for Started {
+        fn drop(&mut self) {
+            self.log.lock().expect("log").push(format!(
+                "{} {}",
+                if self.finished { "finished" } else { "dropped" },
+                self.index
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_bounded_finishes_in_flight_operations_past_the_deadline() {
+        use crate::fault::shutdown::{RunDeadline, SuiteDeadlineExceeded};
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deadline = RunDeadline::new(Some(1)).expect("deadline");
+        let operations = (0..12).map(|index| {
+            let log = std::sync::Arc::clone(&log);
+            async move {
+                let mut started = Started {
+                    index,
+                    finished: false,
+                    log,
+                };
+                // Every in-flight request outlives the suite deadline, as a
+                // PUT capped to the remaining budget would.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                started.finished = true;
+                Ok::<usize, anyhow::Error>(index)
+            }
+        });
+
+        let error = super::finalize_bounded(deadline, 4, operations)
+            .await
+            .expect_err("the deadline is reported once the in-flight set finalized");
+
+        assert!(error.is::<SuiteDeadlineExceeded>(), "{error:#}");
+        let mut log = log.lock().expect("log").clone();
+        log.sort();
+        assert_eq!(
+            log,
+            ["finished 0", "finished 1", "finished 2", "finished 3"],
+            "exactly the concurrent set started, and none of it was dropped mid-flight"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_bounded_never_drops_siblings_when_one_operation_errors() {
+        use crate::fault::shutdown::RunDeadline;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let operations = (0..6).map(|index| {
+            let log = std::sync::Arc::clone(&log);
+            async move {
+                let mut started = Started {
+                    index,
+                    finished: false,
+                    log,
+                };
+                if index == 0 {
+                    anyhow::bail!("recorder write failed");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                started.finished = true;
+                Ok::<usize, anyhow::Error>(index)
+            }
+        });
+
+        let error = super::finalize_bounded(RunDeadline::default(), 4, operations)
+            .await
+            .expect_err("the operation error is surfaced");
+
+        assert!(error.to_string().contains("recorder write failed"));
+        let mut log = log.lock().expect("log").clone();
+        log.sort();
+        assert_eq!(
+            log,
+            [
+                "dropped 0",
+                "finished 1",
+                "finished 2",
+                "finished 3",
+                "finished 4",
+                "finished 5"
+            ],
+            "an early error never cancels its siblings, and without a deadline every operation runs"
+        );
+
+        let completed = super::finalize_bounded(
+            RunDeadline::default(),
+            2,
+            (0..3).map(|index| async move { Ok::<usize, anyhow::Error>(index) }),
+        )
+        .await
+        .expect("all operations complete");
+        assert_eq!(completed.len(), 3);
     }
 
     #[test]

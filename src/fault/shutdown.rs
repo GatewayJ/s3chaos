@@ -74,6 +74,15 @@ impl RunDeadline {
         Ok(requested.min(Duration::from_millis(remaining_ms)))
     }
 
+    /// The suite deadline instant for an internally finalized operation that
+    /// caps each of its own requests; `None` when the suite is unbounded.
+    /// Like `bounded_timeout`, callers await the operation instead of wrapping
+    /// it in `run`.
+    pub(crate) fn instant(self) -> Result<Option<tokio::time::Instant>> {
+        self.check()?;
+        Ok(self.at)
+    }
+
     pub(crate) async fn run<F, T>(self, operation: F) -> Result<T>
     where
         F: Future<Output = Result<T>>,
@@ -253,6 +262,28 @@ mod tests {
             .await
             .expect_err("expired");
         assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn instant_exposes_the_suite_deadline_only_while_budget_remains() {
+        assert!(
+            RunDeadline::default()
+                .instant()
+                .expect("unbounded suite")
+                .is_none()
+        );
+        let deadline = RunDeadline::new(Some(2)).expect("deadline");
+        let at = deadline
+            .instant()
+            .expect("budget remains")
+            .expect("bounded suite has an instant");
+        assert_eq!(
+            at.saturating_duration_since(tokio::time::Instant::now()),
+            std::time::Duration::from_secs(2)
+        );
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        let error = deadline.instant().expect_err("exhausted suite");
+        assert!(error.is::<SuiteDeadlineExceeded>());
     }
 
     #[tokio::test(start_paused = true)]
