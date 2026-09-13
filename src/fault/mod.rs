@@ -39,6 +39,7 @@ pub mod runner;
 pub mod scenarios;
 pub mod shutdown;
 pub mod spec;
+pub mod stale_disk_runner;
 pub mod storage_recovery;
 pub mod storage_recovery_helper;
 pub mod storage_recovery_lease;

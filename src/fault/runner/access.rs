@@ -32,7 +32,7 @@ use kube::core::DynamicObject;
 use std::time::{Duration, Instant};
 use tokio::time::sleep as async_sleep;
 
-pub(super) fn prepare_fault_fixture(
+pub(crate) fn prepare_fault_fixture(
     config: &ClusterTestConfig,
     isolation: FaultIsolation,
 ) -> Result<()> {

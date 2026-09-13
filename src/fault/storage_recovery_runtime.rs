@@ -382,11 +382,15 @@ pub enum StorageRecoveryHostOperation {
     },
     DetachDeviceMapper {
         mapping_name: String,
-        recovery_table_sha256: String,
+        expected_generation_sha256: String,
+        recovery_table: String,
+        isolation_table: String,
     },
     ReattachDeviceMapper {
         mapping_name: String,
-        recovery_table_sha256: String,
+        expected_generation_sha256: String,
+        recovery_table: String,
+        isolation_table: String,
     },
     RestoreShard {
         mutation_operation_id: String,
@@ -453,11 +457,15 @@ impl StorageRecoveryHostOperation {
             }
             Self::DetachDeviceMapper {
                 mapping_name,
-                recovery_table_sha256,
+                expected_generation_sha256,
+                recovery_table,
+                isolation_table,
             }
             | Self::ReattachDeviceMapper {
                 mapping_name,
-                recovery_table_sha256,
+                expected_generation_sha256,
+                recovery_table,
+                isolation_table,
             } => {
                 ensure!(
                     !mapping_name.trim().is_empty()
@@ -466,7 +474,14 @@ impl StorageRecoveryHostOperation {
                             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
                     "device-mapper operation has an unsafe mapping name"
                 );
-                validate_sha256(recovery_table_sha256)
+                validate_sha256(expected_generation_sha256)?;
+                StaleDeviceMapperPlan::new(
+                    mapping_name,
+                    expected_generation_sha256,
+                    recovery_table,
+                    isolation_table,
+                )?;
+                Ok(())
             }
             Self::RestoreShard {
                 mutation_operation_id,
@@ -490,6 +505,90 @@ impl StorageRecoveryHostOperation {
                 Ok(())
             }
         }
+    }
+}
+
+/// Closed device-mapper transition used only by stale-disk-return. The
+/// isolation table retains the exact linear extent and backing device while
+/// forcing both reads and writes to EIO. It is deliberately distinct from the
+/// crash/drop-writes and periodic flakey policies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaleDeviceMapperPlan {
+    pub mapping_name: String,
+    pub expected_generation_sha256: String,
+    pub recovery_table: String,
+    pub recovery_table_sha256: String,
+    pub isolation_table: String,
+    pub isolation_table_sha256: String,
+}
+
+impl StaleDeviceMapperPlan {
+    pub fn new(
+        mapping_name: &str,
+        expected_generation_sha256: &str,
+        recovery_table: &str,
+        isolation_table: &str,
+    ) -> Result<Self> {
+        ensure!(
+            !mapping_name.is_empty()
+                && mapping_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+            "stale device-mapper plan has an unsafe mapping name"
+        );
+        validate_sha256(expected_generation_sha256)?;
+        ensure!(
+            !recovery_table.contains('\n') && !isolation_table.contains('\n'),
+            "stale device-mapper plan must contain one table line"
+        );
+        let recovery = recovery_table.split_whitespace().collect::<Vec<_>>();
+        let isolation = isolation_table.split_whitespace().collect::<Vec<_>>();
+        ensure!(
+            recovery.len() == 5
+                && recovery[0].parse::<u64>().is_ok()
+                && recovery[1].parse::<u64>().is_ok_and(|sectors| sectors > 0)
+                && recovery[2] == "linear"
+                && recovery[3].starts_with("/dev/")
+                && recovery[4].parse::<u64>().is_ok(),
+            "stale device-mapper recovery table is not one non-empty linear extent"
+        );
+        ensure!(
+            isolation.len() == 10
+                && isolation[0] == recovery[0]
+                && isolation[1] == recovery[1]
+                && isolation[2] == "flakey"
+                && isolation[3] == recovery[3]
+                && isolation[4] == recovery[4]
+                && isolation[5] == "0"
+                && isolation[6] == "86400"
+                && isolation[7] == "2"
+                && isolation[8] == "error_reads"
+                && isolation[9] == "error_writes",
+            "stale device-mapper isolation table must preserve the linear extent and force continuous read/write EIO"
+        );
+        Ok(Self {
+            mapping_name: mapping_name.to_string(),
+            expected_generation_sha256: expected_generation_sha256.to_string(),
+            recovery_table: recovery.join(" "),
+            recovery_table_sha256: sha256_bytes(recovery.join(" ").as_bytes()),
+            isolation_table: isolation.join(" "),
+            isolation_table_sha256: sha256_bytes(isolation.join(" ").as_bytes()),
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let rebuilt = Self::new(
+            &self.mapping_name,
+            &self.expected_generation_sha256,
+            &self.recovery_table,
+            &self.isolation_table,
+        )?;
+        ensure!(
+            *self == rebuilt,
+            "stale device-mapper plan digests are not canonical"
+        );
+        Ok(())
     }
 }
 
@@ -540,6 +639,150 @@ impl StorageRecoveryOperationReceipt {
                 && self.journal_persisted_at_ms <= self.completed_at_ms
                 && self.journal_fsync_succeeded,
             "storage-recovery receipt is not durably persisted and ordered"
+        );
+        if matches!(
+            operation,
+            StorageRecoveryHostOperation::DetachDeviceMapper { .. }
+                | StorageRecoveryHostOperation::ReattachDeviceMapper { .. }
+        ) {
+            serde_json::from_str::<StaleDeviceMapperTransitionResponse>(&self.response_body)
+                .context("decode stale device-mapper transition response")?
+                .validate_for(context, operation)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StaleDeviceMapperAction {
+    Isolate,
+    Reattach,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceMapperCommandReceipt {
+    pub argv: Vec<String>,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaleDeviceMapperTransitionResponse {
+    pub action: StaleDeviceMapperAction,
+    pub mapping_name: String,
+    pub generation_sha256: String,
+    pub before_table: String,
+    pub before_table_sha256: String,
+    pub after_table: String,
+    pub after_table_sha256: String,
+    pub commands: Vec<DeviceMapperCommandReceipt>,
+}
+
+impl StaleDeviceMapperTransitionResponse {
+    pub fn validate_for(
+        &self,
+        context: &OwnedStorageContext,
+        operation: &StorageRecoveryHostOperation,
+    ) -> Result<()> {
+        let (expected_action, mapping_name, generation_sha256, recovery_table, isolation_table) =
+            match operation {
+                StorageRecoveryHostOperation::DetachDeviceMapper {
+                    mapping_name,
+                    expected_generation_sha256,
+                    recovery_table,
+                    isolation_table,
+                } => (
+                    StaleDeviceMapperAction::Isolate,
+                    mapping_name,
+                    expected_generation_sha256,
+                    recovery_table,
+                    isolation_table,
+                ),
+                StorageRecoveryHostOperation::ReattachDeviceMapper {
+                    mapping_name,
+                    expected_generation_sha256,
+                    recovery_table,
+                    isolation_table,
+                } => (
+                    StaleDeviceMapperAction::Reattach,
+                    mapping_name,
+                    expected_generation_sha256,
+                    recovery_table,
+                    isolation_table,
+                ),
+                _ => bail!("device-mapper response is bound to a non-DM operation"),
+            };
+        let plan = StaleDeviceMapperPlan::new(
+            mapping_name,
+            generation_sha256,
+            recovery_table,
+            isolation_table,
+        )?;
+        let expected_generation = host_generation_sha256(&context.host_generation)?;
+        ensure!(
+            expected_generation == *generation_sha256
+                && context
+                    .host_generation
+                    .device_mapper_table_sha256
+                    .as_deref()
+                    == Some(plan.recovery_table_sha256.as_str())
+                && self.action == expected_action
+                && self.mapping_name == *mapping_name
+                && self.generation_sha256 == *generation_sha256,
+            "stale device-mapper response is not bound to the owned storage generation"
+        );
+        let (before, after, target) = match expected_action {
+            StaleDeviceMapperAction::Isolate => (
+                plan.recovery_table.as_str(),
+                plan.isolation_table.as_str(),
+                plan.isolation_table.as_str(),
+            ),
+            StaleDeviceMapperAction::Reattach => (
+                plan.isolation_table.as_str(),
+                plan.recovery_table.as_str(),
+                plan.recovery_table.as_str(),
+            ),
+        };
+        ensure!(
+            self.before_table == before
+                && self.after_table == after
+                && self.before_table_sha256 == sha256_bytes(before.as_bytes())
+                && self.after_table_sha256 == sha256_bytes(after.as_bytes()),
+            "stale device-mapper response does not prove the exact before/after tables"
+        );
+        let expected_argv = [
+            vec!["dmsetup", "table", "--showkeys", mapping_name],
+            vec!["dmsetup", "suspend", "--noflush", mapping_name],
+            vec!["dmsetup", "reload", mapping_name, "--table", target],
+            vec!["dmsetup", "resume", mapping_name],
+            vec!["dmsetup", "table", "--showkeys", mapping_name],
+        ];
+        ensure!(
+            self.commands.len() == expected_argv.len(),
+            "stale device-mapper transition has an incomplete command transcript"
+        );
+        let mut previous_completed_at_ms = 0;
+        for (receipt, expected) in self.commands.iter().zip(expected_argv) {
+            ensure!(
+                receipt.argv == expected
+                    && receipt.exit_code == 0
+                    && receipt.stderr.trim().is_empty()
+                    && receipt.started_at_ms > 0
+                    && receipt.started_at_ms <= receipt.completed_at_ms
+                    && receipt.started_at_ms >= previous_completed_at_ms,
+                "stale device-mapper transition command transcript is invalid"
+            );
+            previous_completed_at_ms = receipt.completed_at_ms;
+        }
+        ensure!(
+            self.commands[0].stdout.trim() == before && self.commands[4].stdout.trim() == after,
+            "stale device-mapper table observations do not match the transition"
         );
         Ok(())
     }
@@ -632,8 +875,8 @@ pub fn storage_scope_sha256(context: &OwnedStorageContext) -> String {
 }
 
 pub(crate) fn same_storage_volume_generation(
-    left: &crate::fault::storage_recovery::StorageVolumeIdentity,
-    right: &crate::fault::storage_recovery::StorageVolumeIdentity,
+    left: &StorageVolumeIdentity,
+    right: &StorageVolumeIdentity,
 ) -> bool {
     let mut left = left.clone();
     left.observed_at_ms = right.observed_at_ms;
@@ -683,6 +926,14 @@ pub fn context_sha256(context: &OwnedStorageContext) -> Result<String> {
     Ok(sha256_bytes(
         serde_json::to_vec(&ownership)
             .context("encode storage-recovery mutation ownership for digest")?
+            .as_slice(),
+    ))
+}
+
+pub fn host_generation_sha256(generation: &HostGenerationIdentity) -> Result<String> {
+    Ok(sha256_bytes(
+        serde_json::to_vec(generation)
+            .context("encode storage generation for digest")?
             .as_slice(),
     ))
 }
@@ -839,6 +1090,27 @@ impl KubectlStorageRecoveryAttemptGuard {
                 bail!("storage helper rejected operation: {message}")
             }
             _ => bail!("storage helper returned an unexpected operation response"),
+        }
+    }
+
+    pub async fn execute_stale(
+        &mut self,
+        context: &OwnedStorageContext,
+        request: &crate::fault::storage_recovery_helper::StaleOfflineHelperRequest,
+    ) -> Result<crate::fault::storage_recovery_helper::StaleOfflineHelperResponse> {
+        require_current_lease(self.client.clone(), context).await?;
+        let response = self
+            .exchange(&StorageHelperSessionRequest::StaleExecute {
+                context: Box::new(context.clone()),
+                request: Box::new(request.clone()),
+            })
+            .await?;
+        match response {
+            StorageHelperSessionResponse::StaleResponse { response } => Ok(*response),
+            StorageHelperSessionResponse::Error { message } => {
+                bail!("storage helper rejected stale operation: {message}")
+            }
+            _ => bail!("storage helper returned an unexpected stale response"),
         }
     }
 
@@ -1528,5 +1800,101 @@ mod tests {
                 .any(|arg| matches!(arg.as_str(), "sh" | "bash" | "-c"))
         );
         assert!(command.stdin.is_none());
+    }
+
+    #[test]
+    fn stale_dm_plan_preserves_linear_generation_and_forces_eio() {
+        let plan = StaleDeviceMapperPlan::new(
+            "rustfs-data",
+            HASH,
+            "0 2097152 linear /dev/nvme0n1 4096",
+            "0 2097152 flakey /dev/nvme0n1 4096 0 86400 2 error_reads error_writes",
+        )
+        .expect("stale DM plan");
+
+        plan.validate().expect("canonical plan");
+        assert_ne!(plan.recovery_table_sha256, plan.isolation_table_sha256);
+    }
+
+    #[test]
+    fn stale_dm_plan_rejects_crash_and_periodic_flakey_policies() {
+        for table in [
+            "0 2097152 flakey /dev/nvme0n1 4096 0 86400 1 drop_writes",
+            "0 2097152 flakey /dev/nvme0n1 4096 10 1 2 error_reads error_writes",
+            "0 2097152 error",
+            "0 2097152 flakey /dev/other 4096 0 86400 2 error_reads error_writes",
+        ] {
+            assert!(
+                StaleDeviceMapperPlan::new(
+                    "rustfs-data",
+                    HASH,
+                    "0 2097152 linear /dev/nvme0n1 4096",
+                    table,
+                )
+                .is_err(),
+                "unexpectedly accepted {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_dm_transition_response_requires_exact_linear_to_eio_transcript() {
+        let recovery = "0 2097152 linear /dev/nvme0n1 4096";
+        let isolation = "0 2097152 flakey /dev/nvme0n1 4096 0 86400 2 error_reads error_writes";
+        let mut context = context();
+        context.case = StorageRecoveryCase::StaleDiskReturn;
+        context.identity.scenario = context.case.scenario().to_string();
+        context.host_generation.device_mapper_table_sha256 =
+            Some(sha256_bytes(recovery.as_bytes()));
+        let generation = host_generation_sha256(&context.host_generation).expect("generation");
+        let operation = StorageRecoveryHostOperation::DetachDeviceMapper {
+            mapping_name: "rustfs-data".to_string(),
+            expected_generation_sha256: generation.clone(),
+            recovery_table: recovery.to_string(),
+            isolation_table: isolation.to_string(),
+        };
+        let command = |argv: &[&str], stdout: &str, timestamp: u64| DeviceMapperCommandReceipt {
+            argv: argv.iter().map(|value| (*value).to_string()).collect(),
+            exit_code: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            started_at_ms: timestamp,
+            completed_at_ms: timestamp,
+        };
+        let response = StaleDeviceMapperTransitionResponse {
+            action: StaleDeviceMapperAction::Isolate,
+            mapping_name: "rustfs-data".to_string(),
+            generation_sha256: generation,
+            before_table: recovery.to_string(),
+            before_table_sha256: sha256_bytes(recovery.as_bytes()),
+            after_table: isolation.to_string(),
+            after_table_sha256: sha256_bytes(isolation.as_bytes()),
+            commands: vec![
+                command(
+                    &["dmsetup", "table", "--showkeys", "rustfs-data"],
+                    recovery,
+                    300,
+                ),
+                command(&["dmsetup", "suspend", "--noflush", "rustfs-data"], "", 301),
+                command(
+                    &["dmsetup", "reload", "rustfs-data", "--table", isolation],
+                    "",
+                    302,
+                ),
+                command(&["dmsetup", "resume", "rustfs-data"], "", 303),
+                command(
+                    &["dmsetup", "table", "--showkeys", "rustfs-data"],
+                    isolation,
+                    304,
+                ),
+            ],
+        };
+
+        response
+            .validate_for(&context, &operation)
+            .expect("exact stale DM transition");
+        let mut fabricated = response;
+        fabricated.commands[4].stdout = recovery.to_string();
+        assert!(fabricated.validate_for(&context, &operation).is_err());
     }
 }

@@ -31,11 +31,11 @@ use crate::{
     fault::{
         config::FaultTestConfig,
         host_storage::{
-            DM_FILESYSTEM_CHECK_ARTIFACT, DM_FILESYSTEM_CHECK_SCHEMA_VERSION, DmFilesystemCheck,
-            HOST_STORAGE_PROOF_ARTIFACT, HostStorageAllowlist, HostStorageMutationIntent,
-            HostStorageMutationProof, HostStorageNodeSelector, HostStoragePersistentVolumeClaimRef,
-            HostStoragePostCleanupObservation, HostStorageTargetObservation,
-            normalized_dm_table_sha256,
+            DM_FILESYSTEM_CHECK_ARTIFACT, DM_FILESYSTEM_CHECK_SCHEMA_VERSION, DM_STALE_RETURN_KIND,
+            DmFilesystemCheck, HOST_STORAGE_PROOF_ARTIFACT, HostStorageAllowlist,
+            HostStorageMutationIntent, HostStorageMutationProof, HostStorageNodeSelector,
+            HostStoragePersistentVolumeClaimRef, HostStoragePostCleanupObservation,
+            HostStorageTargetObservation, normalized_dm_table_sha256,
         },
         plan::{FaultInjection, FaultKind},
         scenarios::FaultScenario,
@@ -112,6 +112,7 @@ printf '%s\n' 's3chaos-dm-activation-complete'
 enum DmFaultBehavior {
     ErrorInjection,
     DropWritesCrash,
+    StaleEio,
 }
 
 impl DmFaultBehavior {
@@ -404,6 +405,7 @@ pub struct DmFlakeyGuard {
     mutation_lease: HostMutationLease,
     fault_applied: bool,
     filesystem_recovery: DmFilesystemRecoveryState,
+    stale_cleanup_pending: bool,
     restored: bool,
 }
 
@@ -417,6 +419,353 @@ pub struct DmFlakeySpec<'a> {
     pub fault_table: Option<&'a str>,
     pub recovery_table: Option<&'a str>,
     pub run_id: &'a str,
+}
+
+pub(crate) fn preflight_stale_disk_mutation(
+    config: &FaultTestConfig,
+    scenario: &FaultScenario,
+    run_id: &str,
+) -> Result<HostStorageMutationProof> {
+    ensure!(
+        scenario.name == crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO,
+        "stale device-mapper preflight is bound to another scenario"
+    );
+    let spec = stale_dm_spec(config, run_id)?;
+    validate_stale_config(config, &spec)?;
+    let observer_pod = config
+        .dm_observer_pod
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_POD is required")?;
+    let observer_namespace = config
+        .dm_observer_namespace
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE is required")?;
+    let observation = observe_dm_target_read_only(
+        &config.cluster,
+        &spec,
+        &config.rustfs_volume_path,
+        observer_namespace,
+        observer_pod,
+    )?;
+    HostStorageMutationProof::prove_device_mapper(
+        HostStorageMutationIntent {
+            scenario: scenario.name.clone(),
+            fault_name: "stale-disk-eio".to_string(),
+            fault_kind: DM_STALE_RETURN_KIND.to_string(),
+            run_id: run_id.to_string(),
+            context: config.cluster.context.clone(),
+            namespace: config.cluster.test_namespace.clone(),
+            tenant: config.cluster.tenant_name.clone(),
+            observer_namespace: observer_namespace.to_string(),
+            observer_pod: observer_pod.to_string(),
+            backend_specific_destructive_opt_in: config.device_mapper_destructive_enabled,
+            allowlist: HostStorageAllowlist {
+                nodes: config.host_mutation_allowed_nodes.clone(),
+                devices: config.host_mutation_allowed_devices.clone(),
+                persistent_volumes: config.host_mutation_allowed_persistent_volumes.clone(),
+            },
+            fault_table: None,
+        },
+        observation,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaleDmTableSample {
+    pub(crate) observed_at_ms: u64,
+    pub(crate) table: String,
+    pub(crate) suspended: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaleHostRuntimeIdentity {
+    pub(crate) target_mount_namespace_id: String,
+    pub(crate) filesystem_uuid: String,
+}
+
+pub(crate) fn observe_stale_host_runtime_identity(
+    config: &FaultTestConfig,
+    proof: &HostStorageMutationProof,
+    target_container_id: &str,
+) -> Result<StaleHostRuntimeIdentity> {
+    proof.validate()?;
+    let cri_container_id = target_container_id
+        .strip_prefix("containerd://")
+        .context("stale-disk target must use an explicit containerd container id")?;
+    ensure!(
+        !cri_container_id.trim().is_empty(),
+        "stale-disk target container id is empty"
+    );
+    let inspect = observer_host_command(
+        &config.cluster,
+        &proof.observer_namespace,
+        &proof.observer_pod,
+        ["/usr/bin/crictl", "inspect", cri_container_id],
+    )?;
+    let inspect_json = serde_json::from_str::<Value>(&inspect.stdout)
+        .context("parse stale-disk target container runtime response")?;
+    ensure!(
+        inspect_json.pointer("/status/id").and_then(Value::as_str) == Some(cri_container_id),
+        "container runtime response identifies another target container"
+    );
+    let pid = inspect_json
+        .pointer("/info/pid")
+        .and_then(Value::as_u64)
+        .context("container runtime response lacks target pid")?;
+    ensure!(pid > 0, "container runtime returned target pid zero");
+    let mount_namespace = observer_host_command(
+        &config.cluster,
+        &proof.observer_namespace,
+        &proof.observer_pod,
+        [
+            "/usr/bin/readlink".to_string(),
+            format!("/proc/{pid}/ns/mnt"),
+        ],
+    )?
+    .stdout
+    .trim()
+    .to_string();
+    let filesystem_uuid = observer_host_command(
+        &config.cluster,
+        &proof.observer_namespace,
+        &proof.observer_pod,
+        [
+            "/usr/sbin/blkid",
+            "-s",
+            "UUID",
+            "-o",
+            "value",
+            proof.target.canonical_device.as_str(),
+        ],
+    )?
+    .stdout
+    .trim()
+    .to_string();
+    ensure!(
+        mount_namespace.starts_with("mnt:[")
+            && mount_namespace.ends_with(']')
+            && !filesystem_uuid.is_empty(),
+        "stale-disk target lacks mount-namespace or filesystem generation identity"
+    );
+    Ok(StaleHostRuntimeIdentity {
+        target_mount_namespace_id: mount_namespace,
+        filesystem_uuid,
+    })
+}
+
+const STALE_DM_WATCH_SCRIPT: &str = r#"set -eu
+name=$1
+count=$2
+cancel=$3
+trap '/usr/bin/rm -f -- "$cancel"' EXIT
+i=0
+while [ "$i" -lt "$count" ]; do
+    [ ! -e "$cancel" ] || break
+    observed=$(/usr/bin/date +%s%3N)
+    suspended=$(/usr/sbin/dmsetup info --columns --noheadings --options suspended "$name" | /usr/bin/tr -d '[:space:]' | /usr/bin/tr '[:upper:]' '[:lower:]')
+    table=$(/usr/sbin/dmsetup table --showkeys "$name")
+    case "$suspended" in
+        active|no|n|0) suspended=false ;;
+        suspended|yes|y|1) suspended=true ;;
+        *) exit 71 ;;
+    esac
+    printf '%s|%s|%s\n' "$observed" "$suspended" "$table"
+    i=$((i + 1))
+    /usr/bin/sleep 0.05
+done"#;
+
+const STALE_DM_WATCH_CANCEL_SCRIPT: &str = r#"set -eu
+cancel=$1
+case "$cancel" in
+    /tmp/s3chaos-stale-watch-*) ;;
+    *) exit 72 ;;
+esac
+: > "$cancel""#;
+
+const STALE_DM_WATCH_PREPARE_SCRIPT: &str = r#"set -eu
+cancel=$1
+case "$cancel" in
+    /tmp/s3chaos-stale-watch-*) ;;
+    *) exit 72 ;;
+esac
+/usr/bin/rm -f -- "$cancel""#;
+
+pub(crate) fn stale_dm_watch_cancel_file(proof: &HostStorageMutationProof) -> Result<String> {
+    proof.validate()?;
+    let table = normalized_dm_table_sha256(&proof.tables.recovery_table)?;
+    Ok(format!(
+        "/tmp/s3chaos-stale-watch-{}-{}",
+        &table[..24],
+        proof.generated_at_ms
+    ))
+}
+
+pub(crate) fn cancel_stale_dm_watch(
+    config: &FaultTestConfig,
+    proof: &HostStorageMutationProof,
+) -> Result<()> {
+    let cancel_file = stale_dm_watch_cancel_file(proof)?;
+    let output = observer_host_command(
+        &config.cluster,
+        &proof.observer_namespace,
+        &proof.observer_pod,
+        [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            STALE_DM_WATCH_CANCEL_SCRIPT.to_string(),
+            "s3chaos-stale-watch-cancel".to_string(),
+            cancel_file,
+        ],
+    )?;
+    ensure!(
+        output.stdout.trim().is_empty() && output.stderr.trim().is_empty(),
+        "stale device-mapper watch cancellation wrote unexpected output"
+    );
+    Ok(())
+}
+
+pub(crate) fn prepare_stale_dm_watch(
+    config: &FaultTestConfig,
+    proof: &HostStorageMutationProof,
+) -> Result<()> {
+    let cancel_file = stale_dm_watch_cancel_file(proof)?;
+    let output = observer_host_command(
+        &config.cluster,
+        &proof.observer_namespace,
+        &proof.observer_pod,
+        [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            STALE_DM_WATCH_PREPARE_SCRIPT.to_string(),
+            "s3chaos-stale-watch-prepare".to_string(),
+            cancel_file,
+        ],
+    )?;
+    ensure!(
+        output.stdout.trim().is_empty() && output.stderr.trim().is_empty(),
+        "stale device-mapper watch preparation wrote unexpected output"
+    );
+    Ok(())
+}
+
+pub(crate) fn capture_stale_dm_watch(
+    config: &FaultTestConfig,
+    proof: &HostStorageMutationProof,
+    sample_count: usize,
+) -> Result<Vec<StaleDmTableSample>> {
+    proof.validate()?;
+    ensure!(
+        proof.scenario == crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO
+            && proof.run_id != "preflight"
+            && (3..=2_400).contains(&sample_count),
+        "stale device-mapper watch identity or bounded sample count is invalid"
+    );
+    let cancel_file = stale_dm_watch_cancel_file(proof)?;
+    let output = observer_host_command(
+        &config.cluster,
+        &proof.observer_namespace,
+        &proof.observer_pod,
+        [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            STALE_DM_WATCH_SCRIPT.to_string(),
+            "s3chaos-stale-watch".to_string(),
+            proof.target.mapper_name.clone(),
+            sample_count.to_string(),
+            cancel_file,
+        ],
+    )?;
+    ensure!(
+        output.stderr.trim().is_empty(),
+        "stale device-mapper watch wrote to stderr"
+    );
+    let samples = output
+        .stdout
+        .lines()
+        .map(|line| {
+            let mut fields = line.splitn(3, '|');
+            let observed_at_ms = fields
+                .next()
+                .context("stale DM watch sample lacks a timestamp")?
+                .parse::<u64>()
+                .context("stale DM watch timestamp is invalid")?;
+            let suspended = match fields
+                .next()
+                .context("stale DM watch sample lacks suspended state")?
+            {
+                "false" => false,
+                "true" => true,
+                _ => bail!("stale DM watch returned an invalid suspended state"),
+            };
+            let table = fields
+                .next()
+                .context("stale DM watch sample lacks a mapper table")?
+                .trim()
+                .to_string();
+            ensure!(
+                !table.is_empty()
+                    && (dm_tables_match(&table, &proof.tables.recovery_table)?
+                        || dm_tables_match(&table, &proof.tables.fault_table)?),
+                "stale DM watch observed an unowned mapper table"
+            );
+            Ok(StaleDmTableSample {
+                observed_at_ms,
+                table,
+                suspended,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        (3..=sample_count).contains(&samples.len())
+            && samples.windows(2).all(|window| {
+                window[0].observed_at_ms < window[1].observed_at_ms
+                    && window[1].observed_at_ms - window[0].observed_at_ms <= 100
+            }),
+        "stale device-mapper watch was incomplete or exceeded its 100ms sampling bound"
+    );
+    Ok(samples)
+}
+
+fn validate_stale_config(config: &FaultTestConfig, spec: &DmFlakeySpec<'_>) -> Result<()> {
+    ensure!(
+        config.device_mapper_destructive_enabled,
+        "stale device-mapper mutation requires RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE=1"
+    );
+    let observer_pod = config
+        .dm_observer_pod
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_POD is required")?;
+    let observer_namespace = config
+        .dm_observer_namespace
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE is required")?;
+    ensure!(
+        observer_namespace != config.cluster.test_namespace,
+        "stale storage helper must be outside the disposable Tenant namespace"
+    );
+    ensure!(
+        !observer_pod.trim().is_empty(),
+        "stale storage helper Pod name is empty"
+    );
+    require_exact_config_allowlist(
+        "RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST",
+        &config.host_mutation_allowed_nodes,
+        spec.node,
+    )?;
+    require_exact_config_allowlist(
+        "RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST",
+        &config.host_mutation_allowed_devices,
+        &format!("/dev/mapper/{}", spec.name),
+    )?;
+    ensure!(
+        config.host_mutation_allowed_persistent_volumes.len() == 1
+            && !config.host_mutation_allowed_persistent_volumes[0]
+                .trim()
+                .is_empty(),
+        "RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST must contain exactly one PV"
+    );
+    HostMutationLease::from_config(config, "stale-preflight")?;
+    Ok(())
 }
 
 pub(crate) struct FaultApplyRequest<'a> {
@@ -839,7 +1188,7 @@ fn dm_flakey_spec<'a>(
                 .as_deref()
                 .context("RUSTFS_FAULT_TEST_DM_FAULT_TABLE is required for dm-flakey")?,
         ),
-        DmFaultBehavior::DropWritesCrash => None,
+        DmFaultBehavior::DropWritesCrash | DmFaultBehavior::StaleEio => None,
     };
     let node = config
         .dm_node
@@ -859,6 +1208,15 @@ fn dm_flakey_spec<'a>(
         recovery_table: config.dm_recovery_table.as_deref(),
         run_id,
     })
+}
+
+pub(crate) fn stale_dm_spec<'a>(
+    config: &'a FaultTestConfig,
+    run_id: &'a str,
+) -> Result<DmFlakeySpec<'a>> {
+    let mut spec = dm_flakey_spec(config, run_id, DmFaultBehavior::StaleEio)?;
+    spec.recovery_table = config.dm_recovery_table.as_deref();
+    Ok(spec)
 }
 
 pub fn apply_dm_flakey(
@@ -901,7 +1259,13 @@ pub(crate) fn prepare_dm_flakey(
         DmPodReadiness::Required,
     )?;
     let helper_pod = helper_pod_name(spec.run_id);
-    let manifest = dm_helper_manifest(config, &helper_pod, spec.node, spec.helper_image);
+    let manifest = dm_helper_manifest(
+        config,
+        &helper_pod,
+        spec.node,
+        spec.helper_image,
+        spec.mount_path,
+    );
     collector.write_text(case_name, "dm-helper-manifest.yaml", &manifest)?;
     let mut guard = DmFlakeyGuard {
         config: config.clone(),
@@ -928,6 +1292,7 @@ pub(crate) fn prepare_dm_flakey(
         } else {
             DmFilesystemRecoveryState::NotRequired
         },
+        stale_cleanup_pending: false,
         restored: false,
     };
     let kubectl = Kubectl::new(config).namespaced(&config.test_namespace);
@@ -1000,6 +1365,25 @@ pub(crate) fn prepare_dm_flakey(
     Ok(guard)
 }
 
+pub(crate) fn prepare_stale_disk(
+    fault_config: &FaultTestConfig,
+    collector: &ArtifactCollector,
+    case_name: &str,
+    scenario: &str,
+    run_id: &str,
+    preflight_proof: &HostStorageMutationProof,
+) -> Result<DmFlakeyGuard> {
+    let spec = stale_dm_spec(fault_config, run_id)?;
+    prepare_dm_flakey(
+        fault_config,
+        &spec,
+        collector,
+        case_name,
+        scenario,
+        preflight_proof,
+    )
+}
+
 impl DmFlakeyGuard {
     pub(crate) fn activate(&mut self) -> Result<u64> {
         ensure!(
@@ -1051,9 +1435,14 @@ impl DmFlakeyGuard {
             let initial_state = <Self as DmTransitionPort>::observe(self)
                 .context("observe device-mapper state immediately before fault apply")?;
             let proven_recovery_table = self.recovery_table.clone();
+            let suspend_mode = if self.behavior == DmFaultBehavior::StaleEio {
+                DmSuspendMode::NoFlush
+            } else {
+                DmSuspendMode::Default
+            };
             self.transition_to_table_from_observed(
                 &self.fault_table.clone(),
-                DmSuspendMode::Default,
+                suspend_mode,
                 DmTransitionPolicy::Apply {
                     recovery_table: &proven_recovery_table,
                 },
@@ -1137,6 +1526,54 @@ impl DmFlakeyGuard {
         Ok(())
     }
 
+    pub(crate) fn ensure_stale_owned_state(&mut self, isolated: bool) -> Result<()> {
+        ensure!(
+            self.behavior == DmFaultBehavior::StaleEio,
+            "stale owned-state verification is bound to another fault policy"
+        );
+        if isolated {
+            self.ensure_active("stale-owned-isolated")?;
+        } else {
+            self.ensure_recovery_table_active()?;
+        }
+        Ok(())
+    }
+
+    fn persist_post_cleanup_observation(&mut self) -> Result<()> {
+        let mount = self.capture_mount_snapshot()?;
+        self.verify_mount_source(&mount)?;
+        let cleanup_observation = HostStoragePostCleanupObservation {
+            schema_version: 1,
+            scenario: self.scenario.clone(),
+            fault_name: self.preflight_proof.fault_name.clone(),
+            run_id: self.run_id.clone(),
+            observed_at_ms: now_ms(),
+            node: self.mapping.node.clone(),
+            persistent_volume: self.mapping.pv.clone(),
+            mapper_name: self.dm_name.clone(),
+            logical_device: format!("/dev/mapper/{}", self.dm_name),
+            canonical_device: self.mapper_canonical_device()?,
+            mount_canonical_source: mount.canonical_source.clone(),
+            filesystem_mounted: true,
+            node_quarantined: self.node_has_crash_taint()?,
+            recovery_table_sha256: normalized_dm_table_sha256(
+                &self
+                    .recovery_snapshot
+                    .as_ref()
+                    .context("device-mapper recovery snapshot is missing")?
+                    .table,
+            )?,
+        };
+        self.preflight_proof
+            .validate_post_cleanup(&cleanup_observation)?;
+        self.collector.write_text(
+            &self.case_name,
+            "host-storage-post-cleanup.json",
+            &serde_json::to_string_pretty(&cleanup_observation)?,
+        )?;
+        Ok(())
+    }
+
     pub fn requires_crash_boundary(&self) -> bool {
         self.behavior.requires_crash_boundary()
     }
@@ -1203,7 +1640,7 @@ impl DmFlakeyGuard {
         };
         let recovery_table = self.recovery_table.clone();
         let suspend_mode = match self.behavior {
-            DmFaultBehavior::ErrorInjection => DmSuspendMode::NoFlush,
+            DmFaultBehavior::ErrorInjection | DmFaultBehavior::StaleEio => DmSuspendMode::NoFlush,
             DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
         };
         if let Err(error) = self.mutation_lease.set_phase(HostMutationPhase::Rollback) {
@@ -1221,37 +1658,7 @@ impl DmFlakeyGuard {
             self.remove_node_taint()?;
         }
         self.recovery_snapshot = Some(self.snapshot("recovered")?);
-        let mount = self.capture_mount_snapshot()?;
-        self.verify_mount_source(&mount)?;
-        let cleanup_observation = HostStoragePostCleanupObservation {
-            schema_version: 1,
-            scenario: self.scenario.clone(),
-            fault_name: self.preflight_proof.fault_name.clone(),
-            run_id: self.run_id.clone(),
-            observed_at_ms: now_ms(),
-            node: self.mapping.node.clone(),
-            persistent_volume: self.mapping.pv.clone(),
-            mapper_name: self.dm_name.clone(),
-            logical_device: format!("/dev/mapper/{}", self.dm_name),
-            canonical_device: self.mapper_canonical_device()?,
-            mount_canonical_source: mount.canonical_source.clone(),
-            filesystem_mounted: true,
-            node_quarantined: self.node_has_crash_taint()?,
-            recovery_table_sha256: normalized_dm_table_sha256(
-                &self
-                    .recovery_snapshot
-                    .as_ref()
-                    .context("device-mapper recovery snapshot is missing")?
-                    .table,
-            )?,
-        };
-        self.preflight_proof
-            .validate_post_cleanup(&cleanup_observation)?;
-        self.collector.write_text(
-            &self.case_name,
-            "host-storage-post-cleanup.json",
-            &serde_json::to_string_pretty(&cleanup_observation)?,
-        )?;
+        self.persist_post_cleanup_observation()?;
         if self.requires_crash_boundary() {
             let snapshot = DmCrashRecoverySnapshot {
                 scenario: self.scenario.clone(),
@@ -1271,12 +1678,20 @@ impl DmFlakeyGuard {
                 &serde_json::to_string_pretty(&snapshot)?,
             )?;
         }
-        self.mutation_lease.clear()?;
-        // Storage recovery is complete before deleting the disposable helper.
-        // A lost delete response must not make Drop re-enter mapper recovery
-        // through a helper that may already be gone.
         self.restored = true;
-        self.delete_helper()?;
+        if self.behavior == DmFaultBehavior::StaleEio {
+            // Stale-return qualification still needs the same run-owned host
+            // helper and mutation lease for its offline inventory and exact
+            // orphan cleanup. The mapper is already back on the verified
+            // recovery table, so Drop must not re-enter mapper recovery.
+            self.stale_cleanup_pending = true;
+        } else {
+            self.mutation_lease.clear()?;
+            // Storage recovery is complete before deleting the disposable helper.
+            // A lost delete response must not make Drop re-enter mapper recovery
+            // through a helper that may already be gone.
+            self.delete_helper()?;
+        }
         ensure!(
             !incomplete_crash_boundary,
             "drop_writes durability boundary did not force-delete the target Pod and unmount the filesystem while the fault table was active; storage was recovered before reporting this failure"
@@ -1286,6 +1701,198 @@ impl DmFlakeyGuard {
 
     pub fn recovery_snapshot(&self) -> Option<&DmStatusSnapshot> {
         self.recovery_snapshot.as_ref()
+    }
+
+    pub(crate) fn stale_host_proof(&self) -> &HostStorageMutationProof {
+        &self.preflight_proof
+    }
+
+    pub(crate) fn stale_helper_pod_name(&self) -> &str {
+        &self.helper_pod
+    }
+
+    pub(crate) fn prepare_stale_session_lock(
+        &self,
+        scope_sha256: &str,
+    ) -> Result<(String, u64, u64)> {
+        ensure!(
+            self.behavior == DmFaultBehavior::StaleEio
+                && !self.restored
+                && scope_sha256.len() == 64
+                && scope_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "stale helper lock preflight has an invalid generation or scope"
+        );
+        let lock_path = format!(
+            "{}/storage-{}.lock",
+            crate::fault::storage_recovery_runtime::STORAGE_RECOVERY_HOST_LOCK_DIRECTORY,
+            scope_sha256
+        );
+        let output = self.host_command([
+            "/bin/sh",
+            "-ceu",
+            "umask 077; mkdir -p -- \"$1\"; (set -C; : > \"$2\"); /usr/bin/findmnt -n -o MAJ:MIN --target \"$1\"; /usr/bin/stat -c %i -- \"$2\"",
+            "s3chaos-prepare-stale-lock",
+            crate::fault::storage_recovery_runtime::STORAGE_RECOVERY_HOST_LOCK_DIRECTORY,
+            lock_path.as_str(),
+        ])?;
+        let fields = output.stdout.split_whitespace().collect::<Vec<_>>();
+        ensure!(
+            fields.len() == 2,
+            "stale helper lock probe returned malformed output"
+        );
+        let inode = fields[1]
+            .parse::<u64>()
+            .context("stale helper lock inode is invalid")?;
+        ensure!(
+            fields[0].split_once(':').is_some_and(|(major, minor)| {
+                major.parse::<u32>().is_ok() && minor.parse::<u32>().is_ok()
+            }) && inode > 0,
+            "stale helper lock identity is invalid"
+        );
+        Ok((fields[0].to_string(), inode, now_ms()))
+    }
+
+    pub(crate) fn observe_stale_session_lock(&self, scope_sha256: &str) -> Result<(String, u64)> {
+        let lock_path = format!(
+            "{}/storage-{}.lock",
+            crate::fault::storage_recovery_runtime::STORAGE_RECOVERY_HOST_LOCK_DIRECTORY,
+            scope_sha256
+        );
+        let identity = self.host_command([
+            "/bin/sh",
+            "-ceu",
+            "/usr/bin/findmnt -n -o MAJ:MIN --target \"$1\"; /usr/bin/stat -c %i -- \"$2\"",
+            "s3chaos-observe-stale-lock",
+            crate::fault::storage_recovery_runtime::STORAGE_RECOVERY_HOST_LOCK_DIRECTORY,
+            lock_path.as_str(),
+        ])?;
+        let fields = identity.stdout.split_whitespace().collect::<Vec<_>>();
+        ensure!(
+            fields.len() == 2,
+            "stale helper lock observation is malformed"
+        );
+        let inode = fields[1]
+            .parse::<u64>()
+            .context("stale helper lock observation has an invalid inode")?;
+        let contention =
+            self.host_command_unchecked(["/usr/bin/flock", "-n", lock_path.as_str(), "/bin/true"])?;
+        ensure!(
+            contention.code.is_some_and(|code| code != 0),
+            "stale helper host flock is not held by the persistent session"
+        );
+        Ok((fields[0].to_string(), inode))
+    }
+
+    pub(crate) fn stale_host_generation(
+        &self,
+        mount_namespace_id: &str,
+        filesystem_uuid: &str,
+        rustfs_drive_uuid: &str,
+    ) -> Result<crate::fault::storage_recovery_runtime::HostGenerationIdentity> {
+        ensure!(
+            self.behavior == DmFaultBehavior::StaleEio
+                && (!self.restored || self.recovery_snapshot.is_some()),
+            "stale host generation is outside the prepared generation"
+        );
+        let output = self.host_command([
+            "/bin/sh",
+            "-ceu",
+            "/usr/bin/findmnt -n -o ID --target /target; /usr/bin/findmnt -n -o MAJ:MIN --target /target; /usr/sbin/dmsetup info --columns --noheadings --options uuid \"$1\"",
+            "s3chaos-observe-stale-generation",
+            self.dm_name.as_str(),
+        ])?;
+        let fields = output.stdout.split_whitespace().collect::<Vec<_>>();
+        ensure!(
+            fields.len() == 3,
+            "stale host generation probe returned malformed output"
+        );
+        Ok(
+            crate::fault::storage_recovery_runtime::HostGenerationIdentity {
+                mount_id: fields[0].to_string(),
+                mount_namespace_id: mount_namespace_id.to_string(),
+                device_major_minor: fields[1].to_string(),
+                device_mapper_uuid: Some(fields[2].to_string()),
+                device_mapper_table_sha256: Some(normalized_dm_table_sha256(&self.recovery_table)?),
+                filesystem_uuid: filesystem_uuid.to_string(),
+                rustfs_drive_uuid: rustfs_drive_uuid.to_string(),
+            },
+        )
+    }
+
+    pub(crate) fn arm_stale_helper_fallback(&mut self) -> Result<()> {
+        ensure!(
+            self.behavior == DmFaultBehavior::StaleEio && !self.restored,
+            "cannot arm stale helper fallback outside the prepared generation"
+        );
+        self.ensure_active("stale-helper-active")?;
+        self.fault_applied = true;
+        self.mutation_lease.set_phase(HostMutationPhase::Active)
+    }
+
+    pub(crate) fn begin_stale_helper_mutation(&mut self) -> Result<()> {
+        ensure!(
+            self.behavior == DmFaultBehavior::StaleEio && !self.restored,
+            "cannot begin stale helper mutation outside the prepared generation"
+        );
+        self.ensure_recovery_table_active()?;
+        self.fault_applied = true;
+        self.mutation_lease.set_phase(HostMutationPhase::Active)
+    }
+
+    pub(crate) fn accept_stale_helper_reattach(&mut self) -> Result<()> {
+        ensure!(
+            self.behavior == DmFaultBehavior::StaleEio && self.fault_applied && !self.restored,
+            "cannot accept stale helper reattach outside an active stale generation"
+        );
+        self.ensure_recovery_table_active()?;
+        self.recovery_snapshot = Some(self.snapshot("recovered-by-owned-helper")?);
+        self.persist_post_cleanup_observation()?;
+        self.restored = true;
+        self.stale_cleanup_pending = true;
+        Ok(())
+    }
+
+    pub(crate) fn require_stale_offline_helper(&self) -> Result<()> {
+        ensure!(
+            self.behavior == DmFaultBehavior::StaleEio && !self.restored,
+            "stale offline helper preflight is outside the prepared stale generation"
+        );
+        self.host_command([
+            "/bin/sh",
+            "-c",
+            "[ -x \"$1\" ]",
+            "s3chaos-require-stale-helper",
+            crate::fault::storage_recovery_runtime::STORAGE_RECOVERY_HELPER_PROGRAM,
+        ])
+        .context("stale offline helper binary is unavailable in the run-owned helper Pod")?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_stale_cleanup(&mut self) -> Result<()> {
+        ensure!(
+            self.behavior == DmFaultBehavior::StaleEio
+                && self.restored
+                && self.recovery_snapshot.is_some(),
+            "stale helper cleanup requires a verified returned mapper generation"
+        );
+        if !self.stale_cleanup_pending {
+            return Ok(());
+        }
+        self.mutation_lease.clear()?;
+        self.delete_helper()?;
+        self.stale_cleanup_pending = false;
+        Ok(())
+    }
+
+    pub(crate) fn finish_stale_pre_mutation_cleanup(&mut self) -> Result<()> {
+        ensure!(
+            self.behavior == DmFaultBehavior::StaleEio && !self.fault_applied && !self.restored,
+            "pre-mutation stale cleanup is outside an untouched prepared generation"
+        );
+        self.mutation_lease.clear()?;
+        self.delete_helper()?;
+        self.restored = true;
+        Ok(())
     }
 
     fn wait_helper_ready(&self) -> Result<()> {
@@ -2022,6 +2629,12 @@ fn classify_initial_target_pod(
 
 impl Drop for DmFlakeyGuard {
     fn drop(&mut self) {
+        if self.restored && self.stale_cleanup_pending {
+            eprintln!(
+                "warning: retaining stale-return helper pod {pod} and host mutation state because cleanup-proof release did not complete",
+                pod = self.helper_pod,
+            );
+        }
         if !self.restored {
             let recovery_table = self.recovery_table.clone();
             let mut mapper_recovered = !self.fault_applied;
@@ -2032,7 +2645,9 @@ impl Drop for DmFlakeyGuard {
                     );
                 }
                 let mode = match self.behavior {
-                    DmFaultBehavior::ErrorInjection => DmSuspendMode::NoFlush,
+                    DmFaultBehavior::ErrorInjection | DmFaultBehavior::StaleEio => {
+                        DmSuspendMode::NoFlush
+                    }
                     DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
                 };
                 match self
@@ -2169,8 +2784,10 @@ fn validate_dm_spec(spec: &DmFlakeySpec<'_>) -> Result<()> {
         "RUSTFS_FAULT_TEST_DM_MOUNT_PATH must be an absolute non-root path"
     );
     ensure!(
-        !spec.mount_path.contains(['\n', '\r']),
-        "RUSTFS_FAULT_TEST_DM_MOUNT_PATH must not contain newlines"
+        spec.mount_path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')),
+        "RUSTFS_FAULT_TEST_DM_MOUNT_PATH contains unsupported manifest characters"
     );
     ensure!(
         !spec.name.is_empty()
@@ -2763,7 +3380,13 @@ fn supported_pv_node_selector(
     })
 }
 
-fn dm_helper_manifest(config: &ClusterTestConfig, name: &str, node: &str, image: &str) -> String {
+fn dm_helper_manifest(
+    config: &ClusterTestConfig,
+    name: &str,
+    node: &str,
+    image: &str,
+    target_path: &str,
+) -> String {
     format!(
         r#"apiVersion: v1
 kind: Pod
@@ -2787,11 +3410,25 @@ spec:
         - name: host-root
           mountPath: /host
           mountPropagation: HostToContainer
+        - name: target-volume
+          mountPath: /target
+        - name: helper-journal
+          mountPath: /journal
+        - name: helper-lock
+          mountPath: /var/lock/s3chaos
   volumes:
     - name: host-root
       hostPath:
         path: /
         type: Directory
+    - name: target-volume
+      hostPath:
+        path: {target_path}
+        type: Directory
+    - name: helper-journal
+      emptyDir: {{}}
+    - name: helper-lock
+      emptyDir: {{}}
 "#,
         namespace = config.test_namespace,
         managed_by_label = MANAGED_BY_LABEL,
@@ -2993,11 +3630,16 @@ mod tests {
             "rustfs-fault-dm-helper-run123",
             "worker-a",
             "busybox:test",
+            "/var/lib/rustfs-stale",
         );
 
         assert!(manifest.contains("nodeName: worker-a"));
         assert!(manifest.contains("privileged: true"));
         assert!(manifest.contains("mountPath: /host"));
+        assert!(manifest.contains("mountPath: /target"));
+        assert!(manifest.contains("path: /var/lib/rustfs-stale"));
+        assert!(manifest.contains("mountPath: /journal"));
+        assert!(manifest.contains("mountPath: /var/lock/s3chaos"));
         assert!(manifest.contains("path: /"));
         assert!(manifest.contains("s3chaos"));
     }
@@ -3010,6 +3652,7 @@ mod tests {
             "rustfs-fault-dm-helper-run123",
             "worker-a",
             "busybox:test",
+            "/var/lib/rustfs-stale",
         );
 
         // The guard always tears the pod down explicitly (restore/Drop), so it

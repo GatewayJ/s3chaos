@@ -46,8 +46,9 @@ use crate::fault::{
         acknowledged_mutation_kind, scenario_spec,
     },
     storage_recovery::{
-        DISK_GENERATION_PROOF_ARTIFACT, FORCE_READ_PROOF_ARTIFACT, HEAL_PROGRESS_ARTIFACT,
-        HEAL_SUMMARY_ARTIFACT, VERSION_SHARD_MAPPING_ARTIFACT,
+        DANGLING_CLEANUP_PROOF_ARTIFACT, DISK_GENERATION_PROOF_ARTIFACT, FORCE_READ_PROOF_ARTIFACT,
+        HEAL_PROGRESS_ARTIFACT, HEAL_SUMMARY_ARTIFACT, SHARD_INVENTORY_AFTER_ARTIFACT,
+        SHARD_INVENTORY_BEFORE_ARTIFACT, VERSION_SHARD_MAPPING_ARTIFACT,
     },
     storage_recovery_runner::STORAGE_RECOVERY_WORKFLOW_ARTIFACT,
     workload::WorkloadPlan,
@@ -432,7 +433,31 @@ impl FaultRunArtifactSpec {
     }
 
     pub fn required_names_for_scenario(scenario: &str) -> Vec<String> {
-        let mut names = if matches!(
+        let mut names = if scenario == crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO {
+            [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "target-proof.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "workload-summary.json",
+                "checker-report.json",
+                RECOVERY_HEALTH_ARTIFACT,
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+                DISK_GENERATION_PROOF_ARTIFACT,
+                SHARD_INVENTORY_BEFORE_ARTIFACT,
+                SHARD_INVENTORY_AFTER_ARTIFACT,
+                DANGLING_CLEANUP_PROOF_ARTIFACT,
+                HOST_STORAGE_PROOF_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else if matches!(
             scenario,
             crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO
                 | crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO
@@ -841,6 +866,58 @@ mod tests {
             "force-read-proof.json",
             "force-read-history.jsonl",
             "fresh-volume-cleanup.json",
+        ] {
+            assert!(spec.artifacts.required.contains(&artifact.to_string()));
+        }
+    }
+
+    #[test]
+    fn stale_storage_spec_is_typed_and_requires_physical_proofs() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+        config.scenario = crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO.to_string();
+        config.qualify_planned_storage = true;
+        config.destructive_enabled = true;
+        config.storage_recovery_case =
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn);
+        let scenario = FaultScenario::from_config_for_execution(&config).expect("qualification");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = ExecutionPlan::from_scenario_with_options(
+            &scenario,
+            catalog,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("storage plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let spec = FaultRunSpec::resolved_execution(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+
+        assert_eq!(
+            spec.execution_kind().expect("execution"),
+            ExecutionKind::StorageRecovery
+        );
+        assert!(!spec.scenario.planned_qualification);
+        assert!(spec.scenario.planned_storage_qualification);
+        assert!(matches!(
+            spec.execution,
+            Some(FaultRunExecutionSpec::StorageRecovery {
+                case: crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn,
+                ..
+            })
+        ));
+        for artifact in [
+            "host-storage-proof.json",
+            "disk-generation-proof.json",
+            "shard-inventory-before.json",
+            "shard-inventory-after.json",
+            "dangling-cleanup-proof.json",
         ] {
             assert!(spec.artifacts.required.contains(&artifact.to_string()));
         }
