@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -29,11 +30,12 @@ use crate::fault::{
         ADMIN_REBALANCE_OVERLAP_ARTIFACT, ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
         AdminRebalanceOverlapEvidence, AdminRebalanceTranscript, validate_admin_rebalance_evidence,
     },
-    admin_runner::{ADMIN_WORKFLOW_ARTIFACT, AdminWorkflowEvidence},
+    admin_runner::{ADMIN_WORKFLOW_ARTIFACT, AdminWorkflowEvidence, AdminWorkflowPhaseStatus},
     admin_topology::{
         ADMIN_OPERATION_ARTIFACT, ADMIN_OPERATION_PROGRESS_ARTIFACT, ADMIN_TOPOLOGY_PROOF_ARTIFACT,
-        AdminAttemptIdentity, AdminAttemptWindow, AdminOperationEvidence,
-        AdminOperationProgressSample, AdminTopologyProof, validate_admin_operation_progress,
+        AdminAttemptIdentity, AdminAttemptWindow, AdminCall, AdminOperationEvidence,
+        AdminOperationProgressSample, AdminRequestEvidence, AdminTopologyProof, RebalanceStart,
+        RebalanceStatus, rebalance_progress_sample, validate_admin_operation_progress,
         validate_admin_topology_artifacts,
     },
     backends::chaos_mesh::{
@@ -51,7 +53,7 @@ use crate::fault::{
         DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS, MAX_ACK_TO_FAULT_MS,
     },
     events::{RunEvent, RunEventStatus},
-    fixture::{ADMIN_FIXTURE_ARTIFACT, AdminFixtureEvidence},
+    fixture::{ADMIN_FIXTURE_ARTIFACT, AdminFixtureEvidence, AdminFixturePhase, AdminFixturePlan},
     history::{
         DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome, OperationRecord,
         validate_history_phase_boundary, validate_history_scope_and_order,
@@ -318,6 +320,22 @@ fn validate_failed_attempt_disruption_evidence(
             && run_spec.scenario.case_name == case_name,
         "run-spec.json identity does not match the planned attempt"
     );
+    if scenario == ADMIN_REBALANCE_SCENARIO {
+        let run_spec = read_json::<FaultRunSpec>(&run_spec_path)?;
+        ensure!(
+            run_spec.execution_kind()? == ExecutionKind::Admin,
+            "failed admin scenario does not carry an admin run-spec"
+        );
+        return validate_failed_admin_attempt_disruption_evidence(
+            &case_dir,
+            attempt_run_id,
+            scenario,
+            case_name,
+            attempt_started_at_ms,
+            evaluated_at_ms,
+            &run_spec,
+        );
+    }
     let evidence_path = bound_case_artifact(&case_dir, "fault-evidence.json")?;
     let evidence = read_json::<FaultEvidenceArtifact>(&evidence_path)?;
     ensure!(
@@ -423,6 +441,567 @@ fn validate_failed_attempt_disruption_evidence(
         client_disruptions: disrupted,
         run_failed: has_event(&events, "run", RunEventStatus::Failed),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_failed_admin_attempt_disruption_evidence(
+    case_dir: &Path,
+    attempt_run_id: &str,
+    scenario: &str,
+    case_name: &str,
+    attempt_started_at_ms: u64,
+    evaluated_at_ms: u64,
+    run_spec: &FaultRunSpec,
+) -> Result<FailedAttemptDisruptionEvidence> {
+    ensure!(
+        run_spec.api_version == FAULT_RUN_API_VERSION
+            && run_spec.kind == FAULT_RUN_KIND
+            && run_spec.metadata.run_id == attempt_run_id
+            && run_spec.metadata.name == case_name
+            && run_spec.scenario.name == scenario
+            && run_spec.scenario.case_name == case_name,
+        "failed admin run-spec does not match the planned attempt"
+    );
+    let workflow = read_json::<AdminWorkflowEvidence>(&bound_case_artifact(
+        case_dir,
+        ADMIN_WORKFLOW_ARTIFACT,
+    )?)?;
+    workflow.validate()?;
+    ensure!(
+        !workflow.completed
+            && workflow.scenario == scenario
+            && workflow.run_id == attempt_run_id
+            && workflow.phases.iter().all(|phase| {
+                attempt_started_at_ms <= phase.started_at_ms && phase.ended_at_ms <= evaluated_at_ms
+            }),
+        "failed admin workflow does not belong to the current attempt window"
+    );
+    let phase_names = workflow
+        .phases
+        .iter()
+        .map(|phase| phase.phase.as_str())
+        .collect::<Vec<_>>();
+    ensure!(
+        matches!(
+            phase_names.as_slice(),
+            ["start", "cancel", "cleanup"]
+                | ["start", "operation-workload-overlap", "cancel", "cleanup"]
+                | [
+                    "start",
+                    "operation-workload-overlap",
+                    "verify",
+                    "cancel",
+                    "cleanup"
+                ]
+                | ["start", "operation-workload-overlap", "verify", "cleanup"]
+        ),
+        "failed admin workflow has an unsupported phase sequence"
+    );
+    ensure!(
+        workflow
+            .phases
+            .iter()
+            .find(|phase| phase.phase == "cancel")
+            .is_none_or(|phase| phase.status == AdminWorkflowPhaseStatus::Succeeded),
+        "failed admin workflow does not prove successful ownership-safe cancellation"
+    );
+
+    let fixture =
+        read_json::<AdminFixtureEvidence>(&bound_case_artifact(case_dir, ADMIN_FIXTURE_ARTIFACT)?)?;
+    validate_failed_admin_fixture(
+        &fixture,
+        run_spec,
+        attempt_run_id,
+        scenario,
+        attempt_started_at_ms,
+        evaluated_at_ms,
+    )?;
+    let transcript = match scenario {
+        ADMIN_REBALANCE_SCENARIO => read_json::<AdminRebalanceTranscript>(&bound_case_artifact(
+            case_dir,
+            ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+        )?)?,
+        other => bail!("failed-attempt safety does not support admin scenario {other:?}"),
+    };
+    let proof = if transcript.requests.is_empty() {
+        None
+    } else {
+        let proof = read_json::<AdminTopologyProof>(&bound_case_artifact(
+            case_dir,
+            ADMIN_TOPOLOGY_PROOF_ARTIFACT,
+        )?)?;
+        validate_failed_admin_topology_proof(&proof, &fixture, run_spec, case_name)?;
+        Some(proof)
+    };
+    if transcript.requests.is_empty() {
+        ensure!(
+            !workflow.cancel_attempted,
+            "failed admin workflow attempted cancellation without an owned operation receipt"
+        );
+    }
+    validate_failed_admin_rebalance_transcript(
+        &transcript,
+        proof.as_ref(),
+        &fixture,
+        run_spec,
+        case_name,
+        attempt_started_at_ms,
+        evaluated_at_ms,
+    )?;
+    validate_failed_admin_cancellation(&workflow, &transcript)?;
+
+    let events = read_jsonl::<RunEvent>(&bound_case_artifact(case_dir, "run-events.jsonl")?)?;
+    ensure!(
+        !events.is_empty()
+            && events.iter().all(|event| {
+                event.scenario == scenario
+                    && event.run_id == attempt_run_id
+                    && (attempt_started_at_ms..=evaluated_at_ms).contains(&event.at_ms)
+            })
+            && has_event(&events, "run", RunEventStatus::Started)
+            && has_event(&events, "run", RunEventStatus::Failed),
+        "failed admin run events do not prove the current failed attempt"
+    );
+
+    let workload_window = failed_admin_workload_window(
+        &workflow,
+        &events,
+        case_dir.join("workload-summary.json").exists(),
+    )?;
+    let client_disruptions =
+        if let Some((workload_started_at_ms, workload_ended_at_ms)) = workload_window {
+            fixture.validate_complete()?;
+            ensure!(
+                transcript.operation_id.is_some() && !transcript.requests.is_empty(),
+                "failed admin workload phase lacks a run-owned operation start receipt"
+            );
+            let workload =
+                read_json::<WorkloadPlan>(&bound_case_artifact(case_dir, "workload-plan.json")?)?;
+            ensure!(
+                workload == run_spec.workload.plan
+                    && workload.seed == run_spec.workload.seed
+                    && workload.object_count == run_spec.workload.object_count
+                    && workload.concurrency == run_spec.workload.concurrency
+                    && workload.operation_mix == run_spec.workload.operation_mix,
+                "failed admin workload plan does not match run-spec"
+            );
+            let history =
+                read_jsonl::<OperationRecord>(&bound_case_artifact(case_dir, "history.jsonl")?)?;
+            ensure!(
+                !history.is_empty(),
+                "failed admin workload history must not be empty"
+            );
+            validate_history_scope_and_order(
+                &history,
+                scenario,
+                attempt_run_id,
+                &run_spec.metadata.bucket,
+            )?;
+            let workload_history = history
+                .iter()
+                .filter(|record| {
+                    workload_started_at_ms <= record.started_at_ms
+                        && record.started_at_ms < workload_ended_at_ms
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                !workload_history.is_empty()
+                    && workload_history.iter().all(|record| {
+                        record.ended_at_ms <= workload_ended_at_ms
+                            && record.durability_cohort == Some(DurabilityCohort::FaultActive)
+                    })
+                    && history
+                        .iter()
+                        .filter(|record| {
+                            record.durability_cohort == Some(DurabilityCohort::FaultActive)
+                        })
+                        .all(|record| {
+                            workload_started_at_ms <= record.started_at_ms
+                                && record.started_at_ms < workload_ended_at_ms
+                                && record.ended_at_ms <= workload_ended_at_ms
+                        }),
+                "failed admin workload history is not exactly bound to its workflow phase"
+            );
+            let summary = read_json::<WorkloadSummaryArtifact>(&bound_case_artifact(
+                case_dir,
+                "workload-summary.json",
+            )?)?;
+            ensure!(
+                summary.scenario.as_deref() == Some(scenario)
+                    && summary.run_id.as_deref() == Some(attempt_run_id)
+                    && summary.seed == workload.seed
+                    && summary.object_count == workload.object_count
+                    && summary.concurrency == workload.concurrency
+                    && summary.exercised_all_operation_families(),
+                "failed admin workload summary does not match the completed current-run workload"
+            );
+            summary.require_history_matches(
+                &history,
+                scenario,
+                &run_spec.metadata.bucket,
+                DurabilityCohort::FaultActive,
+                &workload,
+                attempt_run_id,
+            )?;
+            validate_primary_workload_history(&workload_history, &workload, attempt_run_id)?;
+            summary.disrupted()?
+        } else {
+            0
+        };
+
+    Ok(FailedAttemptDisruptionEvidence {
+        client_disruptions,
+        run_failed: true,
+    })
+}
+
+fn failed_admin_workload_window(
+    workflow: &AdminWorkflowEvidence,
+    events: &[RunEvent],
+    workload_summary_exists: bool,
+) -> Result<Option<(u64, u64)>> {
+    let workload_phase = workflow
+        .phases
+        .iter()
+        .find(|phase| phase.phase == "operation-workload-overlap");
+    match workload_phase {
+        Some(phase) => {
+            ensure!(
+                has_event(events, "mixed-workload", RunEventStatus::Started)
+                    && has_event(events, "mixed-workload", RunEventStatus::Succeeded)
+                    && !has_event(events, "mixed-workload", RunEventStatus::Failed)
+                    && workload_summary_exists,
+                "failed admin attempt does not prove one completed workload phase with workload-summary.json"
+            );
+            Ok(Some((phase.started_at_ms, phase.ended_at_ms)))
+        }
+        None => {
+            ensure!(
+                !events.iter().any(|event| event.stage == "mixed-workload")
+                    && !workload_summary_exists,
+                "pre-workload admin failure carries unexpected workload evidence"
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn validate_failed_admin_fixture(
+    fixture: &AdminFixtureEvidence,
+    run_spec: &FaultRunSpec,
+    attempt_run_id: &str,
+    scenario: &str,
+    attempt_started_at_ms: u64,
+    evaluated_at_ms: u64,
+) -> Result<()> {
+    let expected_plan =
+        AdminFixturePlan::for_scenario(scenario, run_spec.recovery.expected_rustfs_pod_count)?;
+    ensure!(
+        fixture.schema_version == 1
+            && fixture.scenario == scenario
+            && fixture.run_id == attempt_run_id
+            && fixture.tenant == run_spec.cluster.tenant
+            && fixture.plan == expected_plan,
+        "failed admin fixture does not match the current run-spec"
+    );
+    let expected_phases = [
+        AdminFixturePhase::PrimaryReady,
+        AdminFixturePhase::PrefillComplete,
+        AdminFixturePhase::ExpansionApplied,
+        AdminFixturePhase::TopologyStable,
+    ];
+    ensure!(
+        fixture.observations.len() <= expected_phases.len(),
+        "failed admin fixture has too many observations"
+    );
+    let tenant_uid = fixture
+        .observations
+        .first()
+        .map(|observation| observation.tenant_uid.as_str());
+    let initial = vec![fixture.plan.initial_pool_name.clone()];
+    let expanded = vec![
+        fixture.plan.initial_pool_name.clone(),
+        fixture.plan.expansion_pool_name.clone(),
+    ];
+    let mut previous_at_ms = 0;
+    for (index, observation) in fixture.observations.iter().enumerate() {
+        let expected_pools = if index < 2 { &initial } else { &expanded };
+        ensure!(
+            observation.phase == expected_phases[index]
+                && observation.observed_at_ms > previous_at_ms
+                && (attempt_started_at_ms..=evaluated_at_ms).contains(&observation.observed_at_ms)
+                && tenant_uid.is_some_and(|uid| !uid.is_empty() && observation.tenant_uid == uid)
+                && observation.pool_names == *expected_pools
+                && if index == 1 {
+                    observation.prefilled_objects.is_some_and(|count| count > 0)
+                } else {
+                    observation.prefilled_objects.is_none()
+                },
+            "failed admin fixture observation is not a valid current-run prefix"
+        );
+        previous_at_ms = observation.observed_at_ms;
+    }
+    Ok(())
+}
+
+fn validate_failed_admin_topology_proof(
+    proof: &AdminTopologyProof,
+    fixture: &AdminFixtureEvidence,
+    run_spec: &FaultRunSpec,
+    case_name: &str,
+) -> Result<()> {
+    let tenant_uid = fixture
+        .observations
+        .first()
+        .map(|observation| observation.tenant_uid.as_str())
+        .context("failed admin transcript lacks a complete fixture Tenant identity")?;
+    ensure!(
+        proof.scenario == ADMIN_REBALANCE_SCENARIO
+            && proof.attempt
+                == (AdminAttemptIdentity {
+                    run_id: run_spec.metadata.run_id.clone(),
+                    case_name: case_name.to_string(),
+                    tenant_uid: tenant_uid.to_string(),
+                }),
+        "failed admin topology proof does not belong to the current attempt"
+    );
+    proof.require_cluster_scope(
+        &run_spec.cluster.context,
+        &run_spec.cluster.namespace,
+        &run_spec.cluster.tenant,
+    )?;
+    proof.require_satisfied()?;
+    let prefilled_count = run_spec.workload.plan.object_count / 2;
+    let mixed_count = run_spec.workload.plan.object_count - prefilled_count;
+    ensure!(
+        proof.workload_max_bytes
+            == run_spec
+                .workload
+                .plan
+                .mixed_write_upper_bound(prefilled_count, mixed_count)?,
+        "failed admin topology proof does not reserve the planned workload budget"
+    );
+    Ok(())
+}
+
+fn validate_failed_admin_cancellation(
+    workflow: &AdminWorkflowEvidence,
+    transcript: &AdminRebalanceTranscript,
+) -> Result<()> {
+    let cancel_phase = workflow.phases.iter().find(|phase| phase.phase == "cancel");
+    let starts = transcript
+        .requests
+        .iter()
+        .filter(|request| {
+            request.method == "POST" && request.path == "/rustfs/admin/v3/rebalance/start"
+        })
+        .count();
+    let stops = transcript
+        .requests
+        .iter()
+        .filter(|request| {
+            request.method == "POST" && request.path == "/rustfs/admin/v3/rebalance/stop"
+        })
+        .count();
+    let terminal = transcript
+        .progress
+        .last()
+        .is_some_and(|sample| sample.completed || sample.failed || sample.canceled_or_stopped);
+    let terminal_observed_at_ms = transcript
+        .progress
+        .last()
+        .map(|sample| sample.observed_at_ms);
+
+    ensure!(
+        stops <= 1 && (!workflow.cancel_attempted || starts == 1) && (stops == 0 || starts == 1),
+        "failed admin cancellation is not bound to one attempt-owned start receipt"
+    );
+    ensure!(
+        (!workflow.cancel_attempted && stops == 0)
+            || (workflow.cancel_attempted && cancel_phase.is_some()),
+        "failed admin cancelAttempted summary contradicts its stop receipt"
+    );
+    ensure!(
+        transcript.requests.is_empty() || terminal,
+        "failed admin attempt does not prove the operation reached a terminal state"
+    );
+    if let Some(cancel_phase) = cancel_phase {
+        ensure!(
+            transcript
+                .requests
+                .iter()
+                .filter(|request| request.path == "/rustfs/admin/v3/rebalance/stop")
+                .all(|request| {
+                    cancel_phase.started_at_ms <= request.started_at_ms
+                        && request.observed_at_ms <= cancel_phase.ended_at_ms
+                })
+                && terminal_observed_at_ms
+                    .is_none_or(|observed| observed <= cancel_phase.ended_at_ms),
+            "failed admin cancellation receipts lie outside the cancel phase"
+        );
+    }
+    Ok(())
+}
+
+fn validate_failed_admin_rebalance_transcript(
+    transcript: &AdminRebalanceTranscript,
+    proof: Option<&AdminTopologyProof>,
+    fixture: &AdminFixtureEvidence,
+    run_spec: &FaultRunSpec,
+    case_name: &str,
+    attempt_started_at_ms: u64,
+    evaluated_at_ms: u64,
+) -> Result<()> {
+    if transcript.requests.is_empty() {
+        ensure!(
+            transcript.operation_id.is_none() && transcript.progress.is_empty(),
+            "empty failed admin transcript carries an operation identity or progress"
+        );
+        return Ok(());
+    }
+    fixture.validate_complete()?;
+    let tenant_uid = fixture.observations[0].tenant_uid.as_str();
+    let proof = proof.context("failed admin transcript lacks its pre-start topology proof")?;
+    let allowed_request = |request: &AdminRequestEvidence| {
+        matches!(
+            (request.method.as_str(), request.path.as_str()),
+            ("POST", "/rustfs/admin/v3/rebalance/start")
+                | ("GET", "/rustfs/admin/v3/rebalance/status")
+                | ("POST", "/rustfs/admin/v3/rebalance/stop")
+        ) && request.query.is_empty()
+    };
+    for request in &transcript.requests {
+        ensure!(
+            allowed_request(request)
+                && (200..300).contains(&request.status)
+                && attempt_started_at_ms <= request.started_at_ms
+                && request.started_at_ms <= request.observed_at_ms
+                && request.observed_at_ms <= evaluated_at_ms
+                && request
+                    .request_id
+                    .as_deref()
+                    .is_some_and(|request_id| !request_id.trim().is_empty()),
+            "failed admin transcript contains an invalid request interval or route"
+        );
+        request.validate()?;
+        proof
+            .runtime
+            .target
+            .require_same_runtime_identity(&request.target)?;
+        if let Some(probe) = &request.runtime_probe {
+            proof.runtime.require_same_runtime(probe)?;
+        }
+        if request.path == "/rustfs/admin/v3/rebalance/stop" {
+            ensure!(
+                request.response_sha256.is_none() && request.response_body.is_none(),
+                "failed admin stop receipt unexpectedly carries an unvalidated response body"
+            );
+        } else {
+            validate_failed_admin_response_receipt(
+                request.response_sha256.as_deref(),
+                request.response_body.as_deref(),
+            )?;
+        }
+    }
+    ensure!(
+        transcript
+            .requests
+            .windows(2)
+            .all(|pair| pair[0].observed_at_ms <= pair[1].started_at_ms),
+        "failed admin transcript requests are unordered"
+    );
+    let start_requests = transcript
+        .requests
+        .iter()
+        .filter(|request| {
+            request.method == "POST" && request.path == "/rustfs/admin/v3/rebalance/start"
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        start_requests.len() <= 1,
+        "failed admin transcript contains duplicate start requests"
+    );
+    if let Some(start) = start_requests.first() {
+        let captured = serde_json::from_str::<RebalanceStart>(
+            start
+                .response_body
+                .as_deref()
+                .expect("receipt checked above"),
+        )?;
+        ensure!(
+            !captured.id.trim().is_empty()
+                && transcript.operation_id.as_deref() == Some(captured.id.as_str()),
+            "failed admin transcript operation ID does not match its start receipt"
+        );
+    }
+    if let Some(operation_id) = &transcript.operation_id {
+        ensure!(
+            !operation_id.trim().is_empty(),
+            "failed admin transcript has an empty operation ID"
+        );
+    }
+    let status_requests = transcript
+        .requests
+        .iter()
+        .filter(|request| {
+            request.method == "GET" && request.path == "/rustfs/admin/v3/rebalance/status"
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        status_requests.len() == transcript.progress.len(),
+        "failed admin transcript progress does not cover the exact status receipts"
+    );
+    let derived_operation_id = transcript
+        .operation_id
+        .as_deref()
+        .or_else(|| {
+            transcript
+                .progress
+                .first()
+                .map(|sample| sample.operation_id.as_str())
+        })
+        .context("failed admin status transcript lacks an operation identity")?;
+    for (request, sample) in status_requests.iter().zip(&transcript.progress) {
+        let status = serde_json::from_str::<RebalanceStatus>(
+            request
+                .response_body
+                .as_deref()
+                .expect("receipt checked above"),
+        )?;
+        ensure!(
+            !derived_operation_id.trim().is_empty() && status.id == derived_operation_id,
+            "failed admin status receipt belongs to a different operation"
+        );
+        let projected = rebalance_progress_sample(
+            proof,
+            derived_operation_id,
+            &AdminCall {
+                value: status,
+                request: (*request).clone(),
+            },
+        )?;
+        ensure!(
+            projected == *sample
+                && sample.attempt.run_id == run_spec.metadata.run_id
+                && sample.attempt.case_name == case_name
+                && sample.attempt.tenant_uid == tenant_uid,
+            "failed admin transcript progress is not derived from its current-run status receipt"
+        );
+    }
+    Ok(())
+}
+
+fn validate_failed_admin_response_receipt(
+    response_sha256: Option<&str>,
+    response_body: Option<&str>,
+) -> Result<()> {
+    let response_sha256 = response_sha256.context("admin response digest is missing")?;
+    let response_body = response_body.context("admin response body is missing")?;
+    ensure!(
+        response_sha256 == hex::encode(Sha256::digest(response_body.as_bytes())),
+        "admin response digest does not match its body"
+    );
+    Ok(())
 }
 
 fn bound_case_artifact(case_dir: &Path, name: &str) -> Result<PathBuf> {
@@ -6348,6 +6927,134 @@ impl WorkloadSummaryArtifact {
     }
 }
 
+fn record_key_counts<'a>(
+    records: impl Iterator<Item = &'a OperationRecord>,
+) -> Result<BTreeMap<String, usize>> {
+    let mut counts = BTreeMap::new();
+    for record in records {
+        let key = record
+            .key
+            .as_ref()
+            .context("planned workload history record lacks an object key")?;
+        *counts.entry(key.clone()).or_insert(0) += 1;
+    }
+    Ok(counts)
+}
+
+fn validate_primary_workload_history(
+    history: &[&OperationRecord],
+    plan: &WorkloadPlan,
+    run_id: &str,
+) -> Result<()> {
+    ensure!(
+        history.iter().all(|record| {
+            matches!(
+                record.kind,
+                OperationKind::Put
+                    | OperationKind::Get
+                    | OperationKind::List
+                    | OperationKind::Delete
+                    | OperationKind::CreateMultipartUpload
+                    | OperationKind::UploadPart
+                    | OperationKind::CompleteMultipartUpload
+                    | OperationKind::AbortMultipartUpload
+            )
+        }),
+        "history.jsonl contains an operation outside the planned mixed workload"
+    );
+    let prefilled_count = plan.object_count / 2;
+    let mixed_count = plan.object_count - prefilled_count;
+    let mut expected_puts = BTreeMap::<String, usize>::new();
+    let mut expected_deletes = BTreeMap::<String, usize>::new();
+    let mut expected_gets = BTreeMap::<String, usize>::new();
+    let mut expected_lists = 0usize;
+    for offset in 0..mixed_count {
+        let index = prefilled_count + offset;
+        let existing_index = plan.existing_object_offset(offset, prefilled_count);
+        let existing_key = ObjectSpec::directory_marker_key(run_id, existing_index);
+        match plan.operation_mix.operation_at(offset) {
+            WorkloadOperation::Put => {
+                *expected_puts
+                    .entry(ObjectSpec::seeded_key(run_id, index))
+                    .or_insert(0) += 1;
+            }
+            WorkloadOperation::Overwrite => {
+                *expected_puts.entry(existing_key).or_insert(0) += 1;
+            }
+            WorkloadOperation::Get => {
+                *expected_gets.entry(existing_key).or_insert(0) += 1;
+            }
+            WorkloadOperation::List => expected_lists += 1,
+            WorkloadOperation::Delete => {
+                *expected_deletes.entry(existing_key).or_insert(0) += 1;
+            }
+            WorkloadOperation::Multipart => {}
+        }
+    }
+
+    let actual_puts = record_key_counts(
+        history
+            .iter()
+            .copied()
+            .filter(|record| record.kind == OperationKind::Put),
+    )?;
+    let actual_deletes = record_key_counts(
+        history
+            .iter()
+            .copied()
+            .filter(|record| record.kind == OperationKind::Delete),
+    )?;
+    ensure!(
+        actual_puts == expected_puts && actual_deletes == expected_deletes,
+        "history.jsonl does not contain the exact planned PUT/overwrite/DELETE operations"
+    );
+    let expected_list_prefix = ObjectSpec::key_prefix(run_id);
+    ensure!(
+        history
+            .iter()
+            .filter(|record| record.kind == OperationKind::List)
+            .count()
+            == expected_lists
+            && history
+                .iter()
+                .filter(|record| record.kind == OperationKind::List)
+                .all(|record| record.key.as_deref() == Some(expected_list_prefix.as_str())),
+        "history.jsonl does not contain the exact planned LIST operations"
+    );
+
+    for record in history.iter().copied().filter(|record| {
+        record.outcome == OperationOutcome::Ok
+            && matches!(record.kind, OperationKind::Put | OperationKind::Delete)
+    }) {
+        let key = record
+            .key
+            .as_ref()
+            .context("successful workload mutation lacks an object key")?;
+        *expected_gets.entry(key.clone()).or_insert(0) += 1;
+    }
+    for record in history.iter().copied().filter(|record| {
+        record.kind == OperationKind::CompleteMultipartUpload
+            && record.outcome == OperationOutcome::Ok
+    }) {
+        let key = record
+            .key
+            .as_ref()
+            .context("successful multipart completion lacks an object key")?;
+        *expected_gets.entry(key.clone()).or_insert(0) += 1;
+    }
+    let actual_gets = record_key_counts(
+        history
+            .iter()
+            .copied()
+            .filter(|record| record.kind == OperationKind::Get),
+    )?;
+    ensure!(
+        actual_gets == expected_gets,
+        "history.jsonl does not contain every planned or success-verification GET"
+    );
+    Ok(())
+}
+
 fn validate_multipart_summary_history(
     summary: &WorkloadSummaryArtifact,
     history: &[&OperationRecord],
@@ -6589,12 +7296,14 @@ mod tests {
         RecommitCandidateManifestArtifact, RecommitReportArtifact, WorkloadSummaryArtifact,
         derive_recommit_candidates, read_json, read_jsonl, recursive_find,
         validate_admin_topology_artifact_files, validate_checker_phase_chain,
-        validate_fault_artifacts, validate_fault_artifacts_and_write_report,
+        validate_failed_attempt_disruptions, validate_fault_artifacts,
+        validate_fault_artifacts_and_write_report,
         validate_fault_artifacts_for_planned_attempt_and_write_report,
         validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts, validate_run_spec,
         validate_target_proof, validate_volume_quorum_health_evidence,
         validate_write_quorum_runtime_evidence,
     };
+    use crate::fault::fixture::AdminFixturePlan;
     use crate::fault::recovery_health::RECOVERY_HEALTH_ARTIFACT;
     use crate::fault::workload::execution::{
         AVAILABILITY_REPORT_ARTIFACT, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
@@ -6602,7 +7311,8 @@ mod tests {
     };
     use crate::fault::{
         acknowledged_mutation::AcknowledgedMutationKind,
-        admin_topology::{AdminAttemptIdentity, AdminAttemptWindow},
+        admin_rebalance::ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+        admin_topology::{ADMIN_TOPOLOGY_PROOF_ARTIFACT, AdminAttemptIdentity, AdminAttemptWindow},
         checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
         config::FaultTestConfig,
         history::{
@@ -6616,8 +7326,8 @@ mod tests {
             HostStorageTargetObservation,
         },
         plan::{
-            FaultInjection, FaultInjectionParameters, FaultKind, FaultPlan, FaultPlanOptions,
-            FaultSelection, FaultTarget,
+            ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultKind, FaultPlan,
+            FaultPlanOptions, FaultSelection, FaultTarget,
         },
         preflight::{
             TargetNodeAffinityProof, TargetNodeSelectorRequirementProof,
@@ -6635,15 +7345,762 @@ mod tests {
             FailureVerdict, ResponsibilityDomain,
         },
         scenarios::{
-            DM_FLAKEY_SCENARIO, FaultScenario, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
-            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, apply_catalog_defaults, scenario_spec,
+            ADMIN_REBALANCE_SCENARIO, DM_FLAKEY_SCENARIO, FaultScenario,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+            apply_catalog_defaults, scenario_spec,
         },
         spec::{FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec},
-        workload::WorkloadPlan,
+        workload::{ObjectSpec, WorkloadPlan},
     };
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use std::{collections::BTreeMap, fs, time::Duration};
+
+    const FAILED_ADMIN_RUN_ID: &str = "run-00000000-0000-4000-8000-000000000076";
+    const FAILED_ADMIN_CASE: &str = "fault_admin_rebalance_preserves_object_model";
+    const FAILED_ADMIN_BUCKET: &str = "admin-failed-bucket";
+
+    struct FailedAdminTestCase {
+        _tempdir: tempfile::TempDir,
+        suite_root: std::path::PathBuf,
+        case_dir: std::path::PathBuf,
+    }
+
+    fn failed_admin_test_case(
+        workload_started: bool,
+        include_summary: bool,
+    ) -> FailedAdminTestCase {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let suite_root = tempdir.path().join("suite");
+        let case_dir = suite_root.join("attempt").join(FAILED_ADMIN_CASE);
+        fs::create_dir_all(&case_dir).expect("case dir");
+
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.qualify_planned_admin = true;
+        let catalog = scenario_spec(ADMIN_REBALANCE_SCENARIO).expect("admin catalog");
+        let scenario = FaultScenario {
+            name: ADMIN_REBALANCE_SCENARIO.to_string(),
+            case_name: catalog.case_name,
+            duration: Duration::from_secs(600),
+            percent: 1,
+            object_count: 12,
+        };
+        let execution = ExecutionPlan::from_scenario_with_options(
+            &scenario,
+            catalog,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("admin execution plan");
+        let workload = WorkloadPlan::seeded(42, 12, 4);
+        let run_spec = FaultRunSpec::resolved_execution(
+            &config,
+            &scenario,
+            catalog,
+            &execution,
+            &workload,
+            FAILED_ADMIN_RUN_ID,
+            FAILED_ADMIN_BUCKET,
+        );
+        write_json(
+            &case_dir,
+            "run-spec.json",
+            &serde_json::to_value(&run_spec).expect("run spec"),
+        );
+
+        let fixture_plan = AdminFixturePlan::for_scenario(
+            ADMIN_REBALANCE_SCENARIO,
+            run_spec.recovery.expected_rustfs_pod_count,
+        )
+        .expect("fixture plan");
+        let initial_pool = fixture_plan.initial_pool_name.clone();
+        let expansion_pool = fixture_plan.expansion_pool_name.clone();
+        let observations = if workload_started {
+            json!([
+                {"phase": "primary-ready", "observedAtMs": 11, "tenantUid": "tenant-uid", "poolNames": [initial_pool]},
+                {"phase": "prefill-complete", "observedAtMs": 12, "tenantUid": "tenant-uid", "poolNames": [initial_pool], "prefilledObjects": 6},
+                {"phase": "expansion-applied", "observedAtMs": 13, "tenantUid": "tenant-uid", "poolNames": [initial_pool, expansion_pool]},
+                {"phase": "topology-stable", "observedAtMs": 14, "tenantUid": "tenant-uid", "poolNames": [initial_pool, expansion_pool]}
+            ])
+        } else {
+            json!([])
+        };
+        write_json(
+            &case_dir,
+            "admin-fixture.json",
+            &json!({
+                "schemaVersion": 1,
+                "scenario": ADMIN_REBALANCE_SCENARIO,
+                "runId": FAILED_ADMIN_RUN_ID,
+                "tenant": run_spec.cluster.tenant,
+                "plan": fixture_plan,
+                "observations": observations
+            }),
+        );
+
+        let phases = if workload_started {
+            json!([
+                {"phase": "start", "status": "succeeded", "startedAtMs": 10, "endedAtMs": 20},
+                {"phase": "operation-workload-overlap", "status": "failed", "startedAtMs": 20, "endedAtMs": 80, "error": "operation failed"},
+                {"phase": "cancel", "status": "succeeded", "startedAtMs": 80, "endedAtMs": 95},
+                {"phase": "cleanup", "status": "succeeded", "startedAtMs": 95, "endedAtMs": 98}
+            ])
+        } else {
+            json!([
+                {"phase": "start", "status": "failed", "startedAtMs": 10, "endedAtMs": 20, "error": "prepare failed"},
+                {"phase": "cancel", "status": "succeeded", "startedAtMs": 20, "endedAtMs": 25},
+                {"phase": "cleanup", "status": "succeeded", "startedAtMs": 25, "endedAtMs": 30}
+            ])
+        };
+        write_json(
+            &case_dir,
+            "admin-workflow.json",
+            &json!({
+                "schemaVersion": 1,
+                "scenario": ADMIN_REBALANCE_SCENARIO,
+                "runId": FAILED_ADMIN_RUN_ID,
+                "phases": phases,
+                "completed": false,
+                "cancelAttempted": workload_started,
+                "cleanupSucceeded": true
+            }),
+        );
+
+        let transcript = if workload_started {
+            let (proof, transcript) = failed_admin_evidence(&run_spec, &workload);
+            write_json(&case_dir, ADMIN_TOPOLOGY_PROOF_ARTIFACT, &proof);
+            transcript
+        } else {
+            json!({"operationId": null, "requests": [], "progress": []})
+        };
+        write_json(&case_dir, "admin-rebalance-transcript.json", &transcript);
+
+        let events = if workload_started {
+            vec![
+                run_event(10, "run", "started"),
+                run_event(21, "mixed-workload", "started"),
+                run_event(70, "mixed-workload", "succeeded"),
+                run_event(98, "run", "failed"),
+            ]
+        } else {
+            vec![
+                run_event(10, "run", "started"),
+                run_event(30, "run", "failed"),
+            ]
+        };
+        write_values_jsonl(&case_dir.join("run-events.jsonl"), &events);
+
+        if workload_started {
+            write_json(
+                &case_dir,
+                "workload-plan.json",
+                &serde_json::to_value(&workload).expect("workload plan"),
+            );
+            let history = failed_admin_history(&workload);
+            write_records_jsonl(&case_dir.join("history.jsonl"), &history);
+            if include_summary {
+                write_json(&case_dir, "workload-summary.json", &failed_admin_summary());
+            }
+        }
+
+        FailedAdminTestCase {
+            _tempdir: tempdir,
+            suite_root,
+            case_dir,
+        }
+    }
+
+    fn failed_admin_evidence(run_spec: &FaultRunSpec, workload: &WorkloadPlan) -> (Value, Value) {
+        let start_body = r#"{"id":"rebalance-1"}"#;
+        let runtime_body = r#"{"info":{"deploymentID":"deployment-1"}}"#;
+        let tenant = run_spec.cluster.tenant.as_str();
+        let namespace = run_spec.cluster.namespace.as_str();
+        let context = run_spec.cluster.context.as_str();
+        let service_name = format!("{tenant}-io");
+        let servers = run_spec.recovery.expected_rustfs_pod_count;
+        let last_server = servers - 1;
+        let primary = format!(
+            "http://{tenant}-primary-{{0...{last_server}}}.{tenant}-hl.{namespace}.svc.cluster.local:9000/data/rustfs{{0...0}}"
+        );
+        let expansion = format!(
+            "http://{tenant}-expansion-{{0...{last_server}}}.{tenant}-hl.{namespace}.svc.cluster.local:9000/data/rustfs{{0...0}}"
+        );
+        let cluster_body = serde_json::to_string(&json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "kube-system", "uid": "cluster-uid"}
+        }))
+        .expect("cluster body");
+        let service_body = serde_json::to_string(&json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "namespace": namespace,
+                "name": service_name,
+                "uid": "service-uid",
+                "resourceVersion": "service-rv-1"
+            },
+            "spec": {
+                "ports": [{"port": 9000}],
+                "selector": {"rustfs.tenant": tenant}
+            }
+        }))
+        .expect("service body");
+        let tenant_body = serde_json::to_string(&json!({
+            "metadata": {
+                "namespace": namespace,
+                "name": tenant,
+                "uid": "tenant-uid",
+                "resourceVersion": "tenant-rv-1"
+            },
+            "spec": {"pools": [
+                {"name": "primary", "servers": servers, "persistence": {"volumesPerServer": 1}},
+                {"name": "expansion", "servers": servers, "persistence": {"volumesPerServer": 1}}
+            ]}
+        }))
+        .expect("tenant body");
+        let endpoint = |base: u64| {
+            json!({
+                "kubernetesContext": context,
+                "clusterUid": "cluster-uid",
+                "portForwardCommand": format!("kubectl --context {context} -n {namespace} port-forward svc/{service_name} 19000:9000"),
+                "portForwardStartedAtMs": 10,
+                "clusterStartedAtMs": base,
+                "clusterObservedAtMs": base + 1,
+                "clusterResponseSha256": hex::encode(Sha256::digest(cluster_body.as_bytes())),
+                "clusterResponseBody": cluster_body,
+                "namespace": namespace,
+                "serviceName": service_name,
+                "serviceUid": "service-uid",
+                "serviceResourceVersion": "service-rv-1",
+                "serviceStartedAtMs": base + 2,
+                "serviceObservedAtMs": base + 3,
+                "serviceResponseSha256": hex::encode(Sha256::digest(service_body.as_bytes())),
+                "serviceResponseBody": service_body,
+                "tenantName": tenant,
+                "tenantUid": "tenant-uid",
+                "tenantResourceVersion": "tenant-rv-1",
+                "tenantStartedAtMs": base + 4,
+                "tenantObservedAtMs": base + 5,
+                "tenantResponseSha256": hex::encode(Sha256::digest(tenant_body.as_bytes())),
+                "tenantResponseBody": tenant_body,
+                "localEndpoint": "http://127.0.0.1:19000",
+                "remotePort": 9000
+            })
+        };
+        let target = |base| json!({"endpoint": endpoint(base), "deploymentId": "deployment-1"});
+        let runtime = |base| {
+            json!({
+                "target": target(base),
+                "status": 200,
+                "startedAtMs": base + 6,
+                "observedAtMs": base + 7,
+                "requestId": format!("runtime-{base}"),
+                "responseSha256": hex::encode(Sha256::digest(runtime_body.as_bytes())),
+                "responseBody": runtime_body
+            })
+        };
+        let runtime_pools = json!([
+            {"id": 0, "cmdline": primary, "status": "active", "decommissionStatus": "none", "rebalanceStatus": "none", "totalSize": 1000000000000000_u64, "currentSize": 900000000000000_u64, "usedSize": 100000000000000_u64, "used": 0.1},
+            {"id": 1, "cmdline": expansion, "status": "active", "decommissionStatus": "none", "rebalanceStatus": "none", "totalSize": 1000000000000000_u64, "currentSize": 900000000000000_u64, "usedSize": 100000000000000_u64, "used": 0.1}
+        ]);
+        let workload_max_bytes = workload
+            .mixed_write_upper_bound(workload.object_count / 2, workload.object_count / 2)
+            .expect("workload capacity");
+        let proof = json!({
+            "runId": FAILED_ADMIN_RUN_ID,
+            "caseName": FAILED_ADMIN_CASE,
+            "tenantUid": "tenant-uid",
+            "scenario": ADMIN_REBALANCE_SCENARIO,
+            "tenant": tenant,
+            "namespace": namespace,
+            "runtime": runtime(10),
+            "tenantPools": [
+                {"name": "primary", "tenantUid": "tenant-uid", "statefulSetName": format!("{tenant}-primary"), "expectedEndpointSet": primary, "internodeScheme": "http", "clusterDomain": "cluster.local", "dataPath": "/data", "runtimePoolId": 0, "servers": servers, "volumesPerServer": 1},
+                {"name": "expansion", "tenantUid": "tenant-uid", "statefulSetName": format!("{tenant}-expansion"), "expectedEndpointSet": expansion, "internodeScheme": "http", "clusterDomain": "cluster.local", "dataPath": "/data", "runtimePoolId": 1, "servers": servers, "volumesPerServer": 1}
+            ],
+            "runtimePools": runtime_pools,
+            "remainingFreeBytes": 1800000000000000_u64,
+            "targetUsedBytes": 0,
+            "workloadMaxBytes": workload_max_bytes,
+            "capacityGuardPercent": 130,
+            "requiredRemainingFreeBytes": workload_max_bytes,
+            "mutuallyExclusive": true,
+            "satisfied": true
+        });
+        let running_body = serde_json::to_string(&json!({
+            "id": "rebalance-1",
+            "pools": [
+                {"id": 0, "status": "started", "progress": {"objects": 0, "versions": 0, "bytes": 0, "remainingBuckets": 1}},
+                {"id": 1, "status": "started", "progress": {"objects": 0, "versions": 0, "bytes": 0, "remainingBuckets": 1}}
+            ]
+        })).expect("running status");
+        let stopped_body = serde_json::to_string(&json!({
+            "id": "rebalance-1",
+            "pools": [
+                {"id": 0, "status": "stopped", "progress": {"objects": 1, "versions": 1, "bytes": 10, "remainingBuckets": 1}},
+                {"id": 1, "status": "stopped", "progress": {"objects": 1, "versions": 1, "bytes": 10, "remainingBuckets": 1}}
+            ],
+            "stoppedAt": "2026-09-13T00:00:00Z"
+        })).expect("stopped status");
+        let transcript = json!({
+            "operationId": "rebalance-1",
+            "requests": [
+            {
+                "target": target(20),
+                "runtimeProbe": {
+                    "target": target(20),
+                    "status": 200,
+                    "startedAtMs": 26,
+                    "observedAtMs": 27,
+                    "requestId": "probe-request",
+                    "responseSha256": hex::encode(Sha256::digest(runtime_body.as_bytes())),
+                    "responseBody": runtime_body
+                },
+                "method": "POST",
+                "path": "/rustfs/admin/v3/rebalance/start",
+                "status": 200,
+                "startedAtMs": 28,
+                "observedAtMs": 29,
+                "requestId": "start-request",
+                "responseSha256": hex::encode(Sha256::digest(start_body.as_bytes())),
+                "responseBody": start_body
+            },
+            {"target": target(50), "method": "GET", "path": "/rustfs/admin/v3/rebalance/status", "query": {}, "status": 200, "startedAtMs": 56, "observedAtMs": 57, "requestId": "status-running", "responseSha256": hex::encode(Sha256::digest(running_body.as_bytes())), "responseBody": running_body},
+            {"target": target(75), "runtimeProbe": runtime(75), "method": "POST", "path": "/rustfs/admin/v3/rebalance/stop", "query": {}, "status": 200, "startedAtMs": 83, "observedAtMs": 84, "requestId": "stop-request"},
+            {"target": target(85), "method": "GET", "path": "/rustfs/admin/v3/rebalance/status", "query": {}, "status": 200, "startedAtMs": 91, "observedAtMs": 92, "requestId": "status-stopped", "responseSha256": hex::encode(Sha256::digest(stopped_body.as_bytes())), "responseBody": stopped_body}
+            ],
+            "progress": [
+                {"runId": FAILED_ADMIN_RUN_ID, "caseName": FAILED_ADMIN_CASE, "tenantUid": "tenant-uid", "operationId": "rebalance-1", "statusRequestId": "status-running", "observedAtMs": 57, "state": "started", "completed": false, "failed": false, "canceledOrStopped": false, "objectsMoved": 0, "versionsMoved": 0, "bytesMoved": 0},
+                {"runId": FAILED_ADMIN_RUN_ID, "caseName": FAILED_ADMIN_CASE, "tenantUid": "tenant-uid", "operationId": "rebalance-1", "statusRequestId": "status-stopped", "observedAtMs": 92, "state": "stopped", "completed": false, "failed": false, "canceledOrStopped": true, "objectsMoved": 2, "versionsMoved": 2, "bytesMoved": 20}
+            ]
+        });
+        (proof, transcript)
+    }
+
+    fn run_event(at_ms: u64, stage: &str, status: &str) -> Value {
+        json!({
+            "at_ms": at_ms,
+            "scenario": ADMIN_REBALANCE_SCENARIO,
+            "run_id": FAILED_ADMIN_RUN_ID,
+            "stage": stage,
+            "status": status,
+            "message": "test receipt"
+        })
+    }
+
+    fn failed_admin_history(plan: &WorkloadPlan) -> Vec<OperationRecord> {
+        let mut records = Vec::new();
+        let prefilled_count = plan.object_count / 2;
+        let put_key = ObjectSpec::seeded_key(FAILED_ADMIN_RUN_ID, prefilled_count);
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::Put,
+            &put_key,
+            OperationOutcome::Ok,
+        );
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::Get,
+            &put_key,
+            OperationOutcome::Ok,
+        );
+        let overwrite_key = ObjectSpec::directory_marker_key(
+            FAILED_ADMIN_RUN_ID,
+            plan.existing_object_offset(1, prefilled_count),
+        );
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::Put,
+            &overwrite_key,
+            OperationOutcome::Ok,
+        );
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::Get,
+            &overwrite_key,
+            OperationOutcome::Ok,
+        );
+        let direct_get_key = ObjectSpec::directory_marker_key(
+            FAILED_ADMIN_RUN_ID,
+            plan.existing_object_offset(2, prefilled_count),
+        );
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::Get,
+            &direct_get_key,
+            OperationOutcome::Failed,
+        );
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::List,
+            &ObjectSpec::key_prefix(FAILED_ADMIN_RUN_ID),
+            OperationOutcome::Ok,
+        );
+        let delete_key = ObjectSpec::directory_marker_key(
+            FAILED_ADMIN_RUN_ID,
+            plan.existing_object_offset(4, prefilled_count),
+        );
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::Delete,
+            &delete_key,
+            OperationOutcome::Ok,
+        );
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::Get,
+            &delete_key,
+            OperationOutcome::Ok,
+        );
+
+        let completion_index = prefilled_count + 5;
+        let completion_key = ObjectSpec::seeded_key(FAILED_ADMIN_RUN_ID, completion_index);
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::CreateMultipartUpload,
+            &completion_key,
+            OperationOutcome::Ok,
+        );
+        for _ in 0..plan.multipart_part_count_at(completion_index) {
+            push_failed_admin_record(
+                &mut records,
+                OperationKind::UploadPart,
+                &completion_key,
+                OperationOutcome::Ok,
+            );
+        }
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::CompleteMultipartUpload,
+            &completion_key,
+            OperationOutcome::Ok,
+        );
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::Get,
+            &completion_key,
+            OperationOutcome::Ok,
+        );
+
+        let abort_key = ObjectSpec::seeded_key(FAILED_ADMIN_RUN_ID, plan.object_count + 11);
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::CreateMultipartUpload,
+            &abort_key,
+            OperationOutcome::Ok,
+        );
+        push_failed_admin_record(
+            &mut records,
+            OperationKind::AbortMultipartUpload,
+            &abort_key,
+            OperationOutcome::Ok,
+        );
+        records
+    }
+
+    fn push_failed_admin_record(
+        records: &mut Vec<OperationRecord>,
+        kind: OperationKind,
+        key: &str,
+        outcome: OperationOutcome,
+    ) {
+        let index = records.len();
+        let started_sequence = (index * 2 + 1) as u64;
+        let ended_sequence = started_sequence + 1;
+        records.push(OperationRecord {
+            id: format!("operation-{index}"),
+            scenario: ADMIN_REBALANCE_SCENARIO.to_string(),
+            run_id: Some(FAILED_ADMIN_RUN_ID.to_string()),
+            kind,
+            bucket: FAILED_ADMIN_BUCKET.to_string(),
+            key: Some(key.to_string()),
+            value_sha256: None,
+            size_bytes: None,
+            version_id: None,
+            listed_keys: None,
+            listed_versions: None,
+            payload_ref: None,
+            range: None,
+            started_sequence: Some(started_sequence),
+            ended_sequence: Some(ended_sequence),
+            started_at_ms: 30 + index as u64,
+            ended_at_ms: 30 + index as u64,
+            outcome,
+            http_status: Some(if outcome == OperationOutcome::Failed {
+                500
+            } else {
+                200
+            }),
+            error: (outcome == OperationOutcome::Failed).then(|| "disrupted".to_string()),
+            durability_cohort: Some(DurabilityCohort::FaultActive),
+            fault_window_relation: None,
+        });
+    }
+
+    fn failed_admin_summary() -> Value {
+        let counts = |ok, failed| json!({"ok": ok, "not_found": 0, "failed": failed, "timeout": 0, "unknown": 0});
+        json!({
+            "scenario": ADMIN_REBALANCE_SCENARIO,
+            "run_id": FAILED_ADMIN_RUN_ID,
+            "seed": 42,
+            "object_count": 12,
+            "concurrency": 4,
+            "recommitted_after_recovery": 0,
+            "puts": counts(2, 0),
+            "gets": counts(4, 1),
+            "deletes": counts(1, 0),
+            "lists": counts(1, 0),
+            "multipart_completes": counts(1, 0),
+            "multipart_aborts": counts(1, 0)
+        })
+    }
+
+    fn write_values_jsonl(path: &std::path::Path, values: &[Value]) {
+        let body = values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{body}\n")).expect("write jsonl");
+    }
+
+    fn write_records_jsonl(path: &std::path::Path, records: &[OperationRecord]) {
+        let values = records
+            .iter()
+            .map(|record| serde_json::to_value(record).expect("history record"))
+            .collect::<Vec<_>>();
+        write_values_jsonl(path, &values);
+    }
+
+    #[test]
+    fn failed_admin_attempt_before_workload_reports_zero_disruptions() {
+        let case = failed_admin_test_case(false, false);
+        let disruptions = validate_failed_attempt_disruptions(
+            &case.suite_root,
+            &case.case_dir,
+            FAILED_ADMIN_RUN_ID,
+            ADMIN_REBALANCE_SCENARIO,
+            FAILED_ADMIN_CASE,
+            10,
+            100,
+        )
+        .expect("pre-workload failure is run-owned");
+        assert_eq!(disruptions, 0);
+    }
+
+    #[test]
+    fn failed_admin_attempt_with_completed_workload_reports_summary_disruptions() {
+        let case = failed_admin_test_case(true, true);
+        let disruptions = validate_failed_attempt_disruptions(
+            &case.suite_root,
+            &case.case_dir,
+            FAILED_ADMIN_RUN_ID,
+            ADMIN_REBALANCE_SCENARIO,
+            FAILED_ADMIN_CASE,
+            10,
+            100,
+        )
+        .expect("completed current-run workload is valid");
+        assert_eq!(disruptions, 1);
+    }
+
+    #[test]
+    fn failed_admin_attempt_rejects_start_only_cancellation_evidence() {
+        let case = failed_admin_test_case(true, true);
+        let transcript_path = case.case_dir.join(ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT);
+        let mut transcript = serde_json::from_slice::<Value>(
+            &fs::read(&transcript_path).expect("transcript artifact"),
+        )
+        .expect("transcript JSON");
+        transcript["requests"] = json!([transcript["requests"][0].clone()]);
+        transcript["progress"] = json!([]);
+        write_json(
+            &case.case_dir,
+            ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+            &transcript,
+        );
+
+        let error = validate_failed_attempt_disruptions(
+            &case.suite_root,
+            &case.case_dir,
+            FAILED_ADMIN_RUN_ID,
+            ADMIN_REBALANCE_SCENARIO,
+            FAILED_ADMIN_CASE,
+            10,
+            100,
+        )
+        .expect_err("start-only cancellation evidence must fail closed");
+        assert!(error.to_string().contains("terminal state"), "{error:#}");
+    }
+
+    #[test]
+    fn failed_admin_attempt_rejects_forged_topology_receipt() {
+        let case = failed_admin_test_case(true, true);
+        let proof_path = case.case_dir.join(ADMIN_TOPOLOGY_PROOF_ARTIFACT);
+        let mut proof =
+            serde_json::from_slice::<Value>(&fs::read(&proof_path).expect("proof artifact"))
+                .expect("proof JSON");
+        let forged_body = "{}";
+        proof["runtime"]["target"]["endpoint"]["clusterResponseBody"] = json!(forged_body);
+        proof["runtime"]["target"]["endpoint"]["clusterResponseSha256"] =
+            json!(hex::encode(Sha256::digest(forged_body.as_bytes())));
+        write_json(&case.case_dir, ADMIN_TOPOLOGY_PROOF_ARTIFACT, &proof);
+
+        let error = validate_failed_attempt_disruptions(
+            &case.suite_root,
+            &case.case_dir,
+            FAILED_ADMIN_RUN_ID,
+            ADMIN_REBALANCE_SCENARIO,
+            FAILED_ADMIN_CASE,
+            10,
+            100,
+        )
+        .expect_err("forged Kubernetes topology receipt must fail closed");
+        assert!(error.to_string().contains("/apiVersion"), "{error:#}");
+    }
+
+    #[test]
+    fn failed_admin_attempt_rejects_progress_not_derived_from_status() {
+        let case = failed_admin_test_case(true, true);
+        let transcript_path = case.case_dir.join(ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT);
+        let mut transcript = serde_json::from_slice::<Value>(
+            &fs::read(&transcript_path).expect("transcript artifact"),
+        )
+        .expect("transcript JSON");
+        transcript["progress"][1]["objectsMoved"] = json!(999);
+        write_json(
+            &case.case_dir,
+            ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+            &transcript,
+        );
+
+        let error = validate_failed_attempt_disruptions(
+            &case.suite_root,
+            &case.case_dir,
+            FAILED_ADMIN_RUN_ID,
+            ADMIN_REBALANCE_SCENARIO,
+            FAILED_ADMIN_CASE,
+            10,
+            100,
+        )
+        .expect_err("forged progress projection must fail closed");
+        assert!(error.to_string().contains("not derived"), "{error:#}");
+    }
+
+    #[test]
+    fn failed_admin_attempt_rejects_self_consistent_incomplete_workload() {
+        let case = failed_admin_test_case(true, true);
+        let history_path = case.case_dir.join("history.jsonl");
+        let mut history = fs::read_to_string(&history_path)
+            .expect("history artifact")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("history record"))
+            .collect::<Vec<_>>();
+        let failed_get = history
+            .iter()
+            .position(|record| record["kind"] == "get" && record["outcome"] == "failed")
+            .expect("failed direct GET");
+        history.remove(failed_get);
+        for (index, record) in history.iter_mut().enumerate() {
+            record["started_sequence"] = json!(index * 2 + 1);
+            record["ended_sequence"] = json!(index * 2 + 2);
+        }
+        write_values_jsonl(&history_path, &history);
+        let mut summary = failed_admin_summary();
+        summary["gets"]["failed"] = json!(0);
+        write_json(&case.case_dir, "workload-summary.json", &summary);
+
+        let error = validate_failed_attempt_disruptions(
+            &case.suite_root,
+            &case.case_dir,
+            FAILED_ADMIN_RUN_ID,
+            ADMIN_REBALANCE_SCENARIO,
+            FAILED_ADMIN_CASE,
+            10,
+            100,
+        )
+        .expect_err("self-consistent incomplete workload must fail closed");
+        assert!(error.to_string().contains("planned"), "{error:#}");
+    }
+
+    #[test]
+    fn failed_admin_attempt_rejects_unplanned_fault_active_operation() {
+        for cohort in [
+            json!("fault_active"),
+            json!("pre_fault"),
+            json!("post_recovery"),
+            Value::Null,
+        ] {
+            let case = failed_admin_test_case(true, true);
+            let history_path = case.case_dir.join("history.jsonl");
+            let mut history = fs::read_to_string(&history_path)
+                .expect("history artifact")
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("history record"))
+                .collect::<Vec<_>>();
+            let mut forged = history[0].clone();
+            forged["id"] = json!("unplanned-head");
+            forged["kind"] = json!("head");
+            forged["outcome"] = json!("failed");
+            forged["durability_cohort"] = cohort;
+            forged["started_sequence"] = json!(history.len() * 2 + 1);
+            forged["ended_sequence"] = json!(history.len() * 2 + 2);
+            forged["started_at_ms"] = json!(79);
+            forged["ended_at_ms"] = json!(79);
+            history.push(forged);
+            write_values_jsonl(&history_path, &history);
+
+            let error = validate_failed_attempt_disruptions(
+                &case.suite_root,
+                &case.case_dir,
+                FAILED_ADMIN_RUN_ID,
+                ADMIN_REBALANCE_SCENARIO,
+                FAILED_ADMIN_CASE,
+                10,
+                100,
+            )
+            .expect_err("unplanned workload-window S3 operation must fail closed");
+            assert!(
+                error.to_string().contains("workflow phase")
+                    || error.to_string().contains("outside the planned"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_admin_attempt_rejects_started_workload_without_current_summary() {
+        let case = failed_admin_test_case(true, false);
+        let error = validate_failed_attempt_disruptions(
+            &case.suite_root,
+            &case.case_dir,
+            FAILED_ADMIN_RUN_ID,
+            ADMIN_REBALANCE_SCENARIO,
+            FAILED_ADMIN_CASE,
+            10,
+            100,
+        )
+        .expect_err("started workload without summary must fail closed");
+        assert!(
+            error.to_string().contains("workload-summary.json"),
+            "{error:#}"
+        );
+
+        let mut foreign = failed_admin_summary();
+        foreign["run_id"] = json!("run-00000000-0000-4000-8000-000000000099");
+        write_json(&case.case_dir, "workload-summary.json", &foreign);
+        let error = validate_failed_attempt_disruptions(
+            &case.suite_root,
+            &case.case_dir,
+            FAILED_ADMIN_RUN_ID,
+            ADMIN_REBALANCE_SCENARIO,
+            FAILED_ADMIN_CASE,
+            10,
+            100,
+        )
+        .expect_err("foreign summary must fail closed");
+        assert!(error.to_string().contains("workload summary"), "{error:#}");
+    }
 
     #[test]
     fn admin_topology_files_require_successful_terminal_progress() {

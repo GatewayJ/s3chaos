@@ -564,7 +564,7 @@ pub struct AdminRequestTarget {
 }
 
 impl AdminRequestTarget {
-    fn require_same_runtime_identity(&self, current: &Self) -> Result<()> {
+    pub(crate) fn require_same_runtime_identity(&self, current: &Self) -> Result<()> {
         self.endpoint.require_same_live_target(&current.endpoint)?;
         ensure!(
             self.deployment_id == current.deployment_id,
@@ -629,7 +629,7 @@ impl AdminRuntimeBinding {
         Ok(())
     }
 
-    fn require_same_runtime(&self, current: &Self) -> Result<()> {
+    pub(crate) fn require_same_runtime(&self, current: &Self) -> Result<()> {
         self.validate()?;
         current.validate()?;
         self.target.require_same_runtime_identity(&current.target)?;
@@ -642,7 +642,7 @@ impl AdminRuntimeBinding {
 }
 
 impl AdminRequestEvidence {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         self.target.endpoint.validate()?;
         ensure!(
             !self.target.deployment_id.trim().is_empty()

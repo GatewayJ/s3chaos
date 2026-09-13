@@ -147,8 +147,16 @@ pub(crate) struct AdminWorkflowExecution {
 
 #[async_trait(?Send)]
 pub(crate) trait AdminCaseDriver: Send + Sync {
+    /// Prepares the run-owned fixture and proves the target without starting
+    /// the destructive admin operation.
+    async fn prepare(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Starts the typed RustFS admin operation and retains its raw receipt.
-    async fn start(&self) -> Result<()>;
+    /// Returns the monotonic instant captured immediately before the start
+    /// request so setup time is never charged to the operation budget.
+    async fn start(&self) -> Result<tokio::time::Instant>;
 
     /// Polls once and classifies only this scenario's terminal semantics.
     async fn observe(&self) -> Result<AdminWorkflowObservation>;
@@ -175,7 +183,9 @@ pub(crate) trait AdminCaseDriver: Send + Sync {
     /// attempt-owned operation can be proven instead of touching ambient work.
     async fn cancel(&self) -> Result<AdminCancelOutcome>;
 
-    /// Restores non-destructive runner resources and flushes pending evidence.
+    /// Releases ephemeral runner resources and flushes pending evidence.
+    /// Run-owned cluster fixtures remain intact for artifact validation and
+    /// the explicit `fault-cleanup` workflow.
     async fn cleanup(&self) -> Result<()>;
 }
 
@@ -197,16 +207,29 @@ pub(crate) async fn execute_admin_workflow<D: AdminCaseDriver + ?Sized>(
         cancel_attempted: false,
         cleanup_succeeded: false,
     };
-    let operation_deadline = tokio::time::Instant::now()
-        .checked_add(operation_timeout)
-        .filter(|_| !operation_timeout.is_zero());
-    let mut primary = match operation_deadline {
-        Some(operation_deadline) if !poll_interval.is_zero() && !recovery_timeout.is_zero() => {
-            run_phase(
-                &mut evidence,
-                "start",
-                run_operation_phase(deadline, operation_deadline, "start", driver.start()),
-            )
+    let mut operation_deadline = None;
+    let mut primary = match (
+        !poll_interval.is_zero(),
+        !operation_timeout.is_zero(),
+        !recovery_timeout.is_zero(),
+    ) {
+        (true, true, true) => {
+            run_phase(&mut evidence, "start", async {
+                deadline
+                    .run(driver.prepare())
+                    .await
+                    .context("admin preparation exceeded the suite deadline")?;
+                let operation_started_at = deadline
+                    .run(driver.start())
+                    .await
+                    .context("admin start exceeded the suite deadline")?;
+                operation_deadline = Some(
+                    operation_started_at
+                        .checked_add(operation_timeout)
+                        .context("admin operation timeout exceeds the monotonic clock range")?,
+                );
+                Ok(())
+            })
             .await
         }
         _ => {
@@ -233,33 +256,21 @@ pub(crate) async fn execute_admin_workflow<D: AdminCaseDriver + ?Sized>(
             wait_for_admin_completion(driver, deadline, operation_deadline, poll_interval).await
         };
         let overlap = async {
-            let (_, observed_running) = tokio::try_join!(
-                run_operation_phase(deadline, operation_deadline, "workload", workload),
-                operation,
-            )?;
+            // Never drop a started S3 workload when status observation fails.
+            // Its own per-request deadlines finish every accepted mutation and
+            // persist the terminal history record before cancellation begins.
+            let (workload_result, operation_result) = tokio::join!(workload, operation);
+            let observed_running = combine_overlap_results(workload_result, operation_result)?;
             if !observed_running {
-                run_operation_phase(
-                    deadline,
-                    operation_deadline,
-                    "completed-operation overlap proof",
-                    driver.verify_completed_overlap(),
-                )
-                .await?;
+                deadline.run(driver.verify_completed_overlap()).await?;
             }
             Ok(())
         };
         primary = run_phase(&mut evidence, "operation-workload-overlap", overlap).await;
     }
 
-    if primary.is_none()
-        && let Some(operation_deadline) = operation_deadline
-    {
-        primary = run_phase(
-            &mut evidence,
-            "verify",
-            run_operation_phase(deadline, operation_deadline, "verify", driver.verify()),
-        )
-        .await;
+    if primary.is_none() && operation_deadline.is_some() {
+        primary = run_phase(&mut evidence, "verify", deadline.run(driver.verify())).await;
     }
 
     if primary.is_some() {
@@ -296,6 +307,17 @@ pub(crate) async fn execute_admin_workflow<D: AdminCaseDriver + ?Sized>(
     AdminWorkflowExecution {
         evidence,
         error: primary,
+    }
+}
+
+fn combine_overlap_results(workload: Result<()>, operation: Result<bool>) -> Result<bool> {
+    match (workload, operation) {
+        (Ok(()), Ok(observed_running)) => Ok(observed_running),
+        (Err(workload), Ok(_)) => Err(workload),
+        (Ok(()), Err(operation)) => Err(operation),
+        (Err(workload), Err(operation)) => {
+            Err(operation.context(format!("admin workload also failed: {workload:#}")))
+        }
     }
 }
 
@@ -490,7 +512,10 @@ fn concrete_admin_case_kind(scenario: &str) -> Result<ConcreteAdminCaseKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[test]
     fn concrete_dispatch_selects_only_live_rebalance_driver() {
@@ -528,8 +553,9 @@ mod tests {
 
     #[async_trait(?Send)]
     impl AdminCaseDriver for FakeDriver {
-        async fn start(&self) -> Result<()> {
-            self.call("start")
+        async fn start(&self) -> Result<tokio::time::Instant> {
+            self.call("start")?;
+            Ok(tokio::time::Instant::now())
         }
 
         async fn observe(&self) -> Result<AdminWorkflowObservation> {
@@ -623,7 +649,7 @@ mod tests {
 
         #[async_trait(?Send)]
         impl AdminCaseDriver for ReceiptOverlapDriver {
-            async fn start(&self) -> Result<()> {
+            async fn start(&self) -> Result<tokio::time::Instant> {
                 self.0.start().await
             }
             async fn observe(&self) -> Result<AdminWorkflowObservation> {
@@ -672,7 +698,7 @@ mod tests {
 
         #[async_trait(?Send)]
         impl AdminCaseDriver for FailingCleanupDriver {
-            async fn start(&self) -> Result<()> {
+            async fn start(&self) -> Result<tokio::time::Instant> {
                 self.0.start().await
             }
             async fn observe(&self) -> Result<AdminWorkflowObservation> {
@@ -724,14 +750,15 @@ mod tests {
 
         #[async_trait(?Send)]
         impl AdminCaseDriver for PendingDriver {
-            async fn start(&self) -> Result<()> {
+            async fn start(&self) -> Result<tokio::time::Instant> {
                 self.0.start().await
             }
             async fn observe(&self) -> Result<AdminWorkflowObservation> {
                 pending().await
             }
             async fn run_workload(&self) -> Result<()> {
-                pending().await
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(())
             }
             async fn verify(&self) -> Result<()> {
                 self.0.verify().await
@@ -764,6 +791,279 @@ mod tests {
         assert_eq!(calls.last(), Some(&"cleanup"));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn status_failure_waits_for_started_workload_to_drain() {
+        struct DrainDriver {
+            inner: FakeDriver,
+            drained: Arc<AtomicBool>,
+        }
+
+        #[async_trait(?Send)]
+        impl AdminCaseDriver for DrainDriver {
+            async fn start(&self) -> Result<tokio::time::Instant> {
+                self.inner.start().await
+            }
+            async fn observe(&self) -> Result<AdminWorkflowObservation> {
+                self.inner.call("observe")?;
+                bail!("status receipt failed")
+            }
+            async fn run_workload(&self) -> Result<()> {
+                self.inner.call("workload")?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                self.drained.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn verify(&self) -> Result<()> {
+                unreachable!("verification must not run after status failure")
+            }
+            async fn cancel(&self) -> Result<AdminCancelOutcome> {
+                self.inner.cancel().await
+            }
+            async fn cleanup(&self) -> Result<()> {
+                self.inner.cleanup().await
+            }
+        }
+
+        let drained = Arc::new(AtomicBool::new(false));
+        let driver = DrainDriver {
+            inner: FakeDriver::default(),
+            drained: Arc::clone(&drained),
+        };
+        let execution = execute_admin_workflow(
+            "admin-rebalance",
+            "run-drain-status",
+            &driver,
+            RunDeadline::default(),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let error = format!("{:#}", execution.error.expect("status must fail"));
+        assert!(error.contains("status receipt failed"), "{error}");
+        assert!(drained.load(Ordering::SeqCst));
+        assert!(execution.evidence.cancel_attempted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operation_timeout_waits_for_started_workload_to_drain() {
+        use std::future::pending;
+
+        struct TimeoutDrainDriver {
+            inner: FakeDriver,
+            drained: Arc<AtomicBool>,
+        }
+
+        #[async_trait(?Send)]
+        impl AdminCaseDriver for TimeoutDrainDriver {
+            async fn start(&self) -> Result<tokio::time::Instant> {
+                self.inner.start().await
+            }
+            async fn observe(&self) -> Result<AdminWorkflowObservation> {
+                pending().await
+            }
+            async fn run_workload(&self) -> Result<()> {
+                self.inner.call("workload")?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                self.drained.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn verify(&self) -> Result<()> {
+                unreachable!("verification must not run after operation timeout")
+            }
+            async fn cancel(&self) -> Result<AdminCancelOutcome> {
+                self.inner.cancel().await
+            }
+            async fn cleanup(&self) -> Result<()> {
+                self.inner.cleanup().await
+            }
+        }
+
+        let drained = Arc::new(AtomicBool::new(false));
+        let driver = TimeoutDrainDriver {
+            inner: FakeDriver::default(),
+            drained: Arc::clone(&drained),
+        };
+        let execution = execute_admin_workflow(
+            "admin-rebalance",
+            "run-drain-timeout",
+            &driver,
+            RunDeadline::default(),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let error = format!("{:#}", execution.error.expect("operation must time out"));
+        assert!(error.contains("admin operation timeout"), "{error}");
+        assert!(drained.load(Ordering::SeqCst));
+        assert!(execution.evidence.cancel_attempted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preparation_and_verification_do_not_consume_operation_timeout() {
+        struct SlowBoundaryDriver(FakeDriver);
+
+        #[async_trait(?Send)]
+        impl AdminCaseDriver for SlowBoundaryDriver {
+            async fn prepare(&self) -> Result<()> {
+                self.0.call("prepare")?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(())
+            }
+            async fn start(&self) -> Result<tokio::time::Instant> {
+                self.0.start().await
+            }
+            async fn observe(&self) -> Result<AdminWorkflowObservation> {
+                self.0.observe().await
+            }
+            async fn run_workload(&self) -> Result<()> {
+                self.0.run_workload().await
+            }
+            async fn verify(&self) -> Result<()> {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                self.0.verify().await
+            }
+            async fn cancel(&self) -> Result<AdminCancelOutcome> {
+                self.0.cancel().await
+            }
+            async fn cleanup(&self) -> Result<()> {
+                self.0.cleanup().await
+            }
+        }
+
+        let driver = SlowBoundaryDriver(FakeDriver {
+            observations: Mutex::new(vec![
+                AdminWorkflowObservation::Completed,
+                AdminWorkflowObservation::Running,
+            ]),
+            ..FakeDriver::default()
+        });
+        let execution = execute_admin_workflow(
+            "admin-rebalance",
+            "run-timeout-boundary",
+            &driver,
+            RunDeadline::default(),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(execution.error.is_none(), "{:#?}", execution.error);
+        let calls = driver.0.calls.lock().expect("calls");
+        assert_eq!(calls[0], "prepare");
+        assert!(calls.contains(&"verify"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suite_deadline_interrupts_pending_verification_and_runs_cleanup() {
+        use std::future::pending;
+
+        struct PendingVerifyDriver(FakeDriver);
+
+        #[async_trait(?Send)]
+        impl AdminCaseDriver for PendingVerifyDriver {
+            async fn start(&self) -> Result<tokio::time::Instant> {
+                self.0.start().await
+            }
+            async fn observe(&self) -> Result<AdminWorkflowObservation> {
+                self.0.observe().await
+            }
+            async fn run_workload(&self) -> Result<()> {
+                self.0.run_workload().await
+            }
+            async fn verify(&self) -> Result<()> {
+                self.0.call("verify")?;
+                pending().await
+            }
+            async fn cancel(&self) -> Result<AdminCancelOutcome> {
+                self.0.cancel().await
+            }
+            async fn cleanup(&self) -> Result<()> {
+                self.0.cleanup().await
+            }
+        }
+
+        let driver = PendingVerifyDriver(FakeDriver {
+            observations: Mutex::new(vec![
+                AdminWorkflowObservation::Completed,
+                AdminWorkflowObservation::Running,
+            ]),
+            ..FakeDriver::default()
+        });
+        let execution = execute_admin_workflow(
+            "admin-rebalance",
+            "run-pending-verify",
+            &driver,
+            RunDeadline::new(Some(1)).expect("deadline"),
+            Duration::from_millis(1),
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let error = format!("{:#}", execution.error.expect("verification must time out"));
+        assert!(error.contains("suite maxDuration"), "{error}");
+        let calls = driver.0.calls.lock().expect("calls");
+        assert!(calls.contains(&"cancel"));
+        assert_eq!(calls.last(), Some(&"cleanup"));
+    }
+
+    #[tokio::test]
+    async fn accepted_start_persistence_failure_still_cancels_owned_operation() {
+        struct AcceptedStartDriver {
+            inner: FakeDriver,
+            owned: AtomicBool,
+        }
+
+        #[async_trait(?Send)]
+        impl AdminCaseDriver for AcceptedStartDriver {
+            async fn start(&self) -> Result<tokio::time::Instant> {
+                self.inner.call("start")?;
+                self.owned.store(true, Ordering::SeqCst);
+                bail!("persist accepted start receipt failed")
+            }
+            async fn observe(&self) -> Result<AdminWorkflowObservation> {
+                unreachable!("observe must not run after start persistence failure")
+            }
+            async fn run_workload(&self) -> Result<()> {
+                unreachable!("workload must not run after start persistence failure")
+            }
+            async fn verify(&self) -> Result<()> {
+                unreachable!("verify must not run after start persistence failure")
+            }
+            async fn cancel(&self) -> Result<AdminCancelOutcome> {
+                ensure!(self.owned.load(Ordering::SeqCst), "operation is not owned");
+                self.inner.cancel().await
+            }
+            async fn cleanup(&self) -> Result<()> {
+                self.inner.cleanup().await
+            }
+        }
+
+        let driver = AcceptedStartDriver {
+            inner: FakeDriver::default(),
+            owned: AtomicBool::new(false),
+        };
+        let execution = execute_admin_workflow(
+            "admin-rebalance",
+            "run-owned-start",
+            &driver,
+            RunDeadline::default(),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let error = format!("{:#}", execution.error.expect("persistence must fail"));
+        assert!(error.contains("persist accepted start receipt failed"));
+        assert!(execution.evidence.cancel_attempted);
+    }
+
     #[tokio::test]
     async fn start_failure_never_runs_workload_or_verification() {
         let driver = FakeDriver::with_fail("start");
@@ -785,12 +1085,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preparation_failure_never_starts_the_admin_operation() {
+        struct PreparationFailureDriver(FakeDriver);
+
+        #[async_trait(?Send)]
+        impl AdminCaseDriver for PreparationFailureDriver {
+            async fn prepare(&self) -> Result<()> {
+                self.0.call("prepare")?;
+                bail!("persist topology proof failed")
+            }
+            async fn start(&self) -> Result<tokio::time::Instant> {
+                unreachable!("admin start must not run after preparation failure")
+            }
+            async fn observe(&self) -> Result<AdminWorkflowObservation> {
+                unreachable!("observe must not run after preparation failure")
+            }
+            async fn run_workload(&self) -> Result<()> {
+                unreachable!("workload must not run after preparation failure")
+            }
+            async fn verify(&self) -> Result<()> {
+                unreachable!("verify must not run after preparation failure")
+            }
+            async fn cancel(&self) -> Result<AdminCancelOutcome> {
+                self.0.call("cancel")?;
+                Ok(AdminCancelOutcome::NoOwnedOperation)
+            }
+            async fn cleanup(&self) -> Result<()> {
+                self.0.cleanup().await
+            }
+        }
+
+        let driver = PreparationFailureDriver(FakeDriver::default());
+        let execution = execute_admin_workflow(
+            "admin-rebalance",
+            "run-prepare-failure",
+            &driver,
+            RunDeadline::default(),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let error = format!("{:#}", execution.error.expect("preparation must fail"));
+        assert!(error.contains("persist topology proof failed"));
+        assert!(!execution.evidence.cancel_attempted);
+        assert_eq!(
+            &*driver.0.calls.lock().expect("calls"),
+            &["prepare", "cancel", "cleanup"]
+        );
+    }
+
+    #[tokio::test]
     async fn failed_start_cannot_cancel_without_an_owned_operation() {
         struct NoOwnedOperationDriver(FakeDriver);
 
         #[async_trait(?Send)]
         impl AdminCaseDriver for NoOwnedOperationDriver {
-            async fn start(&self) -> Result<()> {
+            async fn start(&self) -> Result<tokio::time::Instant> {
                 self.0.call("start")?;
                 bail!("start response was not accepted")
             }

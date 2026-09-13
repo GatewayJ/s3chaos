@@ -1088,7 +1088,7 @@ impl LiveAdminRebalanceDriver {
         })
     }
 
-    async fn start_inner(&self) -> Result<()> {
+    async fn prepare_inner(&self) -> Result<()> {
         let execution_plan = crate::fault::plan::ExecutionPlan::Admin(self.plan.clone());
         let context = initialize_fault_run(
             &self.config,
@@ -1250,6 +1250,12 @@ impl LiveAdminRebalanceDriver {
             &topology_context,
         )?;
         validate_admin_pre_start_snapshot(&proof, &snapshot, now_ms())?;
+        proof.require_satisfied()?;
+        self.collector.write_text(
+            self.scenario.case_name,
+            ADMIN_TOPOLOGY_PROOF_ARTIFACT,
+            &serde_json::to_string_pretty(&proof)?,
+        )?;
         let preflight = PreflightSummary::single_run(
             &self.config,
             &self.scenario.name,
@@ -1269,7 +1275,6 @@ impl LiveAdminRebalanceDriver {
             &serde_json::to_string_pretty(&preflight)?,
         )?;
 
-        let attempted_at_ms = now_ms();
         {
             let mut state = self.state.lock().await;
             state.s3 = Some(s3);
@@ -1278,10 +1283,24 @@ impl LiveAdminRebalanceDriver {
             state.admin = Some(Arc::clone(&adapter));
             state.proof = Some(proof.clone());
             state.pools_before = Some(snapshot);
-            state.start_ownership = RebalanceStartOwnership::Ambiguous { attempted_at_ms };
             state.prefilled = prefilled;
             state.health_baseline = Some(health_baseline);
         }
+        Ok(())
+    }
+
+    async fn start_inner(&self) -> Result<Instant> {
+        let adapter = self
+            .state
+            .lock()
+            .await
+            .admin
+            .clone()
+            .context("rebalance adapter is not prepared")?;
+        let started_at = Instant::now();
+        let attempted_at_ms = now_ms();
+        self.state.lock().await.start_ownership =
+            RebalanceStartOwnership::Ambiguous { attempted_at_ms };
         let start = adapter
             .start_rebalance()
             .await
@@ -1302,7 +1321,7 @@ impl LiveAdminRebalanceDriver {
             transcript.requests.push(start.request.clone());
         }
         self.write_transcript()?;
-        Ok(())
+        Ok(started_at)
     }
 
     async fn persist_fixture(&self, fixture: &AdminFixtureEvidence) -> Result<()> {
@@ -1717,7 +1736,7 @@ impl LiveAdminRebalanceDriver {
         Ok(())
     }
 
-    async fn preserve_evidence(&self, result: Result<()>) -> Result<()> {
+    async fn preserve_evidence<T>(&self, result: Result<T>) -> Result<T> {
         let fixture = self.state.lock().await.fixture.clone();
         let persisted = self
             .write_fixture(&fixture)
@@ -1770,7 +1789,12 @@ impl LiveAdminRebalanceDriver {
 
 #[async_trait(?Send)]
 impl AdminCaseDriver for LiveAdminRebalanceDriver {
-    async fn start(&self) -> Result<()> {
+    async fn prepare(&self) -> Result<()> {
+        let result = self.prepare_inner().await;
+        self.preserve_evidence(result).await
+    }
+
+    async fn start(&self) -> Result<Instant> {
         let result = self.start_inner().await;
         self.preserve_evidence(result).await
     }
@@ -1883,45 +1907,45 @@ impl AdminCaseDriver for LiveAdminRebalanceDriver {
         };
         drop((admin, s3_port_forward));
         let transcript = transcript_state(&self.transcript);
-        let cleanup = persist_then_reset_owned_fixture(
+        let persistence = persist_fixture_evidence(
             &self.collector,
             self.scenario.case_name,
             &fixture,
             &transcript,
-            fixture_owned,
-            || reset_tenant_resources(&self.config.cluster),
         );
         let event = if let Some(events) = events {
             events.record(
                 "run",
-                if verified && cleanup.is_ok() {
+                if verified && persistence.is_ok() {
                     RunEventStatus::Succeeded
                 } else {
                     RunEventStatus::Failed
                 },
-                if verified && cleanup.is_ok() {
-                    "admin rebalance run completed successfully"
-                } else if cleanup.is_err() {
-                    "admin rebalance run-owned fixture cleanup failed"
+                if verified && persistence.is_ok() && fixture_owned {
+                    "admin rebalance run completed; run-owned fixture preserved for explicit fault-cleanup"
+                } else if verified && persistence.is_ok() {
+                    "admin rebalance run completed before owning a Tenant fixture"
+                } else if persistence.is_err() {
+                    "admin rebalance evidence persistence failed; any run-owned fixture remains for explicit fault-cleanup"
+                } else if fixture_owned {
+                    "admin rebalance run ended before successful verification; run-owned fixture preserved for explicit fault-cleanup"
                 } else {
-                    "admin rebalance run ended before successful verification"
+                    "admin rebalance run ended before successful verification or Tenant fixture ownership"
                 },
                 None,
             )
         } else {
             Ok(())
         };
-        combine_primary_and_secondary(cleanup, event, "record fixture cleanup outcome")
+        combine_primary_and_secondary(persistence, event, "record evidence preservation outcome")
     }
 }
 
-fn persist_then_reset_owned_fixture(
+fn persist_fixture_evidence(
     collector: &ArtifactCollector,
     case_name: &str,
     fixture: &AdminFixtureEvidence,
     transcript: &AdminRebalanceTranscript,
-    fixture_owned: bool,
-    reset: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     collector.write_text(
         case_name,
@@ -1933,21 +1957,18 @@ fn persist_then_reset_owned_fixture(
         ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
         &serde_json::to_string_pretty(transcript)?,
     )?;
-    if fixture_owned {
-        reset().context("reset run-owned admin Tenant fixture")?;
-    }
     Ok(())
 }
 
-fn combine_primary_and_secondary(
-    primary: Result<()>,
+fn combine_primary_and_secondary<T>(
+    primary: Result<T>,
     secondary: Result<()>,
     secondary_label: &str,
-) -> Result<()> {
+) -> Result<T> {
     match (primary, secondary) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(value), Ok(())) => Ok(value),
         (Err(primary), Ok(())) => Err(primary),
-        (Ok(()), Err(secondary)) => Err(secondary.context(secondary_label.to_string())),
+        (Ok(_), Err(secondary)) => Err(secondary.context(secondary_label.to_string())),
         (Err(primary), Err(secondary)) => {
             Err(primary.context(format!("{secondary_label} also failed: {secondary:#}")))
         }
@@ -1960,7 +1981,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn cleanup_persists_raw_evidence_before_reset_and_preserves_primary_error() {
+    fn cleanup_persists_raw_evidence_without_resetting_the_owned_fixture() {
         let dir = tempfile::tempdir().expect("tempdir");
         let collector = ArtifactCollector::new(dir.path());
         let fixture = AdminFixtureEvidence {
@@ -1972,28 +1993,17 @@ mod tests {
                 .expect("fixture plan"),
             observations: Vec::new(),
         };
-        let case_dir = collector.case_dir("admin-rebalance");
-        let cleanup = persist_then_reset_owned_fixture(
+        persist_fixture_evidence(
             &collector,
             "admin-rebalance",
             &fixture,
             &AdminRebalanceTranscript::default(),
-            true,
-            || {
-                assert!(case_dir.join(ADMIN_FIXTURE_ARTIFACT).is_file());
-                assert!(case_dir.join(ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT).is_file());
-                Err(anyhow::anyhow!("owned fixture reset failed"))
-            },
-        );
-        let result = combine_primary_and_secondary(
-            Err(anyhow::anyhow!("verification failed")),
-            cleanup,
-            "fixture cleanup",
-        );
-        let error = format!("{:#}", result.expect_err("combined failure"));
+        )
+        .expect("persist cleanup evidence");
 
-        assert!(error.contains("verification failed"));
-        assert!(error.contains("owned fixture reset failed"));
+        let case_dir = collector.case_dir("admin-rebalance");
+        assert!(case_dir.join(ADMIN_FIXTURE_ARTIFACT).is_file());
+        assert!(case_dir.join(ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT).is_file());
     }
 
     fn record(
