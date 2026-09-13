@@ -1515,6 +1515,19 @@ scenarios:
     }
 
     #[test]
+    fn planned_admin_decommission_template_is_well_formed_but_not_runnable() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+            "../../fault/planned/admin-decommission.yaml"
+        ))
+        .expect("planned admin-decommission suite syntax");
+
+        let error = suite
+            .resolve()
+            .expect_err("planned admin-decommission must retain the execution gate");
+        assert!(error.to_string().contains("not executable"));
+    }
+
+    #[test]
     fn rejects_partial_workload_override() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
             r#"

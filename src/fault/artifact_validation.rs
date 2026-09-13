@@ -26,6 +26,11 @@ use uuid::Uuid;
 
 use crate::fault::{
     acknowledged_mutation::AcknowledgedMutationKind,
+    admin_decommission::{
+        ADMIN_DECOMMISSION_OVERLAP_ARTIFACT, ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
+        AdminDecommissionOverlapEvidence, AdminDecommissionTranscript,
+        validate_admin_decommission_evidence,
+    },
     admin_rebalance::{
         ADMIN_REBALANCE_OVERLAP_ARTIFACT, ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
         AdminRebalanceOverlapEvidence, AdminRebalanceTranscript, validate_admin_rebalance_evidence,
@@ -83,8 +88,8 @@ use crate::fault::{
     },
     reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
     scenarios::{
-        self, ADMIN_REBALANCE_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario,
-        acknowledged_mutation_kind,
+        self, ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO,
+        DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario, acknowledged_mutation_kind,
     },
     spec::{
         FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunAckTriggerSpec, FaultRunArtifactSpec,
@@ -172,6 +177,27 @@ pub fn validate_admin_topology_artifact_files(
         )?)?;
         transcript.validate(&operation, &progress)?;
         validate_admin_rebalance_evidence(&operation, &progress, &overlap, &history, &checker)?;
+    }
+    if scenario == ADMIN_DECOMMISSION_SCENARIO {
+        let transcript = read_json::<AdminDecommissionTranscript>(&bound_case_artifact(
+            &case_dir,
+            ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
+        )?)?;
+        ensure!(
+            transcript.operation_id.as_deref() == Some(operation.operation_id.as_str())
+                && transcript.requests == operation.requests
+                && transcript.progress == progress,
+            "admin-decommission transcript does not match operation/progress evidence"
+        );
+        let overlap = read_json::<AdminDecommissionOverlapEvidence>(&bound_case_artifact(
+            &case_dir,
+            ADMIN_DECOMMISSION_OVERLAP_ARTIFACT,
+        )?)?;
+        let history =
+            read_jsonl::<OperationRecord>(&bound_case_artifact(&case_dir, "history.jsonl")?)?;
+        let checker =
+            read_json::<CheckerReport>(&bound_case_artifact(&case_dir, "checker-report.json")?)?;
+        validate_admin_decommission_evidence(&operation, &progress, &overlap, &history, &checker)?;
     }
     Ok(())
 }
@@ -7311,6 +7337,9 @@ mod tests {
     };
     use crate::fault::{
         acknowledged_mutation::AcknowledgedMutationKind,
+        admin_decommission::{
+            ADMIN_DECOMMISSION_OVERLAP_ARTIFACT, ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
+        },
         admin_rebalance::ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
         admin_topology::{ADMIN_TOPOLOGY_PROOF_ARTIFACT, AdminAttemptIdentity, AdminAttemptWindow},
         checker::{self, CheckerReport, RecoveryStabilityClassification, RecoveryStabilityReport},
@@ -7344,6 +7373,7 @@ mod tests {
             AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity,
             FailureVerdict, ResponsibilityDomain,
         },
+        scenarios::ADMIN_DECOMMISSION_SCENARIO,
         scenarios::{
             ADMIN_REBALANCE_SCENARIO, DM_FLAKEY_SCENARIO, FaultScenario,
             NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
@@ -8474,6 +8504,355 @@ mod tests {
             ),
         )
         .expect("progress");
+        let run_id = "run-admin-1";
+        let bucket = "bucket";
+        let prefix_key = crate::fault::workload::ObjectSpec::key_prefix(run_id);
+        let make_record =
+            |id: &str,
+             kind: OperationKind,
+             key: Option<String>,
+             sha: Option<&str>,
+             size: Option<usize>,
+             version_id: Option<&str>,
+             listed_keys: Option<Vec<String>>,
+             listed_versions: Option<Vec<crate::fault::history::ListedVersionEntry>>,
+             started_sequence: u64,
+             started_at_ms: u64| {
+                OperationRecord {
+                    id: id.to_string(),
+                    scenario: ADMIN_DECOMMISSION_SCENARIO.to_string(),
+                    run_id: Some(run_id.to_string()),
+                    kind,
+                    bucket: bucket.to_string(),
+                    key,
+                    value_sha256: sha.map(str::to_string),
+                    size_bytes: size,
+                    version_id: version_id.map(str::to_string),
+                    listed_keys,
+                    listed_versions,
+                    payload_ref: None,
+                    range: None,
+                    started_sequence: Some(started_sequence),
+                    ended_sequence: Some(started_sequence + 1),
+                    started_at_ms,
+                    ended_at_ms: started_at_ms + 1,
+                    outcome: OperationOutcome::Ok,
+                    http_status: Some(200),
+                    error: None,
+                    durability_cohort: None,
+                    fault_window_relation: None,
+                }
+            };
+        let hot = format!("{prefix_key}hot");
+        let zero = format!("{prefix_key}zero/");
+        let new = format!("{prefix_key}new");
+        let large = format!("{prefix_key}large");
+        let mut history_prefix = vec![
+            make_record(
+                "versioning",
+                OperationKind::PutBucketVersioning,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+                101,
+            ),
+            make_record(
+                "seed",
+                OperationKind::Put,
+                Some(hot.clone()),
+                Some("h1"),
+                Some(4),
+                Some("v1"),
+                None,
+                None,
+                3,
+                103,
+            ),
+            make_record(
+                "zero",
+                OperationKind::Put,
+                Some(zero.clone()),
+                Some("hz"),
+                Some(0),
+                Some("v2"),
+                None,
+                None,
+                5,
+                105,
+            ),
+            make_record(
+                "put",
+                OperationKind::Put,
+                Some(new.clone()),
+                Some("h3"),
+                Some(4),
+                Some("v3"),
+                None,
+                None,
+                7,
+                107,
+            ),
+            make_record(
+                "overwrite",
+                OperationKind::Put,
+                Some(hot.clone()),
+                Some("h4"),
+                Some(4),
+                Some("v4"),
+                None,
+                None,
+                9,
+                109,
+            ),
+            make_record(
+                "delete",
+                OperationKind::Delete,
+                Some(hot.clone()),
+                None,
+                None,
+                Some("v5"),
+                None,
+                None,
+                11,
+                111,
+            ),
+            make_record(
+                "multipart",
+                OperationKind::CompleteMultipartUpload,
+                Some(large.clone()),
+                Some("h6"),
+                Some(8),
+                Some("v6"),
+                None,
+                None,
+                13,
+                113,
+            ),
+            make_record(
+                "abort",
+                OperationKind::AbortMultipartUpload,
+                Some(format!("{prefix_key}aborted")),
+                None,
+                None,
+                None,
+                None,
+                None,
+                15,
+                115,
+            ),
+        ];
+        for record in &mut history_prefix {
+            record.durability_cohort = Some(DurabilityCohort::FaultActive);
+            record.fault_window_relation = Some(FaultWindowRelation::DuringFault);
+        }
+        let version_listing = checker::checker_expected_version_listing(&history_prefix)
+            .into_iter()
+            .collect();
+        let live_keys = vec![large.clone(), new.clone(), zero.clone()];
+        let mut checker_suffix = vec![
+            make_record(
+                "checker-get-new",
+                OperationKind::Get,
+                Some(new.clone()),
+                Some("h3"),
+                Some(4),
+                None,
+                None,
+                None,
+                17,
+                210,
+            ),
+            make_record(
+                "checker-get-zero",
+                OperationKind::Get,
+                Some(zero.clone()),
+                Some("hz"),
+                Some(0),
+                None,
+                None,
+                None,
+                19,
+                212,
+            ),
+            make_record(
+                "checker-get-large",
+                OperationKind::Get,
+                Some(large.clone()),
+                Some("h6"),
+                Some(8),
+                None,
+                None,
+                None,
+                21,
+                214,
+            ),
+            make_record(
+                "checker-list",
+                OperationKind::List,
+                Some(prefix_key.clone()),
+                None,
+                None,
+                None,
+                Some(live_keys),
+                None,
+                23,
+                216,
+            ),
+            make_record(
+                "checker-list-versions",
+                OperationKind::ListVersions,
+                Some(prefix_key.clone()),
+                None,
+                None,
+                None,
+                None,
+                Some(version_listing),
+                25,
+                218,
+            ),
+        ];
+        let version_checks = [
+            (&hot, "v1", "h1", 4_usize),
+            (&zero, "v2", "hz", 0),
+            (&new, "v3", "h3", 4),
+            (&hot, "v4", "h4", 4),
+            (&large, "v6", "h6", 8),
+        ];
+        for (index, (key, version_id, sha, size)) in version_checks.iter().enumerate() {
+            checker_suffix.push(make_record(
+                &format!("checker-version-{index}"),
+                OperationKind::Get,
+                Some((*key).clone()),
+                Some(sha),
+                Some(*size),
+                Some(version_id),
+                None,
+                None,
+                27 + index as u64 * 2,
+                220 + index as u64 * 2,
+            ));
+        }
+        let mut deleted_get = make_record(
+            "checker-get-deleted",
+            OperationKind::Get,
+            Some(hot.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            37,
+            232,
+        );
+        deleted_get.outcome = OperationOutcome::NotFound;
+        deleted_get.http_status = Some(404);
+        checker_suffix.push(deleted_get);
+        let mut data_version_checks = version_checks
+            .iter()
+            .map(
+                |(key, version_id, sha, _)| checker::CheckerDataVersionAudit {
+                    key: (*key).clone(),
+                    version_id: (*version_id).to_string(),
+                    expected_sha256: (*sha).to_string(),
+                    observed_sha256: Some((*sha).to_string()),
+                    outcome: OperationOutcome::Ok,
+                    http_status: Some(200),
+                },
+            )
+            .collect::<Vec<_>>();
+        data_version_checks.sort_by(|left, right| {
+            (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id))
+        });
+        let checker = json!({
+            "scenario": ADMIN_DECOMMISSION_SCENARIO,
+            "run_id": run_id,
+            "committed_puts": 5,
+            "expected_live_objects": 3,
+            "verified_live_objects": 3,
+            "missing_committed_objects": [],
+            "unavailable_committed_objects": [],
+            "unknown_committed_read_failures": [],
+            "hash_mismatches": [],
+            "successful_corrupted_reads": [],
+            "unexpected_visible_deleted_objects": [],
+            "list_history_warning_count": 0,
+            "final_list_warning_count": 0,
+            "list_history_warnings": [],
+            "list_warnings": [],
+            "final_listed_objects": 3,
+            "versioning_expected": true,
+            "expected_committed_versions": 5,
+            "verified_committed_versions": 5,
+            "operation_cohorts": {"fault_active": 8},
+            "fault_window_relations": {"during_fault": 8},
+            "audit": {
+                "bucket": bucket,
+                "started_at_ms": 210,
+                "completed_at_ms": 240,
+                "history_prefix_record_count": history_prefix.len(),
+                "history_prefix_sha256": checker::checker_history_records_sha256(&history_prefix).expect("prefix digest"),
+                "history_suffix_record_count": checker_suffix.len(),
+                "history_suffix_sha256": checker::checker_history_records_sha256(&checker_suffix).expect("suffix digest"),
+                "suffix_operations": checker::checker_operation_audits(&checker_suffix),
+                "data_version_checks": data_version_checks,
+                "delete_marker_checks": [{"key": hot, "version_id": "v5", "visible_in_list_object_versions": true}],
+                "list_object_versions_completed": true
+            },
+            "tenant_recovered": true,
+            "passed": true
+        });
+        history_prefix.extend(checker_suffix);
+        fs::write(
+            dir.path().join("history.jsonl"),
+            format!(
+                "{}\n",
+                history_prefix
+                    .iter()
+                    .map(|record| serde_json::to_string(record).expect("history record"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )
+        .expect("history");
+        write_json(dir.path(), "checker-report.json", &checker);
+        write_json(
+            dir.path(),
+            ADMIN_DECOMMISSION_OVERLAP_ARTIFACT,
+            &json!({
+                "runId": run_id,
+                "caseName": case_name,
+                "tenantUid": "tenant-uid",
+                "operationId": "decommission:1:2026-09-05T00:00:00Z",
+                "targetPoolId": 1,
+                "targetPoolExpression": target,
+                "decommissionStartedAtMs": 100,
+                "decommissionCompletedAtMs": 200,
+                "workloadStartedAtMs": 107,
+                "workloadEndedAtMs": 200,
+                "workloadFirstEventSequence": 7,
+                "workloadLastEventSequence": 16,
+                "workloadOperationIds": ["put", "overwrite", "delete", "multipart", "abort"],
+                "overlappingOperationIds": ["put", "overwrite", "delete", "multipart", "abort"],
+                "overlappingStatusRequestIds": ["decommission-status-request"]
+            }),
+        );
+        let operation = read_json::<Value>(&dir.path().join("admin-operation.json"))
+            .expect("operation artifact");
+        let progress = read_jsonl::<Value>(&dir.path().join("admin-operation-progress.jsonl"))
+            .expect("progress artifact");
+        write_json(
+            dir.path(),
+            ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
+            &json!({
+                "operationId": operation["operationId"],
+                "requests": operation["requests"],
+                "progress": progress,
+            }),
+        );
 
         validate_admin_topology_artifact_files(
             "admin-decommission",

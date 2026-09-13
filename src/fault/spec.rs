@@ -22,6 +22,9 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::fault::{
+    admin_decommission::{
+        ADMIN_DECOMMISSION_OVERLAP_ARTIFACT, ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
+    },
     admin_rebalance::{ADMIN_REBALANCE_OVERLAP_ARTIFACT, ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT},
     admin_runner::ADMIN_WORKFLOW_ARTIFACT,
     admin_topology::{
@@ -458,6 +461,15 @@ impl FaultRunArtifactSpec {
                 [
                     ADMIN_REBALANCE_OVERLAP_ARTIFACT,
                     ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+                ]
+                .map(str::to_string),
+            );
+        }
+        if scenario == crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO {
+            names.extend(
+                [
+                    ADMIN_DECOMMISSION_OVERLAP_ARTIFACT,
+                    ADMIN_DECOMMISSION_TRANSCRIPT_ARTIFACT,
                 ]
                 .map(str::to_string),
             );

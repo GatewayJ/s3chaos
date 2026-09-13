@@ -492,21 +492,49 @@ fn concrete_admin_case_driver(
                 config, collector, scenario, admin_plan, run_id, deadline,
             )?,
         )),
+        ConcreteAdminCaseKind::Decommission => Ok(Box::new(
+            crate::fault::admin_decommission::LiveAdminDecommissionDriver::new(
+                config, collector, scenario, admin_plan, run_id, deadline,
+            )?,
+        )),
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConcreteAdminCaseKind {
     Rebalance,
+    Decommission,
 }
 
 fn concrete_admin_case_kind(scenario: &str) -> Result<ConcreteAdminCaseKind> {
     if scenario == crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO {
         return Ok(ConcreteAdminCaseKind::Rebalance);
     }
+    if scenario == crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO {
+        return Ok(ConcreteAdminCaseKind::Decommission);
+    }
     bail!(
         "admin scenario {scenario:?} has a typed execution plan but no concrete case driver; keep it Planned until its scenario implementation is live-qualified"
     )
+}
+
+pub(crate) async fn persist_then_cleanup_admin_fixture<P, C>(persist: P, cleanup: C) -> Result<()>
+where
+    P: FnOnce() -> Result<()>,
+    C: FnOnce() -> Result<()> + Send + 'static,
+{
+    let primary = persist();
+    let cleanup = tokio::task::spawn_blocking(cleanup)
+        .await
+        .context("join blocking admin fixture cleanup")
+        .and_then(|result| result);
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => {
+            Err(primary.context(format!("admin fixture cleanup also failed: {cleanup:#}")))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -518,13 +546,18 @@ mod tests {
     };
 
     #[test]
-    fn concrete_dispatch_selects_only_live_rebalance_driver() {
+    fn concrete_dispatch_selects_both_live_admin_drivers() {
         assert_eq!(
             concrete_admin_case_kind(crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO)
                 .expect("rebalance dispatch"),
             ConcreteAdminCaseKind::Rebalance
         );
-        assert!(concrete_admin_case_kind("admin-decommission").is_err());
+        assert_eq!(
+            concrete_admin_case_kind(crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO)
+                .expect("decommission dispatch"),
+            ConcreteAdminCaseKind::Decommission
+        );
+        assert!(concrete_admin_case_kind("unknown-admin-operation").is_err());
     }
 
     #[derive(Default)]
@@ -1181,6 +1214,64 @@ mod tests {
         assert_eq!(
             &*driver.0.calls.lock().expect("calls"),
             &["start", "cancel", "cleanup"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_persists_before_restore_and_keeps_the_primary_error() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let persist_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+
+        let error = persist_then_cleanup_admin_fixture(
+            move || {
+                persist_calls.lock().expect("calls").push("persist");
+                bail!("persist failed")
+            },
+            move || {
+                cleanup_calls.lock().expect("calls").push("cleanup");
+                bail!("restore failed")
+            },
+        )
+        .await
+        .expect_err("both lifecycle steps fail");
+
+        assert_eq!(&*calls.lock().expect("calls"), &["persist", "cleanup"]);
+        assert_eq!(error.root_cause().to_string(), "persist failed");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("admin fixture cleanup also failed: restore failed"));
+    }
+
+    #[test]
+    fn exact_decommission_plan_has_a_concrete_driver() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let scenario = FaultScenario {
+            name: crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO.to_string(),
+            case_name: "fault_admin_decommission_preserves_object_model",
+            duration: Duration::from_secs(60),
+            percent: 100,
+            object_count: 120,
+        };
+        let plan = AdminExecutionPlan {
+            scenario: scenario.name.clone(),
+            case_name: scenario.case_name,
+            workload_mode: crate::fault::plan::FaultWorkloadMode::S3Mixed,
+            operation_timeout: scenario.duration,
+            topology: crate::fault::admin_topology::AdminTopologyPlan::for_scenario(&scenario.name)
+                .expect("topology"),
+        };
+        let collector = ArtifactCollector::new(tempfile::tempdir().expect("tempdir").path());
+
+        assert!(
+            concrete_admin_case_driver(
+                &config,
+                &collector,
+                &scenario,
+                &plan,
+                "run-1",
+                RunDeadline::default(),
+            )
+            .is_ok()
         );
     }
 }
