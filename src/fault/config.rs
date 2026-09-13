@@ -98,6 +98,9 @@ pub struct FaultTestConfig {
     /// Image containing `/usr/local/bin/s3chaos-storage-helper`; mandatory
     /// only for explicit storage qualification.
     pub storage_recovery_helper_image: Option<String>,
+    /// Strict, operator-reviewed target description for planned storage cases.
+    /// The runner re-reads every named Kubernetes generation before use.
+    pub storage_recovery_target_config: Option<PathBuf>,
     pub scenario: String,
     pub scenario_parameters: FaultInjectionParameters,
     pub duration: Duration,
@@ -330,6 +333,11 @@ impl FaultTestConfig {
                 &get_env,
                 "RUSTFS_FAULT_TEST_STORAGE_HELPER_IMAGE",
             ),
+            storage_recovery_target_config: env_optional(
+                &get_env,
+                "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG",
+            )
+            .map(PathBuf::from),
             scenario,
             scenario_parameters: FaultInjectionParameters::Default,
             duration: Duration::from_secs(env_u64(
@@ -807,6 +815,9 @@ mod tests {
         assert_eq!(config.warp_duration, std::time::Duration::from_secs(60));
         assert!(!config.destructive_enabled);
         assert!(!config.qualify_planned_admin);
+        assert!(!config.qualify_planned_storage);
+        assert!(config.storage_recovery_case.is_none());
+        assert!(config.storage_recovery_target_config.is_none());
         assert!(config.require_destructive_enabled().is_err());
     }
 
@@ -824,6 +835,36 @@ mod tests {
         .expect("fault config");
 
         assert!(config.qualify_planned_admin);
+    }
+
+    #[test]
+    fn planned_storage_qualification_requires_a_typed_case() {
+        let config = FaultTestConfig::from_env_with(
+            |name| match name {
+                "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("fast-csi".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE" => Some("true".to_string()),
+                "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE" => {
+                    Some("on-disk-bitrot-admin-deep".to_string())
+                }
+                "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG" => {
+                    Some("/secure/bitrot-target.json".to_string())
+                }
+                _ => None,
+            },
+            "production-test-cluster".to_string(),
+        )
+        .expect("fault config");
+
+        assert!(config.qualify_planned_storage);
+        assert_eq!(
+            config.storage_recovery_case,
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAdminDeep)
+        );
+        assert_eq!(
+            config.storage_recovery_target_config.as_deref(),
+            Some(std::path::Path::new("/secure/bitrot-target.json"))
+        );
     }
 
     #[test]

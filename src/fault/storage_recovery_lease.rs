@@ -47,11 +47,18 @@ pub enum StorageRecoveryCleanupProof {
     BitrotRestored {
         restore_receipt: Box<StorageRecoveryOperationReceipt>,
     },
+    BitrotAlreadyRepaired {
+        restore_receipt: Box<StorageRecoveryOperationReceipt>,
+    },
+    BitrotVerifiedSuperseded {
+        verification_receipt: Box<StorageRecoveryOperationReceipt>,
+    },
     BitrotQuarantined {
         restore_receipt: Box<StorageRecoveryOperationReceipt>,
     },
     StaleDiskReattached {
         reattach_receipt: Box<StorageRecoveryOperationReceipt>,
+        reattach_context: Box<OwnedStorageContext>,
         post_reattach_generation: Box<HostGenerationIdentity>,
         observed_at_ms: u64,
     },
@@ -72,13 +79,17 @@ impl StorageRecoveryCleanupProof {
                         context.case,
                         StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement
                             | StorageRecoveryCase::FreshVolumeReplacementAdminDeep
+                            | StorageRecoveryCase::OnDiskBitrotAutomaticScanner
+                            | StorageRecoveryCase::OnDiskBitrotAdminDeep
+                            | StorageRecoveryCase::StaleDiskReturn
                     ) && *observed_at_ms
                         >= context.exclusive_access.kubernetes_lease.acquired_at_ms,
-                    "pre-mutation abort proof is not a fresh-volume Lease-generation proof"
+                    "pre-mutation abort proof is not a supported storage Lease-generation proof"
                 );
                 Ok(())
             }
             Self::BitrotRestored { restore_receipt }
+            | Self::BitrotAlreadyRepaired { restore_receipt }
             | Self::BitrotQuarantined {
                 restore_receipt, ..
             } => {
@@ -101,10 +112,11 @@ impl StorageRecoveryCleanupProof {
                 let response: serde_json::Value =
                     serde_json::from_str(&restore_receipt.response_body)
                         .context("decode shard cleanup response")?;
-                let expected = if matches!(self, Self::BitrotRestored { .. }) {
-                    "restored"
-                } else {
-                    "quarantined"
+                let expected = match self {
+                    Self::BitrotRestored { .. } => "restored",
+                    Self::BitrotAlreadyRepaired { .. } => "already-repaired",
+                    Self::BitrotQuarantined { .. } => "quarantined",
+                    _ => unreachable!("matched a restore-receipt bitrot cleanup"),
                 };
                 ensure!(
                     response.get("outcome").and_then(serde_json::Value::as_str) == Some(expected),
@@ -117,8 +129,41 @@ impl StorageRecoveryCleanupProof {
                 }
                 Ok(())
             }
+            Self::BitrotVerifiedSuperseded {
+                verification_receipt,
+            } => {
+                ensure!(
+                    matches!(
+                        context.case,
+                        StorageRecoveryCase::OnDiskBitrotAutomaticScanner
+                            | StorageRecoveryCase::OnDiskBitrotAdminDeep
+                    ),
+                    "bitrot superseded cleanup proof is bound to another recovery case"
+                );
+                validate_receipt_operation(
+                    context,
+                    verification_receipt,
+                    |operation| {
+                        matches!(
+                            operation,
+                            StorageRecoveryHostOperation::VerifySupersededShard { .. }
+                        )
+                    },
+                    "superseded-shard verification",
+                )?;
+                let response: serde_json::Value =
+                    serde_json::from_str(&verification_receipt.response_body)
+                        .context("decode superseded-shard cleanup response")?;
+                ensure!(
+                    response.get("outcome").and_then(serde_json::Value::as_str)
+                        == Some("verified-superseded"),
+                    "superseded-shard cleanup response has the wrong terminal state"
+                );
+                Ok(())
+            }
             Self::StaleDiskReattached {
                 reattach_receipt,
+                reattach_context,
                 post_reattach_generation,
                 observed_at_ms,
             } => {
@@ -127,7 +172,7 @@ impl StorageRecoveryCleanupProof {
                     "stale-disk cleanup proof is bound to another recovery case"
                 );
                 validate_receipt_operation(
-                    context,
+                    reattach_context,
                     reattach_receipt,
                     |operation| {
                         matches!(
@@ -138,7 +183,38 @@ impl StorageRecoveryCleanupProof {
                     "device-mapper reattach",
                 )?;
                 ensure!(
-                    post_reattach_generation.as_ref() == &context.host_generation
+                    reattach_context.identity == context.identity
+                        && reattach_context.case == context.case
+                        && reattach_context.attempt_id == context.attempt_id
+                        && reattach_context.cluster_context == context.cluster_context
+                        && reattach_context.tenant_uid == context.tenant_uid
+                        && reattach_context.scope_sha256 == context.scope_sha256
+                        && crate::fault::storage_recovery_runtime::same_storage_volume_generation(
+                            &reattach_context.volume,
+                            &context.volume,
+                        )
+                        && reattach_context.resource_versions == context.resource_versions
+                        && reattach_context.host_generation == context.host_generation
+                        && reattach_context.exclusive_access.host_flock
+                            == context.exclusive_access.host_flock
+                        && reattach_context.exclusive_access.kubernetes_lease.uid
+                            == context.exclusive_access.kubernetes_lease.uid
+                        && reattach_context
+                            .exclusive_access
+                            .kubernetes_lease
+                            .acquired_at_ms
+                            == context.exclusive_access.kubernetes_lease.acquired_at_ms
+                        && reattach_context
+                            .exclusive_access
+                            .kubernetes_lease
+                            .holder_identity
+                            == context.exclusive_access.kubernetes_lease.holder_identity
+                        && reattach_context
+                            .exclusive_access
+                            .kubernetes_lease
+                            .renew_at_ms
+                            <= context.exclusive_access.kubernetes_lease.renew_at_ms
+                        && post_reattach_generation.as_ref() == &context.host_generation
                         && *observed_at_ms >= reattach_receipt.completed_at_ms,
                     "stale-disk cleanup does not prove the expected reattached generation"
                 );
@@ -202,9 +278,13 @@ impl StorageRecoveryCleanupProof {
         match self {
             Self::AbortedBeforeMutation { observed_at_ms } => *observed_at_ms,
             Self::BitrotRestored { restore_receipt }
+            | Self::BitrotAlreadyRepaired { restore_receipt }
             | Self::BitrotQuarantined {
                 restore_receipt, ..
             } => restore_receipt.completed_at_ms,
+            Self::BitrotVerifiedSuperseded {
+                verification_receipt,
+            } => verification_receipt.completed_at_ms,
             Self::StaleDiskReattached { observed_at_ms, .. }
             | Self::FreshVolumeCommitted { observed_at_ms, .. } => *observed_at_ms,
         }

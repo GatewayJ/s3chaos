@@ -33,6 +33,10 @@ use crate::fault::{
     host_storage::{
         DM_FILESYSTEM_CHECK_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT,
     },
+    on_disk_bitrot::{
+        BITROT_CLEANUP_ARTIFACT, BITROT_CORRUPTION_WINDOW_ARTIFACT, BITROT_HEAL_ARTIFACT,
+        BITROT_MUTATION_ARTIFACT, BITROT_SELECTION_ARTIFACT, BITROT_WORKFLOW_ARTIFACT,
+    },
     plan::{
         ExecutionKind, ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultPlan,
         FaultSelection, FaultTarget, FaultWorkloadMode,
@@ -42,8 +46,9 @@ use crate::fault::{
         acknowledged_mutation_kind, scenario_spec,
     },
     storage_recovery::{
-        DISK_GENERATION_PROOF_ARTIFACT, FORCE_READ_PROOF_ARTIFACT, HEAL_PROGRESS_ARTIFACT,
-        HEAL_SUMMARY_ARTIFACT, VERSION_SHARD_MAPPING_ARTIFACT,
+        DANGLING_CLEANUP_PROOF_ARTIFACT, DISK_GENERATION_PROOF_ARTIFACT, FORCE_READ_PROOF_ARTIFACT,
+        HEAL_PROGRESS_ARTIFACT, HEAL_SUMMARY_ARTIFACT, SHARD_INVENTORY_AFTER_ARTIFACT,
+        SHARD_INVENTORY_BEFORE_ARTIFACT, VERSION_SHARD_MAPPING_ARTIFACT,
     },
     storage_recovery_runner::STORAGE_RECOVERY_WORKFLOW_ARTIFACT,
     workload::WorkloadPlan,
@@ -112,6 +117,8 @@ pub struct FaultRunScenarioSpec {
     pub validation: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub planned_qualification: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub planned_storage_qualification: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detector: Option<FaultDetectorContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,8 +291,8 @@ impl FaultRunSpec {
                 impact_policy: scenario_spec.impact_policy.as_str().to_string(),
                 boundary: scenario_spec.boundary.to_string(),
                 validation: scenario_spec.validation.to_string(),
-                planned_qualification: config.qualify_planned_admin
-                    || config.qualify_planned_storage,
+                planned_qualification: config.qualify_planned_admin,
+                planned_storage_qualification: config.qualify_planned_storage,
                 detector: Some(scenario_spec.detector.contract()),
                 ack_trigger: acknowledged_mutation_kind(&scenario.name).map(|mutation| {
                     FaultRunAckTriggerSpec {
@@ -376,17 +383,8 @@ impl FaultRunSpec {
                     "storage-recovery run-spec must not contain fault injections"
                 );
                 ensure!(
-                    *operation_timeout_seconds > 0,
-                    "storage-recovery run-spec operation timeout must be positive"
-                );
-                ensure!(
-                    case.scenario() == self.scenario.name
-                        && case.scenario() == "fresh-volume-replacement",
-                    "storage-recovery run-spec case does not match its exact planned scenario"
-                );
-                ensure!(
-                    self.scenario.planned_qualification,
-                    "storage-recovery run-spec must record explicit planned qualification"
+                    *operation_timeout_seconds > 0 && case.scenario() == self.scenario.name,
+                    "storage-recovery run-spec has the wrong case or a zero timeout"
                 );
                 Ok(ExecutionKind::StorageRecovery)
             }
@@ -435,7 +433,31 @@ impl FaultRunArtifactSpec {
     }
 
     pub fn required_names_for_scenario(scenario: &str) -> Vec<String> {
-        let mut names = if matches!(
+        let mut names = if scenario == crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO {
+            [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "target-proof.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "workload-summary.json",
+                "checker-report.json",
+                RECOVERY_HEALTH_ARTIFACT,
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+                DISK_GENERATION_PROOF_ARTIFACT,
+                SHARD_INVENTORY_BEFORE_ARTIFACT,
+                SHARD_INVENTORY_AFTER_ARTIFACT,
+                DANGLING_CLEANUP_PROOF_ARTIFACT,
+                HOST_STORAGE_PROOF_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else if matches!(
             scenario,
             crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO
                 | crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO
@@ -490,6 +512,28 @@ impl FaultRunArtifactSpec {
                 FORCE_READ_PROOF_ARTIFACT,
                 crate::fault::fresh_volume::FRESH_VOLUME_READ_HISTORY_ARTIFACT,
                 crate::fault::fresh_volume::FRESH_VOLUME_CLEANUP_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else if scenario == crate::fault::scenarios::ON_DISK_BITROT_SCENARIO {
+            [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "checker-report.json",
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+                BITROT_SELECTION_ARTIFACT,
+                BITROT_MUTATION_ARTIFACT,
+                BITROT_CORRUPTION_WINDOW_ARTIFACT,
+                BITROT_HEAL_ARTIFACT,
+                BITROT_CLEANUP_ARTIFACT,
+                BITROT_WORKFLOW_ARTIFACT,
             ]
             .into_iter()
             .map(str::to_string)
@@ -756,6 +800,7 @@ mod tests {
             ExecutionKind::Admin
         );
         assert!(spec.scenario.planned_qualification);
+        assert!(!spec.scenario.planned_storage_qualification);
         assert!(spec.faults.is_empty());
         assert!(matches!(
             spec.execution,
@@ -811,7 +856,8 @@ mod tests {
             spec.execution_kind().expect("execution"),
             ExecutionKind::StorageRecovery
         );
-        assert!(spec.scenario.planned_qualification);
+        assert!(!spec.scenario.planned_qualification);
+        assert!(spec.scenario.planned_storage_qualification);
         assert!(spec.faults.is_empty());
         for artifact in [
             "storage-recovery-workflow.json",
@@ -820,6 +866,58 @@ mod tests {
             "force-read-proof.json",
             "force-read-history.jsonl",
             "fresh-volume-cleanup.json",
+        ] {
+            assert!(spec.artifacts.required.contains(&artifact.to_string()));
+        }
+    }
+
+    #[test]
+    fn stale_storage_spec_is_typed_and_requires_physical_proofs() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+        config.scenario = crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO.to_string();
+        config.qualify_planned_storage = true;
+        config.destructive_enabled = true;
+        config.storage_recovery_case =
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn);
+        let scenario = FaultScenario::from_config_for_execution(&config).expect("qualification");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = ExecutionPlan::from_scenario_with_options(
+            &scenario,
+            catalog,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("storage plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let spec = FaultRunSpec::resolved_execution(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+
+        assert_eq!(
+            spec.execution_kind().expect("execution"),
+            ExecutionKind::StorageRecovery
+        );
+        assert!(!spec.scenario.planned_qualification);
+        assert!(spec.scenario.planned_storage_qualification);
+        assert!(matches!(
+            spec.execution,
+            Some(FaultRunExecutionSpec::StorageRecovery {
+                case: crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn,
+                ..
+            })
+        ));
+        for artifact in [
+            "host-storage-proof.json",
+            "disk-generation-proof.json",
+            "shard-inventory-before.json",
+            "shard-inventory-after.json",
+            "dangling-cleanup-proof.json",
         ] {
             assert!(spec.artifacts.required.contains(&artifact.to_string()));
         }

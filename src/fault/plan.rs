@@ -32,9 +32,10 @@ use crate::fault::{
         IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, NETWORK_CORRUPT_SCENARIO,
         NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO, NETWORK_LOSS_SCENARIO,
         NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
-        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
-        POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
-        ROLLING_RESTART_ALL_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
+        ON_DISK_BITROT_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO,
+        POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, ROLLING_RESTART_ALL_SCENARIO,
+        STALE_DISK_RETURN_DETECT_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
         WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
     storage_recovery::StorageRecoveryCase,
@@ -112,7 +113,9 @@ impl ExecutionPlan {
         options: FaultPlanOptions,
     ) -> Result<Self> {
         match scenario.name.as_str() {
-            FRESH_VOLUME_REPLACEMENT_SCENARIO => {
+            FRESH_VOLUME_REPLACEMENT_SCENARIO
+            | ON_DISK_BITROT_SCENARIO
+            | STALE_DISK_RETURN_DETECT_SCENARIO => {
                 ensure!(
                     spec.backend == FaultBackend::PlannedReliabilityWorkflow,
                     "storage-recovery scenario {} must use the planned reliability workflow backend",
@@ -241,10 +244,7 @@ impl ExecutionPlan {
     pub fn backend_summary(&self) -> String {
         match self {
             Self::Injection(plan) => plan.backend_summary(),
-            Self::Admin(_) => FaultBackend::PlannedReliabilityWorkflow
-                .as_str()
-                .to_string(),
-            Self::StorageRecovery(_) => FaultBackend::PlannedReliabilityWorkflow
+            Self::Admin(_) | Self::StorageRecovery(_) => FaultBackend::PlannedReliabilityWorkflow
                 .as_str()
                 .to_string(),
         }
@@ -264,7 +264,7 @@ impl ExecutionPlan {
                 AdminTopologyKind::Rebalance => "owned two-pool admin topology".to_string(),
             },
             Self::StorageRecovery(plan) => {
-                format!("owned static Local-PV case {}", plan.case.as_str())
+                format!("owned storage recovery case {}", plan.case.as_str())
             }
         }
     }
