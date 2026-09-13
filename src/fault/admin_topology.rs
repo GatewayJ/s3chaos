@@ -1236,6 +1236,40 @@ pub struct AdminTopologyProof {
 }
 
 impl AdminTopologyProof {
+    pub(crate) fn require_cluster_scope(
+        &self,
+        kubernetes_context: &str,
+        namespace: &str,
+        tenant: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.tenant == tenant
+                && self.namespace == namespace
+                && self.runtime.target.endpoint.kubernetes_context == kubernetes_context
+                && self.runtime.target.endpoint.namespace == namespace
+                && self.runtime.target.endpoint.tenant_name == tenant,
+            "admin topology proof does not match the configured Kubernetes context, namespace, and Tenant"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn expected_pod_names(&self) -> Result<BTreeSet<String>> {
+        let mut names = BTreeSet::new();
+        for pool in &self.tenant_pools {
+            for ordinal in 0..pool.servers {
+                ensure!(
+                    names.insert(format!("{}-{ordinal}", pool.stateful_set_name)),
+                    "admin topology proof contains duplicate RustFS Pod identity"
+                );
+            }
+        }
+        ensure!(
+            !names.is_empty(),
+            "admin topology proof contains no RustFS Pod identity"
+        );
+        Ok(names)
+    }
+
     pub fn build(
         plan: &AdminTopologyPlan,
         scenario: &str,
@@ -4124,6 +4158,38 @@ mod tests {
         assert_eq!(proof.remaining_free_bytes, 1_500);
         assert_eq!(proof.target_used_bytes, 200);
         assert_eq!(proof.required_remaining_free_bytes, 360);
+        let expected_pods = proof.expected_pod_names().expect("proven Pod names");
+        assert_eq!(expected_pods.len(), 8);
+        assert!(expected_pods.contains("fault-tenant-decommission-target-3"));
+        assert!(expected_pods.contains("fault-tenant-primary-3"));
+    }
+
+    #[test]
+    fn topology_proof_must_match_configured_cluster_scope() {
+        let plan = AdminTopologyPlan::for_scenario(ADMIN_DECOMMISSION_SCENARIO).unwrap();
+        let proof = AdminTopologyProof::build(
+            &plan,
+            ADMIN_DECOMMISSION_SCENARIO,
+            &tenant(),
+            pools(),
+            &context(ADMIN_DECOMMISSION_SCENARIO),
+        )
+        .expect("proof");
+
+        proof
+            .require_cluster_scope("kind-admin-test", "fault-ns", "fault-tenant")
+            .expect("matching cluster scope");
+        for (context, namespace, tenant) in [
+            ("kind-other", "fault-ns", "fault-tenant"),
+            ("kind-admin-test", "other-ns", "fault-tenant"),
+            ("kind-admin-test", "fault-ns", "other-tenant"),
+        ] {
+            assert!(
+                proof
+                    .require_cluster_scope(context, namespace, tenant)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
