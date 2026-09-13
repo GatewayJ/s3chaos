@@ -1520,34 +1520,36 @@ impl LiveAdminDecommissionDriver {
     }
 
     async fn start_inner(&self) -> Result<Instant> {
-        let (adapter, proof) = {
-            let state = self.state.lock().await;
-            (
-                state
-                    .admin
-                    .clone()
-                    .context("decommission adapter is not prepared")?,
-                state
-                    .proof
-                    .clone()
-                    .context("decommission topology proof is not prepared")?,
-            )
+        let (adapter, proof, target_pool_id, target_expression) = {
+            let mut state = self.state.lock().await;
+            let adapter = state
+                .admin
+                .clone()
+                .context("decommission adapter is not prepared")?;
+            let proof = state
+                .proof
+                .clone()
+                .context("decommission topology proof is not prepared")?;
+            let pools_before = state
+                .pools_before
+                .as_ref()
+                .context("decommission pool snapshot is not prepared")?;
+            validate_admin_pre_start_snapshot(&proof, pools_before, now_ms())
+                .context("recheck decommission topology immediately before start")?;
+            let target_pool_id = proof
+                .target_pool_id
+                .context("admin-decommission proof lacks a target pool ID")?;
+            let target_expression = proof
+                .target_pool_expression
+                .clone()
+                .context("admin-decommission proof lacks a target pool expression")?;
+            let attempted_at_ms = now_ms();
+            state.start_ownership = DecommissionStartOwnership::Ambiguous { attempted_at_ms };
+            (adapter, proof, target_pool_id, target_expression)
         };
-        let target_pool_id = proof
-            .target_pool_id
-            .context("admin-decommission proof lacks a target pool ID")?;
-        let target_expression = proof
-            .target_pool_expression
-            .as_deref()
-            .context("admin-decommission proof lacks a target pool expression")?;
         let started_at = Instant::now();
-        let attempted_at_ms = now_ms();
-        let mut state = self.state.lock().await;
-        state.start_ownership = DecommissionStartOwnership::Ambiguous { attempted_at_ms };
-        drop(state);
-
         let start = adapter
-            .start_decommission(target_pool_id, target_expression)
+            .start_decommission(target_pool_id, &target_expression)
             .await
             .context("start exact RustFS pool decommission")?;
         validate_decommission_control_call(&proof, START_PATH, &start)?;
