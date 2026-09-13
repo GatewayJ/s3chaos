@@ -272,7 +272,7 @@ impl BitrotSelectionEvidence {
                 && *selected_part_number == response.selected_part.part_number
                 && expected_mount_device_id == &response.mount_device_id
                 && expected_drive_uuid == &response.drive_uuid
-                && response.layout.profile == Xl2FormatProfile::SUPPORTED
+                && response.layout.profile == Xl2FormatProfile::LATEST_RUSTFS
                 && response.layout.inspector_revision == OFFLINE_XL2_INSPECTOR_REVISION
                 && response.layout.version_id == self.probe.version_id
                 && self.probe.committed_at_ms < self.inspection_receipt.started_at_ms,
@@ -2870,7 +2870,7 @@ mod tests {
             xl_meta_sha256: ORIGINAL.to_string(),
             layout: Xl2ObjectVersionLayout {
                 inspector_revision: OFFLINE_XL2_INSPECTOR_REVISION.to_string(),
-                profile: Xl2FormatProfile::SUPPORTED,
+                profile: Xl2FormatProfile::LATEST_RUSTFS,
                 version_id: VERSION.to_string(),
                 data_directory: "data-dir".to_string(),
                 erasure_data_shards: 1,

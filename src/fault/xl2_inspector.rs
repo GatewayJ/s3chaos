@@ -35,6 +35,10 @@ const MAX_MSGPACK_DEPTH: usize = 32;
 
 pub const OFFLINE_XL2_INSPECTOR_REVISION: &str = "xl2-1.3-header3-meta3";
 
+const LATEST_RUSTFS_FORMAT_META_VERSION: &str = "1";
+const LATEST_RUSTFS_ERASURE_FORMAT_VERSION: &str = "3";
+const LATEST_RUSTFS_DISTRIBUTION_ALGORITHM: &str = "SIPMOD+PARITY";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Xl2FormatProfile {
@@ -45,16 +49,21 @@ pub struct Xl2FormatProfile {
 }
 
 impl Xl2FormatProfile {
-    pub const SUPPORTED: Self = Self {
+    /// XL2 envelope written by the current RustFS `main` filemeta encoder.
+    pub const LATEST_RUSTFS: Self = Self {
         file_major: 1,
         file_minor: 3,
         header_version: 3,
         metadata_version: 3,
     };
 
+    /// Compatibility alias for artifacts produced before the profile was
+    /// explicitly named after the RustFS writer it follows.
+    pub const SUPPORTED: Self = Self::LATEST_RUSTFS;
+
     pub fn revision(self) -> Result<&'static str> {
         ensure!(
-            self == Self::SUPPORTED,
+            self == Self::LATEST_RUSTFS,
             "unsupported XL2 capability profile {}.{} header {} metadata {}",
             self.file_major,
             self.file_minor,
@@ -116,42 +125,75 @@ pub fn validate_format_json_drive(
         !expected_deployment.is_nil() && !expected_drive.is_nil(),
         "expected RustFS deployment or drive id is nil"
     );
-    let format =
-        serde_json::from_slice::<serde_json::Value>(bytes).context("decode RustFS format.json")?;
-    let string_at = |pointer: &str| format.pointer(pointer).and_then(serde_json::Value::as_str);
+    let format = serde_json::from_slice::<LatestRustfsFormat>(bytes)
+        .context("decode latest RustFS format.json")?;
+    let deployment =
+        Uuid::parse_str(&format.id).context("RustFS format.json deployment id is not a UUID")?;
+    let drive = Uuid::parse_str(&format.erasure.this)
+        .context("RustFS format.json drive id is not a UUID")?;
     ensure!(
-        string_at("/version") == Some("1")
-            && matches!(string_at("/format"), Some("xl" | "xl-single"))
-            && string_at("/id") == Some(expected_deployment_id)
-            && string_at("/xl/version") == Some("3")
-            && string_at("/xl/this") == Some(expected_drive_uuid),
-        "format.json does not bind the supported format and expected deployment/drive identity"
+        format.version == LATEST_RUSTFS_FORMAT_META_VERSION
+            && matches!(format.backend.as_str(), "xl" | "xl-single")
+            && deployment == expected_deployment
+            && format.erasure.version == LATEST_RUSTFS_ERASURE_FORMAT_VERSION
+            && drive == expected_drive
+            && format.erasure.distribution_algo == LATEST_RUSTFS_DISTRIBUTION_ALGORITHM,
+        "format.json does not match the latest RustFS format profile or expected deployment/drive identity"
     );
-    let sets = format
-        .pointer("/xl/sets")
-        .and_then(serde_json::Value::as_array)
-        .context("format.json lacks XL sets")?;
-    let occurrences = sets
+    ensure!(
+        !format.erasure.sets.is_empty() && format.erasure.sets.iter().all(|set| !set.is_empty()),
+        "format.json has no complete XL sets"
+    );
+    let set_width = format.erasure.sets[0].len();
+    ensure!(
+        format.erasure.sets.iter().all(|set| set.len() == set_width),
+        "format.json XL sets do not have a uniform width"
+    );
+    let mut seen = BTreeSet::new();
+    let drives = format
+        .erasure
+        .sets
         .iter()
-        .flat_map(|set| {
-            set.as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
+        .flatten()
+        .map(|id| {
+            let id = Uuid::parse_str(id).context("format.json XL set entry is not a UUID")?;
+            ensure!(!id.is_nil(), "format.json XL set contains a nil drive UUID");
+            ensure!(
+                seen.insert(id),
+                "format.json XL sets contain a duplicate drive UUID"
+            );
+            Ok(id)
         })
-        .filter(|id| *id == expected_drive_uuid)
-        .count();
+        .collect::<Result<Vec<_>>>()?;
+    let occurrences = drives.iter().filter(|id| **id == expected_drive).count();
     ensure!(
         occurrences == 1,
         "format.json must contain the expected drive exactly once"
     );
     ensure!(
-        string_at("/id").and_then(|id| Uuid::parse_str(id).ok()) == Some(expected_deployment)
-            && string_at("/xl/this").and_then(|id| Uuid::parse_str(id).ok())
-                == Some(expected_drive),
-        "format.json deployment or drive UUID is non-canonical"
+        (format.backend == "xl-single") == format.erasure.sets.iter().all(|set| set.len() == 1),
+        "format.json backend does not match the latest RustFS set width"
     );
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct LatestRustfsFormat {
+    version: String,
+    #[serde(rename = "format")]
+    backend: String,
+    id: String,
+    #[serde(rename = "xl")]
+    erasure: LatestRustfsErasureFormat,
+}
+
+#[derive(Debug, Deserialize)]
+struct LatestRustfsErasureFormat {
+    version: String,
+    this: String,
+    sets: Vec<Vec<String>>,
+    #[serde(rename = "distributionAlgo")]
+    distribution_algo: String,
 }
 
 /// Inspects a captured `xl.meta` and returns exactly one non-delete, non-inline
@@ -919,7 +961,7 @@ mod tests {
         let layout = inspect_xl_meta(&fixture(VERSION, Some(DATA_DIR), &[1, 3]), VERSION)
             .expect("inspect XL2 fixture");
 
-        assert_eq!(layout.profile, Xl2FormatProfile::SUPPORTED);
+        assert_eq!(layout.profile, Xl2FormatProfile::LATEST_RUSTFS);
         assert_eq!(layout.inspector_revision, OFFLINE_XL2_INSPECTOR_REVISION);
         assert_eq!(layout.version_id, VERSION);
         assert_eq!(layout.data_directory, DATA_DIR);
@@ -1021,6 +1063,60 @@ mod tests {
         assert!(
             validate_format_json_drive(
                 &serde_json::to_vec(&duplicate).expect("duplicate format.json"),
+                DEPLOYMENT,
+                DRIVE
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn format_json_requires_the_latest_rustfs_layout_profile() {
+        let latest = serde_json::json!({
+            "version": "1",
+            "format": "xl",
+            "id": DEPLOYMENT,
+            "xl": {
+                "version": "3",
+                "this": DRIVE,
+                "sets": [[DRIVE, "cccccccc-cccc-cccc-cccc-cccccccccccc"]],
+                "distributionAlgo": "SIPMOD+PARITY"
+            }
+        });
+        for pointer in ["/version", "/xl/version", "/xl/distributionAlgo"] {
+            let mut stale = latest.clone();
+            *stale.pointer_mut(pointer).expect("profile field") = serde_json::json!("legacy");
+            assert!(
+                validate_format_json_drive(
+                    &serde_json::to_vec(&stale).expect("stale format.json"),
+                    DEPLOYMENT,
+                    DRIVE
+                )
+                .is_err(),
+                "accepted stale profile field {pointer}"
+            );
+        }
+
+        let mut mismatched_backend = latest;
+        mismatched_backend["format"] = serde_json::json!("xl-single");
+        assert!(
+            validate_format_json_drive(
+                &serde_json::to_vec(&mismatched_backend).expect("mismatched format.json"),
+                DEPLOYMENT,
+                DRIVE
+            )
+            .is_err()
+        );
+
+        let mut uneven_sets = mismatched_backend;
+        uneven_sets["format"] = serde_json::json!("xl");
+        uneven_sets["xl"]["sets"] = serde_json::json!([
+            [DRIVE, "cccccccc-cccc-cccc-cccc-cccccccccccc"],
+            ["dddddddd-dddd-dddd-dddd-dddddddddddd"]
+        ]);
+        assert!(
+            validate_format_json_drive(
+                &serde_json::to_vec(&uneven_sets).expect("uneven format.json"),
                 DEPLOYMENT,
                 DRIVE
             )

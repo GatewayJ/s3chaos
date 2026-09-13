@@ -1515,7 +1515,7 @@ mod tests {
             xl_meta_sha256: HASH.to_string(),
             layout: Xl2ObjectVersionLayout {
                 inspector_revision: OFFLINE_XL2_INSPECTOR_REVISION.to_string(),
-                profile: Xl2FormatProfile::SUPPORTED,
+                profile: Xl2FormatProfile::LATEST_RUSTFS,
                 version_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
                 data_directory: "fedcba98-7654-3210-fedc-ba9876543210".to_string(),
                 erasure_data_shards: 1,
