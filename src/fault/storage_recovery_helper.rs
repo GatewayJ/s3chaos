@@ -2488,7 +2488,7 @@ mod tests {
                 layout: crate::fault::xl2_inspector::Xl2ObjectVersionLayout {
                     inspector_revision: crate::fault::xl2_inspector::OFFLINE_XL2_INSPECTOR_REVISION
                         .to_string(),
-                    profile: crate::fault::xl2_inspector::Xl2FormatProfile::SUPPORTED,
+                    profile: crate::fault::xl2_inspector::Xl2FormatProfile::LATEST_RUSTFS,
                     version_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
                     data_directory: "data-dir".to_string(),
                     erasure_data_shards: 1,
@@ -2599,7 +2599,7 @@ mod tests {
             roots.volume.join(FORMAT_JSON_PATH),
             serde_json::to_vec(&serde_json::json!({
                 "version": "1",
-                "format": "xl",
+                "format": "xl-single",
                 "id": context.volume.rustfs_deployment_id,
                 "xl": {
                     "version": "3",

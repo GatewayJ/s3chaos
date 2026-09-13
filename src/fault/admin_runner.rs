@@ -518,25 +518,6 @@ fn concrete_admin_case_kind(scenario: &str) -> Result<ConcreteAdminCaseKind> {
     )
 }
 
-pub(crate) async fn persist_then_cleanup_admin_fixture<P, C>(persist: P, cleanup: C) -> Result<()>
-where
-    P: FnOnce() -> Result<()>,
-    C: FnOnce() -> Result<()> + Send + 'static,
-{
-    let primary = persist();
-    let cleanup = tokio::task::spawn_blocking(cleanup)
-        .await
-        .context("join blocking admin fixture cleanup")
-        .and_then(|result| result);
-    match (primary, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(primary), Err(cleanup)) => {
-            Err(primary.context(format!("admin fixture cleanup also failed: {cleanup:#}")))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1215,31 +1196,6 @@ mod tests {
             &*driver.0.calls.lock().expect("calls"),
             &["start", "cancel", "cleanup"]
         );
-    }
-
-    #[tokio::test]
-    async fn cleanup_persists_before_restore_and_keeps_the_primary_error() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let persist_calls = Arc::clone(&calls);
-        let cleanup_calls = Arc::clone(&calls);
-
-        let error = persist_then_cleanup_admin_fixture(
-            move || {
-                persist_calls.lock().expect("calls").push("persist");
-                bail!("persist failed")
-            },
-            move || {
-                cleanup_calls.lock().expect("calls").push("cleanup");
-                bail!("restore failed")
-            },
-        )
-        .await
-        .expect_err("both lifecycle steps fail");
-
-        assert_eq!(&*calls.lock().expect("calls"), &["persist", "cleanup"]);
-        assert_eq!(error.root_cause().to_string(), "persist failed");
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("admin fixture cleanup also failed: restore failed"));
     }
 
     #[test]

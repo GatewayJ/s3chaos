@@ -34,10 +34,7 @@ use tokio::{
 };
 
 use crate::fault::{
-    admin_runner::{
-        AdminCancelOutcome, AdminCaseDriver, AdminWorkflowObservation,
-        persist_then_cleanup_admin_fixture,
-    },
+    admin_runner::{AdminCancelOutcome, AdminCaseDriver, AdminWorkflowObservation},
     admin_topology::{
         ADMIN_OPERATION_ARTIFACT, ADMIN_OPERATION_PROGRESS_ARTIFACT, ADMIN_TOPOLOGY_PROOF_ARTIFACT,
         AdminAttemptIdentity, AdminAttemptWindow, AdminCall, AdminOperationEvidence,
@@ -52,8 +49,7 @@ use crate::fault::{
     events::RunEventStatus,
     fixture::{
         ADMIN_FIXTURE_ARTIFACT, AdminFixtureEvidence, AdminFixturePhase, AdminFixturePlan,
-        apply_admin_tenant_stage, capture_admin_fixture_observation,
-        reset_owned_admin_tenant_resources, reset_tenant_resources,
+        apply_admin_tenant_stage, capture_admin_fixture_observation, reset_tenant_resources,
     },
     history::{OperationKind, OperationOutcome, OperationRecord, validate_history_scope_and_order},
     plan::AdminExecutionPlan,
@@ -1295,7 +1291,7 @@ impl LiveAdminDecommissionDriver {
         })
     }
 
-    async fn start_inner(&self) -> Result<Instant> {
+    async fn prepare_inner(&self) -> Result<()> {
         let execution_plan = crate::fault::plan::ExecutionPlan::Admin(self.plan.clone());
         let context = initialize_fault_run(
             &self.config,
@@ -1507,7 +1503,36 @@ impl LiveAdminDecommissionDriver {
             "preflight-summary.json",
             &serde_json::to_string_pretty(&preflight)?,
         )?;
+        self.collector.write_text(
+            self.scenario.case_name,
+            ADMIN_TOPOLOGY_PROOF_ARTIFACT,
+            &serde_json::to_string_pretty(&proof)?,
+        )?;
+        state.s3 = Some(s3);
+        state.s3_port_forward = s3_port_forward;
+        state.s3_endpoint = Some(endpoint);
+        state.admin = Some(Arc::clone(&adapter));
+        state.proof = Some(proof.clone());
+        state.pools_before = Some(pools_before);
+        state.prefilled = prefilled;
+        state.health_baseline = Some(health_baseline);
+        Ok(())
+    }
 
+    async fn start_inner(&self) -> Result<Instant> {
+        let (adapter, proof) = {
+            let state = self.state.lock().await;
+            (
+                state
+                    .admin
+                    .clone()
+                    .context("decommission adapter is not prepared")?,
+                state
+                    .proof
+                    .clone()
+                    .context("decommission topology proof is not prepared")?,
+            )
+        };
         let target_pool_id = proof
             .target_pool_id
             .context("admin-decommission proof lacks a target pool ID")?;
@@ -1517,15 +1542,9 @@ impl LiveAdminDecommissionDriver {
             .context("admin-decommission proof lacks a target pool expression")?;
         let started_at = Instant::now();
         let attempted_at_ms = now_ms();
-        state.s3 = Some(s3);
-        state.s3_port_forward = s3_port_forward;
-        state.s3_endpoint = Some(endpoint);
-        state.admin = Some(Arc::clone(&adapter));
-        state.proof = Some(proof.clone());
-        state.pools_before = Some(pools_before);
-        state.prefilled = prefilled;
-        state.health_baseline = Some(health_baseline);
+        let mut state = self.state.lock().await;
         state.start_ownership = DecommissionStartOwnership::Ambiguous { attempted_at_ms };
+        drop(state);
 
         let start = adapter
             .start_decommission(target_pool_id, target_expression)
@@ -2044,6 +2063,11 @@ impl LiveAdminDecommissionDriver {
 
 #[async_trait(?Send)]
 impl AdminCaseDriver for LiveAdminDecommissionDriver {
+    async fn prepare(&self) -> Result<()> {
+        let result = self.prepare_inner().await;
+        self.preserve_evidence(result).await
+    }
+
     async fn start(&self) -> Result<Instant> {
         let result = self.start_inner().await;
         self.preserve_evidence(result).await
@@ -2182,39 +2206,31 @@ impl AdminCaseDriver for LiveAdminDecommissionDriver {
                 state.s3_port_forward.take(),
             )
         };
-        let cluster = self.config.cluster.clone();
-        let run_id = self.run_id.clone();
-        persist_then_cleanup_admin_fixture(
-            || {
-                self.write_fixture(&fixture)?;
-                self.write_transcript()?;
-                if let Some(events) = &events {
-                    events.record(
-                        "run",
-                        if verified {
-                            RunEventStatus::Succeeded
-                        } else {
-                            RunEventStatus::Failed
-                        },
-                        if verified {
-                            "admin decommission run completed successfully"
-                        } else {
-                            "admin decommission run ended before successful verification"
-                        },
-                        None,
-                    )?;
-                }
-                Ok(())
-            },
-            move || {
-                drop(admin);
-                drop(s3);
-                drop(s3_port_forward);
-                reset_owned_admin_tenant_resources(&cluster, &run_id)
-                    .context("clean up run-owned staged admin Tenant")
-            },
-        )
-        .await
+        drop((admin, s3, s3_port_forward));
+        let persistence = self
+            .write_fixture(&fixture)
+            .and_then(|_| self.write_transcript());
+        let event = if let Some(events) = events {
+            events.record(
+                "run",
+                if verified && persistence.is_ok() {
+                    RunEventStatus::Succeeded
+                } else {
+                    RunEventStatus::Failed
+                },
+                if verified && persistence.is_ok() {
+                    "admin decommission run completed; run-owned fixture preserved for explicit fault-cleanup"
+                } else if persistence.is_err() {
+                    "admin decommission evidence persistence failed; run-owned fixture remains for explicit fault-cleanup"
+                } else {
+                    "admin decommission run ended before successful verification; run-owned fixture preserved for explicit fault-cleanup"
+                },
+                None,
+            )
+        } else {
+            Ok(())
+        };
+        combine_primary_and_secondary(persistence, event, "record evidence preservation outcome")
     }
 }
 
