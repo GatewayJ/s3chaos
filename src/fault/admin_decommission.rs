@@ -158,21 +158,67 @@ impl AdminDecommissionOverlapEvidence {
         progress: &[AdminOperationProgressSample],
         workload: &AdminDecommissionWorkloadReceipt,
     ) -> Result<Self> {
+        ensure!(
+            operation.scenario == ADMIN_DECOMMISSION_SCENARIO,
+            "operation is not admin-decommission"
+        );
+        let evidence = Self::from_receipts(
+            &operation.attempt,
+            &operation.operation_id,
+            operation
+                .target_pool_id
+                .context("decommission operation lacks a target pool ID")?,
+            operation
+                .target_pool_expression
+                .as_deref()
+                .context("decommission operation lacks a target pool expression")?,
+            &operation.requests,
+            progress,
+            workload,
+        )?;
+        evidence.validate(operation, progress, &workload.history)?;
+        Ok(evidence)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_receipts(
+        attempt: &AdminAttemptIdentity,
+        operation_id: &str,
+        target_pool_id: usize,
+        target_pool_expression: &str,
+        requests: &[AdminRequestEvidence],
+        progress: &[AdminOperationProgressSample],
+        workload: &AdminDecommissionWorkloadReceipt,
+    ) -> Result<Self> {
+        validate_overlap_progress_receipts(requests, progress)?;
+        ensure!(
+            !operation_id.trim().is_empty()
+                && !target_pool_expression.trim().is_empty()
+                && !progress.is_empty()
+                && progress.iter().all(|sample| {
+                    sample.attempt == *attempt && sample.operation_id == operation_id
+                })
+                && progress[..progress.len().saturating_sub(1)]
+                    .iter()
+                    .all(|sample| {
+                        !sample.completed && !sample.failed && !sample.canceled_or_stopped
+                    })
+                && progress.last().is_some_and(|sample| {
+                    sample.completed && !sample.failed && !sample.canceled_or_stopped
+                })
+                && progress
+                    .windows(2)
+                    .all(|pair| pair[0].observed_at_ms <= pair[1].observed_at_ms),
+            "completed decommission overlap proof lacks one successful attempt-owned terminal sample"
+        );
         let (decommission_started_at_ms, decommission_completed_at_ms) =
-            decommission_window(operation)?;
+            decommission_window(requests)?;
         let records = workload_records(workload)?;
-        let target_pool_id = operation
-            .target_pool_id
-            .context("decommission operation lacks a target pool ID")?;
-        let target_pool_expression = operation
-            .target_pool_expression
-            .clone()
-            .context("decommission operation lacks a target pool expression")?;
         let evidence = Self {
-            attempt: operation.attempt.clone(),
-            operation_id: operation.operation_id.clone(),
+            attempt: attempt.clone(),
+            operation_id: operation_id.to_string(),
             target_pool_id,
-            target_pool_expression,
+            target_pool_expression: target_pool_expression.to_string(),
             decommission_started_at_ms,
             decommission_completed_at_ms,
             workload_started_at_ms: workload.started_at_ms,
@@ -193,13 +239,13 @@ impl AdminDecommissionOverlapEvidence {
                 .map(|record| record.id.clone())
                 .collect(),
             overlapping_status_request_ids: overlapping_status_request_ids(
-                operation,
+                requests,
                 progress,
                 workload.started_at_ms,
                 workload.ended_at_ms,
             )?,
         };
-        evidence.validate(operation, progress, &workload.history)?;
+        evidence.validate_receipts(requests, progress, &workload.history)?;
         Ok(evidence)
     }
 
@@ -218,15 +264,45 @@ impl AdminDecommissionOverlapEvidence {
                     == Some(self.target_pool_expression.as_str()),
             "decommission overlap identity does not match the admin operation and exact target"
         );
+        self.validate_receipts(&operation.requests, progress, history)
+    }
+
+    fn validate_receipts(
+        &self,
+        requests: &[AdminRequestEvidence],
+        progress: &[AdminOperationProgressSample],
+        history: &[OperationRecord],
+    ) -> Result<()> {
+        ensure!(
+            !self.operation_id.trim().is_empty()
+                && !self.target_pool_expression.trim().is_empty()
+                && !progress.is_empty()
+                && progress.iter().all(|sample| {
+                    sample.attempt == self.attempt && sample.operation_id == self.operation_id
+                })
+                && progress[..progress.len().saturating_sub(1)]
+                    .iter()
+                    .all(|sample| {
+                        !sample.completed && !sample.failed && !sample.canceled_or_stopped
+                    })
+                && progress.last().is_some_and(|sample| {
+                    sample.completed && !sample.failed && !sample.canceled_or_stopped
+                })
+                && progress
+                    .windows(2)
+                    .all(|pair| pair[0].observed_at_ms <= pair[1].observed_at_ms),
+            "decommission overlap progress is not bound to one successful terminal operation"
+        );
+        validate_overlap_progress_receipts(requests, progress)?;
         ensure!(
             !history.is_empty()
                 && history.iter().all(|record| {
                     record.scenario == ADMIN_DECOMMISSION_SCENARIO
-                        && record.run_id.as_deref() == Some(operation.attempt.run_id.as_str())
+                        && record.run_id.as_deref() == Some(self.attempt.run_id.as_str())
                 }),
             "decommission overlap history does not belong to the current attempt"
         );
-        let (started_at_ms, completed_at_ms) = decommission_window(operation)?;
+        let (started_at_ms, completed_at_ms) = decommission_window(requests)?;
         ensure!(
             self.decommission_started_at_ms == started_at_ms
                 && self.decommission_completed_at_ms == completed_at_ms
@@ -275,7 +351,7 @@ impl AdminDecommissionOverlapEvidence {
             "no complete S3 operation interval overlaps the observed decommission window"
         );
         let status_ids = overlapping_status_request_ids(
-            operation,
+            requests,
             progress,
             self.workload_started_at_ms,
             self.workload_ended_at_ms,
@@ -1002,18 +1078,12 @@ fn validate_workload_families(
     Ok(())
 }
 
-fn decommission_window(operation: &AdminOperationEvidence) -> Result<(u64, u64)> {
-    ensure!(
-        operation.scenario == ADMIN_DECOMMISSION_SCENARIO,
-        "operation is not admin-decommission"
-    );
-    let start = operation
-        .requests
+fn decommission_window(requests: &[AdminRequestEvidence]) -> Result<(u64, u64)> {
+    let start = requests
         .iter()
         .find(|request| request.method == "POST" && request.path == START_PATH)
         .context("admin-decommission operation lacks its start receipt")?;
-    let terminal = operation
-        .requests
+    let terminal = requests
         .iter()
         .rev()
         .find(|request| request.method == "GET" && request.path == STATUS_PATH)
@@ -1026,17 +1096,16 @@ fn decommission_window(operation: &AdminOperationEvidence) -> Result<(u64, u64)>
 }
 
 fn overlapping_status_request_ids(
-    operation: &AdminOperationEvidence,
+    requests: &[AdminRequestEvidence],
     progress: &[AdminOperationProgressSample],
     workload_started_at_ms: u64,
     workload_ended_at_ms: u64,
 ) -> Result<Vec<String>> {
-    let progress_ids = progress
+    let progress_receipts = progress
         .iter()
-        .map(|sample| sample.status_request_id.as_str())
+        .map(|sample| (sample.status_request_id.as_str(), sample.observed_at_ms))
         .collect::<BTreeSet<_>>();
-    operation
-        .requests
+    requests
         .iter()
         .filter(|request| {
             request.method == "GET"
@@ -1052,10 +1121,35 @@ fn overlapping_status_request_ids(
             request
                 .request_id
                 .clone()
-                .filter(|request_id| progress_ids.contains(request_id.as_str()))
+                .filter(|request_id| {
+                    progress_receipts.contains(&(request_id.as_str(), request.observed_at_ms))
+                })
                 .context("overlapping decommission status request lacks its progress sample")
         })
         .collect()
+}
+
+fn validate_overlap_progress_receipts(
+    requests: &[AdminRequestEvidence],
+    progress: &[AdminOperationProgressSample],
+) -> Result<()> {
+    let status_requests = requests
+        .iter()
+        .filter(|request| request.method == "GET" && request.path == STATUS_PATH)
+        .collect::<Vec<_>>();
+    ensure!(
+        status_requests.len() == progress.len()
+            && status_requests
+                .iter()
+                .zip(progress)
+                .all(|(request, sample)| {
+                    (200..300).contains(&request.status)
+                        && request.request_id.as_deref() == Some(sample.status_request_id.as_str())
+                        && request.observed_at_ms == sample.observed_at_ms
+                }),
+        "decommission overlap progress is not exactly bound to the ordered status receipts"
+    );
+    Ok(())
 }
 
 fn intervals_overlap(first_start: u64, first_end: u64, second_start: u64, second_end: u64) -> bool {
@@ -1123,6 +1217,15 @@ enum DecommissionStartOwnership {
     Owned {
         operation_id: String,
     },
+}
+
+impl DecommissionStartOwnership {
+    fn operation_id(&self) -> Option<&str> {
+        match self {
+            Self::Owned { operation_id } => Some(operation_id),
+            Self::NotStarted | Self::Ambiguous { .. } => None,
+        }
+    }
 }
 
 pub(crate) struct LiveAdminDecommissionDriver {
@@ -1882,6 +1985,57 @@ impl LiveAdminDecommissionDriver {
             "persist decommission transcript",
         )
     }
+
+    async fn verify_completed_overlap_inner(&self) -> Result<()> {
+        let (proof, operation_id, workload) = {
+            let state = self.state.lock().await;
+            ensure!(
+                state.terminal.is_some(),
+                "fast-completed decommission lacks its terminal status receipt"
+            );
+            let operation_id = state
+                .start_ownership
+                .operation_id()
+                .context("fast-completed decommission is not owned by this attempt")?;
+            (
+                state
+                    .proof
+                    .clone()
+                    .context("decommission topology proof is not ready")?,
+                operation_id.to_string(),
+                state
+                    .workload_receipt
+                    .clone()
+                    .context("fast-completed decommission lacks its completed workload receipt")?,
+            )
+        };
+        proof.require_satisfied()?;
+        let target_pool_id = proof
+            .target_pool_id
+            .context("decommission topology proof lacks its target pool ID")?;
+        let target_pool_expression = proof
+            .target_pool_expression
+            .as_deref()
+            .context("decommission topology proof lacks its target pool expression")?;
+        let transcript = transcript_state(&self.transcript);
+        ensure!(
+            transcript.operation_id.as_deref() == Some(operation_id.as_str())
+                && transcript.requests.iter().all(|request| {
+                    request.target == proof.runtime.target && (200..300).contains(&request.status)
+                }),
+            "fast-completed decommission transcript is not bound to the proven runtime target"
+        );
+        AdminDecommissionOverlapEvidence::from_receipts(
+            &proof.attempt,
+            &operation_id,
+            target_pool_id,
+            target_pool_expression,
+            &transcript.requests,
+            &transcript.progress,
+            &workload,
+        )?;
+        Ok(())
+    }
 }
 
 #[async_trait(?Send)]
@@ -1904,6 +2058,11 @@ impl AdminCaseDriver for LiveAdminDecommissionDriver {
 
     async fn run_workload(&self) -> Result<()> {
         let result = self.run_workload_inner().await;
+        self.preserve_evidence(result).await
+    }
+
+    async fn verify_completed_overlap(&self) -> Result<()> {
+        let result = self.verify_completed_overlap_inner().await;
         self.preserve_evidence(result).await
     }
 
@@ -2176,6 +2335,135 @@ mod tests {
                 15,
             ),
         ]
+    }
+
+    fn admin_request(
+        method: &str,
+        path: &str,
+        request_id: &str,
+        started_at_ms: u64,
+        observed_at_ms: u64,
+    ) -> AdminRequestEvidence {
+        serde_json::from_value(json!({
+            "target": {
+                "endpoint": {
+                    "kubernetesContext": "kind-admin-test",
+                    "clusterUid": "cluster-uid",
+                    "portForwardCommand": "kubectl port-forward",
+                    "portForwardStartedAtMs": 1,
+                    "clusterStartedAtMs": 2,
+                    "clusterObservedAtMs": 3,
+                    "clusterResponseSha256": "cluster-sha",
+                    "clusterResponseBody": "{}",
+                    "namespace": "fault-ns",
+                    "serviceName": "fault-tenant-io",
+                    "serviceUid": "service-uid",
+                    "serviceResourceVersion": "service-rv",
+                    "serviceStartedAtMs": 4,
+                    "serviceObservedAtMs": 5,
+                    "serviceResponseSha256": "service-sha",
+                    "serviceResponseBody": "{}",
+                    "tenantName": "fault-tenant",
+                    "tenantUid": "tenant-uid",
+                    "tenantResourceVersion": "tenant-rv",
+                    "tenantStartedAtMs": 6,
+                    "tenantObservedAtMs": 7,
+                    "tenantResponseSha256": "tenant-sha",
+                    "tenantResponseBody": "{}",
+                    "localEndpoint": "http://127.0.0.1:19000",
+                    "remotePort": 9000
+                },
+                "deploymentId": "deployment-1"
+            },
+            "method": method,
+            "path": path,
+            "query": {},
+            "status": 200,
+            "startedAtMs": started_at_ms,
+            "observedAtMs": observed_at_ms,
+            "requestId": request_id
+        }))
+        .expect("admin request")
+    }
+
+    #[test]
+    fn fast_completion_requires_concrete_s3_and_status_receipt_overlap() {
+        let attempt = AdminAttemptIdentity {
+            run_id: "run-decommission".to_string(),
+            case_name: ADMIN_DECOMMISSION_SCENARIO.to_string(),
+            tenant_uid: "tenant-uid".to_string(),
+        };
+        let requests = vec![
+            admin_request("POST", START_PATH, "start", 100, 106),
+            admin_request("GET", STATUS_PATH, "terminal-status", 107, 109),
+        ];
+        let progress = vec![AdminOperationProgressSample {
+            attempt: attempt.clone(),
+            operation_id: "decommission:1:2026-09-12T00:00:00Z".to_string(),
+            status_request_id: "terminal-status".to_string(),
+            observed_at_ms: 109,
+            state: "complete".to_string(),
+            completed: true,
+            failed: false,
+            canceled_or_stopped: false,
+            objects_moved: Some(1),
+            versions_moved: Some(1),
+            bytes_moved: Some(4),
+        }];
+        let workload = AdminDecommissionWorkloadReceipt {
+            started_at_ms: 107,
+            ended_at_ms: 117,
+            first_event_sequence: 7,
+            last_event_sequence: 16,
+            history: versioned_history(),
+        };
+
+        let evidence = AdminDecommissionOverlapEvidence::from_receipts(
+            &attempt,
+            "decommission:1:2026-09-12T00:00:00Z",
+            1,
+            "pool-1",
+            &requests,
+            &progress,
+            &workload,
+        )
+        .expect("real fast-completion overlap");
+        assert_eq!(evidence.overlapping_operation_ids, ["put", "overwrite"]);
+        assert_eq!(evidence.overlapping_status_request_ids, ["terminal-status"]);
+
+        let mut mismatched_progress = progress.clone();
+        mismatched_progress[0].observed_at_ms = 110;
+        let error = AdminDecommissionOverlapEvidence::from_receipts(
+            &attempt,
+            "decommission:1:2026-09-12T00:00:00Z",
+            1,
+            "pool-1",
+            &requests,
+            &mismatched_progress,
+            &workload,
+        )
+        .expect_err("progress must be bound to its exact status receipt");
+        assert!(error.to_string().contains("ordered status receipts"));
+
+        let mut status_after_workload = requests;
+        status_after_workload[1].started_at_ms = 118;
+        status_after_workload[1].observed_at_ms = 119;
+        let mut progress_after_workload = progress;
+        progress_after_workload[0].observed_at_ms = 119;
+        let error = AdminDecommissionOverlapEvidence::from_receipts(
+            &attempt,
+            "decommission:1:2026-09-12T00:00:00Z",
+            1,
+            "pool-1",
+            &status_after_workload,
+            &progress_after_workload,
+            &workload,
+        )
+        .expect_err("status outside workload must not prove overlap");
+        assert!(
+            error.to_string().contains("status request receipt"),
+            "{error:#}"
+        );
     }
 
     fn terminal_status(state: &str, failed: bool, canceled: bool) -> DecommissionPoolStatus {
