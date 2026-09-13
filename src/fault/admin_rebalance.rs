@@ -183,8 +183,12 @@ impl AdminRebalanceOverlapEvidence {
         let overlapping_operation_ids = workload_records
             .iter()
             .filter(|record| {
-                record.started_at_ms <= rebalance_completed_at_ms
-                    && record.ended_at_ms >= rebalance_started_at_ms
+                strict_intervals_overlap(
+                    record.started_at_ms,
+                    record.ended_at_ms,
+                    rebalance_started_at_ms,
+                    rebalance_completed_at_ms,
+                )
             })
             .map(|record| record.id.clone())
             .collect();
@@ -261,9 +265,12 @@ impl AdminRebalanceOverlapEvidence {
         ensure!(
             self.rebalance_started_at_ms == rebalance_started_at_ms
                 && self.rebalance_completed_at_ms == rebalance_completed_at_ms
-                && self.workload_started_at_ms <= self.workload_ended_at_ms
-                && self.workload_started_at_ms <= self.rebalance_completed_at_ms
-                && self.workload_ended_at_ms >= self.rebalance_started_at_ms,
+                && strict_intervals_overlap(
+                    self.workload_started_at_ms,
+                    self.workload_ended_at_ms,
+                    self.rebalance_started_at_ms,
+                    self.rebalance_completed_at_ms,
+                ),
             "bounded S3 workload did not intersect the observed rebalance window"
         );
         let receipt = AdminRebalanceWorkloadReceipt {
@@ -284,8 +291,12 @@ impl AdminRebalanceOverlapEvidence {
         let overlapping_operation_ids = records
             .iter()
             .filter(|record| {
-                record.started_at_ms <= self.rebalance_completed_at_ms
-                    && record.ended_at_ms >= self.rebalance_started_at_ms
+                strict_intervals_overlap(
+                    record.started_at_ms,
+                    record.ended_at_ms,
+                    self.rebalance_started_at_ms,
+                    self.rebalance_completed_at_ms,
+                )
             })
             .map(|record| record.id.as_str())
             .collect::<Vec<_>>();
@@ -876,8 +887,8 @@ fn rebalance_window(requests: &[AdminRequestEvidence]) -> Result<(u64, u64)> {
         })
         .context("admin-rebalance operation lacks its terminal status receipt")?;
     ensure!(
-        start.observed_at_ms <= terminal.observed_at_ms,
-        "admin-rebalance operation receipt times are inverted"
+        start.observed_at_ms < terminal.observed_at_ms,
+        "admin-rebalance operation receipt interval is empty or inverted"
     );
     Ok((start.observed_at_ms, terminal.observed_at_ms))
 }
@@ -897,8 +908,12 @@ fn overlapping_status_request_ids(
         .filter(|request| {
             request.method == "GET"
                 && request.path == "/rustfs/admin/v3/rebalance/status"
-                && request.started_at_ms <= workload_ended_at_ms
-                && request.observed_at_ms >= workload_started_at_ms
+                && strict_intervals_overlap(
+                    request.started_at_ms,
+                    request.observed_at_ms,
+                    workload_started_at_ms,
+                    workload_ended_at_ms,
+                )
         })
         .map(|request| {
             request
@@ -911,6 +926,18 @@ fn overlapping_status_request_ids(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(request_ids)
+}
+
+fn strict_intervals_overlap(
+    first_start: u64,
+    first_end: u64,
+    second_start: u64,
+    second_end: u64,
+) -> bool {
+    first_start < first_end
+        && second_start < second_end
+        && first_start < second_end
+        && second_start < first_end
 }
 
 fn validate_overlap_progress_receipts(
@@ -2173,7 +2200,7 @@ mod tests {
             &workload,
         )
         .expect("real fast-completion overlap");
-        assert_eq!(evidence.overlapping_operation_ids, ["put", "overwrite"]);
+        assert_eq!(evidence.overlapping_operation_ids, ["put"]);
         assert_eq!(evidence.overlapping_status_request_ids, ["terminal-status"]);
 
         let mut mismatched_progress = progress.clone();
@@ -2189,7 +2216,7 @@ mod tests {
         assert!(error.to_string().contains("ordered status receipts"));
 
         let mut status_after_workload = requests;
-        status_after_workload[1].started_at_ms = 118;
+        status_after_workload[1].started_at_ms = 117;
         status_after_workload[1].observed_at_ms = 119;
         let mut progress_after_workload = progress;
         progress_after_workload[0].observed_at_ms = 119;
@@ -2205,6 +2232,32 @@ mod tests {
             error.to_string().contains("status request receipt"),
             "{error:#}"
         );
+
+        let mut zero_length_status = status_after_workload;
+        zero_length_status[1].started_at_ms = 108;
+        zero_length_status[1].observed_at_ms = 108;
+        let mut zero_length_progress = progress_after_workload;
+        zero_length_progress[0].observed_at_ms = 108;
+        let error = AdminRebalanceOverlapEvidence::from_receipts(
+            &attempt,
+            "rebalance-1",
+            &zero_length_status,
+            &zero_length_progress,
+            &workload,
+        )
+        .expect_err("zero-length status interval must not prove overlap");
+        assert!(
+            error.to_string().contains("status request receipt"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn strict_overlap_rejects_equal_boundaries_and_zero_length_intervals() {
+        assert!(strict_intervals_overlap(100, 110, 105, 106));
+        assert!(!strict_intervals_overlap(100, 109, 109, 110));
+        assert!(!strict_intervals_overlap(100, 100, 99, 101));
+        assert!(!strict_intervals_overlap(99, 101, 100, 100));
     }
 
     #[test]
