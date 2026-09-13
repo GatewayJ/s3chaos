@@ -71,7 +71,10 @@ use crate::fault::{
         QuorumHealthObservation, QuorumMutationClass, QuorumVolumeBoundary,
         require_fresh_runtime_observation,
     },
-    recovery_health::{RECOVERY_HEALTH_ARTIFACT, RecoveryHealthBaseline, RecoveryHealthReport},
+    recovery_health::{
+        RECOVERY_HEALTH_ARTIFACT, RecoveryHealthBaseline, RecoveryHealthReport,
+        readiness_proxy_path,
+    },
     reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
     scenarios::{
         self, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario, acknowledged_mutation_kind,
@@ -86,7 +89,7 @@ use crate::fault::{
         PostRecoveryWriteReport, post_recovery_object_count,
     },
     workload::{
-        WorkloadPlan,
+        ObjectSpec, WorkloadOperation, WorkloadPlan,
         execution::{
             TypedQuorumReadCohortSource, TypedQuorumReadExpectation,
             require_typed_quorum_read_survival,
@@ -1207,8 +1210,11 @@ fn validate_admin_execution_artifacts(
     ensure!(
         json_spec.execution_kind()? == ExecutionKind::Admin
             && json_spec.metadata.run_id == metadata.run_id
-            && json_spec.metadata.name == case_name,
-        "admin run spec execution or identity does not match the attempt"
+            && json_spec.metadata.name == case_name
+            && metadata.context == json_spec.cluster.context
+            && metadata.namespace == json_spec.cluster.namespace
+            && metadata.tenant == json_spec.cluster.tenant,
+        "admin run spec execution, identity, or cluster scope does not match run metadata"
     );
 
     let workload = read_json::<WorkloadPlan>(required(&artifacts, "workload-plan.json")?)?;
@@ -1220,16 +1226,12 @@ fn validate_admin_execution_artifacts(
     );
     let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
     ensure!(!history.is_empty(), "admin history must not be empty");
-    ensure!(
-        history.iter().all(|record| {
-            record.scenario == options.scenario
-                && record
-                    .run_id
-                    .as_deref()
-                    .is_none_or(|run_id| run_id == metadata.run_id)
-        }),
-        "admin history identity does not match the attempt"
-    );
+    validate_history_scope_and_order(
+        &history,
+        &options.scenario,
+        &metadata.run_id,
+        &json_spec.metadata.bucket,
+    )?;
 
     let fixture = read_json::<AdminFixtureEvidence>(required(&artifacts, ADMIN_FIXTURE_ARTIFACT)?)?;
     fixture.validate_complete()?;
@@ -1246,6 +1248,17 @@ fn validate_admin_execution_artifacts(
     );
     let proof =
         read_json::<AdminTopologyProof>(required(&artifacts, ADMIN_TOPOLOGY_PROOF_ARTIFACT)?)?;
+    let operation =
+        read_json::<AdminOperationEvidence>(required(&artifacts, ADMIN_OPERATION_ARTIFACT)?)?;
+    proof.require_cluster_scope(
+        &json_spec.cluster.context,
+        &json_spec.cluster.namespace,
+        &json_spec.cluster.tenant,
+    )?;
+    ensure!(
+        fixture.tenant == json_spec.cluster.tenant,
+        "admin fixture Tenant does not match the configured cluster scope"
+    );
     let tenant_uid = fixture
         .observations
         .first()
@@ -1287,6 +1300,74 @@ fn validate_admin_execution_artifacts(
         case_dir,
     )?;
 
+    let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
+    let (recovery, baseline_event) =
+        validate_recovery_health_report(&artifacts, &metadata, identity, &events)?;
+    let expected_pods = proof.expected_pod_names()?;
+    let readiness_pods = recovery
+        .readiness
+        .iter()
+        .map(|probe| probe.pod_name.clone())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        readiness_pods == expected_pods
+            && recovery.readiness.len() == expected_pods.len()
+            && recovery.readiness.iter().all(|probe| {
+                probe.proxy_path
+                    == readiness_proxy_path(&json_spec.cluster.namespace, &probe.pod_name)
+                    && probe.observed_at_ms >= recovery.started_at_ms
+                    && probe.observed_at_ms <= recovery.completed_at_ms
+            }),
+        "admin recovery-health readiness probes do not cover the exact proven Tenant Pod set"
+    );
+    let start_phase = workflow
+        .phases
+        .iter()
+        .find(|phase| phase.phase == "start")
+        .context("admin workflow lacks start receipt")?;
+    let verify_phase = workflow
+        .phases
+        .iter()
+        .find(|phase| phase.phase == "verify")
+        .context("admin workflow lacks verify receipt")?;
+    let operation_start = operation
+        .requests
+        .iter()
+        .find(|request| request.method == "POST")
+        .context("admin operation lacks its start request")?;
+    ensure!(
+        recovery.baseline.observed_at_ms <= baseline_event.at_ms
+            && baseline_event.at_ms <= operation_start.started_at_ms
+            && start_phase.started_at_ms <= operation_start.started_at_ms
+            && operation_start.observed_at_ms <= start_phase.ended_at_ms,
+        "admin recovery-health baseline was not recorded before the admin operation started"
+    );
+    let recovery_started_event = events
+        .iter()
+        .find(|event| event.stage == "recovery-health" && event.status == RunEventStatus::Started)
+        .context("run-events.jsonl lacks a recovery-health started event")?;
+    let recovery_succeeded_event = events
+        .iter()
+        .find(|event| event.stage == "recovery-health" && event.status == RunEventStatus::Succeeded)
+        .context("run-events.jsonl lacks a successful recovery-health event")?;
+    ensure!(
+        verify_phase.started_at_ms <= recovery_started_event.at_ms
+            && recovery_started_event.at_ms <= recovery.started_at_ms
+            && recovery.completed_at_ms <= recovery_succeeded_event.at_ms
+            && recovery_succeeded_event.at_ms <= verify_phase.ended_at_ms,
+        "admin recovery-health report and events are outside the successful verify phase"
+    );
+    validate_post_recovery_write_artifacts_after(
+        &artifacts,
+        &metadata,
+        identity,
+        &events,
+        &json_spec.metadata.bucket,
+        post_recovery_object_count(workload.object_count),
+        recovery.completed_at_ms,
+        "recovery-health",
+    )?;
+
     let prechecker =
         read_json::<CheckerReport>(required(&artifacts, "checker-pre-recommit-report.json")?)?;
     validate_checker_identity("checker-pre-recommit-report.json", &prechecker, &metadata)?;
@@ -1306,13 +1387,63 @@ fn validate_admin_execution_artifacts(
     )?;
     let recommit =
         read_json::<RecommitReportArtifact>(required(&artifacts, "recommit-report.json")?)?;
+    validate_optional_identity_fields(
+        "recommit-report.json",
+        recommit.scenario.as_deref(),
+        recommit.run_id.as_deref(),
+        &metadata,
+        identity,
+    )?;
     ensure!(
         recommit.failed == 0
             && recommit.harness_errors == 0
-            && recommit.attempted == recommit.committed,
+            && recommit.attempted == recommit.committed
+            && recommit.attempts.len() == recommit.attempted,
         "admin recommit report contains unresolved writes"
     );
-    let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
+    let summary =
+        read_json::<WorkloadSummaryArtifact>(required(&artifacts, "workload-summary.json")?)?;
+    validate_optional_identity_fields(
+        "workload-summary.json",
+        summary.scenario.as_deref(),
+        summary.run_id.as_deref(),
+        &metadata,
+        identity,
+    )?;
+    ensure!(
+        summary.seed == workload.seed
+            && summary.object_count == workload.object_count
+            && summary.concurrency == workload.concurrency,
+        "workload-summary.json does not match workload-plan.json seed/object_count/concurrency"
+    );
+    ensure!(
+        summary.recommitted_after_recovery == recommit.committed,
+        "workload-summary.json recommitted_after_recovery does not match recommit-report.json committed"
+    );
+    validate_checker_phase_chain(
+        &prechecker,
+        &checker,
+        &recommit,
+        summary
+            .recommit_candidates
+            .as_ref()
+            .context("workload-summary.json has no sealed recommit candidate manifest")?,
+        &json_spec.metadata.bucket,
+        &history,
+    )?;
+    ensure!(
+        summary.exercised_all_operation_families(),
+        "workload-summary.json did not exercise every required S3 operation family"
+    );
+    summary.require_history_matches(
+        &history,
+        &options.scenario,
+        &json_spec.metadata.bucket,
+        DurabilityCohort::FaultActive,
+        &workload,
+        &metadata.run_id,
+    )?;
+    let client_disruptions = summary.disrupted()?;
     ensure!(
         events
             .iter()
@@ -1326,7 +1457,7 @@ fn validate_admin_execution_artifacts(
         scenario: options.scenario.clone(),
         case_name: case_name.to_string(),
         seed: workload.seed,
-        client_disruptions: 0,
+        client_disruptions,
         recommitted: recommit.committed,
         committed: checker.committed_puts,
         required_artifacts: json_spec.artifacts.required,
@@ -3220,6 +3351,41 @@ fn validate_recovery_health_artifact(
     evidence: &FaultEvidenceArtifact,
     events: &[RunEvent],
 ) -> Result<()> {
+    let (report, baseline_event) =
+        validate_recovery_health_report(artifacts, metadata, identity, events)?;
+    ensure!(
+        report.baseline.observed_at_ms <= baseline_event.at_ms
+            && evidence
+                .fault_apply_started_at_ms
+                .is_some_and(|apply_started| baseline_event.at_ms <= apply_started),
+        "recovery-health-baseline event was not recorded between the baseline observation and fault activation"
+    );
+    let recovery_started = evidence
+        .recovery_started_at_ms
+        .context("fault-evidence.json recovery_started_at_ms is required")?;
+    let recovery_ended = evidence
+        .recovery_ended_at_ms
+        .context("fault-evidence.json recovery_ended_at_ms is required")?;
+    report.require_within_recovery_window(recovery_started, recovery_ended)?;
+    ensure!(
+        report.readiness.len() == evidence.pods_after.len()
+            && evidence.pods_after.iter().all(|pod| {
+                report
+                    .readiness
+                    .iter()
+                    .any(|probe| probe.pod_name == pod.name && probe.ready)
+            }),
+        "{RECOVERY_HEALTH_ARTIFACT} readiness probes do not cover every Pod in fault-evidence.json pods_after"
+    );
+    Ok(())
+}
+
+fn validate_recovery_health_report<'a>(
+    artifacts: &BTreeMap<String, PathBuf>,
+    metadata: &RunMetadataArtifact,
+    identity: ArtifactIdentityPolicy<'_>,
+    events: &'a [RunEvent],
+) -> Result<(RecoveryHealthReport, &'a RunEvent)> {
     let report = read_json::<RecoveryHealthReport>(required(artifacts, RECOVERY_HEALTH_ARTIFACT)?)?;
     validate_optional_identity_fields(
         RECOVERY_HEALTH_ARTIFACT,
@@ -3251,31 +3417,7 @@ fn validate_recovery_health_artifact(
         recorded_baseline == report.baseline,
         "{RECOVERY_HEALTH_ARTIFACT} baseline does not match the recovery-health-baseline run event"
     );
-    ensure!(
-        report.baseline.observed_at_ms <= baseline_event.at_ms
-            && evidence
-                .fault_apply_started_at_ms
-                .is_some_and(|apply_started| baseline_event.at_ms <= apply_started),
-        "recovery-health-baseline event was not recorded between the baseline observation and fault activation"
-    );
-    let recovery_started = evidence
-        .recovery_started_at_ms
-        .context("fault-evidence.json recovery_started_at_ms is required")?;
-    let recovery_ended = evidence
-        .recovery_ended_at_ms
-        .context("fault-evidence.json recovery_ended_at_ms is required")?;
-    report.require_within_recovery_window(recovery_started, recovery_ended)?;
-    ensure!(
-        report.readiness.len() == evidence.pods_after.len()
-            && evidence.pods_after.iter().all(|pod| {
-                report
-                    .readiness
-                    .iter()
-                    .any(|probe| probe.pod_name == pod.name && probe.ready)
-            }),
-        "{RECOVERY_HEALTH_ARTIFACT} readiness probes do not cover every Pod in fault-evidence.json pods_after"
-    );
-    Ok(())
+    Ok((report, baseline_event))
 }
 
 fn validate_post_recovery_write_artifacts(
@@ -3286,6 +3428,32 @@ fn validate_post_recovery_write_artifacts(
     events: &[RunEvent],
     expected_bucket: &str,
     expected_objects: usize,
+) -> Result<()> {
+    let recovery_ended = evidence
+        .recovery_ended_at_ms
+        .context("fault-evidence.json recovery_ended_at_ms is required")?;
+    validate_post_recovery_write_artifacts_after(
+        artifacts,
+        metadata,
+        identity,
+        events,
+        expected_bucket,
+        expected_objects,
+        recovery_ended,
+        "recovery-evidence",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_post_recovery_write_artifacts_after(
+    artifacts: &BTreeMap<String, PathBuf>,
+    metadata: &RunMetadataArtifact,
+    identity: ArtifactIdentityPolicy<'_>,
+    events: &[RunEvent],
+    expected_bucket: &str,
+    expected_objects: usize,
+    recovery_completed_at_ms: u64,
+    recovery_boundary_stage: &str,
 ) -> Result<()> {
     let report = read_json::<PostRecoveryWriteReport>(required(
         artifacts,
@@ -3306,30 +3474,51 @@ fn validate_post_recovery_write_artifacts(
     report
         .require_success()
         .with_context(|| format!("{POST_RECOVERY_WRITE_REPORT_ARTIFACT} did not pass"))?;
+    ensure!(
+        report.started_at_ms >= recovery_completed_at_ms,
+        "{POST_RECOVERY_WRITE_REPORT_ARTIFACT} started before recovery ended"
+    );
     // The lifecycle evidence must have been persisted before the write gate
     // could fail the run; the runner records both as ordered events.
-    let evidence_persisted = events
+    let recovery_boundary = events
         .iter()
         .position(|event| {
-            event.stage == "recovery-evidence" && event.status == RunEventStatus::Succeeded
+            event.stage == recovery_boundary_stage && event.status == RunEventStatus::Succeeded
         })
-        .context("run-events.jsonl lacks a successful recovery-evidence event")?;
+        .with_context(|| {
+            format!("run-events.jsonl lacks a successful {recovery_boundary_stage} event")
+        })?;
     let probe_started = events
         .iter()
         .position(|event| {
             event.stage == "post-recovery-write" && event.status == RunEventStatus::Started
         })
         .context("run-events.jsonl lacks a post-recovery-write started event")?;
+    let probe_succeeded = events
+        .iter()
+        .enumerate()
+        .skip(probe_started + 1)
+        .find_map(|(index, event)| {
+            (event.stage == "post-recovery-write" && event.status == RunEventStatus::Succeeded)
+                .then_some(index)
+        })
+        .context("run-events.jsonl lacks a successful post-recovery-write event")?;
     ensure!(
-        evidence_persisted < probe_started,
-        "run-events.jsonl shows the post-recovery write probe started before fault-evidence.json was persisted"
+        recovery_boundary < probe_started,
+        "{}",
+        if recovery_boundary_stage == "recovery-evidence" {
+            "run-events.jsonl shows the post-recovery write probe started before fault-evidence.json was persisted"
+        } else {
+            "run-events.jsonl shows the post-recovery write probe started before the recovery boundary"
+        }
     );
-    let recovery_ended = evidence
-        .recovery_ended_at_ms
-        .context("fault-evidence.json recovery_ended_at_ms is required")?;
     ensure!(
-        report.started_at_ms >= recovery_ended,
-        "{POST_RECOVERY_WRITE_REPORT_ARTIFACT} started before recovery ended"
+        events[probe_started].at_ms <= report.started_at_ms
+            && report.completed_at_ms <= events[probe_succeeded].at_ms
+            && events.iter().all(|event| {
+                event.stage != "post-recovery-write" || event.status != RunEventStatus::Failed
+            }),
+        "run-events.jsonl does not prove one successful post-recovery write probe around its report interval"
     );
     let expected_prefix = format!("fault-test-post-recovery/{}/", metadata.run_id);
     ensure!(
@@ -5678,6 +5867,10 @@ struct RunMetadataArtifact {
     scenario: String,
     run_id: String,
     context: String,
+    #[serde(default)]
+    namespace: String,
+    #[serde(default)]
+    tenant: String,
     storage_class: String,
     rustfs_image: String,
     workload_objects: usize,
@@ -5925,6 +6118,54 @@ struct RecommitCandidateArtifact {
 }
 
 impl WorkloadSummaryArtifact {
+    fn require_history_matches(
+        &self,
+        history: &[OperationRecord],
+        scenario: &str,
+        bucket: &str,
+        cohort: DurabilityCohort,
+        plan: &WorkloadPlan,
+        run_id: &str,
+    ) -> Result<()> {
+        let mut projected = [
+            OutcomeCountsArtifact::default(),
+            OutcomeCountsArtifact::default(),
+            OutcomeCountsArtifact::default(),
+            OutcomeCountsArtifact::default(),
+        ];
+        let workload_history = history
+            .iter()
+            .filter(|record| record.durability_cohort == Some(cohort))
+            .collect::<Vec<_>>();
+        for record in &workload_history {
+            ensure!(
+                record.scenario == scenario && record.bucket == bucket,
+                "history.jsonl workload record does not match the selected scenario and bucket"
+            );
+            let index = match record.kind {
+                OperationKind::Put => Some(0),
+                OperationKind::Get => Some(1),
+                OperationKind::Delete => Some(2),
+                OperationKind::List => Some(3),
+                _ => None,
+            };
+            if let Some(index) = index {
+                projected[index].record(record.outcome);
+            }
+        }
+        let expected = [&self.puts, &self.gets, &self.deletes, &self.lists];
+        ensure!(
+            projected
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual == expected),
+            "workload-summary.json outcomes do not match workload history.jsonl records"
+        );
+
+        validate_multipart_summary_history(self, &workload_history, plan, run_id)?;
+        Ok(())
+    }
+
     fn exercised_all_operation_families(&self) -> bool {
         self.puts.total() > 0
             && self.gets.total() > 0
@@ -6083,6 +6324,204 @@ impl WorkloadSummaryArtifact {
         }
         Ok(())
     }
+}
+
+fn validate_multipart_summary_history(
+    summary: &WorkloadSummaryArtifact,
+    history: &[&OperationRecord],
+    plan: &WorkloadPlan,
+    run_id: &str,
+) -> Result<()> {
+    let prefilled_count = plan.object_count / 2;
+    let multipart_indices = (0..plan.object_count - prefilled_count)
+        .filter(|offset| plan.operation_mix.operation_at(*offset) == WorkloadOperation::Multipart)
+        .map(|offset| prefilled_count + offset)
+        .collect::<Vec<_>>();
+    ensure!(
+        summary.multipart_completes.total() == multipart_indices.len()
+            && summary.multipart_aborts.total() == multipart_indices.len(),
+        "workload-summary.json multipart totals do not match workload-plan.json"
+    );
+    let complete_keys = multipart_indices
+        .iter()
+        .map(|index| (ObjectSpec::seeded_key(run_id, *index), *index))
+        .collect::<BTreeMap<_, _>>();
+    let abort_keys = multipart_indices
+        .iter()
+        .map(|index| ObjectSpec::seeded_key(run_id, plan.object_count + *index))
+        .collect::<BTreeSet<_>>();
+    let records_for_key = |key: &str| {
+        history
+            .iter()
+            .copied()
+            .filter(|record| record.key.as_deref() == Some(key))
+            .collect::<Vec<_>>()
+    };
+    let ordered_before = |before: &OperationRecord, after: &OperationRecord| {
+        before
+            .ended_sequence
+            .zip(after.started_sequence)
+            .is_some_and(|(ended, started)| ended < started)
+    };
+
+    let mut projected_completes = OutcomeCountsArtifact::default();
+    for (key, index) in &complete_keys {
+        let records = records_for_key(key);
+        let creates = records
+            .iter()
+            .copied()
+            .filter(|record| record.kind == OperationKind::CreateMultipartUpload)
+            .collect::<Vec<_>>();
+        let uploads = records
+            .iter()
+            .copied()
+            .filter(|record| record.kind == OperationKind::UploadPart)
+            .collect::<Vec<_>>();
+        let completes = records
+            .iter()
+            .copied()
+            .filter(|record| record.kind == OperationKind::CompleteMultipartUpload)
+            .collect::<Vec<_>>();
+        let cleanup_aborts = records
+            .iter()
+            .copied()
+            .filter(|record| record.kind == OperationKind::AbortMultipartUpload)
+            .collect::<Vec<_>>();
+        ensure!(
+            creates.len() == 1 && completes.len() <= 1 && cleanup_aborts.len() <= 1,
+            "history.jsonl does not contain one unambiguous multipart completion sequence for {key:?}"
+        );
+        let create = creates[0];
+        if create.outcome != OperationOutcome::Ok {
+            ensure!(
+                uploads.is_empty() && completes.is_empty() && cleanup_aborts.is_empty(),
+                "history.jsonl continued multipart completion after failed create for {key:?}"
+            );
+            projected_completes.record(OperationOutcome::Unknown);
+            continue;
+        }
+
+        let expected_parts = plan.multipart_part_count_at(*index);
+        ensure!(
+            !uploads.is_empty()
+                && uploads.len() <= expected_parts
+                && ordered_before(create, uploads[0])
+                && uploads
+                    .windows(2)
+                    .all(|pair| ordered_before(pair[0], pair[1])),
+            "history.jsonl multipart upload-part sequence is invalid for {key:?}"
+        );
+        let failed_part = uploads
+            .iter()
+            .position(|record| record.outcome != OperationOutcome::Ok);
+        if let Some(failed_part) = failed_part {
+            ensure!(
+                failed_part + 1 == uploads.len()
+                    && completes.is_empty()
+                    && cleanup_aborts.len() == 1
+                    && ordered_before(uploads[failed_part], cleanup_aborts[0])
+                    && matches!(
+                        cleanup_aborts[0].outcome,
+                        OperationOutcome::Ok | OperationOutcome::NotFound
+                    ),
+                "history.jsonl continued or failed cleanup after multipart upload-part failure for {key:?}"
+            );
+            projected_completes.record(OperationOutcome::Unknown);
+            continue;
+        }
+
+        ensure!(
+            uploads.len() == expected_parts
+                && completes.len() == 1
+                && ordered_before(uploads[uploads.len() - 1], completes[0]),
+            "history.jsonl lacks the planned upload parts or completion for {key:?}"
+        );
+        let complete = completes[0];
+        if complete.outcome == OperationOutcome::Ok {
+            ensure!(
+                cleanup_aborts.is_empty(),
+                "history.jsonl aborted an acknowledged multipart completion for {key:?}"
+            );
+        } else if let Some(cleanup) = cleanup_aborts.first() {
+            ensure!(
+                ordered_before(complete, cleanup)
+                    && matches!(
+                        cleanup.outcome,
+                        OperationOutcome::Ok | OperationOutcome::NotFound
+                    ),
+                "history.jsonl multipart completion cleanup is invalid for {key:?}"
+            );
+        }
+        projected_completes.record(complete.outcome);
+    }
+
+    let mut projected_aborts = OutcomeCountsArtifact::default();
+    for key in &abort_keys {
+        let records = records_for_key(key);
+        let creates = records
+            .iter()
+            .copied()
+            .filter(|record| record.kind == OperationKind::CreateMultipartUpload)
+            .collect::<Vec<_>>();
+        let aborts = records
+            .iter()
+            .copied()
+            .filter(|record| record.kind == OperationKind::AbortMultipartUpload)
+            .collect::<Vec<_>>();
+        ensure!(
+            creates.len() == 1
+                && aborts.len() <= 1
+                && records.iter().all(|record| {
+                    matches!(
+                        record.kind,
+                        OperationKind::CreateMultipartUpload | OperationKind::AbortMultipartUpload
+                    )
+                }),
+            "history.jsonl explicit multipart abort sequence is invalid for {key:?}"
+        );
+        let create = creates[0];
+        if create.outcome == OperationOutcome::Ok {
+            ensure!(
+                aborts.len() == 1 && ordered_before(create, aborts[0]),
+                "history.jsonl lacks an abort after successful multipart create for {key:?}"
+            );
+            projected_aborts.record(aborts[0].outcome);
+        } else {
+            ensure!(
+                aborts.is_empty(),
+                "history.jsonl continued explicit multipart abort after failed create for {key:?}"
+            );
+            projected_aborts.record(OperationOutcome::Unknown);
+        }
+    }
+    ensure!(
+        projected_completes == summary.multipart_completes
+            && projected_aborts == summary.multipart_aborts,
+        "workload-summary.json multipart outcomes do not match workload history.jsonl records"
+    );
+    ensure!(
+        history.iter().all(|record| match record.kind {
+            OperationKind::CreateMultipartUpload => record
+                .key
+                .as_ref()
+                .is_some_and(|key| complete_keys.contains_key(key) || abort_keys.contains(key)),
+            OperationKind::UploadPart => record
+                .key
+                .as_ref()
+                .is_some_and(|key| complete_keys.contains_key(key)),
+            OperationKind::CompleteMultipartUpload => record
+                .key
+                .as_ref()
+                .is_some_and(|key| complete_keys.contains_key(key)),
+            OperationKind::AbortMultipartUpload => record
+                .key
+                .as_ref()
+                .is_some_and(|key| complete_keys.contains_key(key) || abort_keys.contains(key)),
+            _ => true,
+        }),
+        "history.jsonl contains a multipart record outside the planned workload keys"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Deserialize)]
@@ -8769,6 +9208,209 @@ mod tests {
             )
             .is_err(),
             "independent recovery snapshot must reject coordinated proof/cleanup tampering"
+        );
+    }
+
+    #[test]
+    fn workload_summary_must_match_each_fault_active_history_family() {
+        let plan = WorkloadPlan::seeded(42, 12, 1);
+        let summary: WorkloadSummaryArtifact = serde_json::from_value(json!({
+            "seed": 42,
+            "object_count": 12,
+            "concurrency": 1,
+            "recommitted_after_recovery": 0,
+            "puts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+            "gets": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+            "deletes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+            "lists": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+            "multipart_completes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+            "multipart_aborts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0}
+        }))
+        .expect("summary");
+        let record = |id: &str, kind: &str, key: &str, outcome: &str, sequence: u64| {
+            serde_json::from_value::<OperationRecord>(json!({
+                "id": id,
+                "scenario": "admin-rebalance",
+                "kind": kind,
+                "bucket": "bucket",
+                "key": key,
+                "started_at_ms": 10,
+                "ended_at_ms": 11,
+                "started_sequence": sequence * 2 - 1,
+                "ended_sequence": sequence * 2,
+                "outcome": outcome,
+                "durability_cohort": "fault_active"
+            }))
+            .expect("history record")
+        };
+        let complete_key = "fault-test/run-1/object-000011";
+        let abort_key = "fault-test/run-1/object-000023";
+        let mut history = vec![
+            record("put", "put", "key", "ok", 1),
+            record("get", "get", "key", "ok", 2),
+            record("delete", "delete", "key", "ok", 3),
+            record("list", "list", "fault-test/run-1/", "ok", 4),
+            record(
+                "complete-create",
+                "create_multipart_upload",
+                complete_key,
+                "ok",
+                5,
+            ),
+        ];
+        for part in 0..plan.multipart_part_count_at(11) {
+            history.push(record(
+                &format!("complete-part-{part}"),
+                "upload_part",
+                complete_key,
+                "ok",
+                6 + part as u64,
+            ));
+        }
+        let complete_sequence = 6 + plan.multipart_part_count_at(11) as u64;
+        history.push(record(
+            "complete",
+            "complete_multipart_upload",
+            complete_key,
+            "ok",
+            complete_sequence,
+        ));
+        history.push(record(
+            "abort-create",
+            "create_multipart_upload",
+            abort_key,
+            "ok",
+            complete_sequence + 1,
+        ));
+        history.push(record(
+            "abort",
+            "abort_multipart_upload",
+            abort_key,
+            "ok",
+            complete_sequence + 2,
+        ));
+
+        summary
+            .require_history_matches(
+                &history,
+                "admin-rebalance",
+                "bucket",
+                DurabilityCohort::FaultActive,
+                &plan,
+                "run-1",
+            )
+            .expect("matching summary");
+        let mut missing_list = history.clone();
+        missing_list.remove(3);
+        assert!(
+            summary
+                .require_history_matches(
+                    &missing_list,
+                    "admin-rebalance",
+                    "bucket",
+                    DurabilityCohort::FaultActive,
+                    &plan,
+                    "run-1",
+                )
+                .is_err(),
+            "a fabricated family counter must not pass"
+        );
+
+        let mut unplanned_setup = history.clone();
+        unplanned_setup.push(record(
+            "foreign-create",
+            "create_multipart_upload",
+            "fault-test/run-1/object-999999",
+            "failed",
+            200,
+        ));
+        assert!(
+            summary
+                .require_history_matches(
+                    &unplanned_setup,
+                    "admin-rebalance",
+                    "bucket",
+                    DurabilityCohort::FaultActive,
+                    &plan,
+                    "run-1",
+                )
+                .is_err(),
+            "unplanned multipart setup must not disappear from summary counters"
+        );
+
+        let mut setup_failure_summary = summary;
+        setup_failure_summary.multipart_completes = OutcomeCountsArtifact::default();
+        setup_failure_summary
+            .multipart_completes
+            .record(OperationOutcome::Unknown);
+        let mut setup_failure_history = history
+            .iter()
+            .filter(|record| record.key.as_deref() != Some(complete_key))
+            .cloned()
+            .collect::<Vec<_>>();
+        setup_failure_history.push(record(
+            "complete-create-failed",
+            "create_multipart_upload",
+            complete_key,
+            "failed",
+            100,
+        ));
+        setup_failure_summary
+            .require_history_matches(
+                &setup_failure_history,
+                "admin-rebalance",
+                "bucket",
+                DurabilityCohort::FaultActive,
+                &plan,
+                "run-1",
+            )
+            .expect("failed multipart setup projects to an unknown completion");
+
+        setup_failure_summary.multipart_completes = OutcomeCountsArtifact::default();
+        setup_failure_summary
+            .multipart_completes
+            .record(OperationOutcome::Ok);
+        setup_failure_summary.multipart_aborts = OutcomeCountsArtifact::default();
+        setup_failure_summary
+            .multipart_aborts
+            .record(OperationOutcome::Unknown);
+        setup_failure_history = history
+            .iter()
+            .filter(|record| record.key.as_deref() != Some(abort_key))
+            .cloned()
+            .collect();
+        setup_failure_history.push(record(
+            "abort-create-timeout",
+            "create_multipart_upload",
+            abort_key,
+            "timeout",
+            100,
+        ));
+        setup_failure_summary
+            .require_history_matches(
+                &setup_failure_history,
+                "admin-rebalance",
+                "bucket",
+                DurabilityCohort::FaultActive,
+                &plan,
+                "run-1",
+            )
+            .expect("failed abort setup projects to an unknown abort");
+
+        let mut forged_abort = setup_failure_history;
+        forged_abort.last_mut().expect("forged abort setup").kind = OperationKind::UploadPart;
+        assert!(
+            setup_failure_summary
+                .require_history_matches(
+                    &forged_abort,
+                    "admin-rebalance",
+                    "bucket",
+                    DurabilityCohort::FaultActive,
+                    &plan,
+                    "run-1",
+                )
+                .is_err(),
+            "an upload-part failure cannot stand in for explicit abort create evidence"
         );
     }
 
@@ -12531,6 +13173,7 @@ mod tests {
                 json!({"at_ms":6,"scenario":scenario,"run_id":run_id,"stage":"recovery-health-baseline","status":"succeeded","message":"healthy RustFS baseline captured","details":health_baseline}).to_string(),
                 json!({"at_ms":70,"scenario":scenario,"run_id":run_id,"stage":"recovery-evidence","status":"succeeded","message":"fault-evidence.json persisted"}).to_string(),
                 json!({"at_ms":71,"scenario":scenario,"run_id":run_id,"stage":"post-recovery-write","status":"started","message":"probing fresh writes"}).to_string(),
+                json!({"at_ms":200,"scenario":scenario,"run_id":run_id,"stage":"post-recovery-write","status":"succeeded","message":"fresh writes succeeded"}).to_string(),
                 json!({"at_ms":2,"scenario":scenario,"run_id":run_id,"stage":"checker-final","status":"succeeded","message":"checked"}).to_string(),
                 json!({"at_ms":3,"scenario":scenario,"run_id":run_id,"stage":"run","status":"succeeded","message":"done"}).to_string(),
             ].join("\n"),
@@ -13558,6 +14201,21 @@ mod tests {
                 .contains("lacks a successful recovery-evidence event"),
             "{error:#}"
         );
+
+        write_success_artifacts(dir.path(), "io-eio");
+        let mut events = fs::read_to_string(&events_path).expect("events");
+        events.push_str(
+            "\n{\"at_ms\":99,\"scenario\":\"io-eio\",\"run_id\":\"run-00000000-0000-4000-8000-000000000001\",\"stage\":\"post-recovery-write\",\"status\":\"failed\",\"message\":\"probe failed\"}\n",
+        );
+        fs::write(&events_path, events).expect("append failed event");
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("failed probe event must override stale passing artifacts");
+        assert!(
+            error
+                .to_string()
+                .contains("does not prove one successful post-recovery write probe"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -13568,6 +14226,8 @@ mod tests {
             scenario: "pod-failure".to_string(),
             run_id: run_id.to_string(),
             context: "real-cluster".to_string(),
+            namespace: "fault-ns".to_string(),
+            tenant: "fault-tenant".to_string(),
             storage_class: "fast-csi".to_string(),
             rustfs_image: "rustfs:test".to_string(),
             workload_objects: 12,
@@ -13674,6 +14334,8 @@ mod tests {
             scenario: "pod-failure".to_string(),
             run_id: run_id.to_string(),
             context: "real-cluster".to_string(),
+            namespace: "fault-ns".to_string(),
+            tenant: "fault-tenant".to_string(),
             storage_class: "fast-csi".to_string(),
             rustfs_image: "rustfs:test".to_string(),
             workload_objects: 12,
@@ -14162,6 +14824,8 @@ mod tests {
             scenario: scenario.to_string(),
             run_id: run_id.to_string(),
             context: "real-cluster".to_string(),
+            namespace: "fault-ns".to_string(),
+            tenant: "fault-tenant".to_string(),
             storage_class: "fast-csi".to_string(),
             rustfs_image: "rustfs:test".to_string(),
             workload_objects: 12,
@@ -14400,6 +15064,8 @@ mod tests {
             scenario: scenario.to_string(),
             run_id: run_id.to_string(),
             context: "real-cluster".to_string(),
+            namespace: "fault-ns".to_string(),
+            tenant: "fault-tenant".to_string(),
             storage_class: "fast-csi".to_string(),
             rustfs_image: "rustfs:test".to_string(),
             workload_objects: 12,

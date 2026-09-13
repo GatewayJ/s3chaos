@@ -156,6 +156,13 @@ pub(crate) trait AdminCaseDriver: Send + Sync {
     /// Runs the finite, run-owned S3 workload after admin start.
     async fn run_workload(&self) -> Result<()>;
 
+    /// Proves interval overlap from run-owned operation/status and S3
+    /// receipts when the operation reaches terminal state before the runner
+    /// observes a `Running` sample.
+    async fn verify_completed_overlap(&self) -> Result<()> {
+        bail!("admin operation completed before overlap with the workload was observed")
+    }
+
     /// Verifies scenario-specific admin receipts and the committed S3 model.
     async fn verify(&self) -> Result<()>;
 
@@ -214,16 +221,31 @@ pub(crate) async fn execute_admin_workflow<D: AdminCaseDriver + ?Sized>(
     if primary.is_none()
         && let Some(operation_deadline) = operation_deadline
     {
+        let (workload_started_tx, workload_started_rx) = tokio::sync::oneshot::channel();
+        let workload = async {
+            let _ = workload_started_tx.send(());
+            driver.run_workload().await
+        };
+        let operation = async {
+            workload_started_rx
+                .await
+                .map_err(|_| anyhow!("admin workload ended before overlap observation began"))?;
+            wait_for_admin_completion(driver, deadline, operation_deadline, poll_interval).await
+        };
         let overlap = async {
-            tokio::try_join!(
+            let (_, observed_running) = tokio::try_join!(
+                run_operation_phase(deadline, operation_deadline, "workload", workload),
+                operation,
+            )?;
+            if !observed_running {
                 run_operation_phase(
                     deadline,
                     operation_deadline,
-                    "workload",
-                    driver.run_workload(),
-                ),
-                wait_for_admin_completion(driver, deadline, operation_deadline, poll_interval,),
-            )?;
+                    "completed-operation overlap proof",
+                    driver.verify_completed_overlap(),
+                )
+                .await?;
+            }
             Ok(())
         };
         primary = run_phase(&mut evidence, "operation-workload-overlap", overlap).await;
@@ -312,7 +334,8 @@ async fn wait_for_admin_completion<D: AdminCaseDriver + ?Sized>(
     deadline: RunDeadline,
     operation_deadline: tokio::time::Instant,
     poll_interval: Duration,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut observed_running = false;
     loop {
         match run_operation_phase(
             deadline,
@@ -323,6 +346,7 @@ async fn wait_for_admin_completion<D: AdminCaseDriver + ?Sized>(
         .await?
         {
             AdminWorkflowObservation::Running => {
+                observed_running = true;
                 run_operation_phase(
                     deadline,
                     operation_deadline,
@@ -334,7 +358,9 @@ async fn wait_for_admin_completion<D: AdminCaseDriver + ?Sized>(
                 )
                 .await?;
             }
-            AdminWorkflowObservation::Completed => return Ok(()),
+            AdminWorkflowObservation::Completed => {
+                return Ok(observed_running);
+            }
         }
     }
 }
@@ -532,6 +558,83 @@ mod tests {
         assert!(calls.contains(&"workload"));
         assert!(calls.contains(&"observe"));
         assert_eq!(calls[calls.len() - 2..], ["verify", "cleanup"]);
+    }
+
+    #[tokio::test]
+    async fn workflow_rejects_operation_completed_before_observed_overlap() {
+        let driver = FakeDriver {
+            observations: Mutex::new(vec![AdminWorkflowObservation::Completed]),
+            ..FakeDriver::default()
+        };
+        let execution = execute_admin_workflow(
+            "admin-rebalance",
+            "run-1",
+            &driver,
+            RunDeadline::default(),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let error = execution.error.expect("missing overlap must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("completed before overlap with the workload was observed"),
+            "{error:#}"
+        );
+        assert!(execution.evidence.cancel_attempted);
+        assert!(execution.evidence.cleanup_succeeded);
+    }
+
+    #[tokio::test]
+    async fn workflow_accepts_receipt_proof_for_fast_completed_operation() {
+        struct ReceiptOverlapDriver(FakeDriver);
+
+        #[async_trait]
+        impl AdminCaseDriver for ReceiptOverlapDriver {
+            async fn start(&self) -> Result<()> {
+                self.0.start().await
+            }
+            async fn observe(&self) -> Result<AdminWorkflowObservation> {
+                self.0.observe().await
+            }
+            async fn run_workload(&self) -> Result<()> {
+                self.0.run_workload().await
+            }
+            async fn verify_completed_overlap(&self) -> Result<()> {
+                self.0.call("verify-overlap")
+            }
+            async fn verify(&self) -> Result<()> {
+                self.0.verify().await
+            }
+            async fn cancel(&self) -> Result<AdminCancelOutcome> {
+                self.0.cancel().await
+            }
+            async fn cleanup(&self) -> Result<()> {
+                self.0.cleanup().await
+            }
+        }
+
+        let driver = ReceiptOverlapDriver(FakeDriver {
+            observations: Mutex::new(vec![AdminWorkflowObservation::Completed]),
+            ..FakeDriver::default()
+        });
+        let execution = execute_admin_workflow(
+            "admin-rebalance",
+            "run-1",
+            &driver,
+            RunDeadline::default(),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(execution.error.is_none());
+        let calls = driver.0.calls.lock().expect("calls");
+        assert!(calls.contains(&"verify-overlap"));
     }
 
     #[tokio::test]

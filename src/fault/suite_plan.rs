@@ -733,6 +733,10 @@ fn scenario_config(
     attempt_dir: &Path,
 ) -> Result<FaultTestConfig> {
     let mut config = base.clone();
+    // Planned-admin qualification is a single-run opt-in. A suite expands
+    // ordinary catalog scenarios from the same process environment and must
+    // never inherit that authorization into its attempts.
+    config.qualify_planned_admin = false;
     config.scenario = scenario.name.clone();
     config.scenario_parameters = scenario.params.clone();
     if let Some(fault_duration_seconds) = scenario.fault_duration_seconds {
@@ -1481,6 +1485,31 @@ scenarios:
         assert_eq!(config.prefill_concurrency, 8);
         assert_eq!(config.rustfs_pod_stable_window, Duration::from_secs(30));
         assert_eq!(config.cluster.artifacts_dir, attempt_dir);
+    }
+
+    #[test]
+    fn scenario_config_clears_single_run_admin_qualification() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.qualify_planned_admin = true;
+        let attempt_dir = PathBuf::from("target/fault-tests/suite/attempt-1");
+
+        let config = scenario_config(&base, &suite, &suite.scenarios[0], 1, 1, &attempt_dir)
+            .expect("scenario config");
+
+        assert!(!config.qualify_planned_admin);
     }
 
     #[test]
