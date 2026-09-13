@@ -28,7 +28,7 @@ use crate::fault::{
 
 /// Mixes the probe seed away from the workload seed so probe bodies never
 /// collide with workload bodies even when indices overlap.
-const POST_RECOVERY_SEED_SALT: u64 = 0x5052_4F42_4552_4543;
+pub(crate) const POST_RECOVERY_SEED_SALT: u64 = 0x5052_4F42_4552_4543;
 
 impl FaultRun<'_> {
     /// Prove the recovered cluster accepts fresh mutations. The probe records

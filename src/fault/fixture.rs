@@ -15,6 +15,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::framework::{
     command::CommandOutput,
@@ -311,6 +312,49 @@ pub fn apply_admin_tenant_stage(
         .apply_yaml_command(admin_tenant_manifest(config, plan, expanded)?)
         .run_checked()?;
     Ok(())
+}
+
+pub fn capture_admin_fixture_observation(
+    config: &ClusterTestConfig,
+    phase: AdminFixturePhase,
+    prefilled_objects: Option<usize>,
+) -> Result<AdminFixtureObservation> {
+    let output = Kubectl::new(config)
+        .namespaced(&config.test_namespace)
+        .command(["get", "tenant", &config.tenant_name, "-o", "json"])
+        .run_checked()
+        .context("capture staged admin Tenant")?;
+    let tenant = serde_json::from_str::<Value>(&output.stdout)
+        .context("decode staged admin Tenant GET response")?;
+    let tenant_uid = tenant
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("staged admin Tenant GET lacks metadata.uid")?;
+    let pool_names = tenant
+        .pointer("/spec/pools")
+        .and_then(Value::as_array)
+        .context("staged admin Tenant GET lacks spec.pools")?
+        .iter()
+        .map(|pool| {
+            pool.get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .context("staged admin Tenant pool lacks name")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(AdminFixtureObservation {
+        phase,
+        observed_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or_default()
+            .max(1),
+        tenant_uid: tenant_uid.to_string(),
+        pool_names,
+        prefilled_objects,
+    })
 }
 
 pub fn reset_tenant_resources(config: &ClusterTestConfig) -> Result<()> {
