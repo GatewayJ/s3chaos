@@ -1202,11 +1202,11 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::HealRegression,
         ]),
         case_name: "fault_admin_decommission_preserves_object_model",
-        description: "Planned scenario-owned RustFS admin flow: decommission the named, runtime-bound target pool under one finite, byte-bounded S3 workload in a fresh multi-pool Tenant.",
+        description: "Scenario-owned RustFS admin flow: decommission the named, populated source pool under one finite, byte-bounded, version-aware S3 workload.",
         priority: FaultPriority::P1,
         backend: FaultBackend::PlannedReliabilityWorkflow,
         status: FaultScenarioStatus::Planned,
-        workload_profile: FaultScenarioWorkloadProfile::Default,
+        workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
         isolation: FaultIsolation::FreshTenant,
         crds: &[],
         required_tools: &[],
@@ -1221,9 +1221,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             "preflight and a fresh pools/list observation immediately before start must prove the same healthy idle pool identities, no concurrent decommission/rebalance, and remaining capacity covering 130% of target used bytes plus the bounded workload budget",
             "raw Tenant GETs, Kubernetes context/cluster/service UID port-forward identity, and pre/post /rustfs/admin/v3/info deploymentID observations must bind every exact start/status request and pool list to one RustFS deployment",
             "the complete finite workload-plan.json must derive a conservative byte bound that charges every PUT, hot-key overwrite version, multipart completion, and aborted multipart body",
+            "admin-decommission-overlap.json must bind the exact workload history sequence to a target status request interval and at least one S3 operation interval that overlap the operation window",
         ],
         validation: "decommission reaches successful completion without failed moves or cancellation, before/after topology proves the target absent or terminal, and bounded S3 history/checker evidence preserves the committed object model",
-        observability: "admin-topology-proof.json, admin-operation.json, monotonic admin-operation-progress.jsonl, workload history, checker reports, RustFS logs",
+        observability: "admin-topology-proof.json, admin-operation.json, monotonic admin-operation-progress.jsonl, admin-decommission-transcript.json, workload history, checker reports, RustFS logs",
         conflict_domain: "fresh multi-pool Tenant fixture; must not decommission shared or pre-existing resources",
     },
     FaultScenarioSpec {
@@ -1588,10 +1589,12 @@ pub fn apply_catalog_defaults(config: &mut FaultTestConfig) -> Result<()> {
             _ => {}
         }
     }
-    if config.scenario == ADMIN_REBALANCE_SCENARIO {
-        // The staged single-pool prefill must include a deterministic
-        // zero-byte cohort. Nonzero PUT and multipart bodies are still issued
-        // by the mixed workload after the second pool joins.
+    if matches!(
+        config.scenario.as_str(),
+        ADMIN_DECOMMISSION_SCENARIO | ADMIN_REBALANCE_SCENARIO
+    ) {
+        // The staged single-pool prefill includes a deterministic zero-byte
+        // cohort before the mixed workload starts on the two-pool topology.
         config.workload_directory_marker_percent = 100;
     }
     Ok(())
@@ -1634,7 +1637,7 @@ pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ADMIN_REBALANCE_SCENARIO, CLUSTER_COLD_RESTART_SCENARIO,
+        ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, CLUSTER_COLD_RESTART_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
@@ -1762,11 +1765,13 @@ mod tests {
     #[test]
     fn planned_admin_qualification_requires_the_dedicated_entrypoint_and_flag() {
         let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
-        config.scenario = ADMIN_REBALANCE_SCENARIO.to_string();
         config.qualify_planned_admin = true;
 
-        assert!(FaultScenario::from_config(&config).is_err());
-        assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+        for scenario in [ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO] {
+            config.scenario = scenario.to_string();
+            assert!(FaultScenario::from_config(&config).is_err());
+            assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+        }
 
         config.scenario = STALE_DISK_RETURN_DETECT_SCENARIO.to_string();
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
@@ -1841,20 +1846,20 @@ mod tests {
     }
 
     #[test]
-    fn planned_admin_rebalance_uses_versioned_zero_byte_prefill() {
-        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
-        config.scenario = ADMIN_REBALANCE_SCENARIO.to_string();
+    fn planned_admin_cases_use_versioned_zero_byte_prefill() {
+        for scenario in [ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO] {
+            let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+            config.scenario = scenario.to_string();
 
-        apply_catalog_defaults(&mut config).expect("admin rebalance defaults");
+            apply_catalog_defaults(&mut config).expect("admin defaults");
 
-        assert!(config.workload_versioning);
-        assert_eq!(config.workload_directory_marker_percent, 100);
-        assert_eq!(
-            scenario_spec(ADMIN_REBALANCE_SCENARIO)
-                .expect("admin rebalance scenario")
-                .status,
-            FaultScenarioStatus::Planned
-        );
+            assert!(config.workload_versioning);
+            assert_eq!(config.workload_directory_marker_percent, 100);
+            assert_eq!(
+                scenario_spec(scenario).expect("admin scenario").status,
+                FaultScenarioStatus::Planned
+            );
+        }
     }
 
     #[test]

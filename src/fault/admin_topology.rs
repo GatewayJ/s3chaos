@@ -897,6 +897,34 @@ impl RustfsAdminTopologyAdapter {
         Self::connect_bound(endpoint, region, access_key, secret_key, Some(port_forward)).await
     }
 
+    /// Capture the fresh Kubernetes Tenant, RustFS deployment, and pools/list
+    /// receipts bound to this adapter's live port-forward target.
+    pub async fn capture_pool_snapshot(
+        &self,
+        run_id: impl Into<String>,
+        case_name: impl Into<String>,
+    ) -> Result<AdminPoolSnapshot> {
+        let runtime = self.probe_runtime_binding().await?;
+        let tenant_endpoint = self.ensure_port_forward_target()?;
+        runtime
+            .target
+            .endpoint
+            .require_same_live_target(&tenant_endpoint)?;
+        let tenant_response_body = tenant_endpoint.tenant_response_body;
+        let tenant_started_at_ms = tenant_endpoint.tenant_started_at_ms;
+        let tenant_observed_at_ms = tenant_endpoint.tenant_observed_at_ms;
+        let pools = self.list_pools().await?;
+        AdminPoolSnapshot::from_list(
+            run_id,
+            case_name,
+            tenant_response_body.as_bytes(),
+            runtime,
+            tenant_started_at_ms,
+            tenant_observed_at_ms,
+            pools,
+        )
+    }
+
     async fn connect_bound(
         endpoint: AdminEndpointIdentity,
         region: &str,
@@ -952,30 +980,6 @@ impl RustfsAdminTopologyAdapter {
     pub async fn probe_runtime_binding(&self) -> Result<AdminRuntimeBinding> {
         let endpoint = self.ensure_port_forward_target()?;
         probe_runtime_binding(&self.transport, endpoint).await
-    }
-
-    /// Capture the fresh Kubernetes Tenant, RustFS deployment, and pools/list
-    /// receipts needed to bind one admin attempt to this adapter's live
-    /// port-forward target.
-    pub async fn capture_pool_snapshot(
-        &self,
-        run_id: impl Into<String>,
-        case_name: impl Into<String>,
-    ) -> Result<AdminPoolSnapshot> {
-        let runtime = self.probe_runtime_binding().await?;
-        let tenant_response_body = runtime.target.endpoint.tenant_response_body.clone();
-        let tenant_started_at_ms = runtime.target.endpoint.tenant_started_at_ms;
-        let tenant_observed_at_ms = runtime.target.endpoint.tenant_observed_at_ms;
-        let pools = self.list_pools().await?;
-        AdminPoolSnapshot::from_list(
-            run_id,
-            case_name,
-            tenant_response_body.as_bytes(),
-            runtime,
-            tenant_started_at_ms,
-            tenant_observed_at_ms,
-            pools,
-        )
     }
 
     async fn ensure_request_target(
@@ -2610,6 +2614,119 @@ fn project_decommission_status(
         objects_moved: progress.objects_decommissioned,
         bytes_moved: progress.bytes_decommissioned,
     })
+}
+
+/// Build one progress sample directly from a captured RustFS status response.
+///
+/// A live decommission driver may learn the operation identity only after the
+/// first running status response. Passing that identity back through this
+/// constructor keeps every queued/running/terminal sample derived from its raw
+/// response while sharing the offline validator's fail-closed projection.
+pub fn decommission_progress_sample(
+    proof: &AdminTopologyProof,
+    operation_id: &str,
+    call: &AdminCall<DecommissionPoolStatus>,
+) -> Result<AdminOperationProgressSample> {
+    proof.require_satisfied()?;
+    ensure!(
+        proof.scenario == ADMIN_DECOMMISSION_SCENARIO,
+        "decommission progress requires an admin-decommission topology proof"
+    );
+    let target_pool_id = proof
+        .target_pool_id
+        .context("decommission topology proof has no target pool ID")?;
+    let target_pool_expression = proof
+        .target_pool_expression
+        .as_deref()
+        .context("decommission topology proof has no target expression")?;
+    call.request.validate()?;
+    proof
+        .runtime
+        .target
+        .require_same_runtime_identity(&call.request.target)?;
+    ensure!(
+        call.request.method == Method::GET.as_str()
+            && call.request.path == format!("{ADMIN_PREFIX}/decommission/status")
+            && has_exact_operation_query(
+                &call.request,
+                ADMIN_DECOMMISSION_SCENARIO,
+                Some(target_pool_id),
+            )
+            && (200..300).contains(&call.request.status),
+        "decommission progress source is not a successful status request for the proven pool"
+    );
+    let wire_status = parse_captured_json_response::<DecommissionPoolStatus>(
+        &call.request,
+        "RustFS decommission status response",
+    )?;
+    ensure!(
+        wire_status == call.value,
+        "decommission status fields do not match the captured RustFS response"
+    );
+    let projection = project_decommission_status(
+        &call.value,
+        target_pool_id,
+        target_pool_expression,
+        operation_id,
+    )?;
+    let status_request_id = call
+        .request
+        .request_id
+        .clone()
+        .filter(|request_id| !request_id.trim().is_empty())
+        .context("decommission status response lacks a request ID")?;
+    Ok(AdminOperationProgressSample {
+        attempt: proof.attempt.clone(),
+        operation_id: operation_id.to_string(),
+        status_request_id,
+        observed_at_ms: call.request.observed_at_ms,
+        state: projection.state,
+        completed: projection.completed,
+        failed: projection.failed,
+        canceled_or_stopped: projection.canceled,
+        objects_moved: Some(projection.objects_moved),
+        versions_moved: None,
+        bytes_moved: Some(projection.bytes_moved),
+    })
+}
+
+/// Validate a successful decommission control receipt for the proven target.
+pub fn validate_decommission_control_call(
+    proof: &AdminTopologyProof,
+    expected_path: &str,
+    call: &AdminCall<()>,
+) -> Result<()> {
+    proof.require_satisfied()?;
+    ensure!(
+        proof.scenario == ADMIN_DECOMMISSION_SCENARIO
+            && matches!(
+                expected_path,
+                "/rustfs/admin/v3/pools/decommission"
+                    | "/rustfs/admin/v3/pools/cancel"
+                    | "/rustfs/admin/v3/pools/clear"
+            ),
+        "decommission control validation received an unsupported scenario or path"
+    );
+    let target_pool_id = proof
+        .target_pool_id
+        .context("decommission topology proof has no target pool ID")?;
+    call.request.validate()?;
+    proof
+        .runtime
+        .target
+        .require_same_runtime_identity(&call.request.target)?;
+    ensure!(
+        call.request.method == Method::POST.as_str()
+            && call.request.path == expected_path
+            && has_exact_operation_query(
+                &call.request,
+                ADMIN_DECOMMISSION_SCENARIO,
+                Some(target_pool_id),
+            )
+            && (200..300).contains(&call.request.status),
+        "decommission control receipt is not a successful request for the proven target"
+    );
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -5394,6 +5511,24 @@ mod tests {
             ),
         )
         .unwrap();
+        let start_call = AdminCall {
+            value: (),
+            request: operation.requests[0].clone(),
+        };
+        validate_decommission_control_call(
+            &proof,
+            "/rustfs/admin/v3/pools/decommission",
+            &start_call,
+        )
+        .expect("exact target start receipt");
+        assert!(
+            validate_decommission_control_call(
+                &proof,
+                "/rustfs/admin/v3/pools/clear",
+                &start_call,
+            )
+            .is_err()
+        );
         let mut samples = [
             ("queued", false, 110, 0, 0, "decommission-status-request-1"),
             (
@@ -5432,6 +5567,30 @@ mod tests {
             },
         )
         .collect::<Vec<_>>();
+
+        for (expected, request) in samples
+            .iter()
+            .zip(operation.requests.iter().filter(|request| {
+                request.method == "GET"
+                    && request.path == format!("{ADMIN_PREFIX}/decommission/status")
+            }))
+        {
+            let call = AdminCall {
+                value: serde_json::from_str(
+                    request
+                        .response_body
+                        .as_deref()
+                        .expect("captured decommission status body"),
+                )
+                .expect("decode captured decommission status"),
+                request: request.clone(),
+            };
+            assert_eq!(
+                decommission_progress_sample(&proof, &operation.operation_id, &call)
+                    .expect("derive live progress sample"),
+                *expected
+            );
+        }
 
         validate_admin_operation_progress(&operation, &samples, attempt_window())
             .expect("valid decommission state progression");
