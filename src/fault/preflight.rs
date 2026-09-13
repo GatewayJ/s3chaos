@@ -379,6 +379,48 @@ impl PreflightCheck {
 }
 
 impl TargetProof {
+    pub(crate) fn for_storage_recovery(
+        config: &FaultTestConfig,
+        scenario: &FaultScenario,
+        run_id: &str,
+        resolved_pods: Vec<TargetResolvedPodProof>,
+        erasure_set: TargetErasureSetProof,
+    ) -> Self {
+        Self {
+            schema_version: TARGET_PROOF_SCHEMA_VERSION,
+            status: TargetProofStatus::Satisfied,
+            proof_level: TargetProofLevel::ConfiguredHostTarget,
+            generated_at_ms: now_ms(),
+            scenario: scenario.name.clone(),
+            case_name: scenario.case_name.to_string(),
+            run_id: run_id.to_string(),
+            namespace: config.cluster.test_namespace.clone(),
+            tenant: config.cluster.tenant_name.clone(),
+            resolved_pods,
+            faults: vec![TargetProofFault {
+                name: format!("{}-storage-recovery", scenario.name),
+                kind: "fresh-volume-replacement".to_string(),
+                backend: FaultBackend::PlannedReliabilityWorkflow.as_str().to_string(),
+                target_kind: "rustfs-static-local-volume".to_string(),
+                target_summary: "one run-owned static Local-PV logical slot".to_string(),
+                selection: "exactly one receipt-bound volume".to_string(),
+                selection_kind: "receipt-bound".to_string(),
+                selection_value: 1,
+                conflict_domain: "dedicated fresh Tenant and run-owned Local PVs".to_string(),
+                pod_selector: None,
+                volume_path: Some(config.rustfs_volume_path.clone()),
+                host_target: None,
+                erasure_set: Some(erasure_set),
+                statefulset: None,
+            }],
+            requirements: vec![TargetProofRequirement {
+                name: "storage-recovery-owned-volume".to_string(),
+                status: PreflightStatus::Passed,
+                message: "run-owned Local PV, Pod/PVC/PV binding, host generation, and runtime erasure membership were resolved".to_string(),
+            }],
+        }
+    }
+
     pub fn from_plan(
         config: &FaultTestConfig,
         scenario: &FaultScenario,

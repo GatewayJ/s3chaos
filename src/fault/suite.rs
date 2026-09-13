@@ -76,6 +76,11 @@ pub struct FaultSuiteBudgets {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaultSuiteScenario {
     pub name: String,
+    /// Closed planned-case selector. Parsing it keeps qualification suites
+    /// reviewable while ordinary suite resolution still rejects Planned
+    /// catalog entries before any execution plan is produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_recovery_case: Option<crate::fault::storage_recovery::StorageRecoveryCase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<FaultInjectionParameters>,
     #[serde(default = "default_repetitions")]
@@ -491,9 +496,23 @@ impl ResolvedFaultSuiteScenario {
         workload_profiles: &BTreeMap<String, ResolvedFaultSuiteWorkloadOverride>,
     ) -> Result<Self> {
         let spec = scenario_spec(&scenario.name)?;
+        if let Some(case) = scenario.storage_recovery_case {
+            ensure!(
+                case.scenario() == scenario.name,
+                "scenario {} storageRecoveryCase {} belongs to {}",
+                scenario.name,
+                case.as_str(),
+                case.scenario()
+            );
+        }
         ensure!(
             spec.status == FaultScenarioStatus::Executable,
             "scenario {} is not executable",
+            scenario.name
+        );
+        ensure!(
+            scenario.storage_recovery_case.is_none(),
+            "scenario {} cannot use storageRecoveryCase outside explicit Planned qualification",
             scenario.name
         );
         ensure!(
@@ -1850,6 +1869,31 @@ scenarios:
         let error = suite.resolve().expect_err("unimplemented artifact mode");
 
         assert!(error.to_string().contains("artifacts.required=default"));
+    }
+
+    #[test]
+    fn planned_fresh_volume_suites_are_case_unique_and_ordinary_resolution_is_blocked() {
+        for (path, expected) in [
+            (
+                "fault/planned/fresh-volume-replacement-automatic.yaml",
+                crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement,
+            ),
+            (
+                "fault/planned/fresh-volume-replacement-admin-deep.yaml",
+                crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
+            ),
+        ] {
+            let suite = FaultSuite::from_yaml_path(path)
+                .expect("planned suite must remain statically parseable");
+            let [scenario] = suite.scenarios.as_slice() else {
+                panic!("each qualification suite must contain exactly one case")
+            };
+            assert_eq!(scenario.storage_recovery_case, Some(expected));
+            let error = suite
+                .resolve()
+                .expect_err("ordinary suite resolution must reject Planned scenarios");
+            assert!(error.to_string().contains("is not executable"));
+        }
     }
 
     #[test]

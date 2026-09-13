@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -1427,32 +1427,70 @@ pub struct FaultScenario {
 
 impl FaultScenario {
     pub fn from_config(config: &FaultTestConfig) -> Result<Self> {
-        Self::from_config_with_planned_admin(config, false)
+        Self::from_config_with_planned_qualification(config, false, false)
     }
 
     pub(crate) fn from_config_for_execution(config: &FaultTestConfig) -> Result<Self> {
-        Self::from_config_with_planned_admin(config, config.qualify_planned_admin)
+        ensure!(
+            !(config.qualify_planned_admin && config.qualify_planned_storage),
+            "planned admin and storage qualification cannot be enabled together"
+        );
+        if config.qualify_planned_storage {
+            ensure!(
+                config.destructive_enabled,
+                "planned storage qualification requires RUSTFS_FAULT_TEST_DESTRUCTIVE=1"
+            );
+            let case = config.storage_recovery_case.context(
+                "planned storage qualification requires RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE",
+            )?;
+            ensure!(
+                case.scenario() == config.scenario,
+                "planned storage qualification case {} does not belong to exact scenario {}",
+                case.as_str(),
+                config.scenario
+            );
+        }
+        Self::from_config_with_planned_qualification(
+            config,
+            config.qualify_planned_admin,
+            config.qualify_planned_storage,
+        )
     }
 
-    fn from_config_with_planned_admin(
+    fn from_config_with_planned_qualification(
         config: &FaultTestConfig,
         allow_planned_admin: bool,
+        allow_planned_storage: bool,
     ) -> Result<Self> {
         let spec = scenario_spec(&config.scenario)?;
-        let qualification_allowed = allow_planned_admin
+        let admin_qualification_allowed = allow_planned_admin
             && matches!(
                 spec.scenario,
                 ADMIN_DECOMMISSION_SCENARIO | ADMIN_REBALANCE_SCENARIO
             )
             && spec.backend == FaultBackend::PlannedReliabilityWorkflow;
+        let storage_qualification_allowed = allow_planned_storage
+            && spec.scenario == FRESH_VOLUME_REPLACEMENT_SCENARIO
+            && config
+                .storage_recovery_case
+                .is_some_and(|case| case.scenario() == spec.scenario)
+            && spec.backend == FaultBackend::PlannedReliabilityWorkflow;
         if allow_planned_admin {
             ensure!(
-                qualification_allowed,
+                admin_qualification_allowed,
                 "planned admin qualification is restricted to the exact admin-decommission and admin-rebalance scenarios"
             );
         }
+        if allow_planned_storage {
+            ensure!(
+                storage_qualification_allowed,
+                "planned storage qualification is restricted to the exact fresh-volume-replacement scenario and case"
+            );
+        }
         ensure!(
-            spec.status.is_executable() || qualification_allowed,
+            spec.status.is_executable()
+                || admin_qualification_allowed
+                || storage_qualification_allowed,
             "fault scenario {:?} is cataloged as {:?} but is not executable yet; case {}, backend {:?}, validation: {}",
             config.scenario,
             spec.status,
@@ -1774,6 +1812,25 @@ mod tests {
         }
 
         config.scenario = STALE_DISK_RETURN_DETECT_SCENARIO.to_string();
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
+    }
+
+    #[test]
+    fn planned_storage_qualification_requires_exact_destructive_case() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+        config.scenario = super::FRESH_VOLUME_REPLACEMENT_SCENARIO.to_string();
+        config.qualify_planned_storage = true;
+        config.storage_recovery_case = Some(
+            crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
+        );
+
+        assert!(FaultScenario::from_config(&config).is_err());
+        assert!(FaultScenario::from_config_for_execution(&config).is_err());
+        config.destructive_enabled = true;
+        assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+
+        config.storage_recovery_case =
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAdminDeep);
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
     }
 

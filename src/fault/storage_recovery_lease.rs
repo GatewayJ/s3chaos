@@ -41,6 +41,9 @@ const MAX_LEASE_DURATION_SECONDS: u64 = 300;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum StorageRecoveryCleanupProof {
+    AbortedBeforeMutation {
+        observed_at_ms: u64,
+    },
     BitrotRestored {
         restore_receipt: Box<StorageRecoveryOperationReceipt>,
     },
@@ -63,6 +66,18 @@ pub enum StorageRecoveryCleanupProof {
 impl StorageRecoveryCleanupProof {
     pub fn validate_for(&self, context: &OwnedStorageContext) -> Result<()> {
         match self {
+            Self::AbortedBeforeMutation { observed_at_ms } => {
+                ensure!(
+                    matches!(
+                        context.case,
+                        StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement
+                            | StorageRecoveryCase::FreshVolumeReplacementAdminDeep
+                    ) && *observed_at_ms
+                        >= context.exclusive_access.kubernetes_lease.acquired_at_ms,
+                    "pre-mutation abort proof is not a fresh-volume Lease-generation proof"
+                );
+                Ok(())
+            }
             Self::BitrotRestored { restore_receipt }
             | Self::BitrotQuarantined {
                 restore_receipt, ..
@@ -185,6 +200,7 @@ impl StorageRecoveryCleanupProof {
 
     fn completed_at_ms(&self) -> u64 {
         match self {
+            Self::AbortedBeforeMutation { observed_at_ms } => *observed_at_ms,
             Self::BitrotRestored { restore_receipt }
             | Self::BitrotQuarantined {
                 restore_receipt, ..

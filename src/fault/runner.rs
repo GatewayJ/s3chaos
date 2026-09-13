@@ -47,7 +47,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-mod access;
+pub(in crate::fault) mod access;
 mod ack;
 mod injection;
 mod post_recovery;
@@ -126,6 +126,18 @@ pub(crate) async fn run_prepared_scenario_with_config_and_reference_root(
         ExecutionPlan::Admin(admin_plan) => {
             crate::fault::admin_runner::run_admin_case(
                 &config, &collector, &scenario, &plan, admin_plan, &run_id, deadline,
+            )
+            .await
+        }
+        ExecutionPlan::StorageRecovery(storage_plan) => {
+            crate::fault::storage_recovery_runner::run_storage_recovery_case(
+                &config,
+                &collector,
+                &scenario,
+                &plan,
+                storage_plan,
+                &run_id,
+                deadline,
             )
             .await
         }

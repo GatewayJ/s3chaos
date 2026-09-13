@@ -1,0 +1,22 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-fresh-volume-automatic-qualification
+budgets:
+  maxDuration: 1h
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 0
+observability:
+  chaosDashboard: optional
+artifacts:
+  required: strict
+workloadProfiles:
+  recovery:
+    objects: 600
+    concurrency: 30
+scenarios:
+  - name: fresh-volume-replacement
+    storageRecoveryCase: fresh-volume-replacement-automatic-replacement
+    faultDuration: 30m
+    workloadProfile: recovery

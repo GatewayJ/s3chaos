@@ -130,6 +130,25 @@ impl StorageRecoveryCase {
             Self::StaleDiskReturn => None,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FreshVolumeReplacementAutomaticReplacement => {
+                "fresh-volume-replacement-automatic-replacement"
+            }
+            Self::FreshVolumeReplacementAdminDeep => "fresh-volume-replacement-admin-deep",
+            Self::OnDiskBitrotAutomaticScanner => "on-disk-bitrot-automatic-scanner",
+            Self::OnDiskBitrotAdminDeep => "on-disk-bitrot-admin-deep",
+            Self::StaleDiskReturn => "stale-disk-return",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|case| case.as_str() == value)
+            .with_context(|| format!("unknown storage-recovery case {value:?}"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,7 +245,6 @@ impl StorageVolumeIdentity {
             && self.node == other.node
             && self.node_uid == other.node_uid
             && self.storage_class == other.storage_class
-            && self.local_volume_path == other.local_volume_path
             && self.mount_path == other.mount_path
             && self.pool_index == other.pool_index
             && self.set_index == other.set_index
@@ -485,6 +503,7 @@ impl FreshVolumeReplacementProof {
         );
         ensure!(
             self.original.persistent_volume_uid != self.replacement.persistent_volume_uid
+                && self.original.canonical_device != self.replacement.canonical_device
                 && self.original.filesystem_uuid != self.replacement.filesystem_uuid
                 && self.original.rustfs_drive_uuid != self.replacement.rustfs_drive_uuid,
             "fresh replacement must have new PV, filesystem, and RustFS drive generations"
@@ -2232,9 +2251,16 @@ pub enum HealMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum HealObserverIdentity {
-    ReplacementTask { task_id: String, generation: u64 },
-    ScannerStatus { status_cursor: String },
-    AdminOperation { operation_id: String },
+    ReplacementTask {
+        task_id: String,
+        generation: Option<String>,
+    },
+    ScannerStatus {
+        status_cursor: String,
+    },
+    AdminOperation {
+        operation_id: String,
+    },
 }
 
 impl HealObserverIdentity {
@@ -2247,8 +2273,11 @@ impl HealObserverIdentity {
                     generation,
                 },
             ) => ensure!(
-                !task_id.trim().is_empty() && *generation > 0,
-                "automatic replacement requires a task id and positive generation"
+                !task_id.trim().is_empty()
+                    && generation
+                        .as_deref()
+                        .is_some_and(|generation| !generation.trim().is_empty()),
+                "automatic replacement requires a task id and captured generation"
             ),
             (HealMode::AutomaticScanner, Self::ScannerStatus { status_cursor }) => ensure!(
                 !status_cursor.trim().is_empty(),

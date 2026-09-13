@@ -59,6 +59,11 @@ use crate::fault::{
     },
     events::{RunEvent, RunEventStatus},
     fixture::{ADMIN_FIXTURE_ARTIFACT, AdminFixtureEvidence, AdminFixturePhase, AdminFixturePlan},
+    fresh_volume::{
+        FRESH_VOLUME_CLEANUP_ARTIFACT, FRESH_VOLUME_FIXTURE_ARTIFACT,
+        FRESH_VOLUME_HEAL_TRANSCRIPT_ARTIFACT, FRESH_VOLUME_READ_HISTORY_ARTIFACT,
+        FreshVolumeReadMatrixEvidence, HealWireReceipt, validate_heal_transcript,
+    },
     history::{
         DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome, OperationRecord,
         validate_history_phase_boundary, validate_history_scope_and_order,
@@ -94,6 +99,14 @@ use crate::fault::{
     spec::{
         FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunAckTriggerSpec, FaultRunArtifactSpec,
         FaultRunFaultSpec, FaultRunSpec, FaultRunTargetSpec,
+    },
+    storage_recovery::{
+        DISK_GENERATION_PROOF_ARTIFACT, FORCE_READ_PROOF_ARTIFACT, FreshVolumeReplacementProof,
+        HEAL_PROGRESS_ARTIFACT, HEAL_SUMMARY_ARTIFACT, HealProgressSample, HealSummary,
+        VERSION_SHARD_MAPPING_ARTIFACT, VersionShardMappingObservation,
+    },
+    storage_recovery_runner::{
+        STORAGE_RECOVERY_WORKFLOW_ARTIFACT, StorageRecoveryWorkflowEvidence,
     },
     workload::execution::{
         AVAILABILITY_REPORT_ARTIFACT, AvailabilityReport, FamilyAvailability,
@@ -1276,6 +1289,13 @@ fn validate_fault_artifacts_with_identity(
     ) {
         return validate_admin_execution_artifacts(options, identity, scenario_spec.case_name);
     }
+    if options.scenario == scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO {
+        return validate_storage_recovery_execution_artifacts(
+            options,
+            identity,
+            scenario_spec.case_name,
+        );
+    }
     let ack_mutation = acknowledged_mutation_kind(&options.scenario);
     validate_conditional_recovery_stability_artifact(
         &options.artifact_root,
@@ -2091,6 +2111,237 @@ fn validate_admin_execution_artifacts(
     })
 }
 
+fn validate_storage_recovery_execution_artifacts(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+    case_name: &str,
+) -> Result<ArtifactValidationReport> {
+    let artifacts =
+        locate_required_artifacts(&options.artifact_root, case_name, &options.scenario)?;
+    let metadata = read_json::<RunMetadataArtifact>(required(&artifacts, "run-metadata.json")?)?;
+    ensure!(
+        metadata.scenario == options.scenario
+            && metadata.workload_objects == options.expected_workload_objects
+            && metadata.workload_concurrency == options.expected_workload_concurrency,
+        "storage-recovery run metadata does not match the selected scenario or workload"
+    );
+    if let Some(run_id) = identity.planned_run_id() {
+        ensure!(
+            metadata.run_id == run_id,
+            "storage-recovery run metadata does not match the planned attempt"
+        );
+    }
+
+    let json_spec = read_json::<FaultRunSpec>(required(&artifacts, "run-spec.json")?)?;
+    let yaml_spec = read_yaml::<FaultRunSpec>(required(&artifacts, "run-spec.yaml")?)?;
+    ensure!(
+        json_spec == yaml_spec,
+        "storage-recovery run spec JSON and YAML differ"
+    );
+    validate_run_spec(&json_spec, options)?;
+    let case = match json_spec.execution.as_ref() {
+        Some(crate::fault::spec::FaultRunExecutionSpec::StorageRecovery { case, .. }) => *case,
+        _ => bail!("fresh-volume artifacts require typed storage-recovery execution"),
+    };
+    ensure!(
+        json_spec.metadata.run_id == metadata.run_id && json_spec.metadata.name == case_name,
+        "storage-recovery run spec identity does not match the attempt"
+    );
+
+    let workload = read_json::<WorkloadPlan>(required(&artifacts, "workload-plan.json")?)?;
+    ensure!(
+        workload.object_count == options.expected_workload_objects
+            && workload.concurrency == options.expected_workload_concurrency
+            && workload.seed == json_spec.workload.seed,
+        "storage-recovery workload plan does not match run-spec"
+    );
+    let preflight = read_json::<PreflightSummary>(required(&artifacts, "preflight-summary.json")?)?;
+    validate_preflight_summary(&preflight, options)?;
+    ensure!(
+        preflight
+            .run_id
+            .as_deref()
+            .is_none_or(|run_id| run_id == metadata.run_id),
+        "storage-recovery preflight belongs to another attempt"
+    );
+
+    let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
+    ensure!(
+        !history.is_empty(),
+        "storage-recovery history must not be empty"
+    );
+    validate_history_scope_and_order(
+        &history,
+        &metadata.scenario,
+        &metadata.run_id,
+        &json_spec.metadata.bucket,
+    )?;
+
+    let workflow = read_json::<StorageRecoveryWorkflowEvidence>(required(
+        &artifacts,
+        STORAGE_RECOVERY_WORKFLOW_ARTIFACT,
+    )?)?;
+    workflow.validate_completed_attempt(&metadata.scenario, &metadata.run_id, case)?;
+    let replacement = read_json::<FreshVolumeReplacementProof>(required(
+        &artifacts,
+        DISK_GENERATION_PROOF_ARTIFACT,
+    )?)?;
+    let mappings = read_json::<Vec<VersionShardMappingObservation>>(required(
+        &artifacts,
+        VERSION_SHARD_MAPPING_ARTIFACT,
+    )?)?;
+    let progress = read_jsonl::<HealProgressSample>(required(&artifacts, HEAL_PROGRESS_ARTIFACT)?)?;
+    let summary = read_json::<HealSummary>(required(&artifacts, HEAL_SUMMARY_ARTIFACT)?)?;
+    let proof_history =
+        read_jsonl::<OperationRecord>(required(&artifacts, FRESH_VOLUME_READ_HISTORY_ARTIFACT)?)?;
+    validate_history_scope_and_order(
+        &proof_history,
+        &metadata.scenario,
+        &metadata.run_id,
+        &json_spec.metadata.bucket,
+    )?;
+    let read_proof = read_json::<FreshVolumeReadMatrixEvidence>(required(
+        &artifacts,
+        FORCE_READ_PROOF_ARTIFACT,
+    )?)?;
+    read_proof.validate_chain(&mappings, &replacement, &summary, &progress, &proof_history)?;
+    ensure!(
+        replacement.identity.run_id == metadata.run_id
+            && replacement.identity.case_name == case_name
+            && replacement.identity.bucket == json_spec.metadata.bucket,
+        "storage-recovery proof identity does not match metadata"
+    );
+
+    let fixture = read_json::<Value>(required(&artifacts, FRESH_VOLUME_FIXTURE_ARTIFACT)?)?;
+    ensure!(
+        fixture.pointer("/schemaVersion").and_then(Value::as_u64) == Some(1)
+            && fixture.pointer("/runId").and_then(Value::as_str) == Some(metadata.run_id.as_str())
+            && fixture.pointer("/scenario").and_then(Value::as_str)
+                == Some(metadata.scenario.as_str())
+            && fixture
+                .pointer("/replacementProof")
+                .is_some_and(|value| !value.is_null())
+            && fixture
+                .pointer("/prepareReceipt")
+                .is_some_and(|value| !value.is_null()),
+        "fresh-volume fixture artifact is incomplete or belongs to another attempt"
+    );
+    let transcript = read_json::<Vec<HealWireReceipt>>(required(
+        &artifacts,
+        FRESH_VOLUME_HEAL_TRANSCRIPT_ARTIFACT,
+    )?)?;
+    validate_heal_transcript(&transcript, case)?;
+    let cleanup = read_json::<Value>(required(&artifacts, FRESH_VOLUME_CLEANUP_ARTIFACT)?)?;
+    ensure!(
+        cleanup.pointer("/runId").and_then(Value::as_str) == Some(metadata.run_id.as_str())
+            && cleanup
+                .pointer("/tenantResourcesRemoved")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && cleanup.pointer("/error").is_none_or(Value::is_null),
+        "fresh-volume cleanup does not prove successful run-owned teardown"
+    );
+    let recovery_health = read_json::<Value>(required(&artifacts, RECOVERY_HEALTH_ARTIFACT)?)?;
+    ensure!(
+        recovery_health
+            .pointer("/deploymentId")
+            .and_then(Value::as_str)
+            .is_some_and(|deployment| !deployment.trim().is_empty())
+            && recovery_health
+                .pointer("/offlineDrives")
+                .and_then(Value::as_u64)
+                == Some(0)
+            && recovery_health
+                .pointer("/unknownDrives")
+                .and_then(Value::as_u64)
+                == Some(0)
+            && recovery_health.pointer("/shape").is_some()
+            && recovery_health.pointer("/membership").is_some(),
+        "fresh-volume recovery health is not a fully online runtime observation"
+    );
+
+    let prechecker =
+        read_json::<CheckerReport>(required(&artifacts, "checker-pre-recommit-report.json")?)?;
+    validate_checker_identity("checker-pre-recommit-report.json", &prechecker, &metadata)?;
+    validate_checker_report(
+        "checker-pre-recommit-report.json",
+        &prechecker,
+        options.expected_workload_versioning,
+        &history,
+    )?;
+    let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
+    validate_checker_identity("checker-report.json", &checker, &metadata)?;
+    validate_checker_report(
+        "checker-report.json",
+        &checker,
+        options.expected_workload_versioning,
+        &history,
+    )?;
+    let recommit =
+        read_json::<RecommitReportArtifact>(required(&artifacts, "recommit-report.json")?)?;
+    ensure!(
+        recommit.failed == 0
+            && recommit.harness_errors == 0
+            && recommit.attempted == recommit.committed,
+        "storage-recovery recommit report contains unresolved writes"
+    );
+    let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
+    ensure!(
+        events
+            .iter()
+            .all(|event| { event.scenario == options.scenario && event.run_id == metadata.run_id })
+            && has_event(&events, "run", RunEventStatus::Succeeded)
+            && has_event(&events, "checker-final", RunEventStatus::Succeeded),
+        "storage-recovery events do not prove successful checking"
+    );
+    let post_write = read_json::<PostRecoveryWriteReport>(required(
+        &artifacts,
+        POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+    )?)?;
+    post_write.require_success()?;
+    ensure!(
+        post_write.scenario == metadata.scenario
+            && post_write.run_id == metadata.run_id
+            && post_write.objects == post_recovery_object_count(workload.object_count),
+        "storage-recovery post-write report does not match the attempt"
+    );
+    let expected_post_write_prefix = ObjectSpec::post_recovery_key_prefix(&metadata.run_id);
+    ensure!(
+        post_write.key_prefix == expected_post_write_prefix,
+        "storage-recovery post-write report is outside the run-scoped prefix"
+    );
+    let post_write_history =
+        read_jsonl::<OperationRecord>(required(&artifacts, POST_RECOVERY_WRITE_HISTORY_ARTIFACT)?)?;
+    validate_history_scope_and_order(
+        &post_write_history,
+        &metadata.scenario,
+        &metadata.run_id,
+        &json_spec.metadata.bucket,
+    )?;
+    ensure!(
+        post_write_history.iter().all(|record| {
+            record
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(&expected_post_write_prefix))
+                && record.started_at_ms >= post_write.started_at_ms
+                && record.ended_at_ms <= post_write.completed_at_ms
+        }),
+        "storage-recovery post-write history escaped its run prefix or report window"
+    );
+    validate_post_recovery_probe_history(&post_write_history, &post_write, &metadata.run_id)?;
+
+    Ok(ArtifactValidationReport {
+        scenario: options.scenario.clone(),
+        case_name: case_name.to_string(),
+        seed: workload.seed,
+        client_disruptions: 0,
+        recommitted: recommit.committed,
+        committed: checker.committed_puts,
+        required_artifacts: json_spec.artifacts.required,
+    })
+}
+
 fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -> Result<()> {
     ensure!(
         spec.api_version == FAULT_RUN_API_VERSION,
@@ -2117,8 +2368,11 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
     let catalog = scenarios::scenario_spec(&options.scenario)?;
     if catalog.status == crate::fault::scenarios::FaultScenarioStatus::Planned {
         ensure!(
-            execution_kind == ExecutionKind::Admin && spec.scenario.planned_qualification,
-            "planned admin run-spec must record the explicit qualification opt-in"
+            matches!(
+                execution_kind,
+                ExecutionKind::Admin | ExecutionKind::StorageRecovery
+            ) && spec.scenario.planned_qualification,
+            "planned run-spec must record an explicit typed qualification opt-in"
         );
     }
     validate_run_spec_catalog_contract(spec, options)?;
@@ -2195,7 +2449,10 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
             == requires_filesystem_check,
         "run-spec artifacts.required filesystem-check contract does not match its fault kind"
     );
-    if execution_kind == ExecutionKind::Admin {
+    if matches!(
+        execution_kind,
+        ExecutionKind::Admin | ExecutionKind::StorageRecovery
+    ) {
         ensure!(
             spec.artifacts
                 .required
@@ -2276,7 +2533,7 @@ fn validate_run_spec_catalog_contract(
         );
     }
     let execution_kind = spec.execution_kind()?;
-    let (duration, percent, parameters) = match execution_kind {
+    let (duration, percent, parameters, storage_recovery_case) = match execution_kind {
         ExecutionKind::Injection => {
             let artifact_fault = spec
                 .faults
@@ -2292,6 +2549,7 @@ fn validate_run_spec_catalog_contract(
                 artifact_fault.fault_duration_seconds,
                 percent,
                 artifact_fault.parameters.clone(),
+                None,
             )
         }
         ExecutionKind::Admin => {
@@ -2306,6 +2564,22 @@ fn validate_run_spec_catalog_contract(
                 operation_timeout_seconds,
                 1,
                 FaultInjectionParameters::Default,
+                None,
+            )
+        }
+        ExecutionKind::StorageRecovery => {
+            let (case, operation_timeout_seconds) = match &spec.execution {
+                Some(crate::fault::spec::FaultRunExecutionSpec::StorageRecovery {
+                    case,
+                    operation_timeout_seconds,
+                }) => (*case, *operation_timeout_seconds),
+                _ => unreachable!("execution_kind validated the storage-recovery shape"),
+            };
+            (
+                operation_timeout_seconds,
+                1,
+                FaultInjectionParameters::Default,
+                Some(case),
             )
         }
     };
@@ -2322,6 +2596,7 @@ fn validate_run_spec_catalog_contract(
         FaultPlanOptions {
             rustfs_volume_path: options.expected_rustfs_volume_path.clone(),
             scenario_parameters: parameters,
+            storage_recovery_case,
         },
     )
     .context("rebuild canonical execution plan for artifact validation")?;
@@ -2334,6 +2609,15 @@ fn validate_run_spec_catalog_contract(
         ensure!(
             plan.admin().is_some_and(|plan| &plan.topology == topology),
             "run-spec admin topology does not match the catalog's canonical plan"
+        );
+    }
+    if let Some(crate::fault::spec::FaultRunExecutionSpec::StorageRecovery { case, .. }) =
+        &spec.execution
+    {
+        ensure!(
+            plan.storage_recovery()
+                .is_some_and(|plan| &plan.case == case),
+            "run-spec storage-recovery case does not match the catalog's canonical plan"
         );
     }
     let expected_mode = match plan.workload_mode() {

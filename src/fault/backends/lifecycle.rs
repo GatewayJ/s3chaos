@@ -871,14 +871,14 @@ impl Drop for PodWatch {
 /// StatefulSet while the outage is held. The pause is recorded on the
 /// Deployment (`OPERATOR_PAUSE_*` annotations) before the scale so
 /// `restore_paused_operators` can undo it without this process.
-struct OperatorPause {
+pub(in crate::fault) struct OperatorPause {
     cluster: ClusterTestConfig,
     evidence: OperatorPauseEvidence,
     resumed: bool,
 }
 
 impl OperatorPause {
-    fn pause(
+    pub(in crate::fault) fn pause(
         cluster: &ClusterTestConfig,
         deployment: &str,
         image_match: &str,
@@ -969,7 +969,7 @@ impl OperatorPause {
         }
     }
 
-    fn resume(&mut self, timeout: Duration) -> Result<()> {
+    pub(in crate::fault) fn resume(&mut self, timeout: Duration) -> Result<()> {
         if self.resumed {
             return Ok(());
         }

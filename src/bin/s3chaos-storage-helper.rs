@@ -15,6 +15,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 
 use anyhow::{Context, Result, bail, ensure};
+use s3chaos::fault::fresh_volume::{FreshVolumeHostProbeRequest, run_fresh_volume_host_probe};
 use s3chaos::fault::storage_recovery_helper::{
     StorageHelperSession, StorageHelperSessionRequest, StorageHelperSessionResponse,
 };
@@ -22,9 +23,29 @@ use s3chaos::fault::storage_recovery_helper::{
 const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
 
 fn main() -> Result<()> {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.as_slice().get(1).map(String::as_str) == Some("hold") {
+        ensure!(args.len() == 2, "storage helper hold accepts no arguments");
+        loop {
+            std::thread::park_timeout(std::time::Duration::from_secs(60 * 60));
+        }
+    }
+    if args.as_slice().get(1).map(String::as_str) == Some("probe-fresh-volume") {
+        ensure!(
+            args.len() == 2,
+            "fresh-volume probe accepts no free-form arguments"
+        );
+        let request: FreshVolumeHostProbeRequest =
+            serde_json::from_reader(std::io::stdin().lock().take(MAX_REQUEST_BYTES + 1))
+                .context("decode typed fresh-volume host probe request")?;
+        let response = run_fresh_volume_host_probe(&request)?;
+        serde_json::to_writer(std::io::stdout().lock(), &response)
+            .context("write typed fresh-volume host probe response")?;
+        return Ok(());
+    }
     ensure!(
-        std::env::args_os().count() == 1,
-        "storage helper accepts no command-line arguments"
+        args.len() == 1,
+        "storage helper accepts only closed hold and probe-fresh-volume operations"
     );
     let stdin = std::io::stdin();
     let mut input = BufReader::new(stdin.lock());
