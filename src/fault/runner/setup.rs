@@ -25,9 +25,9 @@ use crate::{
         preflight::{PreflightCheck, PreflightPhase, TargetProof},
         reporting::FailureSummary,
         scenarios::{
-            FaultBackend, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
-            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, acknowledged_mutation_kind,
-            requires_prefault_multipart_staging,
+            FaultBackend, IO_EIO_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+            QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+            acknowledged_mutation_kind, requires_prefault_multipart_staging,
         },
         workload::S3WorkloadClient,
     },
@@ -41,9 +41,10 @@ use super::access::{
     wait_for_stable_rustfs_pods,
 };
 use super::targets::{
-    plan_requires_volume_bindings, require_volume_quorum_topology,
-    require_write_quorum_loss_topology, requires_fixed_volume_runtime_proof,
-    volume_quorum_boundary, write_quorum_partition_target_count,
+    plan_requires_volume_bindings, require_volume_availability_topology,
+    require_volume_quorum_topology, require_write_quorum_loss_topology,
+    requires_fixed_volume_runtime_proof, volume_fault_target_count, volume_quorum_boundary,
+    write_quorum_partition_target_count,
 };
 use super::{FaultRun, PreparedWorkload, ProvenTarget, write_preflight_summary};
 use crate::fault::backends::runtime::{
@@ -587,6 +588,61 @@ impl FaultRun<'_> {
         )?;
         let mut topology_observed_at_ms = None;
         let mut execution_injection = plan.fault().clone();
+        if plan.scenario == IO_EIO_SCENARIO {
+            events.record(
+                "volume-availability-topology-proof",
+                RunEventStatus::Started,
+                "proving the live RustFS erasure set can tolerate the selected volume fault",
+                None,
+            )?;
+            let unavailable_volumes = volume_fault_target_count(plan, pods_before.len())?;
+            let observation = match require_volume_availability_topology(
+                config,
+                endpoint,
+                access_key,
+                secret_key,
+                unavailable_volumes,
+                &pods_before,
+            )
+            .await
+            {
+                Ok(observation) => observation,
+                Err(error) => {
+                    preflight_phases.push(PreflightPhase::new(
+                        "volume-availability-topology-proof",
+                        vec![PreflightCheck::failed(
+                            "volume_availability_topology",
+                            error.to_string(),
+                            crate::fault::reporting::ResponsibilityDomain::Environment,
+                        )],
+                    ));
+                    write_preflight_summary(collector, scenario, config, run_id, preflight_phases)
+                        .ok();
+                    self.record_failure(
+                        "volume-availability-topology-proof",
+                        "test_or_environment",
+                        &error,
+                        None,
+                        None,
+                    )?;
+                    return Err(error);
+                }
+            };
+            events.record(
+                "volume-availability-topology-proof",
+                RunEventStatus::Succeeded,
+                "live RustFS geometry proves the selected volume fault stays within every read/write quorum",
+                Some(serde_json::to_value(&observation)?),
+            )?;
+            topology_observed_at_ms = Some(observation.observed_at_ms);
+            target_proof = target_proof.with_erasure_set_topology_proven(
+                observation.shape,
+                observation.health,
+                observation.membership,
+                observation.deployment_id,
+                observation.observed_at_ms,
+            )?;
+        }
         if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
             events.record(
                 "write-quorum-loss-topology-proof",

@@ -944,6 +944,11 @@ mod tests {
             "post-recovery-write-report.json",
             "post-recovery-write-history.jsonl"
         ]);
+        let mut availability_required_artifacts = required_artifacts.clone();
+        availability_required_artifacts
+            .as_array_mut()
+            .expect("required artifacts")
+            .push(json!("availability-report.json"));
         let operation_mix = json!({
             "put": 1,
             "overwrite": 1,
@@ -1035,7 +1040,7 @@ mod tests {
                         "repetition": 1,
                         "priority": "p0",
                         "isolation": "fresh-tenant",
-                        "impactPolicy": "client-disruption-required",
+                        "impactPolicy": "availability-required",
                         "expectedBackend": "chaos-mesh-io-chaos",
                         "catalogTarget": "one RustFS container data volume selected by tenant label and configured RustFS volume path",
                         "detector": {
@@ -1092,7 +1097,7 @@ mod tests {
                         "artifacts": {
                             "attemptDir": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1",
                             "caseDir": "/fixture/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1/fault_io_eio_preserves_committed_objects",
-                            "required": required_artifacts.clone(),
+                            "required": availability_required_artifacts,
                             "eventStream": "run-events.jsonl"
                         },
                         "budget": {
@@ -1393,7 +1398,7 @@ metadata:
 scenarios:
   - name: io-eio
     workload:
-      objects: 72
+      objects: 240
       concurrency: 9
 "#,
         )
@@ -1415,7 +1420,7 @@ scenarios:
         let config = scenario_config(&base, &suite, &suite.scenarios[0], 1, 1, &attempt_dir)
             .expect("scenario config");
 
-        assert_eq!(config.workload.object_count, 72);
+        assert_eq!(config.workload.object_count, 240);
         assert_eq!(config.workload.concurrency, 9);
         assert_eq!(config.workload_operation_mix, base.workload_operation_mix);
     }
@@ -1481,7 +1486,7 @@ scenarios:
     faultDuration: 10m
     percent: 35
     workload:
-      objects: 64
+      objects: 240
       concurrency: 8
 "#,
         )
@@ -1498,7 +1503,7 @@ scenarios:
         assert_eq!(config.duration, Duration::from_secs(600));
         assert_eq!(config.percent, 35);
         assert!(config.percent_overridden);
-        assert_eq!(config.workload.object_count, 64);
+        assert_eq!(config.workload.object_count, 240);
         assert_eq!(config.workload.concurrency, 8);
         assert_eq!(config.prefill_concurrency, 8);
         assert_eq!(config.rustfs_pod_stable_window, Duration::from_secs(30));

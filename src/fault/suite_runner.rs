@@ -876,7 +876,7 @@ scenarios:
     faultDuration: 10m
     percent: 35
     workload:
-      objects: 64
+      objects: 240
       concurrency: 8
 "#,
         )
@@ -912,7 +912,7 @@ scenarios:
         assert_eq!(first.scenario, "io-eio");
         assert_eq!(first.case_name, "fault_io_eio_preserves_committed_objects");
         assert_eq!(first.fault_duration_seconds, 600);
-        assert_eq!(first.workload.objects, 64);
+        assert_eq!(first.workload.objects, 240);
         assert_eq!(first.workload.concurrency, 8);
         assert_eq!(first.workload.profile, None);
         assert_eq!(first.workload.operation_mix.put, 1);
@@ -1048,7 +1048,7 @@ metadata:
   name: rustfs-smoke
 workloadProfiles:
   long-read:
-    objects: 96
+    objects: 400
     concurrency: 12
     operationWeights:
       put: 2
@@ -1081,20 +1081,20 @@ scenarios:
             .expect("suite execution plan");
 
         let attempt = &execution.plan.attempts[0];
-        assert_eq!(attempt.workload.objects, 96);
+        assert_eq!(attempt.workload.objects, 400);
         assert_eq!(attempt.workload.concurrency, 12);
         assert_eq!(attempt.workload.profile.as_deref(), Some("long-read"));
         assert_eq!(attempt.fault_duration_seconds, 1200);
         assert_eq!(attempt.workload.operation_mix.get, 4);
-        assert_eq!(attempt.workload.payload_distribution[0].object_count, 48);
-        assert_eq!(attempt.workload.payload_distribution[1].object_count, 48);
+        assert_eq!(attempt.workload.payload_distribution[0].object_count, 200);
+        assert_eq!(attempt.workload.payload_distribution[1].object_count, 200);
         assert_eq!(
             attempt.workload.hotspot.expect("hotspot").operation_percent,
             80
         );
 
         let config = &execution.attempts[0].config;
-        assert_eq!(config.workload.object_count, 96);
+        assert_eq!(config.workload.object_count, 400);
         assert_eq!(config.workload.concurrency, 12);
         assert_eq!(config.workload_operation_mix.get, 4);
         assert_eq!(config.workload_hotspot.expect("hotspot").object_percent, 20);

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -712,6 +712,34 @@ impl ErasureSetShape {
         self.require_removed_shard_boundary(removed_shards)
     }
 
+    pub fn require_volume_availability_boundary(&self, unavailable_volumes: u32) -> Result<()> {
+        self.validate()?;
+        ensure!(
+            unavailable_volumes > 0,
+            "availability boundary must remove at least one volume"
+        );
+        let remaining_shards = self
+            .total_shards
+            .checked_sub(unavailable_volumes)
+            .context("availability boundary removes more volumes than the set contains")?;
+        let payload = self.payload_quorum()?;
+        let metadata = QuorumRequirements::for_mutation(
+            self.total_shards,
+            self.payload_parity_shards,
+            QuorumMutationClass::DeleteMarker,
+        )?;
+        ensure!(
+            remaining_shards >= payload.read_quorum
+                && remaining_shards >= payload.write_quorum
+                && remaining_shards >= metadata.write_quorum,
+            "removing {unavailable_volumes} volume(s) leaves {remaining_shards} shards, below the read/write availability boundary (payload read {}, payload write {}, metadata write {})",
+            payload.read_quorum,
+            payload.write_quorum,
+            metadata.write_quorum
+        );
+        Ok(())
+    }
+
     fn require_removed_shard_boundary(&self, removed_shards: u32) -> Result<()> {
         let remaining_shards = self
             .total_shards
@@ -840,6 +868,26 @@ mod tests {
                 reject_delete
             );
         }
+    }
+
+    #[test]
+    fn single_volume_availability_requires_live_read_and_write_tolerance() {
+        let tolerant =
+            ErasureSetShape::from_runtime_single_set(4, 1, &[1], &[4], 1).expect("runtime shape");
+        tolerant
+            .require_volume_availability_boundary(1)
+            .expect("one unavailable volume stays within every quorum");
+
+        let zero_parity =
+            ErasureSetShape::from_runtime_single_set(4, 1, &[1], &[4], 0).expect("runtime shape");
+        assert!(zero_parity.require_volume_availability_boundary(1).is_err());
+
+        let two_shards =
+            ErasureSetShape::from_runtime_single_set(2, 1, &[1], &[2], 1).expect("runtime shape");
+        assert!(
+            two_shards.require_volume_availability_boundary(1).is_err(),
+            "a read-tolerant shape that cannot accept writes is not availability-safe"
+        );
     }
 
     #[test]

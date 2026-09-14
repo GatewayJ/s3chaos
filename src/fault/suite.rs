@@ -892,7 +892,7 @@ scenarios:
     faultDuration: 10m
     percent: 20
     workload:
-      objects: 64
+      objects: 240
       concurrency: 8
   - name: network-delay
     repetitions: 2
@@ -1101,7 +1101,7 @@ workloadProfiles:
     objects: 64
     concurrency: 8
 scenarios:
-  - name: io-eio
+  - name: io-latency
     workloadProfile: small
 "#,
         )
@@ -1450,7 +1450,7 @@ metadata:
   name: rustfs-smoke
 workloadProfiles:
   smoke:
-    objects: 64
+    objects: 400
     concurrency: 8
     operationWeights:
       put: 2
@@ -1482,7 +1482,7 @@ scenarios:
         );
         assert_eq!(resolved.scenarios[0].fault_duration_seconds, Some(1200));
         let workload = resolved.scenarios[0].workload.as_ref().expect("workload");
-        assert_eq!(workload.objects, Some(64));
+        assert_eq!(workload.objects, Some(400));
         assert_eq!(workload.concurrency, Some(8));
         assert_eq!(
             workload.operation_weights.expect("operation weights").get,
