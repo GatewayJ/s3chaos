@@ -26,13 +26,12 @@ fn fault_supervision_output(host_storage_mutation_active: bool) -> Output {
 source "$1"
 probe_count=0
 observed_signals=""
-pgrep() { return 1; }
 sleep() { :; }
-host_storage_mutation_active() { [[ "$2" == "active" ]]; }
+host_storage_mutation_active() { [[ "$3" == "active" ]]; }
 kill() {
   case "$1" in
     -TERM|-KILL)
-      observed_signals="${observed_signals}${1#-} "
+      observed_signals="${observed_signals}${1#-}:$2:$3 "
       return 0
       ;;
     -0)
@@ -44,7 +43,7 @@ kill() {
       ;;
   esac
 }
-terminate_process_tree 4242 "$2" token-a 0
+terminate_process_group 4242 4242 "$2" token-a "" 0
 printf '%s\n' "$observed_signals"
 "#,
             "fault-process-supervision-test",
@@ -65,7 +64,10 @@ fn active_dm_termination_past_grace_never_escalates_to_sigkill() {
     let output = fault_supervision_output(true);
 
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "TERM");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "TERM:--:-4242"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("refusing to send SIGKILL"));
     assert!(stderr.contains("waiting for the fault process to restore or quarantine"));
@@ -77,7 +79,10 @@ fn ordinary_fault_termination_past_grace_escalates_to_sigkill() {
     let output = fault_supervision_output(false);
 
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "TERM KILL");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "TERM:--:-4242 KILL:--:-4242"
+    );
     assert!(String::from_utf8_lossy(&output.stderr).contains("escalating to KILL"));
 }
 
