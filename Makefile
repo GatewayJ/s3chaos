@@ -15,116 +15,116 @@ PROTOCOL_COMPAT_SCRIPT := $(CURDIR)/scripts/protocol-compatibility.sh
 check: fmt-check clippy test
 
 fmt:
-	cargo fmt --all
+	+cargo fmt --all
 
 fmt-check:
-	cargo fmt --all -- --check
+	+cargo fmt --all -- --check
 
 clippy:
-	cargo clippy --all-targets -- -D warnings
+	+cargo clippy --all-targets -- -D warnings
 
 test:
-	cargo test --all-targets
+	+cargo test --all-targets
 
 fault-check: check
 	bash -n $(FAULT_SCRIPT)
-	@for suite in $(CURDIR)/fault/examples/*.yaml; do bash $(FAULT_SCRIPT) suite-validate "$$suite"; done
+	+@for suite in $(CURDIR)/fault/examples/*.yaml; do bash $(FAULT_SCRIPT) suite-validate "$$suite"; done
 
 fault-list:
-	@bash $(FAULT_SCRIPT) list
+	+@bash $(FAULT_SCRIPT) list
 
 fault-preflight:
 	@test -n "$(SCENARIO)" || (echo "SCENARIO is required, for example: make fault-preflight SCENARIO=io-eio" >&2; exit 1)
-	bash $(FAULT_SCRIPT) preflight "$(SCENARIO)"
+	+bash $(FAULT_SCRIPT) preflight "$(SCENARIO)"
 
 fault-run:
 	@test -n "$(SCENARIO)" || (echo "SCENARIO is required, for example: make fault-run SCENARIO=io-eio" >&2; exit 1)
-	bash $(FAULT_SCRIPT) run "$(SCENARIO)"
+	+bash $(FAULT_SCRIPT) run "$(SCENARIO)"
 
 fault-run-dm:
-	bash $(FAULT_SCRIPT) dm-run dm-flakey
+	+bash $(FAULT_SCRIPT) dm-run dm-flakey
 
 fault-chaos-plan:
-	@bash $(FAULT_SCRIPT) chaos-plan "$(CHAOS_SUITE)"
+	+@bash $(FAULT_SCRIPT) chaos-plan "$(CHAOS_SUITE)"
 
 fault-chaos-run:
-	bash $(FAULT_SCRIPT) chaos-run "$(CHAOS_SUITE)"
+	+bash $(FAULT_SCRIPT) chaos-run "$(CHAOS_SUITE)"
 
 fault-dm-run:
 	@test -n "$(SCENARIO)" || (echo "SCENARIO is required, for example: make fault-dm-run SCENARIO=dm-flakey" >&2; exit 1)
-	bash $(FAULT_SCRIPT) dm-run "$(SCENARIO)"
+	+bash $(FAULT_SCRIPT) dm-run "$(SCENARIO)"
 
 fault-suite-template:
-	@bash $(FAULT_SCRIPT) suite-template
+	+@bash $(FAULT_SCRIPT) suite-template
 
 fault-suite-validate:
 	@test -n "$(SUITE)" || (echo "SUITE is required, for example: make fault-suite-validate SUITE=suite.yaml" >&2; exit 1)
-	bash $(FAULT_SCRIPT) suite-validate "$(SUITE)"
+	+bash $(FAULT_SCRIPT) suite-validate "$(SUITE)"
 
 fault-suite-plan:
 	@test -n "$(SUITE)" || (echo "SUITE is required, for example: make fault-suite-plan SUITE=suite.yaml" >&2; exit 1)
-	bash $(FAULT_SCRIPT) suite-plan "$(SUITE)"
+	+bash $(FAULT_SCRIPT) suite-plan "$(SUITE)"
 
 fault-suite-run:
 	@test -n "$(SUITE)" || (echo "SUITE is required, for example: make fault-suite-run SUITE=suite.yaml" >&2; exit 1)
-	bash $(FAULT_SCRIPT) suite-run "$(SUITE)"
+	+bash $(FAULT_SCRIPT) suite-run "$(SUITE)"
 
 fault-console-json:
-	cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- fault-console-json "$(CONSOLE_ROOT)"
+	+cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- fault-console-json "$(CONSOLE_ROOT)"
 
 fault-console-serve:
-	cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- fault-console-serve "$(CONSOLE_ROOT)" --addr "$(CONSOLE_ADDR)" $(CONSOLE_ALLOW_NON_LOOPBACK)
+	+cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- fault-console-serve "$(CONSOLE_ROOT)" --addr "$(CONSOLE_ADDR)" $(CONSOLE_ALLOW_NON_LOOPBACK)
 
 fault-dashboard-install:
-	bash $(FAULT_SCRIPT) dashboard-install
+	+bash $(FAULT_SCRIPT) dashboard-install
 
 fault-dashboard-port-forward:
-	bash $(FAULT_SCRIPT) dashboard-port-forward
+	+bash $(FAULT_SCRIPT) dashboard-port-forward
 
 fault-cleanup:
-	bash $(FAULT_SCRIPT) cleanup
+	+bash $(FAULT_SCRIPT) cleanup
 
 protocol-check: check
 	bash -n $(PROTOCOL_SCRIPT)
 	bash -n $(PROTOCOL_COMPAT_SCRIPT)
 
 protocol-list:
-	@bash $(PROTOCOL_SCRIPT) list
+	+@bash $(PROTOCOL_SCRIPT) list
 
 protocol-compatibility-mint:
-	bash $(PROTOCOL_COMPAT_SCRIPT) mint
+	+bash $(PROTOCOL_COMPAT_SCRIPT) mint
 
 protocol-validate-mint-artifacts:
 	@test -n "$(ARTIFACT_ROOT)" || (echo "ARTIFACT_ROOT is required, for example: make protocol-validate-mint-artifacts ARTIFACT_ROOT=target/protocol-compatibility/mint/<run>/mint" >&2; exit 1)
-	cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- protocol-mint-validate-artifacts "$(ARTIFACT_ROOT)"
+	+cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- protocol-mint-validate-artifacts "$(ARTIFACT_ROOT)"
 
 protocol-validate-mint-session:
 	@test -n "$(ARTIFACT_ROOT)" || (echo "ARTIFACT_ROOT is required, for example: make protocol-validate-mint-session ARTIFACT_ROOT=target/protocol-compatibility/mint/<run>" >&2; exit 1)
-	cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- protocol-mint-validate-session "$(ARTIFACT_ROOT)"
+	+cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- protocol-mint-validate-session "$(ARTIFACT_ROOT)"
 
 protocol-mint-cleanup:
 	@test -n "$(ARTIFACT_ROOT)" || (echo "ARTIFACT_ROOT is required, for example: make protocol-mint-cleanup ARTIFACT_ROOT=target/protocol-compatibility/mint/<run>" >&2; exit 1)
-	cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- protocol-mint-cleanup "$(ARTIFACT_ROOT)"
+	+cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- protocol-mint-cleanup "$(ARTIFACT_ROOT)"
 
 protocol-suite-template:
-	@bash $(PROTOCOL_SCRIPT) suite-template
+	+@bash $(PROTOCOL_SCRIPT) suite-template
 
 protocol-suite-validate:
 	@test -n "$(SUITE)" || (echo "SUITE is required, for example: make protocol-suite-validate SUITE=suite.yaml" >&2; exit 1)
-	bash $(PROTOCOL_SCRIPT) suite-validate "$(SUITE)"
+	+bash $(PROTOCOL_SCRIPT) suite-validate "$(SUITE)"
 
 protocol-suite-plan:
 	@test -n "$(SUITE)" || (echo "SUITE is required, for example: make protocol-suite-plan SUITE=suite.yaml" >&2; exit 1)
-	bash $(PROTOCOL_SCRIPT) suite-plan "$(SUITE)"
+	+bash $(PROTOCOL_SCRIPT) suite-plan "$(SUITE)"
 
 protocol-suite-run:
 	@test -n "$(SUITE)" || (echo "SUITE is required, for example: make protocol-suite-run SUITE=suite.yaml" >&2; exit 1)
-	bash $(PROTOCOL_SCRIPT) suite-run "$(SUITE)"
+	+bash $(PROTOCOL_SCRIPT) suite-run "$(SUITE)"
 
 protocol-cleanup:
 	@test -n "$(ARTIFACT_ROOT)" || (echo "ARTIFACT_ROOT is required, for example: make protocol-cleanup ARTIFACT_ROOT=target/protocol-tests/..." >&2; exit 1)
-	bash $(PROTOCOL_SCRIPT) cleanup "$(ARTIFACT_ROOT)"
+	+bash $(PROTOCOL_SCRIPT) cleanup "$(ARTIFACT_ROOT)"
 
 protocol-validate-artifacts:
 	@test -n "$(ARTIFACT_ROOT)" || (echo "ARTIFACT_ROOT is required, for example: make protocol-validate-artifacts ARTIFACT_ROOT=target/protocol-tests/..." >&2; exit 1)
-	bash $(PROTOCOL_SCRIPT) validate-artifacts "$(ARTIFACT_ROOT)"
+	+bash $(PROTOCOL_SCRIPT) validate-artifacts "$(ARTIFACT_ROOT)"
