@@ -26,6 +26,7 @@ RUSTFS_POD_COUNT="${RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT:-4}"
 RUSTFS_VOLUME_PATH="${RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH:-/data/rustfs0}"
 RUSTFS_POD_STABLE_WINDOW_SECONDS="${RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS:-60}"
 HEALTH_GUARD_FAILURE_THRESHOLD="${RUSTFS_FAULT_TEST_HEALTH_GUARD_FAILURE_THRESHOLD:-1}"
+PROCESS_TERMINATION_GRACE_SECONDS="${RUSTFS_FAULT_TEST_PROCESS_TERMINATION_GRACE_SECONDS:-60}"
 BUILD_JOBS="${RUSTFS_FAULT_TEST_BUILD_JOBS:-}"
 CHAOS_MESH_VERSION="${RUSTFS_FAULT_TEST_CHAOS_MESH_VERSION:-2.8.3}"
 CHAOS_DAEMON_RUNTIME="${RUSTFS_FAULT_TEST_CHAOS_DAEMON_RUNTIME:-containerd}"
@@ -41,6 +42,7 @@ OPERATOR_PAUSE_REPLICAS_ANNOTATION="s3chaos.rustfs.com/operator-paused-replicas"
 OPERATOR_PAUSE_RUN_ANNOTATION="s3chaos.rustfs.com/operator-paused-run"
 NAMESPACE_DELETE_TIMEOUT="${RUSTFS_FAULT_TEST_NAMESPACE_DELETE_TIMEOUT:-600s}"
 ACTIVE_PID=""
+ACTIVE_PROCESS_GROUP=""
 ACTIVE_ARTIFACTS=""
 ACTIVE_SCOPE=""
 ACTIVE_NAME=""
@@ -78,6 +80,8 @@ Commands:
 
 RUSTFS_FAULT_TEST_EXPECTED_CONTEXT is optional for ordinary runs. Planned
 qualification requires an explicit expected context, namespace, and Tenant.
+RUSTFS_FAULT_TEST_PROCESS_TERMINATION_GRACE_SECONDS controls the graceful
+shutdown window before non-storage runs are escalated to SIGKILL (default: 60).
 EOF
 }
 
@@ -331,6 +335,7 @@ validate_runtime_env_contract() {
   RUSTFS_VOLUME_PATH="$(trim_value "$RUSTFS_VOLUME_PATH")"
   RUSTFS_POD_STABLE_WINDOW_SECONDS="$(trim_value "$RUSTFS_POD_STABLE_WINDOW_SECONDS")"
   HEALTH_GUARD_FAILURE_THRESHOLD="$(trim_value "$HEALTH_GUARD_FAILURE_THRESHOLD")"
+  PROCESS_TERMINATION_GRACE_SECONDS="$(trim_value "$PROCESS_TERMINATION_GRACE_SECONDS")"
   BUILD_JOBS="$(trim_value "$BUILD_JOBS")"
 
   require_positive_integer RUSTFS_FAULT_TEST_WORKLOAD_OBJECTS "$WORKLOAD_OBJECTS"
@@ -341,6 +346,7 @@ validate_runtime_env_contract() {
   require_absolute_non_root_path RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH "$RUSTFS_VOLUME_PATH"
   require_positive_integer RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS "$RUSTFS_POD_STABLE_WINDOW_SECONDS"
   require_positive_integer RUSTFS_FAULT_TEST_HEALTH_GUARD_FAILURE_THRESHOLD "$HEALTH_GUARD_FAILURE_THRESHOLD"
+  require_positive_integer RUSTFS_FAULT_TEST_PROCESS_TERMINATION_GRACE_SECONDS "$PROCESS_TERMINATION_GRACE_SECONDS"
   if [[ -n "$BUILD_JOBS" ]]; then
     require_positive_integer RUSTFS_FAULT_TEST_BUILD_JOBS "$BUILD_JOBS"
   fi
@@ -351,6 +357,7 @@ validate_runtime_env_contract() {
   export RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH="$RUSTFS_VOLUME_PATH"
   export RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS="$RUSTFS_POD_STABLE_WINDOW_SECONDS"
   export RUSTFS_FAULT_TEST_HEALTH_GUARD_FAILURE_THRESHOLD="$HEALTH_GUARD_FAILURE_THRESHOLD"
+  export RUSTFS_FAULT_TEST_PROCESS_TERMINATION_GRACE_SECONDS="$PROCESS_TERMINATION_GRACE_SECONDS"
   require_optional_positive_integer RUSTFS_FAULT_TEST_DURATION_SECONDS
   require_optional_unsigned_integer RUSTFS_FAULT_TEST_REQUEST_TIMEOUT_SECONDS
   require_optional_unsigned_integer RUSTFS_FAULT_TEST_TIMEOUT_SECONDS
@@ -645,7 +652,9 @@ preflight() {
   require_command jq
   require_command kubectl
   require_command nice
-  require_command pgrep
+  require_command ps
+  require_command awk
+  require_command setsid
   validate_runtime_env_contract "$scenario"
   if [[ "$mode" == "qualification" ]]; then
     validate_qualification_env_contract \
@@ -723,47 +732,63 @@ cleanup_managed_chaos() {
     -l "$MANAGER_SELECTOR" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
 }
 
-signal_process_tree() {
-  local parent="$1" signal="$2"
-  local child
-  for child in $(pgrep -P "$parent" 2>/dev/null || true); do
-    signal_process_tree "$child" "$signal"
-  done
-  kill -"$signal" "$parent" 2>/dev/null || true
+capture_process_group() {
+  local artifacts="$1" stage="$2" process="$3" group="$4"
+  [[ -n "$artifacts" && -d "$artifacts" ]] || return 0
+  {
+    printf 'capturedAt=%s process=%s processGroup=%s stage=%s\n' \
+      "$(date -u +%FT%TZ)" "$process" "$group" "$stage"
+    ps -eo pid=,ppid=,pgid=,stat= \
+      | awk -v group="$group" '$3 == group { print }'
+  } >"$artifacts/process-group-$stage.txt" 2>&1 || true
 }
 
-terminate_process_tree() {
-  local parent="$1" state_file="$2" state_token="$3" grace_seconds="${4:-60}"
-  local child deadline descendants=false
-  for child in $(pgrep -P "$parent" 2>/dev/null || true); do
-    descendants=true
-    signal_process_tree "$child" TERM
-  done
-  if [[ "$descendants" == "false" ]]; then
-    kill -TERM "$parent" 2>/dev/null || true
+process_group_alive() {
+  local process="$1" group="$2"
+  if [[ "$group" =~ ^[1-9][0-9]*$ ]]; then
+    kill -0 -- "-$group" 2>/dev/null
+    return
   fi
+  kill -0 "$process" 2>/dev/null
+}
 
+signal_process_group() {
+  local process="$1" group="$2" signal="$3"
+  if [[ "$group" =~ ^[1-9][0-9]*$ ]]; then
+    kill -"$signal" -- "-$group" 2>/dev/null && return 0
+  fi
+  kill -"$signal" "$process" 2>/dev/null || true
+}
+
+terminate_process_group() {
+  local parent="$1" group="$2" state_file="$3" state_token="$4" artifacts="$5"
+  local grace_seconds="${6:-$PROCESS_TERMINATION_GRACE_SECONDS}" deadline
+  capture_process_group "$artifacts" before-term "$parent" "$group"
+  signal_process_group "$parent" "$group" TERM
   deadline=$((SECONDS + grace_seconds))
-  while kill -0 "$parent" 2>/dev/null && (( SECONDS < deadline )); do
+  while process_group_alive "$parent" "$group" && (( SECONDS < deadline )); do
     sleep 1
   done
-  if kill -0 "$parent" 2>/dev/null; then
+  if process_group_alive "$parent" "$group"; then
     if host_storage_mutation_active "$parent" "$state_file" "$state_token"; then
       echo "warning: device-mapper host-storage mutation may still be active after ${grace_seconds}s; refusing to send SIGKILL because it could interrupt rollback" >&2
       echo "warning: waiting for the fault process to restore or quarantine the target; preserve its proof artifacts for scoped manual recovery if it cannot finish" >&2
-      while kill -0 "$parent" 2>/dev/null; do
+      while process_group_alive "$parent" "$group"; do
         if ! host_storage_mutation_active "$parent" "$state_file" "$state_token"; then
-          echo "warning: host-storage mutation is no longer active but the fault process is still running; escalating to KILL" >&2
-          signal_process_tree "$parent" KILL
+          echo "warning: host-storage mutation is no longer active but the fault process group is still running; escalating to KILL" >&2
+          capture_process_group "$artifacts" before-kill "$parent" "$group"
+          signal_process_group "$parent" "$group" KILL
           break
         fi
         sleep 1
       done
     else
       echo "warning: fault process did not finish graceful recovery within ${grace_seconds}s; escalating to KILL" >&2
-      signal_process_tree "$parent" KILL
+      capture_process_group "$artifacts" before-kill "$parent" "$group"
+      signal_process_group "$parent" "$group" KILL
     fi
   fi
+  capture_process_group "$artifacts" after-termination "$parent" "$group"
 }
 
 process_descends_from() {
@@ -808,6 +833,7 @@ cleanup_host_mutation_state() {
 
 clear_active_run_state() {
   ACTIVE_PID=""
+  ACTIVE_PROCESS_GROUP=""
   ACTIVE_ARTIFACTS=""
   ACTIVE_SCOPE=""
   ACTIVE_NAME=""
@@ -816,7 +842,10 @@ clear_active_run_state() {
 handle_signal() {
   trap '' INT TERM HUP
   if [[ -n "$ACTIVE_PID" ]]; then
-    terminate_process_tree "$ACTIVE_PID" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN"
+    terminate_process_group "$ACTIVE_PID" "$ACTIVE_PROCESS_GROUP" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN" "$ACTIVE_ARTIFACTS"
+    wait "$ACTIVE_PID" 2>/dev/null || true
+    ACTIVE_PID=""
+    ACTIVE_PROCESS_GROUP=""
   fi
   if [[ -n "$ACTIVE_ARTIFACTS" ]]; then
     touch "$ACTIVE_ARTIFACTS/interrupted" \
@@ -1198,9 +1227,9 @@ run_scenario() {
   ACTIVE_ARTIFACTS="$artifacts"
   ACTIVE_SCOPE="scenario"
   ACTIVE_NAME="$scenario"
-  (
-    set +e
-    env "${qualification_env[@]}" \
+  # A runner can spawn helpers that reparent before cancellation. Giving the
+  # run its own session makes its process group the cancellation boundary.
+  setsid env "${qualification_env[@]}" \
     RUSTFS_FAULT_TEST_DESTRUCTIVE=1 \
     RUSTFS_FAULT_TEST_SCENARIO="$scenario" \
     RUSTFS_FAULT_TEST_WORKLOAD_OBJECTS="$WORKLOAD_OBJECTS" \
@@ -1213,11 +1242,9 @@ run_scenario() {
     RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_FILE="$ACTIVE_HOST_MUTATION_STATE_FILE" \
     RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_TOKEN="$ACTIVE_HOST_MUTATION_STATE_TOKEN" \
     "$FAULT_TEST_BINARY" fault-run \
-      >"$artifacts/test.log" 2>&1
-    echo "$?" >"$artifacts/test-exit-code.tmp"
-  ) &
+      >"$artifacts/test.log" 2>&1 &
   test_pid=$!
-  ACTIVE_PID="$test_pid"
+  ACTIVE_PID="$test_pid" ACTIVE_PROCESS_GROUP="$test_pid"
   health_checks=0
   consecutive_health_failures=0
 
@@ -1247,18 +1274,18 @@ run_scenario() {
         || warn_artifact_write_failed "health-watch.jsonl" "$artifacts/health-watch.jsonl"
       if [[ "$will_abort" == "true" ]]; then
         touch "$artifacts/health-guard-failed"
-        terminate_process_tree "$test_pid" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN"
+        terminate_process_group "$test_pid" "$ACTIVE_PROCESS_GROUP" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN" "$artifacts"
         break
       fi
     fi
     sleep 10
   done
 
-  wait "$test_pid" 2>/dev/null || true
+  rc=0
+  wait "$test_pid" 2>/dev/null || rc=$?
   cleanup_host_mutation_state
   ACTIVE_PID=""
-  rc=125
-  [[ -f "$artifacts/test-exit-code.tmp" ]] && rc="$(cat "$artifacts/test-exit-code.tmp")"
+  ACTIVE_PROCESS_GROUP=""
   [[ ! -f "$artifacts/health-guard-failed" ]] || rc=90
   echo "$rc" >"$artifacts/exit-code"
 
@@ -1662,17 +1689,15 @@ run_suite() {
   ACTIVE_ARTIFACTS="$run_root"
   ACTIVE_SCOPE="suite"
   ACTIVE_NAME="$suite_name"
-  (
-    set +e
+  # Keep every suite helper inside a single process-group cancellation boundary.
+  setsid env \
     RUSTFS_FAULT_TEST_DESTRUCTIVE=1 \
     RUSTFS_FAULT_TEST_ARTIFACTS="$run_root" \
     RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_FILE="$ACTIVE_HOST_MUTATION_STATE_FILE" \
     RUSTFS_FAULT_TEST_HOST_MUTATION_STATE_TOKEN="$ACTIVE_HOST_MUTATION_STATE_TOKEN" \
     "$FAULT_TEST_BINARY" fault-suite-run "$suite" \
-      >"$run_root/suite.log" 2>&1
-    echo "$?" >"$run_root/suite-exit-code.tmp"
-  ) &
-  ACTIVE_PID="$!"
+      >"$run_root/suite.log" 2>&1 &
+  ACTIVE_PID="$!" ACTIVE_PROCESS_GROUP="$!"
   health_checks=0
   consecutive_health_failures=0
 
@@ -1702,18 +1727,18 @@ run_suite() {
         || warn_artifact_write_failed "health-watch.jsonl" "$run_root/health-watch.jsonl"
       if [[ "$will_abort" == "true" ]]; then
         touch "$run_root/health-guard-failed"
-        terminate_process_tree "$ACTIVE_PID" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN"
+        terminate_process_group "$ACTIVE_PID" "$ACTIVE_PROCESS_GROUP" "$ACTIVE_HOST_MUTATION_STATE_FILE" "$ACTIVE_HOST_MUTATION_STATE_TOKEN" "$run_root"
         break
       fi
     fi
     sleep 10
   done
 
-  wait "$ACTIVE_PID" 2>/dev/null || true
+  rc=0
+  wait "$ACTIVE_PID" 2>/dev/null || rc=$?
   cleanup_host_mutation_state
   ACTIVE_PID=""
-  rc=125
-  [[ -f "$run_root/suite-exit-code.tmp" ]] && rc="$(cat "$run_root/suite-exit-code.tmp")"
+  ACTIVE_PROCESS_GROUP=""
   [[ ! -f "$run_root/health-guard-failed" ]] || rc=90
   echo "$rc" >"$run_root/suite-exit-code"
   if [[ "$rc" -ne 0 ]]; then

@@ -24,27 +24,27 @@ fn fault_supervision_output(host_storage_mutation_active: bool) -> Output {
             "-c",
             r#"
 source "$1"
-probe_count=0
+group_probe_count=0
 observed_signals=""
-pgrep() { return 1; }
 sleep() { :; }
 host_storage_mutation_active() { [[ "$2" == "active" ]]; }
 kill() {
   case "$1" in
     -TERM|-KILL)
-      observed_signals="${observed_signals}${1#-} "
+      observed_signals="${observed_signals}${1#-}:$2:$3 "
       return 0
       ;;
     -0)
-      probe_count=$((probe_count + 1))
-      (( probe_count <= 3 ))
+      [[ "$2" == "--" && "$3" == "-4242" ]] || return 1
+      group_probe_count=$((group_probe_count + 1))
+      (( group_probe_count <= 3 ))
       ;;
     *)
       return 1
       ;;
   esac
 }
-terminate_process_tree 4242 "$2" token-a 0
+terminate_process_group 4242 4242 "$2" token-a "" 0
 printf '%s\n' "$observed_signals"
 "#,
             "fault-process-supervision-test",
@@ -65,7 +65,10 @@ fn active_dm_termination_past_grace_never_escalates_to_sigkill() {
     let output = fault_supervision_output(true);
 
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "TERM");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "TERM:--:-4242"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("refusing to send SIGKILL"));
     assert!(stderr.contains("waiting for the fault process to restore or quarantine"));
@@ -73,12 +76,48 @@ fn active_dm_termination_past_grace_never_escalates_to_sigkill() {
 
 #[cfg(unix)]
 #[test]
-fn ordinary_fault_termination_past_grace_escalates_to_sigkill() {
+fn ordinary_fault_termination_escalates_when_group_outlives_leader() {
     let output = fault_supervision_output(false);
 
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "TERM KILL");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "TERM:--:-4242 KILL:--:-4242"
+    );
     assert!(String::from_utf8_lossy(&output.stderr).contains("escalating to KILL"));
+}
+
+#[cfg(unix)]
+#[test]
+fn process_group_snapshot_omits_command_arguments() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let secret = "snapshot-secret-must-not-persist";
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+group="$(ps -o pgid= -p "$$" | tr -d '[:space:]')"
+capture_process_group "$2" before-term "$$" "$group"
+"#,
+            "fault-process-snapshot-test",
+            script,
+            temporary.path().to_str().expect("temporary path"),
+            secret,
+        ])
+        .output()
+        .expect("capture process group snapshot");
+
+    assert!(output.status.success());
+    let snapshot = std::fs::read_to_string(temporary.path().join("process-group-before-term.txt"))
+        .expect("process group snapshot");
+    assert!(!snapshot.contains(secret));
+    let processes = snapshot.lines().skip(1).collect::<Vec<_>>();
+    assert!(!processes.is_empty());
+    for process in processes {
+        assert_eq!(process.split_whitespace().count(), 4, "{process}");
+    }
 }
 
 #[cfg(unix)]
