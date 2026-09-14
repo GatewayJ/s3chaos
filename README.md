@@ -39,8 +39,8 @@ console/             Web console assets served by the run console
 ```
 
 The `s3chaos` CLI exposes machine-readable commands (`fault-catalog-json`,
-`protocol-catalog-json`, `*-suite-json`, ...) used by scripts, CI, and the
-console. There is no
+`fault-qualification-catalog-json`, `protocol-catalog-json`,
+`*-suite-json`, ...) used by scripts, CI, and the console. There is no
 installed binary on a fresh checkout; run commands via Cargo:
 
 ```bash
@@ -62,7 +62,7 @@ Chaos Mesh scenarios and one foreground command for exactly one device-mapper
 scenario:
 
 ```bash
-make fault-list                                      # scenario catalog
+make fault-list                                      # executable scenario list
 make fault-chaos-run                                 # canonical 19-attempt suite
 make fault-dm-run SCENARIO=dm-flakey-versioned-hot  # one supervised DM run
 make fault-console-serve                             # browse run artifacts
@@ -75,7 +75,8 @@ make fault-cleanup                                   # release cluster fixtures
 ```
 
 Both live targets build once and run cluster preflight once. The Chaos wrapper
-uses one pre-run plan pass. A separate `fault-preflight` command is unnecessary.
+uses one pre-run plan pass. `make fault-preflight SCENARIO=...` is available for
+standalone diagnostics, but it is not a required execution step.
 Use `make fault-chaos-plan` only when reviewing the resolved plan without
 starting the suite. Override the canonical suite with
 `CHAOS_SUITE=/path/to/suite.yaml`; `fault-chaos-run` rejects static storage and
@@ -113,9 +114,10 @@ monitoring; live qualification is still required before release gating.
 
 ### Planned reliability qualification
 
-List the seven closed qualification cases and run exactly one through the same
-health watcher, evidence capture, artifact validation, and interruption-safe
-supervision used by executable fault scenarios:
+List the seven closed qualification cases, derived from the Rust typed catalog,
+and run exactly one through the same health watcher, evidence capture, artifact
+validation, and interruption-safe supervision used by executable fault
+scenarios:
 
 ```bash
 make fault-qualify-list
@@ -137,6 +139,10 @@ host/PV allowlists. Fresh-volume and bitrot require Chaos Mesh for their
 exact-quorum IOChaos proof. Bitrot additionally requires an absolute,
 operator-reviewed `RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG`, its
 pre-created privileged storage helper, and a privileged owned namespace.
+The bitrot inspector is not pinned to a RustFS release or tag. It explicitly
+accepts the current XL2 1.3/header 3/meta 3 on-disk capability profile with
+format version 1, erasure version 3, and SIPMOD+PARITY checksums, and fails
+closed when an unknown profile is encountered.
 Stale-disk cases require the existing supervised device-mapper environment.
 
 Every invocation gets a case-qualified run root under

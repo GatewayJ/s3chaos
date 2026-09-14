@@ -100,7 +100,7 @@ scripts on both sides, also run `bash -n` on any touched script not covered
 by the chosen umbrella gate.
 
 Any command that mutates the cluster or a live server requires a prepared
-target and explicit user request; this includes `fault-run`, `fault-run-dm`,
+target and explicit user request; this includes `fault-run`, `fault-qualify`,
 `fault-chaos-run`, `fault-dm-run`, `fault-suite-run`,
 `fault-dashboard-install` (Helm-installs Chaos Mesh), `fault-cleanup`,
 `protocol-suite-run`, `protocol-compatibility-mint`, and `protocol-cleanup`.
@@ -119,6 +119,10 @@ interrupted evidence can be investigated while live state still exists:
   context through `RUSTFS_FAULT_TEST_EXPECTED_CONTEXT` before running
   `make fault-cleanup`; never assume that an artifact path selects the cleanup
   target.
+- Planned qualification has a run-level contract around the nested scenario
+  artifacts. Run `make fault-qualify-analyze RUN_ROOT=<root>`, then inspect the
+  recorded context, namespace, and Tenant before cleanup. The qualification
+  run root validates evidence; it does not select a cleanup target.
 
 Mint runs publish a separate artifact contract. Validate the exact artifact
 root printed by the command with

@@ -12,7 +12,7 @@ FAULT_SCRIPT := $(CURDIR)/scripts/fault-test.sh
 PROTOCOL_SCRIPT := $(CURDIR)/scripts/protocol-test.sh
 PROTOCOL_COMPAT_SCRIPT := $(CURDIR)/scripts/protocol-compatibility.sh
 
-.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-qualify-list fault-qualify fault-qualify-analyze fault-preflight fault-run fault-run-dm fault-chaos-plan fault-chaos-run fault-dm-run fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup protocol-check protocol-list protocol-compatibility-mint protocol-mint-cleanup protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts protocol-validate-mint-session
+.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-qualify-list fault-qualify fault-qualify-analyze fault-preflight fault-run fault-chaos-plan fault-chaos-run fault-dm-run fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup protocol-check protocol-list protocol-compatibility-mint protocol-mint-cleanup protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts protocol-validate-mint-session
 
 check: fmt-check clippy test
 
@@ -53,9 +53,6 @@ fault-preflight:
 fault-run:
 	@test -n "$(SCENARIO)" || (echo "SCENARIO is required, for example: make fault-run SCENARIO=io-eio" >&2; exit 1)
 	+bash $(FAULT_SCRIPT) run "$(SCENARIO)"
-
-fault-run-dm:
-	+bash $(FAULT_SCRIPT) dm-run dm-flakey
 
 fault-chaos-plan:
 	+@bash $(FAULT_SCRIPT) chaos-plan "$(CHAOS_SUITE)"

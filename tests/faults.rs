@@ -293,11 +293,13 @@ fn planned_qualification_matrix_is_closed_and_typed() {
             "-c",
             r#"
 source "$1"
+FAULT_TEST_BINARY="$2"
 list_qualification_cases
 ! qualification_case_contract arbitrary-shell
 "#,
             "fault-qualification-matrix-test",
             script,
+            env!("CARGO_BIN_EXE_s3chaos"),
         ])
         .output()
         .expect("inspect qualification matrix");
@@ -481,14 +483,19 @@ fn qualification_metadata_is_bound_to_its_run_root() {
             "-c",
             r#"
 source "$1"
+FAULT_TEST_BINARY="$3"
 write_qualification_plan "$2" fresh-volume-replacement-admin-deep fresh-volume-replacement storage fresh-volume-replacement-admin-deep
 write_qualification_result "$2" passed 0
-s3chaos_cli() { printf '{"artifactRoot":"%s","attempts":[],"warnings":[]}\n' "$2"; }
 analyze_qualification "$2" >"$2/qualification-analysis.json"
+mkdir "$2/requested"
+write_qualification_request_plan "$2/requested" unknown-safe-case
+write_qualification_result "$2/requested" failed 1
+analyze_qualification "$2/requested" >"$2/requested/qualification-analysis.json"
 "#,
             "fault-qualification-metadata-test",
             script,
             temporary.path().to_str().expect("temporary path"),
+            env!("CARGO_BIN_EXE_s3chaos"),
         ])
         .output()
         .expect("write qualification metadata");
@@ -504,6 +511,7 @@ analyze_qualification "$2" >"$2/qualification-analysis.json"
     )
     .expect("qualification plan JSON");
     assert_eq!(plan["schemaVersion"], 1);
+    assert_eq!(plan["resolution"], "resolved");
     assert_eq!(
         plan["qualificationCase"],
         "fresh-volume-replacement-admin-deep"
@@ -546,6 +554,24 @@ analyze_qualification "$2" >"$2/qualification-analysis.json"
     assert_eq!(analysis["console"]["attempts"], serde_json::json!([]));
     assert_eq!(analysis["schemaVersion"], 1);
 
+    let requested_analysis = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(
+            temporary
+                .path()
+                .join("requested/qualification-analysis.json"),
+        )
+        .expect("requested qualification analysis"),
+    )
+    .expect("requested qualification analysis JSON");
+    assert_eq!(
+        requested_analysis["qualificationPlan"]["resolution"],
+        "requested"
+    );
+    assert_eq!(
+        requested_analysis["qualificationResult"]["outcome"],
+        "failed"
+    );
+
     let contradictory = Command::new("bash")
         .args([
             "-c",
@@ -567,6 +593,67 @@ s3chaos_cli() { printf '{}\n'; }
         "{}",
         String::from_utf8_lossy(&contradictory.stderr)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn unknown_qualification_case_leaves_analyzable_requested_plan() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let run_root = temporary.path().join("unknown-case");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+FAULT_TEST_BINARY="$3"
+build_fault_binary() { :; }
+trap handle_exit EXIT
+RUSTFS_FAULT_TEST_RUN_ROOT="$2"
+run_qualification unknown-safe-case
+"#,
+            "fault-qualification-unknown-case-test",
+            script,
+            run_root.to_str().expect("run root"),
+            env!("CARGO_BIN_EXE_s3chaos"),
+        ])
+        .output()
+        .expect("reject unknown qualification case");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unsupported qualification case: unknown-safe-case")
+    );
+
+    let analysis = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+FAULT_TEST_BINARY="$3"
+analyze_qualification "$2"
+"#,
+            "fault-qualification-unknown-case-analysis-test",
+            script,
+            run_root.to_str().expect("run root"),
+            env!("CARGO_BIN_EXE_s3chaos"),
+        ])
+        .output()
+        .expect("analyze rejected qualification case");
+    assert!(
+        analysis.status.success(),
+        "{}",
+        String::from_utf8_lossy(&analysis.stderr)
+    );
+    let analysis = serde_json::from_slice::<serde_json::Value>(&analysis.stdout)
+        .expect("qualification analysis JSON");
+    assert_eq!(
+        analysis["qualificationPlan"]["qualificationCase"],
+        "unknown-safe-case"
+    );
+    assert_eq!(analysis["qualificationPlan"]["resolution"], "requested");
+    assert_eq!(analysis["qualificationResult"]["outcome"], "failed");
 }
 
 #[tokio::test]

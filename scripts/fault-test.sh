@@ -50,6 +50,7 @@ ACTIVE_QUALIFICATION_ROOT=""
 ACTIVE_QUALIFICATION_CASE=""
 FAULT_TEST_BINARY=""
 FAULT_CATALOG_JSON=""
+FAULT_QUALIFICATION_CATALOG_JSON=""
 
 usage() {
   cat <<'EOF'
@@ -75,8 +76,8 @@ Commands:
                         Port-forward the Chaos Mesh Dashboard locally.
   cleanup               Remove managed Chaos and the owned fault namespace.
 
-RUSTFS_FAULT_TEST_EXPECTED_CONTEXT is optional. When unset, the current
-non-Kind kubectl context is used and pinned for the run.
+RUSTFS_FAULT_TEST_EXPECTED_CONTEXT is optional for ordinary runs. Planned
+qualification requires an explicit expected context, namespace, and Tenant.
 EOF
 }
 
@@ -244,38 +245,24 @@ is_planned_scenario() {
   catalog_scenario_query "$1" 'any(.[]; .scenario == $scenario and .status == "planned")' >/dev/null
 }
 
+qualification_catalog_json() {
+  if [[ -z "$FAULT_QUALIFICATION_CATALOG_JSON" ]]; then
+    FAULT_QUALIFICATION_CATALOG_JSON="$(s3chaos_cli fault-qualification-catalog-json)"
+  fi
+  printf '%s\n' "$FAULT_QUALIFICATION_CATALOG_JSON"
+}
+
 qualification_cases() {
-  printf '%s\n' \
-    admin-decommission \
-    admin-rebalance \
-    fresh-volume-replacement-automatic-replacement \
-    fresh-volume-replacement-admin-deep \
-    on-disk-bitrot-automatic-scanner \
-    on-disk-bitrot-admin-deep \
-    stale-disk-return
+  qualification_catalog_json | jq -r '.[].qualificationCase'
 }
 
 qualification_case_contract() {
-  case "$1" in
-    admin-decommission)
-      printf 'admin-decommission|admin|-\n'
-      ;;
-    admin-rebalance)
-      printf 'admin-rebalance|admin|-\n'
-      ;;
-    fresh-volume-replacement-automatic-replacement|fresh-volume-replacement-admin-deep)
-      printf 'fresh-volume-replacement|storage|%s\n' "$1"
-      ;;
-    on-disk-bitrot-automatic-scanner|on-disk-bitrot-admin-deep)
-      printf 'on-disk-bitrot|storage|%s\n' "$1"
-      ;;
-    stale-disk-return)
-      printf 'stale-disk-return-detect|storage|stale-disk-return\n'
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+  qualification_catalog_json | jq -er --arg qualification_case "$1" '
+    .[]
+    | select(.qualificationCase == $qualification_case)
+    | [.scenario, .kind, (.storageRecoveryCase // "-")]
+    | @tsv
+  '
 }
 
 list_qualification_cases() {
@@ -283,7 +270,7 @@ list_qualification_cases() {
   printf 'qualification-case\tscenario\tkind\tstorage-recovery-case\n'
   while IFS= read -r qualification_case; do
     contract="$(qualification_case_contract "$qualification_case")"
-    IFS='|' read -r scenario kind storage_case <<<"$contract"
+    IFS=$'\t' read -r scenario kind storage_case <<<"$contract"
     printf '%s\t%s\t%s\t%s\n' "$qualification_case" "$scenario" "$kind" "$storage_case"
   done < <(qualification_cases)
 }
@@ -293,7 +280,7 @@ resolve_qualification_case() {
   if ! contract="$(qualification_case_contract "$qualification_case")"; then
     die "unsupported qualification case: $qualification_case; run make fault-qualify-list"
   fi
-  IFS='|' read -r QUALIFICATION_SCENARIO QUALIFICATION_KIND QUALIFICATION_STORAGE_CASE <<<"$contract"
+  IFS=$'\t' read -r QUALIFICATION_SCENARIO QUALIFICATION_KIND QUALIFICATION_STORAGE_CASE <<<"$contract"
 }
 
 scenario_percent_supported() {
@@ -1346,6 +1333,33 @@ new_qualification_run_root() {
   fi
 }
 
+write_qualification_request_plan() {
+  local run_root="$1" qualification_case="$2" target temporary
+  target="$run_root/qualification-plan.json"
+  temporary="$(mktemp "$run_root/.qualification-plan.XXXXXX")"
+  if jq -n \
+    --arg qualification_case "$qualification_case" \
+    --arg run_root "$run_root" \
+    --arg created_at "$(date -u +%FT%TZ)" \
+    '{
+      schemaVersion: 1,
+      resolution: "requested",
+      qualificationCase: $qualification_case,
+      scenario: null,
+      kind: null,
+      storageRecoveryCase: null,
+      runRoot: $run_root,
+      artifactRoot: null,
+      createdAt: $created_at
+    }' >"$temporary"; then
+    mv "$temporary" "$target"
+  else
+    local rc=$?
+    rm -f "$temporary"
+    return "$rc"
+  fi
+}
+
 write_qualification_plan() {
   local run_root="$1" qualification_case="$2" scenario="$3" kind="$4" storage_case="$5"
   local storage_case_json=null target temporary
@@ -1364,6 +1378,7 @@ write_qualification_plan() {
     --arg created_at "$(date -u +%FT%TZ)" \
     '{
       schemaVersion: 1,
+      resolution: "resolved",
       qualificationCase: $qualification_case,
       scenario: $scenario,
       kind: $kind,
@@ -1404,7 +1419,8 @@ write_qualification_result() {
 
 run_qualification() {
   local qualification_case="$1" run_root rc outcome
-  resolve_qualification_case "$qualification_case"
+  [[ "$qualification_case" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ && ${#qualification_case} -le 128 ]] \
+    || die "qualification case must be a lowercase kebab-case token"
   ACTIVE_QUALIFICATION_CASE="$qualification_case"
   run_root="$(new_qualification_run_root "$qualification_case")"
   if [[ -d "$run_root" && -n "$(find "$run_root" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
@@ -1414,12 +1430,14 @@ run_qualification() {
   run_root="$(cd "$run_root" && pwd -P)"
   ACTIVE_QUALIFICATION_ROOT="$run_root"
   initialize_summary "$run_root"
-  write_qualification_plan \
-    "$run_root" "$qualification_case" "$QUALIFICATION_SCENARIO" \
-    "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
+  write_qualification_request_plan "$run_root" "$qualification_case"
   echo "qualification run root: $run_root"
   echo "live console: make fault-console-serve CONSOLE_ROOT=$run_root"
   build_fault_binary "$run_root" "qualification=$qualification_case"
+  resolve_qualification_case "$qualification_case"
+  write_qualification_plan \
+    "$run_root" "$qualification_case" "$QUALIFICATION_SCENARIO" \
+    "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
   is_planned_scenario "$QUALIFICATION_SCENARIO" \
     || die "qualification scenario is no longer Planned: $QUALIFICATION_SCENARIO"
   preflight "$QUALIFICATION_SCENARIO" qualification "$qualification_case"
@@ -1444,7 +1462,7 @@ run_qualification() {
 }
 
 analyze_qualification() {
-  local run_root="$1" plan result console_snapshot qualification_case contract scenario kind storage_case rc
+  local run_root="$1" plan result resolution console_snapshot qualification_case contract scenario kind storage_case rc
   require_command cargo
   require_command jq
   require_command mktemp
@@ -1454,30 +1472,20 @@ analyze_qualification() {
   [[ -f "$plan" ]] || die "qualification run lacks qualification-plan.json: $run_root"
   jq -e --arg run_root "$run_root" '
     .schemaVersion == 1
+    and (.resolution == "requested" or .resolution == "resolved")
     and (.qualificationCase | type == "string" and length > 0)
-    and (.scenario | type == "string" and length > 0)
-    and (.kind == "admin" or .kind == "storage")
     and .runRoot == $run_root
-    and .artifactRoot == ($run_root + "/" + .scenario)
+    and (
+      if .resolution == "requested"
+      then .scenario == null and .kind == null and .storageRecoveryCase == null and .artifactRoot == null
+      else (.scenario | type == "string" and length > 0)
+        and (.kind == "admin" or .kind == "storage")
+        and .artifactRoot == ($run_root + "/" + .scenario)
+      end
+    )
   ' "$plan" >/dev/null || die "qualification-plan.json is invalid or belongs to another run root"
+  resolution="$(jq -r '.resolution' "$plan")"
   qualification_case="$(jq -r '.qualificationCase' "$plan")"
-  if ! contract="$(qualification_case_contract "$qualification_case")"; then
-    die "qualification-plan.json names an unsupported qualification case"
-  fi
-  IFS='|' read -r scenario kind storage_case <<<"$contract"
-  jq -e \
-    --arg scenario "$scenario" \
-    --arg kind "$kind" \
-    --arg storage_case "$storage_case" '
-      .scenario == $scenario
-      and .kind == $kind
-      and (
-        if $storage_case == "-"
-        then .storageRecoveryCase == null
-        else .storageRecoveryCase == $storage_case
-        end
-      )
-    ' "$plan" >/dev/null || die "qualification-plan.json contradicts the closed case contract"
   result="$run_root/qualification-result.json"
   if [[ -f "$result" ]]; then
     jq -e '
@@ -1490,6 +1498,30 @@ analyze_qualification() {
         or (.outcome == "interrupted" and .exitCode == 130)
       )
     ' "$result" >/dev/null || die "qualification-result.json is invalid"
+  fi
+  if [[ "$resolution" == "requested" ]]; then
+    [[ -f "$result" ]] \
+      || die "unresolved qualification plan has no terminal result"
+    jq -e '.outcome == "failed" or .outcome == "interrupted"' "$result" >/dev/null \
+      || die "unresolved qualification plan cannot have a passing result"
+  else
+    if ! contract="$(qualification_case_contract "$qualification_case")"; then
+      die "qualification-plan.json names an unsupported qualification case"
+    fi
+    IFS=$'\t' read -r scenario kind storage_case <<<"$contract"
+    jq -e \
+      --arg scenario "$scenario" \
+      --arg kind "$kind" \
+      --arg storage_case "$storage_case" '
+        .scenario == $scenario
+        and .kind == $kind
+        and (
+          if $storage_case == "-"
+          then .storageRecoveryCase == null
+          else .storageRecoveryCase == $storage_case
+          end
+        )
+      ' "$plan" >/dev/null || die "qualification-plan.json contradicts the closed case contract"
   fi
   console_snapshot="$(mktemp /tmp/s3chaos-qualification-console.XXXXXX)"
   if ! s3chaos_cli fault-console-json "$run_root" >"$console_snapshot"; then
