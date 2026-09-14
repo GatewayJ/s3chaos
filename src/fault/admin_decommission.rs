@@ -1682,6 +1682,7 @@ impl LiveAdminDecommissionDriver {
             count: self.scenario.mixed_workload_count(),
             ranged_get_percent: self.config.workload_ranged_get_percent,
             staged_multipart_uploads: None,
+            progress_events: None,
             deadline: self.deadline,
         })
         .await?;

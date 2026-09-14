@@ -14,6 +14,7 @@
 
 use crate::fault::shutdown::RunDeadline;
 use crate::fault::{
+    events::{RunEventRecorder, RunEventStatus},
     history::{
         ByteRange, DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome,
         OperationRecord, PayloadRef, Recorder, validate_history_scope_and_order,
@@ -596,6 +597,10 @@ pub(in crate::fault) struct MixedWorkloadRequest<'a> {
     pub(in crate::fault) ranged_get_percent: u8,
     pub(in crate::fault) staged_multipart_uploads:
         Option<&'a BTreeMap<usize, StagedMultipartUpload>>,
+    /// Emits durable progress snapshots while requests are still in flight.
+    /// This makes a stalled high-load run diagnosable without waiting for all
+    /// operations to return.
+    pub(in crate::fault) progress_events: Option<&'a RunEventRecorder>,
     pub(in crate::fault) deadline: RunDeadline,
 }
 
@@ -620,10 +625,31 @@ pub(in crate::fault) async fn run_mixed_workload(
     let tasks = (0..count).map(|offset| {
         execute_mixed_operation(request, offset, &mutation_locks, &next_mutation_sequence)
     });
-    let results = stream::iter(tasks)
-        .buffer_unordered(plan.concurrency)
-        .collect::<Vec<_>>()
-        .await;
+    let mut tasks = stream::iter(tasks).buffer_unordered(plan.concurrency);
+    let mut progress_tick = tokio::time::interval(Duration::from_secs(30));
+    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut results = Vec::with_capacity(count);
+    loop {
+        tokio::select! {
+            result = tasks.next() => match result {
+                Some(result) => results.push(result?),
+                None => break,
+            },
+            _ = progress_tick.tick(), if request.progress_events.is_some() => {
+                request.progress_events.expect("checked above").record(
+                    "mixed-workload-progress",
+                    RunEventStatus::Observed,
+                    "mixed S3 workload progress snapshot",
+                    Some(serde_json::json!({
+                        "planned": count,
+                        "completed": results.len(),
+                        "in_flight_or_queued": count.saturating_sub(results.len()),
+                        "concurrency": plan.concurrency,
+                    })),
+                )?;
+            }
+        }
+    }
     deadline.check()?;
     let mut completed = Vec::with_capacity(count);
     for result in results {

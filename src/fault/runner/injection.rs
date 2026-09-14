@@ -451,6 +451,7 @@ impl FaultRun<'_> {
             ranged_get_percent: config.workload_ranged_get_percent,
             staged_multipart_uploads: requires_prefault_multipart_staging(&plan.scenario)
                 .then_some(staged_multipart_uploads),
+            progress_events: Some(events),
             deadline: self.deadline,
         })
         .await
