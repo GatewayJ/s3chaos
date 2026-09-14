@@ -421,7 +421,8 @@ impl FaultScenarioSpec {
     pub fn requires_erasure_set_proof(self) -> bool {
         matches!(
             self.scenario,
-            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+            IO_EIO_SCENARIO
+                | NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
                 | QUORUM_P_IO_FAULT_SCENARIO
                 | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
         )
@@ -485,12 +486,12 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         required_tools: &[],
         percent_supported: true,
         param_schema: FaultParameterSchema::None,
-        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
         boundary: "rustfs-workload/fault-injection",
         ci_phase: "faults",
         target: "one RustFS container data volume selected by tenant label and configured RustFS volume path",
         target_proof: DEFAULT_TARGET_PROOF,
-        validation: "prefill succeeds before injection, mixed PUT/GET workload runs while IOChaos is active, committed PUTs are GET+sha256 verified after recovery, and successful GETs cannot return corrupt bytes",
+        validation: "prefill succeeds before injection, every committed object remains readable while IOChaos is active, the mixed workload meets the availability floor, committed PUTs are GET+sha256 verified after recovery, and successful GETs cannot return corrupt bytes",
         observability: "history.jsonl, workload-summary.json, checker-report.json, chaos-manifest.yaml, chaos-describe*.txt, Kubernetes snapshot artifacts",
         conflict_domain: "fresh Tenant/PVC/PV fixture and run-scoped IOChaos cleanup",
     },
@@ -2107,6 +2108,7 @@ mod tests {
         assert_eq!(
             requiring_proof,
             vec![
+                IO_EIO_SCENARIO,
                 NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
                 QUORUM_P_IO_FAULT_SCENARIO,
                 QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
@@ -2143,8 +2145,9 @@ mod tests {
     }
 
     #[test]
-    fn single_component_pod_and_partition_faults_require_availability() {
+    fn single_component_faults_require_availability() {
         for name in [
+            IO_EIO_SCENARIO,
             POD_KILL_ONE_SCENARIO,
             POD_FAILURE_SCENARIO,
             NETWORK_PARTITION_ONE_SCENARIO,
@@ -2160,7 +2163,6 @@ mod tests {
         }
         // Faults that must break clients keep their disruption requirement.
         for name in [
-            IO_EIO_SCENARIO,
             NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
             QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
         ] {

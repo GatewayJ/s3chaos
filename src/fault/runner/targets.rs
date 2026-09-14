@@ -76,6 +76,52 @@ pub(super) async fn require_write_quorum_loss_topology(
     target_servers: u32,
     pods: &[PodIdentity],
 ) -> Result<ObservedErasureSet> {
+    let observation = observe_single_erasure_set_topology(
+        config,
+        endpoint,
+        access_key,
+        secret_key,
+        pods,
+        "write-quorum-loss topology proof",
+    )
+    .await?;
+    observation
+        .shape
+        .require_server_partition_boundary(target_servers)?;
+    Ok(observation)
+}
+
+pub(super) async fn require_volume_availability_topology(
+    config: &FaultTestConfig,
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    unavailable_volumes: u32,
+    pods: &[PodIdentity],
+) -> Result<ObservedErasureSet> {
+    let observation = observe_single_erasure_set_topology(
+        config,
+        endpoint,
+        access_key,
+        secret_key,
+        pods,
+        "volume-availability topology proof",
+    )
+    .await?;
+    observation
+        .shape
+        .require_volume_availability_boundary(unavailable_volumes)?;
+    Ok(observation)
+}
+
+async fn observe_single_erasure_set_topology(
+    config: &FaultTestConfig,
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    pods: &[PodIdentity],
+    purpose: &str,
+) -> Result<ObservedErasureSet> {
     // Age the combined proof from its oldest input: Tenant geometry is read
     // before the admin layout, so a slow second read must not refresh the
     // apparent age of the first observation.
@@ -85,7 +131,7 @@ pub(super) async fn require_write_quorum_loss_topology(
         .namespaced(&cluster.test_namespace)
         .command(["get", "tenant", cluster.tenant_name.as_str(), "-o", "json"])
         .run_checked()
-        .context("reading tenant pool geometry for the write-quorum-loss topology proof")?;
+        .with_context(|| format!("reading tenant pool geometry for the {purpose}"))?;
     let tenant: serde_json::Value =
         serde_json::from_str(&output.stdout).context("decoding tenant topology JSON")?;
     let tenant = tenant_single_pool_geometry(&tenant, config.expected_rustfs_pod_count)?;
@@ -108,7 +154,6 @@ pub(super) async fn require_write_quorum_loss_topology(
     )
     .context("RustFS runtime erasure set is not fully online before fault injection")?;
     let membership = runtime_single_set_membership(&runtime, &shape, pods)?;
-    shape.require_server_partition_boundary(target_servers)?;
     Ok(ObservedErasureSet {
         source: "rustfs-admin-server-info",
         deployment_id: runtime.deployment_id,
@@ -473,6 +518,26 @@ pub(super) fn fixed_volume_target_count(plan: &FaultPlan) -> Option<u32> {
     }
 }
 
+pub(super) fn volume_fault_target_count(plan: &FaultPlan, candidate_volumes: usize) -> Result<u32> {
+    let [fault] = plan.faults() else {
+        bail!("volume availability proof requires exactly one planned fault")
+    };
+    ensure!(
+        candidate_volumes > 0,
+        "volume availability proof has no candidate targets"
+    );
+    fault.rustfs_volume_path()?;
+    match fault.selection() {
+        FaultSelection::FixedTargets(count) => Ok(count),
+        // Legacy `Percent` selects one volume and controls the percentage of
+        // I/O calls faulted on that volume; it is not a percentage of Pods.
+        FaultSelection::Percent(_) => Ok(1),
+        FaultSelection::RuntimeQuorum(_) => {
+            bail!("volume availability proof cannot resolve a runtime quorum selector")
+        }
+    }
+}
+
 pub(super) fn volume_quorum_boundary(plan: &FaultPlan) -> Option<QuorumVolumeBoundary> {
     let [fault] = plan.faults() else {
         return None;
@@ -799,6 +864,7 @@ mod tests {
             },
             quorum::{ErasureSetMember, ErasureSetMembership, ErasureSetShape},
             reporting::PodIdentity,
+            scenarios::{FaultScenario, IO_EIO_SCENARIO, scenario_spec},
         },
         rustfs::{RustfsDriveLayout, RustfsErasureLayout, RustfsServerLayout},
     };
@@ -832,6 +898,21 @@ mod tests {
                 volume_name: "data".to_string(),
                 persistent_volume_claim: Some(format!("data-rustfs-{index}")),
             }])
+    }
+
+    #[test]
+    fn legacy_io_percent_is_one_volume_with_partial_io_sampling() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = IO_EIO_SCENARIO.to_string();
+        config.percent = 100;
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let spec = scenario_spec(IO_EIO_SCENARIO).expect("scenario spec");
+        let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan");
+
+        assert_eq!(
+            volume_fault_target_count(&plan, 4).expect("target count"),
+            1
+        );
     }
 
     #[test]

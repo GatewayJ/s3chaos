@@ -1519,6 +1519,9 @@ fn validate_fault_artifacts_with_identity(
     if options.scenario == scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
         validate_write_quorum_runtime_evidence(&evidence, &target_proof, &json_spec)?;
     }
+    if options.scenario == scenarios::IO_EIO_SCENARIO {
+        validate_volume_availability_topology_evidence(&evidence, &target_proof)?;
+    }
     if json_spec
         .faults
         .iter()
@@ -3253,6 +3256,25 @@ fn validate_target_proof(
                         fault.name
                     )
                 })?;
+        } else if options.scenario == scenarios::IO_EIO_SCENARIO {
+            let unavailable_volumes = match spec_fault.selection.kind.as_str() {
+                // For legacy volume selections, `percent` is the I/O sampling
+                // rate on one selected volume, not a percentage of Pods.
+                "percent" => 1,
+                "fixed-targets" => spec_fault.selection.value,
+                other => bail!(
+                    "target-proof.json fault {} has unsupported availability selection {other:?}",
+                    fault.name
+                ),
+            };
+            shape
+                .require_volume_availability_boundary(unavailable_volumes)
+                .with_context(|| {
+                    format!(
+                        "target-proof.json fault {} does not establish a read/write availability boundary",
+                        fault.name
+                    )
+                })?;
         } else if spec_fault.selection.kind == "runtime-quorum" {
             let volume_quorum = erasure_set.volume_quorum.as_ref().with_context(|| {
                 format!(
@@ -3430,6 +3452,42 @@ fn validate_write_quorum_runtime_evidence(
     membership
         .require_selected_boundary(shape, selected_pods)
         .context("actual NetworkChaos source targets do not cross the write-quorum boundary")?;
+    Ok(())
+}
+
+fn validate_volume_availability_topology_evidence(
+    evidence: &FaultEvidenceArtifact,
+    proof: &TargetProof,
+) -> Result<()> {
+    let erasure_set = proof
+        .faults
+        .iter()
+        .find_map(|fault| fault.erasure_set.as_ref())
+        .context("target-proof.json has no volume-availability erasure-set evidence")?;
+    let apply_started_at_ms = evidence
+        .fault_apply_started_at_ms
+        .context("fault-evidence.json fault_apply_started_at_ms is required")?;
+    require_fresh_runtime_observation(erasure_set.observed_at_ms, apply_started_at_ms)
+        .context("volume-availability topology was stale at fault apply")?;
+
+    let proved = unique_pod_identities(
+        "target-proof.json resolved_pods",
+        proof
+            .resolved_pods
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    let before = unique_pod_identities(
+        "fault-evidence.json pods_before",
+        evidence
+            .pods_before
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    ensure!(
+        proved == before,
+        "volume-availability topology Pods do not match fault-evidence.json pods_before"
+    );
     Ok(())
 }
 
@@ -4939,6 +4997,20 @@ fn validate_availability_artifact(
         report.min_success_percent >= catalog_floor_percent,
         "{AVAILABILITY_REPORT_ARTIFACT} min_success_percent {} is below the catalog availability floor {catalog_floor_percent}",
         report.min_success_percent
+    );
+    let acknowledged_commits = summary
+        .puts
+        .ok
+        .checked_add(summary.multipart_completes.ok)
+        .context("workload-summary.json acknowledged commit count overflowed")?;
+    ensure!(
+        report.commit_probe.objects == acknowledged_commits
+            && report.commit_probe.verified == report.commit_probe.objects
+            && report.commit_probe.failures.is_empty(),
+        "{AVAILABILITY_REPORT_ARTIFACT} commit probe verified {} of {} reported commits with {} failure(s), but workload-summary.json records {acknowledged_commits} acknowledged PUTs, overwrites, and multipart completions",
+        report.commit_probe.verified,
+        report.commit_probe.objects,
+        report.commit_probe.failures.len()
     );
     report
         .require_success()
@@ -9679,6 +9751,46 @@ mod tests {
     }
 
     #[test]
+    fn io_eio_success_requires_redundant_topology_bound_to_the_fault_cohort() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let proof_path = case_dir.join("target-proof.json");
+        let mut proof: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&proof_path).expect("target proof"))
+                .expect("target proof JSON");
+        proof["faults"][0]["erasureSet"]["shape"]["payloadDataShards"] = json!(4);
+        proof["faults"][0]["erasureSet"]["shape"]["payloadParityShards"] = json!(0);
+        write_json(&case_dir, "target-proof.json", &proof);
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("zero-parity topology cannot support an availability claim");
+        assert!(
+            error
+                .to_string()
+                .contains("does not establish a read/write availability boundary"),
+            "{error:#}"
+        );
+
+        write_success_artifacts(dir.path(), "io-eio");
+        let evidence_path = case_dir.join("fault-evidence.json");
+        let mut evidence: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&evidence_path).expect("fault evidence"))
+                .expect("fault evidence JSON");
+        evidence["pods_before"][3]["uid"] = json!("replacement-uid");
+        write_json(&case_dir, "fault-evidence.json", &evidence);
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("topology proof cannot describe a different Pod cohort");
+        assert!(
+            error
+                .to_string()
+                .contains("topology Pods do not match fault-evidence.json pods_before"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn successful_artifact_validation_requires_history_bound_checker_audits() {
         for name in ["checker-pre-recommit-report.json", "checker-report.json"] {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -10257,7 +10369,7 @@ mod tests {
     #[test]
     fn percent_volume_artifacts_accept_csi_pv_without_hostname_affinity() {
         let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
-        config.scenario = "io-eio".to_string();
+        config.scenario = "io-latency".to_string();
         let scenario = FaultScenario::from_config(&config).expect("scenario");
         let catalog = scenario_spec(&scenario.name).expect("catalog");
         let plan = FaultPlan::from_scenario(&scenario, catalog).expect("percent plan");
@@ -10310,7 +10422,7 @@ mod tests {
     #[test]
     fn fixed_volume_runtime_evidence_binds_plan_proof_status_and_drift() {
         let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
-        config.scenario = "io-eio".to_string();
+        config.scenario = "io-latency".to_string();
         let scenario = FaultScenario::from_config(&config).expect("scenario");
         let catalog = scenario_spec(&scenario.name).expect("catalog");
         let plan = FaultPlan::new(
@@ -15498,9 +15610,9 @@ mod tests {
                 "case_name": "fault_io_eio_preserves_committed_objects",
                 "priority": "p0",
                 "isolation": "fresh-tenant",
-                "impact_policy": "client-disruption-required",
+                "impact_policy": "availability-required",
                 "boundary": "rustfs-workload/fault-injection",
-                "validation": "prefill succeeds before injection, mixed PUT/GET workload runs while IOChaos is active, committed PUTs are GET+sha256 verified after recovery, and successful GETs cannot return corrupt bytes",
+                "validation": "prefill succeeds before injection, every committed object remains readable while IOChaos is active, the mixed workload meets the availability floor, committed PUTs are GET+sha256 verified after recovery, and successful GETs cannot return corrupt bytes",
                 "detector": {
                     "revision": 1,
                     "qualification": "gate-candidate",
@@ -15531,12 +15643,13 @@ mod tests {
                 "target_proof": {"required": true, "artifact": "target-proof.json"},
                 "selection": {"kind": "percent", "value": 20},
                 "target_proof_requirements": ["run artifacts must include the selected Kubernetes object or host device identity before the fault is activated"],
+                "erasure_set_proof_required": true,
                 "fault_duration_seconds": 60,
                 "observability": "history.jsonl, workload-summary.json, checker-report.json, chaos-manifest.yaml, chaos-describe*.txt, Kubernetes snapshot artifacts",
                 "conflict_domain": "fresh Tenant/PVC/PV fixture and run-scoped IOChaos cleanup"
             }],
             "artifacts": {
-                "required": FaultRunArtifactSpec::required_names(),
+                "required": FaultRunArtifactSpec::required_names_for_scenario(scenario),
                 "event_stream": "run-events.jsonl"
             }
         });
@@ -15596,30 +15709,31 @@ mod tests {
             &case_dir,
             "target-proof.json",
             &json!({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "status": "satisfied",
                 "proofLevel": "selector_intent",
-                "generatedAtMs": 1,
+                "generatedAtMs": 6,
                 "scenario": scenario,
                 "caseName": "fault_io_eio_preserves_committed_objects",
                 "runId": run_id,
                 "namespace": "rustfs-fault-test",
                 "tenant": "fault-test-tenant",
-                "resolvedPods": [{
-                    "name": "p0",
-                    "uid": "u0",
-                    "node": "node-a",
+                "resolvedPods": (0..4).map(|index| json!({
+                    "name": format!("p{index}"),
+                    "uid": format!("u{index}"),
+                    "ready": true,
+                    "node": format!("node-{index}"),
                     "persistentVolumeClaims": [{
-                        "name": "data-p0",
-                        "volumeName": "pv-a",
+                        "name": format!("data-p{index}"),
+                        "volumeName": format!("pv-{index}"),
                         "storageClass": "fast-csi",
                         "persistentVolume": {
-                            "name": "pv-a",
-                            "node": "node-a",
-                            "deviceOrPath": "/mnt/rustfs0"
+                            "name": format!("pv-{index}"),
+                            "node": format!("node-{index}"),
+                            "deviceOrPath": format!("/mnt/rustfs{index}")
                         }
                     }]
-                }],
+                })).collect::<Vec<_>>(),
                 "faults": [{
                     "name": "io-eio-00-rustfs_volume_io_error",
                     "kind": "rustfs_volume_io_error",
@@ -15627,7 +15741,9 @@ mod tests {
                     "targetKind": "rustfs-volume",
                     "targetSummary": "one RustFS volume at /data/rustfs0",
                     "selection": "20%",
-                    "conflictDomain": "run-scoped IOChaos",
+                    "selectionKind": "percent",
+                    "selectionValue": 20,
+                    "conflictDomain": "fresh Tenant/PVC/PV fixture and run-scoped IOChaos cleanup",
                     "podSelector": {
                         "namespace": "rustfs-fault-test",
                         "tenant": "fault-test-tenant",
@@ -15635,13 +15751,49 @@ mod tests {
                         "exactPodsResolved": true,
                         "note": "preflight resolved current RustFS target pods"
                     },
-                    "volumePath": "/data/rustfs0"
+                    "volumePath": "/data/rustfs0",
+                    "erasureSet": {
+                        "required": true,
+                        "resolved": true,
+                        "source": "rustfs-admin-server-info",
+                        "deploymentId": "deployment-1",
+                        "shape": {
+                            "poolIndex": 0,
+                            "setIndex": 0,
+                            "serverCount": 4,
+                            "volumesPerServer": 1,
+                            "totalShards": 4,
+                            "payloadDataShards": 2,
+                            "payloadParityShards": 2
+                        },
+                        "health": {
+                            "onlineShards": 4,
+                            "offlineShards": 0,
+                            "unknownShards": 0
+                        },
+                        "membership": {
+                            "members": (0..4).map(|index| json!({
+                                "podName": format!("p{index}"),
+                                "serverEndpoint": format!("http://p{index}:9000"),
+                                "shardIds": [format!("d{index}")]
+                            })).collect::<Vec<_>>()
+                        },
+                        "observedAtMs": 5,
+                        "note": "same-erasure-set topology proven from RustFS admin runtime geometry before fault apply"
+                    }
                 }],
-                "requirements": [{
-                    "name": "catalog_target_intent",
-                    "status": "passed",
-                    "message": "one RustFS container data volume"
-                }]
+                "requirements": [
+                    {
+                        "name": "catalog_target_intent",
+                        "status": "passed",
+                        "message": "one RustFS container data volume"
+                    },
+                    {
+                        "name": "same_erasure_set_target_proof",
+                        "status": "passed",
+                        "message": "same-erasure-set topology proven from RustFS admin runtime geometry before fault apply"
+                    }
+                ]
             }),
         );
         write_json(
@@ -15670,7 +15822,7 @@ mod tests {
                 "recovery_stability_reread_seconds": 60,
                 "min_availability_percent": 99,
                 "use_cluster_ip": false,
-                "require_client_disruption": true,
+                "require_client_disruption": false,
                 "chaos_namespace": "chaos-mesh"
             }),
         );
@@ -15875,12 +16027,12 @@ mod tests {
                 "object_count": 12,
                 "concurrency": 4,
                 "total_payload_bytes": 12582912,
-                "puts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
-                "gets": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
-                "deletes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
-                "lists": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
-                "multipart_completes": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
-                "multipart_aborts": {"ok": 1, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "puts": {"ok": 20, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
+                "gets": {"ok": 20, "not_found": 0, "failed": 0, "timeout": 1, "unknown": 0},
+                "deletes": {"ok": 20, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "lists": {"ok": 20, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "multipart_completes": {"ok": 20, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
+                "multipart_aborts": {"ok": 20, "not_found": 0, "failed": 0, "timeout": 0, "unknown": 0},
                 "recommit_candidates": {
                     "scenario": scenario,
                     "run_id": run_id,
@@ -15895,6 +16047,28 @@ mod tests {
                     }]
                 },
                 "recommitted_after_recovery": 1
+            }),
+        );
+        write_json(
+            &case_dir,
+            AVAILABILITY_REPORT_ARTIFACT,
+            &json!({
+                "scenario": scenario,
+                "run_id": run_id,
+                "min_success_percent": 99,
+                "served_by_pod": "p1",
+                "commit_probe": {"objects": 40, "verified": 40, "failures": []},
+                "read_probe": {"objects": 6, "verified": 6, "failures": []},
+                "workload": [
+                    {"family": "put", "total": 21, "disrupted": 1, "success_percent": 95},
+                    {"family": "get", "total": 21, "disrupted": 1, "success_percent": 95},
+                    {"family": "delete", "total": 20, "disrupted": 0, "success_percent": 100},
+                    {"family": "list", "total": 20, "disrupted": 0, "success_percent": 100},
+                    {"family": "multipart_complete", "total": 20, "disrupted": 0, "success_percent": 100},
+                    {"family": "multipart_abort", "total": 20, "disrupted": 0, "success_percent": 100}
+                ],
+                "violations": [],
+                "passed": true
             }),
         );
         write_json(
@@ -15975,11 +16149,17 @@ mod tests {
                 "injected": true,
                 "active_during_workload": true,
                 "recovered": true,
-                "require_client_disruption": true,
+                "require_client_disruption": false,
                 "client_disruptions": 2,
                 "workload_plan": plan,
-                "pods_before": [{"name": "p0", "uid": "u0"}],
-                "pods_after": [{"name": "p0", "uid": "u0"}],
+                "pods_before": (0..4).map(|index| json!({
+                    "name": format!("p{index}"),
+                    "uid": format!("u{index}")
+                })).collect::<Vec<_>>(),
+                "pods_after": (0..4).map(|index| json!({
+                    "name": format!("p{index}"),
+                    "uid": format!("u{index}")
+                })).collect::<Vec<_>>(),
                 "active_snapshots": [{"stage": "active"}],
                 "workload_snapshots": [{"stage": "after-workload"}],
                 "dm_recovery_snapshot": null,
@@ -16022,12 +16202,12 @@ mod tests {
                         "setIndex": 0
                     })).collect::<Vec<_>>()
                 },
-                "readiness": [{
-                    "podName": "p0",
-                    "proxyPath": "/api/v1/namespaces/rustfs-fault-test/pods/p0:9000/proxy/health/ready",
+                "readiness": (0..4).map(|index| json!({
+                    "podName": format!("p{index}"),
+                    "proxyPath": format!("/api/v1/namespaces/rustfs-fault-test/pods/p{index}:9000/proxy/health/ready"),
                     "ready": true,
                     "observedAtMs": 65
-                }],
+                })).collect::<Vec<_>>(),
                 "violations": [],
                 "passed": true
             }),
@@ -16670,6 +16850,7 @@ mod tests {
             "scenario": "pod-failure",
             "run_id": run_id,
             "min_success_percent": 99,
+            "commit_probe": {"objects": 299, "verified": 299, "failures": []},
             "read_probe": {"objects": 6, "verified": 6, "failures": []},
             "workload": [
                 family("put", 200, 1),
@@ -16704,6 +16885,16 @@ mod tests {
         };
 
         validate(&report, &metadata, &summary).expect("consistent availability report");
+
+        report["commit_probe"]["verified"] = json!(298);
+        let error = validate(&report, &metadata, &summary)
+            .expect_err("every acknowledged commit needs immediate verification");
+        assert!(
+            error
+                .to_string()
+                .contains("commit probe verified 298 of 299")
+        );
+        report["commit_probe"]["verified"] = json!(299);
 
         // A family whose counts match but whose stated percentage does not
         // is not the report the runtime would have written.
@@ -16782,6 +16973,8 @@ mod tests {
         // the 99% floor) into a 1000-operation GET family (where they pass)
         // keep the total at 3 but no longer describe the workload that ran.
         let shifted_summary = summary_with((48, 2), (999, 1), (100, 0));
+        report["commit_probe"]["objects"] = json!(148);
+        report["commit_probe"]["verified"] = json!(148);
         report["workload"][0] = family("put", 50, 0);
         report["workload"][1] = family("get", 1000, 3);
         report["workload"][2] = family("delete", 100, 0);
@@ -16803,6 +16996,8 @@ mod tests {
         report["workload"][0] = family("put", 200, 1);
         report["workload"][1] = family("get", 200, 1);
         report["workload"][2] = family("delete", 100, 1);
+        report["commit_probe"]["objects"] = json!(299);
+        report["commit_probe"]["verified"] = json!(299);
         report["min_success_percent"] = json!(90);
         let error =
             validate(&report, &metadata, &summary).expect_err("laxer floor than configured");
@@ -16844,7 +17039,7 @@ mod tests {
                 .iter()
                 .any(|name| name == "availability-report.json")
         );
-        assert!(!plain.iter().any(|name| name == "availability-report.json"));
+        assert!(plain.iter().any(|name| name == "availability-report.json"));
         assert!(!ack.iter().any(|name| name == "availability-report.json"));
     }
 
@@ -17253,6 +17448,7 @@ mod tests {
             "run_id": run_id,
             "min_success_percent": 99,
             "served_by_pod": "p-0",
+            "commit_probe": {"objects": 0, "verified": 0, "failures": []},
             "read_probe": {"objects": 6, "verified": 6, "failures": []},
             "workload": [],
             "violations": [],
