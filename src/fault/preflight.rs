@@ -21,7 +21,7 @@ use std::{
 
 use crate::fault::{
     config::FaultTestConfig,
-    plan::{FaultPlan, FaultTarget},
+    plan::{FaultKind, FaultPlan, FaultTarget},
     quorum::{ErasureSetHealth, ErasureSetMembership, ErasureSetShape, QuorumVolumeTargetProof},
     reporting::ResponsibilityDomain,
     scenarios::{FaultBackend, FaultScenario, FaultScenarioSpec},
@@ -1098,8 +1098,13 @@ fn target_requirements(
                 host_requirement("dm_name", config.dm_name.as_deref()),
                 host_requirement("dm_node", config.dm_node.as_deref()),
                 host_requirement("dm_mount_path", config.dm_mount_path.as_deref()),
-                host_requirement("dm_fault_table", config.dm_fault_table.as_deref()),
             ]);
+            if fault.kind() == FaultKind::RustfsBlockDeviceFlakey {
+                requirements.push(host_requirement(
+                    "dm_fault_table",
+                    config.dm_fault_table.as_deref(),
+                ));
+            }
         }
     }
 
@@ -1285,6 +1290,39 @@ mod tests {
 
         assert_eq!(proof.status, TargetProofStatus::Missing);
         assert!(proof.require_satisfied().is_err());
+    }
+
+    #[test]
+    fn drop_writes_target_proof_derives_its_fault_table() {
+        let mut config = FaultTestConfig::for_test("k3d-lab", "rustfs-fault-dm");
+        config.scenario = "dm-drop-writes-after-ack-overwrite".to_string();
+        config.dm_name = Some("rustfs-fault-dm".to_string());
+        config.dm_node = Some("worker-a".to_string());
+        config.dm_mount_path = Some("/data/rustfs-fault/volume".to_string());
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let spec = scenario_spec(&scenario.name).expect("spec");
+        let plan = FaultPlan::from_scenario_with_options(
+            &scenario,
+            spec,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("plan");
+
+        let proof = TargetProof::from_plan(&config, &scenario, spec, &plan, "run-1");
+
+        assert!(
+            proof
+                .requirements
+                .iter()
+                .all(|requirement| requirement.name != "dm_fault_table")
+        );
+        assert!(
+            !proof.faults[0]
+                .host_target
+                .as_ref()
+                .expect("host target")
+                .has_fault_table
+        );
     }
 
     #[test]
