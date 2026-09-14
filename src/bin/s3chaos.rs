@@ -21,7 +21,7 @@ use s3chaos::fault::{
     artifact_validation::{ArtifactValidationOptions, validate_fault_artifacts_and_write_report},
     console::build_console_snapshot,
     runner::run_selected_scenario_from_env,
-    scenarios::scenario_catalog_json,
+    scenarios::{planned_qualification_catalog_json, scenario_catalog_json},
     shutdown::run_signal_aware,
     spec::{FaultRunArtifactSpec, FaultRunSpec},
     suite::{fault_suite_template_yaml, resolve_fault_suite_yaml},
@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
     match command.as_str() {
         "help" | "--help" | "-h" => print_help(),
         "fault-catalog-json" => print_fault_catalog_json(),
+        "fault-qualification-catalog-json" => print_fault_qualification_catalog_json(),
         "fault-console-json" => print_fault_console_json(args),
         "fault-console-serve" => serve_fault_console(args).await,
         "fault-required-artifacts-json" => print_fault_required_artifacts_json(),
@@ -95,6 +96,7 @@ fn print_help() -> Result<()> {
     println!();
     println!("Commands:");
     println!("  fault-catalog-json");
+    println!("  fault-qualification-catalog-json");
     println!("  fault-console-json <artifact-root>");
     println!("  fault-console-serve <artifact-root> [--addr 127.0.0.1:0] [--allow-non-loopback]");
     println!("  fault-required-artifacts-json");
@@ -607,6 +609,11 @@ fn parse_fault_console_serve_args(
 
 fn print_fault_catalog_json() -> Result<()> {
     println!("{}", scenario_catalog_json()?);
+    Ok(())
+}
+
+fn print_fault_qualification_catalog_json() -> Result<()> {
+    println!("{}", planned_qualification_catalog_json()?);
     Ok(())
 }
 

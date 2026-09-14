@@ -92,8 +92,9 @@ Status legend:
   Meaning: history/checker can report `pre_fault`, `fault_active`,
   `post_recovery`, and fault-window relations. The typed ACK cases additionally
   bind the exact pre-fault trigger record to ACK, apply, activation, and crash
-  timestamps; remaining planned scenario families still need equivalent
-  scenario-specific evidence contracts.
+  timestamps. The qualification-only reliability families now have
+  scenario-specific overlap, generation, mutation, heal, or stale-return
+  contracts; their live timing and topology assumptions still need calibration.
 
 - [x] DONE: LIST timeout/non-completion is separated from successful LIST
   content errors in checker classification.
@@ -171,13 +172,12 @@ guardrails when implementing the ordered TODO below.
 
 ### RustFS Reliability Coverage Boundary
 
-- [ ] PARTIAL: Versioned workload foundation exists, but the reliability plan is
-  not implemented yet.
+- [ ] PARTIAL: Versioned reliability workflows exist behind qualification.
   Meaning: current executable catalog scenarios still mostly cover
-  inject-recover-verify faults. The stateful RustFS reliability flows remain in
-  the ordered TODO below: fresh volume replacement, admin
-  decommission/rebalance, on-disk bitrot, stale disk with dangling cleanup,
-  and long-run suite campaigns.
+  inject-recover-verify faults. Fresh volume replacement, admin
+  decommission/rebalance, on-disk bitrot, and stale disk with dangling cleanup
+  now have closed qualification workflows but remain Planned pending live
+  evidence. Long-run suite campaigns remain in the ordered TODO below.
 
 - [ ] PARTIAL: Keep admin operations as scenario-owned product/recovery steps.
   Meaning: decommission/rebalance now have a fault-owned narrow port, typed
@@ -433,8 +433,9 @@ guardrails when implementing the ordered TODO below.
   and retains the helper and mutation marker for manual recovery. A filesystem
   check failure instead leaves the recovered mapper active, the filesystem
   unmounted, and the node quarantined. PV replacement, bitrot, and stale-disk
-  flows remain non-executable catalog entries and must use the same domain proof
-  when their adapters are implemented.
+  flows remain qualification-only Planned entries; their adapters now apply
+  scenario-specific PV, device, mutation, inventory, and rollback proofs and
+  still require live qualification.
 
 - [x] DONE: Make host/storage mutation preflight side-effect free.
   Meaning: host preflight reads Kubernetes metadata and fixed read-only host
@@ -520,29 +521,36 @@ Reporting only projects this typed checker result into failure-summary fields.
   reads through the healed/repaired volume, for example by faulting the other P
   volumes, before declaring heal success. `ForceReadThroughProof` now rejects
   any artifact that does not leave exactly read quorum online or excludes the
-  repaired shard; runtime orchestration still depends on executable quorum
-  targeting.
+  repaired shard. Fresh-volume and bitrot qualification drivers now execute
+  that exact-quorum targeting; live-cluster calibration remains before either
+  scenario can leave Planned status.
 
 - [ ] PARTIAL: Add `fresh-volume-replacement-heal`.
   Meaning: replace one PVC/PV with an empty volume, record original and
   replacement generation, quarantine/restore path, heal progress, and then force
   proof that the new volume contains the committed versions. The typed
   generation, pre-adoption emptiness, heal, and forced-read evidence contracts
-  exist; a safe Operator/PVC replacement adapter is still required.
+  are connected to the Local-PV replacement driver, including Operator pause,
+  empty-volume proof, rollback, and cleanup. Live Operator and RustFS
+  qualification remains outstanding.
 
 - [ ] PARTIAL: Add `on-disk-bitrot-heal`.
   Meaning: mutate bytes in one shard on a dedicated host volume, prove exact
   object-to-shard mapping, byte offset, original/mutated hash, rollback path,
   and verify corrupt bytes are never returned as successful S3 data. The
-  mutation proof accepts only a versioned RustFS diagnostic mapping and refuses
-  guessed private paths; RustFS does not yet expose that stable hook to S3Chaos.
+  mutation proof accepts only an exact RustFS object-version mapping and refuses
+  guessed private paths. The driver now obtains that mapping with a bounded,
+  offline XL2 inspector plus the privileged storage helper; it accepts the
+  current capability profile and fails closed on unknown formats. Live
+  qualification remains outstanding.
 
 - [ ] PARTIAL: Add heal observer artifacts.
   Meaning: `heal-summary.json` and `heal-progress.jsonl` should explain heal
   convergence/non-convergence, but checker/history remain the S3-visible verdict
   source. Typed summary/progress validation now requires monotonic counters and
-  a matching successful terminal sample; the admin/scanner adapters must emit
-  the artifacts during execution.
+  a matching successful terminal sample. Fresh-volume emits the generic heal
+  artifacts, and bitrot emits case-specific scanner/admin heal evidence during
+  execution; live convergence and timeout calibration remain outstanding.
 
 ### 10. Complete Admin Topology Workflows
 
@@ -607,15 +615,17 @@ Reporting only projects this typed checker result into failure-summary fields.
 - [ ] PARTIAL: Add `stale-disk-return-detect`.
   Meaning: continue writes/deletes while one disk generation is absent, reattach
   the old generation, and prove latest version id, delete marker latest state,
-  and object hash do not roll back. The catalog and evidence contracts exist;
-  the detach/reattach runtime adapter remains intentionally blocked.
+  and object hash do not roll back. The qualification runner now performs the
+  supervised detach/reattach sequence and records bounded absence/return
+  samples; live device-mapper and RustFS qualification remains outstanding.
 
 - [ ] PARTIAL: Cover dangling cleanup inside `stale-disk-return-detect`.
   Meaning: record shard inventory before/after dangling cleanup and prove the
   cleanup actor did not delete recoverable committed fragments. This is a
   recovery phase and oracle of stale-disk return rather than a separate fault
-  family. The proof contract exists; the RustFS inventory/cleanup adapter is
-  still required.
+  family. The runner records inventory before and after cleanup and validates
+  the cleanup proof; live calibration must still demonstrate that the bounded
+  inventory and cleanup behavior match RustFS under workload.
 
 - [ ] TODO: Add `long-run-durability-campaign`.
   Meaning: run repeated calibrated scenarios under continuous workload with

@@ -14,13 +14,14 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use crate::fault::{
     acknowledged_mutation::AcknowledgedMutationKind,
     config::FaultTestConfig,
     plan::FaultInjectionParameters,
     quorum::QuorumCaseClass,
+    storage_recovery::StorageRecoveryCase,
     workload::{
         WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadClass, WorkloadPayloadDistribution,
     },
@@ -1177,7 +1178,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         status: FaultScenarioStatus::Planned,
         workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
         isolation: FaultIsolation::FreshTenant,
-        crds: &[],
+        crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
@@ -1593,6 +1594,73 @@ pub fn scenario_catalog_json() -> Result<String> {
     Ok(serde_json::to_string_pretty(scenario_catalog())?)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PlannedQualificationKind {
+    Admin,
+    Storage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlannedQualificationCaseSpec {
+    qualification_case: &'static str,
+    scenario: &'static str,
+    kind: PlannedQualificationKind,
+    storage_recovery_case: Option<&'static str>,
+}
+
+fn planned_qualification_catalog() -> Result<Vec<PlannedQualificationCaseSpec>> {
+    let mut cases = vec![
+        PlannedQualificationCaseSpec {
+            qualification_case: ADMIN_DECOMMISSION_SCENARIO,
+            scenario: ADMIN_DECOMMISSION_SCENARIO,
+            kind: PlannedQualificationKind::Admin,
+            storage_recovery_case: None,
+        },
+        PlannedQualificationCaseSpec {
+            qualification_case: ADMIN_REBALANCE_SCENARIO,
+            scenario: ADMIN_REBALANCE_SCENARIO,
+            kind: PlannedQualificationKind::Admin,
+            storage_recovery_case: None,
+        },
+    ];
+    cases.extend(
+        StorageRecoveryCase::ALL
+            .into_iter()
+            .map(|case| PlannedQualificationCaseSpec {
+                qualification_case: case.as_str(),
+                scenario: case.scenario(),
+                kind: PlannedQualificationKind::Storage,
+                storage_recovery_case: Some(case.as_str()),
+            }),
+    );
+    for qualification in &cases {
+        let scenario = scenario_spec(qualification.scenario)?;
+        ensure!(
+            scenario.status == FaultScenarioStatus::Planned
+                && scenario.backend == FaultBackend::PlannedReliabilityWorkflow,
+            "qualification case {:?} is not bound to a Planned reliability scenario",
+            qualification.qualification_case
+        );
+    }
+    let unique_cases = cases
+        .iter()
+        .map(|qualification| qualification.qualification_case)
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        unique_cases.len() == cases.len(),
+        "qualification catalog contains duplicate cases"
+    );
+    Ok(cases)
+}
+
+pub fn planned_qualification_catalog_json() -> Result<String> {
+    Ok(serde_json::to_string_pretty(
+        &planned_qualification_catalog()?,
+    )?)
+}
+
 pub fn apply_catalog_defaults(config: &mut FaultTestConfig) -> Result<()> {
     let spec = scenario_spec(&config.scenario)?;
     spec.workload_profile.apply_to_config(config);
@@ -1688,16 +1756,18 @@ mod tests {
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO,
-        DetectorQualification, DurabilityBugFamily, FaultDetectorContract, FaultParameterSchema,
-        FaultScenario, FaultScenarioStatus, FaultScenarioWorkloadProfile, IO_EIO_SCENARIO,
-        IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
+        DetectorQualification, DurabilityBugFamily, FRESH_VOLUME_REPLACEMENT_SCENARIO,
+        FaultDetectorContract, FaultParameterSchema, FaultScenario, FaultScenarioStatus,
+        FaultScenarioWorkloadProfile, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IOCHAOS_CRD,
+        NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, ON_DISK_BITROT_SCENARIO,
         POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
         POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
         ROLLING_RESTART_ALL_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO,
         acknowledged_mutation_kind, apply_catalog_defaults, executable_scenario_catalog,
-        expected_workload_versioning_for_scenario, requires_prefault_multipart_staging,
-        scenario_catalog, scenario_catalog_json, scenario_spec,
+        expected_workload_versioning_for_scenario, planned_qualification_catalog_json,
+        requires_prefault_multipart_staging, scenario_catalog, scenario_catalog_json,
+        scenario_spec,
     };
     use crate::fault::acknowledged_mutation::AcknowledgedMutationKind;
     use crate::fault::config::{FaultTestConfig, FaultWorkloadProfile};
@@ -1840,6 +1910,83 @@ mod tests {
         config.storage_recovery_case =
             Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAdminDeep);
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
+    }
+
+    #[test]
+    fn planned_storage_catalog_declares_runtime_chaos_dependencies() {
+        assert_eq!(
+            scenario_spec(FRESH_VOLUME_REPLACEMENT_SCENARIO)
+                .expect("fresh-volume scenario")
+                .crds,
+            &[IOCHAOS_CRD]
+        );
+        assert_eq!(
+            scenario_spec(ON_DISK_BITROT_SCENARIO)
+                .expect("bitrot scenario")
+                .crds,
+            &[IOCHAOS_CRD]
+        );
+        assert!(
+            scenario_spec(STALE_DISK_RETURN_DETECT_SCENARIO)
+                .expect("stale-disk scenario")
+                .crds
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn planned_qualification_catalog_is_closed_and_derived_from_typed_cases() {
+        let catalog = serde_json::from_str::<serde_json::Value>(
+            &planned_qualification_catalog_json().expect("qualification catalog"),
+        )
+        .expect("qualification catalog JSON");
+        assert_eq!(
+            catalog,
+            serde_json::json!([
+                {
+                    "qualificationCase": "admin-decommission",
+                    "scenario": "admin-decommission",
+                    "kind": "admin",
+                    "storageRecoveryCase": null
+                },
+                {
+                    "qualificationCase": "admin-rebalance",
+                    "scenario": "admin-rebalance",
+                    "kind": "admin",
+                    "storageRecoveryCase": null
+                },
+                {
+                    "qualificationCase": "fresh-volume-replacement-automatic-replacement",
+                    "scenario": "fresh-volume-replacement",
+                    "kind": "storage",
+                    "storageRecoveryCase": "fresh-volume-replacement-automatic-replacement"
+                },
+                {
+                    "qualificationCase": "fresh-volume-replacement-admin-deep",
+                    "scenario": "fresh-volume-replacement",
+                    "kind": "storage",
+                    "storageRecoveryCase": "fresh-volume-replacement-admin-deep"
+                },
+                {
+                    "qualificationCase": "on-disk-bitrot-automatic-scanner",
+                    "scenario": "on-disk-bitrot",
+                    "kind": "storage",
+                    "storageRecoveryCase": "on-disk-bitrot-automatic-scanner"
+                },
+                {
+                    "qualificationCase": "on-disk-bitrot-admin-deep",
+                    "scenario": "on-disk-bitrot",
+                    "kind": "storage",
+                    "storageRecoveryCase": "on-disk-bitrot-admin-deep"
+                },
+                {
+                    "qualificationCase": "stale-disk-return",
+                    "scenario": "stale-disk-return-detect",
+                    "kind": "storage",
+                    "storageRecoveryCase": "stale-disk-return"
+                }
+            ])
+        );
     }
 
     #[test]

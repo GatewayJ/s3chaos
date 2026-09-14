@@ -1,7 +1,6 @@
 name: RustFS protocol live gate
 
 # Triggers:
-# - pull_request: smoke gate only, for protocol harness changes in this repository.
 # - workflow_dispatch: full live execution; inputs identify the RustFS build under test and may
 #   redirect the run to a per-candidate endpoint.
 # - repository_dispatch (event_type rustfs-release-candidate): sent by the rustfs repository for
@@ -21,13 +20,6 @@ name: RustFS protocol live gate
 # against an unpinned target, and a fingerprint without its endpoint can only fail at that pin.
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/protocol-live.yml"
-      - "protocol/**"
-      - "scripts/protocol-test.sh"
-      - "src/protocol/**"
-      - "src/bin/s3chaos.rs"
   workflow_dispatch:
     inputs:
       rustfs_image_digest:
@@ -58,17 +50,17 @@ run-name: >-
 concurrency:
   # One group per candidate: GitHub keeps at most one pending run per group and cancels earlier
   # pending ones, so candidates dispatched in quick succession must not share a group; validate-
-  # inputs refuses dispatches without an identity. Pull request and push runs fall back to the
-  # ref. Live jobs run on the shared runner pool, so runs for different candidates may overlap on
-  # the default target; fixture names carry the run id, which keeps their buckets and identities
-  # disjoint.
+  # inputs refuses dispatches without an identity. A malformed dispatch falls back to the ref
+  # before validation rejects it. Live jobs run on the shared runner pool, so runs for different
+  # candidates may overlap on the default target; fixture names carry the run id, which keeps
+  # their buckets and identities disjoint.
   group: protocol-live-${{ inputs.rustfs_version || github.event.client_payload.rustfs_version || inputs.rustfs_image_digest || github.event.client_payload.rustfs_image_digest || github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFS_PROTOCOL_TEST_DEDICATED: "1"
-  # Provenance of the RustFS build under test; empty for pull requests.
+  # Provenance of the RustFS build under test; every dispatch requires at least one identifier.
   RUSTFS_TARGET_IMAGE_DIGEST: ${{ inputs.rustfs_image_digest || github.event.client_payload.rustfs_image_digest }}
   RUSTFS_TARGET_VERSION: ${{ inputs.rustfs_version || github.event.client_payload.rustfs_version }}
   RUSTFS_TARGET_ENDPOINT_OVERRIDE: ${{ inputs.rustfs_endpoint || github.event.client_payload.rustfs_endpoint }}
@@ -160,7 +152,6 @@ jobs:
   smoke:
     name: Native smoke gate
     needs: validate-inputs
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: sm-standard-4
     environment:
       name: rustfs-protocol-test
@@ -208,7 +199,6 @@ jobs:
   native-regression:
     name: Native full regression
     needs: [validate-inputs, smoke]
-    if: github.event_name != 'pull_request'
     runs-on: sm-standard-4
     environment:
       name: rustfs-protocol-test
@@ -261,7 +251,7 @@ jobs:
   expiration-regression:
     name: STS expiration regression
     needs: [validate-inputs, native-regression]
-    if: ${{ github.event_name != 'pull_request' && always() && needs.validate-inputs.result == 'success' }}
+    if: ${{ always() && needs.validate-inputs.result == 'success' }}
     runs-on: sm-standard-4
     environment:
       name: rustfs-protocol-test
@@ -314,7 +304,7 @@ jobs:
   external-regression:
     name: External identity profile
     needs: [validate-inputs, native-regression]
-    if: ${{ github.event_name != 'pull_request' && always() && needs.validate-inputs.result == 'success' }}
+    if: ${{ always() && needs.validate-inputs.result == 'success' }}
     runs-on: sm-standard-4
     environment:
       name: rustfs-protocol-test
