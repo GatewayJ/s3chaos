@@ -1290,7 +1290,7 @@ mod tests {
     #[test]
     fn percent_volume_proof_accepts_csi_pv_without_hostname_affinity() {
         let mut config = FaultTestConfig::for_test("k3d-lab", "fast-csi");
-        config.scenario = "io-eio".to_string();
+        config.scenario = "io-latency".to_string();
         let scenario = FaultScenario::from_config(&config).expect("scenario");
         let spec = scenario_spec(&scenario.name).expect("spec");
         let plan = FaultPlan::from_scenario_with_options(

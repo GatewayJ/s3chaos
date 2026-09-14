@@ -626,26 +626,26 @@ pub(in crate::fault) async fn run_mixed_workload(
         execute_mixed_operation(request, offset, &mutation_locks, &next_mutation_sequence)
     });
     let mut tasks = stream::iter(tasks).buffer_unordered(plan.concurrency);
-    let mut progress_tick = tokio::time::interval(Duration::from_secs(30));
+    let progress_interval = Duration::from_secs(30);
+    let mut progress_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + progress_interval,
+        progress_interval,
+    );
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut results = Vec::with_capacity(count);
+    record_mixed_workload_progress(request.progress_events, count, 0, plan.concurrency)?;
     loop {
         tokio::select! {
             result = tasks.next() => match result {
-                Some(result) => results.push(result?),
+                Some(result) => results.push(result),
                 None => break,
             },
             _ = progress_tick.tick(), if request.progress_events.is_some() => {
-                request.progress_events.expect("checked above").record(
-                    "mixed-workload-progress",
-                    RunEventStatus::Observed,
-                    "mixed S3 workload progress snapshot",
-                    Some(serde_json::json!({
-                        "planned": count,
-                        "completed": results.len(),
-                        "in_flight_or_queued": count.saturating_sub(results.len()),
-                        "concurrency": plan.concurrency,
-                    })),
+                record_mixed_workload_progress(
+                    request.progress_events,
+                    count,
+                    results.len(),
+                    plan.concurrency,
                 )?;
             }
         }
@@ -655,6 +655,7 @@ pub(in crate::fault) async fn run_mixed_workload(
     for result in results {
         completed.push(result?);
     }
+    let commit_probe = committed_write_probe(&completed);
     // Same-key mutations are serialized above, so completion order is their
     // observed real-time order. Only the final mutation of a key can remain a
     // recommit candidate: replaying an earlier ambiguous PUT after a later
@@ -671,7 +672,30 @@ pub(in crate::fault) async fn run_mixed_workload(
     Ok(MixedWorkloadResult {
         summary,
         unconfirmed_puts,
+        commit_probe,
     })
+}
+
+fn record_mixed_workload_progress(
+    events: Option<&RunEventRecorder>,
+    planned: usize,
+    completed: usize,
+    concurrency: usize,
+) -> Result<()> {
+    if let Some(events) = events {
+        events.record(
+            "mixed-workload-progress",
+            RunEventStatus::Observed,
+            "mixed S3 workload progress snapshot",
+            Some(serde_json::json!({
+                "planned": planned,
+                "completed": completed,
+                "in_flight_or_queued": planned.saturating_sub(completed),
+                "concurrency": concurrency,
+            })),
+        )?;
+    }
+    Ok(())
 }
 
 async fn execute_mixed_operation(
@@ -730,6 +754,14 @@ async fn execute_mixed_operation(
             if let Some(get_outcome) = verified.verify_get_outcome {
                 result.gets.push(get_outcome);
             }
+            if verified.write_outcome == OperationOutcome::Ok {
+                result.record_committed_write(
+                    "PUT",
+                    &spec,
+                    verified.verify_get_outcome,
+                    verified.verified,
+                );
+            }
             if verified.write_outcome != OperationOutcome::Ok {
                 result.unconfirmed_puts.push(RecommitCandidate {
                     object: spec,
@@ -746,6 +778,14 @@ async fn execute_mixed_operation(
             result.puts.push(verified.write_outcome);
             if let Some(get_outcome) = verified.verify_get_outcome {
                 result.gets.push(get_outcome);
+            }
+            if verified.write_outcome == OperationOutcome::Ok {
+                result.record_committed_write(
+                    "overwrite PUT",
+                    &spec,
+                    verified.verify_get_outcome,
+                    verified.verified,
+                );
             }
             if verified.write_outcome != OperationOutcome::Ok {
                 result.unconfirmed_puts.push(RecommitCandidate {
@@ -811,9 +851,18 @@ async fn execute_mixed_operation(
             result.mutation_sequence = Some(next_mutation_sequence.fetch_add(1, Ordering::Relaxed));
             result.multipart_completes.push(complete_outcome);
             if complete_outcome == OperationOutcome::Ok {
-                result
-                    .gets
-                    .push(s3.get_object_result(&spec.key, history).await?.outcome);
+                let get = s3.get_object_result(&spec.key, history).await?;
+                let verified = get
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| spec.matches_body(body));
+                result.gets.push(get.outcome);
+                result.record_committed_write(
+                    "CompleteMultipartUpload",
+                    &spec,
+                    Some(get.outcome),
+                    verified,
+                );
             } else if let Some(record) = complete_record {
                 result.unconfirmed_puts.push(RecommitCandidate {
                     object: spec,
@@ -1147,6 +1196,9 @@ struct MixedTaskResult {
     multipart_completes: Vec<OperationOutcome>,
     multipart_aborts: Vec<OperationOutcome>,
     unconfirmed_puts: Vec<RecommitCandidate>,
+    committed_writes: usize,
+    verified_committed_writes: usize,
+    commit_verification_failures: Vec<String>,
 }
 
 impl MixedTaskResult {
@@ -1162,7 +1214,46 @@ impl MixedTaskResult {
             multipart_completes: Vec::new(),
             multipart_aborts: Vec::new(),
             unconfirmed_puts: Vec::new(),
+            committed_writes: 0,
+            verified_committed_writes: 0,
+            commit_verification_failures: Vec::new(),
         }
+    }
+
+    fn record_committed_write(
+        &mut self,
+        operation: &str,
+        object: &ObjectSpec,
+        get_outcome: Option<OperationOutcome>,
+        verified: bool,
+    ) {
+        self.committed_writes += 1;
+        if verified {
+            self.verified_committed_writes += 1;
+        } else {
+            self.commit_verification_failures.push(format!(
+                "{}: {operation} committed but its verification GET did not return the committed bytes (outcome={get_outcome:?}, expected size={} sha256={})",
+                object.key, object.size_bytes, object.sha256
+            ));
+        }
+    }
+}
+
+fn committed_write_probe(completed: &[MixedTaskResult]) -> ReadProbeSummary {
+    let objects = completed.iter().map(|result| result.committed_writes).sum();
+    let verified = completed
+        .iter()
+        .map(|result| result.verified_committed_writes)
+        .sum();
+    let mut failures = completed
+        .iter()
+        .flat_map(|result| result.commit_verification_failures.iter().cloned())
+        .collect::<Vec<_>>();
+    failures.sort();
+    ReadProbeSummary {
+        objects,
+        verified,
+        failures,
     }
 }
 
@@ -1170,6 +1261,7 @@ impl MixedTaskResult {
 pub(in crate::fault) struct MixedWorkloadResult {
     pub(in crate::fault) summary: WorkloadSummary,
     pub(in crate::fault) unconfirmed_puts: Vec<RecommitCandidate>,
+    pub(in crate::fault) commit_probe: ReadProbeSummary,
 }
 
 impl MixedWorkloadResult {
@@ -1564,6 +1656,62 @@ mod tests {
     use serde_json::json;
 
     use std::time::Duration;
+
+    #[test]
+    fn mixed_workload_progress_records_the_starting_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run-events.jsonl");
+        let events = RunEventRecorder::create(&path, "io-eio", "run-1").expect("events");
+
+        super::record_mixed_workload_progress(Some(&events), 120, 0, 8).expect("progress");
+
+        let event: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(path).expect("read events").trim())
+                .expect("event JSON");
+        assert_eq!(event["stage"], "mixed-workload-progress");
+        assert_eq!(event["details"]["planned"], 120);
+        assert_eq!(event["details"]["completed"], 0);
+        assert_eq!(event["details"]["in_flight_or_queued"], 120);
+        assert_eq!(event["details"]["concurrency"], 8);
+    }
+
+    #[test]
+    fn availability_rejects_an_unverified_fault_active_commit() {
+        let mut summary =
+            WorkloadSummary::new(&WorkloadPlan::seeded(42, 240, 8), "io-eio", "run-1");
+        for _ in 0..20 {
+            summary.puts.record(OperationOutcome::Ok);
+            summary.gets.record(OperationOutcome::Ok);
+            summary.deletes.record(OperationOutcome::Ok);
+            summary.lists.record(OperationOutcome::Ok);
+            summary.multipart_completes.record(OperationOutcome::Ok);
+            summary.multipart_aborts.record(OperationOutcome::Ok);
+        }
+        let report = summary.availability_report(
+            ReadProbeSummary {
+                objects: 40,
+                verified: 39,
+                failures: vec!["object: committed bytes unavailable".to_string()],
+            },
+            ReadProbeSummary {
+                objects: 120,
+                verified: 120,
+                failures: Vec::new(),
+            },
+            99,
+            None,
+        );
+
+        assert!(!report.passed);
+        assert!(report.require_success().is_err());
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.contains("verified 39 of 40 acknowledged commits"))
+        );
+    }
+
     /// The ranged-GET sampler must be a pure function of (seed, index): zero
     /// percent and tiny objects never sample, derived ranges always stay in
     /// bounds, and identical inputs replay identically.
@@ -2210,6 +2358,11 @@ mod tests {
                 object: object.clone(),
                 source_operation_id: source.id.clone(),
             }],
+            commit_probe: ReadProbeSummary {
+                objects: 0,
+                verified: 0,
+                failures: Vec::new(),
+            },
         };
 
         workload
@@ -2276,6 +2429,11 @@ mod tests {
                 object,
                 source_operation_id: source.id,
             }],
+            commit_probe: ReadProbeSummary {
+                objects: 0,
+                verified: 0,
+                failures: Vec::new(),
+            },
         };
 
         let error = workload
@@ -2329,6 +2487,11 @@ mod tests {
                 "run",
             ),
             unconfirmed_puts: candidates,
+            commit_probe: ReadProbeSummary {
+                objects: 0,
+                verified: 0,
+                failures: Vec::new(),
+            },
         };
 
         workload
@@ -2936,6 +3099,10 @@ pub(in crate::fault) struct AvailabilityReport {
     /// active; absent for ClusterIP endpoints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::fault) served_by_pod: Option<String>,
+    /// Immediate GET verification for every PUT, overwrite, or multipart
+    /// completion acknowledged while the fault was active.
+    pub(in crate::fault) commit_probe: ReadProbeSummary,
+    /// Full-cohort verification for objects committed before fault activation.
     pub(in crate::fault) read_probe: ReadProbeSummary,
     pub(in crate::fault) workload: Vec<FamilyAvailability>,
     /// Sorted human-readable reasons the contract failed; empty on success.
@@ -2962,7 +3129,10 @@ impl AvailabilityReport {
     /// Recomputed from the report content so a hand-edited `passed` flag or an
     /// empty `violations` list cannot claim availability the numbers refute.
     fn success_predicate(&self) -> bool {
-        self.read_probe.objects > 0
+        self.commit_probe.objects > 0
+            && self.commit_probe.verified == self.commit_probe.objects
+            && self.commit_probe.failures.is_empty()
+            && self.read_probe.objects > 0
             && self.read_probe.verified == self.read_probe.objects
             && self.read_probe.failures.is_empty()
             && !self.workload.is_empty()
@@ -2990,11 +3160,33 @@ impl WorkloadSummary {
     /// its committed bytes. Workload families use the configured threshold.
     pub(in crate::fault) fn availability_report(
         &self,
+        commit_probe: ReadProbeSummary,
         read_probe: ReadProbeSummary,
         min_success_percent: u8,
         served_by_pod: Option<String>,
     ) -> AvailabilityReport {
         let mut violations = Vec::new();
+        let expected_commits = self.puts.ok.saturating_add(self.multipart_completes.ok);
+        if commit_probe.objects != expected_commits {
+            violations.push(format!(
+                "fault-active commit probe covers {} acknowledged commits, but the workload summary records {expected_commits}",
+                commit_probe.objects
+            ));
+        }
+        if commit_probe.verified != commit_probe.objects || !commit_probe.failures.is_empty() {
+            violations.push(format!(
+                "fault-active commit probe verified {} of {} acknowledged commits; first failures: {}",
+                commit_probe.verified,
+                commit_probe.objects,
+                commit_probe
+                    .failures
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         if read_probe.verified != read_probe.objects || !read_probe.failures.is_empty() {
             violations.push(format!(
                 "fault-active read probe verified {} of {} committed objects; first failures: {}",
@@ -3033,6 +3225,7 @@ impl WorkloadSummary {
             run_id: self.run_id.clone(),
             min_success_percent,
             served_by_pod,
+            commit_probe,
             read_probe,
             workload,
             passed: violations.is_empty(),
@@ -3546,6 +3739,11 @@ mod post_recovery_tests {
         }
         .availability_report(
             ReadProbeSummary {
+                objects: 119,
+                verified: 119,
+                failures: Vec::new(),
+            },
+            ReadProbeSummary {
                 objects: 6,
                 verified: 6,
                 failures: Vec::new(),
@@ -3816,6 +4014,11 @@ mod post_recovery_tests {
             run_id: "run-1".to_string(),
             min_success_percent: 99,
             served_by_pod: None,
+            commit_probe: ReadProbeSummary {
+                objects: 1,
+                verified: 1,
+                failures: Vec::new(),
+            },
             read_probe: ReadProbeSummary {
                 objects: 10,
                 verified: 9,

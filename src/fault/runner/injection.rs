@@ -955,6 +955,7 @@ impl FaultRun<'_> {
         let read_probe = availability_read_probe
             .context("availability scenario ran its workload without the read probe")?;
         let report = workload.summary.availability_report(
+            workload.commit_probe.clone(),
             read_probe,
             config.min_availability_percent,
             served_by_pod,
@@ -971,6 +972,8 @@ impl FaultRun<'_> {
                 &error,
                 Some(serde_json::json!({
                     "min_success_percent": report.min_success_percent,
+                    "commit_probe_verified": report.commit_probe.verified,
+                    "commit_probe_objects": report.commit_probe.objects,
                     "read_probe_verified": report.read_probe.verified,
                     "read_probe_objects": report.read_probe.objects,
                     "violations": report.violations,
@@ -985,6 +988,8 @@ impl FaultRun<'_> {
             "the service kept serving committed reads and the mixed workload under the fault",
             Some(serde_json::json!({
                 "min_success_percent": report.min_success_percent,
+                "commit_probe_verified": report.commit_probe.verified,
+                "commit_probe_objects": report.commit_probe.objects,
                 "read_probe_verified": report.read_probe.verified,
                 "workload": report.workload,
             })),

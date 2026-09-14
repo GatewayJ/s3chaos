@@ -421,7 +421,8 @@ impl FaultScenarioSpec {
     pub fn requires_erasure_set_proof(self) -> bool {
         matches!(
             self.scenario,
-            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+            IO_EIO_SCENARIO
+                | NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
                 | QUORUM_P_IO_FAULT_SCENARIO
                 | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
         )
@@ -2107,6 +2108,7 @@ mod tests {
         assert_eq!(
             requiring_proof,
             vec![
+                IO_EIO_SCENARIO,
                 NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
                 QUORUM_P_IO_FAULT_SCENARIO,
                 QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
