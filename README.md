@@ -420,9 +420,11 @@ fixtures.
   needed; fault suites are never executed by CI.
 - `.github/workflows/protocol-live.yml`: live RustFS suites (smoke gate,
   native regression, expiration regression, external OIDC regression) on the
-  shared `sm-standard-4` runner. Pull requests run the smoke gate only. Full live
-  execution runs on `workflow_dispatch` (inputs `rustfs_image_digest`,
-  `rustfs_version`, and an optional `rustfs_endpoint` +
+  shared `sm-standard-4` runner. It is intentionally not a pull-request gate:
+  pull requests have no live-target credentials, and `.github/workflows/ci.yml`
+  owns their static protocol validation. Full live execution runs on
+  `workflow_dispatch` (inputs `rustfs_image_digest`, `rustfs_version`, and an
+  optional `rustfs_endpoint` +
   `rustfs_target_fingerprint` pair that redirects the run to a
   per-candidate target) and on `repository_dispatch` with event type
   `rustfs-release-candidate`, which the rustfs repository sends for every
