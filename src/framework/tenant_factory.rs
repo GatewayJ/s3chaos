@@ -36,6 +36,7 @@ pub struct TenantTemplate {
     pub node_selector: Option<BTreeMap<String, String>>,
     pub spread_across_hosts: bool,
     pub rustfs_env: Vec<(String, String)>,
+    pub metadata_annotations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +98,7 @@ impl TenantTemplate {
             ),
             spread_across_hosts: false,
             rustfs_env: Vec::new(),
+            metadata_annotations: BTreeMap::new(),
         }
     }
 
@@ -123,6 +125,7 @@ impl TenantTemplate {
             node_selector: None,
             spread_across_hosts: true,
             rustfs_env: Vec::new(),
+            metadata_annotations: BTreeMap::new(),
         }
     }
 
@@ -234,13 +237,17 @@ impl TenantTemplate {
         );
         spec.insert("env".to_string(), Value::Array(env));
 
+        let mut metadata = Map::new();
+        metadata.insert("name".to_string(), json!(self.name));
+        metadata.insert("namespace".to_string(), json!(self.namespace));
+        if !self.metadata_annotations.is_empty() {
+            metadata.insert("annotations".to_string(), json!(self.metadata_annotations));
+        }
+
         let manifest = json!({
             "apiVersion": "rustfs.com/v1alpha1",
             "kind": "Tenant",
-            "metadata": {
-                "name": self.name,
-                "namespace": self.namespace,
-            },
+            "metadata": Value::Object(metadata),
             "spec": Value::Object(spec),
         });
 

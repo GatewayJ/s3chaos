@@ -37,6 +37,7 @@ const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 const FAULT_TEST_MANAGER: &str = "s3chaos";
 const FAULT_TEST_TENANT_ANNOTATION: &str = "rustfs.com/fault-test-tenant";
 const FAULT_TEST_RUN_ANNOTATION: &str = "rustfs.com/fault-test-run";
+const RUNTIME_DEFAULT_IMAGE_ACK_ANNOTATION: &str = "operator.rustfs.com/runtime-default-image-ack";
 pub const ADMIN_FIXTURE_ARTIFACT: &str = "admin-fixture.json";
 pub const ADMIN_PRIMARY_POOL_NAME: &str = "primary";
 pub const ADMIN_EXPANSION_POOL_NAME: &str = "expansion";
@@ -233,6 +234,10 @@ pub fn tenant_manifest(config: &ClusterTestConfig) -> Result<String> {
         credential_secret_name(config),
     );
     template.rustfs_env.clone_from(&config.rustfs_env);
+    template.metadata_annotations.insert(
+        RUNTIME_DEFAULT_IMAGE_ACK_ANNOTATION.to_string(),
+        config.rustfs_image.clone(),
+    );
     // Topology knobs that a single-node/lab cluster otherwise had to patch in
     // source (backlog#1037): the defaults preserve the production 4-node shape.
     template.storage_request = config.tenant_storage_request.clone();
@@ -497,6 +502,15 @@ mod tests {
         assert!(manifest.contains("namespace: rustfs-fault-test"));
         assert!(manifest.contains("storageClassName: fast-csi"));
         assert!(manifest.contains("storage: 100Gi"));
+        assert!(manifest.contains("operator.rustfs.com/runtime-default-image-ack"));
+        assert!(manifest.contains("rustfs/rustfs:test"));
+        let value: serde_json::Value = serde_yaml_ng::from_str(&manifest).expect("valid YAML");
+        assert_eq!(
+            value
+                .pointer("/metadata/annotations/operator.rustfs.com~1runtime-default-image-ack")
+                .and_then(serde_json::Value::as_str),
+            Some("rustfs/rustfs:test")
+        );
         assert!(!manifest.contains("rustfs-storage"));
         assert!(!manifest.contains("RUSTFS_UNSAFE_BYPASS_DISK_CHECK"));
         assert!(manifest.contains("topologyKey: kubernetes.io/hostname"));
