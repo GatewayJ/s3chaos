@@ -284,6 +284,291 @@ require_non_static_suite_plan "$2"
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn planned_qualification_matrix_is_closed_and_typed() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+list_qualification_cases
+! qualification_case_contract arbitrary-shell
+"#,
+            "fault-qualification-matrix-test",
+            script,
+        ])
+        .output()
+        .expect("inspect qualification matrix");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "qualification-case\tscenario\tkind\tstorage-recovery-case\n",
+            "admin-decommission\tadmin-decommission\tadmin\t-\n",
+            "admin-rebalance\tadmin-rebalance\tadmin\t-\n",
+            "fresh-volume-replacement-automatic-replacement\tfresh-volume-replacement\tstorage\tfresh-volume-replacement-automatic-replacement\n",
+            "fresh-volume-replacement-admin-deep\tfresh-volume-replacement\tstorage\tfresh-volume-replacement-admin-deep\n",
+            "on-disk-bitrot-automatic-scanner\ton-disk-bitrot\tstorage\ton-disk-bitrot-automatic-scanner\n",
+            "on-disk-bitrot-admin-deep\ton-disk-bitrot\tstorage\ton-disk-bitrot-admin-deep\n",
+            "stale-disk-return\tstale-disk-return-detect\tstorage\tstale-disk-return\n",
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn qualification_wrapper_passes_only_the_selected_opt_in() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let fake_binary = temporary.path().join("fake-s3chaos");
+    std::fs::write(&fake_binary, "#!/usr/bin/env bash\nenv\n").expect("fake binary");
+    let mut permissions = std::fs::metadata(&fake_binary)
+        .expect("fake binary metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&fake_binary, permissions).expect("fake binary permissions");
+
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+kubectl_cluster() { printf '{"items":[]}\n'; }
+list_non_fault_tenants() { :; }
+scenario_requires_chaos_mesh() { return 1; }
+capture_cluster_snapshot() { :; }
+capture_fault_logs() { :; }
+validate_scenario_artifacts() { :; }
+sleep() { :; }
+FAULT_TEST_BINARY="$2"
+WORKLOAD_OBJECTS=12
+WORKLOAD_CONCURRENCY=1
+RUSTFS_POD_COUNT=4
+RUSTFS_VOLUME_PATH=/data/rustfs0
+RUSTFS_POD_STABLE_WINDOW_SECONDS=1
+HEALTH_GUARD_FAILURE_THRESHOLD=1
+
+mkdir -p "$3/admin" "$3/storage" "$3/ordinary"
+run_scenario admin-decommission "$3/admin" admin -
+run_scenario fresh-volume-replacement "$3/storage" storage fresh-volume-replacement-admin-deep
+RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=1
+RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=1
+RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=stale-disk-return
+run_scenario io-eio "$3/ordinary"
+"#,
+            "fault-qualification-environment-test",
+            script,
+            fake_binary.to_str().expect("fake binary path"),
+            temporary.path().to_str().expect("temporary path"),
+        ])
+        .output()
+        .expect("run qualification environment test");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let read_log = |root: &str, scenario: &str| {
+        std::fs::read_to_string(temporary.path().join(root).join(scenario).join("test.log"))
+            .expect("qualification test log")
+    };
+    let admin = read_log("admin", "admin-decommission");
+    assert!(admin.contains("RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=1\n"));
+    assert!(admin.contains("RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=\n"));
+    assert!(admin.contains("RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=\n"));
+
+    let storage = read_log("storage", "fresh-volume-replacement");
+    assert!(storage.contains("RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=\n"));
+    assert!(storage.contains("RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=1\n"));
+    assert!(
+        storage.contains(
+            "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=fresh-volume-replacement-admin-deep\n"
+        )
+    );
+
+    let ordinary = read_log("ordinary", "io-eio");
+    assert!(ordinary.contains("RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=\n"));
+    assert!(ordinary.contains("RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=\n"));
+    assert!(ordinary.contains("RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn bitrot_qualification_preflight_uses_its_storage_helper_not_the_dm_observer() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let target = temporary.path().join("target.json");
+    std::fs::write(
+        &target,
+        r#"{"volume":{"namespace":"fault-ns"},"helperPodName":"storage-helper"}"#,
+    )
+    .expect("bitrot target config");
+
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+TEST_ROOT="$3"
+require_command() { :; }
+validate_runtime_env_contract() { :; }
+validate_qualification_env_contract() { :; }
+resolve_fault_context() { :; }
+require_storage_class() { :; }
+require_namespace_ownership() { :; }
+require_non_fault_tenants_ready() { :; }
+scenario_requires_chaos_mesh() { return 0; }
+scenario_crds() { printf 'iochaos.chaos-mesh.org\n'; }
+require_chaos_ready() { :; }
+scenario_required_tools() { :; }
+scenario_requires_static_storage() { return 0; }
+validate_dm_env_contract() { touch "$TEST_ROOT/dm-preflight-used"; }
+kubectl_ns() { printf '%s\n' "$*" >>"$TEST_ROOT/kubectl-ns.log"; }
+kubectl_cluster() {
+  if [[ "$*" == "get nodes -o json" ]]; then
+    printf '%s\n' '{"items":[{"status":{"conditions":[{"type":"Ready","status":"True"},{"type":"DiskPressure","status":"False"}]}},{"status":{"conditions":[{"type":"Ready","status":"True"},{"type":"DiskPressure","status":"False"}]}},{"status":{"conditions":[{"type":"Ready","status":"True"},{"type":"DiskPressure","status":"False"}]}},{"status":{"conditions":[{"type":"Ready","status":"True"},{"type":"DiskPressure","status":"False"}]}}]}'
+  elif [[ "$*" == *"jsonpath="* ]]; then
+    printf 'privileged'
+  else
+    printf '{}\n'
+  fi
+}
+QUALIFICATION_SCENARIO=on-disk-bitrot
+QUALIFICATION_KIND=storage
+QUALIFICATION_STORAGE_CASE=on-disk-bitrot-admin-deep
+ACTIVE_QUALIFICATION_CASE=on-disk-bitrot-admin-deep
+FAULT_CONTEXT=real-cluster
+FAULT_NAMESPACE=fault-ns
+RUSTFS_FAULT_TEST_SERVER_IMAGE=rustfs:test
+RUSTFS_FAULT_TEST_STORAGE_CLASS=local-static
+RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG="$2"
+preflight on-disk-bitrot qualification on-disk-bitrot-admin-deep
+[[ ! -e "$TEST_ROOT/dm-preflight-used" ]]
+grep -Fx 'fault-ns get pod storage-helper' "$TEST_ROOT/kubectl-ns.log"
+"#,
+            "fault-qualification-bitrot-preflight-test",
+            script,
+            target.to_str().expect("target path"),
+            temporary.path().to_str().expect("temporary path"),
+        ])
+        .output()
+        .expect("run bitrot qualification preflight test");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn qualification_metadata_is_bound_to_its_run_root() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+write_qualification_plan "$2" fresh-volume-replacement-admin-deep fresh-volume-replacement storage fresh-volume-replacement-admin-deep
+write_qualification_result "$2" passed 0
+s3chaos_cli() { printf '{"artifactRoot":"%s","attempts":[],"warnings":[]}\n' "$2"; }
+analyze_qualification "$2" >"$2/qualification-analysis.json"
+"#,
+            "fault-qualification-metadata-test",
+            script,
+            temporary.path().to_str().expect("temporary path"),
+        ])
+        .output()
+        .expect("write qualification metadata");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(temporary.path().join("qualification-plan.json"))
+            .expect("qualification plan"),
+    )
+    .expect("qualification plan JSON");
+    assert_eq!(plan["schemaVersion"], 1);
+    assert_eq!(
+        plan["qualificationCase"],
+        "fresh-volume-replacement-admin-deep"
+    );
+    assert_eq!(plan["scenario"], "fresh-volume-replacement");
+    assert_eq!(plan["kind"], "storage");
+    assert_eq!(
+        plan["storageRecoveryCase"],
+        "fresh-volume-replacement-admin-deep"
+    );
+    assert_eq!(
+        plan["runRoot"],
+        temporary.path().to_str().expect("temporary path")
+    );
+    assert_eq!(
+        plan["artifactRoot"],
+        temporary
+            .path()
+            .join("fresh-volume-replacement")
+            .to_str()
+            .expect("artifact root")
+    );
+
+    let result = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(temporary.path().join("qualification-result.json"))
+            .expect("qualification result"),
+    )
+    .expect("qualification result JSON");
+    assert_eq!(result["schemaVersion"], 1);
+    assert_eq!(result["outcome"], "passed");
+    assert_eq!(result["exitCode"], 0);
+
+    let analysis = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(temporary.path().join("qualification-analysis.json"))
+            .expect("qualification analysis"),
+    )
+    .expect("qualification analysis JSON");
+    assert_eq!(analysis["qualificationPlan"], plan);
+    assert_eq!(analysis["qualificationResult"], result);
+    assert_eq!(analysis["console"]["attempts"], serde_json::json!([]));
+    assert_eq!(analysis["schemaVersion"], 1);
+
+    let contradictory = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+jq '.scenario = "on-disk-bitrot"' "$2/qualification-plan.json" >"$2/contradictory-plan.json"
+mv "$2/contradictory-plan.json" "$2/qualification-plan.json"
+s3chaos_cli() { printf '{}\n'; }
+! (analyze_qualification "$2")
+"#,
+            "fault-qualification-contradictory-metadata-test",
+            script,
+            temporary.path().to_str().expect("temporary path"),
+        ])
+        .output()
+        .expect("reject contradictory qualification metadata");
+    assert!(
+        contradictory.status.success(),
+        "{}",
+        String::from_utf8_lossy(&contradictory.stderr)
+    );
+}
+
 #[tokio::test]
 #[ignore = "destructive RustFS workload fault scenario; select with RUSTFS_FAULT_TEST_SCENARIO"]
 async fn fault_selected_scenario() -> Result<()> {

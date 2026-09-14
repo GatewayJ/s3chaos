@@ -46,6 +46,8 @@ ACTIVE_SCOPE=""
 ACTIVE_NAME=""
 ACTIVE_HOST_MUTATION_STATE_FILE=""
 ACTIVE_HOST_MUTATION_STATE_TOKEN=""
+ACTIVE_QUALIFICATION_ROOT=""
+ACTIVE_QUALIFICATION_CASE=""
 FAULT_TEST_BINARY=""
 FAULT_CATALOG_JSON=""
 
@@ -60,6 +62,10 @@ Commands:
   chaos-run <file>      Run an ordinary Chaos Mesh-only suite.
   dm-run <scenario>     Run exactly one supervised device-mapper scenario.
   list                  List catalog scenarios.
+  qualify-list          List closed planned-qualification cases.
+  qualify <case>        Run one supervised planned qualification.
+  qualify-analyze <run-root>
+                        Render machine-readable analysis for one qualification.
   suite-template        Print a YAML FaultSuite template.
   suite-validate <file> Validate a YAML FaultSuite contract.
   suite-plan <file>     Render the resolved destructive FaultSuite plan.
@@ -234,6 +240,62 @@ require_supported_scenario() {
   is_supported_scenario "$scenario" || die "unsupported scenario: $scenario"
 }
 
+is_planned_scenario() {
+  catalog_scenario_query "$1" 'any(.[]; .scenario == $scenario and .status == "planned")' >/dev/null
+}
+
+qualification_cases() {
+  printf '%s\n' \
+    admin-decommission \
+    admin-rebalance \
+    fresh-volume-replacement-automatic-replacement \
+    fresh-volume-replacement-admin-deep \
+    on-disk-bitrot-automatic-scanner \
+    on-disk-bitrot-admin-deep \
+    stale-disk-return
+}
+
+qualification_case_contract() {
+  case "$1" in
+    admin-decommission)
+      printf 'admin-decommission|admin|-\n'
+      ;;
+    admin-rebalance)
+      printf 'admin-rebalance|admin|-\n'
+      ;;
+    fresh-volume-replacement-automatic-replacement|fresh-volume-replacement-admin-deep)
+      printf 'fresh-volume-replacement|storage|%s\n' "$1"
+      ;;
+    on-disk-bitrot-automatic-scanner|on-disk-bitrot-admin-deep)
+      printf 'on-disk-bitrot|storage|%s\n' "$1"
+      ;;
+    stale-disk-return)
+      printf 'stale-disk-return-detect|storage|stale-disk-return\n'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+list_qualification_cases() {
+  local qualification_case contract scenario kind storage_case
+  printf 'qualification-case\tscenario\tkind\tstorage-recovery-case\n'
+  while IFS= read -r qualification_case; do
+    contract="$(qualification_case_contract "$qualification_case")"
+    IFS='|' read -r scenario kind storage_case <<<"$contract"
+    printf '%s\t%s\t%s\t%s\n' "$qualification_case" "$scenario" "$kind" "$storage_case"
+  done < <(qualification_cases)
+}
+
+resolve_qualification_case() {
+  local qualification_case="$1" contract
+  if ! contract="$(qualification_case_contract "$qualification_case")"; then
+    die "unsupported qualification case: $qualification_case; run make fault-qualify-list"
+  fi
+  IFS='|' read -r QUALIFICATION_SCENARIO QUALIFICATION_KIND QUALIFICATION_STORAGE_CASE <<<"$contract"
+}
+
 scenario_percent_supported() {
   catalog_scenario_query "$1" '.[] | select(.scenario == $scenario) | .percent_supported' >/dev/null
 }
@@ -318,6 +380,58 @@ validate_runtime_env_contract() {
     scenario_percent_supported "$scenario" || die "RUSTFS_FAULT_TEST_PERCENT does not apply to scenario $scenario"
     export RUSTFS_FAULT_TEST_PERCENT="$percent"
   fi
+}
+
+validate_qualification_env_contract() {
+  local qualification_case="$1" scenario="$2" kind="$3" storage_case="$4"
+  local expected_local_pvs target_config
+
+  require_nonempty_env RUSTFS_FAULT_TEST_EXPECTED_CONTEXT
+  require_nonempty_env RUSTFS_FAULT_TEST_NAMESPACE
+  require_nonempty_env RUSTFS_FAULT_TEST_TENANT
+  FAULT_CONTEXT="$RUSTFS_FAULT_TEST_EXPECTED_CONTEXT"
+  FAULT_NAMESPACE="$RUSTFS_FAULT_TEST_NAMESPACE"
+  FAULT_TENANT="$RUSTFS_FAULT_TEST_TENANT"
+
+  case "$kind" in
+    admin)
+      [[ "$storage_case" == "-" ]] || die "$qualification_case has an unexpected storage-recovery case"
+      ;;
+    storage)
+      [[ "$storage_case" != "-" ]] || die "$qualification_case lacks its storage-recovery case"
+      case "$scenario" in
+        fresh-volume-replacement)
+          require_nonempty_env RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON
+          require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_HELPER_IMAGE
+          require_nonempty_env RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT
+          require_nonempty_env RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST
+          require_nonempty_env RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST
+          require_safe_image_ref RUSTFS_FAULT_TEST_STORAGE_HELPER_IMAGE "$RUSTFS_FAULT_TEST_STORAGE_HELPER_IMAGE"
+          require_safe_node_name RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT "$RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT"
+          expected_local_pvs=$((10#$RUSTFS_POD_COUNT + 1))
+          jq -e --argjson expected "$expected_local_pvs" \
+            'type == "array" and length == $expected' \
+            <<<"$RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON" >/dev/null \
+            || die "RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON must contain exactly $expected_local_pvs Local PV entries"
+          ;;
+        on-disk-bitrot)
+          require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG
+          target_config="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG"
+          require_absolute_non_root_path RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG "$target_config"
+          [[ -f "$target_config" && ! -L "$target_config" ]] \
+            || die "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG must be a regular non-symlink file"
+          ;;
+        stale-disk-return-detect)
+          ;;
+        *)
+          die "unsupported planned storage scenario: $scenario"
+          ;;
+      esac
+      ;;
+    *)
+      die "unsupported qualification kind: $kind"
+      ;;
+  esac
 }
 
 validate_dm_env_contract() {
@@ -503,14 +617,16 @@ port_forward_chaos_dashboard() {
 }
 
 require_storage_class() {
-  local scenario="$1"
+  local scenario="$1" qualification_case="${2:-}"
   local storage_class provisioner pv_count
   require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_CLASS
   storage_class="$RUSTFS_FAULT_TEST_STORAGE_CLASS"
   provisioner="$(kubectl_cluster get storageclass "$storage_class" -o json | jq -r '.provisioner // ""')"
   [[ -n "$provisioner" ]] || die "StorageClass $storage_class has no provisioner"
 
-  if scenario_requires_static_storage "$scenario"; then
+  if [[ "$qualification_case" == fresh-volume-replacement-* ]]; then
+    [[ "$provisioner" == "kubernetes.io/no-provisioner" ]] || die "$qualification_case requires a no-provisioner StorageClass"
+  elif scenario_requires_static_storage "$scenario"; then
     [[ "$provisioner" == "kubernetes.io/no-provisioner" ]] || die "$scenario requires a no-provisioner StorageClass"
     pv_count="$(kubectl_cluster get pv -o json | jq -r --arg storage_class "$storage_class" '
       [.items[]
@@ -527,9 +643,16 @@ require_storage_class() {
 
 preflight() {
   local scenario="${1:-io-eio}"
-  local ready_nodes crd tool
+  local mode="${2:-executable}" qualification_case="${3:-}"
+  local ready_nodes crd tool target_config target_namespace target_helper_pod
   local disk_pressure_nodes
-  require_supported_scenario "$scenario"
+  if [[ "$mode" == "qualification" ]]; then
+    [[ "$scenario" == "$QUALIFICATION_SCENARIO" && "$qualification_case" == "$ACTIVE_QUALIFICATION_CASE" ]] \
+      || die "qualification preflight is not bound to the resolved case"
+  else
+    [[ "$mode" == "executable" && -z "$qualification_case" ]] || die "unsupported preflight mode: $mode"
+    require_supported_scenario "$scenario"
+  fi
 
   require_command cargo
   require_command jq
@@ -537,6 +660,10 @@ preflight() {
   require_command nice
   require_command pgrep
   validate_runtime_env_contract "$scenario"
+  if [[ "$mode" == "qualification" ]]; then
+    validate_qualification_env_contract \
+      "$qualification_case" "$scenario" "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
+  fi
   require_nonempty_env RUSTFS_FAULT_TEST_SERVER_IMAGE
 
   resolve_fault_context
@@ -553,7 +680,7 @@ preflight() {
     | .metadata.name] | join(",")')"
   [[ -z "$disk_pressure_nodes" ]] || die "node DiskPressure present before fault test: $disk_pressure_nodes"
 
-  require_storage_class "$scenario"
+  require_storage_class "$scenario" "$qualification_case"
   require_namespace_ownership
   require_non_fault_tenants_ready
 
@@ -566,13 +693,32 @@ preflight() {
   for tool in $(scenario_required_tools "$scenario"); do
     require_command "$tool"
   done
-  if scenario_requires_static_storage "$scenario"; then
+  if [[ "$scenario" == "on-disk-bitrot" && "$mode" == "qualification" ]]; then
+    target_config="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG"
+    target_namespace="$(jq -er '.volume.namespace | strings | select(length > 0)' "$target_config")" \
+      || die "bitrot target config lacks volume.namespace"
+    target_helper_pod="$(jq -er '.helperPodName | strings | select(length > 0)' "$target_config")" \
+      || die "bitrot target config lacks helperPodName"
+    [[ "$target_namespace" == "$FAULT_NAMESPACE" ]] \
+      || die "bitrot target config belongs to another namespace: $target_namespace"
+    kubectl_ns "$target_namespace" get pod "$target_helper_pod" >/dev/null \
+      || die "on-disk-bitrot requires its configured storage helper Pod"
+    kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 \
+      || die "on-disk-bitrot requires a pre-created owned fault namespace with privileged Pod Security"
+    [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
+      || die "on-disk-bitrot requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
+  elif scenario_requires_static_storage "$scenario"; then
     validate_dm_env_contract "$scenario"
     kubectl_cluster -n "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE" \
       get pod "$RUSTFS_FAULT_TEST_DM_OBSERVER_POD" >/dev/null \
       || die "$scenario requires the configured pre-provisioned host observer Pod"
     kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 || die "$scenario requires a pre-created owned fault namespace with privileged Pod Security"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] || die "$scenario requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
+  elif [[ "$qualification_case" == fresh-volume-replacement-* ]]; then
+    kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 \
+      || die "$qualification_case requires a pre-created owned fault namespace with privileged Pod Security"
+    [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
+      || die "$qualification_case requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
   fi
 
   echo "preflight passed: context=$FAULT_CONTEXT scenario=$scenario nodes=$ready_nodes storageClass=${RUSTFS_FAULT_TEST_STORAGE_CLASS} objects=$WORKLOAD_OBJECTS concurrency=$WORKLOAD_CONCURRENCY pods=$RUSTFS_POD_COUNT volume=$RUSTFS_VOLUME_PATH"
@@ -699,8 +845,28 @@ handle_signal() {
   else
     cleanup_managed_chaos
   fi
+  if [[ -n "$ACTIVE_QUALIFICATION_ROOT" ]]; then
+    write_qualification_result "$ACTIVE_QUALIFICATION_ROOT" interrupted 130 \
+      || warn_artifact_write_failed \
+        "qualification-result.json" "$ACTIVE_QUALIFICATION_ROOT/qualification-result.json"
+  fi
   cleanup_host_mutation_state
   exit 130
+}
+
+handle_exit() {
+  local rc=$? outcome=failed
+  trap - EXIT
+  if [[ -n "$ACTIVE_QUALIFICATION_ROOT" && ! -f "$ACTIVE_QUALIFICATION_ROOT/qualification-result.json" ]]; then
+    [[ "$rc" -ne 130 ]] || outcome=interrupted
+    write_qualification_result "$ACTIVE_QUALIFICATION_ROOT" "$outcome" "$rc" \
+      || warn_artifact_write_failed \
+        "qualification-result.json" "$ACTIVE_QUALIFICATION_ROOT/qualification-result.json"
+    echo "qualification outcome: $outcome" >&2
+    echo "qualification artifacts: $ACTIVE_QUALIFICATION_ROOT" >&2
+    echo "analyze with: make fault-qualify-analyze RUN_ROOT=$ACTIVE_QUALIFICATION_ROOT" >&2
+  fi
+  return "$rc"
 }
 
 capture_cluster_snapshot() {
@@ -995,11 +1161,40 @@ warn_artifact_write_failed() {
 }
 
 run_scenario() {
-  local scenario="$1" run_root="$2"
+  local scenario="$1" run_root="$2" qualification_kind="${3:-ordinary}" storage_case="${4:--}"
   local artifacts="$run_root/$scenario"
   local baseline_ready_nodes baseline_tenants test_pid rc current_time health_checks require_chaos
   local health_status health_safe health_message health_reason
   local consecutive_health_failures will_abort
+  local -a qualification_env
+  case "$qualification_kind" in
+    ordinary)
+      qualification_env=(
+        RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=
+        RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=
+        RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=
+      )
+      ;;
+    admin)
+      [[ "$storage_case" == "-" ]] || die "admin qualification cannot select a storage-recovery case"
+      qualification_env=(
+        RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=1
+        RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=
+        RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=
+      )
+      ;;
+    storage)
+      [[ "$storage_case" != "-" ]] || die "storage qualification requires an exact storage-recovery case"
+      qualification_env=(
+        RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=
+        RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=1
+        "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=$storage_case"
+      )
+      ;;
+    *)
+      die "unsupported qualification kind: $qualification_kind"
+      ;;
+  esac
   mkdir -p "$artifacts"
   baseline_ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
   baseline_tenants="$artifacts/baseline-non-fault-tenants.tsv"
@@ -1018,6 +1213,7 @@ run_scenario() {
   ACTIVE_NAME="$scenario"
   (
     set +e
+    env "${qualification_env[@]}" \
     RUSTFS_FAULT_TEST_DESTRUCTIVE=1 \
     RUSTFS_FAULT_TEST_SCENARIO="$scenario" \
     RUSTFS_FAULT_TEST_WORKLOAD_OBJECTS="$WORKLOAD_OBJECTS" \
@@ -1139,6 +1335,199 @@ run_one() {
 run_dm() {
   local scenario="$1"
   run_one "$scenario" dm
+}
+
+new_qualification_run_root() {
+  local qualification_case="$1"
+  if [[ -n "${RUSTFS_FAULT_TEST_RUN_ROOT:-}" ]]; then
+    echo "$RUSTFS_FAULT_TEST_RUN_ROOT"
+  else
+    echo "$PACKAGE_DIR/target/fault-tests/qualifications/$(date -u +%Y%m%dT%H%M%SZ)-$qualification_case"
+  fi
+}
+
+write_qualification_plan() {
+  local run_root="$1" qualification_case="$2" scenario="$3" kind="$4" storage_case="$5"
+  local storage_case_json=null target temporary
+  target="$run_root/qualification-plan.json"
+  temporary="$(mktemp "$run_root/.qualification-plan.XXXXXX")"
+  if [[ "$storage_case" != "-" ]]; then
+    storage_case_json="$(jq -Rn --arg value "$storage_case" '$value')"
+  fi
+  if jq -n \
+    --arg qualification_case "$qualification_case" \
+    --arg scenario "$scenario" \
+    --arg kind "$kind" \
+    --argjson storage_case "$storage_case_json" \
+    --arg run_root "$run_root" \
+    --arg artifact_root "$run_root/$scenario" \
+    --arg created_at "$(date -u +%FT%TZ)" \
+    '{
+      schemaVersion: 1,
+      qualificationCase: $qualification_case,
+      scenario: $scenario,
+      kind: $kind,
+      storageRecoveryCase: $storage_case,
+      runRoot: $run_root,
+      artifactRoot: $artifact_root,
+      createdAt: $created_at
+    }' >"$temporary"; then
+    mv "$temporary" "$target"
+  else
+    local rc=$?
+    rm -f "$temporary"
+    return "$rc"
+  fi
+}
+
+write_qualification_result() {
+  local run_root="$1" outcome="$2" exit_code="$3" target temporary
+  target="$run_root/qualification-result.json"
+  temporary="$(mktemp "$run_root/.qualification-result.XXXXXX")"
+  if jq -n \
+    --arg outcome "$outcome" \
+    --argjson exit_code "$exit_code" \
+    --arg completed_at "$(date -u +%FT%TZ)" \
+    '{
+      schemaVersion: 1,
+      outcome: $outcome,
+      exitCode: $exit_code,
+      completedAt: $completed_at
+    }' >"$temporary"; then
+    mv "$temporary" "$target"
+  else
+    local rc=$?
+    rm -f "$temporary"
+    return "$rc"
+  fi
+}
+
+run_qualification() {
+  local qualification_case="$1" run_root rc outcome
+  resolve_qualification_case "$qualification_case"
+  ACTIVE_QUALIFICATION_CASE="$qualification_case"
+  run_root="$(new_qualification_run_root "$qualification_case")"
+  if [[ -d "$run_root" && -n "$(find "$run_root" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+    die "qualification run root already exists and is not empty: $run_root"
+  fi
+  mkdir -p "$run_root"
+  run_root="$(cd "$run_root" && pwd -P)"
+  ACTIVE_QUALIFICATION_ROOT="$run_root"
+  initialize_summary "$run_root"
+  write_qualification_plan \
+    "$run_root" "$qualification_case" "$QUALIFICATION_SCENARIO" \
+    "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
+  echo "qualification run root: $run_root"
+  echo "live console: make fault-console-serve CONSOLE_ROOT=$run_root"
+  build_fault_binary "$run_root" "qualification=$qualification_case"
+  is_planned_scenario "$QUALIFICATION_SCENARIO" \
+    || die "qualification scenario is no longer Planned: $QUALIFICATION_SCENARIO"
+  preflight "$QUALIFICATION_SCENARIO" qualification "$qualification_case"
+  echo "s3chaos planned qualification binary ready: case=$qualification_case"
+
+  rc=0
+  if run_scenario \
+    "$QUALIFICATION_SCENARIO" "$run_root" "$QUALIFICATION_KIND" \
+    "$QUALIFICATION_STORAGE_CASE"; then
+    outcome=passed
+  else
+    rc=$?
+    outcome=failed
+  fi
+  write_qualification_result "$run_root" "$outcome" "$rc"
+  ACTIVE_QUALIFICATION_ROOT=""
+  ACTIVE_QUALIFICATION_CASE=""
+  echo "qualification outcome: $outcome"
+  echo "qualification artifacts: $run_root"
+  echo "analyze with: make fault-qualify-analyze RUN_ROOT=$run_root"
+  return "$rc"
+}
+
+analyze_qualification() {
+  local run_root="$1" plan result console_snapshot qualification_case contract scenario kind storage_case rc
+  require_command cargo
+  require_command jq
+  require_command mktemp
+  [[ -d "$run_root" ]] || die "qualification run root does not exist: $run_root"
+  run_root="$(cd "$run_root" && pwd -P)"
+  plan="$run_root/qualification-plan.json"
+  [[ -f "$plan" ]] || die "qualification run lacks qualification-plan.json: $run_root"
+  jq -e --arg run_root "$run_root" '
+    .schemaVersion == 1
+    and (.qualificationCase | type == "string" and length > 0)
+    and (.scenario | type == "string" and length > 0)
+    and (.kind == "admin" or .kind == "storage")
+    and .runRoot == $run_root
+    and .artifactRoot == ($run_root + "/" + .scenario)
+  ' "$plan" >/dev/null || die "qualification-plan.json is invalid or belongs to another run root"
+  qualification_case="$(jq -r '.qualificationCase' "$plan")"
+  if ! contract="$(qualification_case_contract "$qualification_case")"; then
+    die "qualification-plan.json names an unsupported qualification case"
+  fi
+  IFS='|' read -r scenario kind storage_case <<<"$contract"
+  jq -e \
+    --arg scenario "$scenario" \
+    --arg kind "$kind" \
+    --arg storage_case "$storage_case" '
+      .scenario == $scenario
+      and .kind == $kind
+      and (
+        if $storage_case == "-"
+        then .storageRecoveryCase == null
+        else .storageRecoveryCase == $storage_case
+        end
+      )
+    ' "$plan" >/dev/null || die "qualification-plan.json contradicts the closed case contract"
+  result="$run_root/qualification-result.json"
+  if [[ -f "$result" ]]; then
+    jq -e '
+      .schemaVersion == 1
+      and (.completedAt | type == "string" and length > 0)
+      and (.exitCode | type == "number" and floor == . and . >= 0)
+      and (
+        (.outcome == "passed" and .exitCode == 0)
+        or (.outcome == "failed" and .exitCode > 0)
+        or (.outcome == "interrupted" and .exitCode == 130)
+      )
+    ' "$result" >/dev/null || die "qualification-result.json is invalid"
+  fi
+  console_snapshot="$(mktemp /tmp/s3chaos-qualification-console.XXXXXX)"
+  if ! s3chaos_cli fault-console-json "$run_root" >"$console_snapshot"; then
+    rm -f "$console_snapshot"
+    die "failed to build the qualification console snapshot"
+  fi
+  if [[ -f "$result" ]]; then
+    if jq -n \
+      --slurpfile qualification_plan "$plan" \
+      --slurpfile qualification_result "$result" \
+      --slurpfile console "$console_snapshot" \
+      '{
+        schemaVersion: 1,
+        qualificationPlan: $qualification_plan[0],
+        qualificationResult: $qualification_result[0],
+        console: $console[0]
+      }'; then
+      rc=0
+    else
+      rc=$?
+    fi
+  else
+    if jq -n \
+      --slurpfile qualification_plan "$plan" \
+      --slurpfile console "$console_snapshot" \
+      '{
+        schemaVersion: 1,
+        qualificationPlan: $qualification_plan[0],
+        qualificationResult: null,
+        console: $console[0]
+      }'; then
+      rc=0
+    else
+      rc=$?
+    fi
+  fi
+  rm -f "$console_snapshot"
+  return "$rc"
 }
 
 preflight_suite() {
@@ -1397,6 +1786,7 @@ if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
 fi
 
 trap handle_signal INT TERM HUP
+trap handle_exit EXIT
 
 case "${1:-help}" in
   help|-h|--help)
@@ -1428,6 +1818,20 @@ case "${1:-help}" in
   list)
     [[ -z "${2:-}" ]] || die "list does not accept arguments; run a named scenario with: fault-test.sh run <scenario>"
     list_scenarios
+    ;;
+  qualify-list)
+    [[ -z "${2:-}" ]] || die "qualify-list does not accept arguments"
+    list_qualification_cases
+    ;;
+  qualify)
+    [[ -n "${2:-}" ]] || die "qualification case is required"
+    [[ -z "${3:-}" ]] || die "qualify accepts exactly one qualification case"
+    run_qualification "$2"
+    ;;
+  qualify-analyze)
+    [[ -n "${2:-}" ]] || die "qualification run root is required"
+    [[ -z "${3:-}" ]] || die "qualify-analyze accepts exactly one run root"
+    analyze_qualification "$2"
     ;;
   suite-template)
     [[ -z "${2:-}" ]] || die "suite-template does not accept arguments"

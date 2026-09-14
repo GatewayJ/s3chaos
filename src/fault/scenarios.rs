@@ -1176,7 +1176,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         status: FaultScenarioStatus::Planned,
         workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
         isolation: FaultIsolation::FreshTenant,
-        crds: &[],
+        crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
@@ -1687,9 +1687,10 @@ mod tests {
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO,
-        DetectorQualification, DurabilityBugFamily, FaultDetectorContract, FaultParameterSchema,
-        FaultScenario, FaultScenarioStatus, FaultScenarioWorkloadProfile, IO_EIO_SCENARIO,
-        IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
+        DetectorQualification, DurabilityBugFamily, FRESH_VOLUME_REPLACEMENT_SCENARIO,
+        FaultDetectorContract, FaultParameterSchema, FaultScenario, FaultScenarioStatus,
+        FaultScenarioWorkloadProfile, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IOCHAOS_CRD,
+        NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, ON_DISK_BITROT_SCENARIO,
         POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
         POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
@@ -1839,6 +1840,28 @@ mod tests {
         config.storage_recovery_case =
             Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAdminDeep);
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
+    }
+
+    #[test]
+    fn planned_storage_catalog_declares_runtime_chaos_dependencies() {
+        assert_eq!(
+            scenario_spec(FRESH_VOLUME_REPLACEMENT_SCENARIO)
+                .expect("fresh-volume scenario")
+                .crds,
+            &[IOCHAOS_CRD]
+        );
+        assert_eq!(
+            scenario_spec(ON_DISK_BITROT_SCENARIO)
+                .expect("bitrot scenario")
+                .crds,
+            &[IOCHAOS_CRD]
+        );
+        assert!(
+            scenario_spec(STALE_DISK_RETURN_DETECT_SCENARIO)
+                .expect("stale-disk scenario")
+                .crds
+                .is_empty()
+        );
     }
 
     #[test]
