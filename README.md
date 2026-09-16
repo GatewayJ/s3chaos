@@ -63,7 +63,7 @@ scenario:
 
 ```bash
 make fault-list                                      # executable scenario list
-make fault-chaos-run                                 # canonical 19-attempt suite
+make fault-chaos-run                                 # canonical 20-attempt suite
 make fault-dm-run SCENARIO=dm-flakey-versioned-hot  # one supervised DM run
 make fault-console-serve                             # browse run artifacts
 
@@ -167,10 +167,10 @@ execution environments and verdicts separate:
 
 | Suite | Scope | Additional requirement |
 | --- | --- | --- |
-| `chaos-mesh.yaml` | Canonical 19-attempt correctness run: smoke, regression, and four typed quorum checks | Dedicated cluster with Chaos Mesh; reference four-server single-erasure-set topology for the write-quorum boundary |
+| `chaos-mesh.yaml` | Canonical 20-attempt correctness run: smoke, regression, four typed quorum checks, and the two-Pod quorum edge | Dedicated cluster with Chaos Mesh; reference four-server single-erasure-set topology for the write-quorum boundary |
 | `smoke.yaml` | Six short correctness and recovery checks across I/O, pod, and network faults | Dedicated cluster with Chaos Mesh |
 | `regression.yaml` | Remaining ordinary Chaos Mesh scenarios, including the write-quorum boundary | Reference four-server single-erasure-set topology for `network-partition-write-quorum-loss` |
-| `quorum-reliability.yaml` | Four payload/metadata checks at the P and P+1 volume boundaries | Reference four-server single-erasure-set topology |
+| `quorum-reliability.yaml` | Four payload/metadata checks at the P and P+1 volume boundaries, plus the two-Pod quorum edge | Reference four-server single-erasure-set topology |
 | `restart.yaml` | Graceful single-Pod restart, ordered rolling restart, and held cold restart driven through kubectl (no Chaos Mesh, so run it with `make fault-suite-run`; `fault-chaos-run` rejects it) | StatefulSet-managed Tenant; `cluster-cold-restart` also needs `RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT` naming the RustFS operator Deployment it pauses |
 | `warp-performance.yaml` | Performance-only Warp-under-chaos campaign; correctness still comes from the normal checker | `warp` on `PATH`; Warp defaults to 60 seconds |
 
