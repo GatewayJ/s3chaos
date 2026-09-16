@@ -1768,6 +1768,7 @@ pub(in crate::fault) fn requires_prefault_multipart_staging(scenario: &str) -> b
     matches!(
         scenario,
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+            | POD_FAILURE_QUORUM_EDGE_SCENARIO
             | QUORUM_P_IO_FAULT_SCENARIO
             | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
     )
@@ -2213,6 +2214,10 @@ mod tests {
         assert!(requires_prefault_multipart_staging(
             NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
         ));
+        assert!(requires_prefault_multipart_staging(
+            POD_FAILURE_QUORUM_EDGE_SCENARIO
+        ));
+        assert!(!requires_prefault_multipart_staging(POD_FAILURE_SCENARIO));
         assert!(requires_prefault_multipart_staging(
             QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
         ));

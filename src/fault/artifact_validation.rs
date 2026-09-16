@@ -121,7 +121,7 @@ use crate::fault::{
     workload::execution::{
         AVAILABILITY_REPORT_ARTIFACT, AvailabilityReport, FamilyAvailability,
         POST_RECOVERY_WRITE_HISTORY_ARTIFACT, POST_RECOVERY_WRITE_REPORT_ARTIFACT,
-        PostRecoveryWriteReport, QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, ReadProbeSummary,
+        PostRecoveryWriteReport, QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, QuorumEdgeReadSurvivalReport,
         post_recovery_object_count,
     },
     workload::{
@@ -1773,7 +1773,14 @@ fn validate_fault_artifacts_with_identity(
         )?;
     }
     if scenarios::requires_quorum_edge_read_survival(&options.scenario) {
-        validate_quorum_edge_read_survival_artifact(&artifacts, workload_plan.object_count)?;
+        validate_quorum_edge_read_survival_artifact(
+            &artifacts,
+            &metadata,
+            identity,
+            &evidence,
+            &json_spec.metadata.bucket,
+            workload_plan.object_count,
+        )?;
     }
     if requires_write_quorum_loss_history(&options.scenario) {
         let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
@@ -5035,22 +5042,110 @@ fn requires_write_quorum_loss_history(scenario: &str) -> bool {
     )
 }
 
+/// The report must belong to this run, cover the whole prefilled cohort, and
+/// be re-derivable from `history.jsonl`: every prefilled key has exactly one
+/// fault-active GET before the mixed workload, returning its prefill bytes.
 fn validate_quorum_edge_read_survival_artifact(
     artifacts: &BTreeMap<String, PathBuf>,
+    metadata: &RunMetadataArtifact,
+    identity: ArtifactIdentityPolicy<'_>,
+    evidence: &FaultEvidenceArtifact,
+    bucket: &str,
     workload_object_count: usize,
 ) -> Result<()> {
-    let survival =
-        read_json::<ReadProbeSummary>(required(artifacts, QUORUM_EDGE_READ_SURVIVAL_ARTIFACT)?)?;
+    let report = read_json::<QuorumEdgeReadSurvivalReport>(required(
+        artifacts,
+        QUORUM_EDGE_READ_SURVIVAL_ARTIFACT,
+    )?)?;
+    validate_optional_identity_fields(
+        QUORUM_EDGE_READ_SURVIVAL_ARTIFACT,
+        Some(report.scenario.as_str()),
+        Some(report.run_id.as_str()),
+        metadata,
+        identity,
+    )?;
+    let survival = &report.probe;
     survival
         .require_complete_survival()
         .with_context(|| format!("{QUORUM_EDGE_READ_SURVIVAL_ARTIFACT} did not pass"))?;
-    // Bound to the whole prefilled cohort so a truncated probe cannot claim
-    // survival for objects it never read.
     let prefilled = workload_object_count / 2;
     ensure!(
         survival.objects == prefilled,
         "{QUORUM_EDGE_READ_SURVIVAL_ARTIFACT} covers {} objects, but the prefilled cohort has {prefilled}",
         survival.objects
+    );
+
+    let fault_active_at_ms = evidence
+        .fault_active_at_ms
+        .context("fault-evidence.json fault_active_at_ms is required")?;
+    let workload_started_at_ms = evidence
+        .workload_started_at_ms
+        .context("fault-evidence.json workload_started_at_ms is required")?;
+    let history = read_jsonl::<OperationRecord>(required(artifacts, "history.jsonl")?)?;
+    let in_run = |record: &&OperationRecord| {
+        record.scenario == metadata.scenario
+            && record.run_id.as_deref() == Some(metadata.run_id.as_str())
+            && record.bucket == bucket
+    };
+    let workload_prefix = crate::fault::workload::ObjectSpec::key_prefix(&metadata.run_id);
+    let mut prefill = BTreeMap::<&str, &str>::new();
+    for record in history.iter().filter(in_run).filter(|record| {
+        record.kind == OperationKind::Put
+            && record.outcome == OperationOutcome::Ok
+            && record.durability_cohort == Some(DurabilityCohort::PreFault)
+    }) {
+        let Some(key) = record
+            .key
+            .as_deref()
+            .filter(|key| key.starts_with(&workload_prefix))
+        else {
+            continue;
+        };
+        let sha256 = record.value_sha256.as_deref().with_context(|| {
+            format!(
+                "history.jsonl prefill PUT {} records no payload hash",
+                record.id
+            )
+        })?;
+        ensure!(
+            prefill.insert(key, sha256).is_none(),
+            "history.jsonl records more than one prefill PUT for {key:?}"
+        );
+    }
+    ensure!(
+        prefill.len() == prefilled,
+        "history.jsonl records {} prefilled keys, but the workload plan prefills {prefilled}",
+        prefill.len()
+    );
+    let mut probed = BTreeMap::<&str, bool>::new();
+    for record in history.iter().filter(in_run).filter(|record| {
+        record.kind == OperationKind::Get
+            && record.durability_cohort == Some(DurabilityCohort::FaultActive)
+            && record.fault_window_relation == Some(FaultWindowRelation::DuringFault)
+            && record.started_at_ms >= fault_active_at_ms
+            && record.ended_at_ms <= workload_started_at_ms
+    }) {
+        let Some((key, sha256)) = record
+            .key
+            .as_deref()
+            .and_then(|key| prefill.get_key_value(key))
+        else {
+            continue;
+        };
+        let verified = record.outcome == OperationOutcome::Ok
+            && record.range.is_none()
+            && record.value_sha256.as_deref() == Some(*sha256);
+        ensure!(
+            probed.insert(key, verified).is_none(),
+            "history.jsonl holds more than one fault-active probe read of {key:?}"
+        );
+    }
+    let verified = probed.values().filter(|verified| **verified).count();
+    ensure!(
+        probed.len() == prefilled && verified == survival.verified,
+        "history.jsonl proves {verified} verified probe reads over {} of {prefilled} prefilled keys, but {QUORUM_EDGE_READ_SURVIVAL_ARTIFACT} claims {} verified",
+        probed.len(),
+        survival.verified
     );
     Ok(())
 }
@@ -17067,25 +17162,143 @@ mod tests {
     #[test]
     fn quorum_edge_read_survival_artifact_must_cover_the_whole_cohort() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let validate = |summary: serde_json::Value| {
-            write_json(dir.path(), QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, &summary);
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        let scenario = POD_FAILURE_QUORUM_EDGE_SCENARIO;
+        let bucket = "bucket";
+        let metadata = RunMetadataArtifact {
+            scenario: scenario.to_string(),
+            run_id: run_id.to_string(),
+            context: "real-cluster".to_string(),
+            namespace: "rustfs-fault-test".to_string(),
+            tenant: "fault-tenant".to_string(),
+            storage_class: "fast-csi".to_string(),
+            rustfs_image: "rustfs:test".to_string(),
+            workload_objects: 12,
+            workload_concurrency: 4,
+            require_client_disruption: true,
+            recovery_stability_reread_seconds: 60,
+            min_availability_percent: None,
+        };
+        let evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
+            "scenario": scenario,
+            "run_id": run_id,
+            "injected": true,
+            "active_during_workload": true,
+            "recovered": true,
+            "require_client_disruption": true,
+            "client_disruptions": 3,
+            "pods_before": [],
+            "pods_after": [],
+            "active_snapshots": [],
+            "workload_snapshots": [],
+            "fault_active_at_ms": 100,
+            "workload_started_at_ms": 200
+        }))
+        .expect("evidence");
+        let record =
+            |id: usize, kind: &str, index: usize, sha: String, cohort: &str, at_ms: u64| {
+                let mut record = json!({
+                    "id": format!("op-{id:06}"),
+                    "scenario": scenario,
+                    "run_id": run_id,
+                    "kind": kind,
+                    "bucket": bucket,
+                    "key": ObjectSpec::seeded_key(run_id, index),
+                    "value_sha256": sha,
+                    "started_at_ms": at_ms,
+                    "ended_at_ms": at_ms,
+                    "outcome": "ok",
+                    "durability_cohort": cohort
+                });
+                if cohort == "fault_active" {
+                    record["fault_window_relation"] = json!("during_fault");
+                }
+                record
+            };
+        let prefill = (0..6)
+            .map(|index| record(index, "put", index, format!("sha-{index}"), "pre_fault", 10))
+            .collect::<Vec<_>>();
+        let probe =
+            |index: usize, sha: String| record(100 + index, "get", index, sha, "fault_active", 150);
+        let validate = |report: serde_json::Value, history: &[serde_json::Value]| {
+            write_json(dir.path(), QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, &report);
+            fs::write(
+                dir.path().join("history.jsonl"),
+                history
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .expect("history");
             validate_quorum_edge_read_survival_artifact(
-                &BTreeMap::from([(
-                    QUORUM_EDGE_READ_SURVIVAL_ARTIFACT.to_string(),
-                    dir.path().join(QUORUM_EDGE_READ_SURVIVAL_ARTIFACT),
-                )]),
+                &BTreeMap::from([
+                    (
+                        QUORUM_EDGE_READ_SURVIVAL_ARTIFACT.to_string(),
+                        dir.path().join(QUORUM_EDGE_READ_SURVIVAL_ARTIFACT),
+                    ),
+                    (
+                        "history.jsonl".to_string(),
+                        dir.path().join("history.jsonl"),
+                    ),
+                ]),
+                &metadata,
+                ArtifactIdentityPolicy::LegacyCompatible,
+                &evidence,
+                bucket,
                 12,
             )
         };
+        let report = |objects: usize, verified: usize, failures: &[&str]| {
+            json!({
+                "scenario": scenario,
+                "run_id": run_id,
+                "objects": objects,
+                "verified": verified,
+                "failures": failures
+            })
+        };
+        let complete = prefill
+            .iter()
+            .cloned()
+            .chain((0..6).map(|index| probe(index, format!("sha-{index}"))))
+            .collect::<Vec<_>>();
 
-        validate(json!({"objects": 6, "verified": 6, "failures": []}))
-            .expect("complete cohort survived");
+        validate(report(6, 6, &[]), &complete).expect("complete cohort survived");
         // A probe that read only part of the cohort proves nothing about the rest.
-        assert!(validate(json!({"objects": 1, "verified": 1, "failures": []})).is_err());
-        assert!(validate(json!({"objects": 6, "verified": 5, "failures": ["k: 503"]})).is_err());
-        assert!(validate(json!({"objects": 6, "verified": 6, "failures": ["k: 503"]})).is_err());
+        assert!(validate(report(1, 1, &[]), &complete).is_err());
+        assert!(validate(report(6, 5, &["k: 503"]), &complete).is_err());
+        assert!(validate(report(6, 6, &["k: 503"]), &complete).is_err());
+        // An artifact from another run.
+        let mut foreign = report(6, 6, &[]);
+        foreign["run_id"] = json!("run-00000000-0000-4000-8000-000000000002");
+        assert!(validate(foreign, &complete).is_err());
+        // Passing counters that this run's history does not back.
         assert!(
-            validate_quorum_edge_read_survival_artifact(&BTreeMap::new(), 12).is_err(),
+            validate(report(6, 6, &[]), &prefill).is_err(),
+            "no probe reads"
+        );
+        let mut wrong_bytes = complete.clone();
+        wrong_bytes[8]["value_sha256"] = json!("sha-other");
+        assert!(validate(report(6, 6, &[]), &wrong_bytes).is_err());
+        let mut after_workload_start = complete.clone();
+        after_workload_start[9]["started_at_ms"] = json!(250);
+        after_workload_start[9]["ended_at_ms"] = json!(250);
+        assert!(validate(report(6, 6, &[]), &after_workload_start).is_err());
+        let mut duplicated = complete.clone();
+        duplicated.push(probe(0, "sha-0".to_string()));
+        duplicated.last_mut().expect("record")["id"] = json!("op-000999");
+        assert!(validate(report(6, 6, &[]), &duplicated).is_err());
+        assert!(
+            validate_quorum_edge_read_survival_artifact(
+                &BTreeMap::new(),
+                &metadata,
+                ArtifactIdentityPolicy::LegacyCompatible,
+                &evidence,
+                bucket,
+                12,
+            )
+            .is_err(),
             "a missing artifact must fail closed"
         );
     }

@@ -2908,6 +2908,16 @@ pub(in crate::fault) struct ReadProbeSummary {
     pub(in crate::fault) failures: Vec<String>,
 }
 
+/// The quorum-edge read probe as persisted: the counters plus the run they
+/// belong to, so an artifact from another run cannot be substituted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::fault) struct QuorumEdgeReadSurvivalReport {
+    pub(in crate::fault) scenario: String,
+    pub(in crate::fault) run_id: String,
+    #[serde(flatten)]
+    pub(in crate::fault) probe: ReadProbeSummary,
+}
+
 impl ReadProbeSummary {
     /// Every object committed before the fault must still read back with its
     /// committed bytes. Used where read quorum survives by construction, so
