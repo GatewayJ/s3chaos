@@ -964,7 +964,7 @@ scenarios:
                 .iter()
                 .map(|scenario| scenario.repetitions)
                 .sum::<usize>(),
-            19
+            20
         );
         assert!(
             suite.scenarios.iter().all(|scenario| {

@@ -40,6 +40,7 @@ pub const IO_READ_MISTAKE_SCENARIO: &str = "io-read-mistake";
 pub const IO_LATENCY_SCENARIO: &str = "io-latency";
 pub const DISK_FULL_SCENARIO: &str = "disk-full";
 pub const POD_FAILURE_SCENARIO: &str = "pod-failure";
+pub const POD_FAILURE_QUORUM_EDGE_SCENARIO: &str = "pod-failure-quorum-edge";
 pub const STRESS_CPU_SCENARIO: &str = "stress-cpu";
 pub const STRESS_MEMORY_SCENARIO: &str = "stress-memory";
 pub const DM_FLAKEY_SCENARIO: &str = "dm-flakey";
@@ -136,6 +137,15 @@ impl FaultScenarioWorkloadProfile {
             }
         }
     }
+}
+
+/// Scenarios held exactly at the read-quorum boundary: the fault must break
+/// write quorum, so the mixed workload cannot carry an availability floor, but
+/// every object committed before the fault must still read back with its
+/// committed bytes while the fault is active. Losing those reads is a quorum
+/// regression, not expected disruption.
+pub fn requires_quorum_edge_read_survival(scenario: &str) -> bool {
+    scenario == POD_FAILURE_QUORUM_EDGE_SCENARIO
 }
 
 pub fn acknowledged_mutation_kind(scenario: &str) -> Option<AcknowledgedMutationKind> {
@@ -424,6 +434,7 @@ impl FaultScenarioSpec {
             self.scenario,
             IO_EIO_SCENARIO
                 | NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+                | POD_FAILURE_QUORUM_EDGE_SCENARIO
                 | QUORUM_P_IO_FAULT_SCENARIO
                 | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
         )
@@ -775,6 +786,36 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         validation: "the failed Pod recovers, Tenant returns Ready, every committed object remains readable with its hash while one Pod is down and the mixed workload meets the availability floor, RustFS reports every drive ok and every Pod ready after recovery, fresh post-recovery writes succeed, and the S3 object model remains explainable",
         observability: "history.jsonl, checker reports, podchaos manifest/describe/yaml, Pod restart counts, current and previous RustFS logs",
         conflict_domain: "run-scoped PodChaos resource and one target Pod; can reuse a ready Tenant after the prior scenario has cleaned up",
+    },
+    FaultScenarioSpec {
+        scenario: POD_FAILURE_QUORUM_EDGE_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::QuorumViolation,
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
+        case_name: "fault_pod_failure_quorum_edge_keeps_reads_and_rejects_writes",
+        description: "Fail two RustFS Pods at once after a bounded-age RustFS admin runtime snapshot proves their drive membership in one symmetric erasure set leaves the surviving shards at read quorum but below write quorum (the parity boundary of a four-server EC 2+2 set; geometries where two servers are not that boundary fail closed), and verify committed reads survive while every mutation is rejected.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::ChaosMeshPodChaos,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[PODCHAOS_CRD],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        boundary: "rustfs-workload/pod-failure-quorum-edge",
+        ci_phase: "faults",
+        target: "exactly two RustFS Pods selected by tenant label and failed for the scenario duration; the actual injected PodChaos records at activation and after workload must identify servers whose runtime drive membership crosses the write-quorum boundary while retaining read quorum",
+        target_proof: &[
+            "live target proof must bind Tenant geometry and unique Ready Pod identities to bounded-age RustFS admin runtime set/parity and server/drive data before fault activation",
+            "the selected target set must contain exactly the planned number of RustFS Pods, recorded with their UIDs alongside the complete non-target Pod set",
+        ],
+        validation: "the runner proves the actual two-Pod failure leaves read quorum but not write quorum at activation, every committed object stays readable with its committed bytes while the Pods are down, every PUT, DELETE, and multipart completion during the outage fails, times out, or remains unknown, successful reads never return wrong hashes, and after recovery RustFS reports every drive ok, fresh post-recovery writes succeed, and the S3 object model remains explainable",
+        observability: "quorum-edge-read-survival.json, target-proof.json, history.jsonl, workload-summary.json, checker reports, recovery-health.json, podchaos manifest/describe/yaml, Pod restart counts, current and previous RustFS logs",
+        conflict_domain: "run-scoped PodChaos resource and two target Pods; must not overlap with IOChaos or NetworkChaos in the same Tenant",
     },
     FaultScenarioSpec {
         scenario: STRESS_CPU_SCENARIO,
@@ -1761,10 +1802,11 @@ mod tests {
         FaultScenarioWorkloadProfile, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IOCHAOS_CRD,
         NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, ON_DISK_BITROT_SCENARIO,
-        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
-        POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
-        ROLLING_RESTART_ALL_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO,
-        acknowledged_mutation_kind, apply_catalog_defaults, executable_scenario_catalog,
+        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO, POD_FAILURE_SCENARIO,
+        POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, ROLLING_RESTART_ALL_SCENARIO,
+        STALE_DISK_RETURN_DETECT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, acknowledged_mutation_kind,
+        apply_catalog_defaults, executable_scenario_catalog,
         expected_workload_versioning_for_scenario, planned_qualification_catalog_json,
         requires_prefault_multipart_staging, scenario_catalog, scenario_catalog_json,
         scenario_spec,
@@ -1846,8 +1888,8 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 28);
-        assert_eq!(scenario_catalog().len(), 33);
+        assert_eq!(executable_scenario_catalog().count(), 29);
+        assert_eq!(scenario_catalog().len(), 34);
         assert_eq!(
             scenario_catalog()
                 .iter()
@@ -2257,6 +2299,7 @@ mod tests {
             vec![
                 IO_EIO_SCENARIO,
                 NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+                POD_FAILURE_QUORUM_EDGE_SCENARIO,
                 QUORUM_P_IO_FAULT_SCENARIO,
                 QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
             ]
@@ -2321,6 +2364,30 @@ mod tests {
             super::FaultImpactPolicy::AvailabilityRequired.as_str(),
             "availability-required"
         );
+    }
+
+    #[test]
+    fn quorum_edge_pod_failure_breaks_writes_but_must_keep_reads() {
+        let spec = scenario_spec(POD_FAILURE_QUORUM_EDGE_SCENARIO).expect("scenario");
+        assert_eq!(spec.status, FaultScenarioStatus::Executable);
+        assert_eq!(spec.backend, super::FaultBackend::ChaosMeshPodChaos);
+        assert_eq!(spec.priority, super::FaultPriority::P0);
+        assert!(spec.requires_erasure_set_proof());
+        // Write quorum is gone, so no availability floor can apply to the
+        // mixed workload, but the committed cohort must still read back.
+        assert!(spec.impact_policy.requires_client_disruption());
+        assert!(!spec.impact_policy.requires_availability());
+        assert!(spec.impact_policy.availability_floor_percent().is_none());
+        assert!(super::requires_quorum_edge_read_survival(
+            POD_FAILURE_QUORUM_EDGE_SCENARIO
+        ));
+        for other in [
+            POD_FAILURE_SCENARIO,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+            QUORUM_P_IO_FAULT_SCENARIO,
+        ] {
+            assert!(!super::requires_quorum_edge_read_survival(other), "{other}");
+        }
     }
 
     #[test]

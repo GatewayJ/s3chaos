@@ -41,3 +41,6 @@ scenarios:
     params:
       kind: quorumIo
       class: metadata
+  - name: pod-failure-quorum-edge
+    faultDuration: 15m
+    workloadProfile: quorum

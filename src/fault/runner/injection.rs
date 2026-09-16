@@ -26,8 +26,9 @@ use crate::{
         history::DurabilityCohort,
         quorum::require_fresh_runtime_observation,
         scenarios::{
-            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
-            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, requires_prefault_multipart_staging,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO,
+            QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+            requires_prefault_multipart_staging, requires_quorum_edge_read_survival,
         },
     },
     framework::resources,
@@ -44,7 +45,8 @@ use super::access::{
 const PORT_FORWARD_ESTABLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 use super::targets::{
     FixedVolumeTargets, observe_volume_quorum_health, require_active_fixed_volume_targets,
-    require_active_write_quorum_partition, volume_quorum_boundary,
+    require_active_pod_failure_quorum_edge, require_active_write_quorum_partition,
+    volume_quorum_boundary,
 };
 use super::{
     ActiveFault, FaultRun, FaultWorkload, PreparedWorkload, ProvenTarget, WorkloadTargetEvidence,
@@ -52,10 +54,10 @@ use super::{
 };
 use crate::fault::backends::runtime::apply_fault;
 use crate::fault::workload::execution::{
-    AVAILABILITY_REPORT_ARTIFACT, MixedWorkloadRequest, MixedWorkloadResult, ReadProbeSummary,
-    TypedQuorumReadCohortSource, TypedQuorumReadExpectation, probe_read_cohort,
-    probe_typed_quorum_read_cohort, require_typed_quorum_read_survival, run_mixed_workload,
-    run_warp_mixed,
+    AVAILABILITY_REPORT_ARTIFACT, MixedWorkloadRequest, MixedWorkloadResult,
+    QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, ReadProbeSummary, TypedQuorumReadCohortSource,
+    TypedQuorumReadExpectation, probe_read_cohort, probe_typed_quorum_read_cohort,
+    require_typed_quorum_read_survival, run_mixed_workload, run_warp_mixed,
 };
 
 impl FaultRun<'_> {
@@ -141,31 +143,41 @@ impl FaultRun<'_> {
         let events = &self.context.events;
         let (fault_active_at_ms, active_snapshots) =
             self.wait_active_fault(&fault, known_fault_active_at_ms)?;
-        let (pods_at_fault_activation, active_partition_targets) =
-            if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
-                match require_active_write_quorum_partition(
+        let quorum_edge_proof = match plan.scenario.as_str() {
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO => {
+                Some(require_active_write_quorum_partition(
                     config,
                     run_id,
                     plan,
                     &target.pods_before,
                     &target.target_proof,
                     &active_snapshots,
-                ) {
-                    Ok(evidence) => evidence,
-                    Err(error) => {
-                        self.record_failure(
-                            "fault-snapshot-active",
-                            "environment_or_fault_backend",
-                            &error,
-                            None,
-                            Some((&fault, "active-target-evidence-failed")),
-                        )?;
-                        return Err(error);
-                    }
-                }
-            } else {
-                (Vec::new(), BTreeSet::new())
-            };
+                ))
+            }
+            POD_FAILURE_QUORUM_EDGE_SCENARIO => Some(require_active_pod_failure_quorum_edge(
+                config,
+                run_id,
+                plan,
+                &target.pods_before,
+                &target.target_proof,
+                &active_snapshots,
+            )),
+            _ => None,
+        };
+        let (pods_at_fault_activation, active_partition_targets) = match quorum_edge_proof {
+            Some(Ok(evidence)) => evidence,
+            Some(Err(error)) => {
+                self.record_failure(
+                    "fault-snapshot-active",
+                    "environment_or_fault_backend",
+                    &error,
+                    None,
+                    Some((&fault, "active-target-evidence-failed")),
+                )?;
+                return Err(error);
+            }
+            None => (Vec::new(), BTreeSet::new()),
+        };
         let FixedVolumeTargets {
             pods: fixed_volume_pods_at_fault_activation,
             records: active_fixed_volume_targets,
@@ -429,6 +441,64 @@ impl FaultRun<'_> {
         } else {
             None
         };
+        if requires_quorum_edge_read_survival(&plan.scenario) {
+            events.record(
+                "quorum-edge-read-survival",
+                RunEventStatus::Started,
+                "reading every committed object while the cluster sits at the read-quorum boundary",
+                Some(serde_json::json!({ "objects": prefilled.len() })),
+            )?;
+            let summary = match self
+                .deadline
+                .run(probe_read_cohort(
+                    s3,
+                    history,
+                    prefilled,
+                    workload_plan.concurrency,
+                ))
+                .await
+            {
+                Ok(summary) => summary,
+                Err(error) => {
+                    self.record_failure(
+                        "quorum-edge-read-survival",
+                        "workload_or_product",
+                        &error,
+                        None,
+                        Some((fault, "quorum-edge-read-survival-failed")),
+                    )?;
+                    return Err(error);
+                }
+            };
+            collector.write_text(
+                scenario.case_name,
+                QUORUM_EDGE_READ_SURVIVAL_ARTIFACT,
+                &serde_json::to_string_pretty(&summary)?,
+            )?;
+            // Read quorum is still satisfied by the surviving shards, so an
+            // unreadable committed object is a product defect, not the outage
+            // this scenario deliberately holds on the write path.
+            if let Err(error) = summary.require_complete_survival() {
+                self.record_failure(
+                    "quorum-edge-read-survival",
+                    "availability_regression",
+                    &error,
+                    Some(serde_json::json!({
+                        "objects": summary.objects,
+                        "verified": summary.verified,
+                        "failures": summary.failures.len(),
+                    })),
+                    Some((fault, "quorum-edge-read-survival-failed")),
+                )?;
+                return Err(error);
+            }
+            events.record(
+                "quorum-edge-read-survival",
+                RunEventStatus::Succeeded,
+                "every committed object stayed readable with its committed bytes at the read-quorum boundary",
+                Some(serde_json::json!({ "objects": summary.objects })),
+            )?;
+        }
         events.record(
             "mixed-workload",
             RunEventStatus::Started,
@@ -679,39 +749,55 @@ impl FaultRun<'_> {
             pods_at_fault_activation,
             ..
         } = active;
-        let pods_at_workload_snapshot =
-            if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
-                let validation = require_active_write_quorum_partition(
+        let revalidated = match plan.scenario.as_str() {
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO => Some((
+                "NetworkChaos source targets changed while the quorum workload was running",
+                require_active_write_quorum_partition(
                     config,
                     run_id,
                     plan,
                     pods_before,
                     target_proof,
                     workload_snapshots,
-                )
-                .and_then(|(pods, workload_partition_targets)| {
-                    ensure!(
-                        &workload_partition_targets == active_partition_targets,
-                        "NetworkChaos source targets changed while the quorum workload was running"
-                    );
-                    Ok(pods)
-                });
-                match validation {
-                    Ok(pods) => pods,
-                    Err(error) => {
-                        self.record_failure(
-                            "fault-snapshot-after-workload",
-                            "environment_or_fault_backend",
-                            &error,
-                            None,
-                            Some((fault, "workload-target-evidence-failed")),
-                        )?;
-                        return Err(error);
-                    }
+                ),
+            )),
+            POD_FAILURE_QUORUM_EDGE_SCENARIO => Some((
+                "PodChaos targets changed while the quorum-edge workload was running",
+                require_active_pod_failure_quorum_edge(
+                    config,
+                    run_id,
+                    plan,
+                    pods_before,
+                    target_proof,
+                    workload_snapshots,
+                ),
+            )),
+            _ => None,
+        };
+        let pods_at_workload_snapshot = if let Some((drift_message, proof)) = revalidated {
+            let validation = proof.and_then(|(pods, workload_targets)| {
+                ensure!(
+                    &workload_targets == active_partition_targets,
+                    "{drift_message}"
+                );
+                Ok(pods)
+            });
+            match validation {
+                Ok(pods) => pods,
+                Err(error) => {
+                    self.record_failure(
+                        "fault-snapshot-after-workload",
+                        "environment_or_fault_backend",
+                        &error,
+                        None,
+                        Some((fault, "workload-target-evidence-failed")),
+                    )?;
+                    return Err(error);
                 }
-            } else {
-                Vec::new()
-            };
+            }
+        } else {
+            Vec::new()
+        };
         let FixedVolumeTargets {
             pods: fixed_volume_pods_at_workload_snapshot,
             records: workload_fixed_volume_targets,
@@ -830,14 +916,16 @@ impl FaultRun<'_> {
         };
         Ok((fault_active_at_ms, active_snapshots))
     }
-    /// Availability scenarios must prove the service kept serving: the
-    /// fault-active read probe verified every committed object and each
-    /// workload family met the configured success floor.
+    /// Scenarios that assert reads survive must prove the service kept
+    /// serving: availability scenarios verify the fault-active read probe and
+    /// the workload success floor, and quorum-edge scenarios verify the
+    /// committed cohort while writes are expected to fail.
     /// The workload endpoint is a `kubectl port-forward` pinned to one Pod for
-    /// its lifetime. An availability verdict is only meaningful for a client
-    /// attached to a surviving node, so once the fault is active the forward
-    /// is re-established to a Pod the controller did not target. A ClusterIP
-    /// endpoint balances per connection and needs no pinning.
+    /// its lifetime. Such a verdict is only meaningful for a client attached
+    /// to a surviving node — a forward to a failed Pod refuses every
+    /// connection — so once the fault is active the forward is re-established
+    /// to a Pod the controller did not target. A ClusterIP endpoint balances
+    /// per connection and needs no pinning.
     async fn pin_availability_endpoint(
         &self,
         target: &ProvenTarget,
@@ -847,7 +935,9 @@ impl FaultRun<'_> {
     ) -> Result<Option<String>> {
         let events = &self.context.events;
         let cluster = &self.config.cluster;
-        if !self.context.spec.impact_policy.requires_availability() {
+        if !self.context.spec.impact_policy.requires_availability()
+            && !requires_quorum_edge_read_survival(&self.plan.scenario)
+        {
             return Ok(None);
         }
         if port_forward.is_none() {
@@ -1016,7 +1106,10 @@ impl FaultRun<'_> {
             .summary
             .require_fault_evidence(require_client_disruption)
             .and_then(|()| {
-                if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+                if matches!(
+                    plan.scenario.as_str(),
+                    NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO | POD_FAILURE_QUORUM_EDGE_SCENARIO
+                ) {
                     workload.summary.require_write_quorum_loss_effect()
                 } else if matches!(
                     plan.scenario.as_str(),

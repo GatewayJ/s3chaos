@@ -2889,6 +2889,8 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 pub(in crate::fault) const AVAILABILITY_REPORT_ARTIFACT: &str = "availability-report.json";
+pub(in crate::fault) const QUORUM_EDGE_READ_SURVIVAL_ARTIFACT: &str =
+    "quorum-edge-read-survival.json";
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -2904,6 +2906,31 @@ pub(in crate::fault) struct ReadProbeSummary {
     /// `key: reason` for every object that was not readable with its
     /// committed bytes, sorted.
     pub(in crate::fault) failures: Vec<String>,
+}
+
+impl ReadProbeSummary {
+    /// Every object committed before the fault must still read back with its
+    /// committed bytes. Used where read quorum survives by construction, so
+    /// any failure is a regression rather than the scenario's intended outage.
+    pub(in crate::fault) fn require_complete_survival(&self) -> Result<()> {
+        ensure!(
+            self.objects > 0,
+            "read-survival probe covered no committed objects"
+        );
+        ensure!(
+            self.verified == self.objects && self.failures.is_empty(),
+            "read-survival probe verified {} of {} committed objects; first failures: {}",
+            self.verified,
+            self.objects,
+            self.failures
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ok(())
+    }
 }
 
 /// GET every prefilled object once while the fault is active and compare the

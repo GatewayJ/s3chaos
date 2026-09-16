@@ -26,8 +26,9 @@ use crate::{
         reporting::FailureSummary,
         scenarios::{
             FaultBackend, IO_EIO_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
-            QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
-            acknowledged_mutation_kind, requires_prefault_multipart_staging,
+            POD_FAILURE_QUORUM_EDGE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, acknowledged_mutation_kind,
+            requires_prefault_multipart_staging,
         },
         workload::S3WorkloadClient,
     },
@@ -643,7 +644,10 @@ impl FaultRun<'_> {
                 observation.observed_at_ms,
             )?;
         }
-        if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+        if matches!(
+            plan.scenario.as_str(),
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO | POD_FAILURE_QUORUM_EDGE_SCENARIO
+        ) {
             events.record(
                 "write-quorum-loss-topology-proof",
                 RunEventStatus::Started,
