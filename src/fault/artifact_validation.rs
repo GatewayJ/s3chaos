@@ -44,8 +44,9 @@ use crate::fault::{
         validate_admin_topology_artifacts,
     },
     backends::chaos_mesh::{
-        NetworkPartitionEvidenceContract, VolumeTargetEvidenceContract, iochaos_record_pod_id,
-        validate_fixed_volume_snapshot, validate_network_partition_snapshot,
+        NetworkPartitionEvidenceContract, PodFailureEvidenceContract, VolumeTargetEvidenceContract,
+        iochaos_record_pod_id, validate_fixed_volume_snapshot, validate_network_partition_snapshot,
+        validate_pod_failure_snapshot,
     },
     backends::lifecycle::evidence::{
         LifecycleRunContext, POD_LIFECYCLE_EVIDENCE_ARTIFACT, PodLifecycleEvidence,
@@ -120,7 +121,8 @@ use crate::fault::{
     workload::execution::{
         AVAILABILITY_REPORT_ARTIFACT, AvailabilityReport, FamilyAvailability,
         POST_RECOVERY_WRITE_HISTORY_ARTIFACT, POST_RECOVERY_WRITE_REPORT_ARTIFACT,
-        PostRecoveryWriteReport, post_recovery_object_count,
+        PostRecoveryWriteReport, QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, QuorumEdgeReadSurvivalReport,
+        post_recovery_object_count,
     },
     workload::{
         ObjectSpec, WorkloadOperation, WorkloadPlan,
@@ -1517,7 +1519,20 @@ fn validate_fault_artifacts_with_identity(
         metadata.require_client_disruption
     );
     if options.scenario == scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
-        validate_write_quorum_runtime_evidence(&evidence, &target_proof, &json_spec)?;
+        validate_write_quorum_runtime_evidence(
+            &evidence,
+            &target_proof,
+            &json_spec,
+            QuorumEdgeRuntimeKind::NetworkPartition,
+        )?;
+    }
+    if options.scenario == scenarios::POD_FAILURE_QUORUM_EDGE_SCENARIO {
+        validate_write_quorum_runtime_evidence(
+            &evidence,
+            &target_proof,
+            &json_spec,
+            QuorumEdgeRuntimeKind::PodFailure,
+        )?;
     }
     if options.scenario == scenarios::IO_EIO_SCENARIO {
         validate_volume_availability_topology_evidence(&evidence, &target_proof)?;
@@ -1757,12 +1772,17 @@ fn validate_fault_artifacts_with_identity(
             catalog_floor_percent,
         )?;
     }
-    if matches!(
-        options.scenario.as_str(),
-        scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
-            | scenarios::QUORUM_P_IO_FAULT_SCENARIO
-            | scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
-    ) {
+    if scenarios::requires_quorum_edge_read_survival(&options.scenario) {
+        validate_quorum_edge_read_survival_artifact(
+            &artifacts,
+            &metadata,
+            identity,
+            &evidence,
+            &json_spec.metadata.bucket,
+            workload_plan.object_count,
+        )?;
+    }
+    if requires_write_quorum_loss_history(&options.scenario) {
         let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
         let workload_started_at_ms = evidence
             .workload_started_at_ms
@@ -3335,10 +3355,36 @@ fn unique_pod_identities<'a>(
     Ok(pairs)
 }
 
+/// Which Chaos Mesh resource removed the servers that crossed the
+/// write-quorum boundary. Both kinds prove the same geometry; only the
+/// resource and its runtime contract differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuorumEdgeRuntimeKind {
+    NetworkPartition,
+    PodFailure,
+}
+
+impl QuorumEdgeRuntimeKind {
+    fn resource_kind(self) -> &'static str {
+        match self {
+            Self::NetworkPartition => "networkchaos",
+            Self::PodFailure => "podchaos",
+        }
+    }
+
+    fn kind(self) -> &'static str {
+        match self {
+            Self::NetworkPartition => "NetworkChaos",
+            Self::PodFailure => "PodChaos",
+        }
+    }
+}
+
 fn validate_write_quorum_runtime_evidence(
     evidence: &FaultEvidenceArtifact,
     proof: &TargetProof,
     spec: &FaultRunSpec,
+    runtime_kind: QuorumEdgeRuntimeKind,
 ) -> Result<()> {
     let spec_fault = spec
         .faults
@@ -3396,7 +3442,7 @@ fn validate_write_quorum_runtime_evidence(
         .iter()
         .map(|(name, _)| format!("{}/{name}", spec.cluster.namespace))
         .collect::<BTreeSet<_>>();
-    let contract = NetworkPartitionEvidenceContract {
+    let partition_contract = NetworkPartitionEvidenceContract {
         chaos_namespace: &spec.cluster.chaos_namespace,
         target_namespace: &spec.cluster.namespace,
         tenant: &spec.cluster.tenant,
@@ -3405,6 +3451,17 @@ fn validate_write_quorum_runtime_evidence(
         expected_source_targets: spec_fault.selection.value,
         candidate_pod_ids: &candidate_pod_ids,
     };
+    let pod_failure_contract = PodFailureEvidenceContract {
+        chaos_namespace: &spec.cluster.chaos_namespace,
+        target_namespace: &spec.cluster.namespace,
+        tenant: &spec.cluster.tenant,
+        run_id: &spec.metadata.run_id,
+        scenario: &spec.scenario.name,
+        expected_targets: spec_fault.selection.value,
+        duration_seconds: spec_fault.fault_duration_seconds,
+        candidate_pod_ids: &candidate_pod_ids,
+    };
+    let kind = runtime_kind.kind();
     let mut selected_targets = None;
     for (stage, snapshots) in [
         ("active", &evidence.active_snapshots),
@@ -3412,46 +3469,55 @@ fn validate_write_quorum_runtime_evidence(
     ] {
         ensure!(
             snapshots.len() == 1,
-            "fault-evidence.json {stage} stage must contain exactly one NetworkChaos snapshot"
+            "fault-evidence.json {stage} stage must contain exactly one {kind} snapshot"
         );
         let snapshot = &snapshots[0];
         ensure!(
             snapshot.get("stage").and_then(Value::as_str) == Some(stage)
-                && snapshot.get("resource_kind").and_then(Value::as_str) == Some("networkchaos"),
+                && snapshot.get("resource_kind").and_then(Value::as_str)
+                    == Some(runtime_kind.resource_kind()),
             "fault-evidence.json {stage} snapshot metadata is invalid"
         );
-        let resource = snapshot
-            .get("chaos_status")
-            .context("fault-evidence.json NetworkChaos snapshot has no resource object")?;
+        let resource = snapshot.get("chaos_status").with_context(|| {
+            format!("fault-evidence.json {kind} snapshot has no resource object")
+        })?;
         ensure!(
             snapshot.get("resource_name").and_then(Value::as_str)
                 == resource.pointer("/metadata/name").and_then(Value::as_str),
-            "fault-evidence.json NetworkChaos snapshot resource name is inconsistent"
+            "fault-evidence.json {kind} snapshot resource name is inconsistent"
         );
-        let current_targets = validate_network_partition_snapshot(resource, &contract)
-            .with_context(|| format!("validate {stage} NetworkChaos runtime evidence"))?;
+        let current_targets = match runtime_kind {
+            QuorumEdgeRuntimeKind::NetworkPartition => {
+                validate_network_partition_snapshot(resource, &partition_contract)
+            }
+            QuorumEdgeRuntimeKind::PodFailure => {
+                validate_pod_failure_snapshot(resource, &pod_failure_contract)
+            }
+        }
+        .with_context(|| format!("validate {stage} {kind} runtime evidence"))?;
         if let Some(expected_targets) = &selected_targets {
             ensure!(
                 expected_targets == &current_targets,
-                "NetworkChaos selected source targets changed across workload snapshots"
+                "{kind} selected targets changed across workload snapshots"
             );
         } else {
             selected_targets = Some(current_targets);
         }
     }
-    let selected_targets = selected_targets.context("no NetworkChaos source targets observed")?;
+    let selected_targets =
+        selected_targets.with_context(|| format!("no {kind} targets observed"))?;
     let namespace_prefix = format!("{}/", spec.cluster.namespace);
     let selected_pods = selected_targets
         .iter()
         .map(|target| {
             target.strip_prefix(&namespace_prefix).with_context(|| {
-                format!("NetworkChaos selected target {target:?} is outside the run namespace")
+                format!("{kind} selected target {target:?} is outside the run namespace")
             })
         })
         .collect::<Result<Vec<_>>>()?;
     membership
         .require_selected_boundary(shape, selected_pods)
-        .context("actual NetworkChaos source targets do not cross the write-quorum boundary")?;
+        .with_context(|| format!("actual {kind} targets do not cross the write-quorum boundary"))?;
     Ok(())
 }
 
@@ -4960,6 +5026,126 @@ fn validate_post_recovery_probe_history(
             && empty_started > last_delete_ended,
         "{artifact} LIST {} does not prove the prefix empty after the last DELETE",
         empty_list.id
+    );
+    Ok(())
+}
+
+/// Scenarios whose outage must reject every mutation; the offline validator
+/// re-derives that from history instead of trusting the live verdict.
+fn requires_write_quorum_loss_history(scenario: &str) -> bool {
+    matches!(
+        scenario,
+        scenarios::NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+            | scenarios::POD_FAILURE_QUORUM_EDGE_SCENARIO
+            | scenarios::QUORUM_P_IO_FAULT_SCENARIO
+            | scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+    )
+}
+
+/// The report must belong to this run, cover the whole prefilled cohort, and
+/// be re-derivable from `history.jsonl`: every prefilled key has exactly one
+/// fault-active GET before the mixed workload, returning its prefill bytes.
+fn validate_quorum_edge_read_survival_artifact(
+    artifacts: &BTreeMap<String, PathBuf>,
+    metadata: &RunMetadataArtifact,
+    identity: ArtifactIdentityPolicy<'_>,
+    evidence: &FaultEvidenceArtifact,
+    bucket: &str,
+    workload_object_count: usize,
+) -> Result<()> {
+    let report = read_json::<QuorumEdgeReadSurvivalReport>(required(
+        artifacts,
+        QUORUM_EDGE_READ_SURVIVAL_ARTIFACT,
+    )?)?;
+    validate_optional_identity_fields(
+        QUORUM_EDGE_READ_SURVIVAL_ARTIFACT,
+        Some(report.scenario.as_str()),
+        Some(report.run_id.as_str()),
+        metadata,
+        identity,
+    )?;
+    let survival = &report.probe;
+    survival
+        .require_complete_survival()
+        .with_context(|| format!("{QUORUM_EDGE_READ_SURVIVAL_ARTIFACT} did not pass"))?;
+    let prefilled = workload_object_count / 2;
+    ensure!(
+        survival.objects == prefilled,
+        "{QUORUM_EDGE_READ_SURVIVAL_ARTIFACT} covers {} objects, but the prefilled cohort has {prefilled}",
+        survival.objects
+    );
+
+    let fault_active_at_ms = evidence
+        .fault_active_at_ms
+        .context("fault-evidence.json fault_active_at_ms is required")?;
+    let workload_started_at_ms = evidence
+        .workload_started_at_ms
+        .context("fault-evidence.json workload_started_at_ms is required")?;
+    let history = read_jsonl::<OperationRecord>(required(artifacts, "history.jsonl")?)?;
+    let in_run = |record: &&OperationRecord| {
+        record.scenario == metadata.scenario
+            && record.run_id.as_deref() == Some(metadata.run_id.as_str())
+            && record.bucket == bucket
+    };
+    let workload_prefix = crate::fault::workload::ObjectSpec::key_prefix(&metadata.run_id);
+    let mut prefill = BTreeMap::<&str, &str>::new();
+    for record in history.iter().filter(in_run).filter(|record| {
+        record.kind == OperationKind::Put
+            && record.outcome == OperationOutcome::Ok
+            && record.durability_cohort == Some(DurabilityCohort::PreFault)
+    }) {
+        let Some(key) = record
+            .key
+            .as_deref()
+            .filter(|key| key.starts_with(&workload_prefix))
+        else {
+            continue;
+        };
+        let sha256 = record.value_sha256.as_deref().with_context(|| {
+            format!(
+                "history.jsonl prefill PUT {} records no payload hash",
+                record.id
+            )
+        })?;
+        ensure!(
+            prefill.insert(key, sha256).is_none(),
+            "history.jsonl records more than one prefill PUT for {key:?}"
+        );
+    }
+    ensure!(
+        prefill.len() == prefilled,
+        "history.jsonl records {} prefilled keys, but the workload plan prefills {prefilled}",
+        prefill.len()
+    );
+    let mut probed = BTreeMap::<&str, bool>::new();
+    for record in history.iter().filter(in_run).filter(|record| {
+        record.kind == OperationKind::Get
+            && record.durability_cohort == Some(DurabilityCohort::FaultActive)
+            && record.fault_window_relation == Some(FaultWindowRelation::DuringFault)
+            && record.started_at_ms >= fault_active_at_ms
+            && record.ended_at_ms <= workload_started_at_ms
+    }) {
+        let Some((key, sha256)) = record
+            .key
+            .as_deref()
+            .and_then(|key| prefill.get_key_value(key))
+        else {
+            continue;
+        };
+        let verified = record.outcome == OperationOutcome::Ok
+            && record.range.is_none()
+            && record.value_sha256.as_deref() == Some(*sha256);
+        ensure!(
+            probed.insert(key, verified).is_none(),
+            "history.jsonl holds more than one fault-active probe read of {key:?}"
+        );
+    }
+    let verified = probed.values().filter(|verified| **verified).count();
+    ensure!(
+        probed.len() == prefilled && verified == survival.verified,
+        "history.jsonl proves {verified} verified probe reads over {} of {prefilled} prefilled keys, but {QUORUM_EDGE_READ_SURVIVAL_ARTIFACT} claims {} verified",
+        probed.len(),
+        survival.verified
     );
     Ok(())
 }
@@ -7918,12 +8104,13 @@ impl OutcomeCountsArtifact {
 mod tests {
     use super::{
         ArtifactIdentityPolicy, POD_LIFECYCLE_EVIDENCE_ARTIFACT, RunMetadataArtifact,
-        validate_availability_artifact, validate_pod_lifecycle_artifact,
+        requires_write_quorum_loss_history, validate_availability_artifact,
+        validate_pod_lifecycle_artifact, validate_quorum_edge_read_survival_artifact,
     };
     use super::{
         ArtifactValidationOptions, FailureSummary, FaultEvidenceArtifact, OutcomeCountsArtifact,
-        RecommitCandidateManifestArtifact, RecommitReportArtifact, WorkloadSummaryArtifact,
-        derive_recommit_candidates, read_json, read_jsonl, recursive_find,
+        QuorumEdgeRuntimeKind, RecommitCandidateManifestArtifact, RecommitReportArtifact,
+        WorkloadSummaryArtifact, derive_recommit_candidates, read_json, read_jsonl, recursive_find,
         validate_admin_topology_artifact_files, validate_checker_phase_chain,
         validate_failed_attempt_disruptions, validate_fault_artifacts,
         validate_fault_artifacts_and_write_report,
@@ -7936,7 +8123,7 @@ mod tests {
     use crate::fault::recovery_health::RECOVERY_HEALTH_ARTIFACT;
     use crate::fault::workload::execution::{
         AVAILABILITY_REPORT_ARTIFACT, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
-        POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+        POST_RECOVERY_WRITE_REPORT_ARTIFACT, QUORUM_EDGE_READ_SURVIVAL_ARTIFACT,
     };
     use crate::fault::{
         acknowledged_mutation::AcknowledgedMutationKind,
@@ -7978,9 +8165,10 @@ mod tests {
         },
         scenarios::ADMIN_DECOMMISSION_SCENARIO,
         scenarios::{
-            ADMIN_REBALANCE_SCENARIO, DM_FLAKEY_SCENARIO, FaultScenario,
-            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
-            apply_catalog_defaults, scenario_spec,
+            ADMIN_REBALANCE_SCENARIO, DM_FLAKEY_SCENARIO, FaultScenario, IO_EIO_SCENARIO,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO,
+            POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, apply_catalog_defaults, scenario_spec,
         },
         spec::{FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec},
         workload::{ObjectSpec, WorkloadPlan},
@@ -11161,16 +11349,45 @@ mod tests {
             "fault_apply_started_at_ms": 2
         }))
         .expect("fault evidence");
-        validate_write_quorum_runtime_evidence(&evidence, &proof, &run_spec)
-            .expect("runtime selection proof");
+        validate_write_quorum_runtime_evidence(
+            &evidence,
+            &proof,
+            &run_spec,
+            QuorumEdgeRuntimeKind::NetworkPartition,
+        )
+        .expect("runtime selection proof");
         evidence.pods_at_fault_activation[0].uid = "replacement-uid".to_string();
-        assert!(validate_write_quorum_runtime_evidence(&evidence, &proof, &run_spec).is_err());
+        assert!(
+            validate_write_quorum_runtime_evidence(
+                &evidence,
+                &proof,
+                &run_spec,
+                QuorumEdgeRuntimeKind::NetworkPartition,
+            )
+            .is_err()
+        );
         evidence.pods_at_fault_activation[0].uid = "uid-0".to_string();
         evidence.pods_at_workload_snapshot[0].uid = "replacement-uid".to_string();
-        assert!(validate_write_quorum_runtime_evidence(&evidence, &proof, &run_spec).is_err());
+        assert!(
+            validate_write_quorum_runtime_evidence(
+                &evidence,
+                &proof,
+                &run_spec,
+                QuorumEdgeRuntimeKind::NetworkPartition,
+            )
+            .is_err()
+        );
         evidence.pods_at_workload_snapshot[0].uid = "uid-0".to_string();
         evidence.fault_apply_started_at_ms = Some(6_002);
-        assert!(validate_write_quorum_runtime_evidence(&evidence, &proof, &run_spec).is_err());
+        assert!(
+            validate_write_quorum_runtime_evidence(
+                &evidence,
+                &proof,
+                &run_spec,
+                QuorumEdgeRuntimeKind::NetworkPartition,
+            )
+            .is_err()
+        );
 
         let mut tampered = proof;
         let shape = tampered.faults[0]
@@ -11181,6 +11398,161 @@ mod tests {
         shape.payload_data_shards = 7;
         shape.payload_parity_shards = 1;
         assert!(validate_target_proof(&tampered, &run_spec, &options).is_err());
+    }
+
+    #[test]
+    fn pod_failure_quorum_edge_runtime_evidence_binds_podchaos_to_the_boundary() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = POD_FAILURE_QUORUM_EDGE_SCENARIO.to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario(&scenario, catalog).expect("plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+        let run_spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+        let shape =
+            ErasureSetShape::from_runtime_single_set(4, 2, &[1], &[8], 4).expect("runtime shape");
+        let proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs((0..4).map(|index| {
+                TargetResolvedPodProof::new(format!("rustfs-{index}"), format!("uid-{index}"))
+                    .with_node(format!("node-{index}"))
+                    .with_ready(true)
+            }))
+            .with_erasure_set_topology_proven(
+                shape.clone(),
+                ErasureSetHealth::from_runtime(8, 8, 0, 0).expect("runtime health"),
+                ErasureSetMembership::from_runtime(
+                    &shape,
+                    (0..4)
+                        .map(|index| ErasureSetMember {
+                            pod_name: format!("rustfs-{index}"),
+                            server_endpoint: format!("http://rustfs-{index}.rustfs:9000"),
+                            shard_ids: vec![format!("drive-{index}-a"), format!("drive-{index}-b")],
+                        })
+                        .collect(),
+                )
+                .expect("runtime membership"),
+                "deployment-1",
+                1,
+            )
+            .expect("valid runtime proof");
+        let namespace = &run_spec.cluster.namespace;
+        let tenant = &run_spec.cluster.tenant;
+        let resource_for = |targets: &[usize]| {
+            json!({
+                "apiVersion": "chaos-mesh.org/v1alpha1",
+                "kind": "PodChaos",
+                "metadata": {
+                    "name": "quorum-edge",
+                    "namespace": run_spec.cluster.chaos_namespace,
+                    "labels": {
+                        "rustfs-fault-test/run-id": run_spec.metadata.run_id,
+                        "rustfs-fault-test/scenario": run_spec.scenario.name,
+                        "app.kubernetes.io/managed-by": "s3chaos"
+                    }
+                },
+                "spec": {
+                    "action": "pod-failure",
+                    "mode": "fixed",
+                    "value": targets.len().to_string(),
+                    "duration": format!("{}s", run_spec.faults[0].fault_duration_seconds),
+                    "selector": {
+                        "namespaces": [namespace],
+                        "labelSelectors": {"rustfs.tenant": tenant}
+                    }
+                },
+                "status": {
+                    "conditions": [
+                        {"type": "Selected", "status": "True"},
+                        {"type": "AllInjected", "status": "True"},
+                        {"type": "AllRecovered", "status": "False"}
+                    ],
+                    "experiment": {
+                        "desiredPhase": "Run",
+                        "containerRecords": targets.iter().map(|index| json!({
+                            "id": format!("{namespace}/rustfs-{index}"),
+                            "selectorKey": ".",
+                            "phase": "Injected",
+                            "injectedCount": 1
+                        })).collect::<Vec<_>>()
+                    }
+                }
+            })
+        };
+        let evidence_for = |active: serde_json::Value, workload: serde_json::Value| {
+            let snapshot = |stage: &str, resource: serde_json::Value| {
+                json!({
+                    "stage": stage,
+                    "resource_kind": "podchaos",
+                    "resource_name": "quorum-edge",
+                    "chaos_status": resource
+                })
+            };
+            let pods = (0..4)
+                .map(|index| json!({"name": format!("rustfs-{index}"), "uid": format!("uid-{index}")}))
+                .collect::<Vec<_>>();
+            serde_json::from_value::<FaultEvidenceArtifact>(json!({
+                "injected": true,
+                "active_during_workload": true,
+                "recovered": true,
+                "require_client_disruption": true,
+                "client_disruptions": 1,
+                "pods_before": [],
+                "pods_at_fault_activation": pods,
+                "pods_at_workload_snapshot": pods,
+                "pods_after": [],
+                "active_snapshots": [snapshot("active", active)],
+                "workload_snapshots": [snapshot("after-workload", workload)],
+                "fault_apply_started_at_ms": 2
+            }))
+            .expect("fault evidence")
+        };
+        let validate = |evidence: &FaultEvidenceArtifact, kind| {
+            validate_write_quorum_runtime_evidence(evidence, &proof, &run_spec, kind)
+        };
+
+        let evidence = evidence_for(resource_for(&[0, 1]), resource_for(&[0, 1]));
+        validate(&evidence, QuorumEdgeRuntimeKind::PodFailure).expect("two-Pod quorum edge");
+        // The same snapshot is not NetworkChaos evidence.
+        assert!(validate(&evidence, QuorumEdgeRuntimeKind::NetworkPartition).is_err());
+        // Targets that drift between activation and the workload snapshot.
+        assert!(
+            validate(
+                &evidence_for(resource_for(&[0, 1]), resource_for(&[2, 3])),
+                QuorumEdgeRuntimeKind::PodFailure,
+            )
+            .is_err()
+        );
+        // One failed Pod stays inside write quorum, so it is not the boundary.
+        let mut single = run_spec.clone();
+        single.faults[0].selection.value = 1;
+        assert!(
+            validate_write_quorum_runtime_evidence(
+                &evidence_for(resource_for(&[0]), resource_for(&[0])),
+                &proof,
+                &single,
+                QuorumEdgeRuntimeKind::PodFailure,
+            )
+            .is_err()
+        );
+        // A controller duration that differs from the planned fault window.
+        let mut short = resource_for(&[0, 1]);
+        short["spec"]["duration"] = json!("1s");
+        assert!(
+            validate(
+                &evidence_for(short.clone(), short),
+                QuorumEdgeRuntimeKind::PodFailure,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -16785,6 +17157,165 @@ mod tests {
                 .contains("does not prove one successful post-recovery write probe"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn quorum_edge_read_survival_artifact_must_cover_the_whole_cohort() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        let scenario = POD_FAILURE_QUORUM_EDGE_SCENARIO;
+        let bucket = "bucket";
+        let metadata = RunMetadataArtifact {
+            scenario: scenario.to_string(),
+            run_id: run_id.to_string(),
+            context: "real-cluster".to_string(),
+            namespace: "rustfs-fault-test".to_string(),
+            tenant: "fault-tenant".to_string(),
+            storage_class: "fast-csi".to_string(),
+            rustfs_image: "rustfs:test".to_string(),
+            workload_objects: 12,
+            workload_concurrency: 4,
+            require_client_disruption: true,
+            recovery_stability_reread_seconds: 60,
+            min_availability_percent: None,
+        };
+        let evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
+            "scenario": scenario,
+            "run_id": run_id,
+            "injected": true,
+            "active_during_workload": true,
+            "recovered": true,
+            "require_client_disruption": true,
+            "client_disruptions": 3,
+            "pods_before": [],
+            "pods_after": [],
+            "active_snapshots": [],
+            "workload_snapshots": [],
+            "fault_active_at_ms": 100,
+            "workload_started_at_ms": 200
+        }))
+        .expect("evidence");
+        let record =
+            |id: usize, kind: &str, index: usize, sha: String, cohort: &str, at_ms: u64| {
+                let mut record = json!({
+                    "id": format!("op-{id:06}"),
+                    "scenario": scenario,
+                    "run_id": run_id,
+                    "kind": kind,
+                    "bucket": bucket,
+                    "key": ObjectSpec::seeded_key(run_id, index),
+                    "value_sha256": sha,
+                    "started_at_ms": at_ms,
+                    "ended_at_ms": at_ms,
+                    "outcome": "ok",
+                    "durability_cohort": cohort
+                });
+                if cohort == "fault_active" {
+                    record["fault_window_relation"] = json!("during_fault");
+                }
+                record
+            };
+        let prefill = (0..6)
+            .map(|index| record(index, "put", index, format!("sha-{index}"), "pre_fault", 10))
+            .collect::<Vec<_>>();
+        let probe =
+            |index: usize, sha: String| record(100 + index, "get", index, sha, "fault_active", 150);
+        let validate = |report: serde_json::Value, history: &[serde_json::Value]| {
+            write_json(dir.path(), QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, &report);
+            fs::write(
+                dir.path().join("history.jsonl"),
+                history
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .expect("history");
+            validate_quorum_edge_read_survival_artifact(
+                &BTreeMap::from([
+                    (
+                        QUORUM_EDGE_READ_SURVIVAL_ARTIFACT.to_string(),
+                        dir.path().join(QUORUM_EDGE_READ_SURVIVAL_ARTIFACT),
+                    ),
+                    (
+                        "history.jsonl".to_string(),
+                        dir.path().join("history.jsonl"),
+                    ),
+                ]),
+                &metadata,
+                ArtifactIdentityPolicy::LegacyCompatible,
+                &evidence,
+                bucket,
+                12,
+            )
+        };
+        let report = |objects: usize, verified: usize, failures: &[&str]| {
+            json!({
+                "scenario": scenario,
+                "run_id": run_id,
+                "objects": objects,
+                "verified": verified,
+                "failures": failures
+            })
+        };
+        let complete = prefill
+            .iter()
+            .cloned()
+            .chain((0..6).map(|index| probe(index, format!("sha-{index}"))))
+            .collect::<Vec<_>>();
+
+        validate(report(6, 6, &[]), &complete).expect("complete cohort survived");
+        // A probe that read only part of the cohort proves nothing about the rest.
+        assert!(validate(report(1, 1, &[]), &complete).is_err());
+        assert!(validate(report(6, 5, &["k: 503"]), &complete).is_err());
+        assert!(validate(report(6, 6, &["k: 503"]), &complete).is_err());
+        // An artifact from another run.
+        let mut foreign = report(6, 6, &[]);
+        foreign["run_id"] = json!("run-00000000-0000-4000-8000-000000000002");
+        assert!(validate(foreign, &complete).is_err());
+        // Passing counters that this run's history does not back.
+        assert!(
+            validate(report(6, 6, &[]), &prefill).is_err(),
+            "no probe reads"
+        );
+        let mut wrong_bytes = complete.clone();
+        wrong_bytes[8]["value_sha256"] = json!("sha-other");
+        assert!(validate(report(6, 6, &[]), &wrong_bytes).is_err());
+        let mut after_workload_start = complete.clone();
+        after_workload_start[9]["started_at_ms"] = json!(250);
+        after_workload_start[9]["ended_at_ms"] = json!(250);
+        assert!(validate(report(6, 6, &[]), &after_workload_start).is_err());
+        let mut duplicated = complete.clone();
+        duplicated.push(probe(0, "sha-0".to_string()));
+        duplicated.last_mut().expect("record")["id"] = json!("op-000999");
+        assert!(validate(report(6, 6, &[]), &duplicated).is_err());
+        assert!(
+            validate_quorum_edge_read_survival_artifact(
+                &BTreeMap::new(),
+                &metadata,
+                ArtifactIdentityPolicy::LegacyCompatible,
+                &evidence,
+                bucket,
+                12,
+            )
+            .is_err(),
+            "a missing artifact must fail closed"
+        );
+    }
+
+    #[test]
+    fn write_quorum_loss_history_covers_every_write_breaking_boundary() {
+        for scenario in [
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+            POD_FAILURE_QUORUM_EDGE_SCENARIO,
+            QUORUM_P_IO_FAULT_SCENARIO,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+        ] {
+            assert!(requires_write_quorum_loss_history(scenario), "{scenario}");
+        }
+        for scenario in [POD_FAILURE_SCENARIO, IO_EIO_SCENARIO, POD_KILL_ONE_SCENARIO] {
+            assert!(!requires_write_quorum_loss_history(scenario), "{scenario}");
+        }
     }
 
     #[test]

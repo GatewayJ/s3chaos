@@ -1700,23 +1700,23 @@ scenarios:
             build_fault_suite_plan_expansion(suite, base, "quorum-suite-test".to_string())
                 .expect("quorum suite plan");
 
-        assert_eq!(expansion.plan.attempts.len(), 4);
+        assert_eq!(expansion.plan.attempts.len(), 5);
+        // The quorum-edge Pod failure shares the suite but carries no typed
+        // volume boundary, so only the IOChaos attempts are compared here.
         let selections = expansion
             .plan
             .attempts
             .iter()
-            .map(|attempt| {
-                (
+            .filter_map(|attempt| {
+                Some((
                     attempt.scenario.as_str(),
                     attempt.faults[0].selection.kind.as_str(),
                     attempt.faults[0].selection.value,
-                    attempt.faults[0]
-                        .parameters
-                        .quorum_case()
-                        .expect("typed class"),
-                )
+                    attempt.faults[0].parameters.quorum_case().ok()?,
+                ))
             })
             .collect::<Vec<_>>();
+        assert_eq!(selections.len(), 4);
         assert_eq!(selections[0].1, "runtime-quorum");
         assert_eq!(selections[0].2, 0);
         assert_eq!(selections[2].2, 1);
@@ -1739,7 +1739,7 @@ scenarios:
             build_fault_suite_plan_expansion(suite, base, "chaos-suite-test".to_string())
                 .expect("canonical Chaos Mesh suite plan");
 
-        assert_eq!(expansion.plan.attempts.len(), 19);
+        assert_eq!(expansion.plan.attempts.len(), 20);
         assert!(expansion.plan.requires_chaos_mesh);
         assert!(!expansion.plan.requires_static_storage);
         assert!(expansion.plan.required_tools.is_empty());

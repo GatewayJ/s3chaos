@@ -852,6 +852,101 @@ pub(super) fn require_active_write_quorum_partition(
     Ok((pods_active, targets))
 }
 
+/// Prove the live PodChaos failed exactly the planned number of RustFS Pods
+/// and that removing their drives leaves read quorum but breaks write quorum.
+/// Returns the Pod identities observed while the fault is active together with
+/// the namespaced ids of the selected targets.
+pub(super) fn require_active_pod_failure_quorum_edge(
+    config: &FaultTestConfig,
+    run_id: &str,
+    plan: &FaultPlan,
+    pods_before: &[PodIdentity],
+    target_proof: &TargetProof,
+    snapshots: &[FaultStatusSnapshot],
+) -> Result<(Vec<PodIdentity>, BTreeSet<String>)> {
+    ensure!(
+        snapshots.len() == 1,
+        "pod-failure quorum-edge plan requires exactly one runtime fault snapshot"
+    );
+    let fault = plan.fault();
+    let expected_targets = match fault.selection() {
+        FaultSelection::FixedTargets(count) => count,
+        FaultSelection::Percent(_) | FaultSelection::RuntimeQuorum(_) => {
+            bail!("pod-failure quorum-edge proof requires a fixed target count")
+        }
+    };
+    let pods_active = rustfs_pod_identities(&config.cluster)
+        .context("resolve RustFS Pod identities while PodChaos is active")?;
+    let identity_set = |pods: &[PodIdentity]| {
+        pods.iter()
+            .map(|pod| (pod.name.clone(), pod.uid.clone()))
+            .collect::<BTreeSet<_>>()
+    };
+    ensure!(
+        identity_set(&pods_active) == identity_set(pods_before),
+        "RustFS Pod identities changed between target proof and PodChaos activation"
+    );
+    let candidate_pod_ids = pods_active
+        .iter()
+        .map(|pod| format!("{}/{}", config.cluster.test_namespace, pod.name))
+        .collect::<BTreeSet<_>>();
+    let snapshot = &snapshots[0];
+    ensure!(
+        snapshot.resource_kind.as_deref() == Some("podchaos"),
+        "pod-failure quorum-edge runtime snapshot is not a PodChaos resource"
+    );
+    let resource = snapshot
+        .chaos_status
+        .as_ref()
+        .context("pod-failure quorum-edge runtime snapshot has no PodChaos object")?;
+    ensure!(
+        snapshot.resource_name.as_deref()
+            == resource
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str),
+        "pod-failure quorum-edge runtime snapshot resource name is inconsistent"
+    );
+    let targets = chaos_mesh::validate_pod_failure_snapshot(
+        resource,
+        &chaos_mesh::PodFailureEvidenceContract {
+            chaos_namespace: &config.chaos_namespace,
+            target_namespace: &config.cluster.test_namespace,
+            tenant: &config.cluster.tenant_name,
+            run_id,
+            scenario: &plan.scenario,
+            expected_targets,
+            duration_seconds: fault.duration().as_secs(),
+            candidate_pod_ids: &candidate_pod_ids,
+        },
+    )?;
+    let erasure_set = target_proof
+        .faults
+        .iter()
+        .find_map(|fault| fault.erasure_set.as_ref())
+        .context("target proof has no runtime erasure-set evidence")?;
+    let shape = erasure_set
+        .shape
+        .as_ref()
+        .context("target proof runtime erasure-set evidence has no shape")?;
+    let membership = erasure_set
+        .membership
+        .as_ref()
+        .context("target proof runtime erasure-set evidence has no server/drive membership")?;
+    let namespace_prefix = format!("{}/", config.cluster.test_namespace);
+    let selected_pods = targets
+        .iter()
+        .map(|target| {
+            target.strip_prefix(&namespace_prefix).with_context(|| {
+                format!("PodChaos selected target {target:?} is outside the test namespace")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    membership
+        .require_selected_boundary(shape, selected_pods)
+        .context("actual PodChaos targets do not cross the write-quorum boundary")?;
+    Ok((pods_active, targets))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -52,6 +52,17 @@ pub(crate) struct NetworkPartitionEvidenceContract<'a> {
     pub candidate_pod_ids: &'a BTreeSet<String>,
 }
 
+pub(crate) struct PodFailureEvidenceContract<'a> {
+    pub chaos_namespace: &'a str,
+    pub target_namespace: &'a str,
+    pub tenant: &'a str,
+    pub run_id: &'a str,
+    pub scenario: &'a str,
+    pub expected_targets: u32,
+    pub duration_seconds: u64,
+    pub candidate_pod_ids: &'a BTreeSet<String>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct VolumeTargetEvidenceContract<'a> {
     pub chaos_namespace: &'a str,
@@ -143,6 +154,7 @@ pub(crate) fn validate_fixed_volume_snapshot(
         resource
             .pointer("/spec")
             .context("IOChaos spec is missing")?,
+        "IOChaos",
         contract.target_namespace,
         contract.tenant,
     )?;
@@ -365,6 +377,7 @@ pub(crate) fn validate_network_partition_snapshot(
         resource
             .pointer("/spec")
             .context("NetworkChaos spec is missing")?,
+        "NetworkChaos",
         contract.target_namespace,
         contract.tenant,
     )?;
@@ -375,7 +388,12 @@ pub(crate) fn validate_network_partition_snapshot(
         target.get("mode").and_then(Value::as_str) == Some("all"),
         "runtime NetworkChaos peer selector must use mode all"
     );
-    validate_pod_selector(target, contract.target_namespace, contract.tenant)?;
+    validate_pod_selector(
+        target,
+        "NetworkChaos",
+        contract.target_namespace,
+        contract.tenant,
+    )?;
     ensure!(
         chaos_condition_is_true(resource, "Selected")
             && chaos_condition_is_true(resource, "AllInjected")
@@ -419,21 +437,109 @@ pub(crate) fn validate_network_partition_snapshot(
     Ok(source_ids)
 }
 
-fn validate_pod_selector(selector: &Value, namespace: &str, tenant: &str) -> Result<()> {
+/// Prove the live PodChaos really failed the plan-declared number of tenant
+/// Pods, and return their namespaced ids so the caller can bind them to the
+/// runtime erasure-set membership.
+pub(crate) fn validate_pod_failure_snapshot(
+    resource: &Value,
+    contract: &PodFailureEvidenceContract<'_>,
+) -> Result<BTreeSet<String>> {
+    ensure!(
+        resource.get("apiVersion").and_then(Value::as_str) == Some("chaos-mesh.org/v1alpha1")
+            && resource.get("kind").and_then(Value::as_str) == Some("PodChaos"),
+        "runtime fault snapshot is not a Chaos Mesh v1alpha1 PodChaos"
+    );
+    validate_run_metadata(
+        resource,
+        "PodChaos",
+        contract.chaos_namespace,
+        contract.run_id,
+        contract.scenario,
+    )?;
+    ensure!(
+        resource.pointer("/spec/action").and_then(Value::as_str) == Some("pod-failure")
+            && resource.pointer("/spec/mode").and_then(Value::as_str) == Some("fixed")
+            && resource
+                .pointer("/spec/value")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<u32>().ok())
+                == Some(contract.expected_targets),
+        "runtime PodChaos does not match the fixed multi-Pod failure plan"
+    );
+    ensure!(
+        resource.pointer("/spec/duration").and_then(Value::as_str)
+            == Some(format!("{}s", contract.duration_seconds).as_str()),
+        "runtime PodChaos duration does not match the planned fault duration"
+    );
+    validate_pod_selector(
+        resource
+            .pointer("/spec")
+            .context("PodChaos spec is missing")?,
+        "PodChaos",
+        contract.target_namespace,
+        contract.tenant,
+    )?;
+    ensure!(
+        chaos_condition_is_true(resource, "Selected")
+            && chaos_condition_is_true(resource, "AllInjected")
+            && !chaos_condition_is_true(resource, "AllRecovered"),
+        "runtime PodChaos is not selected and fully injected"
+    );
+    ensure!(
+        resource
+            .pointer("/status/experiment/desiredPhase")
+            .and_then(Value::as_str)
+            == Some("Run"),
+        "runtime PodChaos desired phase is not Run"
+    );
+    let records = resource
+        .pointer("/status/experiment/containerRecords")
+        .and_then(Value::as_array)
+        .context("runtime PodChaos has no per-target controller records")?;
+    ensure!(
+        records
+            .iter()
+            .all(|record| matches!(record.get("selectorKey").and_then(Value::as_str), Some("."))),
+        "runtime PodChaos contains an unknown or missing controller selector key"
+    );
+    let target_ids = injected_record_ids(records, ".", "PodChaos")?;
+    ensure!(
+        target_ids.len() == usize::try_from(contract.expected_targets)?,
+        "runtime PodChaos injected {} targets, expected {}",
+        target_ids.len(),
+        contract.expected_targets
+    );
+    ensure!(
+        target_ids.is_subset(contract.candidate_pod_ids),
+        "runtime PodChaos selected a target outside the proved Ready Pod set"
+    );
+    ensure!(
+        target_ids.len() < contract.candidate_pod_ids.len(),
+        "runtime PodChaos failed every proved Ready Pod; the quorum-edge boundary needs survivors"
+    );
+    Ok(target_ids)
+}
+
+fn validate_pod_selector(
+    selector: &Value,
+    kind: &str,
+    namespace: &str,
+    tenant: &str,
+) -> Result<()> {
     let namespaces = selector
         .pointer("/selector/namespaces")
         .and_then(Value::as_array)
-        .context("NetworkChaos selector.namespaces is missing")?;
+        .with_context(|| format!("{kind} selector.namespaces is missing"))?;
     ensure!(
         namespaces.len() == 1 && namespaces[0].as_str() == Some(namespace),
-        "runtime NetworkChaos selector namespace does not match the target namespace"
+        "runtime {kind} selector namespace does not match the target namespace"
     );
     ensure!(
         selector
             .pointer("/selector/labelSelectors/rustfs.tenant")
             .and_then(Value::as_str)
             == Some(tenant),
-        "runtime NetworkChaos selector tenant does not match the target tenant"
+        "runtime {kind} selector tenant does not match the target tenant"
     );
     Ok(())
 }
@@ -709,16 +815,28 @@ fn build_fault_spec(
             )
             .with_name_suffix(resource_name_suffix),
         )),
-        FaultKind::RustfsServerPodFailure => Ok(FaultSpec::Pod(
-            PodChaosSpec::fail_one_rustfs_pod(
+        FaultKind::RustfsServerPodFailure => {
+            // Honor the plan-declared blast radius: the quorum-edge scenario
+            // fails more than one Pod at once, everything else stays
+            // single-target.
+            let chaos = PodChaosSpec::fail_one_rustfs_pod(
                 cluster,
                 &config.chaos_namespace,
                 run_id,
                 &scenario.name,
                 injection.duration(),
-            )?
-            .with_name_suffix(resource_name_suffix),
-        )),
+            )?;
+            let chaos = match injection.selection() {
+                FaultSelection::FixedTargets(count) if count > 1 => {
+                    chaos.with_fixed_targets(count)?
+                }
+                FaultSelection::FixedTargets(_) | FaultSelection::Percent(_) => chaos,
+                FaultSelection::RuntimeQuorum(_) => {
+                    bail!("runtime quorum selection must be resolved before PodChaos rendering")
+                }
+            };
+            Ok(FaultSpec::Pod(chaos.with_name_suffix(resource_name_suffix)))
+        }
         FaultKind::RustfsServerNetworkPartition => {
             // Honor the plan-declared blast radius: quorum-loss scenarios
             // partition more than one Pod, everything else stays single-target.
@@ -911,6 +1029,10 @@ pub struct PodChaosSpec {
     pub target_namespace: String,
     pub tenant_name: String,
     pub action: PodChaosAction,
+    /// `None` renders `mode: one`; `Some(n)` renders `mode: fixed` with
+    /// `value: n`, which is how quorum-edge scenarios take more than one
+    /// server offline at the same instant.
+    pub targets: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1301,6 +1423,7 @@ impl PodChaosSpec {
             target_namespace: config.test_namespace.clone(),
             tenant_name: config.tenant_name.clone(),
             action: PodChaosAction::PodKill,
+            targets: None,
         }
     }
 
@@ -1326,7 +1449,21 @@ impl PodChaosSpec {
             target_namespace: config.test_namespace.clone(),
             tenant_name: config.tenant_name.clone(),
             action: PodChaosAction::PodFailure { duration },
+            targets: None,
         })
+    }
+
+    /// Select a plan-declared number of Pods instead of a single arbitrary
+    /// one. The range is only a sanity bound: that survivors remain and the
+    /// selection crosses the intended quorum boundary is proved against the
+    /// live snapshot and runtime geometry, not here.
+    pub(crate) fn with_fixed_targets(mut self, targets: u32) -> Result<Self> {
+        ensure!(
+            (1..=MAX_ERASURE_SET_SHARDS).contains(&targets),
+            "PodChaos fixed targets must be in 1..={MAX_ERASURE_SET_SHARDS}, got {targets}"
+        );
+        self.targets = Some(targets);
+        Ok(self)
     }
 
     pub fn with_name_suffix(mut self, suffix: &str) -> Self {
@@ -1336,6 +1473,10 @@ impl PodChaosSpec {
 
     pub fn manifest(&self) -> String {
         let action = self.action_manifest();
+        let (mode, value) = match self.targets {
+            Some(targets) => ("fixed", format!("  value: \"{targets}\"\n")),
+            None => ("one", String::new()),
+        };
         format!(
             r#"apiVersion: chaos-mesh.org/v1alpha1
 kind: PodChaos
@@ -1348,8 +1489,8 @@ metadata:
     {managed_by_label}: {managed_by_value}
 spec:
 {action}
-  mode: one
-  selector:
+  mode: {mode}
+{value}  selector:
     namespaces:
       - {target_namespace}
     labelSelectors:
@@ -1366,6 +1507,8 @@ spec:
             target_namespace = self.target_namespace,
             tenant_name = self.tenant_name,
             action = action,
+            mode = mode,
+            value = value,
         )
     }
 
@@ -1772,11 +1915,13 @@ spec:
 #[cfg(test)]
 mod tests {
     use super::{
-        FaultSpec, IoChaosAction, IoChaosSpec, IoLatencyParameters, NetworkChaosAction,
-        NetworkChaosSpec, NetworkDelayParameters, NetworkPartitionEvidenceContract, PodChaosAction,
-        PodChaosSpec, StressChaosAction, StressChaosSpec, VolumeTargetEvidenceContract,
-        build_fault_spec, runtime::chaos_experiment_is_active, validate_fixed_volume_snapshot,
-        validate_network_partition_snapshot, volume_fault_runtime_contract,
+        FaultSpec, IoChaosAction, IoChaosSpec, IoLatencyParameters, MAX_ERASURE_SET_SHARDS,
+        NetworkChaosAction, NetworkChaosSpec, NetworkDelayParameters,
+        NetworkPartitionEvidenceContract, PodChaosAction, PodChaosSpec, PodFailureEvidenceContract,
+        StressChaosAction, StressChaosSpec, VolumeTargetEvidenceContract, build_fault_spec,
+        runtime::chaos_experiment_is_active, validate_fixed_volume_snapshot,
+        validate_network_partition_snapshot, validate_pod_failure_snapshot,
+        volume_fault_runtime_contract,
     };
     use crate::fault::config::FaultTestConfig;
     use crate::fault::plan::{
@@ -2146,6 +2291,157 @@ mod tests {
         assert!(manifest.contains("action: pod-failure"));
         assert!(manifest.contains("duration: \"60s\""));
         assert!(manifest.contains("rustfs.tenant: fault-test-tenant"));
+    }
+
+    #[test]
+    fn pod_failure_manifest_renders_the_plan_declared_fixed_target_count() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let spec = PodChaosSpec::fail_one_rustfs_pod(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "pod-failure-quorum-edge",
+            Duration::from_secs(900),
+        )
+        .expect("valid pod failure")
+        .with_fixed_targets(2)
+        .expect("fixed targets");
+        let manifest = spec.manifest();
+
+        assert!(manifest.contains("action: pod-failure"));
+        assert!(manifest.contains("mode: fixed"));
+        assert!(manifest.contains("value: \"2\""));
+        assert!(manifest.contains("duration: \"900s\""));
+        // A single target keeps the cheaper selector Chaos Mesh resolves
+        // without a count.
+        assert!(
+            PodChaosSpec::fail_one_rustfs_pod(
+                &config.cluster,
+                "chaos-mesh",
+                "run-1234567890",
+                "pod-failure",
+                Duration::from_secs(60),
+            )
+            .expect("valid pod failure")
+            .manifest()
+            .contains("mode: one")
+        );
+        assert!(
+            PodChaosSpec::fail_one_rustfs_pod(
+                &config.cluster,
+                "chaos-mesh",
+                "run-1234567890",
+                "pod-failure-quorum-edge",
+                Duration::from_secs(60),
+            )
+            .expect("valid pod failure")
+            .with_fixed_targets(MAX_ERASURE_SET_SHARDS + 1)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pod_failure_runtime_evidence_binds_injected_records() {
+        let candidates = [
+            "faults/rustfs-0",
+            "faults/rustfs-1",
+            "faults/rustfs-2",
+            "faults/rustfs-3",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+        let contract = PodFailureEvidenceContract {
+            chaos_namespace: "chaos-mesh",
+            target_namespace: "faults",
+            tenant: "tenant-1",
+            run_id: "run-1",
+            scenario: "pod-failure-quorum-edge",
+            expected_targets: 2,
+            duration_seconds: 900,
+            candidate_pod_ids: &candidates,
+        };
+        let resource = serde_json::json!({
+            "apiVersion": "chaos-mesh.org/v1alpha1",
+            "kind": "PodChaos",
+            "metadata": {
+                "namespace": "chaos-mesh",
+                "labels": {
+                    "rustfs-fault-test/run-id": "run-1",
+                    "rustfs-fault-test/scenario": "pod-failure-quorum-edge",
+                    "app.kubernetes.io/managed-by": "s3chaos"
+                }
+            },
+            "spec": {
+                "action": "pod-failure",
+                "mode": "fixed",
+                "value": "2",
+                "duration": "900s",
+                "selector": {
+                    "namespaces": ["faults"],
+                    "labelSelectors": {"rustfs.tenant": "tenant-1"}
+                }
+            },
+            "status": {
+                "conditions": [
+                    {"type": "Selected", "status": "True"},
+                    {"type": "AllInjected", "status": "True"},
+                    {"type": "AllRecovered", "status": "False"}
+                ],
+                "experiment": {
+                    "desiredPhase": "Run",
+                    "containerRecords": [
+                        {"id": "faults/rustfs-0", "selectorKey": ".", "phase": "Injected", "injectedCount": 1},
+                        {"id": "faults/rustfs-1", "selectorKey": ".", "phase": "Injected", "injectedCount": 1}
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            validate_pod_failure_snapshot(&resource, &contract).expect("runtime proof"),
+            ["faults/rustfs-0", "faults/rustfs-1"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+
+        let mut wrong_mode = resource.clone();
+        wrong_mode["spec"]["mode"] = serde_json::json!("one");
+        assert!(validate_pod_failure_snapshot(&wrong_mode, &contract).is_err());
+
+        let mut wrong_duration = resource.clone();
+        wrong_duration["spec"]["duration"] = serde_json::json!("60s");
+        assert!(validate_pod_failure_snapshot(&wrong_duration, &contract).is_err());
+
+        let mut foreign_target = resource.clone();
+        foreign_target["status"]["experiment"]["containerRecords"][1]["id"] =
+            serde_json::json!("other/rustfs-9");
+        assert!(validate_pod_failure_snapshot(&foreign_target, &contract).is_err());
+
+        let mut unknown_selector = resource.clone();
+        unknown_selector["status"]["experiment"]["containerRecords"]
+            .as_array_mut()
+            .expect("records")
+            .push(serde_json::json!({"id": "faults/rustfs-2", "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1}));
+        assert!(validate_pod_failure_snapshot(&unknown_selector, &contract).is_err());
+
+        let mut not_injected = resource.clone();
+        not_injected["status"]["experiment"]["containerRecords"][0]["phase"] =
+            serde_json::json!("Not Injected");
+        assert!(validate_pod_failure_snapshot(&not_injected, &contract).is_err());
+
+        // Failing the whole proved set leaves no survivor to serve reads, so
+        // the quorum-edge boundary cannot hold.
+        let whole_cluster_candidates = ["faults/rustfs-0", "faults/rustfs-1"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let whole_cluster = PodFailureEvidenceContract {
+            candidate_pod_ids: &whole_cluster_candidates,
+            ..contract
+        };
+        assert!(validate_pod_failure_snapshot(&resource, &whole_cluster).is_err());
     }
 
     #[test]

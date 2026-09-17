@@ -415,6 +415,19 @@ guardrails when implementing the ordered TODO below.
   recovery-health gate, the post-recovery write probe, and (for the first
   two) the availability contract. Live calibration is still pending.
 
+- [ ] PARTIAL: Simultaneous multi-node failure (rustfs/backlog#2447).
+  Meaning: `pod-failure-quorum-edge` fails two RustFS Pods with one fixed-count
+  PodChaos after the live runtime topology proof shows that removing their
+  drives leaves read quorum but breaks write quorum; any other geometry fails
+  closed. Every mutation during the outage must be rejected, and a
+  read-survival probe (`quorum-edge-read-survival.json`) must verify the whole
+  prefilled cohort through a forward re-pinned to a surviving Pod. The
+  actual PodChaos targets are bound to the erasure-set membership at
+  activation, after the workload, and again by offline artifact validation.
+  Still open: `node-crash-proxy`, which composes pod-failure with the same
+  node's `drop_writes` crash boundary and needs catalog-declared composite
+  injection in the plan model, plus live calibration of both.
+
 - [x] DONE: Add host/storage mutation preflight.
   Meaning: executable device-mapper scenarios now require exact singleton
   node/device/PV allowlists, a separate device-mapper destructive opt-in, and a

@@ -32,11 +32,11 @@ use crate::fault::{
         IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, NETWORK_CORRUPT_SCENARIO,
         NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO, NETWORK_LOSS_SCENARIO,
         NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
-        ON_DISK_BITROT_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO,
-        POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
-        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, ROLLING_RESTART_ALL_SCENARIO,
-        STALE_DISK_RETURN_DETECT_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
-        WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
+        ON_DISK_BITROT_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
+        POD_FAILURE_QUORUM_EDGE_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
+        POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+        ROLLING_RESTART_ALL_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO, STRESS_CPU_SCENARIO,
+        STRESS_MEMORY_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
     storage_recovery::StorageRecoveryCase,
 };
@@ -1029,12 +1029,20 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
             FaultSelection::Percent(_) => false,
             FaultSelection::RuntimeQuorum(_) => false,
         },
+        // PodChaos pod-failure renders the declared count, so the quorum-edge
+        // scenario can take P servers offline at the same instant. The cap is
+        // a sanity bound; which counts actually cross the quorum boundary is
+        // proved by the scenario's runtime topology proof.
+        FaultKind::RustfsServerPodFailure => match selection {
+            FaultSelection::FixedTargets(count) => (1..=MAX_ERASURE_SET_SHARDS).contains(&count),
+            FaultSelection::Percent(_) => false,
+            FaultSelection::RuntimeQuorum(_) => false,
+        },
         // Every other kind is rendered single-target (`mode: one`) and never
         // reads the count. Accepting FixedTargets(n > 1) here would let a plan
         // declare an n-pod blast radius that the backend silently narrows to
         // one — a weaker fault than requested, i.e. a false sense of coverage.
         FaultKind::RustfsServerPodKill
-        | FaultKind::RustfsServerPodFailure
         | FaultKind::RustfsServerNetworkDelay
         | FaultKind::RustfsServerNetworkLoss
         | FaultKind::RustfsServerNetworkCorrupt
@@ -1193,6 +1201,17 @@ impl FaultPlan {
                 spec.backend,
                 FaultTarget::RustfsServerPod,
                 FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
+            POD_FAILURE_QUORUM_EDGE_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsServerPodFailure,
+                spec.backend,
+                FaultTarget::RustfsServerPod,
+                // Same boundary as the write-quorum partition: the runtime
+                // proof verifies that failing these servers removes enough
+                // shards to break write quorum while preserving read quorum,
+                // and any other layout fails closed.
+                FaultSelection::FixedTargets(WRITE_QUORUM_LOSS_PARTITION_TARGETS),
                 scenario.duration,
             )?,
             NETWORK_PARTITION_ONE_SCENARIO => FaultInjection::new(
@@ -1863,6 +1882,36 @@ mod tests {
             faults[0].selection(),
             FaultSelection::FixedTargets(super::WRITE_QUORUM_LOSS_PARTITION_TARGETS),
             "the quorum-loss plan must declare the two-server blast radius"
+        );
+    }
+
+    #[test]
+    fn quorum_edge_scenario_plans_multi_target_pod_failure() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = super::POD_FAILURE_QUORUM_EDGE_SCENARIO.to_string();
+        let scenario = FaultScenario::from_config(&config).expect("scenario should resolve");
+        let spec = scenario_spec(&scenario.name).expect("catalog spec");
+        let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan should build");
+
+        let faults = plan.faults();
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].kind(), FaultKind::RustfsServerPodFailure);
+        assert_eq!(faults[0].target(), &FaultTarget::RustfsServerPod);
+        assert_eq!(
+            faults[0].selection(),
+            FaultSelection::FixedTargets(super::WRITE_QUORUM_LOSS_PARTITION_TARGETS),
+            "the quorum-edge plan must declare the same P-server blast radius"
+        );
+        // The single-Pod scenario keeps its one-target radius.
+        let mut single = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        single.scenario = super::POD_FAILURE_SCENARIO.to_string();
+        let single_scenario = FaultScenario::from_config(&single).expect("scenario");
+        let single_spec = scenario_spec(&single_scenario.name).expect("catalog spec");
+        let single_plan =
+            FaultPlan::from_scenario(&single_scenario, single_spec).expect("plan should build");
+        assert_eq!(
+            single_plan.fault().selection(),
+            FaultSelection::FixedTargets(1)
         );
     }
 
