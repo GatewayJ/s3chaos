@@ -103,19 +103,42 @@ impl FaultRun<'_> {
         let held = self
             .run_node_down_hold(prepared, target, fault, &node_target, &sampler)
             .await;
-        let samples = sampler.stop();
+        let samples = sampler.stop().await;
         let (served_by_pod, read_probe, stable_objects) = match held {
             Ok(held) => held,
             Err((classification, error)) => {
+                let details = Some(serde_json::json!({
+                    "samples": samples.as_ref().ok(),
+                    "sampling_error": samples.as_ref().err().map(|error| format!("{error:#}")),
+                }));
+                // A quarantine that did not hold explains the failure better
+                // than whatever a probe saw through the returning node, and it
+                // replaces any verdict the probe already wrote.
+                let broken = samples.as_ref().ok().and_then(|samples| {
+                    samples
+                        .iter()
+                        .find_map(|sample| sample.require_down(&node_target).err())
+                });
+                if let Some(broken) = broken {
+                    let error = broken.context(format!(
+                        "the node-down quarantine did not hold while the hold failed: {error:#}"
+                    ));
+                    self.record_failure(
+                        "node-down-hold",
+                        "environment_or_fault_backend",
+                        &error,
+                        details,
+                        Some((fault, "node-down-hold-failed")),
+                    )?;
+                    return Err(error);
+                }
                 // `None` means the failing step already wrote its own verdict.
                 if let Some(classification) = classification {
                     self.record_failure(
                         "node-down-hold",
                         classification,
                         &error,
-                        Some(serde_json::json!({
-                            "samples": samples.as_ref().map_or(0, Vec::len),
-                        })),
+                        details,
                         Some((fault, "node-down-hold-failed")),
                     )?;
                 }
@@ -234,6 +257,25 @@ impl FaultRun<'_> {
                 "every prefilled object was mutated by the workload; the node-down read probe would be vacuous"
             )));
         }
+        // Probe only once the node has been down for the minimum hold, so the
+        // survivors are measured after RustFS can have noticed the loss, not
+        // while it may still be waiting on the dead peer.
+        let min_hold_ms =
+            u64::try_from(NODE_DOWN_MIN_HOLD.as_millis()).map_err(|error| backend(error.into()))?;
+        let remaining =
+            Duration::from_millis((hold_started_at_ms + min_hold_ms).saturating_sub(now_ms()));
+        if !remaining.is_zero() {
+            self.deadline
+                .run(async {
+                    tokio::time::sleep(remaining).await;
+                    Ok(())
+                })
+                .await
+                .map_err(probe_error)?;
+        }
+        sampler.require_down(node_target).map_err(backend)?;
+        fault.ensure_active("node-down-detected").map_err(backend)?;
+
         let case_dir = self.collector.case_dir(self.scenario.case_name);
         let read_history = Recorder::create(
             case_dir.join(NODE_DOWN_READ_HISTORY_ARTIFACT),
@@ -265,21 +307,8 @@ impl FaultRun<'_> {
             .await
             .map_err(|error| (None, error))?;
 
-        // Measured from the first sample, which is where the recorded hold
-        // window starts; the closing sample taken on stop ends it.
-        let min_hold_ms =
-            u64::try_from(NODE_DOWN_MIN_HOLD.as_millis()).map_err(|error| backend(error.into()))?;
-        let remaining =
-            Duration::from_millis((hold_started_at_ms + min_hold_ms).saturating_sub(now_ms()));
-        if !remaining.is_zero() {
-            self.deadline
-                .run(async {
-                    tokio::time::sleep(remaining).await;
-                    Ok(())
-                })
-                .await
-                .map_err(probe_error)?;
-        }
+        // The node stays down until both probes finished; the closing sample
+        // taken on stop ends the recorded window.
         sampler.require_down(node_target).map_err(backend)?;
         fault.ensure_active("node-down-hold-end").map_err(backend)?;
         Ok((served_by_pod, read_probe, stable.len()))
@@ -373,43 +402,45 @@ impl FaultRun<'_> {
     }
 }
 
-/// Samples the target Pod name on a fixed interval from a blocking thread so
+/// Bound on one Pod sample, well inside the evidence's gap bound, so a hung
+/// API call can neither hide the Pod nor keep cleanup from unwinding the
+/// active fault.
+const NODE_DOWN_SAMPLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Samples the target Pod name on a fixed interval from a background task so
 /// the hold's evidence covers the probes as well as the idle wait.
 struct PodSampler {
     stop: Arc<AtomicBool>,
     samples: Arc<Mutex<Vec<NodeDownPodSample>>>,
-    handle: Option<std::thread::JoinHandle<Result<()>>>,
+    task: tokio::task::JoinHandle<()>,
     cluster: ClusterTestConfig,
     pod: String,
 }
 
 impl PodSampler {
     fn start(cluster: ClusterTestConfig, pod: String) -> Self {
-        let cluster_for_close = cluster.clone();
-        let pod_for_close = pod.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let samples = Arc::new(Mutex::new(Vec::new()));
-        let handle = {
+        let task = {
             let stop = stop.clone();
             let samples = samples.clone();
-            std::thread::spawn(move || -> Result<()> {
-                loop {
+            let cluster = cluster.clone();
+            let pod = pod.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::SeqCst) {
                     // A failed observation is skipped rather than fatal: the
                     // evidence bounds the gap between recorded samples, so an
                     // API outage long enough to hide the Pod still fails.
-                    match sample_pod(&cluster, &pod) {
-                        Ok(sample) => samples
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("node-down sample lock poisoned"))?
-                            .push(sample),
+                    match sample_pod(&cluster, &pod).await {
+                        Ok(sample) => match samples.lock() {
+                            Ok(mut samples) => samples.push(sample),
+                            Err(_) => return,
+                        },
                         Err(error) => eprintln!("warning: {error:#}"),
                     }
                     let next = Instant::now() + NODE_DOWN_SAMPLE_INTERVAL;
-                    while Instant::now() < next {
-                        if stop.load(Ordering::SeqCst) {
-                            return Ok(());
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
+                    while Instant::now() < next && !stop.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             })
@@ -417,9 +448,9 @@ impl PodSampler {
         Self {
             stop,
             samples,
-            handle: Some(handle),
-            cluster: cluster_for_close,
-            pod: pod_for_close,
+            task,
+            cluster,
+            pod,
         }
     }
 
@@ -443,10 +474,7 @@ impl PodSampler {
                 "node-down Pod sampler produced no sample within {timeout:?}"
             );
             ensure!(
-                !self
-                    .handle
-                    .as_ref()
-                    .is_some_and(|handle| handle.is_finished()),
+                !self.task.is_finished(),
                 "node-down Pod sampler stopped before its first sample"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -464,21 +492,24 @@ impl PodSampler {
 
     /// Stop sampling, take one closing sample so the hold window ends on an
     /// observation, and return every sample in order.
-    fn stop(mut self) -> Result<Vec<NodeDownPodSample>> {
+    async fn stop(mut self) -> Result<Vec<NodeDownPodSample>> {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("node-down Pod sampler panicked"))??;
+        // Each sample is bounded, so the task ends within one bound plus a
+        // poll interval.
+        (&mut self.task)
+            .await
+            .map_err(|error| anyhow::anyhow!("node-down Pod sampler failed: {error}"))?;
+        let mut closing = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            if let Ok(sample) = sample_pod(&self.cluster, &self.pod).await {
+                closing = Some(sample);
+                break;
+            }
         }
-        let closing = (0..3)
-            .find_map(|attempt| {
-                if attempt > 0 {
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-                sample_pod(&self.cluster, &self.pod).ok()
-            })
-            .context("the closing node-down Pod sample failed three times")?;
+        let closing = closing.context("the closing node-down Pod sample failed three times")?;
         let mut samples = self.snapshot()?;
         samples.push(closing);
         Ok(samples)
@@ -488,15 +519,23 @@ impl PodSampler {
 impl Drop for PodSampler {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.task.abort();
     }
 }
 
-fn sample_pod(cluster: &ClusterTestConfig, pod: &str) -> Result<NodeDownPodSample> {
+async fn sample_pod(cluster: &ClusterTestConfig, pod: &str) -> Result<NodeDownPodSample> {
     let output = Kubectl::new(cluster)
         .namespaced(&cluster.test_namespace)
         .command(["get", "pod", pod, "-o", "json", "--ignore-not-found"])
-        .run_checked()
+        .run_bounded(NODE_DOWN_SAMPLE_TIMEOUT)
+        .await
         .with_context(|| format!("sample RustFS Pod {pod} while its node is held down"))?;
+    ensure!(
+        output.code == Some(0),
+        "sample RustFS Pod {pod} while its node is held down: exit={:?} {}",
+        output.code,
+        output.stderr.trim()
+    );
     let at_ms = now_ms();
     let stdout = output.stdout.trim();
     if stdout.is_empty() {

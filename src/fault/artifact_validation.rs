@@ -6183,6 +6183,9 @@ fn validate_node_down_hold_artifacts(
     );
     hold.validate(untouched.len())?;
 
+    // Survivors are only measured after the node has been down for the
+    // minimum hold, so detection of the loss cannot postdate the probes.
+    let probes_allowed_from_ms = hold.started_at_ms.saturating_add(hold.min_hold_ms);
     let reads =
         read_jsonl::<OperationRecord>(required(artifacts, NODE_DOWN_READ_HISTORY_ARTIFACT)?)?;
     validate_history_scope_and_order(&reads, &metadata.scenario, &metadata.run_id, bucket)?;
@@ -6200,8 +6203,9 @@ fn validate_node_down_hold_artifacts(
                 && record.outcome == OperationOutcome::Ok
                 && untouched.get(key) == record.value_sha256.as_ref()
                 && hold.contains(record.started_at_ms, record.ended_at_ms)
+                && record.started_at_ms >= probes_allowed_from_ms
                 && read_keys.insert(key),
-            "{NODE_DOWN_READ_HISTORY_ARTIFACT} record {} is not one successful in-hold read of an untouched prefilled object with its prefill hash",
+            "{NODE_DOWN_READ_HISTORY_ARTIFACT} record {} is not one successful post-detection read of an untouched prefilled object with its prefill hash",
             record.id
         );
     }
@@ -6252,8 +6256,9 @@ fn validate_node_down_hold_artifacts(
         NODE_DOWN_WRITE_REPORT_ARTIFACT,
     )?)?;
     ensure!(
-        hold.contains(report.started_at_ms, report.completed_at_ms),
-        "{NODE_DOWN_WRITE_REPORT_ARTIFACT} ran outside the node-down hold window"
+        hold.contains(report.started_at_ms, report.completed_at_ms)
+            && report.started_at_ms >= probes_allowed_from_ms,
+        "{NODE_DOWN_WRITE_REPORT_ARTIFACT} ran outside the post-detection part of the node-down hold"
     );
     Ok(())
 }
@@ -17120,7 +17125,7 @@ mod tests {
         ));
         fs::write(case_dir.join("history.jsonl"), jsonl(&history)).expect("history");
 
-        let write_reads = |indices: &[usize], sha_override: Option<&str>| {
+        let write_reads_at = |indices: &[usize], sha_override: Option<&str>, first_ms: u64| {
             let reads = indices
                 .iter()
                 .enumerate()
@@ -17133,7 +17138,7 @@ mod tests {
                             .map(str::to_string)
                             .unwrap_or_else(|| format!("sha-{index}")),
                         "fault_active",
-                        1_500 + position as u64,
+                        first_ms + position as u64,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -17143,9 +17148,14 @@ mod tests {
             )
             .expect("read history");
         };
+        // Probes may only start once the node has been down for the minimum
+        // hold (61_000 here).
+        let write_reads = |indices: &[usize], sha_override: Option<&str>| {
+            write_reads_at(indices, sha_override, 62_000)
+        };
         write_reads(&[1, 2, 3, 4, 5], None);
 
-        let samples = (0..=12)
+        let samples = (0..=14)
             .map(|step| {
                 json!({
                     "at_ms": 1_000 + step * 5_000,
@@ -17165,7 +17175,7 @@ mod tests {
             "min_hold_ms": 60_000,
             "max_sample_gap_ms": 30_000,
             "started_at_ms": 1_000,
-            "ended_at_ms": 61_000,
+            "ended_at_ms": 71_000,
             "samples": samples,
             "read_probe": {"objects": 5, "verified": 5, "failures": []}
         });
@@ -17178,8 +17188,8 @@ mod tests {
             &node_down_prefix,
             NODE_DOWN_WRITE_HISTORY_ARTIFACT,
             NODE_DOWN_WRITE_REPORT_ARTIFACT,
-            2_000,
-            3_000,
+            63_000,
+            64_000,
             "fault_active",
             "during_fault",
         );
@@ -17195,10 +17205,10 @@ mod tests {
         let events = vec![
             event(900, "crash-recovery-boundary", "succeeded"),
             event(1_000, "node-down-hold", "started"),
-            event(1_900, "node-down-write", "started"),
-            event(3_500, "node-down-write", "succeeded"),
-            event(61_500, "node-down-hold", "succeeded"),
-            event(62_000, "fault-delete", "started"),
+            event(62_900, "node-down-write", "started"),
+            event(64_500, "node-down-write", "succeeded"),
+            event(71_500, "node-down-hold", "succeeded"),
+            event(72_000, "fault-delete", "started"),
         ];
         let artifacts = [
             HOST_STORAGE_PROOF_ARTIFACT,
@@ -17230,13 +17240,16 @@ mod tests {
 
         // Reading the overwritten key instead of an untouched one.
         write_reads(&[0, 1, 2, 3, 4], None);
-        expect_err(&events, "is not one successful in-hold read");
+        expect_err(&events, "is not one successful post-detection read");
         // Skipping one untouched key.
         write_reads(&[1, 2, 3, 4], None);
         expect_err(&events, "holds 4 records for 5 untouched");
         // Bytes that are not the prefill payload.
         write_reads(&[1, 2, 3, 4, 5], Some("sha-other"));
-        expect_err(&events, "is not one successful in-hold read");
+        expect_err(&events, "is not one successful post-detection read");
+        // Reads taken before RustFS could have noticed the loss.
+        write_reads_at(&[1, 2, 3, 4, 5], None, 1_500);
+        expect_err(&events, "is not one successful post-detection read");
         write_reads(&[1, 2, 3, 4, 5], None);
 
         // The hold names a Pod that is not the crashed host-storage target.
@@ -17257,6 +17270,27 @@ mod tests {
         let mut failed_step = events.clone();
         failed_step.insert(2, event(1_200, "node-down-hold", "failed"));
         expect_err(&failed_step, "records a failed node-down step");
+
+        // The write probe ran inside the hold but before detection.
+        write_write_probe_fixture(
+            &case_dir,
+            scenario,
+            run_id,
+            &node_down_prefix,
+            NODE_DOWN_WRITE_HISTORY_ARTIFACT,
+            NODE_DOWN_WRITE_REPORT_ARTIFACT,
+            2_000,
+            3_000,
+            "fault_active",
+            "during_fault",
+        );
+        let mut early_write_events = events.clone();
+        early_write_events[2].at_ms = 1_900;
+        early_write_events[3].at_ms = 3_500;
+        expect_err(
+            &early_write_events,
+            "ran outside the post-detection part of the node-down hold",
+        );
 
         // The write probe ran before the hold began.
         write_write_probe_fixture(

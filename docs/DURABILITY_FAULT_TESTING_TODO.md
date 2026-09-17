@@ -430,10 +430,12 @@ guardrails when implementing the ordered TODO below.
   taint and the node-local PV keep the replacement Pod unscheduled, so no
   second injection is needed. A composite PodChaos was rejected because it
   cannot inject into the Pending replacement and, applied before the boundary,
-  would stop the writes `drop_writes` is meant to drop. For at least 60 seconds
-  the target Pod is sampled every five seconds while the survivors must serve
-  every prefilled object the workload never touched and a fresh write probe
-  (`node-down-hold.json`, `node-down-write-report.json`); recovery then
+  would stop the writes `drop_writes` is meant to drop. The target Pod is
+  sampled every five seconds with bounded `kubectl` calls; once the node has
+  been down for 60 seconds the survivors must serve every prefilled object the
+  workload never touched and a fresh write probe while it stays down
+  (`node-down-hold.json`, `node-down-write-report.json`), and suite budgets
+  reserve that hold; recovery then
   requires every drive `ok` again. Live calibration of both scenarios, including
   the hold length against RustFS drive-offline detection, is still pending.
 
