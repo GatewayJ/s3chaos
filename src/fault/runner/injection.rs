@@ -55,9 +55,10 @@ use super::{
 use crate::fault::backends::runtime::apply_fault;
 use crate::fault::workload::execution::{
     AVAILABILITY_REPORT_ARTIFACT, MixedWorkloadRequest, MixedWorkloadResult,
-    QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, ReadProbeSummary, TypedQuorumReadCohortSource,
-    TypedQuorumReadExpectation, probe_read_cohort, probe_typed_quorum_read_cohort,
-    require_typed_quorum_read_survival, run_mixed_workload, run_warp_mixed,
+    QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, QuorumEdgeReadSurvivalReport, ReadProbeSummary,
+    TypedQuorumReadCohortSource, TypedQuorumReadExpectation, probe_read_cohort,
+    probe_typed_quorum_read_cohort, require_typed_quorum_read_survival, run_mixed_workload,
+    run_warp_mixed,
 };
 
 impl FaultRun<'_> {
@@ -473,7 +474,11 @@ impl FaultRun<'_> {
             collector.write_text(
                 scenario.case_name,
                 QUORUM_EDGE_READ_SURVIVAL_ARTIFACT,
-                &serde_json::to_string_pretty(&summary)?,
+                &serde_json::to_string_pretty(&QuorumEdgeReadSurvivalReport {
+                    scenario: scenario.name.clone(),
+                    run_id: run_id.clone(),
+                    probe: summary.clone(),
+                })?,
             )?;
             // Read quorum is still satisfied by the surviving shards, so an
             // unreadable committed object is a product defect, not the outage
