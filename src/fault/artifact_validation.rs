@@ -1566,6 +1566,17 @@ fn validate_fault_artifacts_with_identity(
             &json_spec,
             &evidence,
         )?;
+        if scenarios::holds_node_down_after_crash(&options.scenario) {
+            validate_node_down_hold_artifacts(
+                &artifacts,
+                &host_proof,
+                &metadata,
+                identity,
+                &events,
+                &json_spec.metadata.bucket,
+                workload_plan.object_count,
+            )?;
+        }
         if json_spec
             .faults
             .iter()
@@ -1620,16 +1631,6 @@ fn validate_fault_artifacts_with_identity(
             &metadata.scenario,
             &metadata.run_id,
             &json_spec.metadata.bucket,
-        )?;
-    }
-    if scenarios::holds_node_down_after_crash(&options.scenario) {
-        validate_node_down_hold_artifacts(
-            &artifacts,
-            &metadata,
-            identity,
-            &events,
-            &json_spec.metadata.bucket,
-            workload_plan.object_count,
         )?;
     }
     validate_recovery_health_artifact(&artifacts, &metadata, identity, &evidence, &events)?;
@@ -6125,6 +6126,7 @@ fn validate_ack_mutation_shape(
 /// its fresh-write probe.
 fn validate_node_down_hold_artifacts(
     artifacts: &BTreeMap<String, PathBuf>,
+    host: &HostStorageMutationProof,
     metadata: &RunMetadataArtifact,
     identity: ArtifactIdentityPolicy<'_>,
     events: &[RunEvent],
@@ -6139,8 +6141,6 @@ fn validate_node_down_hold_artifacts(
         metadata,
         identity,
     )?;
-    let host =
-        read_json::<HostStorageMutationProof>(required(artifacts, HOST_STORAGE_PROOF_ARTIFACT)?)?;
     ensure!(
         hold.target
             == NodeDownTarget {
@@ -17210,20 +17210,15 @@ mod tests {
             event(71_500, "node-down-hold", "succeeded"),
             event(72_000, "fault-delete", "started"),
         ];
-        let artifacts = [
-            HOST_STORAGE_PROOF_ARTIFACT,
-            "history.jsonl",
-            NODE_DOWN_HOLD_ARTIFACT,
-            NODE_DOWN_READ_HISTORY_ARTIFACT,
-            NODE_DOWN_WRITE_REPORT_ARTIFACT,
-            NODE_DOWN_WRITE_HISTORY_ARTIFACT,
-        ]
-        .into_iter()
-        .map(|name| (name.to_string(), case_dir.join(name)))
-        .collect::<BTreeMap<_, _>>();
+        let artifacts = FaultRunArtifactSpec::required_names_for_scenario(scenario)
+            .into_iter()
+            .map(|name| (name.clone(), case_dir.join(name)))
+            .collect::<BTreeMap<_, _>>();
+        assert!(!artifacts.contains_key(HOST_STORAGE_PROOF_ARTIFACT));
         let validate = |events: &[RunEvent]| {
             validate_node_down_hold_artifacts(
                 &artifacts,
+                &host_proof,
                 &metadata,
                 ArtifactIdentityPolicy::LegacyCompatible,
                 events,
