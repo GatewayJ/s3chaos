@@ -69,6 +69,7 @@ use crate::fault::{
         ShardMappingSource, StorageRecoveryArtifactIdentity, StorageRecoveryCase,
         StorageVolumeIdentity, VERSION_SHARD_MAPPING_ARTIFACT, VersionShardMappingObservation,
     },
+    storage_recovery_helper::{STORAGE_HELPER_JOURNAL_ROOT, STORAGE_HELPER_VOLUME_ROOT},
     storage_recovery_lease::{
         KubernetesStorageLeaseAdapter, StorageRecoveryCleanupProof, release_owned_lease,
     },
@@ -90,7 +91,10 @@ use crate::fault::{
     workload::{ObjectSpec, S3WorkloadClient, WorkloadPlan},
 };
 use crate::framework::{
-    artifacts::ArtifactCollector, kubectl::Kubectl, port_forward::PortForwardGuard, resources,
+    artifacts::ArtifactCollector,
+    kubectl::Kubectl,
+    port_forward::{PortForwardGuard, PortForwardSpec, replace_port_forward},
+    resources,
 };
 use crate::rustfs::{RustfsAdminTransport, RustfsErasureLayout, read_erasure_layout};
 
@@ -848,12 +852,12 @@ fn storage_helper_pod_manifest(
                     "readOnlyRootFilesystem": true,
                 },
                 "volumeMounts": [
-                    {"name": "volume", "mountPath": "/var/lib/s3chaos/volume", "readOnly": true},
+                    {"name": "volume", "mountPath": STORAGE_HELPER_VOLUME_ROOT, "readOnly": true},
                     {"name": "host-proc", "mountPath": "/host/proc", "readOnly": true},
                     {"name": "host-dev", "mountPath": "/host/dev", "readOnly": true},
                     {"name": "host-sys", "mountPath": "/host/sys", "readOnly": true},
                     {"name": "locks", "mountPath": "/var/lock/s3chaos"},
-                    {"name": "journal", "mountPath": "/var/lib/s3chaos/journal"},
+                    {"name": "journal", "mountPath": STORAGE_HELPER_JOURNAL_ROOT},
                 ],
             }],
             "volumes": [
@@ -1904,7 +1908,7 @@ struct FreshVolumeWorkloadSession {
     prefilled: Vec<ObjectSpec>,
     sealed: SealedVersion,
     endpoint: String,
-    _port_forward: Option<PortForwardGuard>,
+    port_forward: Option<PortForwardGuard>,
     events: RunEventRecorder,
 }
 
@@ -1938,19 +1942,13 @@ fn single_set_runtime_topology(
     )?;
     let mut members = Vec::new();
     for server in &layout.servers {
-        let host = reqwest::Url::parse(&server.endpoint)
-            .context("parse RustFS runtime server endpoint")?
-            .host_str()
-            .context("RustFS runtime server endpoint lacks host")?
-            .to_string();
-        let matches = inventory
+        let candidate_pods = inventory
             .pod_proofs
             .iter()
-            .filter(|pod| host == pod.name || host.starts_with(&format!("{}.", pod.name)))
-            .collect::<Vec<_>>();
-        let [pod] = matches.as_slice() else {
-            bail!("RustFS runtime server endpoint does not map to exactly one target Pod")
-        };
+            .map(|pod| pod.name.as_str())
+            .collect();
+        let pod_name =
+            super::runner::targets::runtime_server_pod_name(&server.endpoint, &candidate_pods)?;
         let drives = server
             .drives
             .iter()
@@ -1962,7 +1960,7 @@ fn single_set_runtime_topology(
             "runtime server does not own one target-set shard"
         );
         members.push(ErasureSetMember {
-            pod_name: pod.name.clone(),
+            pod_name,
             server_endpoint: server.endpoint.clone(),
             shard_ids: drives,
         });
@@ -2311,6 +2309,30 @@ impl<'a> FreshVolumeDriver<'a> {
         let layout = read_erasure_layout(&endpoint, "us-east-1", access_key, secret_key).await?;
         let (shape, membership) = single_set_runtime_topology(&inventory, &layout)?;
         Ok((inventory, layout, shape, membership))
+    }
+
+    async fn wait_for_runtime_topology(
+        &self,
+        phase: &str,
+    ) -> Result<(
+        RustfsTargetInventory,
+        RustfsErasureLayout,
+        ErasureSetShape,
+        ErasureSetMembership,
+    )> {
+        let deadline = Instant::now()
+            + Duration::from_secs(self.config.cluster.timeout.as_secs().clamp(10, 120));
+        loop {
+            match self.current_runtime_topology().await {
+                Ok(topology) => return Ok(topology),
+                Err(error) => {
+                    if Instant::now() >= deadline {
+                        bail!("{phase} runtime topology did not converge: {error:#}");
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
     }
 
     fn trial_target_proof(
@@ -2695,7 +2717,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 ordinary_get_operation_id,
             },
             endpoint,
-            _port_forward: port_forward,
+            port_forward,
             events,
         };
         self.state
@@ -2820,7 +2842,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         let probe_request = |lock_path: PathBuf| FreshVolumeHostProbeRequest {
             target_container_id: target_container_id.to_string(),
             target_mount_path: self.config.rustfs_volume_path.clone(),
-            volume_root: PathBuf::from("/var/lib/s3chaos/volume"),
+            volume_root: PathBuf::from(STORAGE_HELPER_VOLUME_ROOT),
             host_proc_root: PathBuf::from("/host/proc"),
             host_dev_root: PathBuf::from("/host/dev"),
             lock_path,
@@ -2855,16 +2877,13 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         )?;
         let mut members = Vec::new();
         for server in &layout.servers {
-            let endpoint_url = reqwest::Url::parse(&server.endpoint)
-                .context("parse RustFS runtime server endpoint")?;
-            let host = endpoint_url
-                .host_str()
-                .context("RustFS runtime server endpoint lacks host")?;
-            let pod = inventory
+            let candidate_pods = inventory
                 .pod_proofs
                 .iter()
-                .find(|pod| host == pod.name || host.starts_with(&format!("{}.", pod.name)))
-                .context("RustFS runtime server endpoint does not map to one target Pod")?;
+                .map(|pod| pod.name.as_str())
+                .collect();
+            let pod_name =
+                super::runner::targets::runtime_server_pod_name(&server.endpoint, &candidate_pods)?;
             let drives = server
                 .drives
                 .iter()
@@ -2876,7 +2895,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 "runtime server does not own one shard in the target set"
             );
             members.push(ErasureSetMember {
-                pod_name: pod.name.clone(),
+                pod_name,
                 server_endpoint: server.endpoint.clone(),
                 shard_ids: drives,
             });
@@ -3351,8 +3370,8 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         ));
         let empty_request = FreshVolumeHostProbeRequest {
             target_container_id: String::new(),
-            target_mount_path: "/var/lib/s3chaos/volume".to_string(),
-            volume_root: PathBuf::from("/var/lib/s3chaos/volume"),
+            target_mount_path: STORAGE_HELPER_VOLUME_ROOT.to_string(),
+            volume_root: PathBuf::from(STORAGE_HELPER_VOLUME_ROOT),
             host_proc_root: PathBuf::from("/host/proc"),
             host_dev_root: PathBuf::from("/host/dev"),
             lock_path: empty_lock,
@@ -3403,7 +3422,49 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         )
         .await?;
 
-        let (inventory, layout, shape, membership) = self.current_runtime_topology().await?;
+        // Scaling every Pod down invalidates the Service port-forward's
+        // selected Pod. Keep the same endpoint for the workload and heal clients.
+        let (endpoint, mut port_forward) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+            let session = state
+                .session
+                .as_mut()
+                .context("fresh-volume workload session was not prepared")?;
+            (session.endpoint.clone(), session.port_forward.take())
+        };
+        let access = async {
+            if port_forward.is_some() {
+                let local_port = endpoint
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                    .context("parse local S3 port-forward endpoint")?;
+                let spec = PortForwardSpec::tenant_io_with_local_port(
+                    &self.config.cluster.test_namespace,
+                    &self.config.cluster.tenant_name,
+                    local_port,
+                );
+                replace_port_forward(&mut port_forward, || {
+                    spec.start_with_temp_log(&Kubectl::new(&self.config.cluster))
+                })?;
+            }
+            ensure_s3_access(&mut port_forward, &self.config.cluster, &endpoint).await
+        }
+        .await;
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .session
+            .as_mut()
+            .context("fresh-volume workload session disappeared during access recovery")?
+            .port_forward = port_forward;
+        access.context("restore S3 access after fresh-volume Pod replacement")?;
+
+        let (inventory, layout, shape, membership) = self
+            .wait_for_runtime_topology("replacement adoption")
+            .await?;
         ensure!(
             layout.deployment_id == original.rustfs_deployment_id,
             "RustFS deployment identity changed during fresh-volume adoption"
@@ -3446,7 +3507,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 .clone()
                 .context("replacement RustFS container identity is absent")?,
             target_mount_path: self.config.rustfs_volume_path.clone(),
-            volume_root: PathBuf::from("/var/lib/s3chaos/volume"),
+            volume_root: PathBuf::from(STORAGE_HELPER_VOLUME_ROOT),
             host_proc_root: PathBuf::from("/host/proc"),
             host_dev_root: PathBuf::from("/host/dev"),
             lock_path: PathBuf::from(format!(
@@ -3464,9 +3525,8 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             .context("adopted replacement lacks a RustFS drive UUID")?;
         ensure!(
             adopted_probe.canonical_device == empty_probe.canonical_device
-                && adopted_probe.filesystem_uuid == empty_probe.filesystem_uuid
-                && replacement_drive != original.rustfs_drive_uuid,
-            "replacement generation changed or reused the original RustFS drive UUID during adoption"
+                && adopted_probe.filesystem_uuid == empty_probe.filesystem_uuid,
+            "replacement physical generation changed during adoption"
         );
         ensure!(
             membership.members.iter().any(|member| {
@@ -4444,6 +4504,43 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_helper_mounts_match_session_roots() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+        config.storage_recovery_helper_image = Some("rustfs/s3chaos:test".to_string());
+        let raw = storage_helper_pod_manifest(
+            &config,
+            "run-1",
+            "fresh-helper",
+            "storage-a",
+            "/mnt/rustfs-a",
+        )
+        .expect("helper manifest");
+        let pod: Pod = serde_yaml_ng::from_str(&raw).expect("helper Pod");
+        let spec = pod.spec.expect("spec");
+        let mounts = spec.containers[0].volume_mounts.as_ref().expect("mounts");
+        let roots = crate::fault::storage_recovery_helper::StorageHelperRoots::default();
+        for (name, path) in [
+            ("volume", roots.volume),
+            ("journal", roots.journal),
+            ("locks", roots.lock),
+        ] {
+            let mount = mounts
+                .iter()
+                .find(|mount| mount.name == name)
+                .expect("required mount");
+            assert_eq!(Path::new(&mount.mount_path), path.as_path());
+        }
+        assert_eq!(
+            mounts
+                .iter()
+                .find(|mount| mount.name == "volume")
+                .unwrap()
+                .read_only,
+            Some(true)
+        );
+    }
 
     #[test]
     fn lost_found_is_allowed_only_when_recursively_empty() {

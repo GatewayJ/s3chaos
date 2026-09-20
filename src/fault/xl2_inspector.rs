@@ -289,11 +289,11 @@ pub fn inspect_all_xl_meta(bytes: &[u8]) -> Result<Vec<Xl2InventoryVersionLayout
                 && parsed_header.erasure_parity_shards == u64::from(object.erasure_parity_shards),
             "XL2 version header and object erasure geometry disagree"
         );
-        let uses_data_directory = parsed_header.flags & 0b10 != 0;
+        let header_uses_data_directory = parsed_header.flags & 0b10 != 0;
         let inline = parsed_header.flags & 0b100 != 0;
         ensure!(
-            uses_data_directory ^ inline,
-            "XL2 object version must use exactly one inline or shard-part storage form"
+            !(header_uses_data_directory && inline),
+            "XL2 object version cannot be both inline and data-directory flagged"
         );
         let (kind, shard_layout) = if inline {
             ensure!(
@@ -972,6 +972,30 @@ mod tests {
         assert_eq!(
             layout.relative_part_paths,
             [format!("{DATA_DIR}/part.1"), format!("{DATA_DIR}/part.3")]
+        );
+    }
+
+    #[test]
+    fn inventory_accepts_shard_parts_when_header_data_directory_flag_is_clear() {
+        let layout = inspect_xl_meta(
+            &fixture_with_layout(VERSION, Some(DATA_DIR), &[1], &[1024], 0),
+            VERSION,
+        )
+        .expect("inspect XL2 shard object without the legacy data-directory flag");
+
+        assert_eq!(layout.version_id, VERSION);
+        assert_eq!(layout.data_directory, DATA_DIR);
+        assert_eq!(layout.relative_part_paths, [format!("{DATA_DIR}/part.1")]);
+    }
+
+    #[test]
+    fn inventory_rejects_inline_header_with_shard_data_directory() {
+        let bytes = fixture_with_layout(VERSION, Some(DATA_DIR), &[1], &[1024], 0b100);
+        let error = inspect_all_xl_meta(&bytes).expect_err("contradictory inline layout");
+        assert!(
+            error
+                .to_string()
+                .contains("inline XL2 object unexpectedly declares a data directory")
         );
     }
 

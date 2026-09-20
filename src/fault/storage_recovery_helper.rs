@@ -2889,7 +2889,7 @@ mod tests {
     }
 
     #[test]
-    fn aborted_before_mutation_cannot_close_a_mutating_helper_session() {
+    fn fresh_volume_cleanup_requires_committed_physical_replacement() {
         let (_temporary, roots) = test_roots();
         let mut context = context_for(&roots);
         context.identity.scenario = "fresh-volume-replacement".to_string();
@@ -2923,12 +2923,15 @@ mod tests {
 
         let mut session =
             StorageHelperSession::begin(context.clone(), &roots).expect("fresh mutating session");
-        session
+        let prepared = session
             .execute(StorageHelperInvocation {
                 context: context.clone(),
                 operation: StorageRecoveryHostOperation::PrepareFreshVolume {
                     replacement_persistent_volume: "replacement-pv".to_string(),
-                    replacement_persistent_volume_claim: "replacement-pvc".to_string(),
+                    replacement_persistent_volume_claim: context
+                        .volume
+                        .persistent_volume_claim
+                        .clone(),
                 },
             })
             .expect("begin fresh-volume mutation");
@@ -2939,6 +2942,50 @@ mod tests {
             error.to_string().contains("after mutation began"),
             "{error:#}"
         );
+
+        let mut replacement = context.volume.clone();
+        replacement.persistent_volume = "replacement-pv".to_string();
+        replacement.persistent_volume_uid = "replacement-pv-uid".to_string();
+        replacement.persistent_volume_claim_uid = "replacement-pvc-uid".to_string();
+        replacement.canonical_device = "/dev/replacement".to_string();
+        replacement.filesystem_uuid = "replacement-fs".to_string();
+        replacement.observed_at_ms = prepared
+            .completed_at_ms
+            .max(context.volume.observed_at_ms + 1);
+        let committed = StorageRecoveryCleanupProof::FreshVolumeCommitted {
+            observed_at_ms: replacement.observed_at_ms,
+            prepare_receipt: Box::new(prepared),
+            replacement_volume: Box::new(replacement.clone()),
+            old_device_absence_sha256: "a".repeat(64),
+        };
+        session
+            .finish(&context, &committed)
+            .expect("physical replacement may retain the logical slot UUID");
+        for invalid in ["filesystem", "pvc", "node", "slot"] {
+            let mut forged = committed.clone();
+            let StorageRecoveryCleanupProof::FreshVolumeCommitted {
+                replacement_volume, ..
+            } = &mut forged
+            else {
+                unreachable!();
+            };
+            match invalid {
+                "filesystem" => {
+                    replacement_volume.filesystem_uuid = context.volume.filesystem_uuid.clone()
+                }
+                "pvc" => {
+                    replacement_volume.persistent_volume_claim_uid =
+                        context.volume.persistent_volume_claim_uid.clone()
+                }
+                "node" => replacement_volume.node_uid = "foreign-node".to_string(),
+                "slot" => replacement_volume.set_index += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                session.finish(&context, &forged).is_err(),
+                "invalid {invalid} cleanup proof"
+            );
+        }
     }
 
     #[test]

@@ -78,11 +78,12 @@ where
         pod.to_string(),
         "--".to_string(),
         "chroot".to_string(),
-        "/host".to_string(),
+        "/proc/1/root".to_string(),
         "/usr/bin/nsenter".to_string(),
         "--target".to_string(),
         "1".to_string(),
         "--mount".to_string(),
+        "--ipc".to_string(),
         "--root".to_string(),
         "--wd".to_string(),
         "--".to_string(),
@@ -126,35 +127,36 @@ mod tests {
     use crate::framework::command::CommandOutput;
 
     #[test]
-    fn host_command_enters_pid_one_mount_namespace_and_preserves_arguments() {
+    fn host_command_enters_host_mount_and_ipc_namespaces_and_preserves_arguments() {
         let command = command_args("helper", ["/usr/bin/findmnt", "--mountpoint", "/data/pv"]);
 
         assert_eq!(
-            &command[..12],
+            &command[..13],
             [
                 "exec",
                 "helper",
                 "--",
                 "chroot",
-                "/host",
+                "/proc/1/root",
                 "/usr/bin/nsenter",
                 "--target",
                 "1",
                 "--mount",
+                "--ipc",
                 "--root",
                 "--wd",
                 "--",
             ]
         );
-        assert_eq!(command[12], "/bin/sh");
-        assert_eq!(command[13], "-c");
-        assert_eq!(command[14], REMOTE_COMMAND_WRAPPER);
+        assert_eq!(command[13], "/bin/sh");
+        assert_eq!(command[14], "-c");
+        assert_eq!(command[15], REMOTE_COMMAND_WRAPPER);
         assert!(
             REMOTE_COMMAND_WRAPPER.contains("/proc/self/ns/mnt")
                 && REMOTE_COMMAND_WRAPPER.contains("/proc/1/ns/mnt")
         );
         assert_eq!(
-            &command[15..],
+            &command[16..],
             [
                 "s3chaos-host-command",
                 "/usr/bin/findmnt",
