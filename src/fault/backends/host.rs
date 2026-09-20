@@ -1095,31 +1095,18 @@ fn validate_observer_pod_value(pod: &Value, expected_node: &str) -> Result<()> {
             == Some(true),
         "host observer container must be privileged"
     );
-    let host_volume_name = container
-        .pointer("/volumeMounts")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|mount| {
-            mount.get("mountPath").and_then(Value::as_str) == Some("/host")
-                && mount.get("readOnly").and_then(Value::as_bool) == Some(true)
-                && mount.get("mountPropagation").and_then(Value::as_str) == Some("HostToContainer")
-        })
-        .and_then(|mount| mount.get("name").and_then(Value::as_str));
-    let host_volume_name = host_volume_name.context(
-        "host observer Pod must expose /host through a read-only privileged volume mount",
-    )?;
+    // Host-root and data-volume binds can retain a filesystem after the host
+    // unmounts it. Host PID access lets commands enter through /proc/1/root.
     ensure!(
-        pod.pointer("/spec/volumes")
+        !pod.pointer("/spec/volumes")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .any(|volume| {
-                volume.get("name").and_then(Value::as_str) == Some(host_volume_name)
-                    && volume.pointer("/hostPath/path").and_then(Value::as_str) == Some("/")
-                    && volume.pointer("/hostPath/type").and_then(Value::as_str) == Some("Directory")
-            }),
-        "host observer Pod /host mount must reference the read-only host root"
+            .any(|volume| volume.get("hostPath").is_some()
+                || volume.get("persistentVolumeClaim").is_some()
+                || volume.get("csi").is_some()
+                || volume.get("ephemeral").is_some()),
+        "host observer must not bind host or storage volumes; recreate it with hostPID access only"
     );
     ensure!(
         pod.pointer("/spec/restartPolicy").and_then(Value::as_str) == Some("Never"),
@@ -3416,18 +3403,11 @@ spec:
       securityContext:
         privileged: true
       volumeMounts:
-        - name: host-root
-          mountPath: /host
-          mountPropagation: HostToContainer
 {target_mount}        - name: helper-journal
           mountPath: /journal
         - name: helper-lock
           mountPath: /var/lock/s3chaos
   volumes:
-    - name: host-root
-      hostPath:
-        path: /
-        type: Directory
 {target_volume}    - name: helper-journal
       emptyDir: {{}}
     - name: helper-lock
@@ -3608,17 +3588,7 @@ mod tests {
                 "restartPolicy": "Never",
                 "containers": [{
                     "name": "host-tools",
-                    "securityContext": {"privileged": true},
-                    "volumeMounts": [{
-                        "name": "host-root",
-                        "mountPath": "/host",
-                        "readOnly": true,
-                        "mountPropagation": "HostToContainer"
-                    }]
-                }],
-                "volumes": [{
-                    "name": "host-root",
-                    "hostPath": {"path": "/", "type": "Directory"}
+                    "securityContext": {"privileged": true}
                 }]
             },
             "status": {"conditions": [{"type": "Ready", "status": "True"}]}
@@ -3626,7 +3596,7 @@ mod tests {
     }
 
     #[test]
-    fn dm_helper_is_pinned_to_one_node_and_host_root() {
+    fn stale_helper_is_pinned_to_one_node_and_retains_target() {
         let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
         let manifest = dm_helper_manifest(
             &config.cluster,
@@ -3638,12 +3608,12 @@ mod tests {
 
         assert!(manifest.contains("nodeName: worker-a"));
         assert!(manifest.contains("privileged: true"));
-        assert!(manifest.contains("mountPath: /host"));
+        assert!(manifest.contains("hostPID: true"));
+        assert!(!manifest.contains("mountPath: /host"));
         assert!(manifest.contains("mountPath: /target"));
         assert!(manifest.contains("path: /var/lib/rustfs-stale"));
         assert!(manifest.contains("mountPath: /journal"));
         assert!(manifest.contains("mountPath: /var/lock/s3chaos"));
-        assert!(manifest.contains("path: /"));
         assert!(manifest.contains("s3chaos"));
     }
 
@@ -3662,17 +3632,14 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(mounts.iter().all(|mount| mount["name"] != "target-volume"));
-        let host = mounts
-            .iter()
-            .find(|mount| mount["name"] == "host-root")
-            .unwrap();
-        assert_eq!(host["mountPropagation"], "HostToContainer");
+        assert!(mounts.iter().all(|mount| mount["mountPath"] != "/host"));
+        assert_eq!(pod["spec"]["hostPID"], true);
         assert!(
             pod["spec"]["volumes"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|volume| volume["name"] != "target-volume")
+                .all(|volume| volume.get("hostPath").is_none())
         );
     }
 
@@ -3704,10 +3671,16 @@ mod tests {
         no_host_pid["spec"]["hostPID"] = json!(false);
         assert!(validate_observer_pod_value(&no_host_pid, "worker-a").is_err());
 
-        let mut private_mount = valid;
-        private_mount["spec"]["containers"][0]["volumeMounts"][0]["mountPropagation"] =
-            json!("None");
-        assert!(validate_observer_pod_value(&private_mount, "worker-a").is_err());
+        for source in [
+            json!({"hostPath": {"path": "/", "type": "Directory"}}),
+            json!({"persistentVolumeClaim": {"claimName": "target"}}),
+            json!({"csi": {"driver": "test"}}),
+            json!({"ephemeral": {"volumeClaimTemplate": {}}}),
+        ] {
+            let mut bound_storage = valid.clone();
+            bound_storage["spec"]["volumes"] = json!([source]);
+            assert!(validate_observer_pod_value(&bound_storage, "worker-a").is_err());
+        }
     }
 
     #[test]

@@ -170,23 +170,17 @@ spec:
       command: ["sh", "-c", "trap : TERM INT; while :; do sleep 3600 & wait $!; done"]
       securityContext:
         privileged: true
-      volumeMounts:
-        - name: host-root
-          mountPath: /host
-          readOnly: true
-          mountPropagation: HostToContainer
-  volumes:
-    - name: host-root
-      hostPath:
-        path: /
-        type: Directory
 ```
 
 The observer is intentionally separate from the fault namespace because the
 runner recreates that namespace for dedicated-storage scenarios. Its
 privileged access is still security-sensitive; dedicate it to the lab and
-remove it after testing. The runner enters PID 1's mount namespace with the
-host `nsenter` binary for every observer and helper command, then verifies that
+remove it after testing. Recreate older observers that bind the host root or
+storage volumes: such mounts can retain the target filesystem across a host
+unmount, and preflight now rejects them. Observer and crash-helper commands
+access host tools through `/proc/1/root` without creating a host-root bind.
+The runner enters PID 1's mount namespace with the host `nsenter` binary for
+every observer and helper command, then verifies that
 the command sees the same mount namespace as PID 1. The host must provide
 `/usr/bin/nsenter`, `/usr/bin/findmnt`, `/usr/bin/readlink`, and
 `/usr/sbin/dmsetup`. Crash-proxy runs also require `/usr/bin/timeout` and the
