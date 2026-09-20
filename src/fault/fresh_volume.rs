@@ -91,7 +91,10 @@ use crate::fault::{
     workload::{ObjectSpec, S3WorkloadClient, WorkloadPlan},
 };
 use crate::framework::{
-    artifacts::ArtifactCollector, kubectl::Kubectl, port_forward::PortForwardGuard, resources,
+    artifacts::ArtifactCollector,
+    kubectl::Kubectl,
+    port_forward::{PortForwardGuard, PortForwardSpec, replace_port_forward},
+    resources,
 };
 use crate::rustfs::{RustfsAdminTransport, RustfsErasureLayout, read_erasure_layout};
 
@@ -1905,7 +1908,7 @@ struct FreshVolumeWorkloadSession {
     prefilled: Vec<ObjectSpec>,
     sealed: SealedVersion,
     endpoint: String,
-    _port_forward: Option<PortForwardGuard>,
+    port_forward: Option<PortForwardGuard>,
     events: RunEventRecorder,
 }
 
@@ -2714,7 +2717,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 ordinary_get_operation_id,
             },
             endpoint,
-            _port_forward: port_forward,
+            port_forward,
             events,
         };
         self.state
@@ -3418,6 +3421,46 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             self.config.rustfs_pod_stable_window,
         )
         .await?;
+
+        // Scaling every Pod down invalidates the Service port-forward's
+        // selected Pod. Keep the same endpoint for the workload and heal clients.
+        let (endpoint, mut port_forward) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+            let session = state
+                .session
+                .as_mut()
+                .context("fresh-volume workload session was not prepared")?;
+            (session.endpoint.clone(), session.port_forward.take())
+        };
+        let access = async {
+            if port_forward.is_some() {
+                let local_port = endpoint
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                    .context("parse local S3 port-forward endpoint")?;
+                let spec = PortForwardSpec::tenant_io_with_local_port(
+                    &self.config.cluster.test_namespace,
+                    &self.config.cluster.tenant_name,
+                    local_port,
+                );
+                replace_port_forward(&mut port_forward, || {
+                    spec.start_with_temp_log(&Kubectl::new(&self.config.cluster))
+                })?;
+            }
+            ensure_s3_access(&mut port_forward, &self.config.cluster, &endpoint).await
+        }
+        .await;
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .session
+            .as_mut()
+            .context("fresh-volume workload session disappeared during access recovery")?
+            .port_forward = port_forward;
+        access.context("restore S3 access after fresh-volume Pod replacement")?;
 
         let (inventory, layout, shape, membership) = self
             .wait_for_runtime_topology("replacement adoption")
