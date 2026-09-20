@@ -179,8 +179,9 @@ remove it after testing. Recreate older observers that bind the host root or
 storage volumes: such mounts can retain the target filesystem across a host
 unmount, and preflight now rejects them. Observer and crash-helper commands
 access host tools through `/proc/1/root` without creating a host-root bind.
-The runner enters PID 1's mount namespace with the host `nsenter` binary for
-every observer and helper command, then verifies that
+The runner enters PID 1's mount and IPC namespaces with the host `nsenter`
+binary for every observer and helper command. Sharing the host IPC namespace
+lets device-mapper transactions complete their udev semaphore handshake. It verifies that
 the command sees the same mount namespace as PID 1. The host must provide
 `/usr/bin/nsenter`, `/usr/bin/findmnt`, `/usr/bin/readlink`, and
 `/usr/sbin/dmsetup`. Crash-proxy runs also require `/usr/bin/timeout` and the
