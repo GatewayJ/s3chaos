@@ -3525,9 +3525,8 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             .context("adopted replacement lacks a RustFS drive UUID")?;
         ensure!(
             adopted_probe.canonical_device == empty_probe.canonical_device
-                && adopted_probe.filesystem_uuid == empty_probe.filesystem_uuid
-                && replacement_drive != original.rustfs_drive_uuid,
-            "replacement generation changed or reused the original RustFS drive UUID during adoption"
+                && adopted_probe.filesystem_uuid == empty_probe.filesystem_uuid,
+            "replacement physical generation changed during adoption"
         );
         ensure!(
             membership.members.iter().any(|member| {

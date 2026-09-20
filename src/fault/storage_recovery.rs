@@ -261,6 +261,30 @@ impl StorageVolumeIdentity {
             && self.filesystem_uuid == other.filesystem_uuid
             && self.rustfs_drive_uuid == other.rustfs_drive_uuid
     }
+
+    pub(crate) fn validate_replacement_generation(&self, replacement: &Self) -> Result<()> {
+        ensure!(
+            self.same_logical_slot(replacement),
+            "replacement does not occupy the original RustFS logical volume slot"
+        );
+        ensure!(
+            replacement.observed_at_ms > self.observed_at_ms,
+            "replacement identity must be observed after the original identity"
+        );
+        ensure!(
+            self.persistent_volume_claim_uid != replacement.persistent_volume_claim_uid,
+            "fresh replacement reused the original PVC generation"
+        );
+        // Format healing preserves the logical slot's RustFS UUID. Physical
+        // replacement must instead be proven by the storage generations.
+        ensure!(
+            self.persistent_volume_uid != replacement.persistent_volume_uid
+                && self.canonical_device != replacement.canonical_device
+                && self.filesystem_uuid != replacement.filesystem_uuid,
+            "fresh replacement must have new PV, device, and filesystem generations"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,26 +517,8 @@ impl FreshVolumeReplacementProof {
         );
         self.original.validate()?;
         self.replacement.validate()?;
-        ensure!(
-            self.original.same_logical_slot(&self.replacement),
-            "replacement does not occupy the original RustFS logical volume slot"
-        );
-        ensure!(
-            self.replacement.observed_at_ms > self.original.observed_at_ms,
-            "replacement identity must be observed after the original identity"
-        );
-        ensure!(
-            self.original.persistent_volume_claim_uid
-                != self.replacement.persistent_volume_claim_uid,
-            "fresh replacement reused the original PVC generation"
-        );
-        ensure!(
-            self.original.persistent_volume_uid != self.replacement.persistent_volume_uid
-                && self.original.canonical_device != self.replacement.canonical_device
-                && self.original.filesystem_uuid != self.replacement.filesystem_uuid
-                && self.original.rustfs_drive_uuid != self.replacement.rustfs_drive_uuid,
-            "fresh replacement must have new PV, filesystem, and RustFS drive generations"
-        );
+        self.original
+            .validate_replacement_generation(&self.replacement)?;
         self.empty_before_adoption.validate(&self.replacement)
     }
 }
@@ -6182,6 +6188,44 @@ mod tests {
             .expect_err("checker suffix cannot start before its prefix completes");
 
         assert!(error.to_string().contains("post-return prefix/checker"));
+    }
+
+    #[test]
+    fn fresh_replacement_preserves_slot_uuid_but_rejects_reused_physical_storage() {
+        let original = volume("old", 100);
+        let mut replacement = volume("new", 300);
+        replacement.rustfs_drive_uuid = original.rustfs_drive_uuid.clone();
+        FreshVolumeReplacementProof::prove(
+            identity("fresh-volume-replacement"),
+            original.clone(),
+            replacement.clone(),
+            empty_observation(&replacement, 200),
+        )
+        .expect("format heal may preserve the logical slot UUID");
+
+        for reused in ["pv", "pvc", "device", "filesystem"] {
+            let mut candidate = replacement.clone();
+            match reused {
+                "pv" => candidate.persistent_volume_uid = original.persistent_volume_uid.clone(),
+                "pvc" => {
+                    candidate.persistent_volume_claim_uid =
+                        original.persistent_volume_claim_uid.clone()
+                }
+                "device" => candidate.canonical_device = original.canonical_device.clone(),
+                "filesystem" => candidate.filesystem_uuid = original.filesystem_uuid.clone(),
+                _ => unreachable!(),
+            }
+            assert!(
+                FreshVolumeReplacementProof::prove(
+                    identity("fresh-volume-replacement"),
+                    original.clone(),
+                    candidate.clone(),
+                    empty_observation(&candidate, 200),
+                )
+                .is_err(),
+                "reusing {reused} cannot prove a physical replacement"
+            );
+        }
     }
 
     #[test]

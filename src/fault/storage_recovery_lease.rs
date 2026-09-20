@@ -246,6 +246,9 @@ impl StorageRecoveryCleanupProof {
                     "fresh-volume preparation",
                 )?;
                 replacement_volume.validate()?;
+                context
+                    .volume
+                    .validate_replacement_generation(replacement_volume)?;
                 let StorageRecoveryHostOperation::PrepareFreshVolume {
                     replacement_persistent_volume,
                     replacement_persistent_volume_claim,
@@ -255,17 +258,9 @@ impl StorageRecoveryCleanupProof {
                 };
                 validate_sha256(old_device_absence_sha256)?;
                 ensure!(
-                    replacement_volume.rustfs_deployment_id == context.volume.rustfs_deployment_id
-                        && replacement_volume.namespace == context.volume.namespace
-                        && replacement_volume.tenant == context.volume.tenant
-                        && replacement_volume.volume_name == context.volume.volume_name
-                        && replacement_volume.persistent_volume == *replacement_persistent_volume
+                    replacement_volume.persistent_volume == *replacement_persistent_volume
                         && replacement_volume.persistent_volume_claim
                             == *replacement_persistent_volume_claim
-                        && replacement_volume.persistent_volume_uid
-                            != context.volume.persistent_volume_uid
-                        && replacement_volume.rustfs_drive_uuid != context.volume.rustfs_drive_uuid
-                        && replacement_volume.canonical_device != context.volume.canonical_device
                         && *observed_at_ms >= prepare_receipt.completed_at_ms,
                     "fresh-volume cleanup does not prove replacement ownership and old-device absence"
                 );
