@@ -108,6 +108,19 @@ impl PortForwardSpec {
         ))
     }
 
+    pub fn pod_on_available_port(
+        namespace: impl Into<String>,
+        pod_name: impl Into<String>,
+        remote_port: u16,
+    ) -> Result<Self> {
+        Ok(Self {
+            namespace: namespace.into(),
+            service: format!("pod/{}", pod_name.into()),
+            local_port: available_local_port()?,
+            remote_port,
+        })
+    }
+
     pub fn command(&self, kubectl: &Kubectl) -> CommandSpec {
         kubectl.clone().namespaced(&self.namespace).command([
             "port-forward".to_string(),

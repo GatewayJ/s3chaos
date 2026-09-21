@@ -389,6 +389,7 @@ impl HostGenerationIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum StorageRecoveryHostOperation {
+    InspectHostGeneration,
     InspectXlMeta {
         object_directory: String,
         bucket: String,
@@ -431,11 +432,15 @@ pub enum StorageRecoveryHostOperation {
 
 impl StorageRecoveryHostOperation {
     pub fn is_destructive(&self) -> bool {
-        !matches!(self, Self::InspectXlMeta { .. })
+        !matches!(
+            self,
+            Self::InspectHostGeneration | Self::InspectXlMeta { .. }
+        )
     }
 
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::InspectHostGeneration => Ok(()),
             Self::InspectXlMeta {
                 object_directory,
                 bucket,
@@ -649,20 +654,35 @@ impl StorageRecoveryOperationReceipt {
         context: &OwnedStorageContext,
         operation: &StorageRecoveryHostOperation,
     ) -> Result<()> {
+        self.validate_for_time_floor(
+            context,
+            operation,
+            context.exclusive_access.kubernetes_lease.acquired_at_ms,
+        )
+    }
+
+    fn validate_for_time_floor(
+        &self,
+        context: &OwnedStorageContext,
+        operation: &StorageRecoveryHostOperation,
+        earliest_started_at_ms: u64,
+    ) -> Result<()> {
         ensure!(
             uuid::Uuid::parse_str(&self.operation_id).is_ok() && self.operation == *operation,
             "storage-recovery receipt has the wrong operation identity"
         );
         let expected_context_sha256 = context_sha256(context)?;
+        let legacy_context_sha256 = legacy_context_sha256(context)?;
         validate_sha256(&self.context_sha256)?;
         validate_sha256(&self.response_sha256)?;
         ensure!(
-            self.context_sha256 == expected_context_sha256
+            (self.context_sha256 == expected_context_sha256
+                || self.context_sha256 == legacy_context_sha256)
                 && self.response_sha256 == sha256_bytes(self.response_body.as_bytes()),
             "storage-recovery receipt digest does not match its context or raw response"
         );
         ensure!(
-            self.started_at_ms >= context.observed_at_ms
+            self.started_at_ms >= earliest_started_at_ms
                 && self.started_at_ms <= self.journal_persisted_at_ms
                 && self.journal_persisted_at_ms <= self.completed_at_ms
                 && self.journal_fsync_succeeded,
@@ -938,12 +958,25 @@ struct MutationOwnershipDigest<'a> {
 /// acquisition generation, and immutable storage identities remain bound so a
 /// receipt or unresolved journal cannot cross an ownership generation.
 pub fn context_sha256(context: &OwnedStorageContext) -> Result<String> {
+    let mut volume = context.volume.clone();
+    volume.observed_at_ms = 0;
+    context_sha256_for_volume(context, &volume)
+}
+
+fn legacy_context_sha256(context: &OwnedStorageContext) -> Result<String> {
+    context_sha256_for_volume(context, &context.volume)
+}
+
+fn context_sha256_for_volume(
+    context: &OwnedStorageContext,
+    volume: &StorageVolumeIdentity,
+) -> Result<String> {
     let lease = &context.exclusive_access.kubernetes_lease;
     let ownership = MutationOwnershipDigest {
         schema_version: 1,
         attempt_id: &context.attempt_id,
         scope_sha256: &context.scope_sha256,
-        volume: &context.volume,
+        volume,
         host_generation: &context.host_generation,
         lease_namespace: &context.volume.namespace,
         lease_name: &lease.name,
@@ -1120,6 +1153,22 @@ impl PendingMutationResponse {
 }
 
 impl KubectlStorageRecoveryAttemptGuard {
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    pub async fn terminate_for_reconnect(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.poison_transport();
+        tokio::time::timeout(self.timeout, self.child.wait())
+            .await
+            .context("storage helper transport did not exit before reconnect")??;
+        self.finished = true;
+        Ok(())
+    }
+
     pub async fn execute(
         &mut self,
         context: &OwnedStorageContext,
@@ -1319,6 +1368,14 @@ impl KubectlStorageRecoveryAttemptGuard {
         context: &OwnedStorageContext,
         cleanup: &StorageRecoveryCleanupProof,
     ) -> Result<()> {
+        self.finish_in_place(context, cleanup).await
+    }
+
+    pub async fn finish_in_place(
+        &mut self,
+        context: &OwnedStorageContext,
+        cleanup: &StorageRecoveryCleanupProof,
+    ) -> Result<()> {
         require_current_lease(self.client.clone(), context).await?;
         cleanup.validate_for(context)?;
         let response = self
@@ -1431,7 +1488,7 @@ impl Drop for KubectlStorageRecoveryAttemptGuard {
     }
 }
 
-fn valid_kubernetes_name(value: &str) -> bool {
+pub(crate) fn valid_kubernetes_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 253
         && value.bytes().all(|byte| {
@@ -1484,6 +1541,38 @@ mod tests {
     use anyhow::Result;
 
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    async fn reconnect_termination_reaps_the_previous_helper_transport() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("test helper");
+        let stdin = child.stdin.take().expect("test helper stdin");
+        let stdout = child.stdout.take().expect("test helper stdout");
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = kube::Config::new("http://127.0.0.1".parse().expect("test URI"));
+        let client = kube::Client::try_from(config).expect("test Kubernetes client");
+        let mut guard = KubectlStorageRecoveryAttemptGuard {
+            client,
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            timeout: Duration::from_secs(2),
+            finished: false,
+            poisoned: false,
+            pending_mutation_response: None,
+        };
+
+        guard
+            .terminate_for_reconnect()
+            .await
+            .expect("terminate previous helper transport");
+        assert!(guard.finished);
+        assert!(guard.child.try_wait().expect("reap helper").is_some());
+    }
 
     fn volume() -> StorageVolumeIdentity {
         StorageVolumeIdentity {
@@ -1591,6 +1680,8 @@ mod tests {
         renewed.exclusive_access.kubernetes_lease.resource_version = "21".to_string();
         renewed.exclusive_access.kubernetes_lease.renew_at_ms += 100;
         renewed.exclusive_access.kubernetes_lease.expires_at_ms += 100;
+        renewed.observed_at_ms += 100;
+        renewed.volume.observed_at_ms = renewed.observed_at_ms;
         renewed
     }
 
@@ -2240,6 +2331,19 @@ mod tests {
         receipt
             .validate_for(&renew_same_lease(&context), &operation)
             .expect("same Lease renewal must preserve receipt ownership");
+        receipt
+            .validate_for(&renew_same_lease(&renew_same_lease(&context)), &operation)
+            .expect("multiple same-generation Lease renewals preserve receipt ownership");
+
+        let legacy_digest = legacy_context_sha256(&context).expect("legacy context digest");
+        assert_ne!(
+            legacy_digest,
+            context_sha256(&context).expect("context digest")
+        );
+        receipt.context_sha256 = legacy_digest;
+        receipt
+            .validate_for(&context, &operation)
+            .expect("legacy receipt remains valid for its original context");
 
         receipt.journal_fsync_succeeded = false;
         assert!(receipt.validate_for(&context, &operation).is_err());

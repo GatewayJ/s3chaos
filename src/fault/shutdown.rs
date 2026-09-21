@@ -57,6 +57,13 @@ impl RunDeadline {
         Ok(())
     }
 
+    pub(crate) fn remaining_duration(self) -> Result<Option<Duration>> {
+        self.check()?;
+        Ok(self
+            .at
+            .map(|at| at.saturating_duration_since(tokio::time::Instant::now())))
+    }
+
     /// Caps an internally finalized operation to the remaining suite budget.
     /// Callers must await that operation instead of wrapping it in `run`, so
     /// cancellation cannot leave its durable history record unfinished.

@@ -422,6 +422,10 @@ fn validate_failed_attempt_disruption_evidence(
             case_name,
             &failure_path,
         )?;
+        ensure!(
+            failure.cleanup.succeeded(),
+            "failed bitrot attempt did not complete emergency cleanup"
+        );
         return Ok(FailedAttemptDisruptionEvidence {
             client_disruptions: 0,
             run_failed: true,

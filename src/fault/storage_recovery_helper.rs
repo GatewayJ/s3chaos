@@ -40,13 +40,15 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::fault::{
+    fresh_volume::{FreshVolumeHostProbeRequest, run_fresh_volume_host_probe},
     storage_recovery::{FragmentReferenceState, RustfsShardInventoryResponse, ShardInventoryEntry},
     storage_recovery_lease::StorageRecoveryCleanupProof,
     storage_recovery_runtime::{
-        DeviceMapperCommandReceipt, OwnedStorageContext, STORAGE_RECOVERY_HOST_LOCK_DIRECTORY,
-        StaleDeviceMapperAction, StaleDeviceMapperPlan, StaleDeviceMapperTransitionResponse,
-        StorageHelperInvocation, StorageRecoveryHostOperation, StorageRecoveryOperationReceipt,
-        context_sha256, host_generation_sha256, same_storage_volume_generation,
+        DeviceMapperCommandReceipt, HostGenerationIdentity, OwnedStorageContext,
+        STORAGE_RECOVERY_HOST_LOCK_DIRECTORY, StaleDeviceMapperAction, StaleDeviceMapperPlan,
+        StaleDeviceMapperTransitionResponse, StorageHelperInvocation, StorageRecoveryHostOperation,
+        StorageRecoveryOperationReceipt, context_sha256, host_generation_sha256,
+        same_storage_volume_generation,
     },
     xl2_inspector::{
         Xl2InventoryVersionKind, inspect_all_xl_meta, inspect_xl_meta, validate_format_json_drive,
@@ -74,6 +76,10 @@ pub struct StorageHelperRoots {
     pub volume: PathBuf,
     pub journal: PathBuf,
     pub lock: PathBuf,
+    pub host_proc: PathBuf,
+    pub host_dev: PathBuf,
+    #[cfg(test)]
+    pub trust_context_host_generation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -772,6 +778,10 @@ impl Default for StorageHelperRoots {
             volume: PathBuf::from(STORAGE_HELPER_VOLUME_ROOT),
             journal: PathBuf::from(STORAGE_HELPER_JOURNAL_ROOT),
             lock: PathBuf::from(STORAGE_RECOVERY_HOST_LOCK_DIRECTORY),
+            host_proc: PathBuf::from("/host/proc"),
+            host_dev: PathBuf::from("/host/dev"),
+            #[cfg(test)]
+            trust_context_host_generation: false,
         }
     }
 }
@@ -980,10 +990,17 @@ pub struct OfflineShardRecoveryResponse {
 
 pub struct StorageHelperSession {
     owner: OwnedStorageContext,
+    roots: StorageHelperRoots,
     volume_root: File,
     journal_root: File,
     _lock: File,
     mutation_started: bool,
+}
+
+impl Drop for StorageHelperSession {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl StorageHelperSession {
@@ -1024,6 +1041,7 @@ impl StorageHelperSession {
         ensure_no_unresolved_journals(&journal_root, &context)?;
         Ok(Self {
             owner: context,
+            roots: roots.clone(),
             volume_root,
             journal_root,
             _lock: lock,
@@ -1070,6 +1088,36 @@ impl StorageHelperSession {
         );
         if matches!(
             &invocation.operation,
+            StorageRecoveryHostOperation::MutateShard { .. }
+                | StorageRecoveryHostOperation::RestoreShard { .. }
+                | StorageRecoveryHostOperation::VerifySupersededShard { .. }
+                | StorageRecoveryHostOperation::DetachDeviceMapper { .. }
+                | StorageRecoveryHostOperation::ReattachDeviceMapper { .. }
+        ) {
+            // The intentional EIO table blocks format.json until reattach.
+            // Mount, filesystem, DM UUID, and exact isolation-table identity
+            // still bind the operation to the sealed physical generation.
+            let format_readable = !matches!(
+                &invocation.operation,
+                StorageRecoveryHostOperation::ReattachDeviceMapper { .. }
+            );
+            let observed =
+                observe_current_host_generation(&invocation.context, &self.roots, format_readable)?;
+            let mut expected = invocation.context.host_generation.clone();
+            if let StorageRecoveryHostOperation::ReattachDeviceMapper {
+                isolation_table, ..
+            } = &invocation.operation
+            {
+                expected.device_mapper_table_sha256 =
+                    Some(sha256_bytes(canonical_table(isolation_table)?.as_bytes()));
+            }
+            ensure!(
+                observed == expected,
+                "storage helper host generation drifted before destructive operation"
+            );
+        }
+        if matches!(
+            &invocation.operation,
             StorageRecoveryHostOperation::PrepareFreshVolume { .. }
                 | StorageRecoveryHostOperation::DetachDeviceMapper { .. }
                 | StorageRecoveryHostOperation::ReattachDeviceMapper { .. }
@@ -1077,6 +1125,17 @@ impl StorageHelperSession {
             self.mutation_started = true;
         }
         let result = match &invocation.operation {
+            StorageRecoveryHostOperation::InspectHostGeneration => {
+                let observed =
+                    observe_current_host_generation(&invocation.context, &self.roots, true)?;
+                completed_receipt(
+                    &invocation.context,
+                    &self.journal_root,
+                    invocation.operation.clone(),
+                    &observed,
+                    started_at_ms,
+                )
+            }
             StorageRecoveryHostOperation::InspectXlMeta {
                 object_directory,
                 bucket,
@@ -1284,6 +1343,90 @@ impl StorageHelperSession {
         );
         cleanup.validate_for(context)
     }
+}
+
+fn observe_current_host_generation(
+    context: &OwnedStorageContext,
+    roots: &StorageHelperRoots,
+    require_format: bool,
+) -> Result<HostGenerationIdentity> {
+    #[cfg(test)]
+    if roots.trust_context_host_generation {
+        return Ok(context.host_generation.clone());
+    }
+
+    let probe = run_fresh_volume_host_probe(&FreshVolumeHostProbeRequest {
+        target_container_id: context.volume.rustfs_container_id.clone(),
+        target_mount_path: context.volume.mount_path.clone(),
+        volume_root: roots.volume.clone(),
+        host_proc_root: roots.host_proc.clone(),
+        host_dev_root: roots.host_dev.clone(),
+        lock_path: roots
+            .lock
+            .join(format!("storage-{}.lock", context.scope_sha256)),
+        require_format,
+        skip_format_read: !require_format,
+        scan_empty: false,
+    })?;
+    ensure!(
+        probe.canonical_device == context.volume.canonical_device,
+        "storage helper canonical device drifted"
+    );
+    let rustfs_drive_uuid = match probe.rustfs_drive_uuid {
+        Some(drive_uuid) => drive_uuid,
+        None if !require_format => context.host_generation.rustfs_drive_uuid.clone(),
+        None => bail!("storage helper format.json drive UUID is absent"),
+    };
+    let (device_mapper_uuid, device_mapper_table_sha256) =
+        if context.host_generation.device_mapper_uuid.is_some() {
+            let (major, minor) = probe
+                .device_major_minor
+                .split_once(':')
+                .context("storage helper device major:minor is malformed")?;
+            let info = run_dmsetup(&[
+                "info",
+                "--columns",
+                "--noheadings",
+                "--separator",
+                "|",
+                "--options",
+                "name,uuid",
+                "-j",
+                major,
+                "-m",
+                minor,
+            ])?;
+            require_dm_success(&info, "host generation query")?;
+            let lines = info.stdout.trim().lines().collect::<Vec<_>>();
+            ensure!(
+                lines.len() == 1,
+                "storage helper device-mapper identity is ambiguous"
+            );
+            let (mapping_name, uuid) = lines[0]
+                .split_once('|')
+                .context("storage helper device-mapper identity is malformed")?;
+            let mapping_name = mapping_name.trim();
+            let uuid = uuid.trim();
+            ensure!(
+                !mapping_name.is_empty() && !uuid.is_empty(),
+                "storage helper device-mapper identity is empty"
+            );
+            let table = run_dmsetup(&["table", "--showkeys", mapping_name])?;
+            require_dm_success(&table, "host generation table query")?;
+            let table = canonical_table(&table.stdout)?;
+            (Some(uuid.to_string()), Some(sha256_bytes(table.as_bytes())))
+        } else {
+            (None, None)
+        };
+    Ok(HostGenerationIdentity {
+        mount_id: probe.mount_id,
+        mount_namespace_id: probe.mount_namespace_id,
+        device_major_minor: probe.device_major_minor,
+        device_mapper_uuid,
+        device_mapper_table_sha256,
+        filesystem_uuid: probe.filesystem_uuid,
+        rustfs_drive_uuid,
+    })
 }
 
 fn transition_device_mapper(
@@ -2775,6 +2918,9 @@ mod tests {
             volume: temporary.path().join("volume"),
             journal: temporary.path().join("journal"),
             lock: temporary.path().join("lock"),
+            host_proc: temporary.path().join("host-proc"),
+            host_dev: temporary.path().join("host-dev"),
+            trust_context_host_generation: true,
         };
         (temporary, roots)
     }
@@ -2898,6 +3044,8 @@ mod tests {
         context.exclusive_access.kubernetes_lease.resource_version = "21".to_string();
         context.exclusive_access.kubernetes_lease.renew_at_ms += 1;
         context.exclusive_access.kubernetes_lease.expires_at_ms += 60_000;
+        context.observed_at_ms += 1;
+        context.volume.observed_at_ms = context.observed_at_ms;
         context
     }
 
@@ -3617,7 +3765,8 @@ mod tests {
                 operation_id,
             )
             .expect("mutation");
-        fs::remove_file(&part_path).expect("remove mutated shard");
+        let superseded_path = part_path.with_extension("superseded");
+        fs::rename(&part_path, &superseded_path).expect("retain superseded shard inode");
         fs::write(&part_path, b"original shard payload").expect("superseding repaired shard");
         let post_inspection = mutation(&context, &roots, part_path.to_str().expect("part path"));
         let StorageRecoveryHostOperation::MutateShard {
