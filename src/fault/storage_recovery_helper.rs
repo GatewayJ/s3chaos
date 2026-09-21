@@ -880,6 +880,74 @@ pub struct OfflineInspectedShard {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FreshVolumeShardInspectionRequest {
+    pub volume_root: PathBuf,
+    pub deployment_id: String,
+    pub drive_uuid: String,
+    pub mount_device_id: String,
+    pub object_directory: String,
+    pub bucket: String,
+    pub object_key: String,
+    pub object_sha256: String,
+    pub version_id: String,
+    pub selected_part_number: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FreshVolumeShardInspectionResponse {
+    pub observed_at_ms: u64,
+    pub inspection: OfflineXl2InspectResponse,
+}
+
+pub fn inspect_fresh_volume_shard(
+    request: &FreshVolumeShardInspectionRequest,
+) -> Result<FreshVolumeShardInspectionResponse> {
+    ensure!(
+        request.volume_root == Path::new(STORAGE_HELPER_VOLUME_ROOT),
+        "fresh-volume shard inspection must use the fixed helper volume root"
+    );
+    let operation = StorageRecoveryHostOperation::InspectXlMeta {
+        object_directory: request.object_directory.clone(),
+        bucket: request.bucket.clone(),
+        object_key: request.object_key.clone(),
+        object_sha256: request.object_sha256.clone(),
+        version_id: request.version_id.clone(),
+        selected_part_number: request.selected_part_number,
+        expected_mount_device_id: request.mount_device_id.clone(),
+        expected_drive_uuid: request.drive_uuid.clone(),
+    };
+    operation.validate()?;
+    ensure!(
+        request.object_directory == format!("{}/{}", request.bucket, request.object_key)
+            && request.selected_part_number == 1,
+        "fresh-volume shard inspection target does not match the sealed object part"
+    );
+    let root = open_directory(&request.volume_root, "fresh-volume shard inspection root")?;
+    let metadata = root
+        .metadata()
+        .context("stat fresh-volume shard inspection root")?;
+    ensure!(
+        device_id(&metadata) == request.mount_device_id,
+        "fresh-volume shard inspection root device changed"
+    );
+    let inspection = inspect_response(
+        &root,
+        &request.deployment_id,
+        &request.object_directory,
+        &request.version_id,
+        request.selected_part_number,
+        &request.mount_device_id,
+        &request.drive_uuid,
+    )?;
+    Ok(FreshVolumeShardInspectionResponse {
+        observed_at_ms: now_ms()?,
+        inspection,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OfflineShardMutationResponse {
     pub journal_operation_id: String,
     pub relative_part_path: String,
@@ -1350,6 +1418,43 @@ fn inspect(
         bucket == context.identity.bucket && !object_key.trim().is_empty(),
         "offline inspection object identity differs from the owned context"
     );
+    let response = inspect_response(
+        volume_root,
+        &context.volume.rustfs_deployment_id,
+        object_directory,
+        version_id,
+        selected_part_number,
+        expected_mount_device_id,
+        expected_drive_uuid,
+    )?;
+    completed_receipt(
+        context,
+        journal_root,
+        StorageRecoveryHostOperation::InspectXlMeta {
+            object_directory: object_directory.to_string(),
+            bucket: bucket.to_string(),
+            object_key: object_key.to_string(),
+            object_sha256: object_sha256.to_string(),
+            version_id: version_id.to_string(),
+            selected_part_number,
+            expected_mount_device_id: expected_mount_device_id.to_string(),
+            expected_drive_uuid: expected_drive_uuid.to_string(),
+        },
+        &response,
+        started_at_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_response(
+    volume_root: &File,
+    deployment_id: &str,
+    object_directory: &str,
+    version_id: &str,
+    selected_part_number: u32,
+    expected_mount_device_id: &str,
+    expected_drive_uuid: &str,
+) -> Result<OfflineXl2InspectResponse> {
     let format_file = open_beneath(
         volume_root,
         FORMAT_JSON_PATH,
@@ -1357,11 +1462,7 @@ fn inspect(
         0,
     )?;
     let format_bytes = read_limited(&format_file, MAX_FORMAT_JSON_BYTES, "format.json")?;
-    validate_format_json_drive(
-        &format_bytes,
-        &context.volume.rustfs_deployment_id,
-        expected_drive_uuid,
-    )?;
+    validate_format_json_drive(&format_bytes, deployment_id, expected_drive_uuid)?;
     let xl_meta_path = format!("{object_directory}/xl.meta");
     let xl_meta_file = open_beneath(
         volume_root,
@@ -1403,7 +1504,7 @@ fn inspect(
         part_metadata.ino(),
         part_metadata.len(),
     )?;
-    let response = OfflineXl2InspectResponse {
+    Ok(OfflineXl2InspectResponse {
         mount_device_id: expected_mount_device_id.to_string(),
         drive_uuid: expected_drive_uuid.to_string(),
         format_json_sha256: sha256_bytes(&format_bytes),
@@ -1417,23 +1518,7 @@ fn inspect(
             shard_size_bytes: part_metadata.len(),
             original_sha256: hash_file(&part, None)?,
         },
-    };
-    completed_receipt(
-        context,
-        journal_root,
-        StorageRecoveryHostOperation::InspectXlMeta {
-            object_directory: object_directory.to_string(),
-            bucket: bucket.to_string(),
-            object_key: object_key.to_string(),
-            object_sha256: object_sha256.to_string(),
-            version_id: version_id.to_string(),
-            selected_part_number,
-            expected_mount_device_id: expected_mount_device_id.to_string(),
-            expected_drive_uuid: expected_drive_uuid.to_string(),
-        },
-        &response,
-        started_at_ms,
-    )
+    })
 }
 
 fn mutate(

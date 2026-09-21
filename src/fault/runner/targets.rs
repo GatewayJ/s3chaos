@@ -635,6 +635,8 @@ pub(super) fn require_active_fixed_volume_targets(
             run_id,
             scenario,
             volume_path,
+            path: None,
+            exact_pod_names: None,
             expected_targets,
             candidate_pod_ids: &candidate_pod_ids,
             runtime: &runtime_contract,
