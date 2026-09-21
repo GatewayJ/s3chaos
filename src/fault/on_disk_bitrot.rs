@@ -57,7 +57,8 @@ use crate::{
         storage_recovery_lease::{KubernetesStorageLeaseAdapter, StorageRecoveryCleanupProof},
         storage_recovery_runtime::{
             HostFlockProof, KubectlStorageRecoveryAttemptGuard, KubectlStorageRecoveryHostAdapter,
-            KubernetesResourceVersions, OwnedStorageContext, StorageRecoveryExclusiveAccess,
+            KubernetesResourceVersions, OwnedStorageContext, StorageHelperMutationJournalAbsent,
+            StorageHelperMutationRejected, StorageRecoveryExclusiveAccess,
             StorageRecoveryHostOperation, StorageRecoveryOperationReceipt, context_sha256,
             same_storage_volume_generation, storage_scope_sha256,
         },
@@ -471,7 +472,9 @@ impl BitrotSelectionEvidence {
 #[serde(rename_all = "kebab-case")]
 pub enum BitrotReadOutcome {
     ExpectedBytes,
-    CleanRejected,
+    CorruptionRejected,
+    ConfirmedVersionMissing,
+    HarnessRejected,
     UnexpectedBytes,
 }
 
@@ -544,16 +547,15 @@ impl ExactCohortReadReceipt {
             return Ok(CorruptionReadVerdict::HarnessUnqualified);
         }
         ensure!(
-            self.outcome == BitrotReadOutcome::CleanRejected
-                && !two_xx
-                && self.observed_sha256.is_none()
-                && self
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| !error.trim().is_empty()),
-            "corruption-window response is neither a clean rejection nor a classifiable 2xx"
+            !two_xx && self.observed_sha256.is_none(),
+            "rejected read returned bytes"
         );
-        Ok(CorruptionReadVerdict::CleanRejected)
+        Ok(match self.outcome {
+            BitrotReadOutcome::CorruptionRejected => CorruptionReadVerdict::CleanRejected,
+            BitrotReadOutcome::ConfirmedVersionMissing => CorruptionReadVerdict::ProductFailure,
+            BitrotReadOutcome::HarnessRejected => CorruptionReadVerdict::HarnessUnqualified,
+            _ => bail!("corruption-window rejection has an inconsistent outcome"),
+        })
     }
 
     fn require_expected_success(
@@ -613,7 +615,9 @@ impl ExactCohortReadReceipt {
                     && record.value_sha256.as_deref() != Some(probe.expected_sha256.as_str()),
                 "unexpected-byte exact-cohort read history has another outcome"
             ),
-            BitrotReadOutcome::CleanRejected => ensure!(
+            BitrotReadOutcome::CorruptionRejected
+            | BitrotReadOutcome::ConfirmedVersionMissing
+            | BitrotReadOutcome::HarnessRejected => ensure!(
                 record.outcome != OperationOutcome::Ok
                     && record.value_sha256.is_none()
                     && record
@@ -628,6 +632,82 @@ impl ExactCohortReadReceipt {
             ),
         }
         Ok(())
+    }
+}
+
+fn classify_rejected_get(http_status: Option<u16>, error: Option<&str>) -> BitrotReadOutcome {
+    if http_status == Some(404) {
+        return BitrotReadOutcome::ConfirmedVersionMissing;
+    }
+    let normalized = error
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    if http_status.is_some_and(|status| (500..600).contains(&status))
+        && (normalized.contains("bitrot")
+            || normalized.contains("readquorum")
+            || normalized.contains("xminioreadquorum")
+            || normalized.contains("xrustfsreadquorum"))
+    {
+        BitrotReadOutcome::CorruptionRejected
+    } else {
+        BitrotReadOutcome::HarnessRejected
+    }
+}
+
+fn clear_pending_for_prejournal_rejection(
+    pending: &mut Option<(String, StorageRecoveryHostOperation)>,
+    error: &anyhow::Error,
+) {
+    if error
+        .downcast_ref::<StorageHelperMutationRejected>()
+        .is_some()
+    {
+        *pending = None;
+    }
+}
+
+struct BitrotFailureStageState {
+    has_context: bool,
+    has_selection: bool,
+    has_pending_mutation: bool,
+    has_mutation: bool,
+    has_corruption: bool,
+    heal_artifact_persisted: bool,
+    has_heal: bool,
+    has_cleanup: bool,
+    helper_finish_completed: bool,
+}
+
+fn classify_failure_stage(state: &BitrotFailureStageState) -> &'static str {
+    if !state.has_context {
+        "target-proof"
+    } else if !state.has_selection {
+        "selection"
+    } else if state.has_pending_mutation || !state.has_mutation {
+        "mutation"
+    } else if !state.has_corruption {
+        "corruption-window"
+    } else if !state.has_heal {
+        if state.heal_artifact_persisted {
+            "post-heal-verification"
+        } else {
+            "heal"
+        }
+    } else if !state.has_cleanup {
+        "cleanup"
+    } else if !state.helper_finish_completed {
+        "helper-cleanup"
+    } else {
+        "final-checker"
+    }
+}
+
+fn retain_auxiliary_error(diagnostics: &mut Vec<String>, label: &str, result: Result<()>) {
+    if let Err(error) = result {
+        diagnostics.push(format!("{label}: {error:#}"));
     }
 }
 
@@ -741,6 +821,14 @@ impl BitrotCorruptionWindowProof {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RawBitrotEvidenceReceipt {
     pub api_revision: String,
+    #[serde(default)]
+    pub request_path: Option<String>,
+    #[serde(default)]
+    pub request_body_sha256: Option<String>,
+    #[serde(default)]
+    pub request_body: Option<String>,
+    #[serde(default)]
+    pub request_client_token_sha256: Option<String>,
     pub response_sha256: String,
     pub response_body: String,
     pub started_at_ms: u64,
@@ -750,6 +838,20 @@ pub struct RawBitrotEvidenceReceipt {
 impl RawBitrotEvidenceReceipt {
     pub(crate) fn validate(&self, label: &str) -> Result<()> {
         validate_sha256(&self.response_sha256, label)?;
+        ensure!(
+            self.request_body.is_some() == self.request_body_sha256.is_some(),
+            "{label} request body and digest presence differ"
+        );
+        if let (Some(body), Some(digest)) = (&self.request_body, &self.request_body_sha256) {
+            validate_sha256(digest, label)?;
+            ensure!(
+                digest == &sha256_bytes(body.as_bytes()),
+                "{label} request body digest mismatch"
+            );
+        }
+        if let Some(digest) = &self.request_client_token_sha256 {
+            validate_sha256(digest, label)?;
+        }
         ensure!(
             !self.api_revision.trim().is_empty()
                 && self.response_sha256 == sha256_bytes(self.response_body.as_bytes())
@@ -832,8 +934,11 @@ pub(crate) fn validate_heal_progress(
                     serde_json::from_str::<AdminHealStatusBody>(&sample.receipt.response_body)
                         .context("decode admin heal progress")?;
                 ensure!(
-                    body.settings.scan_mode == AdminHealScanMode::Deep,
-                    "admin heal progress was not produced by a Deep scan"
+                    sample.receipt.request_client_token_sha256.as_deref()
+                        == client_token
+                            .map(|token| sha256_bytes(token.as_bytes()))
+                            .as_deref(),
+                    "admin heal progress request is not bound to the owned token"
                 );
                 let expected_state = match body.summary.as_str() {
                     "finished" if body.failure_detail.is_empty() => HealProgressState::Completed,
@@ -883,6 +988,35 @@ pub struct AdminHealStartBody {
     pub client_address: String,
     #[serde(default)]
     pub start_time: String,
+}
+
+pub(crate) fn validate_admin_deep_start_receipt(
+    start: &RawBitrotEvidenceReceipt,
+    bucket: &str,
+) -> Result<AdminHealStartBody> {
+    start.validate("admin heal start")?;
+    let expected_path = format!("/rustfs/admin/v3/heal/{bucket}");
+    let request: Value = serde_json::from_str(
+        start
+            .request_body
+            .as_deref()
+            .context("admin heal start lacks its request body")?,
+    )
+    .context("decode admin heal start request")?;
+    let response = serde_json::from_str::<AdminHealStartBody>(&start.response_body)
+        .context("decode admin heal start response")?;
+    ensure!(
+        start.api_revision == "v3/heal/start"
+            && start.request_path.as_deref() == Some(expected_path.as_str())
+            && start.request_client_token_sha256.is_none()
+            && request.get("recursive").and_then(Value::as_bool) == Some(true)
+            && request.get("scanMode").and_then(Value::as_u64) == Some(2)
+            && !response.client_token.trim().is_empty()
+            && !response.client_address.trim().is_empty()
+            && !response.start_time.trim().is_empty(),
+        "admin heal start does not prove an accepted recursive Deep request"
+    );
+    Ok(response)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1014,7 +1148,7 @@ pub enum BitrotHealEvidence {
         start: RawBitrotEvidenceReceipt,
         progress: Vec<BitrotHealProgressSample>,
         terminal_status: RawBitrotEvidenceReceipt,
-        cancel: Option<RawBitrotEvidenceReceipt>,
+        cancel: Option<Box<RawBitrotEvidenceReceipt>>,
     },
 }
 
@@ -1086,10 +1220,9 @@ impl BitrotHealEvidence {
                         && cancel.is_none(),
                     "successful admin-deep recovery has the wrong case or a cancel receipt"
                 );
-                start.validate("admin heal start")?;
                 terminal_status.validate("admin heal terminal status")?;
-                let start_body = serde_json::from_str::<AdminHealStartBody>(&start.response_body)
-                    .context("decode raw admin heal start")?;
+                let expected_path = format!("/rustfs/admin/v3/heal/{}", selection.probe.bucket);
+                let start_body = validate_admin_deep_start_receipt(start, &selection.probe.bucket)?;
                 validate_heal_progress(
                     progress,
                     BitrotHealProgressSource::AdminDeep,
@@ -1107,6 +1240,11 @@ impl BitrotHealEvidence {
                 ensure!(
                     !start_body.client_token.trim().is_empty()
                         && !start_body.client_address.trim().is_empty()
+                        && progress.iter().all(|sample| {
+                            sample.receipt.api_revision == "v3/heal/status"
+                                && sample.receipt.request_path.as_deref()
+                                    == Some(expected_path.as_str())
+                        })
                         && status_body.summary == "finished"
                         && status_body.failure_detail.is_empty()
                         && status_body
@@ -1276,6 +1414,10 @@ pub struct BitrotEmergencyCleanupEvidence {
     pub chaos_removed: bool,
     pub admin_heal_closed: bool,
     pub helper_closed: bool,
+    #[serde(default)]
+    pub admin_heal_cleanup_required: bool,
+    #[serde(default)]
+    pub admin_heal_cleanup: Option<RawBitrotEvidenceReceipt>,
     pub mutation_lookup: Option<MutationJournalLookup>,
     pub cleanup_proof: Option<StorageRecoveryCleanupProof>,
     pub errors: Vec<String>,
@@ -1300,7 +1442,75 @@ impl BitrotEmergencyCleanupEvidence {
             self.errors.is_empty() == self.succeeded(),
             "bitrot emergency cleanup flags and errors disagree"
         );
+        ensure!(
+            self.admin_heal_cleanup.is_some() <= self.admin_heal_cleanup_required
+                && (!self.admin_heal_cleanup_required
+                    || !self.admin_heal_closed
+                    || self.admin_heal_cleanup.is_some()),
+            "bitrot emergency cleanup lacks required admin heal cancellation evidence"
+        );
         if let Some(context) = context {
+            if let Some(receipt) = &self.admin_heal_cleanup {
+                receipt.validate("admin heal emergency cleanup")?;
+                let expected_path = format!("/rustfs/admin/v3/heal/{}", context.identity.bucket);
+                ensure!(
+                    context.case == StorageRecoveryCase::OnDiskBitrotAdminDeep
+                        && receipt.request_path.as_deref() == Some(expected_path.as_str())
+                        && matches!(
+                            receipt.api_revision.as_str(),
+                            "v3/heal/cancel" | "v3/heal/exact-scope-cancel"
+                        ),
+                    "admin heal cleanup is outside the owned bucket scope"
+                );
+                match receipt.api_revision.as_str() {
+                    "v3/heal/cancel" => {
+                        ensure!(
+                            receipt.request_body.is_none()
+                                && receipt.request_client_token_sha256.is_some(),
+                            "owned admin heal cleanup lacks its token binding"
+                        );
+                        let status =
+                            serde_json::from_str::<AdminHealStatusBody>(&receipt.response_body)
+                                .context("decode owned admin heal cleanup status")?;
+                        ensure!(
+                            matches!(status.summary.as_str(), "stopped" | "finished"),
+                            "owned admin heal cleanup did not reach a terminal status"
+                        );
+                    }
+                    "v3/heal/exact-scope-cancel" => {
+                        ensure!(
+                            receipt.request_client_token_sha256.is_none(),
+                            "exact-scope admin heal cleanup unexpectedly used a token"
+                        );
+                        let request: Value =
+                            serde_json::from_str(receipt.request_body.as_deref().context(
+                                "exact-scope admin heal cleanup lacks its request body",
+                            )?)
+                            .context("decode exact-scope admin heal cleanup request")?;
+                        ensure!(
+                            request.get("recursive").and_then(Value::as_bool) == Some(true)
+                                && request.get("scanMode").and_then(Value::as_u64) == Some(2)
+                                && request.get("dryRun").and_then(Value::as_bool) == Some(false)
+                                && request.get("remove").and_then(Value::as_bool) == Some(false)
+                                && request.get("recreate").and_then(Value::as_bool) == Some(false)
+                                && request.get("updateParity").and_then(Value::as_bool)
+                                    == Some(false)
+                                && request.get("nolock").and_then(Value::as_bool) == Some(false),
+                            "exact-scope admin heal cleanup request changed its safe scope"
+                        );
+                        let stopped =
+                            serde_json::from_str::<AdminHealStartBody>(&receipt.response_body)
+                                .context("decode exact-scope admin heal cleanup receipt")?;
+                        ensure!(
+                            stopped.client_token == context.identity.bucket
+                                && !stopped.client_address.trim().is_empty()
+                                && !stopped.start_time.trim().is_empty(),
+                            "exact-scope admin heal cleanup response identifies another scope"
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
             if let Some(lookup) = &self.mutation_lookup {
                 lookup.validate_for(context, &lookup.operation_id, &lookup.operation)?;
                 let cleanup_operation_id = match self.cleanup_proof.as_ref() {
@@ -1334,7 +1544,9 @@ impl BitrotEmergencyCleanupEvidence {
             }
         } else {
             ensure!(
-                self.mutation_lookup.is_none() && self.cleanup_proof.is_none(),
+                self.admin_heal_cleanup.is_none()
+                    && self.mutation_lookup.is_none()
+                    && self.cleanup_proof.is_none(),
                 "bitrot cleanup proof lacks its owned context"
             );
         }
@@ -1350,6 +1562,8 @@ pub struct BitrotFailureEvidence {
     pub case: StorageRecoveryCase,
     pub stage: String,
     pub primary_error: String,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
     pub context: Option<Box<OwnedStorageContext>>,
     pub cleanup: BitrotEmergencyCleanupEvidence,
     pub observed_at_ms: u64,
@@ -1657,12 +1871,16 @@ enum BitrotAdminHealStartState {
         bucket: String,
         prefix: String,
         request_path: String,
-        requested_at_ms: u64,
         acknowledged_at_ms: u64,
         client_token: String,
-        start_time: String,
-        reconciled_after_response_loss: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdminHealCleanupPlan {
+    api_revision: &'static str,
+    client_token: Option<String>,
+    request_body: Vec<u8>,
 }
 
 impl BitrotAdminHealStartState {
@@ -1675,16 +1893,7 @@ impl BitrotAdminHealStartState {
         }
     }
 
-    fn own_from_start(
-        &mut self,
-        start: &RawBitrotEvidenceReceipt,
-        reconciled_after_response_loss: bool,
-    ) -> Result<AdminHealStartBody> {
-        start.validate("admin heal start")?;
-        ensure!(
-            start.api_revision == "v3/heal/start",
-            "admin heal start used an unexpected API revision"
-        );
+    fn own_from_start(&mut self, start: &RawBitrotEvidenceReceipt) -> Result<AdminHealStartBody> {
         let (bucket, prefix, request_path, requested_at_ms) = match self {
             Self::Ambiguous {
                 bucket,
@@ -1702,17 +1911,11 @@ impl BitrotAdminHealStartState {
         ensure!(
             prefix.is_empty()
                 && request_path == format!("/rustfs/admin/v3/heal/{bucket}")
+                && start.request_path.as_deref() == Some(request_path.as_str())
                 && start.started_at_ms >= requested_at_ms,
             "admin heal start escaped its exact bucket, prefix, or request interval"
         );
-        let start_body = serde_json::from_str::<AdminHealStartBody>(&start.response_body)
-            .context("decode owned admin heal start")?;
-        ensure!(
-            !start_body.client_token.trim().is_empty()
-                && !start_body.client_address.trim().is_empty()
-                && !start_body.start_time.trim().is_empty(),
-            "owned admin heal start lacks token, address, or startTime"
-        );
+        let start_body = validate_admin_deep_start_receipt(start, &bucket)?;
         let parsed_start = time::OffsetDateTime::parse(
             &start_body.start_time,
             &time::format_description::well_known::Rfc3339,
@@ -1729,11 +1932,8 @@ impl BitrotAdminHealStartState {
             bucket,
             prefix,
             request_path,
-            requested_at_ms,
             acknowledged_at_ms: start.completed_at_ms,
             client_token: start_body.client_token.clone(),
-            start_time: start_body.start_time.clone(),
-            reconciled_after_response_loss,
         };
         Ok(start_body)
     }
@@ -1748,8 +1948,9 @@ impl BitrotAdminHealStartState {
             "admin heal status used an unexpected API revision"
         );
         let Self::Owned {
+            request_path,
             acknowledged_at_ms,
-            start_time,
+            client_token,
             ..
         } = self
         else {
@@ -1758,55 +1959,65 @@ impl BitrotAdminHealStartState {
         let status_body = serde_json::from_str::<AdminHealStatusBody>(&status.response_body)
             .context("decode owned admin heal status")?;
         ensure!(
-            status_body.settings.scan_mode == AdminHealScanMode::Deep
-                && !status_body.start_time.trim().is_empty()
+            status.request_path.as_deref() == Some(request_path.as_str())
+                && status.request_client_token_sha256.as_deref()
+                    == Some(sha256_bytes(client_token.as_bytes()).as_str())
                 && status.started_at_ms >= *acknowledged_at_ms,
-            "owned admin heal status is not a Deep scan for the registered interval"
-        );
-        let parsed_start =
-            time::OffsetDateTime::parse(start_time, &time::format_description::well_known::Rfc3339)
-                .context("parse owned admin heal startTime")?;
-        let parsed_status = time::OffsetDateTime::parse(
-            &status_body.start_time,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .context("parse owned admin heal status startTime")?;
-        let start_ms = parsed_start.unix_timestamp_nanos() / 1_000_000;
-        let status_ms = parsed_status.unix_timestamp_nanos() / 1_000_000;
-        ensure!(
-            (start_ms - status_ms).abs() <= 2_000,
-            "admin heal status belongs to another start interval"
+            "admin heal status request is not bound to the owned token and scope"
         );
         Ok(status_body)
     }
 
-    fn owned_token<'a>(&'a self, bucket: &str, request_path: &str) -> Result<Option<&'a str>> {
+    fn cleanup_plan(
+        &self,
+        target_bucket: &str,
+        target_path: &str,
+    ) -> Result<Option<AdminHealCleanupPlan>> {
         match self {
             Self::NotStarted => Ok(None),
-            Self::Ambiguous { .. } => {
-                bail!("admin heal start ownership remains ambiguous; cleanup must fail closed")
-            }
             Self::Owned {
-                bucket: owned_bucket,
+                bucket,
                 prefix,
-                request_path: owned_path,
-                requested_at_ms,
-                acknowledged_at_ms,
+                request_path,
                 client_token,
-                start_time,
-                reconciled_after_response_loss: _,
+                ..
             } => {
                 ensure!(
-                    owned_bucket == bucket
-                        && prefix.is_empty()
-                        && owned_path == request_path
-                        && *requested_at_ms > 0
-                        && *acknowledged_at_ms >= *requested_at_ms
-                        && !client_token.trim().is_empty()
-                        && !start_time.trim().is_empty(),
-                    "owned admin heal cleanup escaped its exact bucket and prefix"
+                    bucket == target_bucket && prefix.is_empty() && request_path == target_path,
+                    "owned admin heal cleanup scope drifted"
                 );
-                Ok(Some(client_token))
+                Ok(Some(AdminHealCleanupPlan {
+                    api_revision: "v3/heal/cancel",
+                    client_token: Some(client_token.clone()),
+                    request_body: Vec::new(),
+                }))
+            }
+            Self::Ambiguous {
+                bucket,
+                prefix,
+                request_path,
+                ..
+            } => {
+                ensure!(
+                    bucket == target_bucket
+                        && prefix.is_empty()
+                        && request_path == target_path
+                        && bucket.starts_with("s3chaos-bitrot-"),
+                    "ambiguous admin heal cannot use exact-scope cleanup"
+                );
+                Ok(Some(AdminHealCleanupPlan {
+                    api_revision: "v3/heal/exact-scope-cancel",
+                    client_token: None,
+                    request_body: serde_json::to_vec(&serde_json::json!({
+                        "recursive": true,
+                        "dryRun": false,
+                        "remove": false,
+                        "recreate": false,
+                        "scanMode": 2,
+                        "updateParity": false,
+                        "nolock": false
+                    }))?,
+                }))
             }
         }
     }
@@ -1942,6 +2153,8 @@ struct LiveOnDiskBitrotRuntime {
     baseline: Option<ExactCohortReadReceipt>,
     admin_heal: BitrotAdminHealStartState,
     heal_progress: Vec<BitrotHealProgressSample>,
+    diagnostic_errors: Vec<String>,
+    heal_artifact_persisted: bool,
     helper_finish_completed: bool,
 }
 
@@ -2088,6 +2301,8 @@ impl LiveOnDiskBitrotRuntime {
             baseline: None,
             admin_heal: BitrotAdminHealStartState::NotStarted,
             heal_progress: Vec::new(),
+            diagnostic_errors: Vec::new(),
+            heal_artifact_persisted: false,
             helper_finish_completed: false,
         })
     }
@@ -2115,7 +2330,7 @@ impl LiveOnDiskBitrotRuntime {
         file.flush()?;
         file.sync_data()?;
         self.heal_progress.push(sample);
-        self.events.record(
+        let event_result = self.events.record(
             "heal-progress",
             match state {
                 HealProgressState::Completed => RunEventStatus::Succeeded,
@@ -2127,7 +2342,13 @@ impl LiveOnDiskBitrotRuntime {
                 "ordinal": self.heal_progress.len() - 1,
                 "failureDetail": failure_detail,
             })),
-        )
+        );
+        retain_auxiliary_error(
+            &mut self.diagnostic_errors,
+            "record heal-progress event",
+            event_result,
+        );
+        Ok(())
     }
 
     fn reset_heal_progress(&mut self) -> Result<()> {
@@ -2147,6 +2368,22 @@ impl LiveOnDiskBitrotRuntime {
         self.helper
             .as_mut()
             .context("storage-recovery helper session is not active")
+    }
+
+    async fn reconnect_helper(&mut self, context: &OwnedStorageContext) -> Result<()> {
+        self.helper.take();
+        let host = KubectlStorageRecoveryHostAdapter::new(
+            &self.config.cluster,
+            context.volume.namespace.clone(),
+            context.helper_pod_name.clone(),
+            self.config.request_timeout,
+        )?;
+        self.helper = Some(
+            host.begin_attempt(context)
+                .await
+                .context("reopen storage helper for durable mutation recovery")?,
+        );
+        Ok(())
     }
 
     async fn renew_current(&mut self) -> Result<OwnedStorageContext> {
@@ -2298,6 +2535,10 @@ impl LiveOnDiskBitrotRuntime {
             .with_context(|| format!("RustFS {api_revision} returned non-UTF-8 evidence"))?;
         Ok(RawBitrotEvidenceReceipt {
             api_revision: api_revision.to_string(),
+            request_path: None,
+            request_body_sha256: None,
+            request_body: None,
+            request_client_token_sha256: None,
             response_sha256: sha256_bytes(response_body.as_bytes()),
             response_body,
             started_at_ms,
@@ -2398,7 +2639,7 @@ impl LiveOnDiskBitrotRuntime {
         );
         self.admin_heal =
             BitrotAdminHealStartState::ambiguous(&self.target.bucket, &path, started_at_ms);
-        let first = self
+        let response = self
             .admin
             .request(
                 Method::POST,
@@ -2407,33 +2648,19 @@ impl LiveOnDiskBitrotRuntime {
                 request_body.clone(),
                 Some("application/json"),
             )
-            .await;
-        let (response, reconciled_after_response_loss) = match first {
-            Ok(response) => (response, false),
-            Err(response_loss) => (
-                self.admin
-                    .request(
-                        Method::POST,
-                        &path,
-                        &[],
-                        request_body,
-                        Some("application/json"),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "admin heal start remained ambiguous after exact-scope replay: {response_loss:#}"
-                        )
-                    })?,
-                true,
-            ),
-        };
+            .await
+            .context(
+                "admin heal start response was lost; exact-scope cleanup is required because RustFS cannot query an active heal without its clientToken",
+            )?;
         let completed_at_ms = now_ms()?.max(started_at_ms);
-        let start =
+        let mut start =
             Self::raw_admin_receipt("v3/heal/start", started_at_ms, completed_at_ms, response)?;
-        let start_body = self
-            .admin_heal
-            .own_from_start(&start, reconciled_after_response_loss)?;
+        let request_body_text =
+            String::from_utf8(request_body).context("encode admin heal request")?;
+        start.request_path = Some(path.clone());
+        start.request_body_sha256 = Some(sha256_bytes(request_body_text.as_bytes()));
+        start.request_body = Some(request_body_text);
+        let start_body = self.admin_heal.own_from_start(&start)?;
         let token = start_body.client_token.clone();
         self.persist_json(BITROT_ADMIN_HEAL_START_ARTIFACT, &start)?;
         self.events.record(
@@ -2464,6 +2691,8 @@ impl LiveOnDiskBitrotRuntime {
             status_completed_at_ms,
             response,
         )?;
+        status.request_path = Some(path.clone());
+        status.request_client_token_sha256 = Some(sha256_bytes(token.as_bytes()));
         loop {
             self.deadline.check()?;
             let body = self.admin_heal.validate_owned_status(&status)?;
@@ -2531,6 +2760,8 @@ impl LiveOnDiskBitrotRuntime {
                         status_completed_at_ms,
                         response,
                     )?;
+                    status.request_path = Some(path.clone());
+                    status.request_client_token_sha256 = Some(sha256_bytes(token.as_bytes()));
                 }
                 HealProgressState::Failed => {
                     let failure_detail =
@@ -2549,14 +2780,15 @@ impl LiveOnDiskBitrotRuntime {
         }
     }
 
-    async fn cancel_owned_admin(&mut self) -> Result<()> {
+    async fn cancel_owned_admin(&mut self) -> Result<Option<RawBitrotEvidenceReceipt>> {
         let path = format!("/rustfs/admin/v3/heal/{}", self.target.bucket);
-        let Some(token) = self
-            .admin_heal
-            .owned_token(&self.target.bucket, &path)?
-            .map(str::to_string)
-        else {
-            return Ok(());
+        let Some(plan) = self.admin_heal.cleanup_plan(&self.target.bucket, &path)? else {
+            return Ok(None);
+        };
+        let query = if let Some(token) = plan.client_token.as_deref() {
+            vec![("forceStop", "true"), ("clientToken", token)]
+        } else {
+            vec![("forceStop", "true")]
         };
         let started_at_ms = now_ms()?;
         let response = self
@@ -2564,22 +2796,41 @@ impl LiveOnDiskBitrotRuntime {
             .request(
                 Method::POST,
                 &path,
-                &[("forceStop", "true"), ("clientToken", token.as_str())],
-                Vec::new(),
-                None,
+                &query,
+                plan.request_body.clone(),
+                (!plan.request_body.is_empty()).then_some("application/json"),
             )
             .await?;
         let completed_at_ms = now_ms()?.max(started_at_ms);
-        let receipt =
-            Self::raw_admin_receipt("v3/heal/cancel", started_at_ms, completed_at_ms, response)?;
-        let body = serde_json::from_str::<AdminHealStatusBody>(&receipt.response_body)
-            .context("decode owned admin heal cancel status")?;
-        ensure!(
-            matches!(body.summary.as_str(), "stopped" | "finished"),
-            "owned admin heal cancel did not return a terminal status"
-        );
+        let mut receipt =
+            Self::raw_admin_receipt(plan.api_revision, started_at_ms, completed_at_ms, response)?;
+        receipt.request_path = Some(path);
+        if !plan.request_body.is_empty() {
+            let body = String::from_utf8(plan.request_body)
+                .context("encode exact-scope cancel request")?;
+            receipt.request_body_sha256 = Some(sha256_bytes(body.as_bytes()));
+            receipt.request_body = Some(body);
+        }
+        if let Some(token) = plan.client_token {
+            receipt.request_client_token_sha256 = Some(sha256_bytes(token.as_bytes()));
+            let status = serde_json::from_str::<AdminHealStatusBody>(&receipt.response_body)
+                .context("decode owned admin heal cancel status")?;
+            ensure!(
+                matches!(status.summary.as_str(), "stopped" | "finished"),
+                "owned admin heal cancel did not return a terminal status"
+            );
+        } else {
+            let stopped = serde_json::from_str::<AdminHealStartBody>(&receipt.response_body)
+                .context("decode exact-scope admin heal cancel receipt")?;
+            ensure!(
+                stopped.client_token == self.target.bucket
+                    && !stopped.client_address.trim().is_empty()
+                    && !stopped.start_time.trim().is_empty(),
+                "exact-scope admin heal cancel receipt does not identify the owned bucket path"
+            );
+        }
         self.admin_heal = BitrotAdminHealStartState::NotStarted;
-        Ok(())
+        Ok(Some(receipt))
     }
 
     async fn perform_exact_read(
@@ -2613,7 +2864,7 @@ impl LiveOnDiskBitrotRuntime {
                 BitrotReadOutcome::UnexpectedBytes
             }
         } else {
-            BitrotReadOutcome::CleanRejected
+            classify_rejected_get(result.http_status, result.error.as_deref())
         };
         Ok(ExactCohortReadReceipt {
             operation_id: recorded.operation_id,
@@ -2626,8 +2877,13 @@ impl LiveOnDiskBitrotRuntime {
             observed_sha256,
             http_status: result.http_status,
             error: result.error.or_else(|| {
-                (outcome == BitrotReadOutcome::CleanRejected)
-                    .then(|| "exact-quorum read was rejected without an SDK detail".to_string())
+                matches!(
+                    outcome,
+                    BitrotReadOutcome::CorruptionRejected
+                        | BitrotReadOutcome::ConfirmedVersionMissing
+                        | BitrotReadOutcome::HarnessRejected
+                )
+                .then(|| "exact-quorum read was rejected without an SDK detail".to_string())
             }),
             outcome,
             target_shard_required: true,
@@ -2643,10 +2899,58 @@ impl LiveOnDiskBitrotRuntime {
         let (mutation_operation_id, mutation_lookup) = if let Some(mutation) = &self.mutation {
             (mutation.mutation_receipt.operation_id.clone(), None)
         } else if let Some((operation_id, operation)) = self.pending_mutation.clone() {
-            let lookup = self
+            let first = self
                 .helper_mut()?
                 .query_mutation(context, &operation_id, &operation)
-                .await?;
+                .await;
+            let lookup = match first {
+                Ok(lookup) => lookup,
+                Err(error)
+                    if error
+                        .downcast_ref::<StorageHelperMutationJournalAbsent>()
+                        .is_some_and(|absent| absent.0 == operation_id) =>
+                {
+                    self.pending_mutation = None;
+                    return Ok((
+                        StorageRecoveryCleanupProof::AbortedBeforeMutation {
+                            observed_at_ms: now_ms()?.max(context.observed_at_ms),
+                        },
+                        None,
+                    ));
+                }
+                Err(transport_error) => {
+                    self.reconnect_helper(context).await.with_context(|| {
+                        format!(
+                            "storage helper transport failed after mutation and reconnect failed: {transport_error:#}"
+                        )
+                    })?;
+                    let recovered = self
+                        .helper_mut()?
+                        .query_mutation(context, &operation_id, &operation)
+                        .await;
+                    match recovered {
+                        Ok(lookup) => lookup,
+                        Err(error)
+                            if error
+                                .downcast_ref::<StorageHelperMutationJournalAbsent>()
+                                .is_some_and(|absent| absent.0 == operation_id) =>
+                        {
+                            self.pending_mutation = None;
+                            return Ok((
+                                StorageRecoveryCleanupProof::AbortedBeforeMutation {
+                                    observed_at_ms: now_ms()?.max(context.observed_at_ms),
+                                },
+                                None,
+                            ));
+                        }
+                        Err(error) => return Err(error).with_context(|| {
+                            format!(
+                                "query durable mutation after helper reconnect; original transport error: {transport_error:#}"
+                            )
+                        }),
+                    }
+                }
+            };
             (operation_id, Some(lookup))
         } else {
             return Ok((
@@ -2682,6 +2986,9 @@ impl LiveOnDiskBitrotRuntime {
     async fn emergency_cleanup(&mut self) -> BitrotEmergencyCleanupEvidence {
         let mut errors = Vec::new();
         let mut mutation_lookup = None;
+        let mut admin_heal_cleanup = None;
+        let admin_heal_cleanup_required =
+            !matches!(self.admin_heal, BitrotAdminHealStartState::NotStarted);
         let mut cleanup_proof = self
             .cleanup
             .as_ref()
@@ -2692,8 +2999,9 @@ impl LiveOnDiskBitrotRuntime {
         if let Err(error) = self.remove_exact_quorum_chaos() {
             errors.push(format!("remove exact-quorum IOChaos: {error:#}"));
         }
-        if let Err(error) = self.cancel_owned_admin().await {
-            errors.push(format!("cancel owned admin heal: {error:#}"));
+        match self.cancel_owned_admin().await {
+            Ok(receipt) => admin_heal_cleanup = receipt,
+            Err(error) => errors.push(format!("cancel owned admin heal: {error:#}")),
         }
         if self.helper.is_some() && self.current.is_some() {
             match self.renew_current().await {
@@ -2734,6 +3042,8 @@ impl LiveOnDiskBitrotRuntime {
             chaos_removed: self.active_chaos.is_none(),
             admin_heal_closed: matches!(self.admin_heal, BitrotAdminHealStartState::NotStarted),
             helper_closed,
+            admin_heal_cleanup_required,
+            admin_heal_cleanup,
             mutation_lookup,
             cleanup_proof,
             errors,
@@ -2742,31 +3052,17 @@ impl LiveOnDiskBitrotRuntime {
     }
 
     fn failure_stage(&self) -> &'static str {
-        if self.current.is_none() {
-            "target-proof"
-        } else if self.selection.is_none() {
-            "selection"
-        } else if self.pending_mutation.is_some() || self.mutation.is_none() {
-            "mutation"
-        } else if self.corruption.is_none() {
-            "corruption-window"
-        } else if self.heal.is_none() {
-            if self
-                .heal_progress
-                .last()
-                .is_some_and(|sample| sample.state == HealProgressState::Completed)
-            {
-                "post-heal-verification"
-            } else {
-                "heal"
-            }
-        } else if self.cleanup.is_none() {
-            "cleanup"
-        } else if !self.helper_finish_completed {
-            "helper-cleanup"
-        } else {
-            "final-checker"
-        }
+        classify_failure_stage(&BitrotFailureStageState {
+            has_context: self.current.is_some(),
+            has_selection: self.selection.is_some(),
+            has_pending_mutation: self.pending_mutation.is_some(),
+            has_mutation: self.mutation.is_some(),
+            has_corruption: self.corruption.is_some(),
+            heal_artifact_persisted: self.heal_artifact_persisted,
+            has_heal: self.heal.is_some(),
+            has_cleanup: self.cleanup.is_some(),
+            helper_finish_completed: self.helper_finish_completed,
+        })
     }
 }
 
@@ -3102,10 +3398,17 @@ impl OnDiskBitrotRuntimePort for LiveOnDiskBitrotRuntime {
         };
         let operation_id = Uuid::new_v4().to_string();
         self.pending_mutation = Some((operation_id.clone(), operation.clone()));
-        let receipt = self
+        let receipt = match self
             .helper_mut()?
             .execute_mutation_with_id(context, &operation_id, &operation)
-            .await?;
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                clear_pending_for_prejournal_rejection(&mut self.pending_mutation, &error);
+                return Err(error);
+            }
+        };
         let evidence = BitrotMutationEvidence {
             schema_version: BITROT_ARTIFACT_SCHEMA_VERSION,
             selection_operation_id: inspection_operation_id.to_string(),
@@ -3238,6 +3541,7 @@ impl OnDiskBitrotRuntimePort for LiveOnDiskBitrotRuntime {
         self.pending_cleanup_proof = Some(helper_cleanup.clone());
         let fresh_mapping = offline_mapping(&recovery_context, &post_inspection)?;
         self.persist_json(BITROT_HEAL_ARTIFACT, &heal)?;
+        self.heal_artifact_persisted = true;
         self.apply_exact_quorum_chaos("-post-heal")?;
         let final_read = self.perform_exact_read(&recovery_context, probe).await?;
         final_read.require_expected_success(&recovery_context, probe)?;
@@ -3498,12 +3802,30 @@ pub async fn execute_on_disk_bitrot(
     let corrupted = runtime.exact_quorum_read(&mutation_context, &probe).await?;
     match corrupted.classify_corruption_window(&mutation_context, &probe)? {
         CorruptionReadVerdict::CleanRejected => {}
-        CorruptionReadVerdict::ProductFailure => {
-            bail!("product failure: a successful corruption-window GET returned bad bytes")
-        }
-        CorruptionReadVerdict::HarnessUnqualified => {
-            bail!("harness unqualified: a required corrupt shard returned clean 2xx bytes")
-        }
+        CorruptionReadVerdict::ProductFailure => match corrupted.outcome {
+            BitrotReadOutcome::UnexpectedBytes => {
+                bail!("product failure: a successful corruption-window GET returned bad bytes")
+            }
+            BitrotReadOutcome::ConfirmedVersionMissing => {
+                bail!(
+                    "product failure: the confirmed versionId returned HTTP 404 during the corruption window"
+                )
+            }
+            _ => bail!(
+                "product failure: corruption-window result violated the exact-version read invariant"
+            ),
+        },
+        CorruptionReadVerdict::HarnessUnqualified => match corrupted.outcome {
+            BitrotReadOutcome::ExpectedBytes => {
+                bail!("harness unqualified: a required corrupt shard returned clean 2xx bytes")
+            }
+            BitrotReadOutcome::HarnessRejected => bail!(
+                "harness unqualified: corruption-window rejection was not an explicit RustFS bitrot or read-quorum response: status={:?} error={:?}",
+                corrupted.http_status,
+                corrupted.error
+            ),
+            _ => bail!("harness unqualified: corruption-window result was not classifiable"),
+        },
     }
     let recovery_context = runtime.renew(&mutation_context).await?;
     validate_renewed_context(&mutation_context, &recovery_context)?;
@@ -3571,27 +3893,28 @@ pub(crate) async fn run_on_disk_bitrot_case(
                 case: storage_plan.case,
                 stage: stage.clone(),
                 primary_error: primary_error.clone(),
+                diagnostics: runtime.diagnostic_errors.clone(),
                 context: runtime.current.clone().map(Box::new),
                 observed_at_ms: now_ms().unwrap_or_default(),
                 cleanup: cleanup.clone(),
             };
             let persist_result = runtime.persist_json(BITROT_FAILURE_ARTIFACT, &failure);
-            runtime
-                .events
-                .record(
-                    "run",
-                    RunEventStatus::Failed,
-                    "on-disk-bitrot failed and emergency cleanup completed",
-                    Some(serde_json::json!({
-                        "stage": stage,
-                        "primaryError": primary_error,
-                        "cleanupSucceeded": cleanup.succeeded(),
-                        "cleanupErrors": cleanup.errors.clone(),
-                    })),
-                )
-                .ok();
+            let event_result = runtime.events.record(
+                "run",
+                RunEventStatus::Failed,
+                "on-disk-bitrot failed and emergency cleanup completed",
+                Some(serde_json::json!({
+                    "stage": stage,
+                    "primaryError": primary_error,
+                    "cleanupSucceeded": cleanup.succeeded(),
+                    "cleanupErrors": cleanup.errors.clone(),
+                })),
+            );
             if let Err(error) = persist_result {
                 return Err(primary.context(format!("persist bitrot failure evidence: {error:#}")));
+            }
+            if let Err(error) = event_result {
+                return Err(primary.context(format!("persist bitrot failure event: {error:#}")));
             }
             if cleanup.succeeded() {
                 Err(primary)
@@ -4070,7 +4393,7 @@ mod tests {
                 &selection.probe,
                 "66666666-6666-6666-6666-666666666666",
                 130,
-                BitrotReadOutcome::CleanRejected,
+                BitrotReadOutcome::CorruptionRejected,
             ),
             opened_at_ms: 122,
             closed_at_ms: 131,
@@ -4088,6 +4411,10 @@ mod tests {
         .expect("scanner status");
         let scanner_status = RawBitrotEvidenceReceipt {
             api_revision: "v3/background-heal/status".to_string(),
+            request_path: None,
+            request_body_sha256: None,
+            request_body: None,
+            request_client_token_sha256: None,
             response_sha256: sha256_bytes(scanner_body.as_bytes()),
             response_body: scanner_body,
             started_at_ms: 900,
@@ -4232,6 +4559,77 @@ mod tests {
                 .expect("classification"),
             CorruptionReadVerdict::ProductFailure
         );
+    }
+
+    #[test]
+    fn rejected_corruption_reads_distinguish_product_and_harness_failures() {
+        assert_eq!(
+            classify_rejected_get(Some(500), Some("XMinioReadQuorum: bitrot detected")),
+            BitrotReadOutcome::CorruptionRejected
+        );
+        assert_eq!(
+            classify_rejected_get(Some(404), Some("NoSuchVersion")),
+            BitrotReadOutcome::ConfirmedVersionMissing
+        );
+        assert_eq!(
+            classify_rejected_get(Some(403), Some("AccessDenied")),
+            BitrotReadOutcome::HarnessRejected
+        );
+        assert_eq!(
+            classify_rejected_get(None, Some("get object timed out")),
+            BitrotReadOutcome::HarnessRejected
+        );
+    }
+
+    #[test]
+    fn prejournal_mutation_rejection_allows_aborted_cleanup_proof() {
+        let operation = StorageRecoveryHostOperation::MutateShard {
+            inspection_operation_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            part_number: 1,
+            byte_offset: 0,
+        };
+        let mut pending = Some((
+            "99999999-9999-4999-8999-999999999999".to_string(),
+            operation.clone(),
+        ));
+        let rejection: anyhow::Error =
+            StorageHelperMutationRejected("mapping digest changed".to_string()).into();
+        clear_pending_for_prejournal_rejection(&mut pending, &rejection);
+        assert!(pending.is_none());
+
+        let mut retained = Some((
+            "99999999-9999-4999-8999-999999999999".to_string(),
+            operation,
+        ));
+        let transport = anyhow::anyhow!("helper response timed out");
+        clear_pending_for_prejournal_rejection(&mut retained, &transport);
+        assert!(retained.is_some());
+        let cleanup = StorageRecoveryCleanupProof::AbortedBeforeMutation {
+            observed_at_ms: context().observed_at_ms,
+        };
+        cleanup
+            .validate_for(&context())
+            .expect("pre-journal rejection can release the Lease");
+    }
+
+    #[test]
+    fn completed_heal_advances_stage_only_after_heal_artifact_persistence() {
+        let mut state = BitrotFailureStageState {
+            has_context: true,
+            has_selection: true,
+            has_pending_mutation: false,
+            has_mutation: true,
+            has_corruption: true,
+            heal_artifact_persisted: false,
+            has_heal: false,
+            has_cleanup: false,
+            helper_finish_completed: false,
+        };
+        let before_persistence = classify_failure_stage(&state);
+        assert_eq!(before_persistence, "heal");
+        state.heal_artifact_persisted = true;
+        let after_persistence = classify_failure_stage(&state);
+        assert_eq!(after_persistence, "post-heal-verification");
     }
 
     #[test]
@@ -4397,7 +4795,12 @@ mod tests {
                 ended_sequence: Some(u64::try_from(index * 2 + 1).expect("end sequence")),
                 started_at_ms: receipt.started_at_ms,
                 ended_at_ms: receipt.completed_at_ms,
-                outcome: if receipt.outcome == BitrotReadOutcome::CleanRejected {
+                outcome: if matches!(
+                    receipt.outcome,
+                    BitrotReadOutcome::CorruptionRejected
+                        | BitrotReadOutcome::ConfirmedVersionMissing
+                        | BitrotReadOutcome::HarnessRejected
+                ) {
                     OperationOutcome::Failed
                 } else {
                     OperationOutcome::Ok
@@ -4443,6 +4846,10 @@ mod tests {
         let response_body = r#"{"summary":"failed","detail":"drive remained corrupt","settings":{"scanMode":2},"items":[]}"#.to_string();
         let receipt = RawBitrotEvidenceReceipt {
             api_revision: "v3/heal/status".to_string(),
+            request_path: Some("/rustfs/admin/v3/heal/test-bucket".to_string()),
+            request_body_sha256: None,
+            request_body: None,
+            request_client_token_sha256: Some(sha256_bytes(b"token")),
             response_sha256: sha256_bytes(response_body.as_bytes()),
             response_body,
             started_at_ms: 1,
@@ -4481,6 +4888,8 @@ mod tests {
             chaos_removed: true,
             admin_heal_closed: true,
             helper_closed: false,
+            admin_heal_cleanup_required: false,
+            admin_heal_cleanup: None,
             mutation_lookup: None,
             cleanup_proof: None,
             errors: vec!["restore selected shard: device identity changed".to_string()],
@@ -4489,6 +4898,73 @@ mod tests {
         assert!(!evidence.succeeded());
         let body = serde_json::to_string(&evidence).expect("cleanup evidence");
         assert!(body.contains("device identity changed"));
+        let mut missing_admin_receipt = evidence;
+        missing_admin_receipt.admin_heal_cleanup_required = true;
+        assert!(missing_admin_receipt.validate_for(None).is_err());
+    }
+
+    #[test]
+    fn exact_scope_admin_cleanup_receipt_is_bound_to_the_run_bucket() {
+        let mut cleanup_context = context();
+        cleanup_context.case = StorageRecoveryCase::OnDiskBitrotAdminDeep;
+        cleanup_context.identity.bucket = "s3chaos-bitrot-run-1".to_string();
+        let request_body = serde_json::json!({
+            "recursive": true,
+            "dryRun": false,
+            "remove": false,
+            "recreate": false,
+            "scanMode": 2,
+            "updateParity": false,
+            "nolock": false
+        })
+        .to_string();
+        let response_body = r#"{"clientToken":"s3chaos-bitrot-run-1","clientAddress":"127.0.0.1","startTime":"1970-01-01T00:00:01Z"}"#.to_string();
+        let receipt = RawBitrotEvidenceReceipt {
+            api_revision: "v3/heal/exact-scope-cancel".to_string(),
+            request_path: Some("/rustfs/admin/v3/heal/s3chaos-bitrot-run-1".to_string()),
+            request_body_sha256: Some(sha256_bytes(request_body.as_bytes())),
+            request_body: Some(request_body),
+            request_client_token_sha256: None,
+            response_sha256: sha256_bytes(response_body.as_bytes()),
+            response_body,
+            started_at_ms: 120,
+            completed_at_ms: 121,
+        };
+        let evidence = BitrotEmergencyCleanupEvidence {
+            attempted: true,
+            chaos_removed: true,
+            admin_heal_closed: true,
+            helper_closed: true,
+            admin_heal_cleanup_required: true,
+            admin_heal_cleanup: Some(receipt),
+            mutation_lookup: None,
+            cleanup_proof: None,
+            errors: Vec::new(),
+            completed_at_ms: 122,
+        };
+        evidence
+            .validate_for(Some(&cleanup_context))
+            .expect("exact bucket-scope cleanup receipt");
+        let mut forged = evidence;
+        forged
+            .admin_heal_cleanup
+            .as_mut()
+            .expect("cleanup receipt")
+            .response_body = r#"{"clientToken":"other-bucket","clientAddress":"127.0.0.1","startTime":"1970-01-01T00:00:01Z"}"#.to_string();
+        let response_sha256 = sha256_bytes(
+            forged
+                .admin_heal_cleanup
+                .as_ref()
+                .expect("cleanup receipt")
+                .response_body
+                .as_bytes(),
+        );
+        forged
+            .admin_heal_cleanup
+            .as_mut()
+            .expect("cleanup receipt")
+            .response_sha256 = response_sha256;
+        assert!(forged.validate_for(Some(&cleanup_context)).is_err());
     }
 
     #[test]
@@ -4516,6 +4992,10 @@ mod tests {
             failure_detail: Some("target shard remained corrupt".to_string()),
             receipt: RawBitrotEvidenceReceipt {
                 api_revision: "v3/heal/status".to_string(),
+                request_path: Some("/rustfs/admin/v3/heal/bucket".to_string()),
+                request_body_sha256: None,
+                request_body: None,
+                request_client_token_sha256: Some(sha256_bytes(b"token-1")),
                 response_sha256: sha256_bytes(response_body.as_bytes()),
                 response_body,
                 started_at_ms: 120,
@@ -4535,12 +5015,15 @@ mod tests {
             case: StorageRecoveryCase::OnDiskBitrotAdminDeep,
             stage: "heal".to_string(),
             primary_error: "owned admin heal failed: target shard remained corrupt".to_string(),
+            diagnostics: Vec::new(),
             context: Some(Box::new(failed_context.clone())),
             cleanup: BitrotEmergencyCleanupEvidence {
                 attempted: true,
                 chaos_removed: true,
                 admin_heal_closed: true,
                 helper_closed: true,
+                admin_heal_cleanup_required: false,
+                admin_heal_cleanup: None,
                 mutation_lookup: None,
                 cleanup_proof: Some(StorageRecoveryCleanupProof::AbortedBeforeMutation {
                     observed_at_ms: 130,
@@ -4559,12 +5042,36 @@ mod tests {
     }
 
     #[test]
+    fn heal_progress_event_failure_is_auxiliary_to_server_failure() {
+        let primary_error = "owned admin heal failed: target shard remained corrupt";
+        let mut diagnostics = Vec::new();
+        retain_auxiliary_error(
+            &mut diagnostics,
+            "record heal-progress event",
+            Err(anyhow::anyhow!("event write failed")),
+        );
+        assert_eq!(
+            primary_error,
+            "owned admin heal failed: target shard remained corrupt"
+        );
+        assert_eq!(
+            diagnostics,
+            vec!["record heal-progress event: event write failed"]
+        );
+    }
+
+    #[test]
     fn accepted_admin_start_is_owned_before_artifact_or_event_writes() {
         let path = "/rustfs/admin/v3/heal/s3chaos-bitrot-run-1";
+        let request_body = r#"{"recursive":true,"scanMode":2}"#;
         let start_body = r#"{"clientToken":"server-token-1","clientAddress":"127.0.0.1","startTime":"1970-01-01T00:00:01Z"}"#;
-        let status_body = r#"{"summary":"running","startTime":"1970-01-01T00:00:01.4Z","settings":{"recursive":true,"scanMode":2},"items":[]}"#;
+        let status_body = r#"{"summary":"running","startTime":"1970-01-01T00:00:20Z","settings":{"recursive":false,"scanMode":0},"items":[]}"#;
         let start = RawBitrotEvidenceReceipt {
             api_revision: "v3/heal/start".to_string(),
+            request_path: Some(path.to_string()),
+            request_body_sha256: Some(sha256_bytes(request_body.as_bytes())),
+            request_body: Some(request_body.to_string()),
+            request_client_token_sha256: None,
             response_sha256: sha256_bytes(start_body.as_bytes()),
             response_body: start_body.to_string(),
             started_at_ms: 1_000,
@@ -4572,6 +5079,10 @@ mod tests {
         };
         let status = RawBitrotEvidenceReceipt {
             api_revision: "v3/heal/status".to_string(),
+            request_path: Some(path.to_string()),
+            request_body_sha256: None,
+            request_body: None,
+            request_client_token_sha256: Some(sha256_bytes(b"server-token-1")),
             response_sha256: sha256_bytes(status_body.as_bytes()),
             response_body: status_body.to_string(),
             started_at_ms: 1_100,
@@ -4580,7 +5091,7 @@ mod tests {
         let mut state = BitrotAdminHealStartState::ambiguous("s3chaos-bitrot-run-1", path, 1_000);
         assert_eq!(
             state
-                .own_from_start(&start, true)
+                .own_from_start(&start)
                 .expect("accepted response owns the heal")
                 .client_token,
             "server-token-1",
@@ -4588,36 +5099,58 @@ mod tests {
         state
             .validate_owned_status(&status)
             .expect("exact status belongs to the owned heal");
-        assert_eq!(
-            state
-                .owned_token("s3chaos-bitrot-run-1", path)
-                .expect("owned exact token"),
-            Some("server-token-1")
-        );
-        assert!(state.owned_token("s3chaos-bitrot-run-2", path).is_err());
+        let cleanup_plan = state
+            .cleanup_plan("s3chaos-bitrot-run-1", path)
+            .expect("owned cleanup plan")
+            .expect("owned heal requires cleanup");
+        assert_eq!(cleanup_plan.client_token.as_deref(), Some("server-token-1"));
+        assert!(state.cleanup_plan("s3chaos-bitrot-run-2", path).is_err());
 
         let mut ambiguous =
             BitrotAdminHealStartState::ambiguous("s3chaos-bitrot-run-1", path, 1_000);
         ambiguous
-            .own_from_start(&start, true)
+            .own_from_start(&start)
             .expect("accepted response owns the heal before persistence");
         let artifact_write: Result<()> = Err(anyhow::anyhow!("artifact write failed"));
         assert!(artifact_write.is_err());
         assert_eq!(
             ambiguous
-                .owned_token("s3chaos-bitrot-run-1", path)
-                .expect("cleanup retains the owned token"),
+                .cleanup_plan("s3chaos-bitrot-run-1", path)
+                .expect("cleanup retains ownership")
+                .expect("owned heal requires cleanup")
+                .client_token
+                .as_deref(),
             Some("server-token-1")
         );
         let mut wrong_status = status.clone();
-        wrong_status.response_body = status_body.replace("00:00:01.4Z", "00:00:20Z");
-        wrong_status.response_sha256 = sha256_bytes(wrong_status.response_body.as_bytes());
+        wrong_status.request_client_token_sha256 = Some(sha256_bytes(b"other-token"));
         assert!(ambiguous.validate_owned_status(&wrong_status).is_err());
+    }
 
-        let mut normal_status = status.clone();
-        normal_status.response_body = status_body.replace("\"scanMode\":2", "\"scanMode\":1");
-        normal_status.response_sha256 = sha256_bytes(normal_status.response_body.as_bytes());
-        assert!(ambiguous.validate_owned_status(&normal_status).is_err());
+    #[test]
+    fn lost_admin_start_response_uses_only_exact_bucket_scope_cleanup() {
+        let bucket = "s3chaos-bitrot-run-1";
+        let path = format!("/rustfs/admin/v3/heal/{bucket}");
+        let ambiguous = BitrotAdminHealStartState::ambiguous(bucket, &path, 1_000);
+        let plan = ambiguous
+            .cleanup_plan(bucket, &path)
+            .expect("exact-scope cleanup plan")
+            .expect("ambiguous start requires cleanup");
+        assert_eq!(plan.api_revision, "v3/heal/exact-scope-cancel");
+        assert_eq!(plan.client_token, None);
+        let body: Value = serde_json::from_slice(&plan.request_body).expect("cleanup request");
+        assert_eq!(body.get("recursive").and_then(Value::as_bool), Some(true));
+        assert_eq!(body.get("scanMode").and_then(Value::as_u64), Some(2));
+        assert!(
+            ambiguous
+                .cleanup_plan("s3chaos-bitrot-run-2", &path)
+                .is_err()
+        );
+        assert!(
+            ambiguous
+                .cleanup_plan(bucket, "/rustfs/admin/v3/heal")
+                .is_err()
+        );
     }
 
     #[test]
@@ -4666,8 +5199,14 @@ mod tests {
         let selection = selection(&renewed(&admin_context, 110));
 
         let start_body = r#"{"clientToken":"token-1","clientAddress":"127.0.0.1","startTime":"1970-01-01T00:00:00Z"}"#;
+        let request_body = r#"{"recursive":true,"scanMode":2}"#;
+        let path = format!("/rustfs/admin/v3/heal/{}", selection.probe.bucket);
         let start = RawBitrotEvidenceReceipt {
             api_revision: "v3/heal/start".to_string(),
+            request_path: Some(path.clone()),
+            request_body_sha256: Some(sha256_bytes(request_body.as_bytes())),
+            request_body: Some(request_body.to_string()),
+            request_client_token_sha256: None,
             response_sha256: sha256_bytes(start_body.as_bytes()),
             response_body: start_body.to_string(),
             started_at_ms: 140,
@@ -4678,7 +5217,7 @@ mod tests {
             failure_detail: String::new(),
             start_time: "1970-01-01T00:00:00Z".to_string(),
             settings: AdminHealSettingsBody {
-                scan_mode: AdminHealScanMode::Deep,
+                scan_mode: AdminHealScanMode::Unknown,
             },
             items: vec![AdminHealResultItem {
                 bucket: selection.probe.bucket.clone(),
@@ -4703,6 +5242,10 @@ mod tests {
         .expect("admin heal status");
         let terminal_status = RawBitrotEvidenceReceipt {
             api_revision: "v3/heal/status".to_string(),
+            request_path: Some(path),
+            request_body_sha256: None,
+            request_body: None,
+            request_client_token_sha256: Some(sha256_bytes(b"token-1")),
             response_sha256: sha256_bytes(status_body.as_bytes()),
             response_body: status_body,
             started_at_ms: 160,

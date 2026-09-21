@@ -79,14 +79,15 @@ use crate::fault::{
         NODE_DOWN_HOLD_ARTIFACT, NodeDownHoldEvidence, NodeDownTarget, untouched_prefill_keys,
     },
     on_disk_bitrot::{
-        AdminHealStartBody, BITROT_ADMIN_HEAL_START_ARTIFACT, BITROT_CLEANUP_ARTIFACT,
+        BITROT_ADMIN_HEAL_START_ARTIFACT, BITROT_CLEANUP_ARTIFACT,
         BITROT_CORRUPTION_WINDOW_ARTIFACT, BITROT_FAILURE_ARTIFACT, BITROT_HEAL_ARTIFACT,
         BITROT_HEAL_PROGRESS_ARTIFACT, BITROT_MUTATION_ARTIFACT, BITROT_SELECTION_ARTIFACT,
         BITROT_WORKFLOW_ARTIFACT, BitrotCleanupEvidence, BitrotCorruptionWindowProof,
         BitrotFailureEvidence, BitrotHealEvidence, BitrotHealProgressSample,
         BitrotHealProgressSource, BitrotMutationEvidence, BitrotSelectionEvidence,
         OnDiskBitrotEvidenceSet, OnDiskBitrotWorkflowEvidence, RawBitrotEvidenceReceipt,
-        validate_heal_progress, validate_on_disk_bitrot_evidence,
+        validate_admin_deep_start_receipt, validate_heal_progress,
+        validate_on_disk_bitrot_evidence,
     },
     plan::{
         ExecutionKind, ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultKind,
@@ -2138,6 +2139,8 @@ fn validate_failed_on_disk_bitrot_artifacts(
             && !has_event(&events, "run", RunEventStatus::Succeeded),
         "failed bitrot events do not belong exclusively to the failed attempt"
     );
+    validate_bitrot_failure_event(&failure, &events)?;
+
     let history = read_jsonl::<OperationRecord>(&artifact("history.jsonl")?)?;
     if !history.is_empty() {
         validate_history_scope_and_order(
@@ -2199,16 +2202,23 @@ fn validate_failed_on_disk_bitrot_artifacts(
             let start = read_json::<RawBitrotEvidenceReceipt>(&artifact(
                 BITROT_ADMIN_HEAL_START_ARTIFACT,
             )?)?;
-            start.validate("failed admin heal start")?;
             Some(
-                serde_json::from_str::<AdminHealStartBody>(&start.response_body)
-                    .context("decode failed admin heal start")?
-                    .client_token,
+                validate_admin_deep_start_receipt(&start, &json_spec.metadata.bucket)?.client_token,
             )
         } else {
             None
         };
         validate_heal_progress(&progress, source, token.as_deref())?;
+        if source == BitrotHealProgressSource::AdminDeep {
+            let expected_path = format!("/rustfs/admin/v3/heal/{}", json_spec.metadata.bucket);
+            ensure!(
+                progress.iter().all(|sample| {
+                    sample.receipt.api_revision == "v3/heal/status"
+                        && sample.receipt.request_path.as_deref() == Some(expected_path.as_str())
+                }),
+                "failed admin heal progress is outside the started bucket scope"
+            );
+        }
     }
     failure.validate_progress_failure(&progress)?;
 
@@ -2296,6 +2306,37 @@ fn validate_failed_bitrot_stage_artifacts(
             && has_heal == (stage_rank >= 5)
             && has_cleanup == (stage_rank >= 7),
         "failed bitrot stage does not match its completed-stage artifacts"
+    );
+    Ok(())
+}
+
+fn validate_bitrot_failure_event(
+    failure: &BitrotFailureEvidence,
+    events: &[RunEvent],
+) -> Result<()> {
+    let failed = events
+        .iter()
+        .filter(|event| event.stage == "run" && event.status == RunEventStatus::Failed)
+        .collect::<Vec<_>>();
+    ensure!(
+        failed.len() == 1,
+        "failed bitrot evidence requires one run Failed event"
+    );
+    let event = failed[0];
+    let details = event
+        .details
+        .as_ref()
+        .and_then(Value::as_object)
+        .context("failed bitrot run event lacks details")?;
+    ensure!(
+        event.at_ms >= failure.observed_at_ms
+            && details.get("stage").and_then(Value::as_str) == Some(failure.stage.as_str())
+            && details.get("primaryError").and_then(Value::as_str)
+                == Some(failure.primary_error.as_str())
+            && details.get("cleanupSucceeded").and_then(Value::as_bool)
+                == Some(failure.cleanup.succeeded())
+            && details.get("cleanupErrors") == Some(&serde_json::json!(failure.cleanup.errors)),
+        "failed bitrot run event differs from bitrot-failure.json"
     );
     Ok(())
 }
@@ -8636,15 +8677,16 @@ mod tests {
         ArtifactValidationOptions, FailureSummary, FaultEvidenceArtifact, OutcomeCountsArtifact,
         QuorumEdgeRuntimeKind, RecommitCandidateManifestArtifact, RecommitReportArtifact,
         WorkloadSummaryArtifact, derive_recommit_candidates, read_json, read_jsonl, recursive_find,
-        validate_admin_topology_artifact_files, validate_checker_phase_chain,
-        validate_failed_attempt_disruptions, validate_failed_bitrot_stage_artifacts,
-        validate_fault_artifacts, validate_fault_artifacts_and_write_report,
+        validate_admin_topology_artifact_files, validate_bitrot_failure_event,
+        validate_checker_phase_chain, validate_failed_attempt_disruptions,
+        validate_failed_bitrot_stage_artifacts, validate_fault_artifacts,
+        validate_fault_artifacts_and_write_report,
         validate_fault_artifacts_for_planned_attempt_and_write_report,
         validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts, validate_run_spec,
         validate_target_proof, validate_volume_quorum_health_evidence,
         validate_write_quorum_runtime_evidence,
     };
-    use crate::fault::events::RunEvent;
+    use crate::fault::events::{RunEvent, RunEventStatus};
     use crate::fault::fixture::AdminFixturePlan;
     use crate::fault::host_storage::HOST_STORAGE_PROOF_ARTIFACT;
     use crate::fault::node_down::NODE_DOWN_HOLD_ARTIFACT;
@@ -8723,6 +8765,61 @@ mod tests {
         assert!(
             validate_failed_bitrot_stage_artifacts("heal", true, true, true, true, false,).is_err()
         );
+    }
+
+    #[test]
+    fn failed_bitrot_event_rejects_forged_primary_error() {
+        let failure: crate::fault::on_disk_bitrot::BitrotFailureEvidence =
+            serde_json::from_value(json!({
+                "schemaVersion": 2,
+                "runId": "run-1",
+                "case": "on-disk-bitrot-admin-deep",
+                "stage": "heal",
+                "primaryError": "owned admin heal failed: checksum mismatch",
+                "diagnostics": [],
+                "context": null,
+                "cleanup": {
+                    "attempted": true,
+                    "chaosRemoved": true,
+                    "adminHealClosed": true,
+                    "helperClosed": true,
+                    "adminHealCleanup": null,
+                    "mutationLookup": null,
+                    "cleanupProof": null,
+                    "errors": [],
+                    "completedAtMs": 120
+                },
+                "observedAtMs": 121
+            }))
+            .expect("failure evidence");
+        let mut event = RunEvent {
+            at_ms: 122,
+            scenario: "on-disk-bitrot".to_string(),
+            run_id: "run-1".to_string(),
+            stage: "run".to_string(),
+            status: RunEventStatus::Failed,
+            message: "failed".to_string(),
+            details: Some(json!({
+                "stage": "heal",
+                "primaryError": failure.primary_error,
+                "cleanupSucceeded": true,
+                "cleanupErrors": []
+            })),
+        };
+        validate_bitrot_failure_event(&failure, &[event.clone()]).expect("bound failure event");
+        for (field, forged) in [
+            ("stage", json!("cleanup")),
+            ("primaryError", json!("forged")),
+            ("cleanupSucceeded", json!(false)),
+            ("cleanupErrors", json!(["forged"])),
+        ] {
+            let mut forged_event = event.clone();
+            forged_event.details.as_mut().expect("details")[field] = forged;
+            assert!(validate_bitrot_failure_event(&failure, &[forged_event]).is_err());
+        }
+        assert!(validate_bitrot_failure_event(&failure, &[event.clone(), event.clone()]).is_err());
+        event.status = RunEventStatus::Succeeded;
+        assert!(validate_bitrot_failure_event(&failure, &[event]).is_err());
     }
 
     struct FailedAdminTestCase {

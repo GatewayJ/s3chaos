@@ -102,7 +102,18 @@ fn main() -> Result<()> {
                         receipt: Box::new(receipt),
                     },
                 )?,
-                Err(error) => write_error(&mut output, &format!("{error:#}"))?,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    match session.mutation_journal_exists(&operation_id) {
+                        Ok(false) => write_response(
+                            &mut output,
+                            &StorageHelperSessionResponse::MutationRejectedBeforeJournal {
+                                message,
+                            },
+                        )?,
+                        Ok(true) | Err(_) => write_error(&mut output, &message)?,
+                    }
+                }
             },
             StorageHelperSessionRequest::QueryMutation {
                 context,
@@ -114,7 +125,13 @@ fn main() -> Result<()> {
                         lookup: Box::new(lookup),
                     },
                 )?,
-                Err(error) => write_error(&mut output, &format!("{error:#}"))?,
+                Err(error) => match session.mutation_journal_exists(&operation_id) {
+                    Ok(false) => write_response(
+                        &mut output,
+                        &StorageHelperSessionResponse::MutationJournalAbsent { operation_id },
+                    )?,
+                    Ok(true) | Err(_) => write_error(&mut output, &format!("{error:#}"))?,
+                },
             },
             StorageHelperSessionRequest::StaleExecute { context, request } => {
                 match session.execute_stale(&context, &request) {
