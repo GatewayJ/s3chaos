@@ -348,6 +348,8 @@ impl FaultRun<'_> {
             active_partition_targets: _,
             active_fixed_volume_targets,
             active_fixed_volume_containers,
+            quorum_activation,
+            deferred_failure: _,
         } = active;
         let FaultWorkload {
             workload,
@@ -360,6 +362,7 @@ impl FaultRun<'_> {
             workload_fixed_volume_containers,
             quorum_health_before_workload,
             quorum_health_after_workload,
+            ran_under_fault,
         } = workload;
         let FaultRemoval {
             fault_delete_started_at_ms,
@@ -371,8 +374,10 @@ impl FaultRun<'_> {
             run_id: run_id.clone(),
             backend: plan.backend_summary(),
             target: plan.target_summary(),
-            injected: true,
-            active_during_workload: true,
+            injected: quorum_activation
+                .as_ref()
+                .is_none_or(|evidence| evidence.qualified),
+            active_during_workload: *ran_under_fault,
             recovered: true,
             require_client_disruption: *require_client_disruption,
             client_disruptions: workload.summary.disrupted(),

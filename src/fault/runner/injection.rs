@@ -43,6 +43,9 @@ use super::access::{
 /// How long a re-pinned `kubectl port-forward` gets to bind its local port
 /// and start accepting connections; only the harness side of the endpoint.
 const PORT_FORWARD_ESTABLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+use super::quorum_activation::{
+    cleanup_quorum_canaries as cleanup_activation_canaries, qualify_quorum_fault_activation,
+};
 use super::targets::{
     FixedVolumeTargets, observe_volume_quorum_health, require_active_fixed_volume_targets,
     require_active_pod_failure_quorum_edge, require_active_write_quorum_partition,
@@ -53,6 +56,7 @@ use super::{
     now_ms, warp_bucket_name,
 };
 use crate::fault::backends::runtime::apply_fault;
+use crate::fault::quorum::QUORUM_FAULT_ACTIVATION_ARTIFACT;
 use crate::fault::workload::execution::{
     AVAILABILITY_REPORT_ARTIFACT, MixedWorkloadRequest, MixedWorkloadResult,
     QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, QuorumEdgeReadSurvivalReport, ReadProbeSummary,
@@ -62,7 +66,7 @@ use crate::fault::workload::execution::{
 };
 
 impl FaultRun<'_> {
-    pub(super) fn activate_fault(&self, target: &ProvenTarget) -> Result<ActiveFault> {
+    pub(super) async fn activate_fault(&self, target: &ProvenTarget) -> Result<ActiveFault> {
         let config = self.config;
         let collector = self.collector;
         let scenario = self.scenario;
@@ -128,9 +132,10 @@ impl FaultRun<'_> {
         )?;
 
         self.complete_fault_activation(target, fault, None, fault_apply_started_at_ms, None)
+            .await
     }
 
-    pub(super) fn complete_fault_activation(
+    pub(super) async fn complete_fault_activation(
         &self,
         target: &ProvenTarget,
         fault: AppliedFault,
@@ -139,6 +144,7 @@ impl FaultRun<'_> {
         known_fault_active_at_ms: Option<u64>,
     ) -> Result<ActiveFault> {
         let config = self.config;
+        let collector = self.collector;
         let plan = self.plan;
         let run_id = &self.context.run_id;
         let events = &self.context.events;
@@ -179,26 +185,102 @@ impl FaultRun<'_> {
             }
             None => (Vec::new(), BTreeSet::new()),
         };
-        let FixedVolumeTargets {
-            pods: fixed_volume_pods_at_fault_activation,
-            records: active_fixed_volume_targets,
-            containers: active_fixed_volume_containers,
-        } = if matches!(
-            target.execution_injection.selection(),
-            crate::fault::plan::FaultSelection::FixedTargets(_)
-        ) && target.execution_injection.rustfs_volume_path().is_ok()
+        let fixed_volume_runtime_proof =
+            if matches!(
+                target.execution_injection.selection(),
+                crate::fault::plan::FaultSelection::FixedTargets(_)
+            ) && target.execution_injection.rustfs_volume_path().is_ok()
+            {
+                Some(require_active_fixed_volume_targets(
+                    config,
+                    run_id,
+                    &target.execution_injection,
+                    &plan.scenario,
+                    &target.pods_before,
+                    &target.target_proof,
+                    &active_snapshots,
+                ))
+            } else {
+                None
+            };
+        let volume_quorum_scenario = matches!(
+            plan.scenario.as_str(),
+            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        );
+        let (fixed_volume_targets, quorum_activation, deferred_failure) = if volume_quorum_scenario
         {
-            match require_active_fixed_volume_targets(
-                config,
-                run_id,
-                &target.execution_injection,
+            events.record(
+                "quorum-fault-activation",
+                RunEventStatus::Started,
+                "independently probing every controller-selected quorum volume for EIO",
+                None,
+            )?;
+            let controller_validation_error = fixed_volume_runtime_proof
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .map(|error| error.to_string());
+            let canary_timeout = std::time::Duration::from_secs(10).min(
+                config
+                    .cluster
+                    .timeout
+                    .max(std::time::Duration::from_secs(1)),
+            );
+            let evidence = qualify_quorum_fault_activation(
+                &config.cluster,
                 &plan.scenario,
-                &target.pods_before,
+                run_id,
                 &target.target_proof,
                 &active_snapshots,
-            ) {
-                Ok(evidence) => evidence,
-                Err(error) => {
+                controller_validation_error,
+                canary_timeout,
+            )
+            .await;
+            evidence.validate()?;
+            collector.write_text(
+                self.scenario.case_name,
+                QUORUM_FAULT_ACTIVATION_ARTIFACT,
+                &serde_json::to_string_pretty(&evidence)?,
+            )?;
+            let failure = evidence.failure_reason();
+            events.record(
+                "quorum-fault-activation",
+                if failure.is_some() {
+                    RunEventStatus::Failed
+                } else {
+                    RunEventStatus::Succeeded
+                },
+                failure.clone().unwrap_or_else(|| {
+                    "every selected quorum volume independently returned EIO".to_string()
+                }),
+                Some(serde_json::json!({
+                    "expected_targets": evidence.expected_targets,
+                    "controller_records": evidence.controller_records,
+                    "canary_targets": evidence.targets.len(),
+                    "qualified": evidence.qualified,
+                    "artifact": QUORUM_FAULT_ACTIVATION_ARTIFACT,
+                })),
+            )?;
+            let pods = evidence
+                .targets
+                .iter()
+                .map(|target| PodIdentity {
+                    name: target.pod_name.clone(),
+                    uid: target.pod_uid.clone(),
+                })
+                .collect();
+            (
+                FixedVolumeTargets {
+                    pods,
+                    records: evidence.selected_record_ids(),
+                    containers: evidence.selected_containers(),
+                },
+                Some(evidence),
+                failure,
+            )
+        } else {
+            let evidence = match fixed_volume_runtime_proof {
+                Some(Ok(evidence)) => evidence,
+                Some(Err(error)) => {
                     self.record_failure(
                         "fault-snapshot-active",
                         "environment_or_fault_backend",
@@ -208,10 +290,15 @@ impl FaultRun<'_> {
                     )?;
                     return Err(error);
                 }
-            }
-        } else {
-            FixedVolumeTargets::default()
+                None => FixedVolumeTargets::default(),
+            };
+            (evidence, None, None)
         };
+        let FixedVolumeTargets {
+            pods: fixed_volume_pods_at_fault_activation,
+            records: active_fixed_volume_targets,
+            containers: active_fixed_volume_containers,
+        } = fixed_volume_targets;
         let pods_at_fault_activation = if fixed_volume_pods_at_fault_activation.is_empty() {
             pods_at_fault_activation
         } else {
@@ -233,6 +320,8 @@ impl FaultRun<'_> {
             active_partition_targets,
             active_fixed_volume_targets,
             active_fixed_volume_containers,
+            quorum_activation,
+            deferred_failure,
         })
     }
     pub(super) async fn exercise_fault(
@@ -654,7 +743,132 @@ impl FaultRun<'_> {
             workload_fixed_volume_containers,
             quorum_health_before_workload,
             quorum_health_after_workload,
+            ran_under_fault: true,
         })
+    }
+
+    pub(super) fn skip_unqualified_quorum_workload(
+        &self,
+        active: &ActiveFault,
+    ) -> Result<FaultWorkload> {
+        let reason = active
+            .deferred_failure
+            .as_deref()
+            .context("unqualified quorum workload skip lacks a failure reason")?;
+        let started_at_ms = now_ms();
+        self.context.events.record(
+            "mixed-workload",
+            RunEventStatus::Observed,
+            "skipped typed quorum workload because independent fault activation proof failed",
+            Some(serde_json::json!({
+                "reason": reason,
+                "recovery_will_continue": true,
+            })),
+        )?;
+        let workload = MixedWorkloadResult::skipped_after_unqualified_activation(
+            &self.context.workload_plan,
+            &self.scenario.name,
+            &self.context.run_id,
+        );
+        self.collector.write_text(
+            self.scenario.case_name,
+            "workload-summary.json",
+            &serde_json::to_string_pretty(&workload.summary)?,
+        )?;
+        let workload_snapshots = active
+            .fault
+            .snapshot("after-workload")
+            .map(|snapshot| vec![snapshot])
+            .unwrap_or_else(|error| {
+                self.context
+                    .events
+                    .record(
+                        "fault-snapshot-after-workload",
+                        RunEventStatus::Failed,
+                        format!("diagnostic snapshot after skipped workload failed: {error:#}"),
+                        None,
+                    )
+                    .ok();
+                Vec::new()
+            });
+        let completed_at_ms = now_ms();
+        Ok(FaultWorkload {
+            workload,
+            workload_started_at_ms: started_at_ms,
+            workload_ended_at_ms: completed_at_ms,
+            require_client_disruption: self.config.require_client_disruption
+                || self.context.spec.impact_policy.requires_client_disruption(),
+            workload_snapshots,
+            pods_at_workload_snapshot: active.pods_at_fault_activation.clone(),
+            workload_fixed_volume_targets: active.active_fixed_volume_targets.clone(),
+            workload_fixed_volume_containers: active.active_fixed_volume_containers.clone(),
+            quorum_health_before_workload: None,
+            quorum_health_after_workload: None,
+            ran_under_fault: false,
+        })
+    }
+
+    pub(super) async fn cleanup_quorum_activation_canaries(&self, active: &mut ActiveFault) {
+        let Some(evidence) = active.quorum_activation.as_mut() else {
+            return;
+        };
+        self.context
+            .events
+            .record(
+                "quorum-canary-cleanup",
+                RunEventStatus::Started,
+                "removing run-owned quorum activation canaries after fault removal",
+                Some(serde_json::json!({ "targets": evidence.targets.len() })),
+            )
+            .ok();
+        let timeout = std::time::Duration::from_secs(10).min(
+            self.config
+                .cluster
+                .timeout
+                .max(std::time::Duration::from_secs(1)),
+        );
+        let cleanup = cleanup_activation_canaries(&self.config.cluster, evidence, timeout).await;
+        let persistence = serde_json::to_string_pretty(evidence)
+            .context("encode quorum activation evidence after canary cleanup")
+            .and_then(|body| {
+                self.collector
+                    .write_text(
+                        self.scenario.case_name,
+                        QUORUM_FAULT_ACTIVATION_ARTIFACT,
+                        &body,
+                    )
+                    .map(|_| ())
+            });
+        let result = cleanup.and(persistence);
+        match result {
+            Ok(_) => {
+                self.context
+                    .events
+                    .record(
+                        "quorum-canary-cleanup",
+                        RunEventStatus::Succeeded,
+                        "run-owned quorum activation canaries were removed",
+                        None,
+                    )
+                    .ok();
+            }
+            Err(error) => {
+                let reason = format!("quorum activation canary cleanup failed: {error:#}");
+                active.deferred_failure = Some(match active.deferred_failure.take() {
+                    Some(primary) => format!("{primary}; {reason}"),
+                    None => reason.clone(),
+                });
+                self.context
+                    .events
+                    .record(
+                        "quorum-canary-cleanup",
+                        RunEventStatus::Failed,
+                        reason,
+                        None,
+                    )
+                    .ok();
+            }
+        }
     }
     pub(super) async fn run_warp_workload(
         &self,

@@ -52,6 +52,7 @@ mod ack;
 mod injection;
 mod node_down;
 mod post_recovery;
+pub(crate) mod quorum_activation;
 mod recovery;
 mod setup;
 pub(crate) mod targets;
@@ -220,15 +221,25 @@ async fn run_fault_case(
                 .run(run.prove_target(&prepared.endpoint, &mut preflight_phases))
                 .await?;
             deadline.check()?;
-            let mut active = run.activate_fault(&target)?;
-            let mut workload = run
-                .exercise_fault(&mut prepared, &target, &active, &staged_multipart_uploads)
-                .await?;
-            deadline.check()?;
+            let mut active = run.activate_fault(&target).await?;
+            let skip_typed_oracle = active.quorum_activation.as_ref().is_some_and(|evidence| {
+                evidence.disposition()
+                    == quorum_activation::QuorumActivationDisposition::SkipTypedOracleAndRecover
+            });
+            let mut workload = if skip_typed_oracle {
+                run.skip_unqualified_quorum_workload(&active)?
+            } else {
+                run.exercise_fault(&mut prepared, &target, &active, &staged_multipart_uploads)
+                    .await?
+            };
+            if !skip_typed_oracle {
+                deadline.check()?;
+            }
             run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
             run.hold_node_down(&mut prepared, &target, &active.fault)
                 .await?;
             let removal = run.remove_fault(&mut active.fault)?;
+            run.cleanup_quorum_activation_canaries(&mut active).await;
             let recovered = run
                 .recover_access(&mut prepared, &target, &mut staged_multipart_uploads)
                 .await?;
@@ -249,7 +260,24 @@ async fn run_fault_case(
             run.recommit(&prepared.s3, &mut workload.workload).await?;
             deadline
                 .run(run.verify_final(&prepared.s3, &workload.workload, &mut evidence))
-                .await
+                .await?;
+            if let Some(reason) = active.deferred_failure.as_deref() {
+                let error = anyhow::anyhow!(reason.to_string());
+                run.record_failure(
+                    "quorum-fault-activation",
+                    "fault_not_active",
+                    &error,
+                    Some(serde_json::json!({
+                        "artifact": crate::fault::quorum::QUORUM_FAULT_ACTIVATION_ARTIFACT,
+                        "recovery_completed": true,
+                        "recommit_completed": true,
+                        "checker_completed": true,
+                    })),
+                    None,
+                )?;
+                return Err(error);
+            }
+            Ok(())
         }
         .await
     };
@@ -349,6 +377,8 @@ struct ActiveFault {
     active_partition_targets: BTreeSet<String>,
     active_fixed_volume_targets: BTreeSet<String>,
     active_fixed_volume_containers: BTreeMap<String, String>,
+    quorum_activation: Option<quorum_activation::QuorumFaultActivationEvidence>,
+    deferred_failure: Option<String>,
 }
 
 struct FaultWorkload {
@@ -362,6 +392,7 @@ struct FaultWorkload {
     workload_fixed_volume_containers: BTreeMap<String, String>,
     quorum_health_before_workload: Option<QuorumHealthObservation>,
     quorum_health_after_workload: Option<QuorumHealthObservation>,
+    ran_under_fault: bool,
 }
 
 struct WorkloadTargetEvidence {

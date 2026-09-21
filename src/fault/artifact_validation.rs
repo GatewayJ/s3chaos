@@ -95,14 +95,15 @@ use crate::fault::{
         target_pod_has_bound_volume, target_pod_has_fixed_volume,
     },
     quorum::{
-        QuorumHealthObservation, QuorumMutationClass, QuorumVolumeBoundary,
-        require_fresh_runtime_observation,
+        QUORUM_FAULT_ACTIVATION_ARTIFACT, QuorumHealthObservation, QuorumMutationClass,
+        QuorumVolumeBoundary, require_fresh_runtime_observation,
     },
     recovery_health::{
         RECOVERY_HEALTH_ARTIFACT, RecoveryHealthBaseline, RecoveryHealthReport,
         readiness_proxy_path,
     },
     reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
+    runner::quorum_activation::{QuorumCanaryCleanupOutcome, QuorumFaultActivationEvidence},
     scenarios::{
         self, ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO,
         DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario, acknowledged_mutation_kind,
@@ -1612,6 +1613,12 @@ fn validate_fault_artifacts_with_identity(
         options.scenario.as_str(),
         scenarios::QUORUM_P_IO_FAULT_SCENARIO | scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
     ) {
+        validate_quorum_fault_activation_evidence(
+            &artifacts,
+            &evidence,
+            &target_proof,
+            &json_spec,
+        )?;
         validate_volume_quorum_health_evidence(&evidence, &target_proof, &history)?;
     }
     if ack_mutation.is_some() {
@@ -4112,6 +4119,134 @@ fn validate_fixed_volume_runtime_evidence(
             "fault-evidence.json persisted fixed volume targets do not match the {stage} IOChaos snapshot"
         );
     }
+    Ok(())
+}
+
+fn validate_quorum_fault_activation_evidence(
+    artifacts: &BTreeMap<String, PathBuf>,
+    evidence: &FaultEvidenceArtifact,
+    proof: &TargetProof,
+    spec: &FaultRunSpec,
+) -> Result<()> {
+    let activation = read_json::<QuorumFaultActivationEvidence>(required(
+        artifacts,
+        QUORUM_FAULT_ACTIVATION_ARTIFACT,
+    )?)?;
+    activation.validate()?;
+    ensure!(
+        activation.qualified && activation.failure_reasons.is_empty(),
+        "quorum activation evidence did not independently prove every target"
+    );
+    ensure!(
+        activation.scenario == spec.scenario.name
+            && activation.run_id == spec.metadata.run_id
+            && activation.backend == "chaos-mesh-iochaos",
+        "quorum activation evidence identity does not match run-spec.json"
+    );
+    let fault_active_at_ms = evidence
+        .fault_active_at_ms
+        .context("fault-evidence.json fault_active_at_ms is required")?;
+    let workload_started_at_ms = evidence
+        .workload_started_at_ms
+        .context("fault-evidence.json workload_started_at_ms is required")?;
+    let fault_delete_started_at_ms = evidence
+        .fault_delete_started_at_ms
+        .context("fault-evidence.json fault_delete_started_at_ms is required")?;
+    let recovery_ended_at_ms = evidence
+        .recovery_ended_at_ms
+        .context("fault-evidence.json recovery_ended_at_ms is required")?;
+    ensure!(
+        activation.started_at_ms >= fault_active_at_ms
+            && activation.completed_at_ms <= workload_started_at_ms,
+        "quorum activation canaries did not complete between fault activation and the typed workload"
+    );
+
+    let erasure_set = proof
+        .faults
+        .iter()
+        .find_map(|fault| fault.erasure_set.as_ref())
+        .context("runtime quorum target proof has no erasure-set evidence")?;
+    let volume_quorum = erasure_set
+        .volume_quorum
+        .as_ref()
+        .context("runtime quorum target proof has no volume bindings")?;
+    ensure!(
+        activation.expected_targets == volume_quorum.target_count
+            && activation.targets.len() == usize::try_from(volume_quorum.target_count)?,
+        "quorum activation evidence does not cover the proven target count"
+    );
+    let selected_names = evidence
+        .pods_at_fault_activation
+        .iter()
+        .map(|pod| pod.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let bindings = volume_quorum
+        .candidates
+        .iter()
+        .map(|binding| (binding.pod_name.as_str(), binding))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        selected_names.len() == activation.targets.len()
+            && activation
+                .targets
+                .iter()
+                .all(|target| selected_names.contains(target.pod_name.as_str())),
+        "quorum activation canary targets do not match fault-evidence.json"
+    );
+    for target in &activation.targets {
+        let binding = bindings.get(target.pod_name.as_str()).with_context(|| {
+            format!(
+                "quorum activation target Pod {:?} has no proven volume binding",
+                target.pod_name
+            )
+        })?;
+        ensure!(
+            target.pod_uid == binding.pod_uid
+                && target.container_id == binding.container_id
+                && target.persistent_volume_claim == binding.persistent_volume_claim
+                && target.persistent_volume == binding.persistent_volume
+                && target.mount_path == binding.mount_path
+                && target.drive_uuid == binding.drive_uuid
+                && iochaos_record_pod_id(&target.controller_record_id)?
+                    == format!("{}/{}", proof.namespace, binding.pod_name),
+            "quorum activation target {:?} differs from target-proof.json",
+            target.pod_name
+        );
+        let cleanup = target.cleanup.as_ref().with_context(|| {
+            format!(
+                "quorum activation target {:?} lacks canary cleanup evidence",
+                target.pod_name
+            )
+        })?;
+        ensure!(
+            cleanup.outcome == QuorumCanaryCleanupOutcome::Removed
+                && cleanup.exit_code == Some(0)
+                && cleanup.started_at_ms >= fault_delete_started_at_ms
+                && cleanup.started_at_ms <= cleanup.completed_at_ms
+                && cleanup.completed_at_ms <= recovery_ended_at_ms,
+            "quorum activation canary cleanup for Pod {:?} is incomplete or outside the recovery window",
+            target.pod_name
+        );
+    }
+
+    let snapshot = evidence
+        .active_snapshots
+        .iter()
+        .find(|snapshot| snapshot.get("resource_kind").and_then(Value::as_str) == Some("iochaos"))
+        .context("fault-evidence.json has no active IOChaos snapshot")?;
+    ensure!(
+        snapshot.get("resource_name").and_then(Value::as_str)
+            == Some(activation.iochaos_resource_name.as_str()),
+        "quorum activation evidence IOChaos name does not match fault-evidence.json"
+    );
+    let snapshot_resource = snapshot
+        .get("chaos_status")
+        .context("fault-evidence.json active IOChaos snapshot lacks its resource")?;
+    let snapshot_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(snapshot_resource)?));
+    ensure!(
+        activation.iochaos_snapshot_sha256 == snapshot_sha256,
+        "quorum activation evidence IOChaos snapshot digest does not match fault-evidence.json"
+    );
     Ok(())
 }
 
@@ -8347,9 +8482,9 @@ mod tests {
         validate_failed_attempt_disruptions, validate_fault_artifacts,
         validate_fault_artifacts_and_write_report,
         validate_fault_artifacts_for_planned_attempt_and_write_report,
-        validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts, validate_run_spec,
-        validate_target_proof, validate_volume_quorum_health_evidence,
-        validate_write_quorum_runtime_evidence,
+        validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts,
+        validate_quorum_fault_activation_evidence, validate_run_spec, validate_target_proof,
+        validate_volume_quorum_health_evidence, validate_write_quorum_runtime_evidence,
     };
     use crate::fault::events::RunEvent;
     use crate::fault::fixture::AdminFixturePlan;
@@ -8393,12 +8528,17 @@ mod tests {
         },
         quorum::{
             ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape,
-            QuorumCaseClass, QuorumDriveHealth, QuorumHealthObservation, QuorumVolumeBinding,
-            QuorumVolumeBoundary, QuorumVolumeTargetProof,
+            QUORUM_FAULT_ACTIVATION_ARTIFACT, QuorumCaseClass, QuorumDriveHealth,
+            QuorumHealthObservation, QuorumVolumeBinding, QuorumVolumeBoundary,
+            QuorumVolumeTargetProof,
         },
         reporting::{
             AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity,
             FailureVerdict, ResponsibilityDomain,
+        },
+        runner::quorum_activation::{
+            QuorumCanaryCleanupEvidence, QuorumCanaryCleanupOutcome, QuorumCanaryOutcome,
+            QuorumFaultActivationEvidence, QuorumFaultActivationTargetEvidence,
         },
         scenarios::ADMIN_DECOMMISSION_SCENARIO,
         scenarios::{
@@ -11359,12 +11499,117 @@ mod tests {
             "workload_started_at_ms": 250,
             "workload_ended_at_ms": 300,
             "fault_delete_started_at_ms": 350,
+            "recovery_ended_at_ms": 400,
             "quorum_health_before_workload": health(210, 220),
             "quorum_health_after_workload": health(310, 320)
         }))
         .expect("quorum health evidence");
         validate_volume_quorum_health_evidence(&health_evidence, &proof, &[])
             .expect("both bounded quorum health observations");
+
+        let iochaos_resource_name = "quorum-run-1";
+        let iochaos_resource = json!({
+            "apiVersion": "chaos-mesh.org/v1alpha1",
+            "kind": "IOChaos",
+            "metadata": {"name": iochaos_resource_name},
+            "status": {
+                "experiment": {
+                    "containerRecords": (0..3).map(|index| json!({
+                        "id": format!("{}/rustfs-{index}/rustfs", run_spec.cluster.namespace),
+                        "selectorKey": ".",
+                        "phase": "Injected",
+                        "injectedCount": 1
+                    })).collect::<Vec<_>>()
+                }
+            }
+        });
+        health_evidence.active_snapshots = vec![json!({
+            "stage": "active",
+            "resource_kind": "iochaos",
+            "resource_name": iochaos_resource_name,
+            "chaos_status": iochaos_resource.clone()
+        })];
+        let activation = QuorumFaultActivationEvidence {
+            schema_version: 1,
+            scenario: run_spec.scenario.name.clone(),
+            run_id: run_spec.metadata.run_id.clone(),
+            backend: "chaos-mesh-iochaos".to_string(),
+            iochaos_resource_name: iochaos_resource_name.to_string(),
+            iochaos_snapshot_sha256: hex::encode(Sha256::digest(
+                serde_json::to_vec(&iochaos_resource).expect("IOChaos JSON"),
+            )),
+            volume_path: "/data/rustfs0".to_string(),
+            expected_targets: 3,
+            controller_records: 3,
+            started_at_ms: 205,
+            completed_at_ms: 209,
+            qualified: true,
+            failure_reasons: Vec::new(),
+            targets: (0..3)
+                .map(|index| QuorumFaultActivationTargetEvidence {
+                    pod_name: format!("rustfs-{index}"),
+                    pod_uid: format!("uid-{index}"),
+                    container_id: format!("containerd://rustfs-{index}"),
+                    persistent_volume_claim: format!("data-{index}"),
+                    persistent_volume: format!("pv-{index}"),
+                    mount_path: "/data/rustfs0".to_string(),
+                    drive_uuid: format!("drive-{index}"),
+                    controller_record_id: format!(
+                        "{}/rustfs-{index}/rustfs",
+                        run_spec.cluster.namespace
+                    ),
+                    canary_path: format!("/data/rustfs0/.s3chaos-quorum-run1-rustfs-{index}"),
+                    started_at_ms: 206,
+                    completed_at_ms: 208,
+                    outcome: QuorumCanaryOutcome::IoErrorObserved,
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: "write error: Input/output error".to_string(),
+                    cleanup: Some(QuorumCanaryCleanupEvidence {
+                        started_at_ms: 351,
+                        completed_at_ms: 352,
+                        outcome: QuorumCanaryCleanupOutcome::Removed,
+                        exit_code: Some(0),
+                        stderr: String::new(),
+                    }),
+                })
+                .collect(),
+        };
+        let activation_dir = tempfile::tempdir().expect("activation artifact dir");
+        write_json(
+            activation_dir.path(),
+            QUORUM_FAULT_ACTIVATION_ARTIFACT,
+            &serde_json::to_value(&activation).expect("activation JSON"),
+        );
+        let activation_artifacts = BTreeMap::from([(
+            QUORUM_FAULT_ACTIVATION_ARTIFACT.to_string(),
+            activation_dir.path().join(QUORUM_FAULT_ACTIVATION_ARTIFACT),
+        )]);
+        validate_quorum_fault_activation_evidence(
+            &activation_artifacts,
+            &health_evidence,
+            &proof,
+            &run_spec,
+        )
+        .expect("bound quorum activation evidence");
+
+        let mut wrong_drive = activation;
+        wrong_drive.targets[0].drive_uuid = "replacement-drive".to_string();
+        write_json(
+            activation_dir.path(),
+            QUORUM_FAULT_ACTIVATION_ARTIFACT,
+            &serde_json::to_value(&wrong_drive).expect("tampered activation JSON"),
+        );
+        assert!(
+            validate_quorum_fault_activation_evidence(
+                &activation_artifacts,
+                &health_evidence,
+                &proof,
+                &run_spec,
+            )
+            .is_err(),
+            "activation target drive UUID must match target-proof.json"
+        );
 
         let saved_before = health_evidence.quorum_health_before_workload.take();
         assert!(
@@ -18139,6 +18384,8 @@ mod tests {
         let plain = FaultRunArtifactSpec::required_names_for_scenario("io-eio");
         let ack = FaultRunArtifactSpec::required_names_for_scenario("dm-drop-writes-after-ack-put");
         let availability = FaultRunArtifactSpec::required_names_for_scenario("pod-failure");
+        let quorum =
+            FaultRunArtifactSpec::required_names_for_scenario(QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO);
         for names in [&plain, &ack, &availability] {
             for artifact in [
                 RECOVERY_HEALTH_ARTIFACT,
@@ -18155,6 +18402,11 @@ mod tests {
         );
         assert!(plain.iter().any(|name| name == "availability-report.json"));
         assert!(!ack.iter().any(|name| name == "availability-report.json"));
+        assert!(
+            quorum
+                .iter()
+                .any(|name| name == QUORUM_FAULT_ACTIVATION_ARTIFACT)
+        );
     }
 
     fn lifecycle_run_spec(

@@ -1212,9 +1212,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             "artifact must prove erasure-set topology and P value before fault activation",
             "artifact must bind every candidate and selected Pod/container/PVC/PV/mount to exactly one RustFS drive UUID in the same set",
             "artifact must prove the complete non-target drive set",
+            "a run-owned write canary in every controller-selected volume must independently return EIO before the typed S3 oracle starts",
         ],
         validation: "the stable typed cohort remains readable at P failed volumes; each mutation must fail without a success ACK when its write quorum exceeds the remaining shard count, and permitted writes must not leave half-committed versions",
-        observability: "runtime topology and volume binding proof, actual IOChaos controller targets at activation and after workload, workload history, checker reports, RustFS logs",
+        observability: "runtime topology and volume binding proof, actual IOChaos controller targets, quorum-fault-activation.json canary results and cleanup, workload history, checker reports, RustFS logs",
         conflict_domain: "fresh Tenant with topology-owned volume selection; must not share erasure-set targeting with other active faults",
     },
     FaultScenarioSpec {
@@ -1242,9 +1243,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             "artifact must prove erasure-set topology, P value, and P+1 target count before fault activation",
             "artifact must bind every candidate and selected Pod/container/PVC/PV/mount to exactly one RustFS drive UUID in the same set",
             "artifact must prove the complete non-target drive set",
+            "a run-owned write canary in every controller-selected volume must independently return EIO before the typed S3 oracle starts",
         ],
         validation: "P+1 rejects every mutation whose write quorum exceeds the remaining shard count, deriving PUT, DELETE marker, and multipart completion expectations separately from proven runtime geometry; prior committed versions remain readable after recovery and no successful read returns corrupt bytes",
-        observability: "runtime topology and volume binding proof, actual IOChaos controller targets at activation and after workload, workload history, checker reports, RustFS logs",
+        observability: "runtime topology and volume binding proof, actual IOChaos controller targets, quorum-fault-activation.json canary results and cleanup, workload history, checker reports, RustFS logs",
         conflict_domain: "fresh Tenant with topology-owned volume selection; must not share erasure-set targeting with other active faults",
     },
     FaultScenarioSpec {
