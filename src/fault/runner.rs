@@ -223,7 +223,7 @@ async fn run_fault_case(
             deadline.check()?;
             let mut active = run.activate_fault(&target).await?;
             let skip_typed_oracle = active.quorum_activation.as_ref().is_some_and(|evidence| {
-                evidence.disposition()
+                evidence.evidence().disposition()
                     == quorum_activation::QuorumActivationDisposition::SkipTypedOracleAndRecover
             });
             let mut workload = if skip_typed_oracle {
@@ -368,6 +368,8 @@ struct ProvenTarget {
 }
 
 struct ActiveFault {
+    // Field order is a cleanup invariant: the backend fault must be dropped
+    // before the canary guard performs its cancellation fallback.
     fault: AppliedFault,
     fault_prepare_started_at_ms: Option<u64>,
     fault_apply_started_at_ms: u64,
@@ -377,7 +379,7 @@ struct ActiveFault {
     active_partition_targets: BTreeSet<String>,
     active_fixed_volume_targets: BTreeSet<String>,
     active_fixed_volume_containers: BTreeMap<String, String>,
-    quorum_activation: Option<quorum_activation::QuorumFaultActivationEvidence>,
+    quorum_activation: Option<quorum_activation::QuorumCanaryCleanupGuard>,
     deferred_failure: Option<String>,
 }
 

@@ -4134,7 +4134,9 @@ fn validate_quorum_fault_activation_evidence(
     )?)?;
     activation.validate()?;
     ensure!(
-        activation.qualified && activation.failure_reasons.is_empty(),
+        activation.qualified
+            && activation.failure_reasons.is_empty()
+            && activation.cleanup_failure_reason.is_none(),
         "quorum activation evidence did not independently prove every target"
     );
     ensure!(
@@ -11545,6 +11547,7 @@ mod tests {
             completed_at_ms: 209,
             qualified: true,
             failure_reasons: Vec::new(),
+            cleanup_failure_reason: None,
             targets: (0..3)
                 .map(|index| QuorumFaultActivationTargetEvidence {
                     pod_name: format!("rustfs-{index}"),
@@ -11592,6 +11595,24 @@ mod tests {
             &run_spec,
         )
         .expect("bound quorum activation evidence");
+
+        let mut cleanup_failed = activation.clone();
+        cleanup_failed.cleanup_failure_reason = Some("cleanup failed".to_string());
+        write_json(
+            activation_dir.path(),
+            QUORUM_FAULT_ACTIVATION_ARTIFACT,
+            &serde_json::to_value(&cleanup_failed).expect("cleanup failure JSON"),
+        );
+        assert!(
+            validate_quorum_fault_activation_evidence(
+                &activation_artifacts,
+                &health_evidence,
+                &proof,
+                &run_spec,
+            )
+            .is_err(),
+            "successful quorum artifacts must reject canary cleanup failure"
+        );
 
         let mut wrong_drive = activation;
         wrong_drive.targets[0].drive_uuid = "replacement-drive".to_string();

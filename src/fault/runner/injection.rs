@@ -44,7 +44,8 @@ use super::access::{
 /// and start accepting connections; only the harness side of the endpoint.
 const PORT_FORWARD_ESTABLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 use super::quorum_activation::{
-    cleanup_quorum_canaries as cleanup_activation_canaries, qualify_quorum_fault_activation,
+    QuorumCanaryCleanupGuard, prepare_quorum_fault_activation,
+    qualify_prepared_quorum_fault_activation,
 };
 use super::targets::{
     FixedVolumeTargets, observe_volume_quorum_health, require_active_fixed_volume_targets,
@@ -207,8 +208,7 @@ impl FaultRun<'_> {
             plan.scenario.as_str(),
             QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
         );
-        let (fixed_volume_targets, quorum_activation, deferred_failure) = if volume_quorum_scenario
-        {
+        let (fixed_volume_targets, quorum_activation, activation_plan) = if volume_quorum_scenario {
             events.record(
                 "quorum-fault-activation",
                 RunEventStatus::Started,
@@ -225,41 +225,13 @@ impl FaultRun<'_> {
                     .timeout
                     .max(std::time::Duration::from_secs(1)),
             );
-            let evidence = qualify_quorum_fault_activation(
-                &config.cluster,
+            let (evidence, activation_plan) = prepare_quorum_fault_activation(
                 &plan.scenario,
                 run_id,
                 &target.target_proof,
                 &active_snapshots,
                 controller_validation_error,
-                canary_timeout,
-            )
-            .await;
-            evidence.validate()?;
-            collector.write_text(
-                self.scenario.case_name,
-                QUORUM_FAULT_ACTIVATION_ARTIFACT,
-                &serde_json::to_string_pretty(&evidence)?,
-            )?;
-            let failure = evidence.failure_reason();
-            events.record(
-                "quorum-fault-activation",
-                if failure.is_some() {
-                    RunEventStatus::Failed
-                } else {
-                    RunEventStatus::Succeeded
-                },
-                failure.clone().unwrap_or_else(|| {
-                    "every selected quorum volume independently returned EIO".to_string()
-                }),
-                Some(serde_json::json!({
-                    "expected_targets": evidence.expected_targets,
-                    "controller_records": evidence.controller_records,
-                    "canary_targets": evidence.targets.len(),
-                    "qualified": evidence.qualified,
-                    "artifact": QUORUM_FAULT_ACTIVATION_ARTIFACT,
-                })),
-            )?;
+            );
             let pods = evidence
                 .targets
                 .iter()
@@ -268,14 +240,22 @@ impl FaultRun<'_> {
                     uid: target.pod_uid.clone(),
                 })
                 .collect();
+            let fixed_volume_targets = FixedVolumeTargets {
+                pods,
+                records: evidence.selected_record_ids(),
+                containers: evidence.selected_containers(),
+            };
+            let cleanup = QuorumCanaryCleanupGuard::new(
+                &config.cluster,
+                collector,
+                self.scenario.case_name,
+                canary_timeout,
+                evidence,
+            );
             (
-                FixedVolumeTargets {
-                    pods,
-                    records: evidence.selected_record_ids(),
-                    containers: evidence.selected_containers(),
-                },
-                Some(evidence),
-                failure,
+                fixed_volume_targets,
+                Some(cleanup),
+                Some((activation_plan, canary_timeout)),
             )
         } else {
             let evidence = match fixed_volume_runtime_proof {
@@ -304,13 +284,7 @@ impl FaultRun<'_> {
         } else {
             fixed_volume_pods_at_fault_activation
         };
-        events.record(
-            "fault-snapshot-active",
-            RunEventStatus::Succeeded,
-            "active fault status snapshots captured",
-            Some(serde_json::json!({ "snapshots": active_snapshots.len() })),
-        )?;
-        Ok(ActiveFault {
+        let mut active = ActiveFault {
             fault,
             fault_prepare_started_at_ms,
             fault_apply_started_at_ms,
@@ -321,8 +295,58 @@ impl FaultRun<'_> {
             active_fixed_volume_targets,
             active_fixed_volume_containers,
             quorum_activation,
-            deferred_failure,
-        })
+            deferred_failure: None,
+        };
+        if let Some((activation_plan, canary_timeout)) = activation_plan {
+            let activation = active
+                .quorum_activation
+                .as_mut()
+                .expect("quorum activation plan has a cleanup guard");
+            qualify_prepared_quorum_fault_activation(
+                &config.cluster,
+                run_id,
+                activation,
+                activation_plan,
+                canary_timeout,
+            )
+            .await;
+            active.deferred_failure = activation.evidence().failure_reason();
+        }
+        if let Some(activation) = active.quorum_activation.as_ref() {
+            let evidence = activation.evidence();
+            evidence.validate()?;
+            collector.write_text(
+                self.scenario.case_name,
+                QUORUM_FAULT_ACTIVATION_ARTIFACT,
+                &serde_json::to_string_pretty(evidence)?,
+            )?;
+            let failure = evidence.failure_reason();
+            events.record(
+                "quorum-fault-activation",
+                if failure.is_some() {
+                    RunEventStatus::Failed
+                } else {
+                    RunEventStatus::Succeeded
+                },
+                failure.unwrap_or_else(|| {
+                    "every selected quorum volume independently returned EIO".to_string()
+                }),
+                Some(serde_json::json!({
+                    "expected_targets": evidence.expected_targets,
+                    "controller_records": evidence.controller_records,
+                    "canary_targets": evidence.targets.len(),
+                    "qualified": evidence.qualified,
+                    "artifact": QUORUM_FAULT_ACTIVATION_ARTIFACT,
+                })),
+            )?;
+        }
+        events.record(
+            "fault-snapshot-active",
+            RunEventStatus::Succeeded,
+            "active fault status snapshots captured",
+            Some(serde_json::json!({ "snapshots": active.active_snapshots.len() })),
+        )?;
+        Ok(active)
     }
     pub(super) async fn exercise_fault(
         &self,
@@ -809,7 +833,7 @@ impl FaultRun<'_> {
     }
 
     pub(super) async fn cleanup_quorum_activation_canaries(&self, active: &mut ActiveFault) {
-        let Some(evidence) = active.quorum_activation.as_mut() else {
+        let Some(activation) = active.quorum_activation.as_mut() else {
             return;
         };
         self.context
@@ -818,29 +842,12 @@ impl FaultRun<'_> {
                 "quorum-canary-cleanup",
                 RunEventStatus::Started,
                 "removing run-owned quorum activation canaries after fault removal",
-                Some(serde_json::json!({ "targets": evidence.targets.len() })),
+                Some(serde_json::json!({
+                    "targets": activation.evidence().targets.len()
+                })),
             )
             .ok();
-        let timeout = std::time::Duration::from_secs(10).min(
-            self.config
-                .cluster
-                .timeout
-                .max(std::time::Duration::from_secs(1)),
-        );
-        let cleanup = cleanup_activation_canaries(&self.config.cluster, evidence, timeout).await;
-        let persistence = serde_json::to_string_pretty(evidence)
-            .context("encode quorum activation evidence after canary cleanup")
-            .and_then(|body| {
-                self.collector
-                    .write_text(
-                        self.scenario.case_name,
-                        QUORUM_FAULT_ACTIVATION_ARTIFACT,
-                        &body,
-                    )
-                    .map(|_| ())
-            });
-        let result = cleanup.and(persistence);
-        match result {
+        match activation.cleanup().await {
             Ok(_) => {
                 self.context
                     .events

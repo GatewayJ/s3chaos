@@ -12,9 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::BTreeMap, time::Duration};
+#[cfg(test)]
+use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    panic::{AssertUnwindSafe, catch_unwind},
+    time::Duration,
+};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +32,10 @@ use crate::{
         reporting::FaultStatusSnapshot,
         workload::sha256_hex,
     },
-    framework::{command::CommandOutput, config::ClusterTestConfig, kubectl::Kubectl},
+    framework::{
+        artifacts::ArtifactCollector, command::CommandOutput, config::ClusterTestConfig,
+        kubectl::Kubectl,
+    },
 };
 
 use super::now_ms;
@@ -43,10 +52,12 @@ fi
 exit "$status""#;
 const CLEANUP_SCRIPT: &str = r#"target=$1
 rm -f -- "$target""#;
+const CLEANUP_FAILURE_ARTIFACT: &str = "quorum-canary-cleanup-error.txt";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum QuorumCanaryOutcome {
+    NotRun,
     IoErrorObserved,
     WriteSucceeded,
     UnexpectedFailure,
@@ -116,6 +127,8 @@ pub(crate) struct QuorumFaultActivationEvidence {
     pub(crate) completed_at_ms: u64,
     pub(crate) qualified: bool,
     pub(crate) failure_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cleanup_failure_reason: Option<String>,
     pub(crate) targets: Vec<QuorumFaultActivationTargetEvidence>,
 }
 
@@ -223,8 +236,18 @@ impl QuorumFaultActivationEvidence {
             self.qualified == (self.failure_reasons.is_empty() && independently_proven),
             "quorum activation qualification is inconsistent with its controller and canary evidence"
         );
+        ensure!(
+            self.cleanup_failure_reason
+                .as_deref()
+                .is_none_or(|reason| !reason.trim().is_empty()),
+            "quorum activation cleanup failure reason is empty"
+        );
         for target in &self.targets {
             match target.outcome {
+                QuorumCanaryOutcome::NotRun => ensure!(
+                    target.exit_code.is_none(),
+                    "quorum activation canary pending result contains a remote exit code"
+                ),
                 QuorumCanaryOutcome::IoErrorObserved => ensure!(
                     target.exit_code.is_some_and(|code| code != 0) && io_error_text(&target.stderr),
                     "quorum activation canary claims EIO without an EIO process result"
@@ -269,6 +292,223 @@ impl QuorumFaultActivationEvidence {
             .iter()
             .map(|target| (target.pod_name.clone(), target.container_id.clone()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+type TestCleanupRunner =
+    Arc<dyn Fn(&mut QuorumFaultActivationEvidence, Duration) -> Result<()> + Send + Sync + 'static>;
+
+#[derive(Clone)]
+enum CleanupBackend {
+    Kubernetes(Box<ClusterTestConfig>),
+    #[cfg(test)]
+    Test(TestCleanupRunner),
+}
+
+impl CleanupBackend {
+    fn run(&self, evidence: &mut QuorumFaultActivationEvidence, timeout: Duration) -> Result<()> {
+        match self {
+            Self::Kubernetes(cluster) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("create quorum canary cleanup runtime")?;
+                runtime.block_on(cleanup_quorum_canaries(cluster, evidence, timeout))
+            }
+            #[cfg(test)]
+            Self::Test(runner) => runner(evidence, timeout),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct QuorumCanaryCleanupTask {
+    backend: CleanupBackend,
+    collector: ArtifactCollector,
+    case_name: String,
+    timeout: Duration,
+}
+
+struct QuorumCanaryCleanupCompletion {
+    evidence: QuorumFaultActivationEvidence,
+    failure: Option<String>,
+}
+
+impl QuorumCanaryCleanupTask {
+    fn persist_completion(
+        self,
+        mut evidence: QuorumFaultActivationEvidence,
+        cleanup_failure: Option<String>,
+    ) -> QuorumCanaryCleanupCompletion {
+        evidence.cleanup_failure_reason = cleanup_failure.clone();
+        let persistence = serde_json::to_string_pretty(&evidence)
+            .context("encode quorum activation evidence after canary cleanup")
+            .and_then(|body| {
+                self.collector
+                    .write_text(
+                        &self.case_name,
+                        crate::fault::quorum::QUORUM_FAULT_ACTIVATION_ARTIFACT,
+                        &body,
+                    )
+                    .map(|_| ())
+            });
+        let persistence_failure = persistence.err().map(|error| error.to_string());
+        let failure = match (cleanup_failure, persistence_failure) {
+            (Some(cleanup), Some(persistence)) => Some(format!(
+                "{cleanup}; persist quorum activation cleanup evidence: {persistence}"
+            )),
+            (Some(cleanup), None) => Some(cleanup),
+            (None, Some(persistence)) => Some(format!(
+                "persist quorum activation cleanup evidence: {persistence}"
+            )),
+            (None, None) => None,
+        };
+        if let Some(failure) = failure.as_deref() {
+            let _ = self
+                .collector
+                .write_text(&self.case_name, CLEANUP_FAILURE_ARTIFACT, failure);
+        }
+        QuorumCanaryCleanupCompletion { evidence, failure }
+    }
+
+    fn execute_on_worker(
+        self,
+        mut evidence: QuorumFaultActivationEvidence,
+    ) -> QuorumCanaryCleanupCompletion {
+        let cleanup = catch_unwind(AssertUnwindSafe(|| {
+            self.backend.run(&mut evidence, self.timeout)
+        }))
+        .map_err(|_| anyhow!("quorum activation canary cleanup panicked"))
+        .and_then(|result| result);
+        let cleanup_failure = cleanup.err().map(|error| error.to_string());
+        self.persist_completion(evidence, cleanup_failure)
+    }
+
+    fn execute(self, evidence: QuorumFaultActivationEvidence) -> QuorumCanaryCleanupCompletion {
+        let fallback_task = self.clone();
+        let fallback_evidence = evidence.clone();
+        // The worker owns its runtime so cancellation and runtime shutdown do
+        // not interrupt the final Kubernetes cleanup attempt.
+        match std::thread::Builder::new()
+            .name("s3chaos-quorum-canary-cleanup".to_string())
+            .spawn(move || self.execute_on_worker(evidence))
+        {
+            Ok(worker) => worker.join().unwrap_or_else(|_| {
+                fallback_task.persist_completion(
+                    fallback_evidence,
+                    Some("quorum activation canary cleanup worker panicked".to_string()),
+                )
+            }),
+            Err(error) => fallback_task.persist_completion(
+                fallback_evidence,
+                Some(format!(
+                    "start quorum activation canary cleanup worker: {error}"
+                )),
+            ),
+        }
+    }
+}
+
+pub(super) struct QuorumCanaryCleanupGuard {
+    task: Option<QuorumCanaryCleanupTask>,
+    evidence: Option<QuorumFaultActivationEvidence>,
+    cleanup_finished: bool,
+}
+
+impl QuorumCanaryCleanupGuard {
+    pub(super) fn new(
+        cluster: &ClusterTestConfig,
+        collector: &ArtifactCollector,
+        case_name: &str,
+        timeout: Duration,
+        evidence: QuorumFaultActivationEvidence,
+    ) -> Self {
+        Self {
+            task: Some(QuorumCanaryCleanupTask {
+                backend: CleanupBackend::Kubernetes(Box::new(cluster.clone())),
+                collector: collector.clone(),
+                case_name: case_name.to_string(),
+                timeout,
+            }),
+            evidence: Some(evidence),
+            cleanup_finished: false,
+        }
+    }
+
+    pub(super) fn evidence(&self) -> &QuorumFaultActivationEvidence {
+        self.evidence
+            .as_ref()
+            .expect("quorum activation evidence is available outside cleanup")
+    }
+
+    fn replace_evidence(&mut self, evidence: QuorumFaultActivationEvidence) {
+        assert!(
+            !self.cleanup_finished && self.evidence.is_some(),
+            "quorum activation evidence can only change before cleanup"
+        );
+        self.evidence = Some(evidence);
+    }
+
+    pub(super) async fn cleanup(&mut self) -> Result<()> {
+        if self.cleanup_finished {
+            return Ok(());
+        }
+        let task = self
+            .task
+            .take()
+            .context("quorum canary cleanup task is missing")?;
+        let fallback_task = task.clone();
+        let evidence = self
+            .evidence
+            .take()
+            .context("quorum activation evidence is missing")?;
+        let fallback_evidence = evidence.clone();
+        let completion = match tokio::task::spawn_blocking(move || task.execute(evidence)).await {
+            Ok(completion) => completion,
+            Err(error) => {
+                self.task = Some(fallback_task);
+                self.evidence = Some(fallback_evidence);
+                return Err(error).context("join quorum canary cleanup task");
+            }
+        };
+        self.evidence = Some(completion.evidence);
+        self.cleanup_finished = true;
+        match completion.failure {
+            Some(failure) => Err(anyhow!(failure)),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        collector: &ArtifactCollector,
+        case_name: &str,
+        evidence: QuorumFaultActivationEvidence,
+        runner: TestCleanupRunner,
+    ) -> Self {
+        Self {
+            task: Some(QuorumCanaryCleanupTask {
+                backend: CleanupBackend::Test(runner),
+                collector: collector.clone(),
+                case_name: case_name.to_string(),
+                timeout: Duration::from_secs(1),
+            }),
+            evidence: Some(evidence),
+            cleanup_finished: false,
+        }
+    }
+}
+
+impl Drop for QuorumCanaryCleanupGuard {
+    fn drop(&mut self) {
+        if self.cleanup_finished {
+            return;
+        }
+        let (Some(task), Some(evidence)) = (self.task.take(), self.evidence.take()) else {
+            return;
+        };
+        let _ = task.execute(evidence);
     }
 }
 
@@ -418,15 +658,18 @@ async fn run_canary(
     }
 }
 
-pub(super) async fn qualify_quorum_fault_activation(
-    cluster: &ClusterTestConfig,
+pub(super) struct QuorumFaultActivationPlan {
+    attempts: Vec<(QuorumVolumeBinding, String)>,
+    failure_reasons: Vec<String>,
+}
+
+pub(super) fn prepare_quorum_fault_activation(
     scenario: &str,
     run_id: &str,
     target_proof: &TargetProof,
     active_snapshots: &[FaultStatusSnapshot],
     controller_validation_error: Option<String>,
-    timeout: Duration,
-) -> QuorumFaultActivationEvidence {
+) -> (QuorumFaultActivationEvidence, QuorumFaultActivationPlan) {
     let started_at_ms = now_ms();
     let mut failure_reasons = controller_validation_error.into_iter().collect::<Vec<_>>();
     let snapshot = active_snapshots.first();
@@ -484,22 +727,86 @@ pub(super) async fn qualify_quorum_fault_activation(
             .and_then(|pod_id| pod_id.rsplit_once('/').map(|(_, pod)| pod.to_string()))
             .and_then(|pod| bindings.get(&pod).cloned());
         match binding {
-            Some(binding) => {
-                attempts.push(run_canary(cluster, run_id, binding, record_id, timeout))
-            }
+            Some(binding) => attempts.push((binding, record_id)),
             None => failure_reasons.push(format!(
                 "IOChaos controller record {record_id:?} does not resolve to a proven quorum volume"
             )),
         }
     }
-    let mut targets = join_all(attempts).await;
-    targets.sort_by(|left, right| left.pod_name.cmp(&right.pod_name));
-    if targets.len() != usize::try_from(expected_targets).unwrap_or(usize::MAX) {
+    if attempts.len() != usize::try_from(expected_targets).unwrap_or(usize::MAX) {
         failure_reasons.push(format!(
             "IOChaos independently exercised {} targets, expected {expected_targets}",
-            targets.len()
+            attempts.len()
         ));
     }
+    failure_reasons.sort();
+    failure_reasons.dedup();
+    let mut targets = attempts
+        .iter()
+        .map(
+            |(binding, controller_record_id)| QuorumFaultActivationTargetEvidence {
+                pod_name: binding.pod_name.clone(),
+                pod_uid: binding.pod_uid.clone(),
+                container_id: binding.container_id.clone(),
+                persistent_volume_claim: binding.persistent_volume_claim.clone(),
+                persistent_volume: binding.persistent_volume.clone(),
+                mount_path: binding.mount_path.clone(),
+                drive_uuid: binding.drive_uuid.clone(),
+                controller_record_id: controller_record_id.clone(),
+                canary_path: canary_path(binding, run_id),
+                started_at_ms,
+                completed_at_ms: started_at_ms,
+                outcome: QuorumCanaryOutcome::NotRun,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: "canary execution did not complete".to_string(),
+                cleanup: None,
+            },
+        )
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| left.pod_name.cmp(&right.pod_name));
+    let mut pending_failure_reasons = failure_reasons.clone();
+    pending_failure_reasons.push("quorum activation canary execution did not complete".to_string());
+    let evidence = QuorumFaultActivationEvidence {
+        schema_version: ACTIVATION_SCHEMA_VERSION,
+        scenario: scenario.to_string(),
+        run_id: run_id.to_string(),
+        backend: "chaos-mesh-iochaos".to_string(),
+        iochaos_resource_name,
+        iochaos_snapshot_sha256,
+        volume_path,
+        expected_targets,
+        controller_records,
+        started_at_ms,
+        completed_at_ms: started_at_ms,
+        qualified: false,
+        failure_reasons: pending_failure_reasons,
+        cleanup_failure_reason: None,
+        targets,
+    };
+    (
+        evidence,
+        QuorumFaultActivationPlan {
+            attempts,
+            failure_reasons,
+        },
+    )
+}
+
+pub(super) async fn qualify_prepared_quorum_fault_activation(
+    cluster: &ClusterTestConfig,
+    run_id: &str,
+    activation: &mut QuorumCanaryCleanupGuard,
+    plan: QuorumFaultActivationPlan,
+    timeout: Duration,
+) {
+    let futures = plan
+        .attempts
+        .into_iter()
+        .map(|(binding, record_id)| run_canary(cluster, run_id, binding, record_id, timeout));
+    let mut targets = join_all(futures).await;
+    targets.sort_by(|left, right| left.pod_name.cmp(&right.pod_name));
+    let mut failure_reasons = plan.failure_reasons;
     for target in &targets {
         if target.outcome != QuorumCanaryOutcome::IoErrorObserved {
             failure_reasons.push(format!(
@@ -511,28 +818,19 @@ pub(super) async fn qualify_quorum_fault_activation(
     failure_reasons.sort();
     failure_reasons.dedup();
     let completed_at_ms = now_ms();
+    let mut evidence = activation.evidence().clone();
     let qualified = failure_reasons.is_empty()
-        && targets.len() == usize::try_from(expected_targets).unwrap_or(usize::MAX)
-        && controller_records == usize::try_from(expected_targets).unwrap_or(usize::MAX)
+        && targets.len() == usize::try_from(evidence.expected_targets).unwrap_or(usize::MAX)
+        && evidence.controller_records
+            == usize::try_from(evidence.expected_targets).unwrap_or(usize::MAX)
         && targets
             .iter()
             .all(|target| target.outcome == QuorumCanaryOutcome::IoErrorObserved);
-    QuorumFaultActivationEvidence {
-        schema_version: ACTIVATION_SCHEMA_VERSION,
-        scenario: scenario.to_string(),
-        run_id: run_id.to_string(),
-        backend: "chaos-mesh-iochaos".to_string(),
-        iochaos_resource_name,
-        iochaos_snapshot_sha256,
-        volume_path,
-        expected_targets,
-        controller_records,
-        started_at_ms,
-        completed_at_ms,
-        qualified,
-        failure_reasons,
-        targets,
-    }
+    evidence.completed_at_ms = completed_at_ms;
+    evidence.qualified = qualified;
+    evidence.failure_reasons = failure_reasons;
+    evidence.targets = targets;
+    activation.replace_evidence(evidence);
 }
 
 pub(super) async fn cleanup_quorum_canaries(
@@ -611,6 +909,11 @@ pub(super) async fn cleanup_quorum_canaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
 
     fn target(index: usize, outcome: QuorumCanaryOutcome) -> QuorumFaultActivationTargetEvidence {
         QuorumFaultActivationTargetEvidence {
@@ -657,7 +960,25 @@ mod tests {
             completed_at_ms: 200,
             qualified,
             failure_reasons,
+            cleanup_failure_reason: None,
             targets,
+        }
+    }
+
+    fn mark_cleanup(
+        evidence: &mut QuorumFaultActivationEvidence,
+        outcome: QuorumCanaryCleanupOutcome,
+        exit_code: Option<i32>,
+        stderr: &str,
+    ) {
+        for target in &mut evidence.targets {
+            target.cleanup = Some(QuorumCanaryCleanupEvidence {
+                started_at_ms: 210,
+                completed_at_ms: 220,
+                outcome,
+                exit_code,
+                stderr: stderr.to_string(),
+            });
         }
     }
 
@@ -767,6 +1088,193 @@ mod tests {
         assert_eq!(
             evidence.disposition(),
             QuorumActivationDisposition::RunTypedOracle
+        );
+    }
+
+    #[test]
+    fn stage_failure_keeps_the_primary_error_and_persists_cleanup_failure() {
+        let dir = tempfile::tempdir().expect("artifact dir");
+        let collector = ArtifactCollector::new(dir.path());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runner_attempts = Arc::clone(&attempts);
+        let runner: TestCleanupRunner = Arc::new(move |evidence, _| {
+            runner_attempts.fetch_add(1, Ordering::SeqCst);
+            mark_cleanup(
+                evidence,
+                QuorumCanaryCleanupOutcome::Failed,
+                Some(1),
+                "forced cleanup failure",
+            );
+            Err(anyhow!("forced cleanup failure"))
+        });
+        let guard = QuorumCanaryCleanupGuard::for_test(
+            &collector,
+            "quorum-case",
+            evidence(
+                1,
+                vec![target(0, QuorumCanaryOutcome::IoErrorObserved)],
+                Vec::new(),
+            ),
+            runner,
+        );
+
+        let primary = {
+            let _guard = guard;
+            Err::<(), _>(anyhow!("typed workload failed"))
+        }
+        .expect_err("stage error");
+
+        assert_eq!(primary.to_string(), "typed workload failed");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let artifact = std::fs::read_to_string(
+            collector
+                .case_dir("quorum-case")
+                .join(crate::fault::quorum::QUORUM_FAULT_ACTIVATION_ARTIFACT),
+        )
+        .expect("cleanup artifact");
+        let persisted: QuorumFaultActivationEvidence =
+            serde_json::from_str(&artifact).expect("cleanup evidence");
+        assert_eq!(
+            persisted.cleanup_failure_reason.as_deref(),
+            Some("forced cleanup failure")
+        );
+        assert_eq!(
+            persisted.targets[0]
+                .cleanup
+                .as_ref()
+                .expect("target cleanup")
+                .outcome,
+            QuorumCanaryCleanupOutcome::Failed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_cleanup_future_finishes_once_and_persists_evidence() {
+        let dir = tempfile::tempdir().expect("artifact dir");
+        let collector = ArtifactCollector::new(dir.path());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runner_attempts = Arc::clone(&attempts);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let runner_release = Arc::clone(&release_rx);
+        let runner: TestCleanupRunner = Arc::new(move |evidence, _| {
+            runner_attempts.fetch_add(1, Ordering::SeqCst);
+            started_tx.send(()).expect("signal cleanup start");
+            runner_release
+                .lock()
+                .expect("release receiver")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release cleanup");
+            mark_cleanup(evidence, QuorumCanaryCleanupOutcome::Removed, Some(0), "");
+            Ok(())
+        });
+        let guard = QuorumCanaryCleanupGuard::for_test(
+            &collector,
+            "quorum-case",
+            evidence(
+                1,
+                vec![target(0, QuorumCanaryOutcome::IoErrorObserved)],
+                Vec::new(),
+            ),
+            runner,
+        );
+        let cleanup = tokio::spawn(async move {
+            let mut guard = guard;
+            guard.cleanup().await
+        });
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cleanup started")
+        })
+        .await
+        .expect("wait for cleanup start");
+
+        cleanup.abort();
+        let _ = cleanup.await;
+        release_tx.send(()).expect("release cleanup worker");
+
+        let artifact_path = collector
+            .case_dir("quorum-case")
+            .join(crate::fault::quorum::QUORUM_FAULT_ACTIVATION_ARTIFACT);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !artifact_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cleanup artifact deadline");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let artifact = std::fs::read_to_string(artifact_path).expect("cleanup artifact");
+        let persisted: QuorumFaultActivationEvidence =
+            serde_json::from_str(&artifact).expect("cleanup evidence");
+        assert!(persisted.cleanup_failure_reason.is_none());
+        assert_eq!(
+            persisted.targets[0]
+                .cleanup
+                .as_ref()
+                .expect("target cleanup")
+                .outcome,
+            QuorumCanaryCleanupOutcome::Removed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_fault_stage_drops_the_guard_and_persists_cleanup() {
+        let dir = tempfile::tempdir().expect("artifact dir");
+        let collector = ArtifactCollector::new(dir.path());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runner_attempts = Arc::clone(&attempts);
+        let runner: TestCleanupRunner = Arc::new(move |evidence, _| {
+            runner_attempts.fetch_add(1, Ordering::SeqCst);
+            mark_cleanup(evidence, QuorumCanaryCleanupOutcome::Removed, Some(0), "");
+            Ok(())
+        });
+        let guard = QuorumCanaryCleanupGuard::for_test(
+            &collector,
+            "quorum-case",
+            evidence(
+                1,
+                vec![target(0, QuorumCanaryOutcome::IoErrorObserved)],
+                Vec::new(),
+            ),
+            runner,
+        );
+        let (stage_started_tx, stage_started_rx) = mpsc::channel();
+        let stage = tokio::spawn(async move {
+            let _guard = guard;
+            stage_started_tx.send(()).expect("stage started");
+            std::future::pending::<()>().await;
+        });
+        tokio::task::spawn_blocking(move || {
+            stage_started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fault stage started")
+        })
+        .await
+        .expect("wait for fault stage");
+
+        stage.abort();
+        let _ = stage.await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let artifact = std::fs::read_to_string(
+            collector
+                .case_dir("quorum-case")
+                .join(crate::fault::quorum::QUORUM_FAULT_ACTIVATION_ARTIFACT),
+        )
+        .expect("cleanup artifact");
+        let persisted: QuorumFaultActivationEvidence =
+            serde_json::from_str(&artifact).expect("cleanup evidence");
+        assert!(persisted.cleanup_failure_reason.is_none());
+        assert_eq!(
+            persisted.targets[0]
+                .cleanup
+                .as_ref()
+                .expect("target cleanup")
+                .outcome,
+            QuorumCanaryCleanupOutcome::Removed
         );
     }
 }

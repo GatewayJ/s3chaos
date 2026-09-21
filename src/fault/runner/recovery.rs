@@ -376,7 +376,7 @@ impl FaultRun<'_> {
             target: plan.target_summary(),
             injected: quorum_activation
                 .as_ref()
-                .is_none_or(|evidence| evidence.qualified),
+                .is_none_or(|guard| guard.evidence().qualified),
             active_during_workload: *ran_under_fault,
             recovered: true,
             require_client_disruption: *require_client_disruption,
