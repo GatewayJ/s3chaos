@@ -80,10 +80,11 @@ use crate::fault::{
     },
     on_disk_bitrot::{
         BITROT_CLEANUP_ARTIFACT, BITROT_CORRUPTION_WINDOW_ARTIFACT, BITROT_HEAL_ARTIFACT,
-        BITROT_MUTATION_ARTIFACT, BITROT_SELECTION_ARTIFACT, BITROT_WORKFLOW_ARTIFACT,
-        BitrotCleanupEvidence, BitrotCorruptionWindowProof, BitrotHealEvidence,
-        BitrotMutationEvidence, BitrotSelectionEvidence, OnDiskBitrotEvidenceSet,
-        OnDiskBitrotWorkflowEvidence, validate_on_disk_bitrot_evidence,
+        BITROT_HEAL_PROGRESS_ARTIFACT, BITROT_MUTATION_ARTIFACT, BITROT_SELECTION_ARTIFACT,
+        BITROT_WORKFLOW_ARTIFACT, BitrotCleanupEvidence, BitrotCorruptionWindowProof,
+        BitrotHealEvidence, BitrotHealProgressSample, BitrotMutationEvidence,
+        BitrotSelectionEvidence, OnDiskBitrotEvidenceSet, OnDiskBitrotWorkflowEvidence,
+        validate_on_disk_bitrot_evidence,
     },
     plan::{
         ExecutionKind, ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultKind,
@@ -1953,6 +1954,14 @@ fn validate_on_disk_bitrot_artifacts(
         BITROT_CORRUPTION_WINDOW_ARTIFACT,
     )?)?;
     let heal = read_json::<BitrotHealEvidence>(required(&artifacts, BITROT_HEAL_ARTIFACT)?)?;
+    let heal_progress = read_jsonl::<BitrotHealProgressSample>(required(
+        &artifacts,
+        BITROT_HEAL_PROGRESS_ARTIFACT,
+    )?)?;
+    ensure!(
+        heal_progress == heal.progress(),
+        "bitrot heal progress transcript differs from the terminal heal artifact"
+    );
     let cleanup =
         read_json::<BitrotCleanupEvidence>(required(&artifacts, BITROT_CLEANUP_ARTIFACT)?)?;
     let workflow =

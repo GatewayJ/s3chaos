@@ -41,7 +41,8 @@ use crate::fault::{
     },
     on_disk_bitrot::{
         BITROT_CLEANUP_ARTIFACT, BITROT_CORRUPTION_WINDOW_ARTIFACT, BITROT_HEAL_ARTIFACT,
-        BITROT_MUTATION_ARTIFACT, BITROT_SELECTION_ARTIFACT, BITROT_WORKFLOW_ARTIFACT,
+        BITROT_HEAL_PROGRESS_ARTIFACT, BITROT_MUTATION_ARTIFACT, BITROT_SELECTION_ARTIFACT,
+        BITROT_WORKFLOW_ARTIFACT,
     },
     plan::{
         ExecutionKind, ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultPlan,
@@ -538,6 +539,7 @@ impl FaultRunArtifactSpec {
                 BITROT_MUTATION_ARTIFACT,
                 BITROT_CORRUPTION_WINDOW_ARTIFACT,
                 BITROT_HEAL_ARTIFACT,
+                BITROT_HEAL_PROGRESS_ARTIFACT,
                 BITROT_CLEANUP_ARTIFACT,
                 BITROT_WORKFLOW_ARTIFACT,
             ]
