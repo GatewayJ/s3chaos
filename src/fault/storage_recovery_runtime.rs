@@ -35,7 +35,9 @@ use crate::{
         storage_recovery::{
             HealMode, StorageRecoveryArtifactIdentity, StorageRecoveryCase, StorageVolumeIdentity,
         },
-        storage_recovery_helper::{StorageHelperSessionRequest, StorageHelperSessionResponse},
+        storage_recovery_helper::{
+            MutationJournalLookup, StorageHelperSessionRequest, StorageHelperSessionResponse,
+        },
         storage_recovery_lease::{
             StorageRecoveryCleanupProof, release_owned_lease, require_current_lease,
         },
@@ -1038,6 +1040,7 @@ impl KubectlStorageRecoveryHostAdapter {
             stdout: BufReader::new(stdout),
             timeout: self.timeout,
             finished: false,
+            pending_mutation_response: None,
         };
         let response = guard
             .exchange(&StorageHelperSessionRequest::Begin {
@@ -1066,6 +1069,26 @@ pub struct KubectlStorageRecoveryAttemptGuard {
     stdout: BufReader<ChildStdout>,
     timeout: Duration,
     finished: bool,
+    pending_mutation_response: Option<PendingMutationResponse>,
+}
+
+#[derive(Clone)]
+enum PendingMutationResponse {
+    Mutation {
+        operation_id: String,
+        lookup_requested: bool,
+    },
+    Lookup {
+        operation_id: String,
+    },
+}
+
+impl PendingMutationResponse {
+    fn operation_id(&self) -> &str {
+        match self {
+            Self::Mutation { operation_id, .. } | Self::Lookup { operation_id } => operation_id,
+        }
+    }
 }
 
 impl KubectlStorageRecoveryAttemptGuard {
@@ -1094,6 +1117,139 @@ impl KubectlStorageRecoveryAttemptGuard {
             }
             _ => bail!("storage helper returned an unexpected operation response"),
         }
+    }
+
+    pub async fn execute_mutation_with_id(
+        &mut self,
+        context: &OwnedStorageContext,
+        operation_id: &str,
+        operation: &StorageRecoveryHostOperation,
+    ) -> Result<StorageRecoveryOperationReceipt> {
+        ensure!(
+            matches!(operation, StorageRecoveryHostOperation::MutateShard { .. }),
+            "explicit helper operationId is restricted to shard mutation"
+        );
+        uuid::Uuid::parse_str(operation_id)
+            .context("storage helper mutation operationId is not a UUID")?;
+        operation.validate()?;
+        require_current_lease(self.client.clone(), context).await?;
+        let request = StorageHelperSessionRequest::ExecuteMutation {
+            operation_id: operation_id.to_string(),
+            invocation: Box::new(StorageHelperInvocation {
+                context: context.clone(),
+                operation: operation.clone(),
+            }),
+        };
+        self.pending_mutation_response = Some(PendingMutationResponse::Mutation {
+            operation_id: operation_id.to_string(),
+            lookup_requested: false,
+        });
+        self.send_request(&request).await?;
+        let response = self.read_response().await?;
+        self.pending_mutation_response = None;
+        match response {
+            StorageHelperSessionResponse::Receipt { receipt } => {
+                receipt.validate_for(context, operation)?;
+                ensure!(
+                    receipt.operation_id == operation_id,
+                    "storage helper changed the controller-owned mutation operationId"
+                );
+                Ok(*receipt)
+            }
+            StorageHelperSessionResponse::Error { message } => {
+                bail!("storage helper rejected mutation: {message}")
+            }
+            _ => bail!("storage helper returned an unexpected mutation response"),
+        }
+    }
+
+    pub async fn query_mutation(
+        &mut self,
+        context: &OwnedStorageContext,
+        operation_id: &str,
+        operation: &StorageRecoveryHostOperation,
+    ) -> Result<MutationJournalLookup> {
+        require_current_lease(self.client.clone(), context).await?;
+        let request = StorageHelperSessionRequest::QueryMutation {
+            context: Box::new(context.clone()),
+            operation_id: operation_id.to_string(),
+        };
+        let response = self
+            .exchange_mutation_lookup(&request, operation_id)
+            .await?;
+        match response {
+            StorageHelperSessionResponse::MutationLookup { lookup } => {
+                lookup.validate_for(context, operation_id, operation)?;
+                Ok(*lookup)
+            }
+            StorageHelperSessionResponse::Error { message } => {
+                bail!("storage helper mutation lookup failed: {message}")
+            }
+            _ => bail!("storage helper returned an unexpected mutation lookup response"),
+        }
+    }
+
+    async fn exchange_mutation_lookup(
+        &mut self,
+        request: &StorageHelperSessionRequest,
+        operation_id: &str,
+    ) -> Result<StorageHelperSessionResponse> {
+        let response = if let Some(pending) = self.pending_mutation_response.clone() {
+            ensure!(
+                pending.operation_id() == operation_id,
+                "another mutation response is still pending"
+            );
+            if matches!(
+                pending,
+                PendingMutationResponse::Mutation {
+                    lookup_requested: false,
+                    ..
+                }
+            ) {
+                self.send_request(request).await?;
+                self.pending_mutation_response = Some(PendingMutationResponse::Mutation {
+                    operation_id: operation_id.to_string(),
+                    lookup_requested: true,
+                });
+            }
+            let first = self.read_response().await?;
+            match pending {
+                PendingMutationResponse::Mutation { .. } => match first {
+                    StorageHelperSessionResponse::MutationLookup { lookup } => {
+                        self.pending_mutation_response = None;
+                        StorageHelperSessionResponse::MutationLookup { lookup }
+                    }
+                    StorageHelperSessionResponse::Receipt { receipt } => {
+                        ensure!(
+                            receipt.operation_id == operation_id,
+                            "delayed mutation response belongs to another operationId"
+                        );
+                        self.pending_mutation_response = Some(PendingMutationResponse::Lookup {
+                            operation_id: operation_id.to_string(),
+                        });
+                        let second = self.read_response().await?;
+                        self.pending_mutation_response = None;
+                        second
+                    }
+                    StorageHelperSessionResponse::Error { .. } => {
+                        self.pending_mutation_response = Some(PendingMutationResponse::Lookup {
+                            operation_id: operation_id.to_string(),
+                        });
+                        let second = self.read_response().await?;
+                        self.pending_mutation_response = None;
+                        second
+                    }
+                    _ => bail!("storage helper returned an unexpected delayed mutation response"),
+                },
+                PendingMutationResponse::Lookup { .. } => {
+                    self.pending_mutation_response = None;
+                    first
+                }
+            }
+        } else {
+            self.exchange(request).await?
+        };
+        Ok(response)
     }
 
     pub async fn execute_stale(
@@ -1153,6 +1309,11 @@ impl KubectlStorageRecoveryAttemptGuard {
         &mut self,
         request: &StorageHelperSessionRequest,
     ) -> Result<StorageHelperSessionResponse> {
+        self.send_request(request).await?;
+        self.read_response().await
+    }
+
+    async fn send_request(&mut self, request: &StorageHelperSessionRequest) -> Result<()> {
         let mut line = serde_json::to_vec(request).context("encode storage helper request")?;
         line.push(b'\n');
         tokio::time::timeout(self.timeout, self.stdin.write_all(&line))
@@ -1161,6 +1322,10 @@ impl KubectlStorageRecoveryAttemptGuard {
         tokio::time::timeout(self.timeout, self.stdin.flush())
             .await
             .context("storage helper request flush timed out")??;
+        Ok(())
+    }
+
+    async fn read_response(&mut self) -> Result<StorageHelperSessionResponse> {
         let mut response = String::new();
         let count = tokio::time::timeout(self.timeout, self.stdout.read_line(&mut response))
             .await
@@ -1484,6 +1649,112 @@ mod tests {
             .expect("invocation object")
             .insert("command".to_string(), serde_json::json!("sh"));
         assert!(serde_json::from_value::<StorageHelperInvocation>(invocation).is_err());
+    }
+
+    #[tokio::test]
+    async fn mutation_lookup_recovers_after_helper_response_timeout() {
+        let context = context();
+        let operation_id = "99999999-9999-9999-9999-999999999999";
+        let operation = StorageRecoveryHostOperation::MutateShard {
+            inspection_operation_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            part_number: 1,
+            byte_offset: 0,
+        };
+        let response_body = "{}".to_string();
+        let delayed = serde_json::to_string(&StorageHelperSessionResponse::Receipt {
+            receipt: Box::new(StorageRecoveryOperationReceipt {
+                operation_id: operation_id.to_string(),
+                operation: operation.clone(),
+                context_sha256: context_sha256(&context).expect("context digest"),
+                response_sha256: sha256_bytes(response_body.as_bytes()),
+                response_body,
+                started_at_ms: 110,
+                journal_persisted_at_ms: 111,
+                completed_at_ms: 112,
+                journal_fsync_succeeded: true,
+            }),
+        })
+        .expect("delayed response");
+        let expected_lookup = MutationJournalLookup {
+            operation_id: operation_id.to_string(),
+            operation: operation.clone(),
+            state: crate::fault::storage_recovery_helper::MutationRecoveryState::Prepared,
+            receipt: None,
+            observed_at_ms: 120,
+        };
+        let lookup = serde_json::to_string(&StorageHelperSessionResponse::MutationLookup {
+            lookup: Box::new(expected_lookup.clone()),
+        })
+        .expect("lookup response");
+        let mut child = tokio::process::Command::new("sh")
+            .args([
+                "-c",
+                "IFS= read -r first; sleep 0.1; printf '%s\\n' \"$DELAYED\"; IFS= read -r second; printf '%s\\n' \"$LOOKUP\"",
+            ])
+            .env("DELAYED", delayed)
+            .env("LOOKUP", lookup)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("test helper");
+        let stdin = child.stdin.take().expect("test helper stdin");
+        let stdout = child.stdout.take().expect("test helper stdout");
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = kube::Config::new("http://127.0.0.1".parse().expect("test URI"));
+        let client = kube::Client::try_from(config).expect("test Kubernetes client");
+        let mut guard = KubectlStorageRecoveryAttemptGuard {
+            client,
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            timeout: Duration::from_millis(20),
+            finished: false,
+            pending_mutation_response: Some(PendingMutationResponse::Mutation {
+                operation_id: operation_id.to_string(),
+                lookup_requested: false,
+            }),
+        };
+        let mutation_request = StorageHelperSessionRequest::ExecuteMutation {
+            operation_id: operation_id.to_string(),
+            invocation: Box::new(StorageHelperInvocation {
+                context: context.clone(),
+                operation: operation.clone(),
+            }),
+        };
+        guard
+            .send_request(&mutation_request)
+            .await
+            .expect("mutation request");
+        let timeout = guard
+            .read_response()
+            .await
+            .expect_err("mutation response timeout");
+        assert!(timeout.to_string().contains("response timed out"));
+        assert_eq!(
+            guard
+                .pending_mutation_response
+                .as_ref()
+                .map(PendingMutationResponse::operation_id),
+            Some(operation_id)
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let query = StorageHelperSessionRequest::QueryMutation {
+            context: Box::new(context),
+            operation_id: operation_id.to_string(),
+        };
+        let response = guard
+            .exchange_mutation_lookup(&query, operation_id)
+            .await
+            .expect("recover mutation lookup after timeout");
+        let StorageHelperSessionResponse::MutationLookup { lookup } = response else {
+            panic!("expected mutation lookup response");
+        };
+        assert_eq!(*lookup, expected_lookup);
+        assert!(guard.pending_mutation_response.is_none());
+        let status = guard.child.wait().await.expect("test helper exit");
+        assert!(status.success());
+        guard.finished = true;
     }
 
     #[test]

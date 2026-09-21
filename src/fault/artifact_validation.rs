@@ -79,12 +79,14 @@ use crate::fault::{
         NODE_DOWN_HOLD_ARTIFACT, NodeDownHoldEvidence, NodeDownTarget, untouched_prefill_keys,
     },
     on_disk_bitrot::{
-        BITROT_CLEANUP_ARTIFACT, BITROT_CORRUPTION_WINDOW_ARTIFACT, BITROT_HEAL_ARTIFACT,
+        AdminHealStartBody, BITROT_ADMIN_HEAL_START_ARTIFACT, BITROT_CLEANUP_ARTIFACT,
+        BITROT_CORRUPTION_WINDOW_ARTIFACT, BITROT_FAILURE_ARTIFACT, BITROT_HEAL_ARTIFACT,
         BITROT_HEAL_PROGRESS_ARTIFACT, BITROT_MUTATION_ARTIFACT, BITROT_SELECTION_ARTIFACT,
         BITROT_WORKFLOW_ARTIFACT, BitrotCleanupEvidence, BitrotCorruptionWindowProof,
-        BitrotHealEvidence, BitrotHealProgressSample, BitrotMutationEvidence,
-        BitrotSelectionEvidence, OnDiskBitrotEvidenceSet, OnDiskBitrotWorkflowEvidence,
-        validate_on_disk_bitrot_evidence,
+        BitrotFailureEvidence, BitrotHealEvidence, BitrotHealProgressSample,
+        BitrotHealProgressSource, BitrotMutationEvidence, BitrotSelectionEvidence,
+        OnDiskBitrotEvidenceSet, OnDiskBitrotWorkflowEvidence, RawBitrotEvidenceReceipt,
+        validate_heal_progress, validate_on_disk_bitrot_evidence,
     },
     plan::{
         ExecutionKind, ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultKind,
@@ -391,6 +393,38 @@ fn validate_failed_attempt_disruption_evidence(
             evaluated_at_ms,
             &run_spec,
         );
+    }
+    if scenario == scenarios::ON_DISK_BITROT_SCENARIO {
+        let full_run_spec = read_json::<FaultRunSpec>(&run_spec_path)?;
+        let failure_path = bound_case_artifact(&case_dir, BITROT_FAILURE_ARTIFACT)?;
+        let failure = read_json::<BitrotFailureEvidence>(&failure_path)?;
+        ensure!(
+            (attempt_started_at_ms..=evaluated_at_ms).contains(&failure.observed_at_ms)
+                && failure.cleanup.completed_at_ms >= attempt_started_at_ms
+                && failure.cleanup.completed_at_ms <= failure.observed_at_ms,
+            "failed bitrot evidence is outside the planned attempt window"
+        );
+        let failure_options = ArtifactValidationOptions {
+            scenario: scenario.to_string(),
+            artifact_root: case_dir.clone(),
+            expected_workload_objects: full_run_spec.workload.object_count,
+            expected_workload_concurrency: full_run_spec.workload.concurrency,
+            expected_workload_versioning: true,
+            expected_rustfs_pod_count: 0,
+            expected_stable_window_seconds: 0,
+            expected_recovery_stability_reread_seconds: 0,
+            expected_rustfs_volume_path: String::new(),
+        };
+        validate_failed_on_disk_bitrot_artifacts(
+            &failure_options,
+            ArtifactIdentityPolicy::PlannedAttempt(attempt_run_id),
+            case_name,
+            &failure_path,
+        )?;
+        return Ok(FailedAttemptDisruptionEvidence {
+            client_disruptions: 0,
+            run_failed: true,
+        });
     }
     let evidence_path = bound_case_artifact(&case_dir, "fault-evidence.json")?;
     let evidence = read_json::<FaultEvidenceArtifact>(&evidence_path)?;
@@ -1889,6 +1923,16 @@ fn validate_on_disk_bitrot_artifacts(
     identity: ArtifactIdentityPolicy<'_>,
     case_name: &str,
 ) -> Result<ArtifactValidationReport> {
+    if let Some(failure_path) =
+        optional_artifact(&options.artifact_root, case_name, BITROT_FAILURE_ARTIFACT)?
+    {
+        return validate_failed_on_disk_bitrot_artifacts(
+            options,
+            identity,
+            case_name,
+            &failure_path,
+        );
+    }
     let artifacts =
         locate_required_artifacts(&options.artifact_root, case_name, &options.scenario)?;
     let metadata = read_json::<RunMetadataArtifact>(required(&artifacts, "run-metadata.json")?)?;
@@ -1998,6 +2042,13 @@ fn validate_on_disk_bitrot_artifacts(
         checker_report_body: &checker_body,
         post_write_report_body: &post_write_body,
     })?;
+    for receipt in [
+        &corruption_window.baseline,
+        &corruption_window.corrupted,
+        &cleanup.post_heal_exact_quorum,
+    ] {
+        receipt.validate_against_history(&selection.probe, &history)?;
+    }
     ensure!(
         workflow.identity.run_id == metadata.run_id
             && workflow.identity.scenario == metadata.scenario
@@ -2014,6 +2065,239 @@ fn validate_on_disk_bitrot_artifacts(
         committed: checker.committed_puts,
         required_artifacts: json_spec.artifacts.required,
     })
+}
+
+fn validate_failed_on_disk_bitrot_artifacts(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+    case_name: &str,
+    failure_path: &Path,
+) -> Result<ArtifactValidationReport> {
+    let case_dir = fs::canonicalize(
+        failure_path
+            .parent()
+            .context("bitrot failure artifact has no case directory")?,
+    )?;
+    let artifact = |name: &str| bound_case_artifact(&case_dir, name);
+    let optional = |name: &str| -> Result<Option<PathBuf>> {
+        let path = case_dir.join(name);
+        if path.is_file() {
+            Ok(Some(bound_case_artifact(&case_dir, name)?))
+        } else {
+            Ok(None)
+        }
+    };
+
+    let metadata = read_json::<RunMetadataArtifact>(&artifact("run-metadata.json")?)?;
+    ensure!(
+        metadata.scenario == options.scenario
+            && metadata.workload_objects == options.expected_workload_objects
+            && metadata.workload_concurrency == options.expected_workload_concurrency,
+        "failed bitrot run metadata does not match the selected scenario or workload"
+    );
+    if let Some(run_id) = identity.planned_run_id() {
+        ensure!(
+            metadata.run_id == run_id,
+            "failed bitrot metadata does not match the planned attempt"
+        );
+    }
+    let json_spec = read_json::<FaultRunSpec>(&artifact("run-spec.json")?)?;
+    let yaml_spec = read_yaml::<FaultRunSpec>(&artifact("run-spec.yaml")?)?;
+    ensure!(
+        json_spec == yaml_spec
+            && json_spec.metadata.run_id == metadata.run_id
+            && json_spec.metadata.name == case_name
+            && json_spec.scenario.name == options.scenario
+            && json_spec.execution_kind()? == ExecutionKind::StorageRecovery,
+        "failed bitrot run spec does not match the current attempt"
+    );
+    let expected_case = match json_spec.execution.as_ref() {
+        Some(crate::fault::spec::FaultRunExecutionSpec::StorageRecovery { case, .. }) => *case,
+        _ => bail!("failed bitrot run spec lacks storage-recovery execution"),
+    };
+    let workload = read_json::<WorkloadPlan>(&artifact("workload-plan.json")?)?;
+    ensure!(
+        workload.object_count == options.expected_workload_objects
+            && workload.concurrency == options.expected_workload_concurrency
+            && workload.seed == json_spec.workload.seed,
+        "failed bitrot workload plan does not match run-spec"
+    );
+    let failure = read_json::<BitrotFailureEvidence>(failure_path)?;
+    ensure!(
+        failure.case == expected_case,
+        "bitrot failure case differs from run-spec"
+    );
+    failure.validate(&metadata.run_id, case_name)?;
+
+    let events = read_jsonl::<RunEvent>(&artifact("run-events.jsonl")?)?;
+    ensure!(
+        events
+            .iter()
+            .all(|event| event.scenario == options.scenario && event.run_id == metadata.run_id)
+            && has_event(&events, "run", RunEventStatus::Started)
+            && !has_event(&events, "run", RunEventStatus::Succeeded),
+        "failed bitrot events do not belong exclusively to the failed attempt"
+    );
+    let history = read_jsonl::<OperationRecord>(&artifact("history.jsonl")?)?;
+    if !history.is_empty() {
+        validate_history_scope_and_order(
+            &history,
+            &options.scenario,
+            &metadata.run_id,
+            &json_spec.metadata.bucket,
+        )?;
+    }
+
+    let selection = optional(BITROT_SELECTION_ARTIFACT)?
+        .map(|path| read_json::<BitrotSelectionEvidence>(&path))
+        .transpose()?;
+    if let Some(selection) = &selection {
+        selection.validate()?;
+        ensure!(
+            selection.identity.run_id == metadata.run_id
+                && selection.identity.case_name == case_name
+                && selection.case == failure.case,
+            "failed bitrot selection belongs to another attempt"
+        );
+    }
+    let mutation = optional(BITROT_MUTATION_ARTIFACT)?
+        .map(|path| read_json::<BitrotMutationEvidence>(&path))
+        .transpose()?;
+    if let Some(mutation) = &mutation {
+        mutation.validate(
+            selection
+                .as_ref()
+                .context("bitrot mutation artifact lacks selection evidence")?,
+        )?;
+    }
+    let corruption = optional(BITROT_CORRUPTION_WINDOW_ARTIFACT)?
+        .map(|path| read_json::<BitrotCorruptionWindowProof>(&path))
+        .transpose()?;
+    if let Some(corruption) = &corruption {
+        let selection = selection
+            .as_ref()
+            .context("bitrot corruption artifact lacks selection evidence")?;
+        let mutation = mutation
+            .as_ref()
+            .context("bitrot corruption artifact lacks mutation evidence")?;
+        corruption.validate(selection, mutation)?;
+        corruption
+            .baseline
+            .validate_against_history(&selection.probe, &history)?;
+        corruption
+            .corrupted
+            .validate_against_history(&selection.probe, &history)?;
+    }
+
+    let progress = optional(BITROT_HEAL_PROGRESS_ARTIFACT)?
+        .map(|path| read_jsonl::<BitrotHealProgressSample>(&path))
+        .transpose()?
+        .unwrap_or_default();
+    if !progress.is_empty() {
+        let source = progress[0].source;
+        let token = if source == BitrotHealProgressSource::AdminDeep {
+            let start = read_json::<RawBitrotEvidenceReceipt>(&artifact(
+                BITROT_ADMIN_HEAL_START_ARTIFACT,
+            )?)?;
+            start.validate("failed admin heal start")?;
+            Some(
+                serde_json::from_str::<AdminHealStartBody>(&start.response_body)
+                    .context("decode failed admin heal start")?
+                    .client_token,
+            )
+        } else {
+            None
+        };
+        validate_heal_progress(&progress, source, token.as_deref())?;
+    }
+    failure.validate_progress_failure(&progress)?;
+
+    let heal = optional(BITROT_HEAL_ARTIFACT)?
+        .map(|path| read_json::<BitrotHealEvidence>(&path))
+        .transpose()?;
+    if let Some(heal) = &heal {
+        ensure!(
+            heal.progress() == progress,
+            "failed bitrot heal artifact differs from its progress transcript"
+        );
+    }
+    let cleanup = optional(BITROT_CLEANUP_ARTIFACT)?
+        .map(|path| read_json::<BitrotCleanupEvidence>(&path))
+        .transpose()?;
+    if let Some(cleanup) = &cleanup {
+        let selection = selection
+            .as_ref()
+            .context("bitrot cleanup artifact lacks selection evidence")?;
+        let mutation = mutation
+            .as_ref()
+            .context("bitrot cleanup artifact lacks mutation evidence")?;
+        let corruption = corruption
+            .as_ref()
+            .context("bitrot cleanup artifact lacks corruption evidence")?;
+        let heal = heal
+            .as_ref()
+            .context("bitrot cleanup artifact lacks heal evidence")?;
+        let mutation_response = mutation.validate(selection)?;
+        cleanup.validate(selection, &mutation_response, heal, corruption.closed_at_ms)?;
+        cleanup
+            .post_heal_exact_quorum
+            .validate_against_history(&selection.probe, &history)?;
+    }
+
+    validate_failed_bitrot_stage_artifacts(
+        &failure.stage,
+        selection.is_some(),
+        mutation.is_some(),
+        corruption.is_some(),
+        heal.is_some(),
+        cleanup.is_some(),
+    )?;
+
+    Ok(ArtifactValidationReport {
+        scenario: options.scenario.clone(),
+        case_name: case_name.to_string(),
+        seed: workload.seed,
+        client_disruptions: 0,
+        recommitted: 0,
+        committed: history
+            .iter()
+            .filter(|record| {
+                record.kind == OperationKind::Put && record.outcome == OperationOutcome::Ok
+            })
+            .count(),
+        required_artifacts: json_spec.artifacts.required,
+    })
+}
+
+fn validate_failed_bitrot_stage_artifacts(
+    stage: &str,
+    has_selection: bool,
+    has_mutation: bool,
+    has_corruption: bool,
+    has_heal: bool,
+    has_cleanup: bool,
+) -> Result<()> {
+    let stage_rank = match stage {
+        "target-proof" => 0,
+        "selection" => 1,
+        "mutation" => 2,
+        "corruption-window" => 3,
+        "heal" => 4,
+        "post-heal-verification" => 5,
+        "cleanup" => 6,
+        "helper-cleanup" => 7,
+        "final-checker" => 8,
+        _ => unreachable!("failure evidence validated the stage above"),
+    };
+    ensure!(
+        has_selection == (stage_rank >= 2)
+            && has_mutation == (stage_rank >= 3)
+            && has_corruption == (stage_rank >= 4)
+            && has_heal == (stage_rank >= 5)
+            && has_cleanup == (stage_rank >= 7),
+        "failed bitrot stage does not match its completed-stage artifacts"
+    );
+    Ok(())
 }
 
 fn validate_admin_execution_artifacts(
@@ -8353,8 +8637,8 @@ mod tests {
         QuorumEdgeRuntimeKind, RecommitCandidateManifestArtifact, RecommitReportArtifact,
         WorkloadSummaryArtifact, derive_recommit_candidates, read_json, read_jsonl, recursive_find,
         validate_admin_topology_artifact_files, validate_checker_phase_chain,
-        validate_failed_attempt_disruptions, validate_fault_artifacts,
-        validate_fault_artifacts_and_write_report,
+        validate_failed_attempt_disruptions, validate_failed_bitrot_stage_artifacts,
+        validate_fault_artifacts, validate_fault_artifacts_and_write_report,
         validate_fault_artifacts_for_planned_attempt_and_write_report,
         validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts, validate_run_spec,
         validate_target_proof, validate_volume_quorum_health_evidence,
@@ -8427,6 +8711,19 @@ mod tests {
     const FAILED_ADMIN_RUN_ID: &str = "run-00000000-0000-4000-8000-000000000076";
     const FAILED_ADMIN_CASE: &str = "fault_admin_rebalance_preserves_object_model";
     const FAILED_ADMIN_BUCKET: &str = "admin-failed-bucket";
+
+    #[test]
+    fn failed_bitrot_stage_requires_only_completed_stage_artifacts() {
+        validate_failed_bitrot_stage_artifacts("heal", true, true, true, false, false)
+            .expect("terminal heal failure has evidence through the corruption window");
+        assert!(
+            validate_failed_bitrot_stage_artifacts("heal", true, false, true, false, false,)
+                .is_err()
+        );
+        assert!(
+            validate_failed_bitrot_stage_artifacts("heal", true, true, true, true, false,).is_err()
+        );
+    }
 
     struct FailedAdminTestCase {
         _tempdir: tempfile::TempDir,

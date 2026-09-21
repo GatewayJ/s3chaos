@@ -219,6 +219,12 @@ pub struct GetObjectResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordedGetObjectResult {
+    pub operation_id: String,
+    pub result: GetObjectResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWriteResult {
     pub write_operation_id: String,
     pub write_outcome: OperationOutcome,
@@ -1126,7 +1132,10 @@ impl S3WorkloadClient {
         key: &str,
         recorder: &Recorder,
     ) -> Result<GetObjectResult> {
-        self.get_object_result_inner(key, None, recorder).await
+        Ok(self
+            .get_object_result_inner(key, None, recorder)
+            .await?
+            .result)
     }
 
     pub async fn get_object_version_result(
@@ -1135,6 +1144,18 @@ impl S3WorkloadClient {
         version_id: &str,
         recorder: &Recorder,
     ) -> Result<GetObjectResult> {
+        Ok(self
+            .get_object_result_inner(key, Some(version_id), recorder)
+            .await?
+            .result)
+    }
+
+    pub(crate) async fn get_object_version_recorded_result(
+        &self,
+        key: &str,
+        version_id: &str,
+        recorder: &Recorder,
+    ) -> Result<RecordedGetObjectResult> {
         self.get_object_result_inner(key, Some(version_id), recorder)
             .await
     }
@@ -1277,7 +1298,7 @@ impl S3WorkloadClient {
         key: &str,
         version_id: Option<&str>,
         recorder: &Recorder,
-    ) -> Result<GetObjectResult> {
+    ) -> Result<RecordedGetObjectResult> {
         let mut record = recorder.begin(
             OperationKind::Get,
             self.bucket.clone(),
@@ -1285,6 +1306,7 @@ impl S3WorkloadClient {
             None,
             None,
         );
+        let operation_id = record.id.clone();
         record.version_id = version_id.map(str::to_string);
         let response = timeout(
             self.request_timeout,
@@ -1307,11 +1329,14 @@ impl S3WorkloadClient {
                     sdk_error_status(&error),
                     Some(format!("get object failed: {error}")),
                 )?;
-                return Ok(GetObjectResult {
-                    outcome,
-                    http_status: sdk_error_status(&error),
-                    error: Some(format!("get object failed: {error}")),
-                    body: None,
+                return Ok(RecordedGetObjectResult {
+                    operation_id,
+                    result: GetObjectResult {
+                        outcome,
+                        http_status: sdk_error_status(&error),
+                        error: Some(format!("get object failed: {error}")),
+                        body: None,
+                    },
                 });
             }
             Err(_) => {
@@ -1321,11 +1346,14 @@ impl S3WorkloadClient {
                     None,
                     Some("get object timed out".to_string()),
                 )?;
-                return Ok(GetObjectResult {
-                    outcome: OperationOutcome::Timeout,
-                    http_status: None,
-                    error: Some("get object timed out".to_string()),
-                    body: None,
+                return Ok(RecordedGetObjectResult {
+                    operation_id,
+                    result: GetObjectResult {
+                        outcome: OperationOutcome::Timeout,
+                        http_status: None,
+                        error: Some("get object timed out".to_string()),
+                        body: None,
+                    },
                 });
             }
         };
@@ -1338,11 +1366,14 @@ impl S3WorkloadClient {
                 record.value_sha256 = Some(sha256_hex(&body));
                 record.size_bytes = Some(body.len());
                 recorder.finish(record, OperationOutcome::Ok, Some(200), None)?;
-                Ok(GetObjectResult {
-                    outcome: OperationOutcome::Ok,
-                    http_status: Some(200),
-                    error: None,
-                    body: Some(body),
+                Ok(RecordedGetObjectResult {
+                    operation_id,
+                    result: GetObjectResult {
+                        outcome: OperationOutcome::Ok,
+                        http_status: Some(200),
+                        error: None,
+                        body: Some(body),
+                    },
                 })
             }
             Ok(Err(error)) => {
@@ -1353,11 +1384,14 @@ impl S3WorkloadClient {
                     Some(200),
                     Some(error.clone()),
                 )?;
-                Ok(GetObjectResult {
-                    outcome: OperationOutcome::Unknown,
-                    http_status: Some(200),
-                    error: Some(error),
-                    body: None,
+                Ok(RecordedGetObjectResult {
+                    operation_id,
+                    result: GetObjectResult {
+                        outcome: OperationOutcome::Unknown,
+                        http_status: Some(200),
+                        error: Some(error),
+                        body: None,
+                    },
                 })
             }
             Err(_) => {
@@ -1367,11 +1401,14 @@ impl S3WorkloadClient {
                     Some(200),
                     Some("get body read timed out".to_string()),
                 )?;
-                Ok(GetObjectResult {
-                    outcome: OperationOutcome::Timeout,
-                    http_status: Some(200),
-                    error: Some("get body read timed out".to_string()),
-                    body: None,
+                Ok(RecordedGetObjectResult {
+                    operation_id,
+                    result: GetObjectResult {
+                        outcome: OperationOutcome::Timeout,
+                        http_status: Some(200),
+                        error: Some("get body read timed out".to_string()),
+                        body: None,
+                    },
                 })
             }
         }

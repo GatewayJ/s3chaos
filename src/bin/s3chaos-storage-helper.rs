@@ -92,6 +92,30 @@ fn main() -> Result<()> {
                     Err(error) => write_error(&mut output, &format!("{error:#}"))?,
                 }
             }
+            StorageHelperSessionRequest::ExecuteMutation {
+                operation_id,
+                invocation,
+            } => match session.execute_mutation_with_id(*invocation, &operation_id) {
+                Ok(receipt) => write_response(
+                    &mut output,
+                    &StorageHelperSessionResponse::Receipt {
+                        receipt: Box::new(receipt),
+                    },
+                )?,
+                Err(error) => write_error(&mut output, &format!("{error:#}"))?,
+            },
+            StorageHelperSessionRequest::QueryMutation {
+                context,
+                operation_id,
+            } => match session.query_mutation(&context, &operation_id) {
+                Ok(lookup) => write_response(
+                    &mut output,
+                    &StorageHelperSessionResponse::MutationLookup {
+                        lookup: Box::new(lookup),
+                    },
+                )?,
+                Err(error) => write_error(&mut output, &format!("{error:#}"))?,
+            },
             StorageHelperSessionRequest::StaleExecute { context, request } => {
                 match session.execute_stale(&context, &request) {
                     Ok(response) => write_response(

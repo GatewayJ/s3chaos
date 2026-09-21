@@ -785,6 +785,14 @@ pub enum StorageHelperSessionRequest {
     Execute {
         invocation: Box<StorageHelperInvocation>,
     },
+    ExecuteMutation {
+        operation_id: String,
+        invocation: Box<StorageHelperInvocation>,
+    },
+    QueryMutation {
+        context: Box<OwnedStorageContext>,
+        operation_id: String,
+    },
     StaleExecute {
         context: Box<OwnedStorageContext>,
         request: Box<StaleOfflineHelperRequest>,
@@ -803,6 +811,9 @@ pub enum StorageHelperSessionResponse {
     },
     Receipt {
         receipt: Box<StorageRecoveryOperationReceipt>,
+    },
+    MutationLookup {
+        lookup: Box<MutationJournalLookup>,
     },
     StaleResponse {
         response: Box<StaleOfflineHelperResponse>,
@@ -824,6 +835,62 @@ enum JournalState {
     Restored,
     VerifiedSuperseded,
     Quarantined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MutationRecoveryState {
+    Prepared,
+    Mutated,
+    Restored,
+    VerifiedSuperseded,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MutationJournalLookup {
+    pub operation_id: String,
+    pub operation: StorageRecoveryHostOperation,
+    pub state: MutationRecoveryState,
+    pub receipt: Option<Box<StorageRecoveryOperationReceipt>>,
+    pub observed_at_ms: u64,
+}
+
+impl MutationJournalLookup {
+    pub fn validate_for(
+        &self,
+        context: &OwnedStorageContext,
+        operation_id: &str,
+        operation: &StorageRecoveryHostOperation,
+    ) -> Result<()> {
+        ensure!(
+            self.operation_id == operation_id
+                && self.operation == *operation
+                && matches!(operation, StorageRecoveryHostOperation::MutateShard { .. })
+                && self.observed_at_ms >= context.exclusive_access.kubernetes_lease.acquired_at_ms,
+            "mutation lookup does not match the owned operation"
+        );
+        if let Some(receipt) = &self.receipt {
+            receipt.validate_for(context, operation)?;
+            ensure!(
+                receipt.operation_id == operation_id
+                    && matches!(
+                        self.state,
+                        MutationRecoveryState::Mutated
+                            | MutationRecoveryState::Restored
+                            | MutationRecoveryState::VerifiedSuperseded
+                    ),
+                "mutation lookup receipt does not describe a completed mutation"
+            );
+        } else {
+            ensure!(
+                self.state == MutationRecoveryState::Prepared,
+                "mutation lookup omitted a receipt outside the prepared state"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -853,6 +920,8 @@ struct MutationJournal {
     response_body: Option<String>,
     #[serde(default)]
     response_sha256: Option<String>,
+    #[serde(default)]
+    started_at_ms: u64,
     updated_at_ms: u64,
 }
 
@@ -958,6 +1027,32 @@ impl StorageHelperSession {
         &mut self,
         invocation: StorageHelperInvocation,
     ) -> Result<StorageRecoveryOperationReceipt> {
+        let operation_id = Uuid::new_v4().to_string();
+        self.execute_with_mutation_operation_id(invocation, &operation_id)
+    }
+
+    pub fn execute_mutation_with_id(
+        &mut self,
+        invocation: StorageHelperInvocation,
+        operation_id: &str,
+    ) -> Result<StorageRecoveryOperationReceipt> {
+        ensure!(
+            matches!(
+                invocation.operation,
+                StorageRecoveryHostOperation::MutateShard { .. }
+            ),
+            "explicit helper operationId is restricted to shard mutation"
+        );
+        self.execute_with_mutation_operation_id(invocation, operation_id)
+    }
+
+    fn execute_with_mutation_operation_id(
+        &mut self,
+        invocation: StorageHelperInvocation,
+        mutation_operation_id: &str,
+    ) -> Result<StorageRecoveryOperationReceipt> {
+        Uuid::parse_str(mutation_operation_id)
+            .context("storage helper mutation operationId is not a UUID")?;
         validate_session_context(&self.owner, &invocation.context)?;
         invocation.operation.validate()?;
         let started_at_ms = now_ms()?;
@@ -999,6 +1094,7 @@ impl StorageHelperSession {
                 &self.volume_root,
                 &self.journal_root,
                 &invocation.operation,
+                mutation_operation_id,
                 started_at_ms,
             ),
             StorageRecoveryHostOperation::RestoreShard {
@@ -1042,6 +1138,68 @@ impl StorageHelperSession {
                 )
             }
         }
+    }
+
+    pub fn query_mutation(
+        &self,
+        context: &OwnedStorageContext,
+        operation_id: &str,
+    ) -> Result<MutationJournalLookup> {
+        Uuid::parse_str(operation_id)
+            .context("storage helper mutation lookup operationId is not a UUID")?;
+        validate_session_context(&self.owner, context)?;
+        let journal = load_journal(&self.journal_root, operation_id)?;
+        ensure!(
+            journal.schema_version == 1
+                && journal.operation_id == operation_id
+                && journal.context_sha256 == context_sha256(context)?
+                && journal.scope_sha256 == context.scope_sha256
+                && journal.lease_uid == context.exclusive_access.kubernetes_lease.uid
+                && journal.lease_acquired_at_ms
+                    == context.exclusive_access.kubernetes_lease.acquired_at_ms
+                && journal.holder_identity
+                    == context.exclusive_access.kubernetes_lease.holder_identity
+                && matches!(
+                    journal.operation,
+                    StorageRecoveryHostOperation::MutateShard { .. }
+                ),
+            "mutation lookup journal belongs to another operation or context"
+        );
+        let state = match journal.state {
+            JournalState::Prepared => MutationRecoveryState::Prepared,
+            JournalState::Mutated => MutationRecoveryState::Mutated,
+            JournalState::Restored => MutationRecoveryState::Restored,
+            JournalState::VerifiedSuperseded => MutationRecoveryState::VerifiedSuperseded,
+            JournalState::Quarantined => MutationRecoveryState::Quarantined,
+            JournalState::Completed => bail!("mutation lookup journal has an invalid state"),
+        };
+        let receipt = if state == MutationRecoveryState::Prepared {
+            None
+        } else {
+            let response_body = required(&journal.response_body, "mutation response body")?;
+            ensure!(
+                journal.response_sha256.as_deref()
+                    == Some(sha256_bytes(response_body.as_bytes()).as_str()),
+                "mutation lookup response digest mismatch"
+            );
+            Some(Box::new(receipt(
+                context,
+                journal.operation.clone(),
+                operation_id.to_string(),
+                response_body.to_string(),
+                journal.started_at_ms,
+                journal.updated_at_ms,
+            )?))
+        };
+        let lookup = MutationJournalLookup {
+            operation_id: operation_id.to_string(),
+            operation: journal.operation,
+            state,
+            receipt,
+            observed_at_ms: now_ms()?,
+        };
+        lookup.validate_for(context, operation_id, &lookup.operation)?;
+        Ok(lookup)
     }
 
     pub fn execute_stale(
@@ -1441,6 +1599,7 @@ fn mutate(
     volume_root: &File,
     journal_root: &File,
     operation: &StorageRecoveryHostOperation,
+    operation_id: &str,
     started_at_ms: u64,
 ) -> Result<StorageRecoveryOperationReceipt> {
     let StorageRecoveryHostOperation::MutateShard {
@@ -1530,11 +1689,10 @@ fn mutate(
         "controlled shard mutation would not change the shard digest"
     );
 
-    let operation_id = Uuid::new_v4().to_string();
     let prepared_at_ms = now_ms()?;
     let mut journal = MutationJournal {
         schema_version: 1,
-        operation_id: operation_id.clone(),
+        operation_id: operation_id.to_string(),
         context_sha256: context_sha256(context)?,
         scope_sha256: context.scope_sha256.clone(),
         lease_uid: context.exclusive_access.kubernetes_lease.uid.clone(),
@@ -1558,6 +1716,7 @@ fn mutate(
         reason: None,
         response_body: None,
         response_sha256: None,
+        started_at_ms,
         updated_at_ms: prepared_at_ms,
     };
     persist_journal(journal_root, &journal)?;
@@ -1584,7 +1743,7 @@ fn mutate(
         "mutated shard digest differs from the precomputed controlled mutation"
     );
     let response = OfflineShardMutationResponse {
-        journal_operation_id: operation_id.clone(),
+        journal_operation_id: operation_id.to_string(),
         relative_part_path: shard.relative_part_path.clone(),
         shard_device_id: shard.shard_device_id.clone(),
         shard_inode: shard.shard_inode,
@@ -1601,7 +1760,7 @@ fn mutate(
     receipt(
         context,
         operation.clone(),
-        operation_id,
+        operation_id.to_string(),
         response_body,
         started_at_ms,
         persisted_at_ms,
@@ -1975,6 +2134,7 @@ fn completed_receipt(
         reason: None,
         response_body: Some(serde_json::to_string(response)?),
         response_sha256: None,
+        started_at_ms,
         updated_at_ms: persisted_at_ms,
     };
     let mut journal = journal;
@@ -3048,6 +3208,55 @@ mod tests {
     }
 
     #[test]
+    fn mutation_journal_lookup_recovers_a_lost_helper_response() {
+        let (_temporary, roots) = test_roots();
+        let part_path = roots.volume.join("bucket/object/data-dir/part.1");
+        fs::create_dir_all(part_path.parent().expect("part parent")).expect("part parent");
+        fs::write(&part_path, b"original shard payload").expect("part");
+        let context = context_for(&roots);
+        let operation = mutation(&context, &roots, part_path.to_str().expect("part path"));
+        let operation_id = "99999999-9999-9999-9999-999999999999";
+        let mut session = StorageHelperSession::begin(context.clone(), &roots).expect("session");
+        let lost_receipt = session
+            .execute_mutation_with_id(
+                StorageHelperInvocation {
+                    context: context.clone(),
+                    operation: operation.clone(),
+                },
+                operation_id,
+            )
+            .expect("durable mutation with a lost controller response");
+
+        let lookup = session
+            .query_mutation(&context, operation_id)
+            .expect("query durable mutation journal");
+        lookup
+            .validate_for(&context, operation_id, &operation)
+            .expect("receipt needed for emergency recovery");
+        assert_eq!(lookup.state, MutationRecoveryState::Mutated);
+        assert_eq!(
+            lookup
+                .receipt
+                .as_deref()
+                .map(|receipt| receipt.response_sha256.as_str()),
+            Some(lost_receipt.response_sha256.as_str())
+        );
+
+        session
+            .execute(StorageHelperInvocation {
+                context,
+                operation: StorageRecoveryHostOperation::RestoreShard {
+                    mutation_operation_id: operation_id.to_string(),
+                },
+            })
+            .expect("restore mutation after response recovery");
+        assert_eq!(
+            fs::read(part_path).expect("restored part"),
+            b"original shard payload"
+        );
+    }
+
+    #[test]
     fn prepared_journal_recovers_after_helper_dies_post_mutation() {
         let (_temporary, roots) = test_roots();
         let part_path = roots.volume.join("bucket/object/data-dir/part.1");
@@ -3099,6 +3308,7 @@ mod tests {
             reason: None,
             response_body: None,
             response_sha256: None,
+            started_at_ms: now_ms().expect("now"),
             updated_at_ms: now_ms().expect("now"),
         };
         let journal_root = open_directory(&roots.journal, "journal root").expect("journal root");
