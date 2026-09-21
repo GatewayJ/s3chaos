@@ -663,7 +663,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::NetworkCorrupt,
-        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
         boundary: "rustfs-workload/network-corrupt",
         ci_phase: "faults",
         target: "one RustFS Pod selected by tenant label with corrupted peer traffic inside the e2e namespace",
@@ -761,7 +761,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         required_tools: &[],
         percent_supported: true,
         param_schema: FaultParameterSchema::None,
-        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
         boundary: "rustfs-workload/storage-pressure",
         ci_phase: "faults",
         target: "one RustFS data volume selected by tenant label with WRITE operations returning ENOSPC",
@@ -1835,14 +1835,14 @@ pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
 mod tests {
     use super::{
         ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, CLUSTER_COLD_RESTART_SCENARIO,
-        DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+        DISK_FULL_SCENARIO, DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO,
         DetectorQualification, DurabilityBugFamily, FRESH_VOLUME_REPLACEMENT_SCENARIO,
         FaultDetectorContract, FaultParameterSchema, FaultScenario, FaultScenarioStatus,
         FaultScenarioWorkloadProfile, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IOCHAOS_CRD,
-        NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
+        NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, ON_DISK_BITROT_SCENARIO,
         POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO, POD_FAILURE_SCENARIO,
         POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
@@ -2387,6 +2387,8 @@ mod tests {
             POD_KILL_ONE_SCENARIO,
             POD_FAILURE_SCENARIO,
             NETWORK_PARTITION_ONE_SCENARIO,
+            NETWORK_CORRUPT_SCENARIO,
+            DISK_FULL_SCENARIO,
         ] {
             let spec = scenario_spec(name).expect("scenario");
             assert_eq!(

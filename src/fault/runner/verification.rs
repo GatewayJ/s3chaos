@@ -132,6 +132,14 @@ impl FaultRun<'_> {
                 "recovery-stability-report.json",
                 &serde_json::to_string_pretty(&recovery_stability_report)?,
             )?;
+            events
+                .record(
+                    "checker-pre-recommit-verdict",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    None,
+                )
+                .ok();
             self.write_failure_summary(
                 FailureSummary::from_checker(
                     &scenario.name,
@@ -337,6 +345,14 @@ impl FaultRun<'_> {
                 )
                 .ok();
             let classification = report.failure_classification();
+            events
+                .record(
+                    "checker-verdict",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    None,
+                )
+                .ok();
             self.write_failure_summary(
                 FailureSummary::from_checker(
                     &scenario.name,

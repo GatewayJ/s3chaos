@@ -127,6 +127,19 @@ pub struct OperationRecord {
     pub size_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
+    /// Version identity addressed by the request. This is distinct from the
+    /// response identity because deleting an existing version creates no new
+    /// immutable version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_version_id: Option<String>,
+    /// Response delete-marker flag for DELETE operations. Older history
+    /// artifacts omit this field and retain their previous interpretation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_delete_marker: Option<bool>,
+    /// Maximum HTTP attempts configured for this mutation request. New
+    /// records set this at the client boundary; legacy records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_max_attempts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listed_keys: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,11 +174,15 @@ pub(crate) fn validate_successful_version_identity_uniqueness<'a>(
 ) -> Result<()> {
     let mut version_identities = HashSet::new();
     for record in records.into_iter().filter(|record| {
-        record.outcome == OperationOutcome::Ok
-            && matches!(
-                record.kind,
-                OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
-            )
+        if record.outcome != OperationOutcome::Ok {
+            return false;
+        }
+        matches!(
+            record.kind,
+            OperationKind::Put | OperationKind::CompleteMultipartUpload
+        ) || (record.kind == OperationKind::Delete
+            && record.request_version_id.is_none()
+            && record.is_delete_marker != Some(false))
     }) {
         let Some(version_id) = record
             .version_id
@@ -193,6 +210,25 @@ pub(crate) fn validate_history_scope_and_order(
     run_id: &str,
     bucket: &str,
 ) -> Result<()> {
+    validate_history_scope_and_order_mode(records, scenario, run_id, bucket, true)
+}
+
+pub(crate) fn validate_partial_history_scope_and_order(
+    records: &[OperationRecord],
+    scenario: &str,
+    run_id: &str,
+    bucket: &str,
+) -> Result<()> {
+    validate_history_scope_and_order_mode(records, scenario, run_id, bucket, false)
+}
+
+fn validate_history_scope_and_order_mode(
+    records: &[OperationRecord],
+    scenario: &str,
+    run_id: &str,
+    bucket: &str,
+    require_contiguous_sequences: bool,
+) -> Result<()> {
     ensure!(
         records.iter().all(|record| {
             record.scenario == scenario
@@ -209,7 +245,7 @@ pub(crate) fn validate_history_scope_and_order(
         .context("history event count overflow")?;
     let expected_last_sequence = u64::try_from(expected_event_count)
         .context("history event count does not fit a recorder sequence")?;
-    let mut event_sequences = vec![false; expected_event_count];
+    let mut event_sequences = HashSet::with_capacity(expected_event_count);
     let mut operation_ids = HashSet::with_capacity(records.len());
     let mut previous_ended_sequence = None;
     let mut previous_mutation_end_by_key = HashMap::<&str, u64>::new();
@@ -231,16 +267,14 @@ pub(crate) fn validate_history_scope_and_order(
         );
         for sequence in [started_sequence, ended_sequence] {
             ensure!(
-                sequence > 0 && sequence <= expected_last_sequence,
-                "history recorder event sequence is outside the complete monotonic range"
+                sequence > 0
+                    && (!require_contiguous_sequences || sequence <= expected_last_sequence),
+                "history recorder event sequence is outside the permitted monotonic range"
             );
-            let index = usize::try_from(sequence - 1)
-                .context("history recorder event sequence does not fit an index")?;
             ensure!(
-                !event_sequences[index],
+                event_sequences.insert(sequence),
                 "history contains a duplicate recorder event sequence"
             );
-            event_sequences[index] = true;
         }
         if let Some(previous) = previous_ended_sequence {
             ensure!(
@@ -369,6 +403,9 @@ impl Recorder {
             value_sha256,
             size_bytes,
             version_id: None,
+            request_version_id: None,
+            is_delete_marker: None,
+            mutation_max_attempts: None,
             listed_keys: None,
             listed_versions: None,
             payload_ref: None,
@@ -515,7 +552,8 @@ fn truncate_error(message: &str) -> String {
 mod tests {
     use super::{
         DurabilityCohort, OperationKind, OperationOutcome, Recorder,
-        validate_history_scope_and_order,
+        validate_history_scope_and_order, validate_partial_history_scope_and_order,
+        validate_successful_version_identity_uniqueness,
     };
     use std::collections::BTreeSet;
 
@@ -576,7 +614,58 @@ mod tests {
         let record = serde_json::from_str::<super::OperationRecord>(legacy).expect("legacy record");
 
         assert_eq!(record.version_id, None);
+        assert_eq!(record.request_version_id, None);
+        assert_eq!(record.is_delete_marker, None);
         assert_eq!(record.kind, OperationKind::Put);
+    }
+
+    #[test]
+    fn repeated_explicit_version_deletes_do_not_claim_new_version_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Recorder::create(dir.path().join("history.jsonl"), "io-eio", "run-1")
+            .expect("recorder");
+        for _ in 0..2 {
+            let mut record = recorder.begin(
+                OperationKind::Delete,
+                "bucket",
+                Some("key".to_string()),
+                None,
+                None,
+            );
+            record.request_version_id = Some("version-1".to_string());
+            record.version_id = Some("version-1".to_string());
+            recorder
+                .finish(record, OperationOutcome::Ok, Some(204), None)
+                .expect("finish explicit version delete");
+        }
+
+        validate_successful_version_identity_uniqueness(&recorder.records())
+            .expect("explicit version deletes may repeat the addressed identity");
+    }
+
+    #[test]
+    fn repeated_created_delete_marker_identity_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Recorder::create(dir.path().join("history.jsonl"), "io-eio", "run-1")
+            .expect("recorder");
+        for _ in 0..2 {
+            let mut record = recorder.begin(
+                OperationKind::Delete,
+                "bucket",
+                Some("key".to_string()),
+                None,
+                None,
+            );
+            record.version_id = Some("marker-1".to_string());
+            record.is_delete_marker = Some(true);
+            recorder
+                .finish(record, OperationOutcome::Ok, Some(204), None)
+                .expect("finish delete marker creation");
+        }
+
+        let error = validate_successful_version_identity_uniqueness(&recorder.records())
+            .expect_err("created delete marker identities must be unique");
+        assert!(error.to_string().contains("marker-1"));
     }
 
     #[test]
@@ -676,6 +765,35 @@ mod tests {
             validate_history_scope_and_order(&reversed_completion, "storage", "run-1", "bucket")
                 .expect_err("completion records must preserve recorder order");
         assert!(error.to_string().contains("completion order"));
+    }
+
+    #[test]
+    fn partial_history_allows_cancellation_sequence_gaps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Recorder::create(dir.path().join("history.jsonl"), "storage", "run-1")
+            .expect("recorder");
+        let _canceled = recorder.begin(
+            OperationKind::Get,
+            "bucket",
+            Some("canceled-key".to_string()),
+            None,
+            None,
+        );
+        let completed = recorder.begin(
+            OperationKind::Get,
+            "bucket",
+            Some("completed-key".to_string()),
+            None,
+            None,
+        );
+        recorder
+            .finish(completed, OperationOutcome::NotFound, Some(404), None)
+            .expect("finish completed request");
+        let records = recorder.records();
+
+        validate_partial_history_scope_and_order(&records, "storage", "run-1", "bucket")
+            .expect("partial history permits the canceled request gap");
+        assert!(validate_history_scope_and_order(&records, "storage", "run-1", "bucket").is_err());
     }
 
     #[test]

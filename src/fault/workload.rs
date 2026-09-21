@@ -34,7 +34,7 @@ use crate::fault::history::{
     Recorder,
 };
 
-const S3_WORKLOAD_MUTATION_MAX_ATTEMPTS: u32 = 3;
+pub(crate) const S3_WORKLOAD_MUTATION_MAX_ATTEMPTS: u32 = 3;
 const MULTIPART_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 const ABORTED_MULTIPART_FIXTURE_BYTES: u64 = 4 * 1024;
 const RUSTFS_METADATA_RESERVE_BYTES_PER_ATTEMPT: u64 = 1024 * 1024;
@@ -200,6 +200,7 @@ pub struct S3WorkloadClient {
     bucket: String,
     request_timeout: Duration,
     mutation_deadline: Option<Instant>,
+    mutation_max_attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,7 +241,6 @@ enum AbortBound {
 
 struct RecordedDelete {
     record: OperationRecord,
-    is_delete_marker: Option<bool>,
 }
 
 /// Where a fresh-write probe keeps its objects. Each scope has its own
@@ -869,6 +869,7 @@ impl S3WorkloadClient {
             request_timeout,
             aws_sdk_s3::config::retry::RetryConfig::standard()
                 .with_max_attempts(S3_WORKLOAD_MUTATION_MAX_ATTEMPTS),
+            S3_WORKLOAD_MUTATION_MAX_ATTEMPTS,
         )
         .await
     }
@@ -887,6 +888,7 @@ impl S3WorkloadClient {
             secret_key,
             request_timeout,
             aws_sdk_s3::config::retry::RetryConfig::disabled(),
+            1,
         )
         .await
     }
@@ -898,6 +900,7 @@ impl S3WorkloadClient {
         secret_key: impl Into<String>,
         request_timeout: Duration,
         retry_config: aws_sdk_s3::config::retry::RetryConfig,
+        mutation_max_attempts: u32,
     ) -> Result<Self> {
         let credentials = Credentials::new(
             access_key.into(),
@@ -922,6 +925,7 @@ impl S3WorkloadClient {
             bucket: bucket.into(),
             request_timeout,
             mutation_deadline: None,
+            mutation_max_attempts,
         })
     }
 
@@ -938,6 +942,7 @@ impl S3WorkloadClient {
                 .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
                 .build(),
         );
+        client.mutation_max_attempts = 1;
         client
     }
 
@@ -1026,6 +1031,7 @@ impl S3WorkloadClient {
             Some(spec.sha256.clone()),
             Some(spec.size_bytes),
         );
+        record.mutation_max_attempts = Some(self.mutation_max_attempts);
         // The body is fully determined by (seed, index, size); recording the
         // generator inputs lets the checker regenerate the exact bytes when
         // verifying ranged GET slices against this committed value.
@@ -1427,20 +1433,23 @@ impl S3WorkloadClient {
         recorder: &Recorder,
     ) -> Result<Option<OperationRecord>> {
         let result = self.delete_object_result(key, recorder).await?;
-        if result.record.outcome == OperationOutcome::Ok && result.is_delete_marker != Some(true) {
+        if result.record.outcome == OperationOutcome::Ok
+            && result.record.is_delete_marker != Some(true)
+        {
             return Ok(None);
         }
         Ok(Some(result.record))
     }
 
     async fn delete_object_result(&self, key: &str, recorder: &Recorder) -> Result<RecordedDelete> {
-        let record = recorder.begin(
+        let mut record = recorder.begin(
             OperationKind::Delete,
             self.bucket.clone(),
             Some(key.to_string()),
             None,
             None,
         );
+        record.mutation_max_attempts = Some(self.mutation_max_attempts);
         let result = self
             .mutation_request(
                 self.client
@@ -1455,9 +1464,9 @@ impl S3WorkloadClient {
             Ok(Ok(output)) => {
                 let mut record = record;
                 record.version_id = output.version_id().map(str::to_string);
+                record.is_delete_marker = output.delete_marker();
                 Ok(RecordedDelete {
                     record: recorder.finish(record, OperationOutcome::Ok, Some(204), None)?,
-                    is_delete_marker: output.delete_marker(),
                 })
             }
             Ok(Err(error)) => {
@@ -1469,7 +1478,6 @@ impl S3WorkloadClient {
                         sdk_error_status(&error),
                         Some(format!("delete object failed: {error}")),
                     )?,
-                    is_delete_marker: None,
                 })
             }
             Err(_) => Ok(RecordedDelete {
@@ -1479,7 +1487,6 @@ impl S3WorkloadClient {
                     None,
                     Some("delete object timed out".to_string()),
                 )?,
-                is_delete_marker: None,
             }),
         }
     }
@@ -1600,13 +1607,14 @@ impl S3WorkloadClient {
         staged: &StagedMultipartUpload,
         recorder: &Recorder,
     ) -> Result<OperationRecord> {
-        let record = recorder.begin(
+        let mut record = recorder.begin(
             OperationKind::CompleteMultipartUpload,
             self.bucket.clone(),
             Some(staged.spec.key.clone()),
             Some(staged.spec.sha256.clone()),
             Some(staged.spec.size_bytes),
         );
+        record.mutation_max_attempts = Some(self.mutation_max_attempts);
         let upload = CompletedMultipartUpload::builder()
             .set_parts(Some(staged.completed_parts.clone()))
             .build();
