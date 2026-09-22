@@ -30,10 +30,7 @@ use crate::{
         history::Recorder,
         plan::{ExecutionPlan, FaultPlan, FaultPlanOptions},
         preflight::{PreflightPhase, PreflightSummary, TargetProof},
-        reporting::{
-            FailureSummary, RunMetadata, write_failure_summary as persist_failure_summary,
-            write_failure_summary_if_absent,
-        },
+        reporting::{FailureSummary, RunMetadata, write_failure_summary_if_absent},
         scenarios::{self, FaultScenario, FaultScenarioSpec},
         spec::FaultRunSpec,
         suite_plan::fault_run_id,
@@ -52,6 +49,7 @@ mod ack;
 mod injection;
 mod node_down;
 mod post_recovery;
+mod quorum_activation;
 mod recovery;
 mod setup;
 pub(crate) mod targets;
@@ -195,81 +193,157 @@ async fn run_fault_case(
     let mut run_completion = context
         .events
         .completion_guard("run", "fault run failed before successful completion");
-    let mut preflight_phases = Vec::new();
-    let mut prepared = deadline
-        .run(async {
-            run.preflight_backends(&mut preflight_phases)?;
-            run.prepare_fixture().await?;
-            run.connect_workload().await
-        })
-        .await?;
-    let mut staged_multipart_uploads = BTreeMap::new();
-    // Keep the S3 client and access guard alive through cleanup on every exit.
-    let result = if scenarios::acknowledged_mutation_kind(&scenario.name).is_some() {
-        run.run_ack_triggered_case(
-            &mut prepared,
-            &mut preflight_phases,
-            &mut staged_multipart_uploads,
+    let result = async {
+        let mut preflight_phases = Vec::new();
+        let mut prepared = deadline
+            .run(async {
+                run.preflight_backends(&mut preflight_phases)?;
+                run.prepare_fixture().await?;
+                run.connect_workload().await
+            })
+            .await?;
+        let mut staged_multipart_uploads = BTreeMap::new();
+        // Keep the S3 client and access guard alive through cleanup on every exit.
+        let result = if scenarios::acknowledged_mutation_kind(&scenario.name).is_some() {
+            run.run_ack_triggered_case(
+                &mut prepared,
+                &mut preflight_phases,
+                &mut staged_multipart_uploads,
+            )
+            .await
+        } else {
+            async {
+                run.stage_uploads(&prepared.s3, &mut staged_multipart_uploads)
+                    .await?;
+                let target = deadline
+                    .run(run.prove_target(&prepared.endpoint, &mut preflight_phases))
+                    .await?;
+                deadline.check()?;
+                let mut active = run.activate_fault(&target).await?;
+                let skip_typed_oracle = active.quorum_activation.as_ref().is_some_and(|evidence| {
+                    evidence.evidence().disposition()
+                        == crate::fault::quorum::activation::QuorumActivationDisposition::SkipTypedOracleAndRecover
+                });
+                let mut workload = if skip_typed_oracle {
+                    run.skip_unqualified_quorum_workload(&active)?
+                } else {
+                    run.exercise_fault(&mut prepared, &target, &active, &staged_multipart_uploads)
+                        .await?
+                };
+                if !skip_typed_oracle {
+                    deadline.check()?;
+                }
+                run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
+                run.hold_node_down(&mut prepared, &target, &active.fault)
+                    .await?;
+                let removal = run.remove_fault(&mut active.fault)?;
+                run.cleanup_quorum_activation_canaries(&mut active).await;
+                let recovered = run
+                    .recover_access(&mut prepared, &target, &mut staged_multipart_uploads)
+                    .await?;
+                // A fault whose evidence can still change after removal (a
+                // lifecycle replacement that crashes after Ready) is re-read once
+                // the recovery gate has passed.
+                run.recheck_fault_after_recovery(&mut active.fault)?;
+                // The lifecycle evidence is complete once recovery finished, so it
+                // is persisted before the write gate: a product failure found by
+                // the probe must still leave fault-evidence.json behind for the
+                // suite's failed-attempt accounting.
+                let mut evidence =
+                    run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
+                run.probe_post_recovery_writes(&prepared.s3).await?;
+                deadline
+                    .run(run.verify_recovered(&prepared.s3, &mut workload.workload))
+                    .await?;
+                run.recommit(&prepared.s3, &mut workload.workload).await?;
+                deadline
+                    .run(run.verify_final(&prepared.s3, &workload.workload, &mut evidence))
+                    .await?;
+                if let Some(reason) = active.deferred_failure.as_deref() {
+                    let error = anyhow::anyhow!(reason.to_string());
+                    return Err(error);
+                }
+                Ok(())
+            }
+            .await
+        };
+        let cleanup = cleanup_staged_multipart_uploads(
+            &prepared.s3,
+            &context.history,
+            staged_multipart_uploads,
+            context.workload_plan.concurrency,
         )
-        .await
-    } else {
-        async {
-            run.stage_uploads(&prepared.s3, &mut staged_multipart_uploads)
-                .await?;
-            let target = deadline
-                .run(run.prove_target(&prepared.endpoint, &mut preflight_phases))
-                .await?;
-            deadline.check()?;
-            let mut active = run.activate_fault(&target)?;
-            let mut workload = run
-                .exercise_fault(&mut prepared, &target, &active, &staged_multipart_uploads)
-                .await?;
-            deadline.check()?;
-            run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
-            run.hold_node_down(&mut prepared, &target, &active.fault)
-                .await?;
-            let removal = run.remove_fault(&mut active.fault)?;
-            let recovered = run
-                .recover_access(&mut prepared, &target, &mut staged_multipart_uploads)
-                .await?;
-            // A fault whose evidence can still change after removal (a
-            // lifecycle replacement that crashes after Ready) is re-read once
-            // the recovery gate has passed.
-            run.recheck_fault_after_recovery(&mut active.fault)?;
-            // The lifecycle evidence is complete once recovery finished, so it
-            // is persisted before the write gate: a product failure found by
-            // the probe must still leave fault-evidence.json behind for the
-            // suite's failed-attempt accounting.
-            let mut evidence =
-                run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
-            run.probe_post_recovery_writes(&prepared.s3).await?;
-            deadline
-                .run(run.verify_recovered(&prepared.s3, &mut workload.workload))
-                .await?;
-            run.recommit(&prepared.s3, &mut workload.workload).await?;
-            deadline
-                .run(run.verify_final(&prepared.s3, &workload.workload, &mut evidence))
-                .await
-        }
-        .await
-    };
-    let cleanup = cleanup_staged_multipart_uploads(
-        &prepared.s3,
-        &context.history,
-        staged_multipart_uploads,
-        context.workload_plan.concurrency,
-    )
+        .await;
+        finish_upload_cleanup(&run, result, cleanup)?;
+        deadline.check()?;
+        context.events.record(
+            "run",
+            RunEventStatus::Succeeded,
+            "fault run completed successfully",
+            None,
+        )?;
+        Ok(())
+    }
     .await;
-    finish_upload_cleanup(&run, result, cleanup)?;
-    deadline.check()?;
-    context.events.record(
-        "run",
-        RunEventStatus::Succeeded,
-        "fault run completed successfully",
-        None,
-    )?;
-    run_completion.complete();
-    Ok(())
+
+    match result {
+        Ok(()) => {
+            run_completion.complete();
+            Ok(())
+        }
+        Err(error) => {
+            ensure_unclassified_runner_failure(
+                collector,
+                &context.events,
+                &scenario.name,
+                scenario.case_name,
+                planned_run_id,
+                &error,
+            )
+            .ok();
+            Err(error)
+        }
+    }
+}
+
+fn record_unclassified_runner_failure(
+    collector: &ArtifactCollector,
+    events: &RunEventRecorder,
+    scenario_name: &str,
+    case_name: &str,
+    run_id: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    events
+        .record("runner", RunEventStatus::Failed, error.to_string(), None)
+        .ok();
+    write_failure_summary_if_absent(
+        collector,
+        case_name,
+        FailureSummary::new(
+            scenario_name,
+            "runner",
+            "test_or_environment",
+            error.to_string(),
+        )?
+        .with_run_id(run_id)
+        .with_case_name(case_name),
+    )
+}
+
+fn ensure_unclassified_runner_failure(
+    collector: &ArtifactCollector,
+    events: &RunEventRecorder,
+    scenario_name: &str,
+    case_name: &str,
+    run_id: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let summary_path = collector.case_dir(case_name).join("failure-summary.json");
+    if summary_path.is_file() {
+        return Ok(());
+    }
+    record_unclassified_runner_failure(collector, events, scenario_name, case_name, run_id, error)
 }
 
 fn finish_upload_cleanup(
@@ -281,6 +355,17 @@ fn finish_upload_cleanup(
     let collector = run.collector;
     let scenario = run.scenario;
     let run_id = &run.context.run_id;
+    if let Err(error) = &result {
+        ensure_unclassified_runner_failure(
+            collector,
+            events,
+            &scenario.name,
+            scenario.case_name,
+            run_id,
+            error,
+        )
+        .ok();
+    }
     if let Err(error) = cleanup {
         events
             .record(
@@ -290,18 +375,20 @@ fn finish_upload_cleanup(
                 None,
             )
             .ok();
-        write_failure_summary_if_absent(
-            collector,
-            scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
-                "multipart-cleanup",
-                "test_or_environment",
-                format!("{error:#}"),
-            )?
-            .with_run_id(run_id),
-        )
-        .ok();
+        if result.is_ok() {
+            write_failure_summary_if_absent(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "multipart-cleanup",
+                    "test_or_environment",
+                    format!("{error:#}"),
+                )?
+                .with_run_id(run_id),
+            )
+            .ok();
+        }
         return match result {
             Ok(()) => Err(error),
             Err(original) => {
@@ -340,6 +427,8 @@ struct ProvenTarget {
 }
 
 struct ActiveFault {
+    // Field order is a cleanup invariant: the backend fault must be dropped
+    // before the canary guard performs its cancellation fallback.
     fault: AppliedFault,
     fault_prepare_started_at_ms: Option<u64>,
     fault_apply_started_at_ms: u64,
@@ -349,6 +438,8 @@ struct ActiveFault {
     active_partition_targets: BTreeSet<String>,
     active_fixed_volume_targets: BTreeSet<String>,
     active_fixed_volume_containers: BTreeMap<String, String>,
+    quorum_activation: Option<quorum_activation::QuorumCanaryCleanupGuard>,
+    deferred_failure: Option<String>,
 }
 
 struct FaultWorkload {
@@ -362,6 +453,7 @@ struct FaultWorkload {
     workload_fixed_volume_containers: BTreeMap<String, String>,
     quorum_health_before_workload: Option<QuorumHealthObservation>,
     quorum_health_after_workload: Option<QuorumHealthObservation>,
+    ran_under_fault: bool,
 }
 
 struct WorkloadTargetEvidence {
@@ -377,7 +469,7 @@ struct FaultRemoval {
 
 impl FaultRun<'_> {
     fn write_failure_summary(&self, summary: FailureSummary) -> Result<()> {
-        persist_failure_summary(
+        write_failure_summary_if_absent(
             self.collector,
             self.scenario.case_name,
             summary.with_run_id(&self.context.run_id),
@@ -396,15 +488,16 @@ impl FaultRun<'_> {
             .events
             .record(stage, RunEventStatus::Failed, error.to_string(), details)
             .ok();
-        if let Some((fault, suffix)) = fault {
-            collect_fault_artifacts(self.collector, self.scenario.case_name, fault, suffix)?;
-        }
         self.write_failure_summary(FailureSummary::new(
             &self.scenario.name,
             stage,
             classification,
             error.to_string(),
-        )?)
+        )?)?;
+        if let Some((fault, suffix)) = fault {
+            collect_fault_artifacts(self.collector, self.scenario.case_name, fault, suffix)?;
+        }
+        Ok(())
     }
 }
 
@@ -550,6 +643,7 @@ fn warp_bucket_name(run_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn fault_bucket_name_is_s3_compatible_and_run_scoped() {
         assert_eq!(
@@ -560,5 +654,88 @@ mod tests {
             warp_bucket_name("run-12345678-abcd-efgh"),
             "rustfs-fault-run12345678abcde-warp"
         );
+    }
+
+    #[test]
+    fn suite_deadline_writes_a_runner_failure_stage_and_summary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector = ArtifactCollector::new(dir.path());
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let run_id = "run-timeout";
+        let events = RunEventRecorder::create(
+            collector.case_dir(case_name).join("run-events.jsonl"),
+            "io-eio",
+            run_id,
+        )
+        .expect("events");
+        events
+            .record("run", RunEventStatus::Started, "started", None)
+            .expect("run start");
+        let deadline = RunDeadline::new(Some(0)).expect("deadline");
+        let error = deadline.check().expect_err("expired suite deadline");
+
+        record_unclassified_runner_failure(
+            &collector, &events, "io-eio", case_name, run_id, &error,
+        )
+        .expect("runner failure evidence");
+        events
+            .record("run", RunEventStatus::Failed, "run failed", None)
+            .expect("run terminal");
+
+        let summary: FailureSummary = serde_json::from_str(
+            &std::fs::read_to_string(collector.case_dir(case_name).join("failure-summary.json"))
+                .expect("summary"),
+        )
+        .expect("summary JSON");
+        assert_eq!(summary.stage, "runner");
+        assert_eq!(
+            summary.phase(),
+            Some(crate::fault::reporting::FailurePhase::Runner)
+        );
+        assert_eq!(summary.run_id.as_deref(), Some(run_id));
+        let events =
+            std::fs::read_to_string(collector.case_dir(case_name).join("run-events.jsonl"))
+                .expect("events text");
+        assert!(events.contains("\"stage\":\"runner\",\"status\":\"failed\""));
+    }
+
+    #[test]
+    fn primary_runner_failure_is_persisted_before_cleanup_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector = ArtifactCollector::new(dir.path());
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let run_id = "run-timeout-cleanup";
+        let events = RunEventRecorder::create(
+            collector.case_dir(case_name).join("run-events.jsonl"),
+            "io-eio",
+            run_id,
+        )
+        .expect("events");
+        let primary = anyhow::anyhow!("suite deadline reached");
+        ensure_unclassified_runner_failure(
+            &collector, &events, "io-eio", case_name, run_id, &primary,
+        )
+        .expect("primary summary");
+        write_failure_summary_if_absent(
+            &collector,
+            case_name,
+            FailureSummary::new(
+                "io-eio",
+                "multipart-cleanup",
+                "test_or_environment",
+                "abort failed",
+            )
+            .expect("cleanup summary")
+            .with_run_id(run_id),
+        )
+        .expect("secondary cleanup summary");
+
+        let summary: FailureSummary = serde_json::from_str(
+            &std::fs::read_to_string(collector.case_dir(case_name).join("failure-summary.json"))
+                .expect("summary"),
+        )
+        .expect("summary JSON");
+        assert_eq!(summary.stage, "runner");
+        assert!(summary.message.contains("suite deadline"));
     }
 }

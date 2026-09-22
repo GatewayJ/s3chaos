@@ -687,9 +687,11 @@ impl FailurePhase {
             | "bucket-create"
             | "prefill"
             | "pod-identity-before-fault" => Self::Setup,
-            "fault-apply" | "wait-active" | "fault-snapshot-active" | "active-snapshot-failed" => {
-                Self::FaultInjection
-            }
+            "fault-apply"
+            | "wait-active"
+            | "fault-snapshot-active"
+            | "active-snapshot-failed"
+            | "quorum-fault-activation" => Self::FaultInjection,
             "s3-access-under-fault"
             | "warp-workload"
             | "mixed-workload"
@@ -727,6 +729,10 @@ fn primary_evidence_refs_for(stage: &str, phase: FailurePhase) -> Vec<String> {
     let mut refs = Vec::new();
 
     match phase {
+        FailurePhase::FaultInjection if stage == "quorum-fault-activation" => {
+            push_unique(&mut refs, "quorum-fault-activation.json");
+            push_unique(&mut refs, "target-proof.json");
+        }
         FailurePhase::Checker => {
             if stage == "checker-pre-recommit" {
                 push_unique(&mut refs, "recovery-stability-report.json");

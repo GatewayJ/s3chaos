@@ -21,7 +21,7 @@ use crate::fault::{
     },
     quorum::{QuorumCaseClass, QuorumMutationClass},
     workload::{
-        GetObjectResult, ObjectSpec, S3WorkloadClient, StagedMultipartUpload, WorkloadOperation,
+        ObjectSpec, S3WorkloadClient, StagedMultipartUpload, WorkloadOperation,
         WorkloadOperationMix, WorkloadPlan, WriteProbeScope, sha256_hex,
     },
 };
@@ -851,7 +851,14 @@ async fn execute_mixed_operation(
             result.mutation_sequence = Some(next_mutation_sequence.fetch_add(1, Ordering::Relaxed));
             result.multipart_completes.push(complete_outcome);
             if complete_outcome == OperationOutcome::Ok {
-                let get = s3.get_object_result(&spec.key, history).await?;
+                let get = s3
+                    .verify_mutation_result(
+                        complete_record
+                            .as_ref()
+                            .context("acknowledged completion has no record")?,
+                        history,
+                    )
+                    .await?;
                 let verified = get
                     .body
                     .as_deref()
@@ -1265,6 +1272,22 @@ pub(in crate::fault) struct MixedWorkloadResult {
 }
 
 impl MixedWorkloadResult {
+    pub(in crate::fault) fn skipped_after_unqualified_activation(
+        plan: &WorkloadPlan,
+        scenario: &str,
+        run_id: &str,
+    ) -> Self {
+        Self {
+            summary: WorkloadSummary::new(plan, scenario, run_id),
+            unconfirmed_puts: Vec::new(),
+            commit_probe: ReadProbeSummary {
+                objects: 0,
+                verified: 0,
+                failures: Vec::new(),
+            },
+        }
+    }
+
     pub(in crate::fault) fn seal_recommit_candidates(
         &mut self,
         s3: &S3WorkloadClient,
@@ -2177,6 +2200,11 @@ mod tests {
             value_sha256: Some(committed_sha256.clone()),
             size_bytes: Some(size_bytes),
             version_id: None,
+            request_version_id: None,
+            is_delete_marker: None,
+            mutation_max_attempts: None,
+            mutation_attempts: None,
+            read_purpose: None,
             listed_keys: None,
             listed_versions: None,
             payload_ref,
@@ -2959,7 +2987,7 @@ pub(in crate::fault) async fn probe_read_cohort(
     );
     let outcomes = stream::iter(prefilled.iter())
         .map(|object| async move {
-            let get = s3.get_object_result(&object.key, history).await?;
+            let get = s3.get_cohort_probe_result(&object.key, history).await?;
             let failure = match (get.outcome, get.body.as_deref()) {
                 (OperationOutcome::Ok, Some(body)) if object.matches_body(body) => None,
                 (OperationOutcome::Ok, Some(body)) => Some(format!(
@@ -3202,8 +3230,33 @@ impl WorkloadSummary {
         min_success_percent: u8,
         served_by_pod: Option<String>,
     ) -> AvailabilityReport {
+        let report = AvailabilityReport {
+            scenario: self.scenario.clone(),
+            run_id: self.run_id.clone(),
+            min_success_percent,
+            served_by_pod,
+            commit_probe,
+            read_probe,
+            workload: self.family_availability(),
+            violations: Vec::new(),
+            passed: false,
+        };
+        report.rebuild_verdict(self.puts.ok.saturating_add(self.multipart_completes.ok))
+    }
+}
+
+impl AvailabilityReport {
+    pub(in crate::fault) fn rebuild_verdict(&self, expected_commits: usize) -> Self {
+        let Self {
+            min_success_percent,
+            served_by_pod,
+            commit_probe,
+            read_probe,
+            workload,
+            ..
+        } = self.clone();
         let mut violations = Vec::new();
-        let expected_commits = self.puts.ok.saturating_add(self.multipart_completes.ok);
+
         if commit_probe.objects != expected_commits {
             violations.push(format!(
                 "fault-active commit probe covers {} acknowledged commits, but the workload summary records {expected_commits}",
@@ -3238,7 +3291,7 @@ impl WorkloadSummary {
                     .join(", ")
             ));
         }
-        let workload = self.family_availability();
+
         for family in &workload {
             if family.total < MIN_AVAILABILITY_FAMILY_TOTAL {
                 violations.push(format!(
@@ -3268,6 +3321,232 @@ impl WorkloadSummary {
             passed: violations.is_empty(),
             violations,
         }
+    }
+}
+
+pub(in crate::fault) fn cohort_probe_reads<'a>(
+    history: &'a [OperationRecord],
+    count: usize,
+    run_id: &str,
+) -> Result<Vec<&'a OperationRecord>> {
+    let prefix = ObjectSpec::key_prefix(run_id);
+    let prefill = history
+        .iter()
+        .filter(|r| {
+            r.durability_cohort == Some(DurabilityCohort::PreFault)
+                && r.kind == OperationKind::Put
+                && r.outcome == OperationOutcome::Ok
+                && r.key.as_deref().is_some_and(|key| key.starts_with(&prefix))
+        })
+        .filter_map(|r| r.key.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        prefill.len() == count,
+        "availability history does not cover the prefilled cohort"
+    );
+    let reads = history
+        .iter()
+        .filter(|r| {
+            r.durability_cohort == Some(DurabilityCohort::FaultActive) && r.is_cohort_probe()
+        })
+        .collect::<Vec<_>>();
+    let keys = reads
+        .iter()
+        .filter_map(|r| r.key.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        reads.len() == count
+            && keys == prefill
+            && reads.iter().all(|r| r.kind == OperationKind::Get
+                && r.range.is_none()
+                && r.verification_of().is_none()),
+        "availability history lacks one initial full GET per prefilled object"
+    );
+    let mixed_started = history
+        .iter()
+        .filter(|r| {
+            r.durability_cohort == Some(DurabilityCohort::FaultActive) && !r.is_cohort_probe()
+        })
+        .filter_map(|r| r.started_sequence)
+        .min();
+    ensure!(
+        reads.iter().all(|r| r
+            .ended_sequence
+            .is_some_and(|end| mixed_started.is_none_or(|start| end < start))),
+        "cohort probe did not finish before the mixed workload"
+    );
+    Ok(reads)
+}
+
+impl AvailabilityReport {
+    pub(in crate::fault) fn authenticate_probes(
+        &self,
+        history: &[OperationRecord],
+        prefilled: usize,
+    ) -> Result<()> {
+        let reads = cohort_probe_reads(history, prefilled, &self.run_id)?;
+        let prefill = history
+            .iter()
+            .filter(|r| {
+                r.kind == OperationKind::Put
+                    && r.outcome == OperationOutcome::Ok
+                    && r.durability_cohort == Some(DurabilityCohort::PreFault)
+            })
+            .filter_map(|r| r.key.as_deref().map(|key| (key, r)))
+            .collect::<BTreeMap<_, _>>();
+        let prefill_keys = reads
+            .iter()
+            .filter_map(|r| r.key.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut verifications = BTreeMap::<&str, Vec<&OperationRecord>>::new();
+        let mut mutation_starts = BTreeMap::<&str, Vec<u64>>::new();
+        for record in history
+            .iter()
+            .filter(|r| r.durability_cohort == Some(DurabilityCohort::FaultActive))
+        {
+            if let Some(id) = record.verification_of() {
+                verifications.entry(id).or_default().push(record);
+            }
+            if matches!(
+                record.kind,
+                OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+            ) {
+                mutation_starts
+                    .entry(record.key.as_deref().context("mutation has no key")?)
+                    .or_default()
+                    .push(
+                        record
+                            .started_sequence
+                            .context("mutation has no start sequence")?,
+                    );
+            }
+        }
+        for starts in mutation_starts.values_mut() {
+            starts.sort_unstable();
+        }
+        let mut failures = Vec::new();
+        for get in &reads {
+            let write = prefill
+                .get(get.key.as_deref().context("availability GET has no key")?)
+                .context("availability probe has no committed prefill")?;
+            let key = get.key.as_deref().context("availability GET has no key")?;
+            ensure!(
+                write
+                    .ended_sequence
+                    .zip(get.started_sequence)
+                    .is_some_and(|(end, start)| end < start),
+                "availability GET precedes its prefill"
+            );
+            if probe_read_matches(write, get)? {
+                continue;
+            }
+            failures.push(if get.outcome == OperationOutcome::Ok {
+                format!(
+                    "{key}: wrong bytes (expected size={} sha256={}, got size={} sha256={})",
+                    write.size_bytes.context("prefill has no size")?,
+                    write
+                        .value_sha256
+                        .as_deref()
+                        .context("prefill has no hash")?,
+                    get.size_bytes.context("successful GET has no size")?,
+                    get.value_sha256
+                        .as_deref()
+                        .context("successful GET has no hash")?
+                )
+            } else {
+                format!(
+                    "{key}: {:?}{}{}",
+                    get.outcome,
+                    get.http_status
+                        .map(|status| format!(" http_status={status}"))
+                        .unwrap_or_default(),
+                    get.error
+                        .as_deref()
+                        .map(|error| format!(" error={error}"))
+                        .unwrap_or_default()
+                )
+            });
+        }
+        failures.sort();
+        ensure!(
+            self.read_probe
+                == ReadProbeSummary {
+                    objects: reads.len(),
+                    verified: reads.len() - failures.len(),
+                    failures
+                },
+            "availability read probe differs from history"
+        );
+
+        let mut commits = 0;
+        let mut failures = Vec::new();
+        for write in history.iter().filter(|r| {
+            r.durability_cohort == Some(DurabilityCohort::FaultActive)
+                && matches!(
+                    r.kind,
+                    OperationKind::Put | OperationKind::CompleteMultipartUpload
+                )
+                && r.outcome == OperationOutcome::Ok
+        }) {
+            commits += 1;
+            let linked = verifications.remove(write.id.as_str()).unwrap_or_default();
+            let [get] = linked.as_slice() else {
+                bail!("availability commit lacks exactly one linked verification GET");
+            };
+            ensure!(
+                get.kind == OperationKind::Get
+                    && get.key == write.key
+                    && get.bucket == write.bucket
+                    && get.range.is_none()
+                    && get.version_id.is_none()
+                    && get.durability_cohort == Some(DurabilityCohort::FaultActive)
+                    && write
+                        .ended_sequence
+                        .zip(get.started_sequence)
+                        .is_some_and(|(end, start)| end < start)
+                    && mutation_starts
+                        .get(write.key.as_deref().unwrap_or_default())
+                        .is_some_and(|starts| {
+                            let next = starts
+                                .partition_point(|start| Some(*start) <= write.ended_sequence);
+                            starts
+                                .get(next)
+                                .is_none_or(|start| Some(*start) > get.ended_sequence)
+                        }),
+                "availability verification GET is outside its acknowledged mutation window"
+            );
+            if probe_read_matches(write, get)? {
+                continue;
+            }
+            let operation = if write.kind == OperationKind::CompleteMultipartUpload {
+                "CompleteMultipartUpload"
+            } else if prefill_keys.contains(write.key.as_deref().unwrap_or_default()) {
+                "overwrite PUT"
+            } else {
+                "PUT"
+            };
+            failures.push(format!("{}: {operation} committed but its verification GET did not return the committed bytes (outcome={:?}, expected size={} sha256={})",
+                write.key.as_deref().context("commit has no key")?, Some(get.outcome), write.size_bytes.context("commit has no size")?, write.value_sha256.as_deref().context("commit has no hash")?));
+        }
+        ensure!(
+            verifications.is_empty(),
+            "availability history contains an unbound verification GET"
+        );
+        failures.sort();
+        ensure!(
+            self.commit_probe
+                == ReadProbeSummary {
+                    objects: commits,
+                    verified: commits - failures.len(),
+                    failures
+                },
+            "availability commit probe differs from history"
+        );
+        ensure!(
+            self == &self.rebuild_verdict(commits),
+            "availability verdict or violations differ from authenticated observations"
+        );
+        Ok(())
     }
 }
 
@@ -3357,18 +3636,254 @@ impl PostRecoveryWriteReport {
     }
 }
 
-fn get_failure_reason(get: &GetObjectResult) -> String {
-    format!(
-        "{:?}{}{}",
-        get.outcome,
-        get.http_status
-            .map(|status| format!(" http_status={status}"))
-            .unwrap_or_default(),
-        get.error
-            .as_deref()
-            .map(|error| format!(" error={error}"))
-            .unwrap_or_default()
-    )
+/// Replay the probe protocol, including failed requests. Missing transitions are
+/// invalid evidence, while completed negative observations produce a failed report.
+struct WriteProbeHistory<'a> {
+    records: BTreeMap<&'a str, std::collections::VecDeque<&'a OperationRecord>>,
+}
+
+impl<'a> WriteProbeHistory<'a> {
+    fn new(history: &'a [OperationRecord]) -> Result<Self> {
+        let mut records: BTreeMap<&str, std::collections::VecDeque<&OperationRecord>> =
+            BTreeMap::new();
+        for record in history {
+            let key = record
+                .key
+                .as_deref()
+                .context("write probe request has no key")?;
+            ensure!(
+                record.range.is_none()
+                    && (record.version_id.is_none() || record.kind != OperationKind::Get),
+                "write probe contains a ranged or versioned GET"
+            );
+            records.entry(key).or_default().push_back(record);
+        }
+        Ok(Self { records })
+    }
+
+    fn take(&mut self, key: &str, kind: OperationKind, after: u64) -> Result<&'a OperationRecord> {
+        let record = self
+            .records
+            .get_mut(key)
+            .and_then(|records| records.pop_front())
+            .with_context(|| format!("write probe lacks {kind:?} for {key:?}"))?;
+        ensure!(
+            record.kind == kind
+                && record.started_sequence.is_some_and(|start| start > after)
+                && record
+                    .ended_sequence
+                    .zip(record.started_sequence)
+                    .is_some_and(|(end, start)| end > start),
+            "write probe has an unexpected or out-of-order request for {key:?}: {:?}",
+            record.kind
+        );
+        Ok(record)
+    }
+
+    fn multipart(&mut self, key: &str, after: u64) -> Result<(Option<&'a OperationRecord>, u64)> {
+        let create = self.take(key, OperationKind::CreateMultipartUpload, after)?;
+        let mut ended = create.ended_sequence.unwrap();
+        if create.outcome != OperationOutcome::Ok {
+            return Ok((None, ended));
+        }
+        let mut parts = 0;
+        while self
+            .records
+            .get(key)
+            .and_then(|records| records.front())
+            .is_some_and(|r| r.kind == OperationKind::UploadPart)
+        {
+            let part = self.take(key, OperationKind::UploadPart, ended)?;
+            ended = part.ended_sequence.unwrap();
+            parts += 1;
+            if part.outcome != OperationOutcome::Ok {
+                let abort = self.take(key, OperationKind::AbortMultipartUpload, ended)?;
+                ensure!(
+                    matches!(
+                        abort.outcome,
+                        OperationOutcome::Ok | OperationOutcome::NotFound
+                    ),
+                    "failed multipart staging lacks successful cleanup"
+                );
+                return Ok((None, abort.ended_sequence.unwrap()));
+            }
+        }
+        ensure!(parts > 0, "multipart probe lacks upload parts");
+        let complete = self.take(key, OperationKind::CompleteMultipartUpload, ended)?;
+        ended = complete.ended_sequence.unwrap();
+        if complete.outcome != OperationOutcome::Ok
+            && self
+                .records
+                .get(key)
+                .and_then(|records| records.front())
+                .is_some_and(|r| r.kind == OperationKind::AbortMultipartUpload)
+        {
+            let abort = self.take(key, OperationKind::AbortMultipartUpload, ended)?;
+            ensure!(
+                matches!(
+                    abort.outcome,
+                    OperationOutcome::Ok | OperationOutcome::NotFound
+                ),
+                "failed multipart completion lacks successful cleanup"
+            );
+            ended = abort.ended_sequence.unwrap();
+        }
+        Ok((Some(complete), ended))
+    }
+}
+
+impl PostRecoveryWriteReport {
+    pub(in crate::fault) fn rebuild_from_history(
+        &self,
+        history: &[OperationRecord],
+    ) -> Result<Self> {
+        let mut replay = WriteProbeHistory::new(history)?;
+        let key = |index| format!("{}object-{index:06}", self.key_prefix);
+        let mut rebuilt = Self {
+            puts_verified: 0,
+            deletes_verified_absent: 0,
+            multipart_completes_verified: 0,
+            multipart_aborts_ok: 0,
+            lists_verified: 0,
+            failures: Vec::new(),
+            passed: false,
+            ..self.clone()
+        };
+        let mut writes_ended = 0;
+        for index in 0..self.objects {
+            let key = key(index);
+            let put = replay.take(&key, OperationKind::Put, 0)?;
+            let mut ended = put.ended_sequence.unwrap();
+            if put.outcome == OperationOutcome::Ok {
+                let get = replay.take(&key, OperationKind::Get, ended)?;
+                ended = get.ended_sequence.unwrap();
+                if probe_read_matches(put, get)? {
+                    rebuilt.puts_verified += 1;
+                } else {
+                    rebuilt.failures.push(format!(
+                        "get {key}: did not return the acknowledged PUT bytes"
+                    ));
+                }
+            } else {
+                rebuilt
+                    .failures
+                    .push(format!("put {key}: {:?}", put.outcome));
+            }
+            writes_ended = writes_ended.max(ended);
+        }
+        let multipart_key = key(self.objects);
+        let (complete, mut ended) = replay.multipart(&multipart_key, writes_ended)?;
+        match complete {
+            Some(complete) if complete.outcome == OperationOutcome::Ok => {
+                let get = replay.take(&multipart_key, OperationKind::Get, ended)?;
+                ended = get.ended_sequence.unwrap();
+                if probe_read_matches(complete, get)? {
+                    rebuilt.multipart_completes_verified = 1;
+                } else {
+                    rebuilt.failures.push(format!(
+                        "get {multipart_key}: did not return the acknowledged multipart bytes"
+                    ));
+                }
+            }
+            Some(complete) => rebuilt.failures.push(format!(
+                "complete-multipart {multipart_key}: {:?}",
+                complete.outcome
+            )),
+            None => rebuilt.failures.push(format!(
+                "complete-multipart {multipart_key}: upload staging failed before completion"
+            )),
+        }
+        let abort_key = key(self.objects + 1);
+        let create = replay.take(&abort_key, OperationKind::CreateMultipartUpload, ended)?;
+        ended = create.ended_sequence.unwrap();
+        let abort_outcome = if create.outcome == OperationOutcome::Ok {
+            let abort = replay.take(&abort_key, OperationKind::AbortMultipartUpload, ended)?;
+            ended = abort.ended_sequence.unwrap();
+            abort.outcome
+        } else {
+            OperationOutcome::Unknown
+        };
+        if abort_outcome == OperationOutcome::Ok {
+            rebuilt.multipart_aborts_ok = 1;
+        } else {
+            rebuilt
+                .failures
+                .push(format!("abort-multipart {abort_key}: {abort_outcome:?}"));
+        }
+        let mut expected_live = (0..self.objects).map(key).collect::<Vec<_>>();
+        if rebuilt.multipart_completes_verified == 1 {
+            expected_live.push(multipart_key.clone());
+        }
+        expected_live.sort();
+        let live = replay.take(&self.key_prefix, OperationKind::List, ended)?;
+        if probe_list_matches(live, &expected_live) {
+            rebuilt.lists_verified += 1;
+        } else {
+            rebuilt.failures.push(format!(
+                "list {}: did not return the live probe keys",
+                self.key_prefix
+            ));
+        }
+        let mut deletes_ended = live.ended_sequence.unwrap();
+        for target in &expected_live {
+            let delete =
+                replay.take(target, OperationKind::Delete, live.ended_sequence.unwrap())?;
+            let mut ended = delete.ended_sequence.unwrap();
+            if delete.outcome == OperationOutcome::Ok {
+                let get = replay.take(target, OperationKind::Get, ended)?;
+                ended = get.ended_sequence.unwrap();
+                if get.outcome == OperationOutcome::NotFound && get.http_status == Some(404) {
+                    if target != &multipart_key {
+                        rebuilt.deletes_verified_absent += 1;
+                    }
+                } else {
+                    rebuilt
+                        .failures
+                        .push(format!("get {target}: did not prove absence after DELETE"));
+                }
+            } else {
+                rebuilt
+                    .failures
+                    .push(format!("delete {target}: {:?}", delete.outcome));
+            }
+            deletes_ended = deletes_ended.max(ended);
+        }
+        let empty = replay.take(&self.key_prefix, OperationKind::List, deletes_ended)?;
+        if probe_list_matches(empty, &[]) {
+            rebuilt.lists_verified += 1;
+        } else {
+            rebuilt.failures.push(format!(
+                "list {}: did not prove the probe prefix empty",
+                self.key_prefix
+            ));
+        }
+        ensure!(
+            replay.records.values().all(|records| records.is_empty()),
+            "write probe contains extra requests"
+        );
+        rebuilt.failures.sort();
+        rebuilt.passed = rebuilt.failures.is_empty() && rebuilt.success_predicate();
+        Ok(rebuilt)
+    }
+}
+
+fn probe_read_matches(write: &OperationRecord, get: &OperationRecord) -> Result<bool> {
+    ensure!(
+        write.value_sha256.is_some() && write.size_bytes.is_some(),
+        "write probe mutation lacks payload identity"
+    );
+    Ok(get.outcome == OperationOutcome::Ok
+        && get.http_status == Some(200)
+        && get.value_sha256 == write.value_sha256
+        && get.size_bytes == write.size_bytes)
+}
+
+fn probe_list_matches(record: &OperationRecord, expected: &[String]) -> bool {
+    let Some(mut listed) = record.listed_keys.clone() else {
+        return false;
+    };
+    listed.sort();
+    record.outcome == OperationOutcome::Ok && record.http_status == Some(200) && listed == expected
 }
 
 /// Run `operations` with bounded concurrency so that every started operation
@@ -3420,22 +3935,13 @@ pub(in crate::fault) async fn run_post_recovery_write_probe(
         object_count,
         concurrency,
         deadline,
-    } = request;
-    let scope = *scope;
-    let object_count = *object_count;
+    } = *request;
     ensure!(
         object_count >= POST_RECOVERY_MIN_OBJECTS,
         "post-recovery write probe needs at least {POST_RECOVERY_MIN_OBJECTS} objects"
     );
     let prefix = scope.key_prefix(run_id);
     let started_at_ms = now_ms();
-    let failures = AsyncMutex::new(Vec::<String>::new());
-    let record_failure = |message: String| {
-        let failures = &failures;
-        async move { failures.lock().await.push(message) }
-    };
-
-    // Phase 1: PUT + GET verify every object.
     let objects = (0..object_count)
         .map(|index| {
             ObjectSpec::prepare_write_probe(
@@ -3443,243 +3949,88 @@ pub(in crate::fault) async fn run_post_recovery_write_probe(
                 run_id,
                 index,
                 post_recovery_object_size(index),
-                *seed,
+                seed,
             )
         })
         .collect::<Vec<_>>();
-    let puts_verified = finalize_bounded(
-        *deadline,
-        (*concurrency).clamp(1, 8),
+    finalize_bounded(
+        deadline,
+        concurrency.clamp(1, 8),
         objects.iter().map(|object| async {
             let put = s3.put_object_record(object, history).await?;
-            if put.outcome != OperationOutcome::Ok {
-                record_failure(format!(
-                    "put {}: {:?}{}",
-                    object.spec.key,
-                    put.outcome,
-                    put.error
-                        .as_deref()
-                        .map(|error| format!(" error={error}"))
-                        .unwrap_or_default()
-                ))
-                .await;
-                return Ok::<bool, anyhow::Error>(false);
+            if put.outcome == OperationOutcome::Ok {
+                s3.get_object_result(&object.spec.key, history).await?;
             }
-            let get = s3.get_object_result(&object.spec.key, history).await?;
-            match (get.outcome, get.body.as_deref()) {
-                (OperationOutcome::Ok, Some(body)) if object.spec.matches_body(body) => Ok(true),
-                (OperationOutcome::Ok, Some(body)) => {
-                    record_failure(format!(
-                        "get {}: wrong bytes after acknowledged PUT (expected sha256={}, got sha256={})",
-                        object.spec.key,
-                        object.spec.sha256,
-                        sha256_hex(body)
-                    ))
-                    .await;
-                    Ok(false)
-                }
-                _ => {
-                    record_failure(format!(
-                        "get {}: {} after acknowledged PUT",
-                        object.spec.key,
-                        get_failure_reason(&get)
-                    ))
-                    .await;
-                    Ok(false)
-                }
-            }
+            Ok(())
         }),
     )
-    .await?
-    .into_iter()
-    .filter(|verified| *verified)
-    .count();
+    .await?;
 
-    // Phase 2: one multipart completion and one multipart abort.
     deadline.check()?;
     let multipart = ObjectSpec::prepare_write_probe(
         scope,
         run_id,
         object_count,
         POST_RECOVERY_MULTIPART_SIZE_BYTES,
-        *seed,
+        seed,
     );
-    let multipart_completes_verified = match s3
+    let multipart_verified = match s3
         .complete_multipart_object_record(&multipart, history)
         .await?
     {
         Some(record) if record.outcome == OperationOutcome::Ok => {
             let get = s3.get_object_result(&multipart.spec.key, history).await?;
-            match (get.outcome, get.body.as_deref()) {
-                (OperationOutcome::Ok, Some(body)) if multipart.spec.matches_body(body) => 1,
-                _ => {
-                    record_failure(format!(
-                        "get {}: {} after acknowledged CompleteMultipartUpload",
-                        multipart.spec.key,
-                        get_failure_reason(&get)
-                    ))
-                    .await;
-                    0
-                }
-            }
-        }
-        Some(record) => {
-            record_failure(format!(
-                "complete-multipart {}: {:?}{}",
-                multipart.spec.key,
-                record.outcome,
-                record
-                    .error
+            get.outcome == OperationOutcome::Ok
+                && get
+                    .body
                     .as_deref()
-                    .map(|error| format!(" error={error}"))
-                    .unwrap_or_default()
-            ))
-            .await;
-            0
+                    .is_some_and(|body| multipart.spec.matches_body(body))
         }
-        None => {
-            record_failure(format!(
-                "complete-multipart {}: upload staging failed before completion",
-                multipart.spec.key
-            ))
-            .await;
-            0
-        }
+        _ => false,
     };
-    let abort_target =
-        ObjectSpec::prepare_write_probe(scope, run_id, object_count + 1, 4096, *seed);
-    let multipart_aborts_ok = match s3.abort_multipart_object(&abort_target, history).await? {
-        OperationOutcome::Ok => 1,
-        outcome => {
-            record_failure(format!(
-                "abort-multipart {}: {outcome:?}",
-                abort_target.spec.key
-            ))
-            .await;
-            0
-        }
-    };
+    let abort_target = ObjectSpec::prepare_write_probe(scope, run_id, object_count + 1, 4096, seed);
+    s3.abort_multipart_object(&abort_target, history).await?;
 
-    // Phase 3: LIST must show exactly the live probe objects.
     deadline.check()?;
-    let mut lists_verified = 0usize;
-    let mut expected_live = objects
-        .iter()
-        .map(|object| object.spec.key.clone())
-        .collect::<Vec<_>>();
-    if multipart_completes_verified == 1 {
-        expected_live.push(multipart.spec.key.clone());
-    }
-    expected_live.sort();
-    match s3.list_prefix(&prefix, history).await? {
-        Some(mut listed) => {
-            listed.sort();
-            if listed == expected_live {
-                lists_verified += 1;
-            } else {
-                record_failure(format!(
-                    "list {prefix}: expected {} live keys, listed {} (missing={:?} unexpected={:?})",
-                    expected_live.len(),
-                    listed.len(),
-                    expected_live
-                        .iter()
-                        .filter(|key| listed.binary_search(key).is_err())
-                        .take(5)
-                        .collect::<Vec<_>>(),
-                    listed
-                        .iter()
-                        .filter(|key| expected_live.binary_search(key).is_err())
-                        .take(5)
-                        .collect::<Vec<_>>()
-                ))
-                .await;
-            }
-        }
-        None => record_failure(format!("list {prefix}: did not complete after PUTs")).await,
-    }
-
-    // Phase 4: DELETE every probe object and prove it is gone.
+    s3.list_prefix(&prefix, history).await?;
     let mut delete_targets = objects
         .iter()
         .map(|object| object.spec.key.clone())
         .collect::<Vec<_>>();
-    if multipart_completes_verified == 1 {
+    if multipart_verified {
         delete_targets.push(multipart.spec.key.clone());
     }
-    let deletes_verified_absent = finalize_bounded(
-        *deadline,
-        (*concurrency).clamp(1, 8),
-        delete_targets.iter().map(|key| async move {
+    finalize_bounded(
+        deadline,
+        concurrency.clamp(1, 8),
+        delete_targets.iter().map(|key| async {
             let delete = s3.delete_object_record(key, history).await?;
-            if delete.outcome != OperationOutcome::Ok {
-                record_failure(format!(
-                    "delete {key}: {:?}{}",
-                    delete.outcome,
-                    delete
-                        .error
-                        .as_deref()
-                        .map(|error| format!(" error={error}"))
-                        .unwrap_or_default()
-                ))
-                .await;
-                return Ok::<bool, anyhow::Error>(false);
+            if delete.outcome == OperationOutcome::Ok {
+                s3.get_object_result(key, history).await?;
             }
-            let get = s3.get_object_result(key, history).await?;
-            if get.outcome == OperationOutcome::NotFound {
-                Ok(true)
-            } else {
-                record_failure(format!(
-                    "get {key}: {} after acknowledged DELETE",
-                    get_failure_reason(&get)
-                ))
-                .await;
-                Ok(false)
-            }
+            Ok(())
         }),
     )
-    .await?
-    .into_iter()
-    .filter(|verified| *verified)
-    .count();
-    // Count only the plain objects toward the object contract; the multipart
-    // key is verified through its own counter.
-    let deletes_verified_absent =
-        deletes_verified_absent.saturating_sub(usize::from(multipart_completes_verified == 1));
-
-    // Phase 5: LIST must be empty again.
+    .await?;
     deadline.check()?;
-    match s3.list_prefix(&prefix, history).await? {
-        Some(listed) if listed.is_empty() => lists_verified += 1,
-        Some(listed) => {
-            record_failure(format!(
-                "list {prefix}: {} key(s) still listed after acknowledged DELETEs: {:?}",
-                listed.len(),
-                listed.iter().take(5).collect::<Vec<_>>()
-            ))
-            .await
-        }
-        None => record_failure(format!("list {prefix}: did not complete after DELETEs")).await,
-    }
+    s3.list_prefix(&prefix, history).await?;
 
-    let mut failures = failures.into_inner();
-    failures.sort();
-    let report = PostRecoveryWriteReport {
+    PostRecoveryWriteReport {
         scenario: history.scenario(),
         run_id: history.run_id(),
         key_prefix: prefix,
         started_at_ms,
         completed_at_ms: now_ms(),
         objects: object_count,
-        puts_verified,
-        deletes_verified_absent,
-        multipart_completes_verified,
-        multipart_aborts_ok,
-        lists_verified,
-        failures,
+        puts_verified: 0,
+        deletes_verified_absent: 0,
+        multipart_completes_verified: 0,
+        multipart_aborts_ok: 0,
+        lists_verified: 0,
+        failures: Vec::new(),
         passed: false,
-    };
-    let passed = report.failures.is_empty() && report.success_predicate();
-    Ok(PostRecoveryWriteReport { passed, ..report })
+    }
+    .rebuild_from_history(&history.records())
 }
 
 #[cfg(test)]
@@ -3708,6 +4059,104 @@ mod post_recovery_tests {
         counts
     }
 
+    #[test]
+    fn availability_failure_must_match_prefill_and_linked_commit_reads() {
+        use crate::fault::history::{DurabilityCohort, OperationKind, Recorder};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Recorder::create(dir.path().join("history.jsonl"), "disk-full", "run-1")
+            .expect("recorder");
+        let prefill = crate::fault::workload::ObjectSpec::prepare_seeded("run-1", 0, 16, 7).spec;
+        recorder.set_durability_cohort(DurabilityCohort::PreFault);
+        let write = recorder.begin(
+            OperationKind::Put,
+            "bucket",
+            Some(prefill.key.clone()),
+            Some(prefill.sha256.clone()),
+            Some(prefill.size_bytes),
+        );
+        recorder
+            .finish(write, OperationOutcome::Ok, Some(200), None)
+            .expect("prefill");
+        recorder.set_durability_cohort(DurabilityCohort::FaultActive);
+        let mut read = recorder.begin(
+            OperationKind::Get,
+            "bucket",
+            Some(prefill.key.clone()),
+            Some(prefill.sha256.clone()),
+            Some(prefill.size_bytes),
+        );
+        read.read_purpose = Some(crate::fault::history::ReadPurpose::CohortProbe);
+        recorder
+            .finish(read, OperationOutcome::Ok, Some(200), None)
+            .expect("read probe");
+        let object = crate::fault::workload::ObjectSpec::prepare_seeded("run-1", 1, 16, 7).spec;
+        let write = recorder.begin(
+            OperationKind::Put,
+            "bucket",
+            Some(object.key.clone()),
+            Some(object.sha256.clone()),
+            Some(object.size_bytes),
+        );
+        let write = recorder
+            .finish(write, OperationOutcome::Ok, Some(200), None)
+            .expect("commit");
+        let mut get = recorder.begin(
+            OperationKind::Get,
+            "bucket",
+            Some(object.key.clone()),
+            None,
+            None,
+        );
+        get.read_purpose = Some(crate::fault::history::ReadPurpose::MutationVerification {
+            operation_id: write.id.clone(),
+        });
+        recorder
+            .finish(get, OperationOutcome::Failed, Some(503), None)
+            .expect("failed verification");
+        let mut task = super::MixedTaskResult::new(1);
+        task.record_committed_write("PUT", &object, Some(OperationOutcome::Failed), false);
+        let mut summary = WorkloadSummary::new(
+            &crate::fault::workload::WorkloadPlan::seeded(7, 12, 1),
+            "disk-full",
+            "run-1",
+        );
+        summary.puts = counts(1, 0, 0, 0);
+        let report = summary.availability_report(
+            super::committed_write_probe(&[task]),
+            ReadProbeSummary {
+                objects: 1,
+                verified: 1,
+                failures: Vec::new(),
+            },
+            99,
+            None,
+        );
+        let records = recorder.records();
+        assert!(!report.passed);
+        report
+            .authenticate_probes(&records, 1)
+            .expect("authenticated negative verdict");
+        let mut forged = report.clone();
+        forged.commit_probe.verified = 1;
+        forged.commit_probe.failures.clear();
+        forged = forged.rebuild_verdict(1);
+        assert!(forged.authenticate_probes(&records, 1).is_err());
+        let mut forged = report.clone();
+        forged.violations = vec!["unrelated failure".into()];
+        assert!(forged.authenticate_probes(&records, 1).is_err());
+        let mut unbound = records.clone();
+        unbound.last_mut().expect("GET").read_purpose = None;
+        assert!(report.authenticate_probes(&unbound, 1).is_err());
+        let mut reordered = records.clone();
+        reordered[1].started_sequence = Some(20);
+        reordered[1].ended_sequence = Some(21);
+        assert!(report.authenticate_probes(&reordered, 1).is_err());
+        let mut extra = records;
+        let mut duplicate = extra.last().expect("GET").clone();
+        duplicate.id = "duplicate".into();
+        extra.push(duplicate);
+        assert!(report.authenticate_probes(&extra, 1).is_err());
+    }
     #[test]
     fn family_availability_rounds_down_and_treats_not_found_as_served() {
         let family = FamilyAvailability::from_counts("get", &counts(198, 1, 1, 0));
