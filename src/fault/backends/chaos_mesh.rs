@@ -156,10 +156,19 @@ pub(crate) fn validate_fixed_volume_snapshot(
         .pointer("/spec")
         .context("IOChaos spec is missing")?;
     if let Some(expected) = contract.exact_pod_names {
-        let selected = spec
-            .pointer(&format!("/selector/pods/{}", contract.target_namespace))
+        let pods = spec
+            .pointer("/selector/pods")
+            .and_then(Value::as_object)
+            .context("IOChaos exact Pod selector is missing")?;
+        ensure!(
+            pods.len() == 1,
+            "IOChaos exact Pod selector contains another namespace"
+        );
+        let names = pods
+            .get(contract.target_namespace)
             .and_then(Value::as_array)
-            .context("IOChaos exact Pod selector is missing")?
+            .context("IOChaos exact Pod namespace is missing")?;
+        let selected = names
             .iter()
             .map(|pod| {
                 pod.as_str()
@@ -169,6 +178,8 @@ pub(crate) fn validate_fixed_volume_snapshot(
             .collect::<Result<BTreeSet<_>>>()?;
         ensure!(
             selected == *expected
+                && names.len() == expected.len()
+                && expected.len() == usize::try_from(contract.expected_targets)?
                 && spec.pointer("/selector/namespaces").is_none()
                 && spec.pointer("/selector/labelSelectors").is_none(),
             "runtime IOChaos exact Pod selector changed"
@@ -269,6 +280,16 @@ pub(crate) fn validate_fixed_volume_snapshot(
         pod_ids.is_subset(contract.candidate_pod_ids),
         "runtime IOChaos selected a target outside the proved Ready Pod set"
     );
+    if let Some(expected) = contract.exact_pod_names {
+        let expected_ids = expected
+            .iter()
+            .map(|pod| format!("{}/{}", contract.target_namespace, pod))
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            pod_ids == expected_ids,
+            "runtime IOChaos records differ from the exact Pod selector"
+        );
+    }
     Ok(record_ids)
 }
 
@@ -2180,6 +2201,28 @@ mod tests {
         };
         validate_fixed_volume_snapshot(&exact_resource, &exact_contract)
             .expect("exact Pod runtime proof");
+        for (pointer, value) in [
+            ("/spec/selector/pods/other", serde_json::json!(["rustfs-0"])),
+            (
+                "/spec/selector/pods/faults",
+                serde_json::json!(["rustfs-0", "rustfs-1", "rustfs-1"]),
+            ),
+            (
+                "/status/experiment/containerRecords/1/id",
+                serde_json::json!("faults/rustfs-2/rustfs"),
+            ),
+        ] {
+            let mut changed = exact_resource.clone();
+            if pointer == "/spec/selector/pods/other" {
+                changed["spec"]["selector"]["pods"]["other"] = value;
+            } else {
+                *changed.pointer_mut(pointer).expect("fixture field") = value;
+            }
+            assert!(
+                validate_fixed_volume_snapshot(&changed, &exact_contract).is_err(),
+                "reject changed {pointer}"
+            );
+        }
 
         for (pointer, value) in [
             ("/metadata/namespace", serde_json::json!("other-chaos")),

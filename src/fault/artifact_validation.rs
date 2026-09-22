@@ -3337,7 +3337,15 @@ fn validate_storage_recovery_execution_artifacts(
         &artifacts,
         FORCE_READ_PROOF_ARTIFACT,
     )?)?;
-    read_proof.validate_chain(&mappings, &replacement, &summary, &progress, &proof_history)?;
+    let original_target_proof = fs::read_to_string(required(&artifacts, "target-proof.json")?)?;
+    read_proof.validate_chain(
+        &mappings,
+        &replacement,
+        &summary,
+        &progress,
+        &proof_history,
+        &original_target_proof,
+    )?;
     ensure!(
         read_proof.chaos_namespace() == json_spec.cluster.chaos_namespace
             && replacement.replacement.namespace == json_spec.cluster.namespace
@@ -5321,6 +5329,8 @@ fn validate_quorum_activation_binding(
             run_id: &spec.metadata.run_id,
             scenario: &spec.scenario.name,
             volume_path: &activation.volume_path,
+            path: None,
+            exact_pod_names: None,
             expected_targets: volume_quorum.target_count,
             candidate_pod_ids: &candidates,
             runtime: &runtime,

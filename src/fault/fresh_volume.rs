@@ -269,6 +269,47 @@ fn validate_target_continuity(
     Ok(())
 }
 
+fn validate_replacement_membership(
+    original: &ErasureSetMembership,
+    current: &ErasureSetMembership,
+    old_volume: &StorageVolumeIdentity,
+    new_volume: &StorageVolumeIdentity,
+) -> Result<()> {
+    let mut expected = original.clone();
+    let target = expected
+        .members
+        .iter_mut()
+        .find(|member| member.pod_name == old_volume.pod)
+        .context("original volume is outside pre-replacement membership")?;
+    ensure!(
+        target.shard_ids.as_slice() == [old_volume.rustfs_drive_uuid.as_str()],
+        "original volume does not own the mapped shard"
+    );
+    target.pod_name = new_volume.pod.clone();
+    target.shard_ids = vec![new_volume.rustfs_drive_uuid.clone()];
+    ensure!(
+        expected == *current,
+        "runtime membership changed outside the replacement slot"
+    );
+    Ok(())
+}
+
+fn validate_rebuilt_shard(
+    original: &crate::fault::storage_recovery_helper::OfflineXl2InspectResponse,
+    rebuilt: &crate::fault::storage_recovery_helper::OfflineXl2InspectResponse,
+) -> Result<()> {
+    ensure!(
+        original.layout == rebuilt.layout
+            && original.selected_part.part_number == rebuilt.selected_part.part_number
+            && original.selected_part.relative_part_path
+                == rebuilt.selected_part.relative_part_path
+            && original.selected_part.shard_size_bytes == rebuilt.selected_part.shard_size_bytes
+            && original.selected_part.original_sha256 == rebuilt.selected_part.original_sha256,
+        "replacement shard differs from the sealed pre-replacement shard"
+    );
+    Ok(())
+}
+
 fn validate_read_result(
     outcome: OperationOutcome,
     http_status: Option<u16>,
@@ -406,7 +447,9 @@ impl FreshVolumeReadMatrixEvidence {
             )?;
         }
         ensure!(
-            self.shard_before_fault.request == self.shard_after_fault.request,
+            self.shard_before_fault.request == self.shard_after_fault.request
+                && self.shard_before_fault.response.inspection.layout
+                    == self.shard_after_fault.response.inspection.layout,
             "replacement shard inspection request changed during the causal read proof"
         );
         validate_target_continuity(
@@ -731,6 +774,7 @@ impl FreshVolumeReadMatrixEvidence {
         summary: &HealSummary,
         progress: &[HealProgressSample],
         records: &[crate::fault::history::OperationRecord],
+        original_target_proof_body: &str,
     ) -> Result<()> {
         self.validate(records)?;
         replacement.validate()?;
@@ -749,7 +793,60 @@ impl FreshVolumeReadMatrixEvidence {
                     == replacement.replacement.rustfs_drive_uuid,
             "fresh-volume evidence identities or mapping cardinality do not match"
         );
-        let mapping = mappings[0].validated_mapping(&self.membership, &self.shape)?;
+        let original_proof: TargetProof = serde_json::from_str(original_target_proof_body)?;
+        let original_erasure = original_proof
+            .faults
+            .first()
+            .and_then(|fault| fault.erasure_set.as_ref())
+            .context("original target proof lacks erasure membership")?;
+        let original_membership = original_erasure
+            .membership
+            .as_ref()
+            .context("original target proof lacks runtime members")?;
+        original_membership.validate(&self.shape)?;
+        ensure!(
+            original_proof.status == crate::fault::preflight::TargetProofStatus::Satisfied
+                && original_proof.scenario == self.identity.scenario
+                && original_proof.run_id == self.identity.run_id
+                && original_proof.namespace == replacement.original.namespace
+                && original_proof.tenant == replacement.original.tenant
+                && original_erasure.shape.as_ref() == Some(&self.shape)
+                && sha256_text(original_target_proof_body) == mappings[0].target_proof_sha256
+                && mappings[0].identity == self.identity
+                && mappings[0].source == ShardMappingSource::OfflineXl2Inspector,
+            "original shard mapping is not bound to its pre-replacement target proof"
+        );
+        let original = mappings[0]
+            .offline_evidence
+            .as_ref()
+            .context("original shard mapping lacks its offline inspection")?;
+        ensure!(
+            original.context.volume == replacement.original,
+            "original shard inspection belongs to another storage generation"
+        );
+        validate_replacement_membership(
+            original_membership,
+            &self.membership,
+            &replacement.original,
+            &replacement.replacement,
+        )?;
+        let mapping = mappings[0].validated_mapping(original_membership, &self.shape)?;
+        let original_shard: crate::fault::storage_recovery_helper::OfflineXl2InspectResponse =
+            serde_json::from_str(&mappings[0].response_body)?;
+        validate_rebuilt_shard(
+            &original_shard,
+            &self.shard_before_fault.response.inspection,
+        )?;
+        ensure!(
+            self.shard_before_fault.target_pod == replacement.replacement.pod
+                && self.shard_before_fault.target_pod_uid == replacement.replacement.pod_uid
+                && self.shard_before_fault.target_container_id
+                    == replacement.replacement.rustfs_container_id
+                && self.shard_before_fault.mount_path == replacement.replacement.mount_path
+                && replacement.replacement.observed_at_ms <= self.shard_before_fault.captured_at_ms
+                && summary.completed_at_ms <= self.shard_before_fault.captured_at_ms,
+            "replacement shard inspection is not bound to the adopted and healed storage generation"
+        );
         ensure!(
             mapping.bucket == self.identity.bucket
                 && mapping.object_key == self.object_key
@@ -4978,18 +5075,12 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 &serde_json::to_string_pretty(summary)?,
             )?;
         }
-        if let (Some(replacement_proof), Some(causal_read_proof), Some(proof_history)) = (
-            replacement_proof.as_ref(),
-            causal_read_proof.as_ref(),
-            proof_history.as_ref(),
-        ) {
-            causal_read_proof.validate(&proof_history.records())?;
+        if let Some(causal_read_proof) = &causal_read_proof {
             self.collector.write_text(
                 self.scenario.case_name,
                 FRESH_VOLUME_READ_PROOF_ARTIFACT,
                 &serde_json::to_string_pretty(causal_read_proof)?,
             )?;
-            replacement_proof.validate()?;
         }
         self.collector.write_text(
             self.scenario.case_name,
@@ -5028,6 +5119,27 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                     "membership": membership,
                     "observedAtMs": now_ms(),
                 }))?,
+            )?;
+        }
+        if let (Some(replacement_proof), Some(causal_read_proof), Some(proof_history)) = (
+            replacement_proof.as_ref(),
+            causal_read_proof.as_ref(),
+            proof_history.as_ref(),
+        ) {
+            let case_dir = self.collector.case_dir(self.scenario.case_name);
+            let mappings = serde_json::from_str::<Vec<VersionShardMappingObservation>>(
+                &fs::read_to_string(case_dir.join(VERSION_SHARD_MAPPING_ARTIFACT))?,
+            )?;
+            let original_target_proof = fs::read_to_string(case_dir.join("target-proof.json"))?;
+            causal_read_proof.validate_chain(
+                &mappings,
+                replacement_proof,
+                summary
+                    .as_ref()
+                    .context("causal read proof lacks completed heal evidence")?,
+                &progress,
+                &proof_history.records(),
+                &original_target_proof,
             )?;
         }
         Ok(())
@@ -5281,6 +5393,131 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn volume(generation: &str, observed_at_ms: u64) -> StorageVolumeIdentity {
+        StorageVolumeIdentity {
+            target_proof_sha256: "a".repeat(64),
+            host_storage_proof_sha256: "b".repeat(64),
+            rustfs_deployment_id: "deployment-1".to_string(),
+            namespace: "fault-run".to_string(),
+            tenant: "rustfs".to_string(),
+            pod: "rustfs-0".to_string(),
+            pod_uid: format!("pod-{generation}"),
+            rustfs_container_id: format!("containerd://{}", sha256_text(generation)),
+            volume_name: "data-0".to_string(),
+            persistent_volume_claim: "data-0-rustfs-0".to_string(),
+            persistent_volume_claim_uid: format!("pvc-{generation}"),
+            persistent_volume: format!("pv-{generation}"),
+            persistent_volume_uid: format!("pv-uid-{generation}"),
+            node: "worker-0".to_string(),
+            node_uid: "node-0".to_string(),
+            storage_class: "rustfs-local".to_string(),
+            local_volume_path: "/var/lib/rustfs/data0".to_string(),
+            mount_path: "/data0".to_string(),
+            canonical_device: format!("/dev/mapper/data-{generation}"),
+            target_mount_namespace_id: "mnt:[4026533000]".to_string(),
+            filesystem_uuid: format!("fs-{generation}"),
+            rustfs_drive_uuid: format!("drive-{generation}"),
+            pool_index: 0,
+            set_index: 0,
+            observed_at_ms,
+        }
+    }
+
+    #[test]
+    fn replacement_membership_binds_both_storage_generations() {
+        let mut old = volume("old", 100);
+        old.pod = "rustfs-0".to_string();
+        let mut new = volume("new", 300);
+        new.pod = old.pod.clone();
+        let original = ErasureSetMembership {
+            members: vec![
+                ErasureSetMember {
+                    pod_name: old.pod.clone(),
+                    server_endpoint: "server-0".to_string(),
+                    shard_ids: vec![old.rustfs_drive_uuid.clone()],
+                },
+                ErasureSetMember {
+                    pod_name: "rustfs-1".to_string(),
+                    server_endpoint: "server-1".to_string(),
+                    shard_ids: vec!["sibling".to_string()],
+                },
+            ],
+        };
+        let mut current = original.clone();
+        current.members[0].shard_ids = vec![new.rustfs_drive_uuid.clone()];
+        validate_replacement_membership(&original, &current, &old, &new)
+            .expect("replacement UUID may change");
+        let mut same_uuid = new.clone();
+        same_uuid.rustfs_drive_uuid = old.rustfs_drive_uuid.clone();
+        validate_replacement_membership(&original, &original, &old, &same_uuid)
+            .expect("format healing may preserve the slot UUID");
+        assert!(validate_replacement_membership(&current, &current, &old, &new).is_err());
+        current.members[1].shard_ids = vec!["foreign-sibling".to_string()];
+        assert!(validate_replacement_membership(&original, &current, &old, &new).is_err());
+    }
+
+    #[test]
+    fn rebuilt_shard_must_restore_the_sealed_shard_on_a_new_device() {
+        use crate::fault::storage_recovery_helper::{
+            OfflineInspectedShard, OfflineXl2InspectResponse,
+        };
+        use crate::fault::xl2_inspector::{
+            OFFLINE_XL2_INSPECTOR_REVISION, Xl2FormatProfile, Xl2ObjectVersionLayout,
+        };
+        let original = OfflineXl2InspectResponse {
+            mount_device_id: "8:1".to_string(),
+            drive_uuid: "old".to_string(),
+            format_json_sha256: "a".repeat(64),
+            xl_meta_sha256: "b".repeat(64),
+            layout: Xl2ObjectVersionLayout {
+                inspector_revision: OFFLINE_XL2_INSPECTOR_REVISION.to_string(),
+                profile: Xl2FormatProfile::LATEST_RUSTFS,
+                version_id: "version-1".to_string(),
+                data_directory: "data".to_string(),
+                erasure_data_shards: 2,
+                erasure_parity_shards: 2,
+                erasure_index: 1,
+                part_numbers: vec![1],
+                part_sizes: vec![1024],
+                relative_part_paths: vec!["bucket/key/data/part.1".to_string()],
+            },
+            selected_part: OfflineInspectedShard {
+                part_number: 1,
+                relative_part_path: "bucket/key/data/part.1".to_string(),
+                shard_device_id: "8:1".to_string(),
+                shard_inode: 42,
+                shard_size_bytes: 1024,
+                original_sha256: "c".repeat(64),
+            },
+        };
+        let mut rebuilt = original.clone();
+        rebuilt.mount_device_id = "8:2".to_string();
+        rebuilt.drive_uuid = "new".to_string();
+        rebuilt.format_json_sha256 = "d".repeat(64);
+        rebuilt.xl_meta_sha256 = "e".repeat(64);
+        rebuilt.selected_part.shard_device_id = "8:2".to_string();
+        rebuilt.selected_part.shard_inode = 99;
+        validate_rebuilt_shard(&original, &rebuilt)
+            .expect("physical and metadata generations may differ");
+        for corruption in ["bytes", "index", "version", "path", "size"] {
+            let mut altered = rebuilt.clone();
+            match corruption {
+                "bytes" => altered.selected_part.original_sha256 = "f".repeat(64),
+                "index" => altered.layout.erasure_index = 2,
+                "version" => altered.layout.version_id = "another-version".to_string(),
+                "path" => {
+                    altered.selected_part.relative_part_path = "bucket/key/other/part.1".to_string()
+                }
+                "size" => altered.selected_part.shard_size_bytes += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_rebuilt_shard(&original, &altered).is_err(),
+                "must reject changed {corruption}"
+            );
+        }
+    }
 
     fn target_fingerprint(
         pod_uid: &'static str,
