@@ -1095,6 +1095,10 @@ impl FaultRun<'_> {
             config.min_availability_percent,
             served_by_pod,
         );
+        report.authenticate_probes(
+            &self.context.history.records(),
+            self.context.workload_plan.object_count / 2,
+        )?;
         collector.write_text(
             scenario.case_name,
             AVAILABILITY_REPORT_ARTIFACT,

@@ -2173,6 +2173,17 @@ scenarios:
             evidence_ref("run-events.jsonl")
         ]);
         write_failure_summary(case_dir, summary.clone());
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms": 10, "scenario": planned.scenario, "run_id": planned.run_id, "stage": "run", "status": "started", "message": "started"}).to_string(),
+                json!({"at_ms": 83, "scenario": planned.scenario, "run_id": planned.run_id, "stage": "checker-pre-recommit", "status": "failed", "message": "recovery tail"}).to_string(),
+                json!({"at_ms": 84, "scenario": planned.scenario, "run_id": planned.run_id, "stage": "checker-pre-recommit-verdict", "status": "failed", "message": "recovery tail"}).to_string(),
+                json!({"at_ms": 90, "scenario": planned.scenario, "run_id": planned.run_id, "stage": "run", "status": "failed", "message": "failed"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write pre-recommit verdict events");
 
         validate_expected_failure_artifacts(
             &suite_root,
@@ -2598,6 +2609,8 @@ scenarios:
             case_dir.join("run-events.jsonl"),
             [
                 json!({"at_ms": 10, "scenario": planned.scenario, "run_id": run_id, "stage": "run", "status": "started", "message": "started"}).to_string(),
+                json!({"at_ms": 83, "scenario": planned.scenario, "run_id": run_id, "stage": "checker-final", "status": "failed", "message": "hash mismatch"}).to_string(),
+                json!({"at_ms": 84, "scenario": planned.scenario, "run_id": run_id, "stage": "checker-verdict", "status": "failed", "message": "hash mismatch"}).to_string(),
                 json!({"at_ms": 90, "scenario": planned.scenario, "run_id": run_id, "stage": "run", "status": "failed", "message": "failed"}).to_string(),
             ]
             .join("\n"),

@@ -98,7 +98,6 @@ impl FaultRun<'_> {
             if let Some(index) = staged_upload_index {
                 staged_uploads.remove(&index);
             }
-            self.deadline.check()?;
             self.prepare_ack_crash_boundary(&mut active, trigger)?;
             let removal = self.remove_fault(&mut active.fault)?;
             let mut no_staged_uploads = BTreeMap::new();
