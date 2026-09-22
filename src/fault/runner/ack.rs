@@ -98,7 +98,6 @@ impl FaultRun<'_> {
             if let Some(index) = staged_upload_index {
                 staged_uploads.remove(&index);
             }
-            self.deadline.check()?;
             self.prepare_ack_crash_boundary(&mut active, trigger)?;
             let removal = self.remove_fault(&mut active.fault)?;
             let mut no_staged_uploads = BTreeMap::new();
@@ -346,13 +345,15 @@ impl FaultRun<'_> {
             "the fault became active after the eligible ACK and within its deadline",
             Some(serde_json::to_value(&evidence)?),
         )?;
-        let active = self.complete_fault_activation(
-            target,
-            fault,
-            Some(fault_prepare_started_at_ms),
-            fault_apply_started_at_ms,
-            Some(fault_active_at_ms),
-        )?;
+        let active = self
+            .complete_fault_activation(
+                target,
+                fault,
+                Some(fault_prepare_started_at_ms),
+                fault_apply_started_at_ms,
+                Some(fault_active_at_ms),
+            )
+            .await?;
         Ok((active, evidence))
     }
 

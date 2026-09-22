@@ -71,6 +71,8 @@ pub(crate) struct VolumeTargetEvidenceContract<'a> {
     pub run_id: &'a str,
     pub scenario: &'a str,
     pub volume_path: &'a str,
+    pub path: Option<&'a str>,
+    pub exact_pod_names: Option<&'a BTreeSet<String>>,
     pub expected_targets: u32,
     pub candidate_pod_ids: &'a BTreeSet<String>,
     pub runtime: &'a IoChaosRuntimeContract,
@@ -150,18 +152,51 @@ pub(crate) fn validate_fixed_volume_snapshot(
                 == Some(contract.expected_targets),
         "runtime IOChaos does not match the fixed volume target count"
     );
-    validate_pod_selector(
-        resource
-            .pointer("/spec")
-            .context("IOChaos spec is missing")?,
-        "IOChaos",
-        contract.target_namespace,
-        contract.tenant,
-    )?;
+    let spec = resource
+        .pointer("/spec")
+        .context("IOChaos spec is missing")?;
+    if let Some(expected) = contract.exact_pod_names {
+        let pods = spec
+            .pointer("/selector/pods")
+            .and_then(Value::as_object)
+            .context("IOChaos exact Pod selector is missing")?;
+        ensure!(
+            pods.len() == 1,
+            "IOChaos exact Pod selector contains another namespace"
+        );
+        let names = pods
+            .get(contract.target_namespace)
+            .and_then(Value::as_array)
+            .context("IOChaos exact Pod namespace is missing")?;
+        let selected = names
+            .iter()
+            .map(|pod| {
+                pod.as_str()
+                    .map(str::to_string)
+                    .context("IOChaos exact Pod selector contains a non-string")
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        ensure!(
+            selected == *expected
+                && names.len() == expected.len()
+                && expected.len() == usize::try_from(contract.expected_targets)?
+                && spec.pointer("/selector/namespaces").is_none()
+                && spec.pointer("/selector/labelSelectors").is_none(),
+            "runtime IOChaos exact Pod selector changed"
+        );
+    } else {
+        validate_pod_selector(spec, "IOChaos", contract.target_namespace, contract.tenant)?;
+    }
     ensure!(
         resource.pointer("/spec/volumePath").and_then(Value::as_str) == Some(contract.volume_path)
             && resource.pointer("/spec/path").and_then(Value::as_str)
-                == Some(format!("{}/**/*", contract.volume_path).as_str()),
+                == Some(
+                    contract
+                        .path
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{}/**/*", contract.volume_path))
+                        .as_str(),
+                ),
         "runtime IOChaos volume path does not match the planned target"
     );
     ensure!(
@@ -245,6 +280,16 @@ pub(crate) fn validate_fixed_volume_snapshot(
         pod_ids.is_subset(contract.candidate_pod_ids),
         "runtime IOChaos selected a target outside the proved Ready Pod set"
     );
+    if let Some(expected) = contract.exact_pod_names {
+        let expected_ids = expected
+            .iter()
+            .map(|pod| format!("{}/{}", contract.target_namespace, pod))
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            pod_ids == expected_ids,
+            "runtime IOChaos records differ from the exact Pod selector"
+        );
+    }
     Ok(record_ids)
 }
 
@@ -1004,6 +1049,7 @@ pub struct IoChaosSpec {
     pub tenant_name: String,
     pub container_name: String,
     pub volume_path: String,
+    pub path: Option<String>,
     pub methods: Vec<String>,
     pub action: IoChaosAction,
     pub percent: u8,
@@ -1130,6 +1176,7 @@ impl IoChaosSpec {
             tenant_name: config.tenant_name.clone(),
             container_name: "rustfs".to_string(),
             volume_path: volume_path.into(),
+            path: None,
             methods: vec!["READ".to_string(), "WRITE".to_string()],
             action: IoChaosAction::Fault { errno: 5 },
             percent,
@@ -1170,6 +1217,7 @@ impl IoChaosSpec {
             tenant_name: config.tenant_name.clone(),
             container_name: "rustfs".to_string(),
             volume_path: volume_path.into(),
+            path: None,
             methods: vec!["READ".to_string()],
             action: IoChaosAction::Mistake {
                 filling: "random".to_string(),
@@ -1219,6 +1267,7 @@ impl IoChaosSpec {
             tenant_name: config.tenant_name.clone(),
             container_name: "rustfs".to_string(),
             volume_path: volume_path.into(),
+            path: None,
             methods: parameters.methods,
             action: IoChaosAction::Latency {
                 delay: parameters.delay,
@@ -1261,6 +1310,7 @@ impl IoChaosSpec {
             tenant_name: config.tenant_name.clone(),
             container_name: "rustfs".to_string(),
             volume_path: volume_path.into(),
+            path: None,
             methods: vec!["WRITE".to_string()],
             action: IoChaosAction::Fault { errno: 28 },
             percent,
@@ -1306,6 +1356,28 @@ impl IoChaosSpec {
         Ok(self)
     }
 
+    pub(crate) fn with_exact_path(mut self, path: impl Into<String>) -> Result<Self> {
+        let path = path.into();
+        ensure!(
+            path.starts_with(&format!("{}/", self.volume_path))
+                && !path.contains("/**")
+                && path
+                    .split('/')
+                    .all(|component| component != "." && component != "..")
+                && path.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+                }),
+            "IOChaos exact path must be a normalized child of volumePath"
+        );
+        self.path = Some(path);
+        Ok(self)
+    }
+
+    pub(crate) fn with_read_only(mut self) -> Self {
+        self.methods = vec!["READ".to_string()];
+        self
+    }
+
     pub fn with_name_suffix(mut self, suffix: &str) -> Self {
         self.name.push_str(suffix);
         self
@@ -1340,6 +1412,10 @@ impl IoChaosSpec {
             ),
         };
 
+        let path = self
+            .path
+            .clone()
+            .unwrap_or_else(|| format!("{}/**/*", self.volume_path));
         format!(
             r#"apiVersion: chaos-mesh.org/v1alpha1
 kind: IOChaos
@@ -1358,7 +1434,7 @@ spec:
   containerNames:
     - {container_name}
   volumePath: {volume_path}
-  path: {volume_path}/**/*
+  path: {path}
   methods:
 {methods}
   percent: {percent}
@@ -1375,6 +1451,7 @@ spec:
             selector = selector,
             container_name = self.container_name,
             volume_path = self.volume_path,
+            path = path,
             methods = methods,
             percent = self.percent,
             action = action,
@@ -1994,6 +2071,33 @@ mod tests {
     }
 
     #[test]
+    fn exact_part_read_fault_keeps_volume_and_path_scopes_distinct() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let spec = IoChaosSpec::eio_on_rustfs_volume(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "fresh-volume-replacement",
+            "/data/rustfs0",
+            100,
+            Duration::from_secs(60),
+        )
+        .expect("valid io chaos")
+        .with_read_only()
+        .with_exact_path("/data/rustfs0/bucket/key/data/part.1")
+        .expect("exact part path")
+        .with_exact_pods(vec!["rustfs-0".to_string()])
+        .expect("replacement Pod selector");
+        let manifest = spec.manifest();
+
+        assert!(manifest.contains("volumePath: /data/rustfs0"));
+        assert!(manifest.contains("path: /data/rustfs0/bucket/key/data/part.1"));
+        assert!(manifest.contains("methods:\n    - READ"));
+        assert!(!manifest.contains("    - WRITE"));
+        assert!(!manifest.contains(".metadata.bin"));
+    }
+
+    #[test]
     fn fixed_volume_manifest_and_runtime_records_prove_exact_targets() {
         let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
         let scenario = test_scenario("io-eio");
@@ -2028,6 +2132,8 @@ mod tests {
             run_id: "run-1",
             scenario: "io-eio",
             volume_path: "/data/rustfs0",
+            path: None,
+            exact_pod_names: None,
             expected_targets: 2,
             candidate_pod_ids: &candidates,
             runtime: &runtime_contract,
@@ -2081,8 +2187,45 @@ mod tests {
                 .map(str::to_string)
                 .collect()
         );
+        let exact_pods = ["rustfs-0", "rustfs-1"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut exact_resource = resource.clone();
+        exact_resource["spec"]["selector"] = serde_json::json!({
+            "pods": {"faults": ["rustfs-0", "rustfs-1"]}
+        });
+        let exact_contract = VolumeTargetEvidenceContract {
+            exact_pod_names: Some(&exact_pods),
+            ..contract
+        };
+        validate_fixed_volume_snapshot(&exact_resource, &exact_contract)
+            .expect("exact Pod runtime proof");
+        for (pointer, value) in [
+            ("/spec/selector/pods/other", serde_json::json!(["rustfs-0"])),
+            (
+                "/spec/selector/pods/faults",
+                serde_json::json!(["rustfs-0", "rustfs-1", "rustfs-1"]),
+            ),
+            (
+                "/status/experiment/containerRecords/1/id",
+                serde_json::json!("faults/rustfs-2/rustfs"),
+            ),
+        ] {
+            let mut changed = exact_resource.clone();
+            if pointer == "/spec/selector/pods/other" {
+                changed["spec"]["selector"]["pods"]["other"] = value;
+            } else {
+                *changed.pointer_mut(pointer).expect("fixture field") = value;
+            }
+            assert!(
+                validate_fixed_volume_snapshot(&changed, &exact_contract).is_err(),
+                "reject changed {pointer}"
+            );
+        }
 
         for (pointer, value) in [
+            ("/metadata/namespace", serde_json::json!("other-chaos")),
             ("/spec/action", serde_json::json!("latency")),
             ("/spec/errno", serde_json::json!(28)),
             ("/spec/methods", serde_json::json!(["WRITE"])),

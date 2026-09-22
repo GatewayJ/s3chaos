@@ -699,7 +699,7 @@ fn validate_fault_artifacts_command(mut args: impl Iterator<Item = String>) -> R
     let options = ArtifactValidationOptions::from_env(scenario, artifact_root)?;
     let report = validate_fault_artifacts_and_write_report(&options)?;
     if summary_tsv {
-        println!("{}", report.validation_summary_tsv_row());
+        println!("{}", report.validation_summary_tsv_row()?);
     } else {
         println!("{}", serde_json::to_string_pretty(&report)?);
     }

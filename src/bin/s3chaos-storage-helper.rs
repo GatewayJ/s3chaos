@@ -17,8 +17,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use anyhow::{Context, Result, bail, ensure};
 use s3chaos::fault::fresh_volume::{FreshVolumeHostProbeRequest, run_fresh_volume_host_probe};
 use s3chaos::fault::storage_recovery_helper::{
-    StaleOfflineHelperRequest, StorageHelperSession, StorageHelperSessionRequest,
-    StorageHelperSessionResponse, execute_stale_offline_helper,
+    FreshVolumeShardInspectionRequest, StaleOfflineHelperRequest, StorageHelperSession,
+    StorageHelperSessionRequest, StorageHelperSessionResponse, execute_stale_offline_helper,
+    inspect_fresh_volume_shard,
 };
 
 const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
@@ -48,9 +49,22 @@ fn main() -> Result<()> {
             .context("write typed fresh-volume host probe response")?;
         return Ok(());
     }
+    if args.as_slice().get(1).map(String::as_str) == Some("inspect-fresh-volume-shard") {
+        ensure!(
+            args.len() == 2,
+            "fresh-volume shard inspection accepts no free-form arguments"
+        );
+        let request: FreshVolumeShardInspectionRequest =
+            serde_json::from_reader(std::io::stdin().lock().take(MAX_REQUEST_BYTES + 1))
+                .context("decode typed fresh-volume shard inspection request")?;
+        let response = inspect_fresh_volume_shard(&request)?;
+        serde_json::to_writer(std::io::stdout().lock(), &response)
+            .context("write typed fresh-volume shard inspection response")?;
+        return Ok(());
+    }
     ensure!(
         args.len() == 1,
-        "storage helper accepts only closed hold, probe-fresh-volume, and stale one-shot operations"
+        "storage helper accepts only closed hold, fresh-volume probes, and stale one-shot operations"
     );
     let stdin = std::io::stdin();
     let mut input = BufReader::new(stdin.lock());
