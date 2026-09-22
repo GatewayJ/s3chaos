@@ -732,6 +732,13 @@ for index in 0 1; do
   token="${ACTIVE_QUORUM_DM_STATE_TOKENS[$index]}"
   jq -n --arg token "$token" '{schemaVersion:1,token:$token,ownerPid:222,phase:"active"}' >"$file"
   host_storage_mutation_active 111 "" "" || exit 21
+  probes=0 signals=""
+  process_group_alive() { probes=$((probes + 1)); (( probes <= 2 )); }
+  capture_process_group() { :; }
+  signal_process_group() { signals="$signals $3"; }
+  sleep() { :; }
+  terminate_process_group 111 111 "" "" "$2" 0
+  [[ "$signals" == " TERM" ]] || exit 27
   printf '{' >"$file"
   host_storage_mutation_active 111 "" "" || exit 22
   jq -n '{schemaVersion:1,token:"foreign",ownerPid:222,phase:"rollback"}' >"$file"
