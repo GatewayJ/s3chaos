@@ -104,7 +104,6 @@ Fresh-volume replacement and bitrot are executable through `fault-run` or a
 single-attempt `fault-suite-run`, with an explicit recovery case. Their four
 suite examples are in `fault/examples/`; each still requires dedicated storage,
 target proofs, destructive authorization, and the existing cleanup contracts.
-Executable status does not establish live calibration or release qualification.
 The existing `fault-qualify` interface remains available for all seven cases.
 
 ```bash
