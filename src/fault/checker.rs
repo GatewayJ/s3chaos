@@ -16,6 +16,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep as async_sleep, timeout};
 
@@ -57,6 +58,10 @@ pub struct CheckerOperationAudit {
     pub kind: OperationKind,
     pub key: Option<String>,
     pub version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_delete_marker: Option<bool>,
     pub observed_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<usize>,
@@ -340,7 +345,6 @@ impl CheckerReport {
             && self.hash_mismatches.is_empty()
             && self.successful_corrupted_reads.is_empty()
             && self.unexpected_visible_deleted_objects.is_empty()
-            && self.unknown_writes_materialized.is_empty()
             && self.unknown_write_value_conflicts.is_empty()
             && self.final_list_warning_count == 0
             && self.list_warnings.is_empty()
@@ -464,6 +468,8 @@ pub(crate) fn checker_operation_audits(records: &[OperationRecord]) -> Vec<Check
             kind: record.kind,
             key: record.key.clone(),
             version_id: record.version_id.clone(),
+            request_version_id: record.request_version_id.clone(),
+            is_delete_marker: record.is_delete_marker,
             observed_sha256: record.value_sha256.clone(),
             size_bytes: record.size_bytes,
             listed_keys: record.listed_keys.clone(),
@@ -483,6 +489,950 @@ pub(crate) fn validate_checker_audit_against_history(
 ) -> Result<()> {
     let (prefix, suffix) = validate_checker_audit_receipt(report, history)?;
     validate_successful_checker_observations(report, prefix, suffix)
+}
+
+pub(crate) fn validate_checker_failure_signal(report: &CheckerReport) -> Result<()> {
+    ensure!(
+        !report.passed && !report.success_predicate(),
+        "checker verdict report does not contain a failing S3-model observation"
+    );
+    ensure!(
+        report.failure_classification() != RecoveryStabilityClassification::HarnessError,
+        "checker verdict report has no classifiable S3-model observation"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_checker_failure_against_history(
+    report: &CheckerReport,
+    history: &[OperationRecord],
+) -> Result<()> {
+    let (prefix, suffix) = validate_checker_audit_receipt(report, history)?;
+    validate_checker_failure_signal(report)?;
+    let proven = authenticated_checker_failure_classifications(report, prefix, suffix)?;
+    let classification = report.failure_classification();
+    ensure!(
+        proven.contains(&classification),
+        "checker failure classification {:?} is not supported by authenticated history observations",
+        classification.as_str()
+    );
+    Ok(())
+}
+
+fn authenticated_checker_failure_classifications(
+    report: &CheckerReport,
+    prefix: &[OperationRecord],
+    suffix: &[OperationRecord],
+) -> Result<Vec<RecoveryStabilityClassification>> {
+    let model = object_model(prefix);
+    let mut proven = Vec::new();
+    let mut add = |classification| {
+        if !proven.contains(&classification) {
+            proven.push(classification);
+        }
+    };
+    let historical = successful_read_anomalies(prefix);
+    let mut authenticated_hash_mismatches = BTreeSet::new();
+    let authenticated_successful_corrupted_reads = historical
+        .corrupted_reads
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let authenticated_historical_deleted_objects = historical
+        .visible_deleted_objects
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut authenticated_resurrected_deleted_objects = BTreeSet::new();
+    let mut authenticated_ambiguous_delete_resurrections = BTreeSet::new();
+    let mut authenticated_listed_keys_unreadable = BTreeSet::new();
+    let mut authenticated_missing_committed_objects = BTreeSet::new();
+    let mut authenticated_version_hash_mismatches = BTreeSet::new();
+    let mut authenticated_missing_committed_versions = BTreeSet::new();
+    let mut authenticated_missing_committed_delete_markers = BTreeSet::new();
+    let mut authenticated_unavailable_committed_objects = Vec::new();
+    let mut authenticated_unknown_committed_read_failures = Vec::new();
+    let mut authenticated_unknown_write_value_conflicts = historical
+        .unknown_write_value_conflicts
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut authenticated_unknown_writes_materialized = historical
+        .unknown_writes_materialized
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut authenticated_unavailable_committed_versions = BTreeSet::new();
+    let mut authenticated_unexpected_listed_objects = BTreeSet::new();
+    let initial_lineage = committed_version_lineage(prefix);
+    let mut authenticated_delete_marker_lineage_incomplete = initial_lineage
+        .delete_marker_lineage_incomplete
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut authenticated_multipart_lineage_incomplete = initial_lineage
+        .multipart_upload_lineage_incomplete
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut authenticated_list_warnings = BTreeSet::new();
+    let mut authenticated_list_warning_count = 0_usize;
+    let mut authenticated_verified_live_objects = 0_usize;
+    let mut authenticated_verified_committed_versions = 0_usize;
+    let mut authenticated_tolerated_ambiguous_deletes = BTreeSet::new();
+    let mut authenticated_failed_writes_materialized = BTreeSet::new();
+    if !historical.corrupted_reads.is_empty()
+        || !historical.unknown_write_value_conflicts.is_empty()
+    {
+        add(RecoveryStabilityClassification::DataCorruption);
+    }
+    if !historical.visible_deleted_objects.is_empty() {
+        add(RecoveryStabilityClassification::DeletedObjectResurrected);
+    }
+
+    let mut current_gets = BTreeMap::<&str, &OperationRecord>::new();
+    let mut version_gets = BTreeMap::<(&str, &str), &OperationRecord>::new();
+    for record in suffix
+        .iter()
+        .filter(|record| record.kind == OperationKind::Get)
+    {
+        let key = record
+            .key
+            .as_deref()
+            .context("checker GET history record has no key")?;
+        if let Some(version_id) = record.version_id.as_deref() {
+            ensure!(
+                version_gets.insert((key, version_id), record).is_none(),
+                "checker issued duplicate version GETs for {key}@{version_id}"
+            );
+        } else {
+            ensure!(
+                current_gets.insert(key, record).is_none(),
+                "checker issued duplicate current GETs for {key}"
+            );
+        }
+    }
+
+    let record_object = |record: &OperationRecord| {
+        record
+            .value_sha256
+            .as_ref()
+            .zip(record.size_bytes)
+            .map(|(sha256, size_bytes)| ExpectedObject {
+                sha256: sha256.clone(),
+                size_bytes,
+            })
+    };
+    let mut materialized_ambiguous_write_keys = BTreeSet::new();
+    let mut ambiguous_delete_absent = BTreeSet::new();
+    let mut ambiguous_delete_present = BTreeSet::new();
+    let mut ambiguous_write_absent = BTreeSet::new();
+    let mut missing_live_keys = BTreeSet::new();
+    for (key, expected) in &model.live {
+        let Some(get) = current_gets.get(key.as_str()).copied() else {
+            continue;
+        };
+        if get.outcome == OperationOutcome::NotFound && model.ambiguous_delete_pending.contains(key)
+        {
+            ambiguous_delete_absent.insert(key.clone());
+            continue;
+        }
+        match (get.outcome, record_object(get)) {
+            (OperationOutcome::Ok, Some(actual)) if actual == *expected => {
+                authenticated_verified_live_objects += 1;
+                if model.unknown_writes.get(key).is_none_or(Vec::is_empty)
+                    && model.ambiguous_delete_pending.contains(key)
+                {
+                    ambiguous_delete_present.insert(key.clone());
+                }
+            }
+            (OperationOutcome::Ok, Some(actual)) => {
+                let attempts = model
+                    .unknown_writes
+                    .get(key)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                if let Some(attempt) = matching_active_ambiguous_object(attempts, &actual) {
+                    authenticated_verified_live_objects += 1;
+                    materialized_ambiguous_write_keys.insert(key.clone());
+                    authenticated_unknown_writes_materialized.insert(
+                        ambiguous_write_materialized_from_object_message(key, attempt, &actual),
+                    );
+                    add(RecoveryStabilityClassification::AmbiguousWriteMaterialized);
+                } else if let Some(attempt) =
+                    matching_superseded_ambiguous_object(attempts, &actual)
+                {
+                    authenticated_unknown_writes_materialized.insert(
+                        ambiguous_write_materialized_from_object_message(key, attempt, &actual),
+                    );
+                    authenticated_unknown_write_value_conflicts.insert(
+                        superseded_ambiguous_object_conflict_message(
+                            key,
+                            Some(expected),
+                            attempt,
+                            &actual,
+                        ),
+                    );
+                    add(RecoveryStabilityClassification::DataCorruption);
+                } else if !attempts.is_empty() {
+                    authenticated_unknown_write_value_conflicts.insert(
+                        unknown_write_value_conflict_from_object_message(
+                            key,
+                            Some(expected),
+                            attempts,
+                            &actual,
+                        ),
+                    );
+                    add(RecoveryStabilityClassification::DataCorruption);
+                } else {
+                    authenticated_hash_mismatches.insert(format!(
+                        "{key}: expected {} ({} bytes), got {} ({} bytes)",
+                        expected.sha256, expected.size_bytes, actual.sha256, actual.size_bytes
+                    ));
+                    add(RecoveryStabilityClassification::DataCorruption);
+                }
+            }
+            (OperationOutcome::NotFound, None) => {
+                missing_live_keys.insert(key.clone());
+                authenticated_missing_committed_objects.insert(key.clone());
+                add(RecoveryStabilityClassification::CommittedObjectUnavailable);
+            }
+            (OperationOutcome::Failed | OperationOutcome::Timeout, None) => {
+                authenticated_unavailable_committed_objects.push(CommittedReadFailure::observed(
+                    key,
+                    get.outcome,
+                    get.http_status,
+                    get.error.as_deref(),
+                    None,
+                ));
+                add(RecoveryStabilityClassification::CommittedObjectUnavailable);
+            }
+            (OperationOutcome::Unknown | OperationOutcome::Ok, None) => {
+                authenticated_unknown_committed_read_failures.push(CommittedReadFailure::observed(
+                    key,
+                    get.outcome,
+                    get.http_status,
+                    get.error.as_deref(),
+                    None,
+                ));
+                add(RecoveryStabilityClassification::CommittedObjectUnavailable);
+            }
+            (outcome, Some(actual)) => {
+                authenticated_unknown_committed_read_failures.push(CommittedReadFailure::observed(
+                    key,
+                    outcome,
+                    get.http_status,
+                    get.error.as_deref(),
+                    Some(actual.size_bytes),
+                ));
+                add(RecoveryStabilityClassification::CommittedObjectUnavailable);
+            }
+        }
+    }
+    for (key, attempts) in &model.unknown_writes {
+        if model.live.contains_key(key) {
+            continue;
+        }
+        let Some(get) = current_gets.get(key.as_str()).copied() else {
+            continue;
+        };
+        if get.outcome == OperationOutcome::Ok
+            && let Some(actual) = record_object(get)
+        {
+            if let Some(attempt) = matching_active_ambiguous_object(attempts, &actual) {
+                materialized_ambiguous_write_keys.insert(key.clone());
+                authenticated_unknown_writes_materialized.insert(
+                    ambiguous_write_materialized_from_object_message(key, attempt, &actual),
+                );
+                add(RecoveryStabilityClassification::AmbiguousWriteMaterialized);
+            } else if let Some(attempt) = matching_superseded_ambiguous_object(attempts, &actual) {
+                authenticated_unknown_writes_materialized.insert(
+                    ambiguous_write_materialized_from_object_message(key, attempt, &actual),
+                );
+                authenticated_unknown_write_value_conflicts.insert(
+                    superseded_ambiguous_object_conflict_message(key, None, attempt, &actual),
+                );
+                add(RecoveryStabilityClassification::DataCorruption);
+            } else {
+                authenticated_unknown_write_value_conflicts.insert(
+                    unknown_write_value_conflict_from_object_message(key, None, attempts, &actual),
+                );
+                add(RecoveryStabilityClassification::DataCorruption);
+            }
+        } else if get.outcome == OperationOutcome::NotFound {
+            ambiguous_write_absent.insert(key.clone());
+        }
+    }
+    for key in model
+        .deleted
+        .iter()
+        .filter(|key| !model.unknown_writes.contains_key(*key))
+    {
+        if current_gets
+            .get(key.as_str())
+            .is_some_and(|get| get.outcome == OperationOutcome::Ok && record_object(get).is_some())
+        {
+            let size_bytes = current_gets
+                .get(key.as_str())
+                .and_then(|get| get.size_bytes)
+                .expect("record object checked above");
+            authenticated_resurrected_deleted_objects.insert(format!(
+                "{key}: committed delete resurrected on GET ({size_bytes} bytes)"
+            ));
+            add(RecoveryStabilityClassification::DeletedObjectResurrected);
+        }
+    }
+
+    let run_prefix = ObjectSpec::key_prefix(&report.run_id);
+    let final_lists = suffix
+        .iter()
+        .filter(|record| {
+            record.kind == OperationKind::List && record.key.as_deref() == Some(run_prefix.as_str())
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        final_lists.len() == 1,
+        "checker failure history must contain exactly one final prefix LIST"
+    );
+    let final_list = final_lists[0];
+    let mut authenticated_final_listed_keys = None;
+    if final_list.outcome == OperationOutcome::Ok && final_list.http_status == Some(200) {
+        let listed = final_list
+            .listed_keys
+            .as_ref()
+            .context("successful checker LIST has no captured keys")?
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        authenticated_final_listed_keys = Some(listed.clone());
+        let mut warnings = WarningSummary::default();
+        evaluate_final_list_keys(
+            &model,
+            &ambiguous_delete_absent,
+            &materialized_ambiguous_write_keys,
+            &listed,
+            &run_prefix,
+            &mut warnings,
+        );
+        authenticated_list_warning_count += warnings.total_count;
+        authenticated_list_warnings.extend(warnings.samples.iter().cloned());
+        let mut warning_report = CheckerReport {
+            missing_committed_objects: missing_live_keys.into_iter().collect(),
+            list_warnings: warnings.samples.clone(),
+            final_list_warning_count: warnings.total_count,
+            ..report.clone()
+        };
+        warning_report.list_warnings.sort();
+        if final_list_content_corruption_signal(&warning_report) {
+            add(RecoveryStabilityClassification::DataCorruption);
+        }
+        for key in unexplained_listed_keys(&model, &listed) {
+            let Some(get) = current_gets.get(key.as_str()).copied() else {
+                add(RecoveryStabilityClassification::ListedKeyUnreadable);
+                continue;
+            };
+            if get.outcome != OperationOutcome::Ok || record_object(get).is_none() {
+                authenticated_listed_keys_unreadable.insert(format!(
+                    "{key}: {:?}{}",
+                    get.outcome,
+                    get.http_status
+                        .map(|status| format!(" http_status={status}"))
+                        .unwrap_or_default()
+                ));
+                add(RecoveryStabilityClassification::ListedKeyUnreadable);
+                continue;
+            }
+            let actual = record_object(get).expect("checked above");
+            match model.failed_writes.get(&key) {
+                Some(attempted) if attempted.contains(&actual.sha256) => {
+                    authenticated_failed_writes_materialized.insert(key);
+                }
+                Some(attempted) => {
+                    authenticated_unexpected_listed_objects.insert(format!(
+                        "{key}: readable bytes sha256={} size={} match no failed write attempt {attempted:?}",
+                        actual.sha256, actual.size_bytes
+                    ));
+                    add(RecoveryStabilityClassification::UnexpectedListedObject);
+                }
+                None => {
+                    authenticated_unexpected_listed_objects.insert(key);
+                    add(RecoveryStabilityClassification::UnexpectedListedObject);
+                }
+            }
+        }
+        for key in ambiguous_write_absent.intersection(&listed) {
+            authenticated_listed_keys_unreadable.insert(format!(
+                "{key}: NotFound (ambiguous write listed but absent on GET)"
+            ));
+            add(RecoveryStabilityClassification::ListedKeyUnreadable);
+        }
+    } else {
+        let warning = format!("LIST prefix {run_prefix} did not complete");
+        authenticated_list_warning_count += 1;
+        authenticated_list_warnings.insert(warning);
+        add(RecoveryStabilityClassification::ListUnavailableOrUnknown);
+    }
+
+    if !report.versioning_expected
+        && let Some(listed) = authenticated_final_listed_keys.as_ref()
+    {
+        authenticated_tolerated_ambiguous_deletes.extend(
+            ambiguous_delete_absent
+                .iter()
+                .filter(|key| !listed.contains(*key))
+                .cloned(),
+        );
+    }
+
+    if !report.versioning_expected {
+        ensure!(
+            suffix
+                .iter()
+                .all(|record| record.kind != OperationKind::ListVersions),
+            "non-versioned checker failure contains ListObjectVersions history"
+        );
+    }
+
+    if report.versioning_expected {
+        let lineage = committed_version_lineage(prefix);
+        if lineage.missing_version_id_count > 0 {
+            add(RecoveryStabilityClassification::VersionIdMissingOnCommittedWrite);
+        }
+        if !lineage.delete_marker_lineage_incomplete.is_empty() {
+            add(RecoveryStabilityClassification::DeleteMarkerLineageIncomplete);
+        }
+        if !lineage.multipart_upload_lineage_incomplete.is_empty() {
+            add(RecoveryStabilityClassification::MultipartUploadLineageIncomplete);
+        }
+        for version in &lineage.versions {
+            let Some(get) = version_gets
+                .get(&(version.key.as_str(), version.version_id.as_str()))
+                .copied()
+            else {
+                continue;
+            };
+            match (get.outcome, record_object(get)) {
+                (OperationOutcome::Ok, Some(actual))
+                    if actual.sha256 != version.sha256
+                        || actual.size_bytes != version.size_bytes =>
+                {
+                    authenticated_version_hash_mismatches.insert(format!(
+                        "{}@{}: expected {} ({} bytes), got {} ({} bytes)",
+                        version.key,
+                        version.version_id,
+                        version.sha256,
+                        version.size_bytes,
+                        actual.sha256,
+                        actual.size_bytes
+                    ));
+                    add(RecoveryStabilityClassification::VersionHashMismatch);
+                }
+                (OperationOutcome::NotFound, None) => {
+                    let reference = format!("{}@{}", version.key, version.version_id);
+                    authenticated_missing_committed_versions.insert(reference.clone());
+                    add(RecoveryStabilityClassification::CommittedVersionMissing);
+                    if version.kind == OperationKind::CompleteMultipartUpload {
+                        authenticated_multipart_lineage_incomplete.insert(format!(
+                            "{reference}: committed multipart completion version is missing"
+                        ));
+                        add(RecoveryStabilityClassification::MultipartUploadLineageIncomplete);
+                    }
+                }
+                (OperationOutcome::Ok, Some(_)) => {
+                    authenticated_verified_committed_versions += 1;
+                }
+                _ => {
+                    let reference = format!("{}@{}", version.key, version.version_id);
+                    authenticated_unavailable_committed_versions.insert(read_failure_message(
+                        &reference,
+                        get.outcome,
+                        get.http_status,
+                        get.error
+                            .as_deref()
+                            .or(record_object(get).is_some().then_some("unexpected body")),
+                    ));
+                    add(RecoveryStabilityClassification::CommittedVersionUnavailable);
+                }
+            }
+        }
+
+        let version_lists = suffix
+            .iter()
+            .filter(|record| {
+                record.kind == OperationKind::ListVersions
+                    && record.key.as_deref() == Some(run_prefix.as_str())
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            version_lists.len() == 1,
+            "versioned checker failure history must contain exactly one ListObjectVersions receipt"
+        );
+        let version_list = version_lists[0];
+        if version_list.outcome == OperationOutcome::Ok && version_list.http_status == Some(200) {
+            let listed = version_list
+                .listed_versions
+                .as_ref()
+                .context("successful ListObjectVersions has no captured entries")?;
+            let entries = listed
+                .iter()
+                .map(|entry| ObjectVersionEntry {
+                    key: entry.key.clone(),
+                    version_id: entry.version_id.clone(),
+                    is_latest: entry.is_latest,
+                    is_delete_marker: entry.is_delete_marker,
+                })
+                .collect::<Vec<_>>();
+            let (missing_versions, missing_multipart) =
+                missing_committed_version_entries(&lineage.versions, &entries);
+            authenticated_missing_committed_versions.extend(missing_versions.iter().cloned());
+            authenticated_multipart_lineage_incomplete.extend(missing_multipart.iter().cloned());
+            if !missing_versions.is_empty() {
+                add(RecoveryStabilityClassification::CommittedVersionMissing);
+            }
+            if !missing_multipart.is_empty() {
+                add(RecoveryStabilityClassification::MultipartUploadLineageIncomplete);
+            }
+            let missing_delete_markers =
+                missing_committed_delete_markers(&lineage.delete_markers, &entries);
+            authenticated_missing_committed_delete_markers
+                .extend(missing_delete_markers.iter().cloned());
+            if !missing_delete_markers.is_empty() {
+                add(RecoveryStabilityClassification::DeleteMarkerMissing);
+            }
+            let listed_lineage_conflicts =
+                listed_version_lineage_conflicts(prefix, &lineage, &entries);
+            authenticated_delete_marker_lineage_incomplete
+                .extend(listed_lineage_conflicts.iter().cloned());
+            if !listed_lineage_conflicts.is_empty() {
+                add(RecoveryStabilityClassification::DeleteMarkerLineageIncomplete);
+            }
+
+            let (mut candidates, candidate_conflicts) =
+                ambiguous_version_candidates(&model, &lineage, &entries);
+            if !candidate_conflicts.is_empty() {
+                add(RecoveryStabilityClassification::DataCorruption);
+            }
+            authenticated_unknown_write_value_conflicts.extend(candidate_conflicts);
+            let mut sources = VersionWriteSourceIndex::from_sources(&model.version_write_sources);
+            candidates.sort_by(|left, right| {
+                (&left.key, !left.is_latest, &left.version_id).cmp(&(
+                    &right.key,
+                    !right.is_latest,
+                    &right.version_id,
+                ))
+            });
+            let mut materialized = Vec::new();
+            for candidate in candidates {
+                let Some(get) = version_gets
+                    .get(&(candidate.key.as_str(), candidate.version_id.as_str()))
+                    .copied()
+                else {
+                    continue;
+                };
+                let Some(actual) = record_object(get) else {
+                    authenticated_unknown_write_value_conflicts.insert(format!(
+                        "{}@{}: uncommitted version could not be verified; outcome={:?} status={:?} error={:?}; ambiguous attempts [{}]",
+                        candidate.key,
+                        candidate.version_id,
+                        get.outcome,
+                        get.http_status,
+                        get.error,
+                        candidate.attempt_summary
+                    ));
+                    add(RecoveryStabilityClassification::DataCorruption);
+                    continue;
+                };
+                if get.outcome != OperationOutcome::Ok {
+                    authenticated_unknown_write_value_conflicts.insert(format!(
+                        "{}@{}: uncommitted version could not be verified; outcome={:?} status={:?} error={:?}; ambiguous attempts [{}]",
+                        candidate.key,
+                        candidate.version_id,
+                        get.outcome,
+                        get.http_status,
+                        get.error,
+                        candidate.attempt_summary
+                    ));
+                    add(RecoveryStabilityClassification::DataCorruption);
+                    continue;
+                }
+                if let Some(source) = take_version_write_source(
+                    &mut sources,
+                    &candidate.key,
+                    &actual,
+                    candidate.is_latest,
+                ) {
+                    let evidence = ambiguous_version_materialized_from_object_message(
+                        &candidate.key,
+                        &candidate.version_id,
+                        &source.attempt,
+                        &actual,
+                    );
+                    authenticated_unknown_writes_materialized.insert(evidence.clone());
+                    add(RecoveryStabilityClassification::AmbiguousWriteMaterialized);
+                    materialized.push(MaterializedAmbiguousVersion {
+                        key: candidate.key,
+                        version_id: candidate.version_id,
+                        evidence,
+                        active: source.active,
+                    });
+                } else {
+                    authenticated_unknown_write_value_conflicts.insert(format!(
+                        "{}@{}: observed uncommitted version {} ({} bytes), but it matched no ambiguous attempt [{}]",
+                        candidate.key,
+                        candidate.version_id,
+                        actual.sha256,
+                        actual.size_bytes,
+                        candidate.attempt_summary
+                    ));
+                    add(RecoveryStabilityClassification::DataCorruption);
+                }
+            }
+            let expected_latest = checker_expected_version_listing(prefix)
+                .into_iter()
+                .filter(|entry| entry.is_latest)
+                .map(|entry| (entry.key.clone(), entry))
+                .collect::<BTreeMap<_, _>>();
+            let (actual_latest, conflicts) = latest_version_entries(&entries);
+            authenticated_delete_marker_lineage_incomplete.extend(conflicts.iter().cloned());
+            let mut lineage_report = report.clone();
+            lineage_report.delete_marker_lineage_incomplete.clear();
+            lineage_report
+                .delete_marker_lineage_incomplete
+                .extend(conflicts);
+            evaluate_latest_version_lineage(
+                &mut lineage_report,
+                &model,
+                &expected_latest,
+                &actual_latest,
+                &materialized,
+                &lineage.delete_markers,
+            );
+            authenticated_delete_marker_lineage_incomplete.extend(
+                lineage_report
+                    .delete_marker_lineage_incomplete
+                    .iter()
+                    .cloned(),
+            );
+            if !lineage_report.delete_marker_lineage_incomplete.is_empty() {
+                add(RecoveryStabilityClassification::DeleteMarkerLineageIncomplete);
+            }
+            for key in &ambiguous_delete_present {
+                if actual_latest
+                    .get(key)
+                    .is_some_and(|entry| entry.is_delete_marker)
+                {
+                    authenticated_ambiguous_delete_resurrections.insert(format!(
+                        "{key}: GET returned the committed body after ambiguous delete but ListObjectVersions reports a delete marker latest"
+                    ));
+                    add(RecoveryStabilityClassification::DeletedObjectResurrected);
+                }
+            }
+            for key in &ambiguous_delete_absent {
+                let list_proves_absence = authenticated_final_listed_keys
+                    .as_ref()
+                    .is_some_and(|listed| !listed.contains(key));
+                let latest = actual_latest.get(key);
+                let version_proves_delete = latest.is_some_and(|entry| {
+                    novel_ambiguous_delete_marker(
+                        key,
+                        entry.is_delete_marker,
+                        entry.version_id.as_deref(),
+                        lineage
+                            .delete_markers
+                            .iter()
+                            .map(|marker| (marker.key.as_str(), marker.version_id.as_str())),
+                    )
+                });
+                if list_proves_absence && version_proves_delete {
+                    authenticated_tolerated_ambiguous_deletes.insert(key.clone());
+                    continue;
+                }
+                match latest {
+                    Some(entry) if !entry.is_delete_marker => {
+                        authenticated_missing_committed_objects.insert(key.clone());
+                        add(RecoveryStabilityClassification::CommittedObjectUnavailable);
+                    }
+                    None => {
+                        authenticated_delete_marker_lineage_incomplete.insert(format!(
+                            "{key}: GET returned 404 after ambiguous delete but ListObjectVersions has no latest entry"
+                        ));
+                        add(RecoveryStabilityClassification::DeleteMarkerLineageIncomplete);
+                    }
+                    Some(entry)
+                        if !novel_ambiguous_delete_marker(
+                            key,
+                            entry.is_delete_marker,
+                            entry.version_id.as_deref(),
+                            lineage
+                                .delete_markers
+                                .iter()
+                                .map(|marker| (marker.key.as_str(), marker.version_id.as_str())),
+                        ) =>
+                    {
+                        authenticated_delete_marker_lineage_incomplete.insert(format!(
+                            "{key}: GET returned 404 after ambiguous delete but the latest delete marker has no novel version identity"
+                        ));
+                        add(RecoveryStabilityClassification::DeleteMarkerLineageIncomplete);
+                    }
+                    Some(_) => {}
+                }
+            }
+            for key in &ambiguous_delete_present {
+                match actual_latest.get(key) {
+                    Some(entry) if entry.is_delete_marker => {}
+                    Some(entry)
+                        if expected_latest.get(key).is_none_or(|expected| {
+                            entry.version_id != expected.version_id || expected.is_delete_marker
+                        }) =>
+                    {
+                        authenticated_delete_marker_lineage_incomplete.insert(format!(
+                            "{key}: ambiguous delete did not materialize but latest data version identity drifted"
+                        ));
+                        add(RecoveryStabilityClassification::DeleteMarkerLineageIncomplete);
+                    }
+                    None => {
+                        authenticated_delete_marker_lineage_incomplete.insert(format!(
+                            "{key}: ambiguous delete did not materialize but ListObjectVersions has no latest data entry"
+                        ));
+                        add(RecoveryStabilityClassification::DeleteMarkerLineageIncomplete);
+                    }
+                    Some(_) => {}
+                }
+            }
+        } else {
+            let warning = format!("ListObjectVersions prefix {run_prefix} did not complete");
+            authenticated_list_warning_count += 1;
+            authenticated_list_warnings.insert(warning);
+            add(RecoveryStabilityClassification::ListUnavailableOrUnknown);
+        }
+    }
+    if !authenticated_unknown_write_value_conflicts.is_empty() {
+        add(RecoveryStabilityClassification::DataCorruption);
+    }
+    if !authenticated_unknown_writes_materialized.is_empty() {
+        add(RecoveryStabilityClassification::AmbiguousWriteMaterialized);
+    }
+    ensure_reported_checker_failure_entries(
+        "hash_mismatches",
+        &report.hash_mismatches,
+        &authenticated_hash_mismatches,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "successful_corrupted_reads",
+        &report.successful_corrupted_reads,
+        &authenticated_successful_corrupted_reads,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "unexpected_visible_deleted_objects",
+        &report.unexpected_visible_deleted_objects,
+        &authenticated_historical_deleted_objects
+            .union(&authenticated_ambiguous_delete_resurrections)
+            .cloned()
+            .collect(),
+    )?;
+    ensure_reported_checker_failure_entries(
+        "resurrected_deleted_objects",
+        &report.resurrected_deleted_objects,
+        &authenticated_resurrected_deleted_objects,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "listed_keys_unreadable",
+        &report.listed_keys_unreadable,
+        &authenticated_listed_keys_unreadable,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "missing_committed_objects",
+        &report.missing_committed_objects,
+        &authenticated_missing_committed_objects,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "version_hash_mismatches",
+        &report.version_hash_mismatches,
+        &authenticated_version_hash_mismatches,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "missing_committed_versions",
+        &report.missing_committed_versions,
+        &authenticated_missing_committed_versions,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "missing_committed_delete_markers",
+        &report.missing_committed_delete_markers,
+        &authenticated_missing_committed_delete_markers,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "unknown_write_value_conflicts",
+        &report.unknown_write_value_conflicts,
+        &authenticated_unknown_write_value_conflicts,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "unknown_writes_materialized",
+        &report.unknown_writes_materialized,
+        &authenticated_unknown_writes_materialized,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "unavailable_committed_versions",
+        &report.unavailable_committed_versions,
+        &authenticated_unavailable_committed_versions,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "unexpected_listed_objects",
+        &report.unexpected_listed_objects,
+        &authenticated_unexpected_listed_objects,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "delete_marker_lineage_incomplete",
+        &report.delete_marker_lineage_incomplete,
+        &authenticated_delete_marker_lineage_incomplete,
+    )?;
+    ensure_reported_checker_failure_entries(
+        "multipart_upload_lineage_incomplete",
+        &report.multipart_upload_lineage_incomplete,
+        &authenticated_multipart_lineage_incomplete,
+    )?;
+    let reported_list_warnings = report
+        .list_warnings
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        report.list_warnings.len() == authenticated_list_warning_count.min(MAX_WARNING_SAMPLES)
+            && reported_list_warnings.len() == report.list_warnings.len()
+            && reported_list_warnings
+                .iter()
+                .all(|warning| authenticated_list_warnings.contains(warning)),
+        "checker failure field list_warnings does not match authenticated history"
+    );
+    ensure!(
+        report.final_list_warning_count == authenticated_list_warning_count,
+        "checker failure field final_list_warning_count does not match authenticated history"
+    );
+    ensure_reported_checker_failure_multiset(
+        "unavailable_committed_objects",
+        &report.unavailable_committed_objects,
+        &authenticated_unavailable_committed_objects,
+    )?;
+    ensure_reported_checker_failure_multiset(
+        "unknown_committed_read_failures",
+        &report.unknown_committed_read_failures,
+        &authenticated_unknown_committed_read_failures,
+    )?;
+    ensure!(
+        report.committed_writes_missing_version_id_count
+            == if report.versioning_expected {
+                initial_lineage.missing_version_id_count
+            } else {
+                0
+            }
+            && report
+                .committed_writes_missing_version_id
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                == if report.versioning_expected {
+                    initial_lineage
+                        .missing_version_id_samples
+                        .into_iter()
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                },
+        "checker committed-write version-id failure evidence does not match authenticated history"
+    );
+    let historical_list_warnings = list_history_warnings(prefix);
+    ensure!(
+        report.list_history_warning_count == historical_list_warnings.total_count
+            && report.list_history_warnings == historical_list_warnings.samples,
+        "checker list-history warning summary does not match authenticated history"
+    );
+    ensure!(
+        report.committed_puts == model.committed_writes
+            && report.expected_live_objects == model.live.len()
+            && report.verified_live_objects == authenticated_verified_live_objects,
+        "checker object counters do not match authenticated history"
+    );
+    ensure!(
+        report.operation_cohorts == operation_cohort_counts(prefix)
+            && report.fault_window_relations == fault_window_relation_counts(prefix),
+        "checker workload cohort summaries do not match authenticated history"
+    );
+    ensure!(
+        report.final_listed_objects == authenticated_final_listed_keys.as_ref().map(BTreeSet::len),
+        "checker final listed-object count does not match authenticated history"
+    );
+    ensure!(
+        report
+            .tolerated_ambiguous_deletes
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            == authenticated_tolerated_ambiguous_deletes
+            && report.tolerated_ambiguous_deletes.len()
+                == authenticated_tolerated_ambiguous_deletes.len(),
+        "checker tolerated ambiguous deletes do not match authenticated history"
+    );
+    ensure!(
+        report
+            .failed_writes_materialized
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            == authenticated_failed_writes_materialized
+            && report.failed_writes_materialized.len()
+                == authenticated_failed_writes_materialized.len(),
+        "checker failed-write materialization evidence does not match authenticated history"
+    );
+    ensure!(
+        report.expected_committed_versions
+            == if report.versioning_expected {
+                initial_lineage.versions.len()
+            } else {
+                0
+            }
+            && report.verified_committed_versions
+                == if report.versioning_expected {
+                    authenticated_verified_committed_versions
+                } else {
+                    0
+                },
+        "checker committed-version counters do not match authenticated history"
+    );
+    Ok(proven)
+}
+
+fn ensure_reported_checker_failure_entries(
+    field: &str,
+    reported: &[String],
+    authenticated: &BTreeSet<String>,
+) -> Result<()> {
+    let reported_count = reported.len();
+    let reported = reported.iter().cloned().collect::<BTreeSet<_>>();
+    ensure!(
+        reported_count == authenticated.len() && reported == *authenticated,
+        "checker failure field {field} does not match authenticated history"
+    );
+    Ok(())
+}
+
+fn ensure_reported_checker_failure_multiset<T: PartialEq>(
+    field: &str,
+    reported: &[T],
+    authenticated: &[T],
+) -> Result<()> {
+    let mut matched = vec![false; authenticated.len()];
+    ensure!(
+        reported.len() == authenticated.len()
+            && reported.iter().all(|entry| {
+                authenticated
+                    .iter()
+                    .enumerate()
+                    .find(|(index, authenticated)| !matched[*index] && entry == *authenticated)
+                    .map(|(index, _)| matched[index] = true)
+                    .is_some()
+            }),
+        "checker failure field {field} does not match authenticated history"
+    );
+    Ok(())
 }
 
 /// Authenticate captured operations independently of whether their S3 verdict
@@ -561,9 +1511,6 @@ fn validate_successful_checker_observations(
         historical_read_anomalies.corrupted_reads.is_empty()
             && historical_read_anomalies.visible_deleted_objects.is_empty()
             && historical_read_anomalies
-                .unknown_writes_materialized
-                .is_empty()
-            && historical_read_anomalies
                 .unknown_write_value_conflicts
                 .is_empty(),
         "authenticated history prefix contains a successful-read correctness anomaly"
@@ -599,9 +1546,7 @@ fn validate_successful_checker_observations(
     ensure!(
         tolerated.len() == report.tolerated_ambiguous_deletes.len()
             && tolerated.iter().all(|key| {
-                model.ambiguous_delete_pending.contains(*key)
-                    && model.live.contains_key(*key)
-                    && !model.unknown_writes.contains_key(*key)
+                model.ambiguous_delete_pending.contains(*key) && model.live.contains_key(*key)
             }),
         "checker tolerated ambiguous deletes are not derived from the authenticated model"
     );
@@ -653,6 +1598,8 @@ fn validate_successful_checker_observations(
             == expected_current_keys.iter().map(String::as_str).collect(),
         "checker current GET coverage does not match its authenticated model"
     );
+    let mut materialized_unknown_keys = BTreeSet::new();
+    let mut expected_materialization_evidence = BTreeSet::new();
     for key in &expected_current_keys {
         let record = current_gets
             .get(key.as_str())
@@ -663,13 +1610,68 @@ fn validate_successful_checker_observations(
                     record.outcome == OperationOutcome::NotFound && record.http_status == Some(404),
                     "tolerated ambiguous delete {key} is not authenticated by GET 404"
                 );
+            } else if record.outcome == OperationOutcome::Ok
+                && record.http_status == Some(200)
+                && record.value_sha256.as_deref() == Some(expected.sha256.as_str())
+                && record.size_bytes == Some(expected.size_bytes)
+            {
+                // The current value is the last definite commit. A later
+                // timeout write may still be present in version history, and
+                // its version-specific GET is authenticated separately.
+            } else {
+                let actual = ExpectedObject {
+                    sha256: record
+                        .value_sha256
+                        .clone()
+                        .context("checker current GET has no body digest")?,
+                    size_bytes: record
+                        .size_bytes
+                        .context("checker current GET has no body size")?,
+                };
+                let attempts = model.unknown_writes.get(key).context(
+                    "checker current GET does not match the authenticated committed value",
+                )?;
+                let attempt = matching_active_ambiguous_object(attempts, &actual).with_context(
+                    || {
+                        format!(
+                            "checker current GET for {key} matches neither the authenticated committed value nor an active timeout-write attempt"
+                        )
+                    },
+                )?;
+                ensure!(
+                    record.outcome == OperationOutcome::Ok && record.http_status == Some(200),
+                    "checker current GET for {key} did not successfully read the authenticated timeout-write value"
+                );
+                materialized_unknown_keys.insert(key.clone());
+                expected_materialization_evidence.insert(
+                    ambiguous_write_materialized_from_object_message(key, attempt, &actual),
+                );
+            }
+        } else if let Some(attempts) = model.unknown_writes.get(key) {
+            if record.outcome == OperationOutcome::Ok && record.http_status == Some(200) {
+                let actual = ExpectedObject {
+                    sha256: record
+                        .value_sha256
+                        .clone()
+                        .context("checker current GET has no body digest")?,
+                    size_bytes: record
+                        .size_bytes
+                        .context("checker current GET has no body size")?,
+                };
+                let attempt =
+                    matching_active_ambiguous_object(attempts, &actual).with_context(|| {
+                        format!(
+                            "checker current GET for {key} matches no active timeout-write attempt"
+                        )
+                    })?;
+                materialized_unknown_keys.insert(key.clone());
+                expected_materialization_evidence.insert(
+                    ambiguous_write_materialized_from_object_message(key, attempt, &actual),
+                );
             } else {
                 ensure!(
-                    record.outcome == OperationOutcome::Ok
-                        && record.http_status == Some(200)
-                        && record.value_sha256.as_deref() == Some(expected.sha256.as_str())
-                        && record.size_bytes == Some(expected.size_bytes),
-                    "checker current GET for {key} does not match the authenticated committed value"
+                    record.outcome == OperationOutcome::NotFound && record.http_status == Some(404),
+                    "checker current GET for unresolved timeout-write key {key} is neither an authenticated materialization nor 404"
                 );
             }
         } else if unexplained_listed.contains(key) {
@@ -695,7 +1697,6 @@ fn validate_successful_checker_observations(
         report.verified_live_objects + tolerated.len() == model.live.len(),
         "checker verified_live_objects does not match authenticated GET evidence"
     );
-
     let prefix_key = ObjectSpec::key_prefix(&report.run_id);
     let final_lists = suffix
         .iter()
@@ -723,6 +1724,7 @@ fn validate_successful_checker_observations(
         .live
         .keys()
         .filter(|key| !tolerated.contains(key.as_str()))
+        .chain(materialized_unknown_keys.iter())
         .chain(report.failed_writes_materialized.iter())
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
@@ -731,7 +1733,26 @@ fn validate_successful_checker_observations(
         "checker final LIST does not match its authenticated model"
     );
 
-    validate_versioned_checker_suffix(report, prefix, suffix, &tolerated, &prefix_key)
+    let version_materialization_evidence =
+        validate_versioned_checker_suffix(report, prefix, suffix, &tolerated, &prefix_key)?;
+    let expected_materializations = historical_read_anomalies
+        .unknown_writes_materialized
+        .iter()
+        .cloned()
+        .chain(expected_materialization_evidence)
+        .chain(version_materialization_evidence)
+        .collect::<BTreeSet<_>>();
+    let reported_materializations = report
+        .unknown_writes_materialized
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        reported_materializations.len() == report.unknown_writes_materialized.len()
+            && reported_materializations == expected_materializations,
+        "checker report timeout-write materialization evidence does not match authenticated GET history"
+    );
+    Ok(())
 }
 
 fn validate_versioned_checker_suffix(
@@ -740,7 +1761,7 @@ fn validate_versioned_checker_suffix(
     suffix: &[OperationRecord],
     tolerated: &BTreeSet<&str>,
     prefix_key: &str,
-) -> Result<()> {
+) -> Result<BTreeSet<String>> {
     let version_lists = suffix
         .iter()
         .filter(|record| {
@@ -757,7 +1778,7 @@ fn validate_versioned_checker_suffix(
                 }),
             "non-versioned checker contains versioned audit evidence"
         );
-        return Ok(());
+        return Ok(BTreeSet::new());
     }
 
     ensure!(
@@ -779,6 +1800,7 @@ fn validate_versioned_checker_suffix(
         .as_ref()
         .context("checker ListObjectVersions has no captured entries")?;
     let mut listed_data_versions = BTreeSet::<(&str, &str)>::new();
+    let mut listed_data_latest = BTreeMap::<(&str, &str), bool>::new();
     let mut listed_delete_markers = BTreeSet::<(&str, &str)>::new();
     let mut actual_latest = BTreeMap::<&str, &ListedVersionEntry>::new();
     for entry in listed_versions {
@@ -787,6 +1809,7 @@ fn validate_versioned_checker_suffix(
                 listed_delete_markers.insert((entry.key.as_str(), version_id));
             } else {
                 listed_data_versions.insert((entry.key.as_str(), version_id));
+                listed_data_latest.insert((entry.key.as_str(), version_id), entry.is_latest);
             }
         }
         if entry.is_latest {
@@ -798,10 +1821,14 @@ fn validate_versioned_checker_suffix(
         }
     }
     let lineage = committed_version_lineage(prefix);
+    let model = object_model(prefix);
+    let listed_lineage_conflicts =
+        listed_version_lineage_conflicts(prefix, &lineage, listed_versions);
     ensure!(
         lineage.missing_version_id_count == 0
             && lineage.delete_marker_lineage_incomplete.is_empty()
-            && lineage.multipart_upload_lineage_incomplete.is_empty(),
+            && lineage.multipart_upload_lineage_incomplete.is_empty()
+            && listed_lineage_conflicts.is_empty(),
         "authenticated versioned history has incomplete committed lineage"
     );
 
@@ -815,35 +1842,6 @@ fn validate_versioned_checker_suffix(
             "authenticated history produced multiple expected latest entries"
         );
     }
-    ensure!(
-        actual_latest.keys().copied().collect::<BTreeSet<_>>()
-            == expected_latest.keys().map(String::as_str).collect(),
-        "ListObjectVersions latest-key set does not match authenticated history"
-    );
-    for (key, expected) in &expected_latest {
-        let actual = actual_latest[key.as_str()];
-        if tolerated.contains(key.as_str()) {
-            ensure!(
-                novel_ambiguous_delete_marker(
-                    key,
-                    actual.is_delete_marker,
-                    actual.version_id.as_deref(),
-                    lineage
-                        .delete_markers
-                        .iter()
-                        .map(|marker| (marker.key.as_str(), marker.version_id.as_str())),
-                ),
-                "tolerated ambiguous delete {key} is not a novel latest delete marker"
-            );
-        } else {
-            ensure!(
-                actual.version_id == expected.version_id
-                    && actual.is_delete_marker == expected.is_delete_marker,
-                "latest version for {key} does not match authenticated history"
-            );
-        }
-    }
-
     ensure!(
         report.expected_committed_versions == lineage.versions.len()
             && report.verified_committed_versions == lineage.versions.len(),
@@ -876,13 +1874,18 @@ fn validate_versioned_checker_suffix(
         );
     }
     ensure!(
-        actual_version_gets.keys().copied().collect::<BTreeSet<_>>()
-            == expected_version_gets.keys().copied().collect(),
-        "checker committed-version GET coverage does not match authenticated history"
+        actual_version_gets.keys().copied().collect::<BTreeSet<_>>() == listed_data_versions,
+        "checker version GET coverage does not match ListObjectVersions data entries"
+    );
+    ensure!(
+        expected_version_gets
+            .keys()
+            .all(|identity| actual_version_gets.contains_key(identity)),
+        "checker version GET coverage omits a committed version"
     );
     let mut expected_data_version_audits = Vec::with_capacity(expected_version_gets.len());
-    for (identity, expected) in expected_version_gets {
-        let record = actual_version_gets[&identity];
+    for (identity, expected) in &expected_version_gets {
+        let record = actual_version_gets[identity];
         ensure!(
             record.outcome == OperationOutcome::Ok
                 && record.http_status == Some(200)
@@ -906,6 +1909,145 @@ fn validate_versioned_checker_suffix(
             outcome: record.outcome,
             http_status: record.http_status,
         });
+    }
+    let mut active_ambiguous_versions = BTreeSet::<(String, String)>::new();
+    let mut expected_ambiguous_version_evidence = BTreeSet::new();
+    let mut uncommitted_version_gets = actual_version_gets
+        .iter()
+        .filter(|(identity, _)| !expected_version_gets.contains_key(*identity))
+        .collect::<Vec<_>>();
+    uncommitted_version_gets.sort_by(|(left, _), (right, _)| {
+        let left_latest = listed_data_latest.get(*left).copied().unwrap_or_default();
+        let right_latest = listed_data_latest.get(*right).copied().unwrap_or_default();
+        (left.0, !left_latest, left.1).cmp(&(right.0, !right_latest, right.1))
+    });
+    let mut version_write_sources =
+        VersionWriteSourceIndex::from_sources(&model.version_write_sources);
+    let reported_materialization_evidence = report
+        .unknown_writes_materialized
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for (identity, record) in uncommitted_version_gets {
+        ensure!(
+            record.outcome == OperationOutcome::Ok && record.http_status == Some(200),
+            "checker ambiguous-version GET for {}@{} did not succeed",
+            identity.0,
+            identity.1
+        );
+        let actual = ExpectedObject {
+            sha256: record
+                .value_sha256
+                .clone()
+                .context("checker ambiguous-version GET has no body digest")?,
+            size_bytes: record
+                .size_bytes
+                .context("checker ambiguous-version GET has no body size")?,
+        };
+        model
+            .version_write_sources
+            .get(identity.0)
+            .with_context(|| {
+                format!(
+                    "checker GET authenticated no retry-capable write for {}@{}",
+                    identity.0, identity.1
+                )
+            })?;
+        let is_latest = listed_data_latest
+            .get(identity)
+            .copied()
+            .unwrap_or_default();
+        let source = take_version_write_source(
+            &mut version_write_sources,
+            identity.0,
+            &actual,
+            is_latest,
+        )
+        .with_context(|| {
+            format!(
+                "checker uncommitted-version GET for {}@{} exceeds its retry-capable write budget or matches no write",
+                identity.0, identity.1
+            )
+        })?;
+        let evidence = ambiguous_version_materialized_from_object_message(
+            identity.0,
+            identity.1,
+            &source.attempt,
+            &actual,
+        );
+        ensure!(
+            reported_materialization_evidence.contains(evidence.as_str()),
+            "checker report omits authenticated retry-created version materialization"
+        );
+        expected_ambiguous_version_evidence.insert(evidence);
+        if source.active {
+            active_ambiguous_versions.insert((identity.0.to_string(), identity.1.to_string()));
+        }
+    }
+
+    let expected_latest_keys = expected_latest
+        .keys()
+        .cloned()
+        .chain(active_ambiguous_versions.iter().map(|(key, _)| key.clone()))
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        actual_latest.keys().copied().collect::<BTreeSet<_>>()
+            == expected_latest_keys.iter().map(String::as_str).collect(),
+        "ListObjectVersions latest-key set does not match authenticated history"
+    );
+    for key in &expected_latest_keys {
+        let actual = actual_latest[key.as_str()];
+        if tolerated.contains(key.as_str()) {
+            ensure!(
+                novel_ambiguous_delete_marker(
+                    key,
+                    actual.is_delete_marker,
+                    actual.version_id.as_deref(),
+                    lineage
+                        .delete_markers
+                        .iter()
+                        .map(|marker| (marker.key.as_str(), marker.version_id.as_str())),
+                ),
+                "tolerated ambiguous delete {key} is not a novel latest delete marker"
+            );
+            continue;
+        }
+        if model.ambiguous_delete_lineage_pending.contains(key) {
+            let matches_committed = expected_latest.get(key).is_some_and(|expected| {
+                actual.version_id == expected.version_id
+                    && actual.is_delete_marker == expected.is_delete_marker
+            });
+            let matches_active_ambiguous = !actual.is_delete_marker
+                && actual.version_id.as_deref().is_some_and(|version_id| {
+                    active_ambiguous_versions.contains(&(key.clone(), version_id.to_string()))
+                });
+            let matches_ambiguous_delete = novel_ambiguous_delete_marker(
+                key,
+                actual.is_delete_marker,
+                actual.version_id.as_deref(),
+                lineage
+                    .delete_markers
+                    .iter()
+                    .map(|marker| (marker.key.as_str(), marker.version_id.as_str())),
+            );
+            ensure!(
+                matches_committed || matches_active_ambiguous || matches_ambiguous_delete,
+                "latest version for {key} does not match its committed, ambiguous write, or ambiguous DELETE lineage"
+            );
+            continue;
+        }
+        let matches_committed = expected_latest.get(key).is_some_and(|expected| {
+            actual.version_id == expected.version_id
+                && actual.is_delete_marker == expected.is_delete_marker
+        });
+        let matches_active_ambiguous = !actual.is_delete_marker
+            && actual.version_id.as_deref().is_some_and(|version_id| {
+                active_ambiguous_versions.contains(&(key.clone(), version_id.to_string()))
+            });
+        ensure!(
+            matches_committed || matches_active_ambiguous,
+            "latest version for {key} does not match authenticated history"
+        );
     }
     expected_data_version_audits
         .sort_by(|left, right| (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id)));
@@ -937,7 +2079,7 @@ fn validate_versioned_checker_suffix(
         audit.delete_marker_checks == expected_delete_marker_audits,
         "checker delete-marker audit summary does not match authenticated history"
     );
-    Ok(())
+    Ok(expected_ambiguous_version_evidence)
 }
 
 pub(crate) fn checker_expected_current_get_keys(records: &[OperationRecord]) -> BTreeSet<String> {
@@ -966,10 +2108,14 @@ pub(crate) fn checker_expected_version_listing(
     let mut versions = Vec::new();
     let mut latest_by_key = BTreeMap::new();
     for record in records.iter().filter(|record| {
-        matches!(
+        let committed_write = matches!(
             record.kind,
-            OperationKind::Put | OperationKind::CompleteMultipartUpload | OperationKind::Delete
-        ) && record.outcome == OperationOutcome::Ok
+            OperationKind::Put | OperationKind::CompleteMultipartUpload
+        );
+        let committed_delete_marker = record.kind == OperationKind::Delete
+            && record.request_version_id.is_none()
+            && record.is_delete_marker != Some(false);
+        record.outcome == OperationOutcome::Ok && (committed_write || committed_delete_marker)
     }) {
         let (Some(key), Some(version_id)) = (record.key.as_ref(), record.version_id.as_deref())
         else {
@@ -1070,6 +2216,7 @@ pub async fn check_s3_history(
     let mut ambiguous_delete_absent = BTreeSet::new();
     let mut ambiguous_delete_present = BTreeSet::new();
     let mut ambiguous_write_absent = BTreeSet::new();
+    let mut materialized_ambiguous_write_keys = BTreeSet::new();
     let mut version_latest_by_key = None;
     let expected_latest_versions = expect_versioning.then(|| {
         checker_expected_version_listing(&initial_records)
@@ -1098,8 +2245,14 @@ pub async fn check_s3_history(
     .buffer_unordered(concurrency);
     while let Some(result) = final_results.next().await {
         let (key, expected, unknown_writes, get) = result?;
+        if get.outcome == OperationOutcome::Ok
+            && get.body.as_deref().is_some_and(|body| {
+                matching_active_ambiguous_write(&unknown_writes, body).is_some()
+            })
+        {
+            materialized_ambiguous_write_keys.insert(key.clone());
+        }
         if expected.is_some()
-            && unknown_writes.is_empty()
             && get.outcome == OperationOutcome::NotFound
             && model.ambiguous_delete_pending.contains(&key)
         {
@@ -1196,6 +2349,13 @@ pub async fn check_s3_history(
                 report
                     .delete_marker_lineage_incomplete
                     .extend(latest_conflicts);
+                report
+                    .delete_marker_lineage_incomplete
+                    .extend(listed_version_lineage_conflicts(
+                        &initial_records,
+                        lineage,
+                        &entries,
+                    ));
                 delete_marker_checks =
                     checker_delete_marker_audits(&lineage.delete_markers, Some(entries.as_slice()));
                 let (missing_versions, multipart_lineage) =
@@ -1206,16 +2366,6 @@ pub async fn check_s3_history(
                     .extend(multipart_lineage);
                 report.missing_committed_delete_markers =
                     missing_committed_delete_markers(&lineage.delete_markers, &entries);
-                evaluate_latest_version_lineage(
-                    &mut report,
-                    &model,
-                    expected_latest_versions
-                        .as_ref()
-                        .expect("versioning enabled above"),
-                    version_latest_by_key
-                        .as_ref()
-                        .expect("latest version map was just captured"),
-                );
                 let (materialized, conflicts) = materialized_ambiguous_versions(
                     s3,
                     recorder,
@@ -1225,7 +2375,21 @@ pub async fn check_s3_history(
                     concurrency,
                 )
                 .await?;
-                report.unknown_writes_materialized.extend(materialized);
+                evaluate_latest_version_lineage(
+                    &mut report,
+                    &model,
+                    expected_latest_versions
+                        .as_ref()
+                        .expect("versioning enabled above"),
+                    version_latest_by_key
+                        .as_ref()
+                        .expect("latest version map was just captured"),
+                    &materialized,
+                    &lineage.delete_markers,
+                );
+                report
+                    .unknown_writes_materialized
+                    .extend(materialized.into_iter().map(|version| version.evidence));
                 report.unknown_write_value_conflicts.extend(conflicts);
             }
             None => {
@@ -1243,6 +2407,7 @@ pub async fn check_s3_history(
             evaluate_final_list_keys(
                 &model,
                 &ambiguous_delete_absent,
+                &materialized_ambiguous_write_keys,
                 &listed,
                 &prefix,
                 &mut final_list_warnings,
@@ -1516,7 +2681,99 @@ struct SupersedingMutation {
 struct AmbiguousVersionCandidate {
     key: String,
     version_id: String,
-    attempts: Vec<AmbiguousWriteAttempt>,
+    is_latest: bool,
+    attempt_summary: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionWriteSource {
+    attempt: AmbiguousWriteAttempt,
+    remaining_versions: usize,
+    may_be_latest: bool,
+}
+
+#[derive(Debug, Default)]
+struct VersionWriteSourceIndex {
+    buckets: BTreeMap<(String, ExpectedObject), VersionWriteSourceBucket>,
+}
+
+#[derive(Debug, Default)]
+struct VersionWriteSourceBucket {
+    sources: Vec<VersionWriteSource>,
+    active: Vec<usize>,
+    inactive: Vec<usize>,
+    all: Vec<usize>,
+}
+
+impl VersionWriteSourceIndex {
+    fn from_sources(sources: &BTreeMap<String, Vec<VersionWriteSource>>) -> Self {
+        let mut index = Self::default();
+        for (key, key_sources) in sources {
+            for source in key_sources {
+                let bucket = index
+                    .buckets
+                    .entry((key.clone(), source.attempt.object.clone()))
+                    .or_default();
+                let source_index = bucket.sources.len();
+                bucket.sources.push(source.clone());
+                bucket.all.push(source_index);
+                if source.may_be_latest && source.attempt.superseded_by.is_none() {
+                    bucket.active.push(source_index);
+                } else {
+                    bucket.inactive.push(source_index);
+                }
+            }
+        }
+        index
+    }
+
+    fn take(
+        &mut self,
+        key: &str,
+        actual: &ExpectedObject,
+        is_latest: bool,
+    ) -> Option<VersionWriteMatch> {
+        let bucket = self.buckets.get_mut(&(key.to_string(), actual.clone()))?;
+        let source_index = if is_latest {
+            next_available_source(&mut bucket.active, &bucket.sources)
+        } else {
+            next_available_source(&mut bucket.inactive, &bucket.sources)
+                .or_else(|| next_available_source(&mut bucket.all, &bucket.sources))
+        }?;
+        let source = &mut bucket.sources[source_index];
+        source.remaining_versions -= 1;
+        Some(VersionWriteMatch {
+            attempt: source.attempt.clone(),
+            active: source.may_be_latest && source.attempt.superseded_by.is_none(),
+        })
+    }
+}
+
+fn next_available_source(
+    indices: &mut Vec<usize>,
+    sources: &[VersionWriteSource],
+) -> Option<usize> {
+    while let Some(index) = indices.last().copied() {
+        if sources[index].remaining_versions > 0 {
+            return Some(index);
+        }
+        indices.pop();
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionWriteMatch {
+    attempt: AmbiguousWriteAttempt,
+    active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaterializedAmbiguousVersion {
+    key: String,
+    version_id: String,
+    evidence: String,
+    active: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1524,10 +2781,15 @@ struct ObjectModel {
     live: BTreeMap<String, ExpectedObject>,
     deleted: BTreeSet<String>,
     unknown_writes: BTreeMap<String, Vec<AmbiguousWriteAttempt>>,
+    version_write_sources: BTreeMap<String, Vec<VersionWriteSource>>,
     // Keys still committed-present whose latest delete was ambiguous
     // (timeout/unknown): the object may or may not have been removed, so a
     // post-recovery 404 is a legitimate outcome rather than a lost object.
     ambiguous_delete_pending: BTreeSet<String>,
+    // Keys with a known current version whose latest DELETE may have created
+    // another versioned delete marker. This includes keys already deleted by
+    // an earlier committed DELETE without changing current-object accounting.
+    ambiguous_delete_lineage_pending: BTreeSet<String>,
     // Keys whose PUT or CompleteMultipartUpload returned a definite failure,
     // mapped to the sha256 of every payload those failed attempts sent. S3
     // allows a failed response for a write that still materialized, so a
@@ -1578,8 +2840,20 @@ fn committed_version_lineage(records: &[OperationRecord]) -> VersionLineage {
             record.kind,
             OperationKind::Put | OperationKind::CompleteMultipartUpload
         ) && record.outcome == OperationOutcome::Ok;
-        let is_committed_delete =
-            record.kind == OperationKind::Delete && record.outcome == OperationOutcome::Ok;
+        let is_committed_delete = record.kind == OperationKind::Delete
+            && record.outcome == OperationOutcome::Ok
+            && record.request_version_id.is_none()
+            && record.is_delete_marker != Some(false);
+        if record.kind == OperationKind::Delete
+            && record.outcome == OperationOutcome::Ok
+            && record.request_version_id.is_none()
+            && record.is_delete_marker == Some(false)
+        {
+            lineage.delete_marker_lineage_incomplete.push(format!(
+                "{}: successful unversioned DELETE did not confirm delete-marker creation",
+                record.key.as_deref().unwrap_or("<unknown>")
+            ));
+        }
         if !is_committed_write && !is_committed_delete {
             continue;
         }
@@ -1706,6 +2980,107 @@ fn checker_delete_marker_audits(
         .collect()
 }
 
+trait ListedVersionIdentity {
+    fn key(&self) -> &str;
+    fn version_id(&self) -> Option<&str>;
+    fn is_delete_marker(&self) -> bool;
+}
+
+impl ListedVersionIdentity for ObjectVersionEntry {
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn version_id(&self) -> Option<&str> {
+        self.version_id.as_deref()
+    }
+
+    fn is_delete_marker(&self) -> bool {
+        self.is_delete_marker
+    }
+}
+
+impl ListedVersionIdentity for ListedVersionEntry {
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn version_id(&self) -> Option<&str> {
+        self.version_id.as_deref()
+    }
+
+    fn is_delete_marker(&self) -> bool {
+        self.is_delete_marker
+    }
+}
+
+fn listed_version_lineage_conflicts<T: ListedVersionIdentity>(
+    records: &[OperationRecord],
+    lineage: &VersionLineage,
+    entries: &[T],
+) -> Vec<String> {
+    let committed_markers = lineage
+        .delete_markers
+        .iter()
+        .map(|marker| (marker.key.as_str(), marker.version_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut retry_delete_budget = BTreeMap::<&str, usize>::new();
+    for record in records.iter().filter(|record| {
+        record.kind == OperationKind::Delete && record.request_version_id.is_none()
+    }) {
+        if let Some(key) = record.key.as_deref() {
+            let max_attempts = mutation_attempts(record);
+            let budget = match record.outcome {
+                OperationOutcome::Ok => max_attempts.saturating_sub(1),
+                OperationOutcome::Timeout | OperationOutcome::Unknown => max_attempts,
+                OperationOutcome::Failed => max_attempts.saturating_sub(1),
+                OperationOutcome::NotFound => 0,
+            };
+            *retry_delete_budget.entry(key).or_default() += budget;
+        }
+    }
+
+    let mut used_retry_deletes = BTreeMap::<&str, usize>::new();
+    let mut seen_identities = BTreeSet::<(&str, &str)>::new();
+    let mut conflicts = Vec::new();
+    for entry in entries {
+        let Some(version_id) = entry
+            .version_id()
+            .filter(|version_id| !version_id.is_empty() && *version_id != "null")
+        else {
+            conflicts.push(format!(
+                "{}: ListObjectVersions entry has no immutable version identity",
+                entry.key()
+            ));
+            continue;
+        };
+        if !seen_identities.insert((entry.key(), version_id)) {
+            conflicts.push(format!(
+                "{}@{version_id}: ListObjectVersions returned a duplicate immutable version identity",
+                entry.key()
+            ));
+            continue;
+        }
+        if !entry.is_delete_marker() || committed_markers.contains(&(entry.key(), version_id)) {
+            continue;
+        }
+        let used = used_retry_deletes.entry(entry.key()).or_default();
+        let budget = retry_delete_budget
+            .get(entry.key())
+            .copied()
+            .unwrap_or_default();
+        if *used < budget {
+            *used += 1;
+        } else {
+            conflicts.push(format!(
+                "{}@{version_id}: delete marker has no committed or ambiguous DELETE source",
+                entry.key()
+            ));
+        }
+    }
+    conflicts
+}
+
 fn missing_committed_version_entries(
     committed: &[CommittedVersion],
     entries: &[ObjectVersionEntry],
@@ -1760,15 +3135,58 @@ fn evaluate_latest_version_lineage(
     model: &ObjectModel,
     expected: &BTreeMap<String, ListedVersionEntry>,
     actual: &BTreeMap<String, ObjectVersionEntry>,
+    materialized: &[MaterializedAmbiguousVersion],
+    committed_delete_markers: &[CommittedDeleteMarker],
 ) {
+    let active_ambiguous_versions = materialized
+        .iter()
+        .filter(|version| version.active)
+        .map(|version| (version.key.as_str(), version.version_id.as_str()))
+        .collect::<BTreeSet<_>>();
     for (key, expected_entry) in expected {
-        if model.ambiguous_delete_pending.contains(key) {
+        if model.ambiguous_delete_lineage_pending.contains(key) {
+            match actual.get(key) {
+                Some(actual_entry) => {
+                    let matches_committed = actual_entry.version_id == expected_entry.version_id
+                        && actual_entry.is_delete_marker == expected_entry.is_delete_marker;
+                    let matches_active_ambiguous = !actual_entry.is_delete_marker
+                        && actual_entry
+                            .version_id
+                            .as_deref()
+                            .is_some_and(|version_id| {
+                                active_ambiguous_versions.contains(&(key.as_str(), version_id))
+                            });
+                    let matches_ambiguous_delete = novel_ambiguous_delete_marker(
+                        key,
+                        actual_entry.is_delete_marker,
+                        actual_entry.version_id.as_deref(),
+                        committed_delete_markers
+                            .iter()
+                            .map(|marker| (marker.key.as_str(), marker.version_id.as_str())),
+                    );
+                    if !(matches_committed || matches_active_ambiguous || matches_ambiguous_delete)
+                    {
+                        report.delete_marker_lineage_incomplete.push(format!(
+                            "{key}: latest version {:?} does not match its committed, ambiguous write, or ambiguous DELETE lineage",
+                            actual_entry.version_id
+                        ));
+                    }
+                }
+                None => report.delete_marker_lineage_incomplete.push(format!(
+                    "{key}: ListObjectVersions has no unique latest entry after an ambiguous DELETE"
+                )),
+            }
             continue;
         }
         match actual.get(key) {
             Some(actual_entry)
                 if actual_entry.version_id == expected_entry.version_id
                     && actual_entry.is_delete_marker == expected_entry.is_delete_marker => {}
+            Some(actual_entry)
+                if !actual_entry.is_delete_marker
+                    && actual_entry.version_id.as_deref().is_some_and(|version_id| {
+                        active_ambiguous_versions.contains(&(key.as_str(), version_id))
+                    }) => {}
             Some(actual_entry) => report.delete_marker_lineage_incomplete.push(format!(
                 "{key}: latest version {:?} deleteMarker={} does not match expected {:?} deleteMarker={}",
                 actual_entry.version_id,
@@ -1782,7 +3200,16 @@ fn evaluate_latest_version_lineage(
         }
     }
     for key in actual.keys() {
-        if !expected.contains_key(key) && !model.ambiguous_delete_pending.contains(key) {
+        let active_ambiguous_latest = actual.get(key).is_some_and(|entry| {
+            !entry.is_delete_marker
+                && entry.version_id.as_deref().is_some_and(|version_id| {
+                    active_ambiguous_versions.contains(&(key.as_str(), version_id))
+                })
+        });
+        if !expected.contains_key(key)
+            && !model.ambiguous_delete_lineage_pending.contains(key)
+            && !active_ambiguous_latest
+        {
             report.delete_marker_lineage_incomplete.push(format!(
                 "{key}: ListObjectVersions returned an unexpected latest entry"
             ));
@@ -1943,16 +3370,32 @@ fn ambiguous_version_candidates(
         .collect::<BTreeSet<_>>();
     let mut candidates = Vec::new();
     let mut conflicts = Vec::new();
+    let mut attempt_summaries = BTreeMap::<&str, Arc<str>>::new();
 
     for entry in entries.iter().filter(|entry| !entry.is_delete_marker) {
-        let attempts = model
-            .unknown_writes
-            .get(&entry.key)
-            .cloned()
-            .unwrap_or_default();
+        let attempt_summary = attempt_summaries
+            .entry(entry.key.as_str())
+            .or_insert_with(|| {
+                Arc::from(
+                    model
+                        .version_write_sources
+                        .get(&entry.key)
+                        .map(|sources| {
+                            ambiguous_write_attempt_summary(
+                                &sources
+                                    .iter()
+                                    .map(|source| source.attempt.clone())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .unwrap_or_default(),
+                )
+            })
+            .clone();
         let Some(version_id) = entry.version_id.as_ref() else {
             conflicts.push(uncommitted_version_missing_id_message(
-                &entry.key, &attempts,
+                &entry.key,
+                &attempt_summary,
             ));
             continue;
         };
@@ -1962,7 +3405,8 @@ fn ambiguous_version_candidates(
         candidates.push(AmbiguousVersionCandidate {
             key: entry.key.clone(),
             version_id: version_id.clone(),
-            attempts,
+            is_latest: entry.is_latest,
+            attempt_summary,
         });
     }
 
@@ -1976,9 +3420,10 @@ async fn materialized_ambiguous_versions(
     lineage: &VersionLineage,
     entries: &[ObjectVersionEntry],
     concurrency: usize,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<(Vec<MaterializedAmbiguousVersion>, Vec<String>)> {
     let (candidates, mut conflicts) = ambiguous_version_candidates(model, lineage, entries);
     let mut materialized = Vec::new();
+    let mut observations = Vec::new();
     let mut results = stream::iter(candidates.into_iter().map(|candidate| {
         let s3 = s3.clone();
         let recorder = recorder.clone();
@@ -1992,17 +3437,34 @@ async fn materialized_ambiguous_versions(
     .buffer_unordered(concurrency.max(1));
 
     while let Some(result) = results.next().await {
-        let (candidate, get) = result?;
-        evaluate_ambiguous_version_get(&mut materialized, &mut conflicts, &candidate, get);
+        observations.push(result?);
+    }
+    observations.sort_by(|(left, _), (right, _)| {
+        (&left.key, !left.is_latest, &left.version_id).cmp(&(
+            &right.key,
+            !right.is_latest,
+            &right.version_id,
+        ))
+    });
+    let mut sources = VersionWriteSourceIndex::from_sources(&model.version_write_sources);
+    for (candidate, get) in observations {
+        evaluate_ambiguous_version_get(
+            &mut materialized,
+            &mut conflicts,
+            &candidate,
+            get,
+            &mut sources,
+        );
     }
     Ok((materialized, conflicts))
 }
 
 fn evaluate_ambiguous_version_get(
-    materialized: &mut Vec<String>,
+    materialized: &mut Vec<MaterializedAmbiguousVersion>,
     conflicts: &mut Vec<String>,
     candidate: &AmbiguousVersionCandidate,
     get: GetObjectResult,
+    sources: &mut VersionWriteSourceIndex,
 ) {
     let Some(body) = get.body.as_deref() else {
         conflicts.push(uncommitted_version_unverified_message(candidate, &get));
@@ -2012,13 +3474,24 @@ fn evaluate_ambiguous_version_get(
         conflicts.push(uncommitted_version_unverified_message(candidate, &get));
         return;
     }
-    if let Some(attempt) = matching_ambiguous_write(&candidate.attempts, body) {
-        materialized.push(ambiguous_version_materialized_message(
-            &candidate.key,
-            &candidate.version_id,
-            attempt,
-            body,
-        ));
+    let actual = ExpectedObject {
+        sha256: sha256_hex(body),
+        size_bytes: body.len(),
+    };
+    if let Some(source) =
+        take_version_write_source(sources, &candidate.key, &actual, candidate.is_latest)
+    {
+        materialized.push(MaterializedAmbiguousVersion {
+            key: candidate.key.clone(),
+            version_id: candidate.version_id.clone(),
+            evidence: ambiguous_version_materialized_message(
+                &candidate.key,
+                &candidate.version_id,
+                &source.attempt,
+                body,
+            ),
+            active: source.active,
+        });
         return;
     }
     conflicts.push(uncommitted_version_value_conflict_message(candidate, body));
@@ -2042,6 +3515,7 @@ impl WarningSummary {
 fn evaluate_final_list_keys(
     model: &ObjectModel,
     ambiguous_delete_absent: &BTreeSet<String>,
+    materialized_ambiguous_write_keys: &BTreeSet<String>,
     listed: &BTreeSet<String>,
     prefix: &str,
     warnings: &mut WarningSummary,
@@ -2061,7 +3535,7 @@ fn evaluate_final_list_keys(
         }
     }
     for key in &model.deleted {
-        if listed.contains(key) {
+        if listed.contains(key) && !materialized_ambiguous_write_keys.contains(key) {
             warnings.push(format!("LIST prefix {prefix} included deleted key {key}"));
         }
     }
@@ -2157,6 +3631,12 @@ fn evaluate_final_get(
                 return;
             }
             if let Some(attempt) = matching_active_ambiguous_write(ambiguous_writes, &body) {
+                if expected.is_some() {
+                    // A timeout overwrite that becomes current still proves
+                    // the key has one legitimate live value. In versioned
+                    // mode the prior committed value is checked by version ID.
+                    report.verified_live_objects += 1;
+                }
                 report
                     .unknown_writes_materialized
                     .push(ambiguous_write_materialized_message(&key, attempt, &body));
@@ -2362,16 +3842,6 @@ fn hash_mismatch_message(key: &str, expected: &ExpectedObject, body: &[u8]) -> S
     )
 }
 
-fn matching_ambiguous_write<'a>(
-    attempts: &'a [AmbiguousWriteAttempt],
-    body: &[u8],
-) -> Option<&'a AmbiguousWriteAttempt> {
-    attempts
-        .iter()
-        .rev()
-        .find(|attempt| object_matches(&attempt.object, body))
-}
-
 fn matching_active_ambiguous_write<'a>(
     attempts: &'a [AmbiguousWriteAttempt],
     body: &[u8],
@@ -2392,6 +3862,15 @@ fn matching_superseded_ambiguous_write<'a>(
         .rev()
         .filter(|attempt| attempt.superseded_by.is_some())
         .find(|attempt| object_matches(&attempt.object, body))
+}
+
+fn take_version_write_source(
+    sources: &mut VersionWriteSourceIndex,
+    key: &str,
+    actual: &ExpectedObject,
+    is_latest: bool,
+) -> Option<VersionWriteMatch> {
+    sources.take(key, actual, is_latest)
 }
 
 fn matching_active_ambiguous_object<'a>(
@@ -2485,18 +3964,34 @@ fn ambiguous_version_materialized_message(
     attempt: &AmbiguousWriteAttempt,
     body: &[u8],
 ) -> String {
-    format!(
-        "{key}@{version_id}: {} materialized as version {} ({} bytes)",
-        ambiguous_write_attempt_label(attempt),
-        sha256_hex(body),
-        body.len()
+    ambiguous_version_materialized_from_object_message(
+        key,
+        version_id,
+        attempt,
+        &ExpectedObject {
+            sha256: sha256_hex(body),
+            size_bytes: body.len(),
+        },
     )
 }
 
-fn uncommitted_version_missing_id_message(key: &str, attempts: &[AmbiguousWriteAttempt]) -> String {
-    let attempts = ambiguous_write_attempt_summary(attempts);
+fn ambiguous_version_materialized_from_object_message(
+    key: &str,
+    version_id: &str,
+    attempt: &AmbiguousWriteAttempt,
+    actual: &ExpectedObject,
+) -> String {
     format!(
-        "{key}: uncommitted non-delete version from ListObjectVersions did not include a version id; ambiguous attempts [{attempts}]"
+        "{key}@{version_id}: {} materialized as version {} ({} bytes)",
+        ambiguous_write_attempt_label(attempt),
+        actual.sha256,
+        actual.size_bytes
+    )
+}
+
+fn uncommitted_version_missing_id_message(key: &str, attempt_summary: &str) -> String {
+    format!(
+        "{key}: uncommitted non-delete version from ListObjectVersions did not include a version id; ambiguous attempts [{attempt_summary}]"
     )
 }
 
@@ -2504,10 +3999,14 @@ fn uncommitted_version_unverified_message(
     candidate: &AmbiguousVersionCandidate,
     get: &GetObjectResult,
 ) -> String {
-    let attempts = ambiguous_write_attempt_summary(&candidate.attempts);
     format!(
-        "{}@{}: uncommitted version could not be verified; outcome={:?} status={:?} error={:?}; ambiguous attempts [{attempts}]",
-        candidate.key, candidate.version_id, get.outcome, get.http_status, get.error
+        "{}@{}: uncommitted version could not be verified; outcome={:?} status={:?} error={:?}; ambiguous attempts [{}]",
+        candidate.key,
+        candidate.version_id,
+        get.outcome,
+        get.http_status,
+        get.error,
+        candidate.attempt_summary
     )
 }
 
@@ -2515,14 +4014,13 @@ fn uncommitted_version_value_conflict_message(
     candidate: &AmbiguousVersionCandidate,
     body: &[u8],
 ) -> String {
-    let attempts = ambiguous_write_attempt_summary(&candidate.attempts);
     format!(
         "{}@{}: observed uncommitted version {} ({} bytes), but it matched no ambiguous attempt [{}]",
         candidate.key,
         candidate.version_id,
         sha256_hex(body),
         body.len(),
-        attempts
+        candidate.attempt_summary
     )
 }
 
@@ -2950,6 +4448,26 @@ pub(crate) fn recovery_key_sets_are_consistent(report: &RecoveryStabilityReport)
             .all(|key| still_unavailable.contains(key))
 }
 
+pub(crate) fn validate_recovery_stability_against_checker(
+    recovery: &RecoveryStabilityReport,
+    checker: &CheckerReport,
+) -> Result<()> {
+    ensure!(
+        recovery.immediate_passed == checker.passed
+            && recovery.final_list_warning_count == checker.final_list_warning_count
+            && recovery.list_warnings == checker.list_warnings,
+        "recovery-stability-report.json immediate verdict or LIST evidence does not match the checker"
+    );
+    validate_recovery_key_sets(recovery, checker)
+        .context("recovery-stability-report.json key evidence is not bound to checker evidence")?;
+    ensure!(
+        recovery.classification == classify_recovery_stability(recovery, checker),
+        "recovery-stability-report.json classification does not match its checker/recovery evidence: expected {}",
+        classify_recovery_stability(recovery, checker).as_str()
+    );
+    Ok(())
+}
+
 pub(crate) fn validate_recovery_key_sets(
     report: &RecoveryStabilityReport,
     immediate_report: &CheckerReport,
@@ -3092,7 +4610,6 @@ fn immediate_failures_are_only_reread_candidates(
         && immediate_report
             .unexpected_visible_deleted_objects
             .is_empty()
-        && immediate_report.unknown_writes_materialized.is_empty()
         && immediate_report.unknown_write_value_conflicts.is_empty()
         && immediate_report.final_list_warning_count == 0
         && immediate_report.committed_writes_missing_version_id_count == 0
@@ -3121,18 +4638,88 @@ fn object_model(records: &[OperationRecord]) -> ObjectModel {
     model
 }
 
+fn version_write_source_budget(record: &OperationRecord) -> usize {
+    let max_attempts = mutation_attempts(record);
+    match (record.kind, record.outcome) {
+        (OperationKind::Put, OperationOutcome::Ok) => max_attempts.saturating_sub(1),
+        (OperationKind::Put, OperationOutcome::Timeout | OperationOutcome::Unknown) => max_attempts,
+        (OperationKind::Put, OperationOutcome::Failed) => max_attempts.saturating_sub(1),
+        (
+            OperationKind::CompleteMultipartUpload,
+            OperationOutcome::Timeout | OperationOutcome::Unknown,
+        ) => max_attempts.min(1),
+        (
+            OperationKind::CompleteMultipartUpload,
+            OperationOutcome::Failed | OperationOutcome::NotFound,
+        ) if max_attempts > 1 => 1,
+        _ => 0,
+    }
+}
+
+fn mutation_attempts(record: &OperationRecord) -> usize {
+    // Legacy records cannot prove retries. One ambiguous request may explain
+    // one version, but a configured ceiling is never evidence of transmissions.
+    record.mutation_attempts.unwrap_or(1) as usize
+}
+
+fn record_version_write_source(model: &mut ObjectModel, record: &OperationRecord) {
+    let remaining_versions = version_write_source_budget(record);
+    if remaining_versions == 0 {
+        return;
+    }
+    let Some((key, object)) = record_object(record) else {
+        return;
+    };
+    model
+        .version_write_sources
+        .entry(key)
+        .or_default()
+        .push(VersionWriteSource {
+            attempt: AmbiguousWriteAttempt {
+                id: record.id.clone(),
+                kind: record.kind,
+                outcome: record.outcome,
+                object,
+                payload_ref: record.payload_ref,
+                started_at_ms: record.started_at_ms,
+                ended_at_ms: record.ended_at_ms,
+                ended_sequence: record.ended_sequence,
+                superseded_by: None,
+            },
+            remaining_versions,
+            may_be_latest: matches!(
+                record.outcome,
+                OperationOutcome::Timeout
+                    | OperationOutcome::Unknown
+                    | OperationOutcome::Failed
+                    | OperationOutcome::NotFound
+            ),
+        });
+}
+
 fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
+    if record.mutation_attempts == Some(0)
+        && matches!(
+            record.kind,
+            OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+        )
+    {
+        return;
+    }
     match record.kind {
         OperationKind::Put | OperationKind::CompleteMultipartUpload
             if record.outcome == OperationOutcome::Ok =>
         {
             if let Some((key, object)) = record_object(record) {
                 mark_superseded_ambiguous_writes(model, &key, record);
+                mark_superseded_version_sources(model, &key, record);
                 model.committed_writes += 1;
                 model.deleted.remove(&key);
                 model.ambiguous_delete_pending.remove(&key);
+                model.ambiguous_delete_lineage_pending.remove(&key);
                 model.live.insert(key, object);
             }
+            record_version_write_source(model, record);
         }
         OperationKind::Put | OperationKind::CompleteMultipartUpload
             if matches!(
@@ -3157,18 +4744,49 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
                         superseded_by: None,
                     });
             }
+            record_version_write_source(model, record);
         }
         OperationKind::Put | OperationKind::CompleteMultipartUpload
-            if record.outcome == OperationOutcome::Failed =>
+            if matches!(
+                record.outcome,
+                OperationOutcome::Failed | OperationOutcome::NotFound
+            ) =>
         {
-            if let (Some(key), Some(sha256)) = (record.key.clone(), record.value_sha256.clone()) {
-                model.failed_writes.entry(key).or_default().insert(sha256);
+            if version_write_source_budget(record) > 0 {
+                if let Some((key, object)) = record_object(record) {
+                    if record.kind == OperationKind::CompleteMultipartUpload
+                        || model.live.contains_key(&key)
+                        || model.deleted.contains(&key)
+                    {
+                        model.unknown_writes.entry(key.clone()).or_default().push(
+                            AmbiguousWriteAttempt {
+                                id: record.id.clone(),
+                                kind: record.kind,
+                                outcome: record.outcome,
+                                object,
+                                payload_ref: record.payload_ref,
+                                started_at_ms: record.started_at_ms,
+                                ended_at_ms: record.ended_at_ms,
+                                ended_sequence: record.ended_sequence,
+                                superseded_by: None,
+                            },
+                        );
+                    }
+                    if record.outcome == OperationOutcome::Failed
+                        && let Some(sha256) = record.value_sha256.clone()
+                    {
+                        model.failed_writes.entry(key).or_default().insert(sha256);
+                    }
+                }
+                record_version_write_source(model, record);
             }
         }
         OperationKind::Delete if record.outcome == OperationOutcome::Ok => {
             if let Some(key) = record.key.clone() {
                 mark_superseded_ambiguous_writes(model, &key, record);
+                mark_superseded_version_sources(model, &key, record);
                 model.ambiguous_delete_pending.remove(&key);
+                model.ambiguous_delete_lineage_pending.remove(&key);
                 model.live.remove(&key);
                 model.deleted.insert(key);
             }
@@ -3177,15 +4795,19 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
             if matches!(
                 record.outcome,
                 OperationOutcome::Timeout | OperationOutcome::Unknown
-            ) =>
+            ) || (record.outcome == OperationOutcome::Failed
+                && mutation_attempts(record) > 1) =>
         {
             // An ambiguous delete of a committed object may or may not have
             // taken effect; mark it so a post-recovery 404 is tolerated instead
             // of being reported as a lost committed object.
-            if let Some(key) = record.key.clone()
-                && model.live.contains_key(&key)
-            {
-                model.ambiguous_delete_pending.insert(key);
+            if let Some(key) = record.key.clone() {
+                if model.live.contains_key(&key) {
+                    model.ambiguous_delete_pending.insert(key.clone());
+                }
+                if model.live.contains_key(&key) || model.deleted.contains(&key) {
+                    model.ambiguous_delete_lineage_pending.insert(key);
+                }
             }
         }
         _ => {}
@@ -3198,6 +4820,33 @@ fn mark_superseded_ambiguous_writes(
     superseding_record: &OperationRecord,
 ) {
     mark_superseded_attempts(&mut model.unknown_writes, key, superseding_record);
+}
+
+fn mark_superseded_version_sources(
+    model: &mut ObjectModel,
+    key: &str,
+    superseding_record: &OperationRecord,
+) {
+    let Some(sources) = model.version_write_sources.get_mut(key) else {
+        return;
+    };
+    for source in sources {
+        let attempt = &mut source.attempt;
+        if attempt.superseded_by.is_none()
+            && completion_precedes_start(
+                attempt.ended_sequence,
+                attempt.ended_at_ms,
+                superseding_record.started_sequence,
+                superseding_record.started_at_ms,
+            )
+        {
+            attempt.superseded_by = Some(SupersedingMutation {
+                id: superseding_record.id.clone(),
+                kind: superseding_record.kind,
+                started_at_ms: superseding_record.started_at_ms,
+            });
+        }
+    }
 }
 
 fn mark_superseded_attempts(
@@ -3960,6 +5609,7 @@ mod tests {
     use crate::fault::workload::seeded_bytes;
     use crate::fault::workload::{GetObjectResult, ObjectVersionEntry, sha256_hex};
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
 
     fn record(
         id: &str,
@@ -3978,6 +5628,11 @@ mod tests {
             value_sha256: Some(hash.to_string()),
             size_bytes: Some(1),
             version_id: None,
+            request_version_id: None,
+            is_delete_marker: None,
+            mutation_max_attempts: None,
+            mutation_attempts: None,
+            read_purpose: None,
             payload_ref: None,
             range: None,
             started_sequence: None,
@@ -4044,6 +5699,11 @@ mod tests {
             value_sha256: None,
             size_bytes: Some(keys.len()),
             version_id: None,
+            request_version_id: None,
+            is_delete_marker: None,
+            mutation_max_attempts: None,
+            mutation_attempts: None,
+            read_purpose: None,
             listed_keys: Some(keys.iter().map(|key| key.to_string()).collect()),
             listed_versions: None,
             payload_ref: None,
@@ -4077,6 +5737,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recovery_failure_authentication_rejects_an_unrelated_reread() {
+        let mut immediate = empty_report();
+        immediate.passed = false;
+        immediate.unavailable_committed_objects.push(
+            "k: outcome=Timeout status=200 error=\"get body read timed out\""
+                .to_string()
+                .into(),
+        );
+        let mut recovery = recovery_report_with_attempted_key("k");
+        recovery.reread_recovered_keys.push("k".into());
+        finish_recovery_stability_report(&mut recovery, &immediate);
+        super::validate_recovery_stability_against_checker(&recovery, &immediate)
+            .expect("bound recovery");
+        recovery.reread_attempted_keys = vec!["unrelated".into()];
+        recovery.reread_recovered_keys = vec!["unrelated".into()];
+        assert!(super::validate_recovery_stability_against_checker(&recovery, &immediate).is_err());
+    }
+
+    #[test]
+    fn configured_retry_ceiling_does_not_authenticate_extra_versions() {
+        for kind in [
+            OperationKind::Put,
+            OperationKind::Delete,
+            OperationKind::CompleteMultipartUpload,
+        ] {
+            let mut rejected = record("rejected", kind, "k", "sha", OperationOutcome::Failed);
+            rejected.http_status = Some(400);
+            rejected.mutation_max_attempts = Some(3);
+            for attempts in [None, Some(1)] {
+                rejected.mutation_attempts = attempts;
+                let model = object_model(&[
+                    record("put", OperationKind::Put, "k", "old", OperationOutcome::Ok),
+                    rejected.clone(),
+                ]);
+                assert!(model.version_write_sources.is_empty());
+                assert!(model.unknown_writes.is_empty());
+                assert!(model.ambiguous_delete_pending.is_empty());
+            }
+        }
+        let mut unsent = record(
+            "unsent",
+            OperationKind::Put,
+            "k",
+            "sha",
+            OperationOutcome::Timeout,
+        );
+        unsent.mutation_attempts = Some(0);
+        let model = object_model(&[unsent]);
+        assert!(model.unknown_writes.is_empty() && model.version_write_sources.is_empty());
+    }
     #[test]
     fn corrupted_successful_get_is_hard_failure_input() {
         let records = vec![
@@ -4146,6 +5857,52 @@ mod tests {
         // a post-recovery 404 a legitimate outcome.
         assert!(model.live.contains_key("k"));
         assert!(model.ambiguous_delete_pending.contains("k"));
+    }
+
+    #[test]
+    fn failed_delete_with_retries_marks_committed_key_pending() {
+        let put = record("op-1", OperationKind::Put, "k", "v1", OperationOutcome::Ok);
+        let mut failed_delete = record(
+            "op-2",
+            OperationKind::Delete,
+            "k",
+            "",
+            OperationOutcome::Failed,
+        );
+        failed_delete.mutation_attempts = Some(3);
+        let model = object_model(&[put.clone(), failed_delete.clone()]);
+        assert!(model.live.contains_key("k"));
+        assert!(model.ambiguous_delete_pending.contains("k"));
+
+        let mut quiet_delete = failed_delete;
+        quiet_delete.scenario = "dm-drop-writes-after-ack-delete-marker".to_string();
+        quiet_delete.mutation_attempts = Some(1);
+        assert!(
+            object_model(&[put, quiet_delete])
+                .ambiguous_delete_pending
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ambiguous_delete_after_committed_delete_only_relaxes_version_lineage() {
+        let committed_delete = record("op-2", OperationKind::Delete, "k", "", OperationOutcome::Ok);
+        let ambiguous_delete = record(
+            "op-3",
+            OperationKind::Delete,
+            "k",
+            "",
+            OperationOutcome::Timeout,
+        );
+        let model = object_model(&[
+            record("op-1", OperationKind::Put, "k", "v1", OperationOutcome::Ok),
+            committed_delete,
+            ambiguous_delete,
+        ]);
+
+        assert!(model.deleted.contains("k"));
+        assert!(model.ambiguous_delete_pending.is_empty());
+        assert!(model.ambiguous_delete_lineage_pending.contains("k"));
     }
 
     #[test]
@@ -4381,6 +6138,7 @@ mod tests {
     #[test]
     fn ambiguous_overwrite_materializing_is_not_committed_hash_mismatch() {
         let mut report = empty_report();
+        report.expected_live_objects = 1;
         let committed = ExpectedObject {
             sha256: sha256_hex(b"a"),
             size_bytes: 1,
@@ -4402,6 +6160,7 @@ mod tests {
 
         assert!(report.hash_mismatches.is_empty());
         assert_eq!(report.unknown_writes_materialized.len(), 1);
+        assert!(report.success_predicate());
         assert_eq!(
             super::classify_without_reread(&report),
             RecoveryStabilityClassification::AmbiguousWriteMaterialized
@@ -4748,13 +6507,16 @@ mod tests {
                 "c",
                 OperationOutcome::Timeout,
             ),
-            record(
-                "op-5",
-                OperationKind::CompleteMultipartUpload,
-                "failed",
-                "d",
-                OperationOutcome::Failed,
-            ),
+            OperationRecord {
+                mutation_attempts: Some(3),
+                ..record(
+                    "op-5",
+                    OperationKind::CompleteMultipartUpload,
+                    "failed",
+                    "d",
+                    OperationOutcome::Failed,
+                )
+            },
         ]);
         assert_eq!(
             model.failed_writes.get("failed"),
@@ -4770,18 +6532,21 @@ mod tests {
 
         let unexplained = unexplained_listed_keys(&model, &listed);
 
-        assert_eq!(unexplained, vec!["failed".to_string(), "ghost".to_string()]);
+        assert_eq!(unexplained, vec!["ghost".to_string()]);
     }
 
     #[test]
     fn unexplained_listed_key_outcomes_split_ghost_tolerated_and_unexpected() {
-        let model = object_model(&[record(
-            "op-1",
-            OperationKind::Put,
-            "failed",
-            &sha256_hex(b"d"),
-            OperationOutcome::Failed,
-        )]);
+        let model = object_model(&[OperationRecord {
+            mutation_attempts: Some(3),
+            ..record(
+                "op-1",
+                OperationKind::Put,
+                "failed",
+                &sha256_hex(b"d"),
+                OperationOutcome::Failed,
+            )
+        }]);
         let readable = GetObjectResult {
             outcome: OperationOutcome::Ok,
             http_status: Some(200),
@@ -6146,6 +7911,24 @@ mod tests {
     }
 
     #[test]
+    fn successful_unversioned_delete_requires_a_confirmed_delete_marker() {
+        let mut delete = record(
+            "delete-204",
+            OperationKind::Delete,
+            "deleted-key",
+            "",
+            OperationOutcome::Ok,
+        );
+        delete.version_id = Some("marker-1".to_string());
+        delete.is_delete_marker = Some(false);
+
+        let lineage = super::committed_version_lineage(std::slice::from_ref(&delete));
+        assert!(lineage.delete_markers.is_empty());
+        assert_eq!(lineage.delete_marker_lineage_incomplete.len(), 1);
+        assert!(super::checker_expected_version_listing(&[delete]).is_empty());
+    }
+
+    #[test]
     fn resurrected_deleted_objects_require_visible_latest_non_marker() {
         use crate::fault::workload::ObjectVersionEntry;
         use std::collections::BTreeSet;
@@ -6264,6 +8047,186 @@ mod tests {
     }
 
     #[test]
+    fn listed_delete_markers_require_committed_or_ambiguous_delete_sources() {
+        use crate::fault::workload::ObjectVersionEntry;
+
+        let mut put = record(
+            "put-1",
+            OperationKind::Put,
+            "k",
+            "sha",
+            OperationOutcome::Ok,
+        );
+        put.version_id = Some("version-1".to_string());
+        let entries = vec![
+            ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some("version-1".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+            ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some("ghost-marker".to_string()),
+                is_latest: false,
+                is_delete_marker: true,
+            },
+        ];
+        let lineage = super::committed_version_lineage(std::slice::from_ref(&put));
+        let conflicts =
+            super::listed_version_lineage_conflicts(std::slice::from_ref(&put), &lineage, &entries);
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].contains("no committed or ambiguous DELETE source"));
+
+        let ambiguous_delete = record(
+            "delete-timeout",
+            OperationKind::Delete,
+            "k",
+            "",
+            OperationOutcome::Timeout,
+        );
+        let history = vec![put, ambiguous_delete];
+        assert!(
+            super::listed_version_lineage_conflicts(&history, &lineage, &entries).is_empty(),
+            "one timeout DELETE can explain one otherwise unknown marker"
+        );
+
+        let mut duplicated = entries;
+        duplicated.push(duplicated[1].clone());
+        let conflicts = super::listed_version_lineage_conflicts(&history, &lineage, &duplicated);
+        assert!(
+            conflicts
+                .iter()
+                .any(|conflict| conflict.contains("duplicate immutable version identity"))
+        );
+    }
+
+    #[test]
+    fn listed_delete_markers_respect_the_sdk_retry_budget() {
+        use crate::fault::workload::ObjectVersionEntry;
+
+        let mut put = record(
+            "put-1",
+            OperationKind::Put,
+            "k",
+            "sha",
+            OperationOutcome::Ok,
+        );
+        put.version_id = Some("version-1".to_string());
+        let mut timeout_delete = record(
+            "delete-timeout",
+            OperationKind::Delete,
+            "k",
+            "",
+            OperationOutcome::Timeout,
+        );
+        timeout_delete.mutation_attempts = Some(3);
+        let timeout_history = vec![put.clone(), timeout_delete];
+        let timeout_lineage = super::committed_version_lineage(std::slice::from_ref(&put));
+        let marker = |index: usize| ObjectVersionEntry {
+            key: "k".to_string(),
+            version_id: Some(format!("marker-{index}")),
+            is_latest: index == 3,
+            is_delete_marker: true,
+        };
+        let three_markers = (1..=3).map(marker).collect::<Vec<_>>();
+        assert!(
+            super::listed_version_lineage_conflicts(
+                &timeout_history,
+                &timeout_lineage,
+                &three_markers,
+            )
+            .is_empty()
+        );
+        let four_markers = (1..=4).map(marker).collect::<Vec<_>>();
+        assert_eq!(
+            super::listed_version_lineage_conflicts(
+                &timeout_history,
+                &timeout_lineage,
+                &four_markers,
+            )
+            .len(),
+            1
+        );
+
+        let mut failed_delete = record(
+            "delete-failed",
+            OperationKind::Delete,
+            "k",
+            "",
+            OperationOutcome::Failed,
+        );
+        failed_delete.mutation_attempts = Some(3);
+        let failed_history = vec![put.clone(), failed_delete];
+        let two_markers = (1..=2).map(marker).collect::<Vec<_>>();
+        assert!(
+            super::listed_version_lineage_conflicts(
+                &failed_history,
+                &timeout_lineage,
+                &two_markers,
+            )
+            .is_empty(),
+            "a final failed response may follow two applied retry attempts"
+        );
+        assert_eq!(
+            super::listed_version_lineage_conflicts(
+                &failed_history,
+                &timeout_lineage,
+                &three_markers,
+            )
+            .len(),
+            1
+        );
+
+        let mut committed_delete = record(
+            "delete-ok",
+            OperationKind::Delete,
+            "k",
+            "",
+            OperationOutcome::Ok,
+        );
+        committed_delete.mutation_attempts = Some(3);
+        committed_delete.version_id = Some("marker-3".to_string());
+        let success_history = vec![put, committed_delete];
+        let success_lineage = super::committed_version_lineage(&success_history);
+        assert!(
+            super::listed_version_lineage_conflicts(
+                &success_history,
+                &success_lineage,
+                &three_markers,
+            )
+            .is_empty(),
+            "a successful retry may leave two earlier delete markers"
+        );
+        assert_eq!(
+            super::listed_version_lineage_conflicts(
+                &success_history,
+                &success_lineage,
+                &four_markers,
+            )
+            .len(),
+            1
+        );
+
+        let mut quiet_history = success_history;
+        for record in &mut quiet_history {
+            record.scenario = "dm-drop-writes-after-ack-delete-marker".to_string();
+            record.mutation_attempts = Some(1);
+        }
+        let quiet_lineage = super::committed_version_lineage(&quiet_history);
+        assert_eq!(
+            super::listed_version_lineage_conflicts(
+                &quiet_history,
+                &quiet_lineage,
+                &three_markers,
+            )
+            .len(),
+            2,
+            "quiet ACK mutations disable SDK retries"
+        );
+    }
+
+    #[test]
     fn ambiguous_version_candidates_ignore_committed_versions_but_keep_unknown_versions() {
         use crate::fault::workload::ObjectVersionEntry;
 
@@ -6344,10 +8307,22 @@ mod tests {
         let candidate = super::AmbiguousVersionCandidate {
             key: "k".to_string(),
             version_id: "ver-timeout".to_string(),
-            attempts: vec![attempt],
+            is_latest: true,
+            attempt_summary: Arc::from(super::ambiguous_write_attempt_summary(
+                std::slice::from_ref(&attempt),
+            )),
         };
         let mut materialized = Vec::new();
         let mut conflicts = Vec::new();
+        let source_map = BTreeMap::from([(
+            "k".to_string(),
+            vec![super::VersionWriteSource {
+                attempt,
+                remaining_versions: 3,
+                may_be_latest: true,
+            }],
+        )]);
+        let mut sources = super::VersionWriteSourceIndex::from_sources(&source_map);
 
         super::evaluate_ambiguous_version_get(
             &mut materialized,
@@ -6359,12 +8334,332 @@ mod tests {
                 error: None,
                 body: Some(b"b".to_vec()),
             },
+            &mut sources,
         );
 
         assert!(conflicts.is_empty());
         assert_eq!(materialized.len(), 1);
-        assert!(materialized[0].contains("k@ver-timeout"));
-        assert!(materialized[0].contains("materialized as version"));
+        assert_eq!(materialized[0].key, "k");
+        assert_eq!(materialized[0].version_id, "ver-timeout");
+        assert!(materialized[0].active);
+        assert!(materialized[0].evidence.contains("k@ver-timeout"));
+        assert!(materialized[0].evidence.contains("materialized as version"));
+    }
+
+    #[test]
+    fn one_timeout_put_cannot_explain_more_versions_than_http_attempts() {
+        let mut timeout = record(
+            "put-timeout",
+            OperationKind::Put,
+            "k",
+            &sha256_hex(b"b"),
+            OperationOutcome::Timeout,
+        );
+        timeout.mutation_attempts = Some(3);
+        let model = object_model(&[timeout]);
+        let lineage = super::committed_version_lineage(&[]);
+        let entries = (1..=4)
+            .map(|index| ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some(format!("version-{index}")),
+                is_latest: index == 4,
+                is_delete_marker: false,
+            })
+            .collect::<Vec<_>>();
+        let (mut candidates, conflicts) =
+            super::ambiguous_version_candidates(&model, &lineage, &entries);
+        assert!(conflicts.is_empty());
+        candidates.sort_by_key(|candidate| !candidate.is_latest);
+        let mut sources =
+            super::VersionWriteSourceIndex::from_sources(&model.version_write_sources);
+        let mut materialized = Vec::new();
+        let mut conflicts = Vec::new();
+        for candidate in candidates {
+            super::evaluate_ambiguous_version_get(
+                &mut materialized,
+                &mut conflicts,
+                &candidate,
+                GetObjectResult {
+                    outcome: OperationOutcome::Ok,
+                    http_status: Some(200),
+                    error: None,
+                    body: Some(b"b".to_vec()),
+                },
+                &mut sources,
+            );
+        }
+        assert_eq!(materialized.len(), 3);
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].contains("matched no ambiguous attempt"));
+    }
+
+    #[test]
+    fn recorded_no_retry_timeout_put_explains_only_one_version() {
+        let mut timeout = record(
+            "put-timeout",
+            OperationKind::Put,
+            "k",
+            &sha256_hex(b"b"),
+            OperationOutcome::Timeout,
+        );
+        timeout.scenario = "stale-disk-return-detect".to_string();
+        timeout.mutation_max_attempts = Some(1);
+        timeout.mutation_attempts = Some(1);
+        let model = object_model(&[timeout]);
+        let entries = (1..=2)
+            .map(|index| ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some(format!("version-{index}")),
+                is_latest: index == 2,
+                is_delete_marker: false,
+            })
+            .collect::<Vec<_>>();
+        let (candidates, conflicts) = super::ambiguous_version_candidates(
+            &model,
+            &super::VersionLineage::default(),
+            &entries,
+        );
+        assert!(conflicts.is_empty());
+        let actual = ExpectedObject {
+            sha256: sha256_hex(b"b"),
+            size_bytes: 1,
+        };
+        let mut sources =
+            super::VersionWriteSourceIndex::from_sources(&model.version_write_sources);
+        assert!(super::take_version_write_source(&mut sources, "k", &actual, true).is_some());
+        assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_none());
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn hotspot_retry_versions_share_diagnostics_and_consume_indexed_sources() {
+        const VERSION_COUNT: usize = 20_000;
+        let object_hash = sha256_hex(b"b");
+        let mut model = ObjectModel::default();
+        model.version_write_sources.insert(
+            "k".to_string(),
+            (0..VERSION_COUNT)
+                .map(|index| super::VersionWriteSource {
+                    attempt: ambiguous_attempt(&format!("put-{index}"), &object_hash),
+                    remaining_versions: 1,
+                    may_be_latest: true,
+                })
+                .collect(),
+        );
+        let entries = (0..VERSION_COUNT)
+            .map(|index| ObjectVersionEntry {
+                key: "k".to_string(),
+                version_id: Some(format!("version-{index}")),
+                is_latest: false,
+                is_delete_marker: false,
+            })
+            .collect::<Vec<_>>();
+        let (candidates, conflicts) = super::ambiguous_version_candidates(
+            &model,
+            &super::VersionLineage::default(),
+            &entries,
+        );
+        assert!(conflicts.is_empty());
+        assert_eq!(candidates.len(), VERSION_COUNT);
+        assert!(Arc::ptr_eq(
+            &candidates[0].attempt_summary,
+            &candidates[VERSION_COUNT - 1].attempt_summary,
+        ));
+
+        let actual = ExpectedObject {
+            sha256: object_hash,
+            size_bytes: 1,
+        };
+        let mut sources =
+            super::VersionWriteSourceIndex::from_sources(&model.version_write_sources);
+        for _ in 0..VERSION_COUNT {
+            assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_some());
+        }
+        assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_none());
+    }
+
+    #[test]
+    fn successful_put_retry_versions_use_only_the_unrecorded_attempt_budget() {
+        let mut committed = record(
+            "put-ok",
+            OperationKind::Put,
+            "k",
+            &sha256_hex(b"b"),
+            OperationOutcome::Ok,
+        );
+        committed.mutation_attempts = Some(3);
+        committed.version_id = Some("version-final".to_string());
+        let model = object_model(std::slice::from_ref(&committed));
+        let actual = ExpectedObject {
+            sha256: sha256_hex(b"b"),
+            size_bytes: 1,
+        };
+        let mut sources =
+            super::VersionWriteSourceIndex::from_sources(&model.version_write_sources);
+        assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_some());
+        assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_some());
+        assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_none());
+        assert!(
+            super::take_version_write_source(
+                &mut super::VersionWriteSourceIndex::from_sources(&model.version_write_sources),
+                "k",
+                &actual,
+                true,
+            )
+            .is_none(),
+            "the recorded successful response must remain newer than its earlier retries"
+        );
+        committed.scenario = "dm-drop-writes-after-ack-put".to_string();
+        committed.mutation_attempts = Some(1);
+        assert!(
+            object_model(&[committed]).version_write_sources.is_empty(),
+            "quiet ACK mutations have no unrecorded retry-version budget"
+        );
+    }
+
+    #[test]
+    fn failed_put_retry_versions_use_only_the_prior_attempt_budget() {
+        let mut failed = record(
+            "put-failed",
+            OperationKind::Put,
+            "k",
+            &sha256_hex(b"b"),
+            OperationOutcome::Failed,
+        );
+        failed.mutation_attempts = Some(3);
+        let actual = ExpectedObject {
+            sha256: sha256_hex(b"b"),
+            size_bytes: 1,
+        };
+        let failed_model = object_model(std::slice::from_ref(&failed));
+        let mut sources =
+            super::VersionWriteSourceIndex::from_sources(&failed_model.version_write_sources);
+        assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_some());
+        assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_some());
+        assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_none());
+
+        failed.scenario = "dm-drop-writes-after-ack-put".to_string();
+        failed.mutation_attempts = Some(1);
+        let quiet_model = object_model(&[failed]);
+        assert!(
+            quiet_model.version_write_sources.is_empty() && quiet_model.unknown_writes.is_empty(),
+            "quiet ACK mutations have no prior retry-version budget"
+        );
+    }
+
+    #[test]
+    fn failed_put_retry_can_be_the_current_overwrite_value() {
+        let baseline = record(
+            "put-baseline",
+            OperationKind::Put,
+            "k",
+            &sha256_hex(b"a"),
+            OperationOutcome::Ok,
+        );
+        let mut failed = record(
+            "put-failed",
+            OperationKind::Put,
+            "k",
+            &sha256_hex(b"b"),
+            OperationOutcome::Failed,
+        );
+        failed.mutation_attempts = Some(3);
+        let model = object_model(&[baseline, failed]);
+        let mut report = empty_report();
+        super::evaluate_final_get(
+            &mut report,
+            "k".to_string(),
+            model.live.get("k"),
+            &model.unknown_writes["k"],
+            GetObjectResult {
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+                error: None,
+                body: Some(b"b".to_vec()),
+            },
+        );
+        assert!(report.hash_mismatches.is_empty());
+        assert_eq!(report.unknown_writes_materialized.len(), 1);
+    }
+
+    #[test]
+    fn multipart_terminal_error_retry_can_explain_only_one_completed_version() {
+        let actual = ExpectedObject {
+            sha256: sha256_hex(b"b"),
+            size_bytes: 1,
+        };
+        for outcome in [OperationOutcome::NotFound, OperationOutcome::Failed] {
+            let mut terminal = record(
+                "complete-terminal",
+                OperationKind::CompleteMultipartUpload,
+                "k",
+                &sha256_hex(b"b"),
+                outcome,
+            );
+            terminal.mutation_attempts = Some(3);
+            let model = object_model(std::slice::from_ref(&terminal));
+            assert!(model.unknown_writes.contains_key("k"));
+            let mut sources =
+                super::VersionWriteSourceIndex::from_sources(&model.version_write_sources);
+            assert!(super::take_version_write_source(&mut sources, "k", &actual, true).is_some());
+            assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_none());
+
+            terminal.scenario = "dm-drop-writes-after-ack-multipart-complete".to_string();
+            terminal.mutation_attempts = Some(1);
+            let quiet_model = object_model(&[terminal]);
+            assert!(quiet_model.unknown_writes.is_empty());
+            assert!(quiet_model.version_write_sources.is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_committed_version_get_returns_an_error_without_panicking() {
+        let prefix_key = "fault-test/run-1/";
+        let mut committed = record(
+            "put-ok",
+            OperationKind::Put,
+            "fault-test/run-1/key",
+            "sha",
+            OperationOutcome::Ok,
+        );
+        committed.version_id = Some("version-1".to_string());
+        let mut version_list = record(
+            "list-versions",
+            OperationKind::ListVersions,
+            prefix_key,
+            "",
+            OperationOutcome::Ok,
+        );
+        version_list.value_sha256 = None;
+        version_list.size_bytes = Some(0);
+        version_list.listed_versions = Some(Vec::new());
+        let mut report = empty_report();
+        report.versioning_expected = true;
+        report.expected_committed_versions = 1;
+        report.verified_committed_versions = 1;
+        report.audit = Some(CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            history_prefix_record_count: 1,
+            history_prefix_sha256: String::new(),
+            history_suffix_record_count: 1,
+            history_suffix_sha256: String::new(),
+            suffix_operations: Vec::new(),
+            data_version_checks: Vec::new(),
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: Some(true),
+        });
+
+        let error = super::validate_versioned_checker_suffix(
+            &report,
+            &[committed],
+            &[version_list],
+            &BTreeSet::new(),
+            prefix_key,
+        )
+        .expect_err("missing committed version evidence must be rejected");
+        assert!(error.to_string().contains("omits a committed version"));
     }
 
     #[test]
@@ -6403,10 +8698,22 @@ mod tests {
         let candidate = super::AmbiguousVersionCandidate {
             key: "k".to_string(),
             version_id: "ver-extra".to_string(),
-            attempts: vec![attempt],
+            is_latest: false,
+            attempt_summary: Arc::from(super::ambiguous_write_attempt_summary(
+                std::slice::from_ref(&attempt),
+            )),
         };
         let mut materialized = Vec::new();
         let mut conflicts = Vec::new();
+        let source_map = BTreeMap::from([(
+            "k".to_string(),
+            vec![super::VersionWriteSource {
+                attempt,
+                remaining_versions: 3,
+                may_be_latest: true,
+            }],
+        )]);
+        let mut sources = super::VersionWriteSourceIndex::from_sources(&source_map);
 
         super::evaluate_ambiguous_version_get(
             &mut materialized,
@@ -6418,6 +8725,7 @@ mod tests {
                 error: None,
                 body: Some(b"c".to_vec()),
             },
+            &mut sources,
         );
 
         assert!(materialized.is_empty());
@@ -7208,7 +9516,8 @@ mod tests {
         evaluate_final_list_keys(
             &model,
             &absent,
-            &BTreeSet::from([key]),
+            &BTreeSet::new(),
+            &BTreeSet::from([key.clone()]),
             "fault-test/run/",
             &mut contradiction,
         );
@@ -7218,10 +9527,22 @@ mod tests {
             &model,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             "fault-test/run/",
             &mut present_omission,
         );
         assert_eq!(present_omission.total_count, 1);
+
+        let mut materialized_write = WarningSummary::default();
+        evaluate_final_list_keys(
+            &model,
+            &BTreeSet::new(),
+            &BTreeSet::from([key.clone()]),
+            &BTreeSet::from([key]),
+            "fault-test/run/",
+            &mut materialized_write,
+        );
+        assert_eq!(materialized_write.total_count, 0);
     }
 
     #[test]
@@ -7264,7 +9585,14 @@ mod tests {
         let model = ObjectModel::default();
 
         let mut missing = empty_report();
-        super::evaluate_latest_version_lineage(&mut missing, &model, &expected, &BTreeMap::new());
+        super::evaluate_latest_version_lineage(
+            &mut missing,
+            &model,
+            &expected,
+            &BTreeMap::new(),
+            &[],
+            &[],
+        );
         assert_eq!(missing.delete_marker_lineage_incomplete.len(), 1);
 
         let wrong = BTreeMap::from([(
@@ -7277,7 +9605,14 @@ mod tests {
             },
         )]);
         let mut mismatched = empty_report();
-        super::evaluate_latest_version_lineage(&mut mismatched, &model, &expected, &wrong);
+        super::evaluate_latest_version_lineage(
+            &mut mismatched,
+            &model,
+            &expected,
+            &wrong,
+            &[],
+            &[],
+        );
         assert_eq!(mismatched.delete_marker_lineage_incomplete.len(), 1);
 
         let matching = BTreeMap::from([(
@@ -7290,8 +9625,97 @@ mod tests {
             },
         )]);
         let mut clean = empty_report();
-        super::evaluate_latest_version_lineage(&mut clean, &model, &expected, &matching);
+        super::evaluate_latest_version_lineage(&mut clean, &model, &expected, &matching, &[], &[]);
         assert!(clean.delete_marker_lineage_incomplete.is_empty());
+
+        let mut ambiguous_delete_model = ObjectModel::default();
+        ambiguous_delete_model
+            .ambiguous_delete_lineage_pending
+            .insert("key".to_string());
+        let marker = BTreeMap::from([(
+            "key".to_string(),
+            ObjectVersionEntry {
+                key: "key".to_string(),
+                version_id: Some("delete-2".to_string()),
+                is_latest: true,
+                is_delete_marker: true,
+            },
+        )]);
+        let mut ambiguous_marker = empty_report();
+        super::evaluate_latest_version_lineage(
+            &mut ambiguous_marker,
+            &ambiguous_delete_model,
+            &expected,
+            &marker,
+            &[],
+            &[],
+        );
+        assert!(ambiguous_marker.delete_marker_lineage_incomplete.is_empty());
+
+        let active_ambiguous = BTreeMap::from([(
+            "key".to_string(),
+            ObjectVersionEntry {
+                key: "key".to_string(),
+                version_id: Some("version-timeout".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        )]);
+        let materialized = [super::MaterializedAmbiguousVersion {
+            key: "key".to_string(),
+            version_id: "version-timeout".to_string(),
+            evidence: "authenticated timeout write".to_string(),
+            active: true,
+        }];
+        let mut ambiguous_write = empty_report();
+        super::evaluate_latest_version_lineage(
+            &mut ambiguous_write,
+            &ambiguous_delete_model,
+            &expected,
+            &active_ambiguous,
+            &materialized,
+            &[],
+        );
+        assert!(ambiguous_write.delete_marker_lineage_incomplete.is_empty());
+
+        let expected_marker = BTreeMap::from([(
+            "key".to_string(),
+            ListedVersionEntry {
+                key: "key".to_string(),
+                version_id: Some("delete-1".to_string()),
+                is_latest: true,
+                is_delete_marker: true,
+            },
+        )]);
+        let stale_marker = BTreeMap::from([(
+            "key".to_string(),
+            ObjectVersionEntry {
+                key: "key".to_string(),
+                version_id: Some("delete-0".to_string()),
+                is_latest: true,
+                is_delete_marker: true,
+            },
+        )]);
+        let committed_markers = [
+            super::CommittedDeleteMarker {
+                key: "key".to_string(),
+                version_id: "delete-0".to_string(),
+            },
+            super::CommittedDeleteMarker {
+                key: "key".to_string(),
+                version_id: "delete-1".to_string(),
+            },
+        ];
+        let mut stale_latest = empty_report();
+        super::evaluate_latest_version_lineage(
+            &mut stale_latest,
+            &ambiguous_delete_model,
+            &expected_marker,
+            &stale_marker,
+            &[],
+            &committed_markers,
+        );
+        assert_eq!(stale_latest.delete_marker_lineage_incomplete.len(), 1);
     }
 
     #[test]
@@ -7456,6 +9880,7 @@ mod tests {
             OperationOutcome::Failed,
         );
         failed.run_id = Some("run-1".to_string());
+        failed.mutation_attempts = Some(3);
         failed.http_status = Some(503);
         let mut live_get = record(
             "op-3",
@@ -7544,6 +9969,268 @@ mod tests {
                 .expect_err("listed unexplained key must be probed")
                 .to_string()
                 .contains("current GET coverage")
+        );
+    }
+
+    #[test]
+    fn checker_audit_accepts_authenticated_same_value_timeout_put_materialization() {
+        let run_prefix = "fault-test/run-1/";
+        let key = format!("{run_prefix}object-000001");
+        let hash = sha256_hex(b"a");
+        let mut committed = timed_record(
+            "put-committed",
+            OperationKind::Put,
+            &key,
+            &hash,
+            OperationOutcome::Ok,
+            1,
+            2,
+        );
+        let mut timeout = timed_record(
+            "put-timeout",
+            OperationKind::Put,
+            &key,
+            &hash,
+            OperationOutcome::Timeout,
+            3,
+            4,
+        );
+        timeout.http_status = None;
+        let mut historical_get = timed_record(
+            "get-after-timeout",
+            OperationKind::Get,
+            &key,
+            &hash,
+            OperationOutcome::Ok,
+            5,
+            6,
+        );
+        let mut checker_get = timed_record(
+            "checker-get",
+            OperationKind::Get,
+            &key,
+            &hash,
+            OperationOutcome::Ok,
+            10,
+            11,
+        );
+        let mut final_list = list_record("checker-list", run_prefix, 12, 13, &[key.as_str()]);
+        for operation in [
+            &mut committed,
+            &mut timeout,
+            &mut historical_get,
+            &mut checker_get,
+            &mut final_list,
+        ] {
+            operation.run_id = Some("run-1".to_string());
+        }
+        let mut history = vec![committed, timeout, historical_get, checker_get, final_list];
+        assign_recorder_sequences(&mut history);
+        let prefix = history[..3].to_vec();
+        let suffix = history[3..].to_vec();
+
+        let mut report = empty_report();
+        report.run_id = "run-1".to_string();
+        report.committed_puts = 1;
+        report.expected_live_objects = 1;
+        report.verified_live_objects = 1;
+        report.final_listed_objects = Some(1);
+        report.unknown_writes_materialized =
+            successful_read_anomalies(&prefix).unknown_writes_materialized;
+        report.operation_cohorts = super::operation_cohort_counts(&prefix);
+        report.fault_window_relations = super::fault_window_relation_counts(&prefix);
+        report.audit = Some(CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 9,
+            completed_at_ms: 14,
+            history_prefix_record_count: prefix.len(),
+            history_prefix_sha256: checker_history_records_sha256(&prefix).expect("prefix digest"),
+            history_suffix_record_count: suffix.len(),
+            history_suffix_sha256: checker_history_records_sha256(&suffix).expect("suffix digest"),
+            suffix_operations: checker_operation_audits(&suffix),
+            data_version_checks: Vec::new(),
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: None,
+        });
+        report.passed = true;
+
+        report
+            .require_success()
+            .expect("same-value timeout outcome");
+        validate_checker_audit_against_history(&report, &history)
+            .expect("authenticated timeout PUT materialization");
+    }
+
+    #[test]
+    fn versioned_checker_authenticates_materialized_timeout_put_version() {
+        let run_prefix = "fault-test/run-1/";
+        let key = format!("{run_prefix}object-000001");
+        let committed_hash = sha256_hex(b"a");
+        let timeout_hash = sha256_hex(b"b");
+        let mut committed = timed_record(
+            "put-committed",
+            OperationKind::Put,
+            &key,
+            &committed_hash,
+            OperationOutcome::Ok,
+            1,
+            2,
+        );
+        committed.version_id = Some("version-1".to_string());
+        let mut timeout = timed_record(
+            "put-timeout",
+            OperationKind::Put,
+            &key,
+            &timeout_hash,
+            OperationOutcome::Timeout,
+            3,
+            4,
+        );
+        timeout.http_status = None;
+        let mut current_get = timed_record(
+            "checker-current-get",
+            OperationKind::Get,
+            &key,
+            &timeout_hash,
+            OperationOutcome::Ok,
+            10,
+            11,
+        );
+        let mut committed_get = timed_record(
+            "checker-version-1-get",
+            OperationKind::Get,
+            &key,
+            &committed_hash,
+            OperationOutcome::Ok,
+            12,
+            13,
+        );
+        committed_get.version_id = Some("version-1".to_string());
+        let mut version_list = timed_record(
+            "checker-list-versions",
+            OperationKind::ListVersions,
+            run_prefix,
+            "",
+            OperationOutcome::Ok,
+            14,
+            15,
+        );
+        version_list.value_sha256 = None;
+        version_list.size_bytes = Some(2);
+        version_list.listed_versions = Some(vec![
+            ListedVersionEntry {
+                key: key.clone(),
+                version_id: Some("version-timeout".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+            ListedVersionEntry {
+                key: key.clone(),
+                version_id: Some("version-1".to_string()),
+                is_latest: false,
+                is_delete_marker: false,
+            },
+        ]);
+        let mut timeout_version_get = timed_record(
+            "checker-version-timeout-get",
+            OperationKind::Get,
+            &key,
+            &timeout_hash,
+            OperationOutcome::Ok,
+            16,
+            17,
+        );
+        timeout_version_get.version_id = Some("version-timeout".to_string());
+        let mut final_list = list_record("checker-list", run_prefix, 18, 19, &[key.as_str()]);
+        for operation in [
+            &mut committed,
+            &mut timeout,
+            &mut current_get,
+            &mut committed_get,
+            &mut version_list,
+            &mut timeout_version_get,
+            &mut final_list,
+        ] {
+            operation.run_id = Some("run-1".to_string());
+        }
+        let mut history = vec![
+            committed,
+            timeout,
+            current_get,
+            committed_get,
+            version_list,
+            timeout_version_get,
+            final_list,
+        ];
+        assign_recorder_sequences(&mut history);
+        let prefix = history[..2].to_vec();
+        let suffix = history[2..].to_vec();
+        let attempt = object_model(&prefix).unknown_writes[&key][0].clone();
+        let current_materialized = super::ambiguous_write_materialized_from_object_message(
+            &key,
+            &attempt,
+            &ExpectedObject {
+                sha256: timeout_hash.clone(),
+                size_bytes: 1,
+            },
+        );
+        let version_materialized = super::ambiguous_version_materialized_from_object_message(
+            &key,
+            "version-timeout",
+            &attempt,
+            &ExpectedObject {
+                sha256: timeout_hash.clone(),
+                size_bytes: 1,
+            },
+        );
+
+        let audit = |suffix: &[OperationRecord]| CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 9,
+            completed_at_ms: 20,
+            history_prefix_record_count: prefix.len(),
+            history_prefix_sha256: checker_history_records_sha256(&prefix).expect("prefix digest"),
+            history_suffix_record_count: suffix.len(),
+            history_suffix_sha256: checker_history_records_sha256(suffix).expect("suffix digest"),
+            suffix_operations: checker_operation_audits(suffix),
+            data_version_checks: vec![super::CheckerDataVersionAudit {
+                key: key.clone(),
+                version_id: "version-1".to_string(),
+                expected_sha256: committed_hash.clone(),
+                observed_sha256: Some(committed_hash.clone()),
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+            }],
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: Some(true),
+        };
+        let mut report = empty_report();
+        report.run_id = "run-1".to_string();
+        report.versioning_expected = true;
+        report.committed_puts = 1;
+        report.expected_live_objects = 1;
+        report.verified_live_objects = 1;
+        report.expected_committed_versions = 1;
+        report.verified_committed_versions = 1;
+        report.final_listed_objects = Some(1);
+        report.unknown_writes_materialized = vec![current_materialized, version_materialized];
+        report.operation_cohorts = super::operation_cohort_counts(&prefix);
+        report.fault_window_relations = super::fault_window_relation_counts(&prefix);
+        report.audit = Some(audit(&suffix));
+        report.passed = true;
+
+        validate_checker_audit_against_history(&report, &history)
+            .expect("versioned timeout PUT materialization is authenticated");
+
+        let mut tampered_history = history.clone();
+        tampered_history[5].value_sha256 = Some(sha256_hex(b"corrupt"));
+        let mut tampered_report = report;
+        tampered_report.audit = Some(audit(&tampered_history[2..]));
+        assert!(
+            validate_checker_audit_against_history(&tampered_report, &tampered_history)
+                .expect_err("foreign timeout version body must be rejected")
+                .to_string()
+                .contains("matches no write")
         );
     }
 
@@ -7715,8 +10402,17 @@ mod tests {
             .unknown_writes_materialized
             .push("key: ambiguous write became visible".to_string());
         assert!(
-            forged_materialized_write.require_success().is_err(),
-            "passed=true cannot hide a materialized ambiguous write"
+            forged_materialized_write.require_success().is_ok(),
+            "a same-value materialized timeout remains a valid ambiguous outcome"
+        );
+
+        let mut forged_conflicting_write = forged_materialized_write;
+        forged_conflicting_write
+            .unknown_write_value_conflicts
+            .push("key: timeout materialized with different bytes".to_string());
+        assert!(
+            forged_conflicting_write.require_success().is_err(),
+            "passed=true cannot hide an ambiguous write value conflict"
         );
 
         let mut forged_incomplete_multipart = report;
@@ -7846,6 +10542,161 @@ mod tests {
             .tolerated_ambiguous_deletes
             .push("key".to_string());
         assert!(duplicated.require_success().is_err());
+    }
+
+    #[test]
+    fn versioned_timeout_write_followed_by_timeout_delete_is_authenticatable() {
+        let key = "fault-test/run-1/key";
+        let mut committed = timed_record(
+            "put-committed",
+            OperationKind::Put,
+            key,
+            "hash-committed",
+            OperationOutcome::Ok,
+            1,
+            2,
+        );
+        committed.version_id = Some("version-committed".to_string());
+        let timeout_write = timed_record(
+            "put-timeout",
+            OperationKind::Put,
+            key,
+            "hash-timeout",
+            OperationOutcome::Timeout,
+            3,
+            4,
+        );
+        let timeout_delete = timed_record(
+            "delete-timeout",
+            OperationKind::Delete,
+            key,
+            "",
+            OperationOutcome::Timeout,
+            5,
+            6,
+        );
+
+        let mut current_get = timed_record(
+            "get-current",
+            OperationKind::Get,
+            key,
+            "hash-timeout",
+            OperationOutcome::Ok,
+            11,
+            12,
+        );
+        current_get.http_status = Some(200);
+        let mut committed_get = timed_record(
+            "get-committed-version",
+            OperationKind::Get,
+            key,
+            "hash-committed",
+            OperationOutcome::Ok,
+            13,
+            14,
+        );
+        committed_get.version_id = Some("version-committed".to_string());
+        let mut version_list = timed_record(
+            "list-versions",
+            OperationKind::ListVersions,
+            "fault-test/run-1/",
+            "",
+            OperationOutcome::Ok,
+            15,
+            16,
+        );
+        version_list.value_sha256 = None;
+        version_list.size_bytes = Some(2);
+        version_list.listed_versions = Some(vec![
+            ListedVersionEntry {
+                key: key.to_string(),
+                version_id: Some("version-committed".to_string()),
+                is_latest: false,
+                is_delete_marker: false,
+            },
+            ListedVersionEntry {
+                key: key.to_string(),
+                version_id: Some("version-timeout".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        ]);
+        let mut timeout_version_get = timed_record(
+            "get-timeout-version",
+            OperationKind::Get,
+            key,
+            "hash-timeout",
+            OperationOutcome::Ok,
+            17,
+            18,
+        );
+        timeout_version_get.version_id = Some("version-timeout".to_string());
+        let final_list = list_record("list-final", "fault-test/run-1/", 19, 20, &[key]);
+
+        let mut prefix = vec![committed, timeout_write, timeout_delete];
+        let mut suffix = vec![
+            current_get,
+            committed_get,
+            version_list,
+            timeout_version_get,
+            final_list,
+        ];
+        for operation in prefix.iter_mut().chain(&mut suffix) {
+            operation.run_id = Some("run-1".to_string());
+        }
+        let mut history = prefix.clone();
+        history.extend(suffix.clone());
+        assign_recorder_sequences(&mut history);
+        let prefix = history[..3].to_vec();
+        let suffix = history[3..].to_vec();
+        let attempt = object_model(&prefix).unknown_writes[key][0].clone();
+        let timeout_object = ExpectedObject {
+            sha256: "hash-timeout".to_string(),
+            size_bytes: 1,
+        };
+        let current_materialized =
+            super::ambiguous_write_materialized_from_object_message(key, &attempt, &timeout_object);
+        let version_materialized = super::ambiguous_version_materialized_from_object_message(
+            key,
+            "version-timeout",
+            &attempt,
+            &timeout_object,
+        );
+
+        let mut report = empty_report();
+        report.committed_puts = 1;
+        report.expected_live_objects = 1;
+        report.verified_live_objects = 1;
+        report.final_listed_objects = Some(1);
+        report.versioning_expected = true;
+        report.expected_committed_versions = 1;
+        report.verified_committed_versions = 1;
+        report.unknown_writes_materialized = vec![current_materialized, version_materialized];
+        report.audit = Some(CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 10,
+            completed_at_ms: 21,
+            history_prefix_record_count: prefix.len(),
+            history_prefix_sha256: checker_history_records_sha256(&prefix).expect("prefix digest"),
+            history_suffix_record_count: suffix.len(),
+            history_suffix_sha256: checker_history_records_sha256(&suffix).expect("suffix digest"),
+            suffix_operations: checker_operation_audits(&suffix),
+            data_version_checks: vec![super::CheckerDataVersionAudit {
+                key: key.to_string(),
+                version_id: "version-committed".to_string(),
+                expected_sha256: "hash-committed".to_string(),
+                observed_sha256: Some("hash-committed".to_string()),
+                outcome: OperationOutcome::Ok,
+                http_status: Some(200),
+            }],
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: Some(true),
+        });
+        report.passed = true;
+
+        report.require_success().expect("locally consistent report");
+        validate_checker_audit_against_history(&report, &history)
+            .expect("joint timeout write and timeout delete outcome");
     }
 
     #[test]
@@ -8054,6 +10905,364 @@ mod tests {
             checker_expected_current_get_keys(&[timeout]),
             BTreeSet::from(["ambiguous-only".to_string()])
         );
+    }
+
+    #[test]
+    fn failed_checker_classification_requires_authenticated_negative_observation() {
+        let key = "fault-test/run-1/key";
+        let mut put = timed_record(
+            "put",
+            OperationKind::Put,
+            key,
+            "expected-hash",
+            OperationOutcome::Ok,
+            1,
+            2,
+        );
+        let mut get = timed_record(
+            "checker-get",
+            OperationKind::Get,
+            key,
+            "observed-hash",
+            OperationOutcome::Ok,
+            3,
+            4,
+        );
+        let mut list = list_record("checker-list", "fault-test/run-1/", 5, 6, &[key]);
+        for record in [&mut put, &mut get, &mut list] {
+            record.run_id = Some("run-1".to_string());
+        }
+        let mut history = vec![put, get, list];
+        assign_recorder_sequences(&mut history);
+        let mut report = empty_report();
+        report.committed_puts = 1;
+        report.expected_live_objects = 1;
+        report.final_listed_objects = Some(1);
+        report.hash_mismatches.push(format!(
+            "{key}: expected expected-hash (1 bytes), got observed-hash (1 bytes)"
+        ));
+        report.audit = Some(CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 3,
+            completed_at_ms: 6,
+            history_prefix_record_count: 1,
+            history_prefix_sha256: checker_history_records_sha256(&history[..1])
+                .expect("prefix digest"),
+            history_suffix_record_count: 2,
+            history_suffix_sha256: checker_history_records_sha256(&history[1..])
+                .expect("suffix digest"),
+            suffix_operations: checker_operation_audits(&history[1..]),
+            data_version_checks: Vec::new(),
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: None,
+        });
+
+        super::validate_checker_failure_against_history(&report, &history)
+            .expect("mismatching GET authenticates data corruption");
+
+        report
+            .hash_mismatches
+            .push(report.hash_mismatches[0].clone());
+        let error = super::validate_checker_failure_against_history(&report, &history)
+            .expect_err("duplicate evidence must not replace an authenticated entry");
+        assert!(error.to_string().contains("hash_mismatches"), "{error:#}");
+        report.hash_mismatches.pop();
+
+        report.hash_mismatches[0] =
+            "fault-test/run-1/forged: expected expected-hash (1 bytes), got observed-hash (1 bytes)"
+                .to_string();
+        let error = super::validate_checker_failure_against_history(&report, &history)
+            .expect_err("a different key cannot borrow an authenticated mismatch classification");
+        assert!(error.to_string().contains("hash_mismatches"), "{error:#}");
+        report.hash_mismatches[0] =
+            format!("{key}: expected expected-hash (1 bytes), got observed-hash (1 bytes)");
+
+        history[1].value_sha256 = Some("expected-hash".to_string());
+        let audit = report.audit.as_mut().expect("checker audit");
+        audit.history_suffix_sha256 =
+            checker_history_records_sha256(&history[1..]).expect("clean suffix digest");
+        audit.suffix_operations = checker_operation_audits(&history[1..]);
+        let error = super::validate_checker_failure_against_history(&report, &history)
+            .expect_err("clean GET cannot authenticate a fabricated mismatch");
+        assert!(error.to_string().contains("hash_mismatches"), "{error:#}");
+    }
+
+    #[test]
+    fn checker_failure_authenticates_ambiguous_delete_joint_observations() {
+        let (visible_history, visible_report) = ambiguous_delete_failure_fixture(true);
+        super::validate_checker_failure_against_history(&visible_report, &visible_history)
+            .expect("visible object plus latest delete marker proves resurrection");
+
+        let (missing_history, missing_report) = ambiguous_delete_failure_fixture(false);
+        super::validate_checker_failure_against_history(&missing_report, &missing_history)
+            .expect("missing object plus committed latest data version proves unavailability");
+    }
+
+    #[test]
+    fn checker_failure_authenticates_listed_ambiguous_put_absent_on_get() {
+        let key = "fault-test/run-1/ambiguous";
+        let prefix_key = "fault-test/run-1/";
+        let mut timeout_put = timed_record(
+            "put-timeout",
+            OperationKind::Put,
+            key,
+            "attempted-hash",
+            OperationOutcome::Timeout,
+            1,
+            2,
+        );
+        timeout_put.http_status = None;
+        let mut current_get = timed_record(
+            "checker-get",
+            OperationKind::Get,
+            key,
+            "",
+            OperationOutcome::NotFound,
+            3,
+            4,
+        );
+        current_get.value_sha256 = None;
+        current_get.size_bytes = None;
+        current_get.http_status = Some(404);
+        let mut final_list = list_record("checker-list", prefix_key, 5, 6, &[key]);
+        for record in [&mut timeout_put, &mut current_get, &mut final_list] {
+            record.run_id = Some("run-1".to_string());
+        }
+        let mut history = vec![timeout_put, current_get, final_list];
+        assign_recorder_sequences(&mut history);
+        let mut report = empty_report();
+        report.final_listed_objects = Some(1);
+        report.listed_keys_unreadable.push(format!(
+            "{key}: NotFound (ambiguous write listed but absent on GET)"
+        ));
+        report.audit = Some(CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 3,
+            completed_at_ms: 6,
+            history_prefix_record_count: 1,
+            history_prefix_sha256: checker_history_records_sha256(&history[..1])
+                .expect("prefix digest"),
+            history_suffix_record_count: 2,
+            history_suffix_sha256: checker_history_records_sha256(&history[1..])
+                .expect("suffix digest"),
+            suffix_operations: checker_operation_audits(&history[1..]),
+            data_version_checks: Vec::new(),
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: None,
+        });
+
+        super::validate_checker_failure_against_history(&report, &history)
+            .expect("listed ambiguous write absent on GET proves an unreadable listed key");
+    }
+
+    #[test]
+    fn checker_failure_rejects_forged_unexpected_listed_object_identity() {
+        let key = "fault-test/run-1/failed-write";
+        let prefix_key = "fault-test/run-1/";
+        let mut failed_put = timed_record(
+            "put-failed",
+            OperationKind::Put,
+            key,
+            "attempted-hash",
+            OperationOutcome::Failed,
+            1,
+            2,
+        );
+        failed_put.mutation_attempts = Some(3);
+        failed_put.http_status = Some(500);
+        let mut listed_get = timed_record(
+            "checker-listed-get",
+            OperationKind::Get,
+            key,
+            "foreign-hash",
+            OperationOutcome::Ok,
+            3,
+            4,
+        );
+        let mut final_list = list_record("checker-list", prefix_key, 5, 6, &[key]);
+        for record in [&mut failed_put, &mut listed_get, &mut final_list] {
+            record.run_id = Some("run-1".to_string());
+        }
+        let mut history = vec![failed_put, listed_get, final_list];
+        assign_recorder_sequences(&mut history);
+        let mut report = empty_report();
+        report.final_listed_objects = Some(1);
+        report.unexpected_listed_objects.push(format!(
+            "{key}: readable bytes sha256=foreign-hash size=1 match no failed write attempt {{\"attempted-hash\"}}"
+        ));
+        report.audit = Some(CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 3,
+            completed_at_ms: 6,
+            history_prefix_record_count: 1,
+            history_prefix_sha256: checker_history_records_sha256(&history[..1])
+                .expect("prefix digest"),
+            history_suffix_record_count: 2,
+            history_suffix_sha256: checker_history_records_sha256(&history[1..])
+                .expect("suffix digest"),
+            suffix_operations: checker_operation_audits(&history[1..]),
+            data_version_checks: Vec::new(),
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: None,
+        });
+
+        super::validate_checker_failure_against_history(&report, &history)
+            .expect("exact unexpected listed object observation is authenticated");
+
+        report.unexpected_listed_objects[0] =
+            report.unexpected_listed_objects[0].replace("failed-write", "forged-key");
+        let error = super::validate_checker_failure_against_history(&report, &history)
+            .expect_err("another key cannot borrow an unexpected-object classification");
+        assert!(
+            error.to_string().contains("unexpected_listed_objects"),
+            "{error:#}"
+        );
+    }
+
+    fn ambiguous_delete_failure_fixture(
+        visible_with_latest_marker: bool,
+    ) -> (Vec<OperationRecord>, CheckerReport) {
+        let key = "fault-test/run-1/key";
+        let prefix_key = "fault-test/run-1/";
+        let mut put = timed_record(
+            "put",
+            OperationKind::Put,
+            key,
+            "committed-hash",
+            OperationOutcome::Ok,
+            1,
+            2,
+        );
+        put.version_id = Some("v1".to_string());
+        let mut delete = timed_record(
+            "delete-timeout",
+            OperationKind::Delete,
+            key,
+            "",
+            OperationOutcome::Timeout,
+            3,
+            4,
+        );
+        delete.value_sha256 = None;
+        delete.size_bytes = None;
+        delete.http_status = None;
+        let mut current_get = timed_record(
+            "checker-current-get",
+            OperationKind::Get,
+            key,
+            "committed-hash",
+            if visible_with_latest_marker {
+                OperationOutcome::Ok
+            } else {
+                OperationOutcome::NotFound
+            },
+            10,
+            11,
+        );
+        if !visible_with_latest_marker {
+            current_get.value_sha256 = None;
+            current_get.size_bytes = None;
+            current_get.http_status = Some(404);
+        }
+        let mut version_get = timed_record(
+            "checker-version-get",
+            OperationKind::Get,
+            key,
+            "committed-hash",
+            OperationOutcome::Ok,
+            12,
+            13,
+        );
+        version_get.version_id = Some("v1".to_string());
+        let mut version_list = timed_record(
+            "checker-list-versions",
+            OperationKind::ListVersions,
+            prefix_key,
+            "",
+            OperationOutcome::Ok,
+            14,
+            15,
+        );
+        version_list.value_sha256 = None;
+        version_list.listed_versions = Some(if visible_with_latest_marker {
+            vec![
+                ListedVersionEntry {
+                    key: key.to_string(),
+                    version_id: Some("v1".to_string()),
+                    is_latest: false,
+                    is_delete_marker: false,
+                },
+                ListedVersionEntry {
+                    key: key.to_string(),
+                    version_id: Some("d1".to_string()),
+                    is_latest: true,
+                    is_delete_marker: true,
+                },
+            ]
+        } else {
+            vec![ListedVersionEntry {
+                key: key.to_string(),
+                version_id: Some("v1".to_string()),
+                is_latest: true,
+                is_delete_marker: false,
+            }]
+        });
+        let listed_keys = if visible_with_latest_marker {
+            vec![key]
+        } else {
+            Vec::new()
+        };
+        let mut final_list = list_record("checker-list", prefix_key, 16, 17, &listed_keys);
+        for record in [
+            &mut put,
+            &mut delete,
+            &mut current_get,
+            &mut version_get,
+            &mut version_list,
+            &mut final_list,
+        ] {
+            record.run_id = Some("run-1".to_string());
+        }
+        let mut history = vec![
+            put,
+            delete,
+            current_get,
+            version_get,
+            version_list,
+            final_list,
+        ];
+        assign_recorder_sequences(&mut history);
+        let mut report = empty_report();
+        report.committed_puts = 1;
+        report.expected_live_objects = 1;
+        report.verified_live_objects = usize::from(visible_with_latest_marker);
+        report.versioning_expected = true;
+        report.expected_committed_versions = 1;
+        report.verified_committed_versions = 1;
+        report.final_listed_objects = Some(listed_keys.len());
+        if visible_with_latest_marker {
+            report.unexpected_visible_deleted_objects.push(format!(
+                "{key}: GET returned the committed body after ambiguous delete but ListObjectVersions reports a delete marker latest"
+            ));
+        } else {
+            report.missing_committed_objects.push(key.to_string());
+        }
+        report.audit = Some(CheckerAudit {
+            bucket: "bucket".to_string(),
+            started_at_ms: 10,
+            completed_at_ms: 17,
+            history_prefix_record_count: 2,
+            history_prefix_sha256: checker_history_records_sha256(&history[..2])
+                .expect("prefix digest"),
+            history_suffix_record_count: 4,
+            history_suffix_sha256: checker_history_records_sha256(&history[2..])
+                .expect("suffix digest"),
+            suffix_operations: checker_operation_audits(&history[2..]),
+            data_version_checks: Vec::new(),
+            delete_marker_checks: Vec::new(),
+            list_object_versions_completed: Some(true),
+        });
+        (history, report)
     }
 
     fn empty_report() -> CheckerReport {

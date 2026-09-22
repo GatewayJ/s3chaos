@@ -26,19 +26,46 @@ use aws_sdk_s3::{
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 use tokio::time::{Instant, timeout};
 
 use crate::fault::history::{
     ByteRange, ListedVersionEntry, OperationKind, OperationOutcome, OperationRecord, PayloadRef,
-    Recorder,
+    ReadPurpose, Recorder,
 };
 
-const S3_WORKLOAD_MUTATION_MAX_ATTEMPTS: u32 = 3;
+pub(crate) const S3_WORKLOAD_MUTATION_MAX_ATTEMPTS: u32 = 3;
 const MULTIPART_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 const ABORTED_MULTIPART_FIXTURE_BYTES: u64 = 4 * 1024;
 const RUSTFS_METADATA_RESERVE_BYTES_PER_ATTEMPT: u64 = 1024 * 1024;
 const RUSTFS_MAX_ERASURE_EXPANSION: u64 = 2;
+
+/// Per-operation interceptor: shared clients must never share request counters.
+#[derive(Debug, Clone, Default)]
+struct MutationAttempts(Arc<AtomicU32>);
+
+impl aws_sdk_s3::config::Intercept for MutationAttempts {
+    fn name(&self) -> &'static str {
+        "MutationAttempts"
+    }
+
+    fn read_before_transmit(
+        &self,
+        _: &aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+        _: &aws_sdk_s3::config::RuntimeComponents,
+        _: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSpec {
@@ -200,6 +227,7 @@ pub struct S3WorkloadClient {
     bucket: String,
     request_timeout: Duration,
     mutation_deadline: Option<Instant>,
+    mutation_max_attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,7 +268,6 @@ enum AbortBound {
 
 struct RecordedDelete {
     record: OperationRecord,
-    is_delete_marker: Option<bool>,
 }
 
 /// Where a fresh-write probe keeps its objects. Each scope has its own
@@ -869,6 +896,7 @@ impl S3WorkloadClient {
             request_timeout,
             aws_sdk_s3::config::retry::RetryConfig::standard()
                 .with_max_attempts(S3_WORKLOAD_MUTATION_MAX_ATTEMPTS),
+            S3_WORKLOAD_MUTATION_MAX_ATTEMPTS,
         )
         .await
     }
@@ -887,6 +915,7 @@ impl S3WorkloadClient {
             secret_key,
             request_timeout,
             aws_sdk_s3::config::retry::RetryConfig::disabled(),
+            1,
         )
         .await
     }
@@ -898,6 +927,7 @@ impl S3WorkloadClient {
         secret_key: impl Into<String>,
         request_timeout: Duration,
         retry_config: aws_sdk_s3::config::retry::RetryConfig,
+        mutation_max_attempts: u32,
     ) -> Result<Self> {
         let credentials = Credentials::new(
             access_key.into(),
@@ -922,6 +952,7 @@ impl S3WorkloadClient {
             bucket: bucket.into(),
             request_timeout,
             mutation_deadline: None,
+            mutation_max_attempts,
         })
     }
 
@@ -938,6 +969,7 @@ impl S3WorkloadClient {
                 .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
                 .build(),
         );
+        client.mutation_max_attempts = 1;
         client
     }
 
@@ -1026,6 +1058,7 @@ impl S3WorkloadClient {
             Some(spec.sha256.clone()),
             Some(spec.size_bytes),
         );
+        record.mutation_max_attempts = Some(self.mutation_max_attempts);
         // The body is fully determined by (seed, index, size); recording the
         // generator inputs lets the checker regenerate the exact bytes when
         // verifying ranged GET slices against this committed value.
@@ -1033,6 +1066,7 @@ impl S3WorkloadClient {
             seed: spec.seed,
             index: spec.index,
         });
+        let attempts = MutationAttempts::default();
         let result = self
             .mutation_request(
                 self.client
@@ -1040,9 +1074,12 @@ impl S3WorkloadClient {
                     .bucket(&self.bucket)
                     .key(&spec.key)
                     .body(ByteStream::from(object.body.clone()))
+                    .customize()
+                    .interceptor(attempts.clone())
                     .send(),
             )
             .await;
+        record.mutation_attempts = Some(attempts.0.load(Ordering::Relaxed));
 
         match result {
             Ok(Ok(output)) => {
@@ -1126,7 +1163,17 @@ impl S3WorkloadClient {
         key: &str,
         recorder: &Recorder,
     ) -> Result<GetObjectResult> {
-        self.get_object_result_inner(key, None, recorder).await
+        self.get_object_result_inner(key, None, None, recorder)
+            .await
+    }
+
+    pub(crate) async fn get_cohort_probe_result(
+        &self,
+        key: &str,
+        recorder: &Recorder,
+    ) -> Result<GetObjectResult> {
+        self.get_object_result_inner(key, None, Some(ReadPurpose::CohortProbe), recorder)
+            .await
     }
 
     pub async fn get_object_version_result(
@@ -1135,7 +1182,7 @@ impl S3WorkloadClient {
         version_id: &str,
         recorder: &Recorder,
     ) -> Result<GetObjectResult> {
-        self.get_object_result_inner(key, Some(version_id), recorder)
+        self.get_object_result_inner(key, Some(version_id), None, recorder)
             .await
     }
 
@@ -1276,6 +1323,7 @@ impl S3WorkloadClient {
         &self,
         key: &str,
         version_id: Option<&str>,
+        read_purpose: Option<ReadPurpose>,
         recorder: &Recorder,
     ) -> Result<GetObjectResult> {
         let mut record = recorder.begin(
@@ -1286,6 +1334,7 @@ impl S3WorkloadClient {
             None,
         );
         record.version_id = version_id.map(str::to_string);
+        record.read_purpose = read_purpose;
         let response = timeout(
             self.request_timeout,
             self.client
@@ -1377,6 +1426,22 @@ impl S3WorkloadClient {
         }
     }
 
+    pub(crate) async fn verify_mutation_result(
+        &self,
+        mutation: &OperationRecord,
+        recorder: &Recorder,
+    ) -> Result<GetObjectResult> {
+        self.get_object_result_inner(
+            mutation.key.as_deref().context("mutation has no key")?,
+            None,
+            Some(ReadPurpose::MutationVerification {
+                operation_id: mutation.id.clone(),
+            }),
+            recorder,
+        )
+        .await
+    }
+
     pub async fn put_and_verify_object(
         &self,
         object: &PreparedObject,
@@ -1393,7 +1458,7 @@ impl S3WorkloadClient {
             });
         }
 
-        let get = self.get_object_result(&object.spec.key, recorder).await?;
+        let get = self.verify_mutation_result(&write_record, recorder).await?;
         let verified = get
             .body
             .as_deref()
@@ -1427,37 +1492,44 @@ impl S3WorkloadClient {
         recorder: &Recorder,
     ) -> Result<Option<OperationRecord>> {
         let result = self.delete_object_result(key, recorder).await?;
-        if result.record.outcome == OperationOutcome::Ok && result.is_delete_marker != Some(true) {
+        if result.record.outcome == OperationOutcome::Ok
+            && result.record.is_delete_marker != Some(true)
+        {
             return Ok(None);
         }
         Ok(Some(result.record))
     }
 
     async fn delete_object_result(&self, key: &str, recorder: &Recorder) -> Result<RecordedDelete> {
-        let record = recorder.begin(
+        let mut record = recorder.begin(
             OperationKind::Delete,
             self.bucket.clone(),
             Some(key.to_string()),
             None,
             None,
         );
+        record.mutation_max_attempts = Some(self.mutation_max_attempts);
+        let attempts = MutationAttempts::default();
         let result = self
             .mutation_request(
                 self.client
                     .delete_object()
                     .bucket(&self.bucket)
                     .key(key)
+                    .customize()
+                    .interceptor(attempts.clone())
                     .send(),
             )
             .await;
+        record.mutation_attempts = Some(attempts.0.load(Ordering::Relaxed));
 
         match result {
             Ok(Ok(output)) => {
                 let mut record = record;
                 record.version_id = output.version_id().map(str::to_string);
+                record.is_delete_marker = output.delete_marker();
                 Ok(RecordedDelete {
                     record: recorder.finish(record, OperationOutcome::Ok, Some(204), None)?,
-                    is_delete_marker: output.delete_marker(),
                 })
             }
             Ok(Err(error)) => {
@@ -1469,7 +1541,6 @@ impl S3WorkloadClient {
                         sdk_error_status(&error),
                         Some(format!("delete object failed: {error}")),
                     )?,
-                    is_delete_marker: None,
                 })
             }
             Err(_) => Ok(RecordedDelete {
@@ -1479,7 +1550,6 @@ impl S3WorkloadClient {
                     None,
                     Some("delete object timed out".to_string()),
                 )?,
-                is_delete_marker: None,
             }),
         }
     }
@@ -1600,16 +1670,18 @@ impl S3WorkloadClient {
         staged: &StagedMultipartUpload,
         recorder: &Recorder,
     ) -> Result<OperationRecord> {
-        let record = recorder.begin(
+        let mut record = recorder.begin(
             OperationKind::CompleteMultipartUpload,
             self.bucket.clone(),
             Some(staged.spec.key.clone()),
             Some(staged.spec.sha256.clone()),
             Some(staged.spec.size_bytes),
         );
+        record.mutation_max_attempts = Some(self.mutation_max_attempts);
         let upload = CompletedMultipartUpload::builder()
             .set_parts(Some(staged.completed_parts.clone()))
             .build();
+        let attempts = MutationAttempts::default();
         let result = self
             .mutation_request(
                 self.client
@@ -1618,9 +1690,12 @@ impl S3WorkloadClient {
                     .key(&staged.spec.key)
                     .upload_id(&staged.upload_id)
                     .multipart_upload(upload)
+                    .customize()
+                    .interceptor(attempts.clone())
                     .send(),
             )
             .await;
+        record.mutation_attempts = Some(attempts.0.load(Ordering::Relaxed));
         match result {
             Ok(Ok(output)) => {
                 let mut record = record;
@@ -2183,6 +2258,93 @@ mod tests {
         WorkloadPayloadDistribution, WorkloadPlan, sha256_hex,
     };
 
+    #[tokio::test]
+    async fn mutation_history_counts_transmissions_instead_of_the_retry_ceiling() {
+        use crate::fault::history::{OperationOutcome, Recorder};
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::any};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let app = Router::new().fallback(any(move |request: axum::extract::Request| {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let status = if request.uri().path().contains("retry") {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                (
+                    status,
+                    "<Error><Code>InvalidRequest</Code><Message>test rejection</Message></Error>",
+                )
+                    .into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let client = super::S3WorkloadClient::new(
+            endpoint,
+            "bucket",
+            "test-access",
+            "test-secret",
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Recorder::create(dir.path().join("history.jsonl"), "io-eio", "run-1")
+            .expect("recorder");
+        let mut object = ObjectSpec::prepare_seeded("run-1", 0, 16, 7);
+        let rejected = client
+            .put_object_record(&object, &recorder)
+            .await
+            .expect("PUT");
+        assert_eq!(rejected.outcome, OperationOutcome::Failed);
+        assert_eq!(rejected.mutation_max_attempts, Some(3));
+        assert_eq!(rejected.mutation_attempts, Some(1));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        object.spec.key = "retry".into();
+        requests.store(0, Ordering::SeqCst);
+        let retried = client
+            .put_object_record(&object, &recorder)
+            .await
+            .expect("retried PUT");
+        assert_eq!(retried.mutation_attempts, Some(3));
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        requests.store(0, Ordering::SeqCst);
+        let expired = client.with_mutation_deadline(tokio::time::Instant::now());
+        let unsent = expired
+            .put_object_record(&object, &recorder)
+            .await
+            .expect("unsent PUT");
+        assert_eq!(unsent.mutation_attempts, Some(0));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        let deleted = client
+            .delete_object_record("key", &recorder)
+            .await
+            .expect("DELETE");
+        assert_eq!(deleted.mutation_attempts, Some(1));
+        let staged = super::StagedMultipartUpload {
+            spec: object.spec,
+            upload_id: "upload-1".into(),
+            completed_parts: Vec::new(),
+        };
+        let completed = client
+            .complete_staged_multipart_object_record(&staged, &recorder)
+            .await
+            .expect("complete");
+        assert_eq!(completed.mutation_attempts, Some(3));
+        server.abort();
+    }
     #[tokio::test]
     async fn probe_abort_is_capped_by_the_mutation_deadline_while_cleanup_still_sends() {
         use crate::fault::history::{OperationKind, OperationOutcome, Recorder};

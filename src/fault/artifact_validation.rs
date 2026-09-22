@@ -68,6 +68,7 @@ use crate::fault::{
     history::{
         DurabilityCohort, FaultWindowRelation, OperationKind, OperationOutcome, OperationRecord,
         validate_history_phase_boundary, validate_history_scope_and_order,
+        validate_partial_history_scope_and_order,
     },
     host_storage::DmStatusSnapshot,
     host_storage::{
@@ -257,6 +258,8 @@ pub struct ArtifactValidationOptions {
 pub struct ArtifactValidationReport {
     pub scenario: String,
     pub case_name: String,
+    pub terminal_stage: String,
+    pub run_succeeded: bool,
     pub seed: u64,
     pub client_disruptions: usize,
     pub recommitted: usize,
@@ -477,12 +480,14 @@ fn validate_failed_attempt_disruption_evidence(
                 root: &case_dir,
                 case_name,
                 events: &events,
-                evidence: &evidence,
+                evidence: Some(&evidence),
                 history: &history,
                 scenario,
                 run_id: attempt_run_id,
                 bucket: &full_run_spec.metadata.bucket,
                 run_spec: &full_run_spec,
+                require_boundary: true,
+                require_recovered: true,
             },
             expected_mutation,
         )?;
@@ -1148,11 +1153,15 @@ pub(crate) fn validate_attempt_failure_summary_reference(
 }
 
 impl ArtifactValidationReport {
-    pub fn validation_summary_tsv_row(&self) -> String {
-        format!(
+    pub fn validation_summary_tsv_row(&self) -> Result<String> {
+        ensure!(
+            self.run_succeeded,
+            "validation-summary TSV is available only for successful fault runs"
+        );
+        Ok(format!(
             "{}\t{}\t0\t{}\t{}\t{}\t0\t0\t0\t0\ttrue",
             self.scenario, self.seed, self.client_disruptions, self.recommitted, self.committed
-        )
+        ))
     }
 }
 
@@ -1295,6 +1304,829 @@ pub fn validate_fault_artifacts(
     validate_fault_artifacts_with_identity(options, ArtifactIdentityPolicy::LegacyCompatible)
 }
 
+fn completed_workload_evidence_present(
+    ack_mutation: bool,
+    workload_summary_present: bool,
+    history_present: bool,
+) -> bool {
+    history_present && (ack_mutation || workload_summary_present)
+}
+
+fn partial_recommit_report_required(
+    ack_mutation: bool,
+    terminal_stage: &str,
+    recommit_reached: bool,
+    final_checker_completed: bool,
+) -> bool {
+    !ack_mutation
+        && (matches!(
+            terminal_stage,
+            "recommit-unconfirmed" | "checker-final" | "checker-verdict"
+        ) || recommit_reached
+            || final_checker_completed)
+}
+
+fn validate_partial_failed_injection_artifacts(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+    case_name: &str,
+) -> Result<Option<ArtifactValidationReport>> {
+    let Some(events_path) =
+        optional_artifact(&options.artifact_root, case_name, "run-events.jsonl")?
+    else {
+        return Ok(None);
+    };
+    let events = read_jsonl::<RunEvent>(&events_path)?;
+    if !has_event(&events, "run", RunEventStatus::Failed) {
+        return Ok(None);
+    }
+    ensure!(
+        !events.is_empty()
+            && has_event(&events, "run", RunEventStatus::Started)
+            && !has_event(&events, "run", RunEventStatus::Succeeded),
+        "failed run-events.jsonl contains a conflicting or incomplete run result"
+    );
+    ensure!(
+        events.windows(2).all(|pair| pair[0].at_ms <= pair[1].at_ms),
+        "failed run-events.jsonl timestamps are not monotonic"
+    );
+    let run_id = events
+        .first()
+        .map(|event| event.run_id.as_str())
+        .context("failed run-events.jsonl has no run identity")?;
+    ensure!(
+        !run_id.trim().is_empty()
+            && events
+                .iter()
+                .all(|event| { event.scenario == options.scenario && event.run_id == run_id }),
+        "failed run-events.jsonl contains mixed scenario or run identities"
+    );
+    if let Some(planned_run_id) = identity.planned_run_id() {
+        ensure!(
+            run_id == planned_run_id,
+            "failed run-events.jsonl run identity does not match the planned attempt"
+        );
+    }
+    ensure!(
+        events
+            .iter()
+            .filter(|event| event.stage == "run" && event.status == RunEventStatus::Failed)
+            .count()
+            == 1,
+        "failed run-events.jsonl must contain exactly one failed run terminal event"
+    );
+    let observed_terminal_stage = events
+        .iter()
+        .rev()
+        .find(|event| event.status == RunEventStatus::Failed && event.stage != "run")
+        .map(|event| event.stage.clone())
+        .unwrap_or_else(|| "run".to_string());
+
+    let summary_path = locate_artifact(&options.artifact_root, case_name, "failure-summary.json")?;
+    let summary = read_json::<FailureSummary>(&summary_path)?;
+    let terminal_phase = summary
+        .phase()
+        .context("failure-summary.json has no terminal phase")?;
+    summary.validate_classification_projection()?;
+    validate_failure_summary_v2_fields(
+        &summary,
+        Some(failure_summary_reference_root(&options.artifact_root)),
+        Some(&summary_path),
+    )?;
+    let summary_failure_index = events
+        .iter()
+        .position(|event| event.stage == summary.stage && event.status == RunEventStatus::Failed)
+        .context("failure-summary.json stage has no matching failed run event")?;
+    let preceding_failures = events
+        .iter()
+        .take(summary_failure_index)
+        .filter(|event| event.status == RunEventStatus::Failed && event.stage != "run")
+        .collect::<Vec<_>>();
+    let expected_checker_predecessor = match summary.stage.as_str() {
+        "checker-pre-recommit-verdict" => Some("checker-pre-recommit"),
+        "checker-verdict" => Some("checker-final"),
+        _ => None,
+    };
+    let preceding_failures_are_primary_safe = match expected_checker_predecessor {
+        Some(expected) => preceding_failures.len() == 1 && preceding_failures[0].stage == expected,
+        None => preceding_failures.is_empty(),
+    };
+    let only_secondary_cleanup_failures_follow = events
+        .iter()
+        .skip(summary_failure_index + 1)
+        .filter(|event| event.status == RunEventStatus::Failed && event.stage != "run")
+        .all(|event| FailurePhase::from_stage(&event.stage) == FailurePhase::Cleanup);
+    ensure!(
+        summary.scenario == options.scenario
+            && summary.run_id.as_deref() == Some(run_id)
+            && summary.case_name.as_deref() == Some(case_name)
+            && summary.verdict == FailureVerdict::Failed
+            && preceding_failures_are_primary_safe
+            && only_secondary_cleanup_failures_follow,
+        "failure-summary.json does not identify the primary failed run stage; last observed failed stage was {observed_terminal_stage:?}"
+    );
+    let terminal_stage = summary.stage.clone();
+    let target_preflight_completed =
+        has_event(&events, "target-preflight", RunEventStatus::Succeeded);
+    let workload_completed = has_event(&events, "mixed-workload", RunEventStatus::Succeeded);
+    let recovery_health_completed =
+        has_event(&events, "recovery-health", RunEventStatus::Succeeded);
+    let recovery_evidence_completed =
+        has_event(&events, "recovery-evidence", RunEventStatus::Succeeded);
+    let post_recovery_probe_completed =
+        has_event(&events, "post-recovery-write", RunEventStatus::Succeeded);
+    let pre_recommit_checker_completed =
+        has_event(&events, "checker-pre-recommit", RunEventStatus::Succeeded);
+    let recommit_completed = has_event(&events, "recommit-unconfirmed", RunEventStatus::Succeeded);
+    let final_checker_completed = has_event(&events, "checker-final", RunEventStatus::Succeeded);
+    let ack_mutation_kind = acknowledged_mutation_kind(&options.scenario);
+    let ack_mutation = ack_mutation_kind.is_some();
+    let recommit_reached = events
+        .iter()
+        .any(|event| event.stage == "recommit-unconfirmed");
+    let final_checker_reached = events.iter().any(|event| event.stage == "checker-final");
+    if !ack_mutation {
+        ensure!(
+            !recommit_reached || pre_recommit_checker_completed,
+            "recommit-unconfirmed stage was reached before checker-pre-recommit succeeded"
+        );
+        ensure!(
+            !final_checker_reached || recommit_completed,
+            "checker-final stage was reached before recommit-unconfirmed succeeded"
+        );
+    }
+    let late_progress_observed = target_preflight_completed
+        || workload_completed
+        || recovery_health_completed
+        || recovery_evidence_completed
+        || post_recovery_probe_completed
+        || pre_recommit_checker_completed
+        || recommit_completed
+        || final_checker_completed;
+
+    let run_spec_path = locate_artifact(&options.artifact_root, case_name, "run-spec.json")?;
+    let run_spec = read_json::<FaultRunSpec>(&run_spec_path)?;
+    validate_run_spec(&run_spec, options)?;
+    ensure!(
+        run_spec.metadata.name == case_name && run_spec.metadata.run_id == run_id,
+        "failed run-spec.json identity does not match run-events.jsonl"
+    );
+    let run_spec_yaml_path = locate_artifact(&options.artifact_root, case_name, "run-spec.yaml")?;
+    let run_spec_yaml = read_yaml::<FaultRunSpec>(&run_spec_yaml_path)?;
+    ensure!(
+        run_spec_yaml == run_spec,
+        "failed run spec JSON and YAML artifacts do not describe the same contract"
+    );
+
+    let metadata_path = locate_artifact(&options.artifact_root, case_name, "run-metadata.json")?;
+    let metadata = read_json::<RunMetadataArtifact>(&metadata_path)?;
+    ensure!(
+        metadata.scenario == options.scenario
+            && metadata.run_id == run_id
+            && metadata.workload_objects == options.expected_workload_objects
+            && metadata.workload_concurrency == options.expected_workload_concurrency
+            && metadata.recovery_stability_reread_seconds
+                == options.expected_recovery_stability_reread_seconds,
+        "failed run-metadata.json does not match the selected run"
+    );
+    ensure_nonempty(&metadata.context, "failed run-metadata.json context")?;
+    ensure_nonempty(
+        &metadata.storage_class,
+        "failed run-metadata.json storage_class",
+    )?;
+    ensure_nonempty(
+        &metadata.rustfs_image,
+        "failed run-metadata.json rustfs_image",
+    )?;
+
+    let workload_plan_path =
+        locate_artifact(&options.artifact_root, case_name, "workload-plan.json")?;
+    let workload_plan = read_json::<WorkloadPlan>(&workload_plan_path)?;
+    let workload_plan_identity = read_json::<ArtifactIdentity>(&workload_plan_path)?;
+    validate_optional_artifact_identity(
+        "failed workload-plan.json",
+        &workload_plan_identity,
+        &metadata,
+        identity,
+    )?;
+    ensure!(
+        workload_plan == run_spec.workload.plan,
+        "failed workload-plan.json does not match run-spec.json"
+    );
+
+    let mut required_artifacts = vec![
+        "failure-summary.json".to_string(),
+        "run-events.jsonl".to_string(),
+        "run-metadata.json".to_string(),
+        "run-spec.json".to_string(),
+        "run-spec.yaml".to_string(),
+        "workload-plan.json".to_string(),
+    ];
+    let mut partial_artifacts = BTreeMap::new();
+    let preflight_path = match terminal_phase {
+        FailurePhase::Preflight => {
+            optional_artifact(&options.artifact_root, case_name, "preflight-summary.json")?
+        }
+        FailurePhase::Runner if !late_progress_observed => {
+            optional_artifact(&options.artifact_root, case_name, "preflight-summary.json")?
+        }
+        _ => Some(locate_artifact(
+            &options.artifact_root,
+            case_name,
+            "preflight-summary.json",
+        )?),
+    };
+    if let Some(path) = preflight_path {
+        let preflight = read_json::<PreflightSummary>(&path)?;
+        validate_partial_preflight_summary(&preflight, options, run_id)?;
+        if matches!(
+            terminal_phase,
+            FailurePhase::FaultInjection
+                | FailurePhase::Workload
+                | FailurePhase::Recovery
+                | FailurePhase::Checker
+                | FailurePhase::Cleanup
+        ) || late_progress_observed
+        {
+            validate_preflight_summary(&preflight, options)?;
+        }
+        required_artifacts.push("preflight-summary.json".to_string());
+    }
+    if matches!(
+        terminal_phase,
+        FailurePhase::FaultInjection
+            | FailurePhase::Workload
+            | FailurePhase::Recovery
+            | FailurePhase::Checker
+    ) || terminal_stage == "fault-delete"
+        || target_preflight_completed
+        || workload_completed
+        || recovery_health_completed
+        || recovery_evidence_completed
+        || post_recovery_probe_completed
+        || pre_recommit_checker_completed
+        || recommit_completed
+        || final_checker_completed
+    {
+        let target_proof_path =
+            locate_artifact(&options.artifact_root, case_name, "target-proof.json")?;
+        let target_proof = read_json::<TargetProof>(&target_proof_path)?;
+        validate_target_proof(&target_proof, &run_spec, options)?;
+        partial_artifacts.insert("target-proof.json".to_string(), target_proof_path);
+        required_artifacts.push("target-proof.json".to_string());
+    }
+    let mut client_disruptions = 0;
+    let workload_summary = if let Some(path) =
+        optional_artifact(&options.artifact_root, case_name, "workload-summary.json")?
+    {
+        let workload = read_json::<WorkloadSummaryArtifact>(&path)?;
+        ensure!(
+            workload.scenario.as_deref() == Some(&options.scenario)
+                && workload.run_id.as_deref() == Some(run_id),
+            "failed workload-summary.json identity does not match the selected run"
+        );
+        client_disruptions = workload.disrupted()?;
+        required_artifacts.push("workload-summary.json".to_string());
+        Some(workload)
+    } else {
+        None
+    };
+    let workload_summary_present = workload_summary.is_some();
+    let history = if let Some(path) =
+        optional_artifact(&options.artifact_root, case_name, "history.jsonl")?
+    {
+        let history = read_jsonl::<OperationRecord>(&path)?;
+        if !history.is_empty() {
+            validate_partial_history_scope_and_order(
+                &history,
+                &options.scenario,
+                run_id,
+                &run_spec.metadata.bucket,
+            )?;
+        }
+        required_artifacts.push("history.jsonl".to_string());
+        partial_artifacts.insert("history.jsonl".to_string(), path);
+        Some(history)
+    } else {
+        None
+    };
+    let fault_evidence = if let Some(path) =
+        optional_artifact(&options.artifact_root, case_name, "fault-evidence.json")?
+    {
+        let evidence = read_json::<FaultEvidenceArtifact>(&path)?;
+        ensure!(
+            evidence.scenario.as_deref() == Some(&options.scenario)
+                && evidence.run_id.as_deref() == Some(run_id),
+            "failed fault-evidence.json identity does not match the selected run"
+        );
+        partial_artifacts.insert("fault-evidence.json".to_string(), path);
+        required_artifacts.push("fault-evidence.json".to_string());
+        Some(evidence)
+    } else {
+        None
+    };
+    if let Some(path) =
+        optional_artifact(&options.artifact_root, case_name, RECOVERY_HEALTH_ARTIFACT)?
+    {
+        let recovery = read_json::<RecoveryHealthReport>(&path)?;
+        ensure!(
+            recovery.scenario == options.scenario
+                && recovery.run_id == run_id
+                && recovery.started_at_ms > 0
+                && recovery.started_at_ms <= recovery.completed_at_ms
+                && recovery.attempts > 0,
+            "failed recovery-health.json identity or observation interval is invalid"
+        );
+        recovery
+            .baseline
+            .validate()
+            .context("failed recovery-health.json baseline is invalid")?;
+        partial_artifacts.insert(RECOVERY_HEALTH_ARTIFACT.to_string(), path);
+        required_artifacts.push(RECOVERY_HEALTH_ARTIFACT.to_string());
+    }
+    let post_recovery_report_present = if let Some(path) = optional_artifact(
+        &options.artifact_root,
+        case_name,
+        POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+    )? {
+        let report = read_json::<PostRecoveryWriteReport>(&path)?;
+        ensure!(
+            report.scenario == options.scenario
+                && report.run_id == run_id
+                && report.objects == post_recovery_object_count(options.expected_workload_objects)
+                && report.started_at_ms > 0
+                && report.started_at_ms <= report.completed_at_ms,
+            "failed post-recovery-write-report.json identity, size, or interval is invalid"
+        );
+        partial_artifacts.insert(POST_RECOVERY_WRITE_REPORT_ARTIFACT.to_string(), path);
+        required_artifacts.push(POST_RECOVERY_WRITE_REPORT_ARTIFACT.to_string());
+        true
+    } else {
+        false
+    };
+    let post_recovery_history_present = if let Some(path) = optional_artifact(
+        &options.artifact_root,
+        case_name,
+        POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+    )? {
+        let records = read_jsonl::<OperationRecord>(&path)?;
+        validate_history_scope_and_order(
+            &records,
+            &options.scenario,
+            run_id,
+            &run_spec.metadata.bucket,
+        )?;
+        let expected_prefix = WriteProbeScope::PostRecovery.key_prefix(run_id);
+        ensure!(
+            records.iter().all(|record| record
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(&expected_prefix))),
+            "failed post-recovery-write-history.jsonl contains a key outside the run-scoped probe prefix"
+        );
+        partial_artifacts.insert(POST_RECOVERY_WRITE_HISTORY_ARTIFACT.to_string(), path);
+        required_artifacts.push(POST_RECOVERY_WRITE_HISTORY_ARTIFACT.to_string());
+        true
+    } else {
+        false
+    };
+    let recommit_report = if let Some(path) =
+        optional_artifact(&options.artifact_root, case_name, "recommit-report.json")?
+    {
+        let recommit = read_json::<RecommitReportArtifact>(&path)?;
+        validate_optional_identity_fields(
+            "failed recommit-report.json",
+            recommit.scenario.as_deref(),
+            recommit.run_id.as_deref(),
+            &metadata,
+            identity,
+        )?;
+        validate_recommit_report_counters(&recommit)
+            .context("failed recommit-report.json counters do not match its attempts")?;
+        required_artifacts.push("recommit-report.json".to_string());
+        Some(recommit)
+    } else {
+        None
+    };
+    let recommit_report_present = recommit_report.is_some();
+    let recovery_stability_report = if let Some(path) = optional_artifact(
+        &options.artifact_root,
+        case_name,
+        "recovery-stability-report.json",
+    )? {
+        let recovery = read_json::<RecoveryStabilityReport>(&path)?;
+        validate_optional_identity_fields(
+            "failed recovery-stability-report.json",
+            recovery.scenario.as_deref(),
+            recovery.run_id.as_deref(),
+            &metadata,
+            identity,
+        )?;
+        validate_recovery_stability_report(&recovery)
+            .context("failed recovery-stability-report.json is invalid")?;
+        required_artifacts.push("recovery-stability-report.json".to_string());
+        Some(recovery)
+    } else {
+        None
+    };
+    let mut checker_report_passed = BTreeMap::new();
+    let mut checker_reports = BTreeMap::new();
+    for name in ["checker-pre-recommit-report.json", "checker-report.json"] {
+        let Some(path) = optional_artifact(&options.artifact_root, case_name, name)? else {
+            continue;
+        };
+        let report = read_json::<CheckerReport>(&path)?;
+        validate_checker_identity(name, &report, &metadata)?;
+        ensure!(
+            report.versioning_expected == options.expected_workload_versioning,
+            "failed {name} versioning mode does not match the selected run"
+        );
+        let history = history
+            .as_deref()
+            .context("failed checker report exists without history.jsonl")?;
+        if report.passed {
+            checker::validate_checker_audit_against_history(&report, history)
+                .with_context(|| format!("failed {name} audit does not match history.jsonl"))?;
+        } else {
+            checker::validate_checker_failure_against_history(&report, history)
+                .with_context(|| format!("failed {name} verdict does not match history.jsonl"))?;
+        }
+        checker_report_passed.insert(name, report.passed);
+        checker_reports.insert(name, report);
+        required_artifacts.push(name.to_string());
+    }
+    for name in ["checker-pre-recommit-error.txt", "checker-final-error.txt"] {
+        let Some(path) = optional_artifact(&options.artifact_root, case_name, name)? else {
+            continue;
+        };
+        ensure!(
+            !fs::read_to_string(&path)?.trim().is_empty(),
+            "failed {name} is empty"
+        );
+        required_artifacts.push(name.to_string());
+    }
+    let completed_workload_required =
+        matches!(
+            terminal_phase,
+            FailurePhase::Recovery | FailurePhase::Checker
+        ) || matches!(terminal_stage.as_str(), "fault-delete" | "availability")
+            || workload_completed
+            || recovery_health_completed
+            || recovery_evidence_completed
+            || post_recovery_probe_completed
+            || pre_recommit_checker_completed
+            || recommit_completed
+            || final_checker_completed;
+    ensure!(
+        !completed_workload_required
+            || completed_workload_evidence_present(
+                ack_mutation,
+                workload_summary_present,
+                history.is_some(),
+            ),
+        "{terminal_stage} failure lacks workload-summary.json or history.jsonl from the completed workload phase"
+    );
+    if completed_workload_required && !ack_mutation {
+        let workload = workload_summary
+            .as_ref()
+            .context("completed mixed workload lacks workload-summary.json")?;
+        let history = history
+            .as_deref()
+            .filter(|records| !records.is_empty())
+            .context("completed mixed workload lacks non-empty history.jsonl")?;
+        ensure!(
+            workload.seed == workload_plan.seed
+                && workload.object_count == workload_plan.object_count
+                && workload.concurrency == workload_plan.concurrency
+                && workload.exercised_all_operation_families(),
+            "completed workload-summary.json does not match workload-plan.json"
+        );
+        workload.require_history_matches(
+            history,
+            &options.scenario,
+            &run_spec.metadata.bucket,
+            DurabilityCohort::FaultActive,
+            &workload_plan,
+            run_id,
+        )?;
+        let workload_history = mixed_workload_history(history, DurabilityCohort::FaultActive);
+        validate_primary_workload_history(&workload_history, &workload_plan, run_id)?;
+    }
+    if let Some(manifest) = workload_summary
+        .as_ref()
+        .and_then(|workload| workload.recommit_candidates.as_ref())
+    {
+        let records = history
+            .as_deref()
+            .context("sealed recommit candidates lack history.jsonl")?;
+        validate_recommit_candidate_manifest(
+            manifest,
+            &run_spec.metadata.bucket,
+            &metadata.scenario,
+            run_id,
+            records,
+        )?;
+        ensure!(
+            recommit_report_present
+                || !records[manifest.history_record_count..]
+                    .iter()
+                    .any(|record| {
+                        matches!(
+                            record.kind,
+                            OperationKind::Put
+                                | OperationKind::Delete
+                                | OperationKind::CompleteMultipartUpload
+                        )
+                    }),
+            "post-manifest mutation history lacks recommit-report.json"
+        );
+    }
+    if let Some(recommit) = recommit_report.as_ref() {
+        let workload = workload_summary
+            .as_ref()
+            .context("failed recommit-report.json exists without workload-summary.json")?;
+        let manifest = workload
+            .recommit_candidates
+            .as_ref()
+            .context("failed recommit-report.json has no sealed candidate manifest")?;
+        let history = history
+            .as_deref()
+            .context("failed recommit-report.json exists without history.jsonl")?;
+        let allow_deadline_truncation = authenticate_recommit_deadline_truncation(
+            &options.artifact_root,
+            &summary,
+            &events,
+            recommit,
+            manifest,
+            history,
+            run_id,
+        )?;
+        validate_partial_recommit_report(
+            recommit,
+            manifest,
+            &run_spec.metadata.bucket,
+            &metadata.scenario,
+            run_id,
+            history,
+            allow_deadline_truncation,
+        )
+        .context("failed recommit-report.json does not match its sealed candidates and history")?;
+    }
+    if recovery_evidence_completed {
+        let evidence = fault_evidence
+            .as_ref()
+            .context("completed recovery evidence lacks fault-evidence.json")?;
+        if ack_mutation {
+            ensure!(
+                evidence.injected && !evidence.active_during_workload && evidence.recovered,
+                "completed ACK-triggered fault-evidence.json does not prove injection and recovery"
+            );
+            validate_ack_fault_window_evidence(evidence)?;
+        } else {
+            ensure!(
+                evidence.injected && evidence.active_during_workload && evidence.recovered,
+                "completed fault-evidence.json does not prove injection, workload overlap, and recovery"
+            );
+            validate_fault_window_evidence(evidence)?;
+        }
+        ensure!(
+            evidence.require_client_disruption == metadata.require_client_disruption,
+            "completed fault-evidence.json disruption policy does not match run-metadata.json"
+        );
+        validate_recovery_health_artifact(
+            &partial_artifacts,
+            &metadata,
+            identity,
+            evidence,
+            &events,
+        )?;
+    } else if recovery_health_completed {
+        validate_recovery_health_report(&partial_artifacts, &metadata, identity, &events)?;
+    }
+    let ack_requirements = ack_partial_artifact_requirements(&events, recovery_evidence_completed);
+    let ack_artifacts_required = ack_mutation && ack_requirements.validation_required;
+    if let Some(expected_mutation) = ack_mutation_kind.filter(|_| ack_artifacts_required) {
+        let history = history
+            .as_deref()
+            .filter(|records| !records.is_empty())
+            .context("ACK crash lifecycle lacks non-empty history.jsonl")?;
+        let expectation = validate_ack_triggered_dm_artifacts(
+            AckArtifactValidationContext {
+                root: &options.artifact_root,
+                case_name,
+                events: &events,
+                evidence: if recovery_evidence_completed {
+                    fault_evidence.as_ref()
+                } else {
+                    None
+                },
+                history,
+                scenario: &metadata.scenario,
+                run_id,
+                bucket: &run_spec.metadata.bucket,
+                run_spec: &run_spec,
+                require_boundary: ack_requirements.boundary_required,
+                require_recovered: ack_requirements.recovered_required,
+            },
+            expected_mutation,
+        )?;
+        required_artifacts.extend(
+            ["ack-to-fault-evidence.json", HOST_STORAGE_PROOF_ARTIFACT].map(str::to_string),
+        );
+        if ack_requirements.boundary_required {
+            required_artifacts.push("dm-crash-boundary.json".to_string());
+        }
+        if ack_requirements.recovered_required {
+            required_artifacts.push("dm-crash-recovered.json".to_string());
+        }
+        if pre_recommit_checker_completed || final_checker_completed {
+            let evidence = fault_evidence
+                .as_ref()
+                .context("completed ACK checker lacks fault-evidence.json")?;
+            let prechecker = checker_reports
+                .get("checker-pre-recommit-report.json")
+                .context("completed ACK prechecker lacks its report")?;
+            validate_ack_prechecker_boundary(
+                prechecker,
+                history,
+                &expectation.trigger_operation_id,
+                evidence.recovery_ended_at_ms,
+            )?;
+            validate_ack_checker_report(
+                "checker-pre-recommit-report.json",
+                prechecker,
+                &expectation,
+            )?;
+        }
+        if final_checker_completed {
+            let prechecker = checker_reports
+                .get("checker-pre-recommit-report.json")
+                .context("completed ACK final checker lacks its prechecker report")?;
+            let checker = checker_reports
+                .get("checker-report.json")
+                .context("completed ACK final checker lacks its report")?;
+            validate_ack_checker_report("checker-report.json", checker, &expectation)?;
+            validate_ack_checker_phase_chain(
+                prechecker,
+                checker,
+                &run_spec.metadata.bucket,
+                history,
+            )?;
+        }
+    }
+
+    if terminal_stage == "availability"
+        || has_event(&events, "availability", RunEventStatus::Succeeded)
+    {
+        let path = locate_artifact(
+            &options.artifact_root,
+            case_name,
+            AVAILABILITY_REPORT_ARTIFACT,
+        )?;
+        let report = read_json::<AvailabilityReport>(&path)?;
+        validate_optional_identity_fields(
+            AVAILABILITY_REPORT_ARTIFACT,
+            Some(&report.scenario),
+            Some(&report.run_id),
+            &metadata,
+            identity,
+        )?;
+        let floor = scenarios::scenario_spec(&options.scenario)?
+            .impact_policy
+            .availability_floor_percent()
+            .context("availability verdict has no catalog contract")?;
+        let workload = workload_summary
+            .as_ref()
+            .context("availability verdict lacks workload summary")?;
+        validate_availability_report_content(
+            &report,
+            &metadata,
+            workload,
+            workload_plan.object_count,
+            floor,
+        )?;
+        report.authenticate_probes(
+            history
+                .as_deref()
+                .context("availability verdict lacks history")?,
+            workload_plan.object_count / 2,
+        )?;
+        ensure!(
+            if terminal_stage == "availability" {
+                !report.passed && summary.classification == "availability_regression"
+            } else {
+                report.passed
+            },
+            "availability failure classification contradicts the authenticated verdict"
+        );
+        required_artifacts.push(AVAILABILITY_REPORT_ARTIFACT.to_string());
+    }
+    let post_recovery_probe_required = (terminal_stage == "post-recovery-write"
+        && summary.classification == "post_recovery_write_failed")
+        || matches!(terminal_phase, FailurePhase::Checker)
+        || terminal_stage == "recommit-unconfirmed"
+        || post_recovery_probe_completed
+        || pre_recommit_checker_completed
+        || recommit_completed
+        || final_checker_completed;
+    ensure!(
+        !post_recovery_probe_required
+            || (post_recovery_report_present && post_recovery_history_present),
+        "{terminal_stage} failure lacks the completed post-recovery write probe artifacts"
+    );
+    if post_recovery_probe_required {
+        let evidence = fault_evidence
+            .as_ref()
+            .context("completed post-recovery write probe lacks fault-evidence.json")?;
+        validate_write_probe_artifacts_after(
+            POST_RECOVERY_WRITE_PROBE,
+            &partial_artifacts,
+            &metadata,
+            identity,
+            &events,
+            &run_spec.metadata.bucket,
+            post_recovery_object_count(options.expected_workload_objects),
+            evidence
+                .recovery_ended_at_ms
+                .context("fault evidence lacks recovery boundary")?,
+            "recovery-evidence",
+            terminal_stage != "post-recovery-write",
+        )?;
+    }
+    if terminal_stage == "post-recovery-write" && post_recovery_report_present {
+        let report = read_json::<PostRecoveryWriteReport>(required(
+            &partial_artifacts,
+            POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+        )?)?;
+        ensure!(
+            !report.passed && summary.classification == "post_recovery_write_failed",
+            "post-recovery failure classification does not match its probe verdict"
+        );
+    }
+    ensure!(
+        !partial_recommit_report_required(
+            ack_mutation,
+            &terminal_stage,
+            recommit_reached,
+            final_checker_completed,
+        ) || recommit_report_present,
+        "{terminal_stage} failure lacks recommit-report.json from the completed recommit phase"
+    );
+    ensure!(
+        !(pre_recommit_checker_completed || recommit_completed || final_checker_completed)
+            || checker_report_passed.get("checker-pre-recommit-report.json") == Some(&true),
+        "completed checker-pre-recommit stage lacks its passing checker report"
+    );
+    ensure!(
+        !final_checker_completed || checker_report_passed.get("checker-report.json") == Some(&true),
+        "completed checker-final stage lacks its passing checker report"
+    );
+    match terminal_stage.as_str() {
+        "checker-pre-recommit-verdict" => {
+            let report = checker_reports
+                .get("checker-pre-recommit-report.json")
+                .context("checker-pre-recommit-verdict lacks checker-pre-recommit-report.json")?;
+            checker::validate_checker_failure_signal(report)
+                .context("checker-pre-recommit-verdict report has no failing observation")?;
+            let recovery = recovery_stability_report
+                .as_ref()
+                .context("checker-pre-recommit-verdict lacks recovery-stability-report.json")?;
+            checker::validate_recovery_stability_against_checker(recovery, report)?;
+            validate_recovery_failure_summary_fields(&summary, recovery)?;
+            ensure!(
+                !recovery.immediate_passed
+                    && recovery.classification.as_str() == summary.classification,
+                "checker-pre-recommit-verdict classification does not match its recovery evidence"
+            );
+        }
+        "checker-verdict" => {
+            let report = checker_reports
+                .get("checker-report.json")
+                .context("checker-verdict lacks checker-report.json")?;
+            checker::validate_checker_failure_signal(report)
+                .context("checker-verdict report has no failing observation")?;
+            ensure!(
+                report.failure_classification().as_str() == summary.classification,
+                "checker-verdict classification does not match its checker report"
+            );
+        }
+        _ => {}
+    }
+    required_artifacts.sort();
+
+    Ok(Some(ArtifactValidationReport {
+        scenario: options.scenario.clone(),
+        case_name: case_name.to_string(),
+        terminal_stage,
+        run_succeeded: false,
+        seed: workload_plan.seed,
+        client_disruptions,
+        recommitted: 0,
+        committed: 0,
+        required_artifacts,
+    }))
+}
+
 fn validate_fault_artifacts_with_identity(
     options: &ArtifactValidationOptions,
     identity: ArtifactIdentityPolicy<'_>,
@@ -1318,6 +2150,11 @@ fn validate_fault_artifacts_with_identity(
     }
     if options.scenario == scenarios::STALE_DISK_RETURN_DETECT_SCENARIO {
         return validate_stale_disk_execution_artifacts(options, identity, scenario_spec.case_name);
+    }
+    if let Some(report) =
+        validate_partial_failed_injection_artifacts(options, identity, scenario_spec.case_name)?
+    {
+        return Ok(report);
     }
     let ack_mutation = acknowledged_mutation_kind(&options.scenario);
     validate_conditional_recovery_stability_artifact(
@@ -1674,12 +2511,14 @@ fn validate_fault_artifacts_with_identity(
                 root: &options.artifact_root,
                 case_name: scenario_spec.case_name,
                 events: &events,
-                evidence: &evidence,
+                evidence: Some(&evidence),
                 history: &history,
                 scenario: &metadata.scenario,
                 run_id: &metadata.run_id,
                 bucket: &json_spec.metadata.bucket,
                 run_spec: &json_spec,
+                require_boundary: true,
+                require_recovered: true,
             },
             expected_mutation,
         )?)
@@ -1725,6 +2564,8 @@ fn validate_fault_artifacts_with_identity(
         return Ok(ArtifactValidationReport {
             scenario: options.scenario.clone(),
             case_name: scenario_spec.case_name.to_string(),
+            terminal_stage: "checker-final".to_string(),
+            run_succeeded: true,
             seed: workload_plan.seed,
             client_disruptions: 0,
             recommitted: 0,
@@ -1882,6 +2723,8 @@ fn validate_fault_artifacts_with_identity(
     Ok(ArtifactValidationReport {
         scenario: options.scenario.clone(),
         case_name: scenario_spec.case_name.to_string(),
+        terminal_stage: "checker-final".to_string(),
+        run_succeeded: true,
         seed: workload_plan.seed,
         client_disruptions: evidence.client_disruptions,
         recommitted: recommit.committed,
@@ -2006,6 +2849,8 @@ fn validate_on_disk_bitrot_artifacts(
     Ok(ArtifactValidationReport {
         scenario: options.scenario.clone(),
         case_name: case_name.to_string(),
+        terminal_stage: "checker-final".to_string(),
+        run_succeeded: true,
         seed: workload.seed,
         client_disruptions: 0,
         recommitted: 0,
@@ -2291,6 +3136,8 @@ fn validate_admin_execution_artifacts(
     Ok(ArtifactValidationReport {
         scenario: options.scenario.clone(),
         case_name: case_name.to_string(),
+        terminal_stage: "checker-final".to_string(),
+        run_succeeded: true,
         seed: workload.seed,
         client_disruptions,
         recommitted: recommit.committed,
@@ -2517,16 +3364,13 @@ fn validate_storage_recovery_execution_artifacts(
         }),
         "storage-recovery post-write history escaped its run prefix or report window"
     );
-    validate_write_probe_history(
-        POST_RECOVERY_WRITE_PROBE,
-        &post_write_history,
-        &post_write,
-        &metadata.run_id,
-    )?;
+    validate_write_probe_history(&post_write_history, &post_write)?;
 
     Ok(ArtifactValidationReport {
         scenario: options.scenario.clone(),
         case_name: case_name.to_string(),
+        terminal_stage: "checker-final".to_string(),
+        run_succeeded: true,
         seed: workload.seed,
         client_disruptions: 0,
         recommitted: recommit.committed,
@@ -2632,6 +3476,8 @@ fn validate_stale_disk_execution_artifacts(
     Ok(ArtifactValidationReport {
         scenario: options.scenario.clone(),
         case_name: case_name.to_string(),
+        terminal_stage: "checker-final".to_string(),
+        run_succeeded: true,
         seed: workload.seed,
         client_disruptions: 0,
         recommitted: 0,
@@ -2980,6 +3826,64 @@ fn validate_preflight_summary(
             .iter()
             .any(|phase| phase.name == "target-proof" && phase.status == PreflightStatus::Passed),
         "preflight-summary.json must include passed target-proof phase"
+    );
+    Ok(())
+}
+
+fn validate_partial_preflight_summary(
+    summary: &PreflightSummary,
+    options: &ArtifactValidationOptions,
+    run_id: &str,
+) -> Result<()> {
+    ensure!(
+        summary.schema_version == 1
+            && summary.run_id.as_deref() == Some(run_id)
+            && summary
+                .scenario_set
+                .iter()
+                .any(|scenario| scenario == &options.scenario),
+        "failed preflight-summary.json identity does not match the selected run"
+    );
+    ensure_nonempty(&summary.context, "failed preflight-summary.json context")?;
+    ensure_nonempty(
+        &summary.namespace,
+        "failed preflight-summary.json namespace",
+    )?;
+    ensure_nonempty(&summary.tenant, "failed preflight-summary.json tenant")?;
+    ensure_nonempty(
+        &summary.storage_class,
+        "failed preflight-summary.json storage_class",
+    )?;
+    ensure!(
+        !summary.phases.is_empty()
+            && summary.phases.iter().all(|phase| {
+                !phase.name.trim().is_empty()
+                    && !phase.checks.is_empty()
+                    && phase.status
+                        == if phase
+                            .checks
+                            .iter()
+                            .any(|check| check.status == PreflightStatus::Failed)
+                        {
+                            PreflightStatus::Failed
+                        } else {
+                            PreflightStatus::Passed
+                        }
+            }),
+        "failed preflight-summary.json contains an empty or inconsistent phase"
+    );
+    let expected_status = if summary
+        .phases
+        .iter()
+        .any(|phase| phase.status == PreflightStatus::Failed)
+    {
+        PreflightStatus::Failed
+    } else {
+        PreflightStatus::Passed
+    };
+    ensure!(
+        summary.status == expected_status,
+        "failed preflight-summary.json status does not match its phases"
     );
     Ok(())
 }
@@ -4486,6 +5390,356 @@ fn derive_recommit_candidates(
     Ok(candidates)
 }
 
+fn validate_recommit_candidate_manifest(
+    manifest: &RecommitCandidateManifestArtifact,
+    expected_bucket: &str,
+    expected_scenario: &str,
+    expected_run_id: &str,
+    history: &[OperationRecord],
+) -> Result<HashMap<RecommitIdentity, String>> {
+    ensure!(
+        manifest.scenario == expected_scenario
+            && manifest.run_id == expected_run_id
+            && manifest.bucket == expected_bucket,
+        "recommit candidate manifest does not match the run target identity"
+    );
+    let history_prefix = history
+        .get(..manifest.history_record_count)
+        .context("recommit candidate manifest history bounds exceed history.jsonl")?;
+    ensure!(
+        manifest.history_sha256 == checker::checker_history_records_sha256(history_prefix)?,
+        "recommit candidate manifest is not bound to its authenticated history prefix"
+    );
+
+    let mut records_by_id = HashMap::with_capacity(history_prefix.len());
+    for record in history_prefix {
+        records_by_id.insert(record.id.as_str(), record);
+    }
+    let derived_candidates = derive_recommit_candidates(history_prefix)?;
+    let mut expected = HashMap::<RecommitIdentity, String>::new();
+    for candidate in &manifest.candidates {
+        ensure!(
+            expected
+                .insert(
+                    (
+                        candidate.key.clone(),
+                        candidate.size_bytes,
+                        candidate.sha256.clone(),
+                    ),
+                    candidate.source_operation_id.clone(),
+                )
+                .is_none(),
+            "recommit candidate manifest contains a duplicate object identity"
+        );
+        let source = records_by_id
+            .get(candidate.source_operation_id.as_str())
+            .copied()
+            .with_context(|| {
+                format!(
+                    "recommit candidate {} source operation is absent from its authenticated history",
+                    candidate.key
+                )
+            })?;
+        ensure!(
+            matches!(
+                source.kind,
+                OperationKind::Put | OperationKind::CompleteMultipartUpload
+            ) && source.outcome != OperationOutcome::Ok
+                && source.bucket == expected_bucket
+                && source.key.as_deref() == Some(candidate.key.as_str())
+                && source.value_sha256.as_deref() == Some(candidate.sha256.as_str())
+                && source.size_bytes == Some(candidate.size_bytes),
+            "recommit candidate {} does not match its authenticated source operation",
+            candidate.key
+        );
+    }
+    ensure!(
+        expected == derived_candidates,
+        "recommit candidate manifest does not match the final unconfirmed mutations in authenticated history"
+    );
+    Ok(expected)
+}
+
+fn authenticate_recommit_deadline_truncation(
+    artifact_root: &Path,
+    summary: &FailureSummary,
+    events: &[RunEvent],
+    recommit: &RecommitReportArtifact,
+    manifest: &RecommitCandidateManifestArtifact,
+    history: &[OperationRecord],
+    run_id: &str,
+) -> Result<bool> {
+    if recommit.attempted == manifest.candidates.len() {
+        return Ok(false);
+    }
+    let suite_root = [Some(artifact_root), artifact_root.parent()]
+        .into_iter()
+        .flatten()
+        .find(|root| root.join("suite-plan.json").is_file())
+        .context("incomplete recommit report has no suite-plan.json deadline source")?;
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SuiteDeadlinePlan {
+        budgets: SuiteDeadlineBudgets,
+        attempts: Vec<SuiteDeadlineAttempt>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SuiteDeadlineBudgets {
+        max_duration_seconds: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SuiteDeadlineAttempt {
+        run_id: Option<String>,
+        scenario: String,
+    }
+    let suite_plan = read_json::<SuiteDeadlinePlan>(&suite_root.join("suite-plan.json"))?;
+    let matching_attempts = suite_plan
+        .attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.run_id.as_deref() == Some(run_id) && attempt.scenario == summary.scenario
+        })
+        .collect::<Vec<_>>();
+    let max_duration_seconds = suite_plan
+        .budgets
+        .max_duration_seconds
+        .context("incomplete recommit report has no configured suite maxDuration")?;
+    let deadline_message =
+        format!("suite maxDuration budget {max_duration_seconds}s was reached during execution");
+    ensure!(
+        recommit.attempted < manifest.candidates.len()
+            && summary.stage == "recommit-unconfirmed"
+            && summary.classification == "test_or_environment"
+            && summary.message == deadline_message
+            && matching_attempts.len() == 1,
+        "incomplete recommit report lacks an authenticated suite-deadline failure summary"
+    );
+    let started = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.stage == "recommit-unconfirmed" && event.status == RunEventStatus::Started
+        })
+        .collect::<Vec<_>>();
+    let failures = events
+        .iter()
+        .enumerate()
+        .filter(|event| {
+            event.1.stage == "recommit-unconfirmed" && event.1.status == RunEventStatus::Failed
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        started.len() == 1
+            && failures.len() == 1
+            && started[0].0 < failures[0].0
+            && started[0].1.at_ms <= failures[0].1.at_ms
+            && failures[0].1.message == summary.message,
+        "incomplete recommit report lacks one ordered Started/Failed suite-deadline event pair"
+    );
+    let details = failures[0]
+        .1
+        .details
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .context("suite-deadline recommit failure event has no details")?;
+    ensure!(
+        details.len() == 2
+            && details.get("attempted").and_then(serde_json::Value::as_u64)
+                == u64::try_from(recommit.attempted).ok()
+            && details
+                .get("candidates")
+                .and_then(serde_json::Value::as_u64)
+                == u64::try_from(manifest.candidates.len()).ok(),
+        "suite-deadline recommit failure event does not match the report and sealed candidates"
+    );
+    let history_after_manifest = history
+        .get(manifest.history_record_count..)
+        .context("suite-deadline recommit history bounds exceed history.jsonl")?;
+    let recommit_started_at_ms = started[0].1.at_ms;
+    let recommit_failed_at_ms = failures[0].1.at_ms;
+    ensure!(
+        history_after_manifest.iter().all(|record| {
+            if record.started_at_ms < recommit_started_at_ms {
+                record.ended_at_ms <= recommit_started_at_ms && record.kind != OperationKind::Put
+            } else {
+                record.ended_at_ms <= recommit_failed_at_ms
+            }
+        }),
+        "suite-deadline history crosses or exceeds its authenticated recommit interval"
+    );
+    Ok(true)
+}
+
+fn validate_partial_recommit_report(
+    recommit: &RecommitReportArtifact,
+    manifest: &RecommitCandidateManifestArtifact,
+    expected_bucket: &str,
+    expected_scenario: &str,
+    expected_run_id: &str,
+    history: &[OperationRecord],
+    allow_deadline_truncation: bool,
+) -> Result<()> {
+    let expected = validate_recommit_candidate_manifest(
+        manifest,
+        expected_bucket,
+        expected_scenario,
+        expected_run_id,
+        history,
+    )?;
+    ensure!(
+        recommit.attempts.len() == recommit.attempted
+            && (recommit.attempted == expected.len()
+                || (recommit.attempted < expected.len() && allow_deadline_truncation)),
+        "recommit-report.json does not cover every sealed candidate without authenticated suite-deadline truncation"
+    );
+    ensure!(
+        recommit
+            .attempts
+            .iter()
+            .zip(&manifest.candidates)
+            .all(|(attempt, candidate)| {
+                attempt.source_operation_id == candidate.source_operation_id
+                    && attempt.key == candidate.key
+                    && attempt.size_bytes == candidate.size_bytes
+                    && attempt.sha256 == candidate.sha256
+            }),
+        "recommit-report.json attempts are not an exact prefix of the sealed candidate manifest"
+    );
+
+    let mut expected_by_key = HashMap::<&str, (&RecommitIdentity, &str)>::new();
+    for (identity, source_operation_id) in &expected {
+        ensure!(
+            expected_by_key
+                .insert(
+                    identity.0.as_str(),
+                    (identity, source_operation_id.as_str())
+                )
+                .is_none(),
+            "recommit candidate manifest contains duplicate keys"
+        );
+    }
+    let history_after_manifest = history
+        .get(manifest.history_record_count..)
+        .context("recommit history bounds exceed history.jsonl")?;
+    ensure!(
+        history_after_manifest.iter().all(|record| matches!(
+            record.kind,
+            OperationKind::Put
+                | OperationKind::Get
+                | OperationKind::Head
+                | OperationKind::List
+                | OperationKind::ListVersions
+        )),
+        "history.jsonl contains an unauthenticated post-manifest mutation"
+    );
+    let mut put_by_key = HashMap::<&str, &OperationRecord>::new();
+    for record in history_after_manifest
+        .iter()
+        .filter(|record| record.kind == OperationKind::Put)
+    {
+        let key = record
+            .key
+            .as_deref()
+            .context("post-manifest PUT has no key")?;
+        ensure!(
+            put_by_key.insert(key, record).is_none(),
+            "history.jsonl contains multiple post-manifest PUTs for one key"
+        );
+    }
+    let mut verification_by_key = HashMap::<&str, &OperationRecord>::new();
+    for record in history_after_manifest {
+        let Some(key) = record.key.as_deref() else {
+            continue;
+        };
+        let Some(put) = put_by_key.get(key).copied() else {
+            continue;
+        };
+        let put_ended = put
+            .ended_sequence
+            .context("recorded recommit PUT has no ended sequence")?;
+        let Some(started) = record
+            .started_sequence
+            .filter(|started| *started > put_ended)
+        else {
+            continue;
+        };
+        match verification_by_key.get(key).copied() {
+            Some(current)
+                if current
+                    .started_sequence
+                    .is_some_and(|current_started| current_started <= started) => {}
+            _ => {
+                verification_by_key.insert(key, record);
+            }
+        }
+    }
+    let mut attempted_keys = BTreeSet::new();
+    let mut recorded_put_keys = BTreeSet::new();
+
+    for attempt in &recommit.attempts {
+        ensure!(
+            attempted_keys.insert(attempt.key.as_str()),
+            "recommit-report.json contains duplicate attempts for one key"
+        );
+        let (identity, source_operation_id) = expected_by_key
+            .get(attempt.key.as_str())
+            .copied()
+            .context("recommit-report.json attempt is absent from its sealed candidate manifest")?;
+        ensure!(
+            identity.1 == attempt.size_bytes
+                && identity.2.as_str() == attempt.sha256.as_str()
+                && source_operation_id == attempt.source_operation_id.as_str(),
+            "recommit-report.json attempt does not match its sealed candidate manifest"
+        );
+
+        if attempt.outcome.is_none() {
+            ensure!(
+                !put_by_key.contains_key(attempt.key.as_str()),
+                "recommit-report.json harness error conflicts with a recorded recommit PUT"
+            );
+            continue;
+        }
+        let put = put_by_key.get(attempt.key.as_str()).copied().context(
+            "recommit-report.json attempt has no matching recommit PUT in history.jsonl",
+        )?;
+        recorded_put_keys.insert(attempt.key.as_str());
+        ensure!(
+            put.value_sha256.as_deref() == Some(attempt.sha256.as_str())
+                && put.size_bytes == Some(attempt.size_bytes)
+                && Some(put.outcome) == attempt.outcome
+                && put.http_status == attempt.http_status
+                && put.error == attempt.error,
+            "recommit-report.json PUT outcome does not match history.jsonl"
+        );
+        if attempt.outcome != Some(OperationOutcome::Ok) {
+            continue;
+        }
+        let verification = verification_by_key
+            .get(attempt.key.as_str())
+            .copied()
+            .context("successful recommit PUT has no following verification GET")?;
+        ensure!(
+            verification.kind == OperationKind::Get
+                && verification.version_id.is_none()
+                && verification.range.is_none()
+                && Some(verification.outcome) == attempt.verify_get_outcome
+                && (verification.outcome != OperationOutcome::Ok
+                    || (verification.value_sha256.as_deref() == Some(attempt.sha256.as_str())
+                        && verification.size_bytes == Some(attempt.size_bytes))),
+            "recommit-report.json verification outcome does not match history.jsonl"
+        );
+    }
+
+    let all_recorded_put_keys = put_by_key.keys().copied().collect::<BTreeSet<_>>();
+    ensure!(
+        all_recorded_put_keys == recorded_put_keys,
+        "history.jsonl contains a recommit PUT absent from recommit-report.json"
+    );
+    Ok(())
+}
+
 fn validate_checker_phase_chain(
     prechecker: &CheckerReport,
     checker: &CheckerReport,
@@ -4575,53 +5829,13 @@ fn validate_checker_phase_chain(
     validate_history_phase_boundary(&history[..pre_end], recommit_history, "prechecker/recommit")?;
     validate_history_phase_boundary(final_prefix, final_suffix, "recommit/final-checker")?;
 
-    let mut records_by_id = HashMap::with_capacity(manifest.history_record_count);
-    for record in &history[..manifest.history_record_count] {
-        records_by_id.insert(record.id.as_str(), record);
-    }
-    let derived_candidates = derive_recommit_candidates(&history[..manifest.history_record_count])?;
-
-    let mut expected = HashMap::<RecommitIdentity, String>::new();
-    for candidate in &manifest.candidates {
-        ensure!(
-            expected
-                .insert(
-                    (
-                        candidate.key.clone(),
-                        candidate.size_bytes,
-                        candidate.sha256.clone(),
-                    ),
-                    candidate.source_operation_id.clone(),
-                )
-                .is_none(),
-            "recommit candidate manifest contains a duplicate object identity"
-        );
-        let source = records_by_id
-            .get(candidate.source_operation_id.as_str())
-            .copied()
-            .with_context(|| {
-                format!(
-                    "recommit candidate {} source operation is absent from its authenticated history",
-                    candidate.key
-                )
-            })?;
-        ensure!(
-            matches!(
-                source.kind,
-                OperationKind::Put | OperationKind::CompleteMultipartUpload
-            ) && source.outcome != OperationOutcome::Ok
-                && source.bucket == expected_bucket
-                && source.key.as_deref() == Some(candidate.key.as_str())
-                && source.value_sha256.as_deref() == Some(candidate.sha256.as_str())
-                && source.size_bytes == Some(candidate.size_bytes),
-            "recommit candidate {} does not match its authenticated source operation",
-            candidate.key
-        );
-    }
-    ensure!(
-        expected == derived_candidates,
-        "recommit candidate manifest does not match the final unconfirmed mutations in authenticated history"
-    );
+    let expected = validate_recommit_candidate_manifest(
+        manifest,
+        expected_bucket,
+        &prechecker.scenario,
+        &prechecker.run_id,
+        history,
+    )?;
     ensure!(
         manifest.candidates.len() == recommit.attempted,
         "recommit candidate manifest count does not match recommit-report.json"
@@ -4945,6 +6159,7 @@ fn validate_post_recovery_write_artifacts_after(
         expected_objects,
         recovery_completed_at_ms,
         recovery_boundary_stage,
+        true,
     )
 }
 
@@ -4959,6 +6174,7 @@ fn validate_write_probe_artifacts_after(
     expected_objects: usize,
     boundary_at_ms: u64,
     boundary_stage: &str,
+    expected_passed: bool,
 ) -> Result<()> {
     let WriteProbeEvidence {
         report_artifact,
@@ -4983,9 +6199,15 @@ fn validate_write_probe_artifacts_after(
         "{report_artifact} probed {} objects but the workload plan sizes the probe at {expected_objects}",
         report.objects
     );
-    report
-        .require_success()
-        .with_context(|| format!("{report_artifact} did not pass"))?;
+    ensure!(
+        report.passed == expected_passed,
+        "{report_artifact} verdict contradicts the required probe outcome"
+    );
+    let expected_status = if expected_passed {
+        RunEventStatus::Succeeded
+    } else {
+        RunEventStatus::Failed
+    };
     ensure!(
         report.started_at_ms >= boundary_at_ms,
         "{report_artifact} started before {starts_after}"
@@ -5007,10 +6229,11 @@ fn validate_write_probe_artifacts_after(
         .enumerate()
         .skip(probe_started + 1)
         .find_map(|(index, event)| {
-            (event.stage == event_stage && event.status == RunEventStatus::Succeeded)
-                .then_some(index)
+            (event.stage == event_stage && event.status == expected_status).then_some(index)
         })
-        .with_context(|| format!("run-events.jsonl lacks a successful {event_stage} event"))?;
+        .with_context(|| {
+            format!("run-events.jsonl lacks a {event_stage} {expected_status:?} event")
+        })?;
     ensure!(
         boundary < probe_started,
         "{}",
@@ -5024,9 +6247,14 @@ fn validate_write_probe_artifacts_after(
         events[probe_started].at_ms <= report.started_at_ms
             && report.completed_at_ms <= events[probe_succeeded].at_ms
             && events.iter().all(|event| {
-                event.stage != event_stage || event.status != RunEventStatus::Failed
+                event.stage != event_stage
+                    || matches!(
+                        event.status,
+                        RunEventStatus::Started | RunEventStatus::Observed
+                    )
+                    || event.status == expected_status
             }),
-        "run-events.jsonl does not prove one successful {label} probe around its report interval"
+        "run-events.jsonl does not prove one {expected_status:?} {label} probe around its report interval"
     );
     let expected_prefix = probe.scope.key_prefix(&metadata.run_id);
     ensure!(
@@ -5061,196 +6289,19 @@ fn validate_write_probe_artifacts_after(
             record.id
         );
     }
-    validate_write_probe_history(probe, &history, &report, &metadata.run_id)
+    validate_write_probe_history(&history, &report)
 }
 
-/// Every counter the probe report claims must be evidenced by its dedicated
-/// history, in the order the probe issues its requests: each plain object a
-/// PUT ok, a hash- and size-matching GET, a DELETE ok, then a GET 404; the
-/// multipart key its completion, matching GET, DELETE, and 404; the abort
-/// key its abort; and exactly two prefix LISTs, the first returning every
-/// live probe key after the writes and before any DELETE, the second empty
-/// after the last DELETE. Records outside that shape are not tolerated.
+/// The workload owns the probe protocol and verdict. This boundary binds the
+/// persisted report to that same replay, including complete negative outcomes.
 fn validate_write_probe_history(
-    probe: WriteProbeEvidence,
     history: &[OperationRecord],
     report: &PostRecoveryWriteReport,
-    run_id: &str,
 ) -> Result<()> {
-    let artifact = probe.history_artifact;
-    let scope = probe.scope;
-    let prefix = scope.key_prefix(run_id);
-    let plain_keys = (0..report.objects)
-        .map(|index| scope.key(run_id, index))
-        .collect::<Vec<_>>();
-    let multipart_key = scope.key(run_id, report.objects);
-    let abort_key = scope.key(run_id, report.objects + 1);
-
-    for record in history {
-        let key = record.key.as_deref().unwrap_or_default();
-        let allowed = if key == prefix {
-            matches!(record.kind, OperationKind::List)
-        } else if key == multipart_key {
-            matches!(
-                record.kind,
-                OperationKind::CreateMultipartUpload
-                    | OperationKind::UploadPart
-                    | OperationKind::CompleteMultipartUpload
-                    | OperationKind::Get
-                    | OperationKind::Delete
-            )
-        } else if key == abort_key {
-            matches!(
-                record.kind,
-                OperationKind::CreateMultipartUpload | OperationKind::AbortMultipartUpload
-            )
-        } else if plain_keys.iter().any(|plain| plain == key) {
-            matches!(
-                record.kind,
-                OperationKind::Put | OperationKind::Get | OperationKind::Delete
-            )
-        } else {
-            false
-        };
-        ensure!(
-            allowed,
-            "{artifact} record {} is a {:?} on {key:?}, which the probe never issues",
-            record.id,
-            record.kind
-        );
-        ensure!(
-            record.outcome == OperationOutcome::Ok
-                || (record.kind == OperationKind::Get
-                    && record.outcome == OperationOutcome::NotFound),
-            "{artifact} record {} ({:?} {key:?}) ended {:?}; a passed probe has no failed requests",
-            record.id,
-            record.kind,
-            record.outcome
-        );
-    }
-
-    let sequences = |record: &OperationRecord| -> Result<(u64, u64)> {
-        Ok((
-            record.started_sequence.with_context(|| {
-                format!("{artifact} record {} has no start sequence", record.id)
-            })?,
-            record
-                .ended_sequence
-                .with_context(|| format!("{artifact} record {} has no end sequence", record.id))?,
-        ))
-    };
-    let records_for = |key: &str, kind: OperationKind| {
-        let mut records = history
-            .iter()
-            .filter(|record| record.kind == kind && record.key.as_deref() == Some(key))
-            .collect::<Vec<_>>();
-        records.sort_by_key(|record| record.started_sequence);
-        records
-    };
-    let exactly_one = |key: &str, kind: OperationKind| -> Result<&OperationRecord> {
-        let records = records_for(key, kind);
-        ensure!(
-            records.len() == 1,
-            "{artifact} must hold exactly one acknowledged {kind:?} for {key:?}, found {}",
-            records.len()
-        );
-        Ok(records[0])
-    };
-    // Returns the verify-GET end and the DELETE start/end sequences so the
-    // LISTs can be placed relative to the writes and deletes.
-    let object_lifecycle = |key: &str, write_kind: OperationKind| -> Result<(u64, u64, u64)> {
-        let write = exactly_one(key, write_kind)?;
-        let (_, write_ended) = sequences(write)?;
-        let written_sha256 = write.value_sha256.as_deref().with_context(|| {
-            format!("{artifact} {write_kind:?} for {key:?} records no payload hash")
-        })?;
-        let delete = exactly_one(key, OperationKind::Delete)?;
-        let (delete_started, delete_ended) = sequences(delete)?;
-        let gets = records_for(key, OperationKind::Get);
-        ensure!(
-            gets.len() == 2,
-            "{artifact} must hold exactly two GETs for {key:?} (verify, then absence), found {}",
-            gets.len()
-        );
-        let (verify, absent) = (gets[0], gets[1]);
-        let (verify_started, verify_ended) = sequences(verify)?;
-        ensure!(
-            verify.outcome == OperationOutcome::Ok
-                && verify.http_status == Some(200)
-                && verify.value_sha256.as_deref() == Some(written_sha256)
-                && verify.size_bytes == write.size_bytes
-                && verify_started > write_ended,
-            "{artifact} GET {} does not read back the acknowledged {write_kind:?} of {key:?} with its hash and size",
-            verify.id
-        );
-        ensure!(
-            delete_started > verify_ended,
-            "{artifact} DELETE {} of {key:?} did not follow its verified read",
-            delete.id
-        );
-        let (absent_started, _) = sequences(absent)?;
-        ensure!(
-            absent.outcome == OperationOutcome::NotFound
-                && absent.http_status == Some(404)
-                && absent_started > delete_ended,
-            "{artifact} GET {} does not prove {key:?} absent after its acknowledged DELETE",
-            absent.id
-        );
-        Ok((verify_ended, delete_started, delete_ended))
-    };
-
-    let mut last_verify_ended = 0;
-    let mut first_delete_started = u64::MAX;
-    let mut last_delete_ended = 0;
-    for key in plain_keys.iter().chain(std::iter::once(&multipart_key)) {
-        let write_kind = if key == &multipart_key {
-            OperationKind::CompleteMultipartUpload
-        } else {
-            OperationKind::Put
-        };
-        let (verify_ended, delete_started, delete_ended) = object_lifecycle(key, write_kind)?;
-        last_verify_ended = last_verify_ended.max(verify_ended);
-        first_delete_started = first_delete_started.min(delete_started);
-        last_delete_ended = last_delete_ended.max(delete_ended);
-    }
-    exactly_one(&multipart_key, OperationKind::CreateMultipartUpload)?;
-    exactly_one(&abort_key, OperationKind::CreateMultipartUpload)?;
-    exactly_one(&abort_key, OperationKind::AbortMultipartUpload)?;
-
-    let lists = records_for(&prefix, OperationKind::List);
+    let rebuilt = report.rebuild_from_history(history)?;
     ensure!(
-        lists.len() == 2,
-        "{artifact} must hold exactly two prefix LISTs, found {}",
-        lists.len()
-    );
-    let (live_list, empty_list) = (lists[0], lists[1]);
-    let mut expected_live = plain_keys.clone();
-    expected_live.push(multipart_key.clone());
-    expected_live.sort();
-    let mut listed = live_list
-        .listed_keys
-        .clone()
-        .with_context(|| format!("{artifact} LIST {} captured no keys", live_list.id))?;
-    listed.sort();
-    let (live_started, live_ended) = sequences(live_list)?;
-    ensure!(
-        live_list.http_status == Some(200)
-            && listed == expected_live
-            && live_started > last_verify_ended
-            && live_ended < first_delete_started,
-        "{artifact} LIST {} does not show exactly the live probe objects between the verified writes and the first DELETE",
-        live_list.id
-    );
-    let (empty_started, _) = sequences(empty_list)?;
-    ensure!(
-        empty_list.http_status == Some(200)
-            && empty_list
-                .listed_keys
-                .as_ref()
-                .is_some_and(|keys| keys.is_empty())
-            && empty_started > last_delete_ended,
-        "{artifact} LIST {} does not prove the prefix empty after the last DELETE",
-        empty_list.id
+        &rebuilt == report,
+        "write probe report counters, failures, or verdict do not match its history"
     );
     Ok(())
 }
@@ -5375,6 +6426,56 @@ fn validate_quorum_edge_read_survival_artifact(
     Ok(())
 }
 
+fn validate_availability_report_content(
+    report: &AvailabilityReport,
+    metadata: &RunMetadataArtifact,
+    summary: &WorkloadSummaryArtifact,
+    workload_object_count: usize,
+    catalog_floor_percent: u8,
+) -> Result<()> {
+    let configured_floor = metadata.min_availability_percent.context(
+        "run-metadata.json min_availability_percent is required for availability scenarios",
+    )?;
+    ensure!(
+        report.min_success_percent == configured_floor,
+        "availability-report.json min_success_percent does not match run-metadata.json"
+    );
+    ensure!(
+        configured_floor >= catalog_floor_percent,
+        "availability-report.json min_success_percent {configured_floor} is below the catalog availability floor {catalog_floor_percent}"
+    );
+    let commits = summary
+        .puts
+        .ok
+        .checked_add(summary.multipart_completes.ok)
+        .context("workload acknowledged commit count overflowed")?;
+    ensure!(
+        report.commit_probe.objects == commits,
+        "availability-report.json commit probe does not cover {commits} acknowledged mutations"
+    );
+    ensure!(
+        report.read_probe.objects == workload_object_count / 2,
+        "availability-report.json read probe did not cover the complete prefilled cohort"
+    );
+    let expected = summary.family_availability()?;
+    ensure!(
+        report.workload.len() == expected.len(),
+        "availability-report.json does not contain every workload family"
+    );
+    for (family, expected) in report.workload.iter().zip(expected) {
+        ensure!(
+            family == &expected,
+            "availability-report.json family does not match workload-summary.json {}",
+            expected.family
+        );
+    }
+    ensure!(
+        report == &report.rebuild_verdict(commits),
+        "availability-report.json verdict or violations do not match its observations"
+    );
+    Ok(())
+}
+
 fn validate_availability_artifact(
     artifacts: &BTreeMap<String, PathBuf>,
     metadata: &RunMetadataArtifact,
@@ -5388,91 +6489,24 @@ fn validate_availability_artifact(
         read_json::<AvailabilityReport>(required(artifacts, AVAILABILITY_REPORT_ARTIFACT)?)?;
     validate_optional_identity_fields(
         AVAILABILITY_REPORT_ARTIFACT,
-        Some(report.scenario.as_str()),
-        Some(report.run_id.as_str()),
+        Some(&report.scenario),
+        Some(&report.run_id),
         metadata,
         identity,
     )?;
-    // The floor the run was configured with is persisted in run-metadata.json
-    // and may only tighten the catalog floor; a report claiming a laxer floor
-    // than either is not evidence.
-    let configured_floor = metadata.min_availability_percent.context(
-        "run-metadata.json min_availability_percent is required for availability scenarios",
+    validate_availability_report_content(
+        &report,
+        metadata,
+        summary,
+        workload_object_count,
+        catalog_floor_percent,
     )?;
-    ensure!(
-        report.min_success_percent == configured_floor,
-        "{AVAILABILITY_REPORT_ARTIFACT} min_success_percent {} does not match run-metadata.json min_availability_percent {configured_floor}",
-        report.min_success_percent
-    );
-    ensure!(
-        report.min_success_percent >= catalog_floor_percent,
-        "{AVAILABILITY_REPORT_ARTIFACT} min_success_percent {} is below the catalog availability floor {catalog_floor_percent}",
-        report.min_success_percent
-    );
-    let acknowledged_commits = summary
-        .puts
-        .ok
-        .checked_add(summary.multipart_completes.ok)
-        .context("workload-summary.json acknowledged commit count overflowed")?;
-    ensure!(
-        report.commit_probe.objects == acknowledged_commits
-            && report.commit_probe.verified == report.commit_probe.objects
-            && report.commit_probe.failures.is_empty(),
-        "{AVAILABILITY_REPORT_ARTIFACT} commit probe verified {} of {} reported commits with {} failure(s), but workload-summary.json records {acknowledged_commits} acknowledged PUTs, overwrites, and multipart completions",
-        report.commit_probe.verified,
-        report.commit_probe.objects,
-        report.commit_probe.failures.len()
-    );
     report
         .require_success()
-        .with_context(|| format!("{AVAILABILITY_REPORT_ARTIFACT} did not pass"))?;
+        .context("availability-report.json did not pass")?;
     ensure!(
-        report.read_probe.objects == workload_object_count / 2
-            && report.read_probe.verified == report.read_probe.objects
-            && report.read_probe.failures.is_empty(),
-        "{AVAILABILITY_REPORT_ARTIFACT} read probe did not verify the complete prefilled cohort"
-    );
-    // Every family is recomputed from workload-summary.json and must equal
-    // the report's, so disruptions cannot be shifted from a small family
-    // that would violate the floor into a large one that tolerates them, and
-    // the floor verdict is re-derived rather than trusted.
-    let expected_families = summary.family_availability()?;
-    ensure!(
-        report.workload.len() == expected_families.len(),
-        "{AVAILABILITY_REPORT_ARTIFACT} lists {} workload families but workload-summary.json defines {}",
-        report.workload.len(),
-        expected_families.len()
-    );
-    for (family, expected) in report.workload.iter().zip(&expected_families) {
-        ensure!(
-            family == expected,
-            "{AVAILABILITY_REPORT_ARTIFACT} family {:?} ({} of {} disrupted, {}%) does not match workload-summary.json {} ({} of {} disrupted, {}%)",
-            family.family,
-            family.disrupted,
-            family.total,
-            family.success_percent,
-            expected.family,
-            expected.disrupted,
-            expected.total,
-            expected.success_percent
-        );
-        ensure!(
-            expected.meets_floor(report.min_success_percent),
-            "{AVAILABILITY_REPORT_ARTIFACT} family {} ({} of {} disrupted) does not meet the {}% floor recomputed from workload-summary.json",
-            expected.family,
-            expected.disrupted,
-            expected.total,
-            report.min_success_percent
-        );
-    }
-    let disrupted = expected_families
-        .iter()
-        .map(|family| family.disrupted)
-        .sum::<usize>();
-    ensure!(
-        disrupted == evidence.client_disruptions,
-        "{AVAILABILITY_REPORT_ARTIFACT} workload disruptions {disrupted} do not match fault-evidence.json client_disruptions {}",
-        evidence.client_disruptions
+        summary.disrupted()? == evidence.client_disruptions,
+        "availability-report.json workload disruptions do not match fault-evidence.json client_disruptions"
     );
     Ok(())
 }
@@ -5691,12 +6725,14 @@ struct AckArtifactValidationContext<'a> {
     root: &'a Path,
     case_name: &'a str,
     events: &'a [RunEvent],
-    evidence: &'a FaultEvidenceArtifact,
+    evidence: Option<&'a FaultEvidenceArtifact>,
     history: &'a [OperationRecord],
     scenario: &'a str,
     run_id: &'a str,
     bucket: &'a str,
     run_spec: &'a FaultRunSpec,
+    require_boundary: bool,
+    require_recovered: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -5728,30 +6764,56 @@ fn validate_ack_triggered_dm_artifacts(
         run_id,
         bucket,
         run_spec,
+        require_boundary,
+        require_recovered,
     } = context;
     validate_history_scope_and_order(history, scenario, run_id, bucket)?;
-    let preparation_event = events
+    let preparation_started = events
         .iter()
-        .find(|event| {
-            event.stage == "fault-prepare"
-                && event.status == RunEventStatus::Succeeded
-                && event.scenario == scenario
-                && event.run_id == run_id
+        .enumerate()
+        .filter(|(_, event)| {
+            event.stage == "fault-prepare" && event.status == RunEventStatus::Started
         })
-        .context("run-events.jsonl lacks successful fault preparation")?;
+        .collect::<Vec<_>>();
+    let preparation_succeeded = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.stage == "fault-prepare" && event.status == RunEventStatus::Succeeded
+        })
+        .collect::<Vec<_>>();
+    let apply_started = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.stage == "fault-apply" && event.status == RunEventStatus::Started
+        })
+        .collect::<Vec<_>>();
+    let apply_succeeded = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.stage == "fault-apply" && event.status == RunEventStatus::Succeeded
+        })
+        .collect::<Vec<_>>();
+    let ack_succeeded = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.stage == "ack-trigger" && event.status == RunEventStatus::Succeeded
+        })
+        .collect::<Vec<_>>();
     ensure!(
-        events.iter().any(|event| {
-            event.stage == "ack-trigger"
-                && event.status == RunEventStatus::Succeeded
-                && event.scenario == scenario
-                && event.run_id == run_id
-        }) && events.iter().any(|event| {
-            event.stage == "crash-recovery-boundary"
-                && event.status == RunEventStatus::Succeeded
-                && event.scenario == scenario
-                && event.run_id == run_id
-        }),
-        "run-events.jsonl lacks a successful ACK trigger or crash-recovery boundary"
+        preparation_started.len() == 1
+            && preparation_succeeded.len() == 1
+            && apply_started.len() == 1
+            && apply_succeeded.len() == 1
+            && ack_succeeded.len() == 1
+            && preparation_started[0].0 < preparation_succeeded[0].0
+            && preparation_succeeded[0].0 < apply_started[0].0
+            && apply_started[0].0 < apply_succeeded[0].0
+            && apply_succeeded[0].0 < ack_succeeded[0].0,
+        "run-events.jsonl lacks one ordered fault preparation, fault activation, and ACK trigger sequence"
     );
     let ack = read_json::<AckTriggeredCrashEvidenceArtifact>(&locate_artifact(
         root,
@@ -5774,15 +6836,24 @@ fn validate_ack_triggered_dm_artifacts(
         scenario,
         run_id,
         AckFaultTimeline {
-            prepare_started_at_ms: evidence.fault_prepare_started_at_ms,
-            apply_started_at_ms: evidence.fault_apply_started_at_ms,
+            prepare_started_at_ms: Some(preparation_started[0].1.at_ms),
+            apply_started_at_ms: Some(apply_started[0].1.at_ms),
         },
         trigger,
     )?;
-    ensure!(
-        evidence.fault_active_at_ms == Some(ack.fault_activated_at_ms),
-        "ACK activation timestamp does not match fault-evidence.json"
-    );
+    if let Some(evidence) = evidence {
+        ensure!(
+            evidence.fault_prepare_started_at_ms.is_some_and(|started| {
+                preparation_started[0].1.at_ms <= started
+                    && started <= ack.trigger_acknowledged_at_ms
+            }) && evidence.fault_apply_started_at_ms.is_some_and(|started| {
+                ack.trigger_acknowledged_at_ms <= started
+                    && started <= apply_started[0].1.at_ms
+                    && apply_started[0].1.at_ms <= ack.fault_activated_at_ms
+            }) && evidence.fault_active_at_ms == Some(ack.fault_activated_at_ms),
+            "ACK lifecycle timestamps do not match fault-evidence.json"
+        );
+    }
 
     ensure!(
         trigger.scenario == scenario
@@ -5815,74 +6886,103 @@ fn validate_ack_triggered_dm_artifacts(
     validate_ack_mutation_shape(history, trigger, expected_mutation)?;
     let checker_expectation = ack_checker_expectation(history, trigger, expected_mutation)?;
 
-    let boundary = read_json::<DmCrashBoundaryArtifact>(&locate_artifact(
-        root,
-        case_name,
-        "dm-crash-boundary.json",
-    )?)?;
-    ensure!(
-        boundary.scenario == scenario
-            && boundary.run_id == run_id
-            && boundary.started_at_ms == ack.crash_boundary_started_at_ms
-            && boundary.completed_at_ms >= boundary.started_at_ms
-            && boundary.filesystem_unmounted
-            && boundary.mapper_mounts_absent
-            && !boundary.mount_before.canonical_source.is_empty()
-            && !boundary.mount_before.filesystem.is_empty()
-            && !boundary.mount_before.options.is_empty()
-            && boundary
-                .fault
-                .table
-                .split_whitespace()
-                .any(|field| field == "drop_writes")
-            && evidence
-                .fault_delete_started_at_ms
-                .is_some_and(|started| started >= boundary.completed_at_ms),
-        "dm-crash-boundary.json does not match the ACK-triggered drop_writes boundary"
-    );
-    if let Some(replacement_uid) = &boundary.replacement_pod_uid {
-        ensure!(
-            replacement_uid != &boundary.old_pod_uid,
-            "dm-crash-boundary.json replacement Pod UID must differ from the deleted Pod UID"
-        );
-    }
-    let recovered = read_json::<DmCrashRecoveryArtifact>(&locate_artifact(
-        root,
-        case_name,
-        "dm-crash-recovered.json",
-    )?)?;
-    ensure!(
-        recovered.scenario == scenario
-            && recovered.run_id == run_id
-            && recovered.recovered_at_ms >= boundary.completed_at_ms
-            && recovered.taint_removed
-            && !recovered.mount.source.is_empty()
-            && !recovered.mount.canonical_source.is_empty()
-            && !recovered.mount.filesystem.is_empty()
-            && recovered.mount.canonical_source == boundary.mount_before.canonical_source
-            && recovered.mount.filesystem == boundary.mount_before.filesystem
-            && recovered.mount.options == boundary.mount_before.options
-            && normalize_dm_table(&recovered.fault.table)
-                == normalize_dm_table(&recovered.expected_table)
-            && drop_writes_table_matches_recovery(&boundary.fault.table, &recovered.expected_table)
-            && !recovered
-                .fault
-                .table
-                .split_whitespace()
-                .any(|field| field == "drop_writes"),
-        "dm-crash-recovered.json does not prove recovery of the ACK-triggered fault"
-    );
     let host_proof = read_json::<HostStorageMutationProof>(&locate_artifact(
         root,
         case_name,
         HOST_STORAGE_PROOF_ARTIFACT,
     )?)?;
+    host_proof
+        .validate()
+        .context("validate ACK host-storage-proof.json")?;
     ensure!(
-        host_proof.generated_at_ms <= preparation_event.at_ms
-            && preparation_event.at_ms <= ack.trigger_acknowledged_at_ms,
+        host_proof.generated_at_ms <= preparation_succeeded[0].1.at_ms
+            && preparation_succeeded[0].1.at_ms <= ack.trigger_acknowledged_at_ms,
         "host-storage proof and successful fault preparation must precede the trigger ACK"
     );
-    validate_ack_crash_target_identity(&boundary, &host_proof, evidence)?;
+
+    let boundary = if require_boundary || require_recovered {
+        ensure!(
+            has_event(events, "crash-recovery-boundary", RunEventStatus::Succeeded),
+            "run-events.jsonl lacks a successful ACK crash-recovery boundary"
+        );
+        let boundary = read_json::<DmCrashBoundaryArtifact>(&locate_artifact(
+            root,
+            case_name,
+            "dm-crash-boundary.json",
+        )?)?;
+        ensure!(
+            boundary.scenario == scenario
+                && boundary.run_id == run_id
+                && boundary.started_at_ms == ack.crash_boundary_started_at_ms
+                && boundary.completed_at_ms >= boundary.started_at_ms
+                && boundary.filesystem_unmounted
+                && boundary.mapper_mounts_absent
+                && !boundary.mount_before.canonical_source.is_empty()
+                && !boundary.mount_before.filesystem.is_empty()
+                && !boundary.mount_before.options.is_empty()
+                && boundary.old_pod_uid == host_proof.target.pod_uid
+                && boundary.mount_before.canonical_source
+                    == host_proof.target.mount_canonical_source
+                && boundary.mount_before.filesystem == host_proof.target.filesystem
+                && boundary
+                    .fault
+                    .table
+                    .split_whitespace()
+                    .any(|field| field == "drop_writes")
+                && evidence.is_none_or(|evidence| {
+                    evidence
+                        .fault_delete_started_at_ms
+                        .is_some_and(|started| started >= boundary.completed_at_ms)
+                }),
+            "dm-crash-boundary.json does not match the ACK-triggered drop_writes boundary"
+        );
+        if let Some(replacement_uid) = &boundary.replacement_pod_uid {
+            ensure!(
+                replacement_uid != &boundary.old_pod_uid,
+                "dm-crash-boundary.json replacement Pod UID must differ from the deleted Pod UID"
+            );
+        }
+        if let Some(evidence) = evidence {
+            validate_ack_crash_target_identity(&boundary, &host_proof, evidence)?;
+        }
+        Some(boundary)
+    } else {
+        None
+    };
+    if require_recovered {
+        let boundary = boundary
+            .as_ref()
+            .context("ACK recovery evidence lacks a validated crash boundary")?;
+        let recovered = read_json::<DmCrashRecoveryArtifact>(&locate_artifact(
+            root,
+            case_name,
+            "dm-crash-recovered.json",
+        )?)?;
+        ensure!(
+            recovered.scenario == scenario
+                && recovered.run_id == run_id
+                && recovered.recovered_at_ms >= boundary.completed_at_ms
+                && recovered.taint_removed
+                && !recovered.mount.source.is_empty()
+                && !recovered.mount.canonical_source.is_empty()
+                && !recovered.mount.filesystem.is_empty()
+                && recovered.mount.canonical_source == boundary.mount_before.canonical_source
+                && recovered.mount.filesystem == boundary.mount_before.filesystem
+                && recovered.mount.options == boundary.mount_before.options
+                && normalize_dm_table(&recovered.fault.table)
+                    == normalize_dm_table(&recovered.expected_table)
+                && drop_writes_table_matches_recovery(
+                    &boundary.fault.table,
+                    &recovered.expected_table
+                )
+                && !recovered
+                    .fault
+                    .table
+                    .split_whitespace()
+                    .any(|field| field == "drop_writes"),
+            "dm-crash-recovered.json does not prove recovery of the ACK-triggered fault"
+        );
+    }
     Ok(checker_expectation)
 }
 
@@ -6387,6 +7487,7 @@ fn validate_node_down_hold_artifacts(
         post_recovery_object_count(workload_object_count),
         hold.started_at_ms,
         "crash-recovery-boundary",
+        true,
     )?;
     let report = read_json::<PostRecoveryWriteReport>(required(
         artifacts,
@@ -6842,7 +7943,11 @@ pub(crate) fn validate_expected_failure_artifacts(
                 event.status != RunEventStatus::Failed
                     || matches!(
                         event.stage.as_str(),
-                        "run" | "checker-pre-recommit" | "checker-final"
+                        "run"
+                            | "checker-pre-recommit"
+                            | "checker-pre-recommit-verdict"
+                            | "checker-final"
+                            | "checker-verdict"
                     )
             }),
         "expected failure contains a conflicting run result or non-checker failure"
@@ -6915,25 +8020,7 @@ fn validate_expected_failure_signal(
                     && recovery.run_id.as_deref() == Some(run_id),
                 "recovery-stability-report.json identity does not match the planned attempt"
             );
-            ensure!(
-                recovery.immediate_passed == checker.passed,
-                "recovery-stability-report.json immediate_passed does not match checker-pre-recommit-report.json"
-            );
-            ensure!(
-                recovery.final_list_warning_count == checker.final_list_warning_count
-                    && recovery.list_warnings == checker.list_warnings,
-                "recovery-stability-report.json LIST evidence does not match checker-pre-recommit-report.json"
-            );
-            checker::validate_recovery_key_sets(&recovery, &checker).context(
-                "recovery-stability-report.json key evidence is not bound to checker evidence",
-            )?;
-            let observed = checker::classify_recovery_stability(&recovery, &checker);
-            ensure!(
-                recovery.classification == observed,
-                "recovery-stability-report.json claims classification {:?}, but its checker/recovery evidence classifies as {:?}",
-                recovery.classification.as_str(),
-                observed.as_str()
-            );
+            checker::validate_recovery_stability_against_checker(&recovery, &checker)?;
             ensure!(
                 recovery.classification.as_str() == summary.classification,
                 "recovery-stability-report.json supports classification {:?}, not {:?}",
@@ -7604,6 +8691,34 @@ fn has_event(events: &[RunEvent], stage: &str, status: RunEventStatus) -> bool {
         .any(|event| event.stage == stage && event.status == status)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AckPartialArtifactRequirements {
+    validation_required: bool,
+    boundary_required: bool,
+    recovered_required: bool,
+}
+
+fn ack_partial_artifact_requirements(
+    events: &[RunEvent],
+    recovery_evidence_completed: bool,
+) -> AckPartialArtifactRequirements {
+    let ack_trigger_completed = has_event(events, "ack-trigger", RunEventStatus::Succeeded);
+    let crash_boundary_reached = events
+        .iter()
+        .any(|event| event.stage == "crash-recovery-boundary");
+    let crash_boundary_completed =
+        has_event(events, "crash-recovery-boundary", RunEventStatus::Succeeded);
+    let fault_delete_completed = has_event(events, "fault-delete", RunEventStatus::Succeeded);
+    let recovery_health_reached = events.iter().any(|event| event.stage == "recovery-health");
+    let recovered_required =
+        fault_delete_completed || recovery_health_reached || recovery_evidence_completed;
+    AckPartialArtifactRequirements {
+        validation_required: ack_trigger_completed || crash_boundary_reached || recovered_required,
+        boundary_required: crash_boundary_completed || recovered_required,
+        recovered_required,
+    }
+}
+
 fn ensure_nonempty(value: &str, field: &str) -> Result<()> {
     ensure!(!value.trim().is_empty(), "{field} must not be empty");
     Ok(())
@@ -7863,6 +8978,56 @@ struct RecommitAttemptArtifact {
     harness_error: Option<String>,
 }
 
+fn validate_recommit_report_counters(report: &RecommitReportArtifact) -> Result<()> {
+    ensure!(
+        report.attempts.len() == report.attempted,
+        "attempt count does not match attempted"
+    );
+    for attempt in &report.attempts {
+        ensure!(
+            attempt.harness_error.is_some() == attempt.outcome.is_none(),
+            "attempt outcome and harness error classification conflict"
+        );
+        ensure!(
+            (attempt.outcome == Some(OperationOutcome::Ok)) == attempt.verify_get_outcome.is_some(),
+            "recommit verification outcome does not match its PUT outcome"
+        );
+    }
+    let committed = report
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.outcome == Some(OperationOutcome::Ok))
+        .count();
+    let failed = report
+        .attempts
+        .iter()
+        .filter(|attempt| {
+            matches!(
+                attempt.outcome,
+                Some(
+                    OperationOutcome::NotFound
+                        | OperationOutcome::Failed
+                        | OperationOutcome::Timeout
+                        | OperationOutcome::Unknown
+                )
+            ) || (attempt.outcome == Some(OperationOutcome::Ok)
+                && attempt.verify_get_outcome != Some(OperationOutcome::Ok))
+        })
+        .count();
+    let harness_errors = report
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.harness_error.is_some())
+        .count();
+    ensure!(
+        report.committed == committed
+            && report.failed == failed
+            && report.harness_errors == harness_errors,
+        "aggregate counters do not match attempt outcomes"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct WorkloadSummaryArtifact {
     #[serde(default)]
@@ -7911,16 +9076,20 @@ impl WorkloadSummaryArtifact {
         plan: &WorkloadPlan,
         run_id: &str,
     ) -> Result<()> {
+        if history.iter().any(OperationRecord::is_cohort_probe) {
+            crate::fault::workload::execution::cohort_probe_reads(
+                history,
+                plan.object_count / 2,
+                run_id,
+            )?;
+        }
         let mut projected = [
             OutcomeCountsArtifact::default(),
             OutcomeCountsArtifact::default(),
             OutcomeCountsArtifact::default(),
             OutcomeCountsArtifact::default(),
         ];
-        let workload_history = history
-            .iter()
-            .filter(|record| record.durability_cohort == Some(cohort))
-            .collect::<Vec<_>>();
+        let workload_history = mixed_workload_history(history, cohort);
         for record in &workload_history {
             ensure!(
                 record.scenario == scenario && record.bucket == bucket,
@@ -8122,6 +9291,16 @@ fn record_key_counts<'a>(
         *counts.entry(key.clone()).or_insert(0) += 1;
     }
     Ok(counts)
+}
+
+fn mixed_workload_history(
+    history: &[OperationRecord],
+    cohort: DurabilityCohort,
+) -> Vec<&OperationRecord> {
+    history
+        .iter()
+        .filter(|record| record.durability_cohort == Some(cohort) && !record.is_cohort_probe())
+        .collect()
 }
 
 fn validate_primary_workload_history(
@@ -8478,21 +9657,26 @@ mod tests {
     };
     use super::{
         ArtifactValidationOptions, FailureSummary, FaultEvidenceArtifact, OutcomeCountsArtifact,
-        QuorumEdgeRuntimeKind, RecommitCandidateManifestArtifact, RecommitReportArtifact,
-        WorkloadSummaryArtifact, derive_recommit_candidates, read_json, read_jsonl, recursive_find,
+        QuorumEdgeRuntimeKind, RecommitAttemptArtifact, RecommitCandidateArtifact,
+        RecommitCandidateManifestArtifact, RecommitReportArtifact, WorkloadSummaryArtifact,
+        ack_partial_artifact_requirements, authenticate_recommit_deadline_truncation,
+        completed_workload_evidence_present, derive_recommit_candidates,
+        partial_recommit_report_required, read_json, read_jsonl, recursive_find,
         validate_admin_topology_artifact_files, validate_checker_phase_chain,
         validate_failed_attempt_disruptions, validate_fault_artifacts,
         validate_fault_artifacts_and_write_report,
         validate_fault_artifacts_for_planned_attempt_and_write_report,
         validate_fixed_volume_runtime_evidence, validate_host_storage_artifacts,
-        validate_quorum_fault_activation_evidence, validate_run_spec, validate_target_proof,
-        validate_volume_quorum_health_evidence, validate_write_quorum_runtime_evidence,
+        validate_partial_recommit_report, validate_primary_workload_history,
+        validate_quorum_fault_activation_evidence, validate_recommit_report_counters,
+        validate_run_spec, validate_target_proof, validate_volume_quorum_health_evidence,
+        validate_write_quorum_runtime_evidence,
     };
-    use crate::fault::events::RunEvent;
+    use crate::fault::events::{RunEvent, RunEventStatus};
     use crate::fault::fixture::AdminFixturePlan;
     use crate::fault::host_storage::HOST_STORAGE_PROOF_ARTIFACT;
     use crate::fault::node_down::NODE_DOWN_HOLD_ARTIFACT;
-    use crate::fault::recovery_health::RECOVERY_HEALTH_ARTIFACT;
+    use crate::fault::recovery_health::{RECOVERY_HEALTH_ARTIFACT, RecoveryHealthReport};
     use crate::fault::workload::execution::{
         AVAILABILITY_REPORT_ARTIFACT, NODE_DOWN_READ_HISTORY_ARTIFACT,
         NODE_DOWN_WRITE_HISTORY_ARTIFACT, NODE_DOWN_WRITE_REPORT_ARTIFACT,
@@ -9018,6 +10202,11 @@ mod tests {
             value_sha256: None,
             size_bytes: None,
             version_id: None,
+            request_version_id: None,
+            is_delete_marker: None,
+            mutation_max_attempts: None,
+            mutation_attempts: None,
+            read_purpose: None,
             listed_keys: None,
             listed_versions: None,
             payload_ref: None,
@@ -9699,6 +10888,11 @@ mod tests {
                     value_sha256: sha.map(str::to_string),
                     size_bytes: size,
                     version_id: version_id.map(str::to_string),
+                    request_version_id: None,
+                    is_delete_marker: None,
+                    mutation_max_attempts: None,
+                    mutation_attempts: None,
+                    read_purpose: None,
                     listed_keys,
                     listed_versions,
                     payload_ref: None,
@@ -10313,9 +11507,21 @@ mod tests {
 
         assert_eq!(report.scenario, "io-eio");
         assert_eq!(
-            report.validation_summary_tsv_row(),
+            report
+                .validation_summary_tsv_row()
+                .expect("successful TSV row"),
             "io-eio\t42\t0\t2\t1\t2\t0\t0\t0\t0\ttrue"
         );
+
+        let failed = super::ArtifactValidationReport {
+            run_succeeded: false,
+            terminal_stage: "checker-verdict".to_string(),
+            ..report
+        };
+        let error = failed
+            .validation_summary_tsv_row()
+            .expect_err("failed runs cannot publish a successful TSV row");
+        assert!(error.to_string().contains("successful fault runs"));
     }
 
     #[test]
@@ -10451,6 +11657,346 @@ mod tests {
     }
 
     #[test]
+    fn partial_recommit_report_authenticates_failed_verification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let mut history =
+            read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+        let summary = read_json::<WorkloadSummaryArtifact>(&case_dir.join("workload-summary.json"))
+            .expect("workload summary");
+        let manifest = summary.recommit_candidates.as_ref().expect("manifest");
+        let mut recommit =
+            read_json::<RecommitReportArtifact>(&case_dir.join("recommit-report.json"))
+                .expect("recommit report");
+        let candidate = &manifest.candidates[0];
+        let put_index = history[manifest.history_record_count..]
+            .iter()
+            .position(|record| {
+                record.kind == OperationKind::Put
+                    && record.key.as_deref() == Some(candidate.key.as_str())
+            })
+            .map(|index| index + manifest.history_record_count)
+            .expect("recommit PUT");
+        let put_end = history[put_index].ended_sequence.expect("PUT end sequence");
+        let verify_index = history
+            .iter()
+            .position(|record| {
+                record.kind == OperationKind::Get
+                    && record.key.as_deref() == Some(candidate.key.as_str())
+                    && record
+                        .started_sequence
+                        .is_some_and(|started| started > put_end)
+            })
+            .expect("recommit verification GET");
+        history[verify_index].outcome = OperationOutcome::Timeout;
+        history[verify_index].http_status = Some(200);
+        history[verify_index].value_sha256 = None;
+        history[verify_index].size_bytes = None;
+        history[verify_index].error = Some("get body read timed out".to_string());
+        recommit.failed = 1;
+        recommit.attempts[0].verify_get_outcome = Some(OperationOutcome::Timeout);
+
+        validate_recommit_report_counters(&recommit)
+            .expect("a committed PUT may also have a failed verification GET");
+        validate_partial_recommit_report(
+            &recommit,
+            manifest,
+            "bucket",
+            "io-eio",
+            "run-00000000-0000-4000-8000-000000000001",
+            &history,
+            false,
+        )
+        .expect("failed recommit remains authenticated by manifest and history");
+
+        recommit.attempts[0].source_operation_id = "forged-source".to_string();
+        let error = validate_partial_recommit_report(
+            &recommit,
+            manifest,
+            "bucket",
+            "io-eio",
+            "run-00000000-0000-4000-8000-000000000001",
+            &history,
+            false,
+        )
+        .expect_err("forged failure evidence must be rejected");
+        assert!(
+            error.to_string().contains("sealed candidate manifest"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn partial_recommit_omission_requires_authenticated_deadline_truncation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let mut history =
+            read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+        let summary = read_json::<WorkloadSummaryArtifact>(&case_dir.join("workload-summary.json"))
+            .expect("workload summary");
+        let manifest = summary.recommit_candidates.as_ref().expect("manifest");
+        history.truncate(manifest.history_record_count);
+        let recommit = RecommitReportArtifact {
+            scenario: Some("io-eio".to_string()),
+            run_id: Some("run-00000000-0000-4000-8000-000000000001".to_string()),
+            attempted: 0,
+            committed: 0,
+            failed: 0,
+            harness_errors: 0,
+            attempts: Vec::new(),
+        };
+
+        let error = validate_partial_recommit_report(
+            &recommit,
+            manifest,
+            "bucket",
+            "io-eio",
+            "run-00000000-0000-4000-8000-000000000001",
+            &history,
+            false,
+        )
+        .expect_err("an omitted candidate requires authenticated deadline truncation");
+        assert!(
+            error.to_string().contains("authenticated suite-deadline"),
+            "{error:#}"
+        );
+
+        validate_partial_recommit_report(
+            &recommit,
+            manifest,
+            "bucket",
+            "io-eio",
+            "run-00000000-0000-4000-8000-000000000001",
+            &history,
+            true,
+        )
+        .expect("authenticated deadline permits an exact attempted prefix");
+    }
+
+    #[test]
+    fn recommit_deadline_truncation_requires_the_suite_budget_and_started_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        let mut history =
+            read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+        let workload =
+            read_json::<WorkloadSummaryArtifact>(&case_dir.join("workload-summary.json"))
+                .expect("workload summary");
+        let manifest = workload.recommit_candidates.as_ref().expect("manifest");
+        let mut prechecker_get = history
+            .iter()
+            .find(|record| record.kind == OperationKind::Get)
+            .cloned()
+            .expect("fixture GET");
+        prechecker_get.id = "checker-pre-recommit-get".to_string();
+        prechecker_get.started_at_ms = 50;
+        prechecker_get.ended_at_ms = 75;
+        history.truncate(manifest.history_record_count);
+        history.push(prechecker_get);
+        let recommit = RecommitReportArtifact {
+            scenario: Some("io-eio".to_string()),
+            run_id: Some(run_id.to_string()),
+            attempted: 0,
+            committed: 0,
+            failed: 0,
+            harness_errors: 0,
+            attempts: Vec::new(),
+        };
+        write_json(
+            dir.path(),
+            "suite-plan.json",
+            &json!({
+                "budgets": {"maxDurationSeconds": 300},
+                "attempts": [{"runId": run_id, "scenario": "io-eio"}]
+            }),
+        );
+        let message = "suite maxDuration budget 300s was reached during execution";
+        let summary = FailureSummary::new(
+            "io-eio",
+            "recommit-unconfirmed",
+            "test_or_environment",
+            message,
+        )
+        .expect("failure summary");
+        let event = |at_ms, status: RunEventStatus, message: &str, details| RunEvent {
+            at_ms,
+            scenario: "io-eio".to_string(),
+            run_id: run_id.to_string(),
+            stage: "recommit-unconfirmed".to_string(),
+            status,
+            message: message.to_string(),
+            details,
+        };
+        let started = event(100, RunEventStatus::Started, "recommitting", None);
+        let failed = event(
+            200,
+            RunEventStatus::Failed,
+            message,
+            Some(json!({"attempted": 0, "candidates": 1})),
+        );
+        authenticate_recommit_deadline_truncation(
+            &case_dir,
+            &summary,
+            &[started.clone(), failed.clone()],
+            &recommit,
+            manifest,
+            &history,
+            run_id,
+        )
+        .expect("suite budget authenticates prechecker history before exact truncation");
+
+        let mut crossing_history = history.clone();
+        crossing_history
+            .last_mut()
+            .expect("prechecker record")
+            .ended_at_ms = 125;
+        assert!(
+            authenticate_recommit_deadline_truncation(
+                &case_dir,
+                &summary,
+                &[started.clone(), failed.clone()],
+                &recommit,
+                manifest,
+                &crossing_history,
+                run_id,
+            )
+            .is_err()
+        );
+
+        let forged_summary = FailureSummary::new(
+            "io-eio",
+            "recommit-unconfirmed",
+            "test_or_environment",
+            "suite maxDuration budget forgeds was reached during execution",
+        )
+        .expect("forged summary");
+        assert!(
+            authenticate_recommit_deadline_truncation(
+                &case_dir,
+                &forged_summary,
+                &[started.clone(), failed.clone()],
+                &recommit,
+                manifest,
+                &history,
+                run_id,
+            )
+            .is_err()
+        );
+        assert!(
+            authenticate_recommit_deadline_truncation(
+                &case_dir,
+                &summary,
+                &[failed],
+                &recommit,
+                manifest,
+                &history,
+                run_id,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_recommit_rejects_an_extra_same_key_put() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let mut history =
+            read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+        let summary = read_json::<WorkloadSummaryArtifact>(&case_dir.join("workload-summary.json"))
+            .expect("workload summary");
+        let manifest = summary.recommit_candidates.as_ref().expect("manifest");
+        let recommit = read_json::<RecommitReportArtifact>(&case_dir.join("recommit-report.json"))
+            .expect("recommit report");
+        let mut extra_put = history[manifest.history_record_count..]
+            .iter()
+            .find(|record| record.kind == OperationKind::Put)
+            .expect("recommit PUT")
+            .clone();
+        extra_put.id = "extra-same-key-put".to_string();
+        extra_put.value_sha256 = Some("different-digest".to_string());
+        let next_sequence = history
+            .iter()
+            .filter_map(|record| record.ended_sequence)
+            .max()
+            .expect("history sequence")
+            + 1;
+        extra_put.started_sequence = Some(next_sequence);
+        extra_put.ended_sequence = Some(next_sequence + 1);
+        history.push(extra_put);
+
+        let error = validate_partial_recommit_report(
+            &recommit,
+            manifest,
+            "bucket",
+            "io-eio",
+            "run-00000000-0000-4000-8000-000000000001",
+            &history,
+            false,
+        )
+        .expect_err("an extra same-key PUT cannot be hidden by key-set equality");
+        assert!(
+            error
+                .to_string()
+                .contains("multiple post-manifest PUTs for one key"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn partial_recommit_rejects_an_extra_post_manifest_delete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let mut history =
+            read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+        let summary = read_json::<WorkloadSummaryArtifact>(&case_dir.join("workload-summary.json"))
+            .expect("workload summary");
+        let manifest = summary.recommit_candidates.as_ref().expect("manifest");
+        let recommit = read_json::<RecommitReportArtifact>(&case_dir.join("recommit-report.json"))
+            .expect("recommit report");
+        let mut extra_delete = history[manifest.history_record_count..]
+            .iter()
+            .find(|record| record.kind == OperationKind::Put)
+            .expect("recommit PUT")
+            .clone();
+        extra_delete.id = "extra-post-manifest-delete".to_string();
+        extra_delete.kind = OperationKind::Delete;
+        extra_delete.value_sha256 = None;
+        extra_delete.size_bytes = None;
+        let next_sequence = history
+            .iter()
+            .filter_map(|record| record.ended_sequence)
+            .max()
+            .expect("history sequence")
+            + 1;
+        extra_delete.started_sequence = Some(next_sequence);
+        extra_delete.ended_sequence = Some(next_sequence + 1);
+        history.push(extra_delete);
+
+        let error = validate_partial_recommit_report(
+            &recommit,
+            manifest,
+            "bucket",
+            "io-eio",
+            "run-00000000-0000-4000-8000-000000000001",
+            &history,
+            false,
+        )
+        .expect_err("post-manifest DELETE must have a matching recommit attempt");
+        assert!(
+            error
+                .to_string()
+                .contains("unauthenticated post-manifest mutation"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn recommit_candidates_cannot_be_omitted_from_the_sealed_manifest() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_success_artifacts(dir.path(), "io-eio");
@@ -10574,6 +12120,11 @@ mod tests {
                 value_sha256: Some(format!("hash-{index:06}")),
                 size_bytes: Some(1),
                 version_id: None,
+                request_version_id: None,
+                is_delete_marker: None,
+                mutation_max_attempts: None,
+                mutation_attempts: None,
+                read_purpose: None,
                 listed_keys: None,
                 listed_versions: None,
                 payload_ref: None,
@@ -10592,6 +12143,131 @@ mod tests {
 
         let candidates = derive_recommit_candidates(&records).expect("linear derivation");
         assert_eq!(candidates.len(), CANDIDATES);
+    }
+
+    #[test]
+    fn partial_recommit_validation_scales_to_twenty_thousand_candidates() {
+        const CANDIDATES: usize = 20_000;
+        const RUN_ID: &str = "run-00000000-0000-4000-8000-000000000001";
+        let record = |id: String,
+                      kind: OperationKind,
+                      key: String,
+                      sha256: String,
+                      outcome: OperationOutcome,
+                      ordinal: usize| {
+            let started_sequence = ordinal as u64 * 2 + 1;
+            OperationRecord {
+                id,
+                scenario: "io-eio".to_string(),
+                run_id: Some(RUN_ID.to_string()),
+                kind,
+                bucket: "bucket".to_string(),
+                key: Some(key),
+                value_sha256: Some(sha256),
+                size_bytes: Some(1),
+                version_id: None,
+                request_version_id: None,
+                is_delete_marker: None,
+                mutation_max_attempts: None,
+                mutation_attempts: None,
+                read_purpose: None,
+                listed_keys: None,
+                listed_versions: None,
+                payload_ref: None,
+                range: None,
+                started_sequence: Some(started_sequence),
+                ended_sequence: Some(started_sequence + 1),
+                started_at_ms: started_sequence,
+                ended_at_ms: started_sequence + 1,
+                outcome,
+                http_status: (outcome == OperationOutcome::Ok).then_some(200),
+                error: (outcome == OperationOutcome::Timeout).then(|| "timeout".to_string()),
+                durability_cohort: None,
+                fault_window_relation: None,
+            }
+        };
+
+        let mut history = Vec::with_capacity(CANDIDATES * 3);
+        let mut candidates = Vec::with_capacity(CANDIDATES);
+        let mut attempts = Vec::with_capacity(CANDIDATES);
+        for index in 0..CANDIDATES {
+            let source_operation_id = format!("source-{index:06}");
+            let key = format!("key-{index:06}");
+            let sha256 = format!("hash-{index:06}");
+            history.push(record(
+                source_operation_id.clone(),
+                OperationKind::Put,
+                key.clone(),
+                sha256.clone(),
+                OperationOutcome::Timeout,
+                index,
+            ));
+            candidates.push(RecommitCandidateArtifact {
+                source_operation_id: source_operation_id.clone(),
+                key: key.clone(),
+                size_bytes: 1,
+                sha256: sha256.clone(),
+            });
+            attempts.push(RecommitAttemptArtifact {
+                source_operation_id,
+                key,
+                size_bytes: 1,
+                sha256,
+                outcome: Some(OperationOutcome::Ok),
+                verify_get_outcome: Some(OperationOutcome::Ok),
+                http_status: Some(200),
+                error: None,
+                harness_error: None,
+            });
+        }
+        let history_record_count = history.len();
+        let history_sha256 =
+            checker::checker_history_records_sha256(&history).expect("candidate history digest");
+        for index in 0..CANDIDATES {
+            let key = format!("key-{index:06}");
+            let sha256 = format!("hash-{index:06}");
+            let put_ordinal = history.len();
+            history.push(record(
+                format!("recommit-put-{index:06}"),
+                OperationKind::Put,
+                key.clone(),
+                sha256.clone(),
+                OperationOutcome::Ok,
+                put_ordinal,
+            ));
+            let get_ordinal = history.len();
+            history.push(record(
+                format!("recommit-get-{index:06}"),
+                OperationKind::Get,
+                key,
+                sha256,
+                OperationOutcome::Ok,
+                get_ordinal,
+            ));
+        }
+        let manifest = RecommitCandidateManifestArtifact {
+            scenario: "io-eio".to_string(),
+            run_id: RUN_ID.to_string(),
+            bucket: "bucket".to_string(),
+            history_record_count,
+            history_sha256,
+            candidates,
+        };
+        let recommit = RecommitReportArtifact {
+            scenario: Some("io-eio".to_string()),
+            run_id: Some(RUN_ID.to_string()),
+            attempted: CANDIDATES,
+            committed: CANDIDATES,
+            failed: 0,
+            harness_errors: 0,
+            attempts,
+        };
+
+        validate_recommit_report_counters(&recommit).expect("recommit counters");
+        validate_partial_recommit_report(
+            &recommit, &manifest, "bucket", "io-eio", RUN_ID, &history, false,
+        )
+        .expect("linear partial recommit validation");
     }
 
     #[test]
@@ -13150,6 +14826,1145 @@ mod tests {
     }
 
     #[test]
+    fn failed_fault_evidence_stage_does_not_require_recovery_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let case_dir = dir.path().join(case_name);
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms":1,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"started","message":"started"}).to_string(),
+                json!({"at_ms":2,"scenario":"io-eio","run_id":run_id,"stage":"fault-evidence","status":"failed","message":"activation proof missing"}).to_string(),
+                json!({"at_ms":3,"scenario":"io-eio","run_id":run_id,"stage":"multipart-cleanup","status":"failed","message":"secondary cleanup failure"}).to_string(),
+                json!({"at_ms":4,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"failed","message":"run failed"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("failed events");
+        let summary = FailureSummary::new(
+            "io-eio",
+            "fault-evidence",
+            "test_or_environment",
+            "activation proof missing",
+        )
+        .expect("failure summary")
+        .with_run_id(run_id)
+        .with_case_name(case_name);
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &serde_json::to_value(&summary).expect("failure summary JSON"),
+        );
+        for artifact in [
+            "checker-pre-recommit-report.json",
+            "checker-report.json",
+            "fault-evidence.json",
+            "recommit-report.json",
+            "recovery-health.json",
+            "post-recovery-write-report.json",
+            "post-recovery-write-history.jsonl",
+        ] {
+            let path = case_dir.join(artifact);
+            if path.exists() {
+                fs::remove_file(path).expect("remove future-stage artifact");
+            }
+        }
+
+        let mut history =
+            read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+        let workload =
+            read_json::<WorkloadSummaryArtifact>(&case_dir.join("workload-summary.json"))
+                .expect("workload");
+        history.truncate(
+            workload
+                .recommit_candidates
+                .as_ref()
+                .expect("manifest")
+                .history_record_count,
+        );
+        fs::write(
+            case_dir.join("history.jsonl"),
+            history
+                .iter()
+                .map(|r| serde_json::to_string(r).expect("record"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("truncate future-stage history");
+
+        let report = validate_fault_artifacts(&success_options(dir.path()))
+            .expect("failed-stage artifacts remain structurally valid");
+
+        assert!(!report.run_succeeded);
+        assert_eq!(report.terminal_stage, "fault-evidence");
+        assert!(
+            !report
+                .required_artifacts
+                .iter()
+                .any(|name| name == "recommit-report.json")
+        );
+        for required in [
+            "run-spec.yaml",
+            "preflight-summary.json",
+            "target-proof.json",
+        ] {
+            assert!(
+                report
+                    .required_artifacts
+                    .iter()
+                    .any(|name| name == required),
+                "missing pre-recovery artifact contract for {required}"
+            );
+        }
+
+        let stale_summary = FailureSummary::new(
+            "io-eio",
+            "fixture-prepare",
+            "test_or_environment",
+            "stale setup failure",
+        )
+        .expect("stale failure summary")
+        .with_run_id(run_id)
+        .with_case_name(case_name);
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &serde_json::to_value(stale_summary).expect("stale failure summary JSON"),
+        );
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("summary must identify the primary failed stage");
+        assert!(
+            error
+                .to_string()
+                .contains("stage has no matching failed run event"),
+            "{error:#}"
+        );
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &serde_json::to_value(summary).expect("failure summary JSON"),
+        );
+
+        fs::remove_file(case_dir.join("target-proof.json")).expect("remove target proof");
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("workload-stage failure still requires target proof");
+        assert!(error.to_string().contains("target-proof.json"));
+    }
+
+    fn authenticate_success_fixture_mixed_workload(case_dir: &std::path::Path) {
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        let plan = WorkloadPlan::seeded(42, 12, 4);
+        let original =
+            read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+        let scenario = original[0].scenario.clone();
+        let record = |id: String,
+                      kind: OperationKind,
+                      key: String,
+                      outcome: OperationOutcome,
+                      value_sha256: Option<String>,
+                      size_bytes: Option<usize>,
+                      listed_keys: Option<Vec<String>>,
+                      cohort: DurabilityCohort,
+                      relation: FaultWindowRelation| {
+            OperationRecord {
+                id,
+                scenario: scenario.clone(),
+                run_id: Some(run_id.to_string()),
+                kind,
+                bucket: "bucket".to_string(),
+                key: Some(key),
+                value_sha256,
+                size_bytes,
+                version_id: None,
+                request_version_id: None,
+                is_delete_marker: None,
+                mutation_max_attempts: None,
+                mutation_attempts: None,
+                read_purpose: None,
+                listed_keys,
+                listed_versions: None,
+                payload_ref: None,
+                range: None,
+                started_sequence: None,
+                ended_sequence: None,
+                started_at_ms: 0,
+                ended_at_ms: 0,
+                outcome,
+                http_status: match outcome {
+                    OperationOutcome::Ok => Some(200),
+                    OperationOutcome::NotFound => Some(404),
+                    _ => None,
+                },
+                error: matches!(
+                    outcome,
+                    OperationOutcome::Failed
+                        | OperationOutcome::Timeout
+                        | OperationOutcome::Unknown
+                )
+                .then(|| "authenticated workload outcome".to_string()),
+                durability_cohort: Some(cohort),
+                fault_window_relation: Some(relation),
+            }
+        };
+        let candidate_key = ObjectSpec::seeded_key(run_id, 6);
+        let overwrite_key = ObjectSpec::directory_marker_key(run_id, 1);
+        let mut timeout_put = original[1].clone();
+        timeout_put.key = Some(candidate_key.clone());
+        let workload_records = vec![
+            timeout_put,
+            record(
+                "mixed-overwrite".to_string(),
+                OperationKind::Put,
+                overwrite_key.clone(),
+                OperationOutcome::Ok,
+                Some("overwrite-sha".to_string()),
+                Some(1),
+                None,
+                DurabilityCohort::FaultActive,
+                FaultWindowRelation::DuringFault,
+            ),
+            record(
+                "mixed-overwrite-get".to_string(),
+                OperationKind::Get,
+                overwrite_key.clone(),
+                OperationOutcome::Ok,
+                Some("overwrite-sha".to_string()),
+                Some(1),
+                None,
+                DurabilityCohort::FaultActive,
+                FaultWindowRelation::DuringFault,
+            ),
+            record(
+                "mixed-get".to_string(),
+                OperationKind::Get,
+                ObjectSpec::directory_marker_key(run_id, 2),
+                OperationOutcome::NotFound,
+                None,
+                None,
+                None,
+                DurabilityCohort::FaultActive,
+                FaultWindowRelation::DuringFault,
+            ),
+            record(
+                "mixed-list".to_string(),
+                OperationKind::List,
+                ObjectSpec::key_prefix(run_id),
+                OperationOutcome::Ok,
+                None,
+                Some(2),
+                Some(vec!["key".to_string(), overwrite_key.clone()]),
+                DurabilityCohort::FaultActive,
+                FaultWindowRelation::DuringFault,
+            ),
+            record(
+                "mixed-delete".to_string(),
+                OperationKind::Delete,
+                ObjectSpec::directory_marker_key(run_id, 4),
+                OperationOutcome::Failed,
+                None,
+                None,
+                None,
+                DurabilityCohort::FaultActive,
+                FaultWindowRelation::DuringFault,
+            ),
+            record(
+                "mixed-complete-create".to_string(),
+                OperationKind::CreateMultipartUpload,
+                ObjectSpec::seeded_key(run_id, 11),
+                OperationOutcome::Failed,
+                None,
+                None,
+                None,
+                DurabilityCohort::FaultActive,
+                FaultWindowRelation::DuringFault,
+            ),
+            record(
+                "mixed-abort-create".to_string(),
+                OperationKind::CreateMultipartUpload,
+                ObjectSpec::seeded_key(run_id, plan.object_count + 11),
+                OperationOutcome::Failed,
+                None,
+                None,
+                None,
+                DurabilityCohort::FaultActive,
+                FaultWindowRelation::DuringFault,
+            ),
+        ];
+        let mut history = vec![original[0].clone()];
+        history.extend(workload_records);
+        let workload_prefix_len = history.len();
+        history.extend([
+            original[2].clone(),
+            record(
+                "prechecker-overwrite-get".to_string(),
+                OperationKind::Get,
+                overwrite_key.clone(),
+                OperationOutcome::Ok,
+                Some("overwrite-sha".to_string()),
+                Some(1),
+                None,
+                DurabilityCohort::PostRecovery,
+                FaultWindowRelation::AfterFault,
+            ),
+            record(
+                "prechecker-candidate-get".to_string(),
+                OperationKind::Get,
+                candidate_key.clone(),
+                OperationOutcome::NotFound,
+                None,
+                None,
+                None,
+                DurabilityCohort::PostRecovery,
+                FaultWindowRelation::AfterFault,
+            ),
+            original[3].clone(),
+        ]);
+        history.last_mut().expect("prechecker LIST").listed_keys =
+            Some(vec!["key".to_string(), overwrite_key.clone()]);
+        history.last_mut().expect("prechecker LIST").size_bytes = Some(2);
+        let prechecker_suffix_len = 4;
+        let recommit_start = history.len();
+        let mut recommit_put = original[4].clone();
+        recommit_put.key = Some(candidate_key.clone());
+        let mut recommit_get = original[5].clone();
+        recommit_get.key = Some(candidate_key.clone());
+        history.extend([recommit_put, recommit_get]);
+        let final_prefix_len = history.len();
+        let mut final_candidate_get = original[6].clone();
+        final_candidate_get.key = Some(candidate_key.clone());
+        let mut final_list = original[7].clone();
+        final_list.listed_keys = Some(vec!["key".to_string(), candidate_key.clone()]);
+        final_list.size_bytes = Some(2);
+        history.extend([
+            record(
+                "final-prefill-get".to_string(),
+                OperationKind::Get,
+                "key".to_string(),
+                OperationOutcome::Ok,
+                Some("sha".to_string()),
+                Some(1),
+                None,
+                DurabilityCohort::PostRecovery,
+                FaultWindowRelation::AfterFault,
+            ),
+            record(
+                "final-overwrite-get".to_string(),
+                OperationKind::Get,
+                overwrite_key,
+                OperationOutcome::Ok,
+                Some("overwrite-sha".to_string()),
+                Some(1),
+                None,
+                DurabilityCohort::PostRecovery,
+                FaultWindowRelation::AfterFault,
+            ),
+            final_candidate_get,
+            final_list,
+        ]);
+        history.last_mut().expect("final LIST").listed_keys = Some(vec![
+            "key".to_string(),
+            ObjectSpec::directory_marker_key(run_id, 1),
+            candidate_key.clone(),
+        ]);
+        history.last_mut().expect("final LIST").size_bytes = Some(3);
+        for (index, record) in history.iter_mut().enumerate() {
+            record.started_at_ms = index as u64 * 2 + 1;
+            record.ended_at_ms = index as u64 * 2 + 2;
+            record.started_sequence = Some(index as u64 * 2 + 1);
+            record.ended_sequence = Some(index as u64 * 2 + 2);
+        }
+        fs::write(
+            case_dir.join("history.jsonl"),
+            format!(
+                "{}\n",
+                history
+                    .iter()
+                    .map(|record| serde_json::to_string(record).expect("history record"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )
+        .expect("history");
+
+        let mut summary: Value =
+            read_json(&case_dir.join("workload-summary.json")).expect("workload summary");
+        summary["puts"] = json!({"ok":1,"not_found":0,"failed":0,"timeout":1,"unknown":0});
+        summary["gets"] = json!({"ok":1,"not_found":1,"failed":0,"timeout":0,"unknown":0});
+        summary["deletes"] = json!({"ok":0,"not_found":0,"failed":1,"timeout":0,"unknown":0});
+        summary["lists"] = json!({"ok":1,"not_found":0,"failed":0,"timeout":0,"unknown":0});
+        summary["multipart_completes"] =
+            json!({"ok":0,"not_found":0,"failed":0,"timeout":0,"unknown":1});
+        summary["multipart_aborts"] =
+            json!({"ok":0,"not_found":0,"failed":0,"timeout":0,"unknown":1});
+        summary["recommit_candidates"]["history_record_count"] = json!(workload_prefix_len);
+        summary["recommit_candidates"]["history_sha256"] = json!(
+            checker::checker_history_records_sha256(&history[..workload_prefix_len])
+                .expect("candidate digest")
+        );
+        summary["recommit_candidates"]["candidates"][0]["key"] = json!(candidate_key);
+        write_json(case_dir, "workload-summary.json", &summary);
+
+        let mut recommit: Value =
+            read_json(&case_dir.join("recommit-report.json")).expect("recommit report");
+        recommit["attempts"][0]["key"] = json!(candidate_key);
+        write_json(case_dir, "recommit-report.json", &recommit);
+
+        let update_checker = |name: &str,
+                              prefix_len: usize,
+                              suffix_len: usize,
+                              committed_puts: usize,
+                              live_objects: usize| {
+            let mut report = read_json::<CheckerReport>(&case_dir.join(name)).expect("checker");
+            let audit = report.audit.as_mut().expect("checker audit");
+            let suffix = &history[prefix_len..prefix_len + suffix_len];
+            audit.history_prefix_record_count = prefix_len;
+            audit.history_suffix_record_count = suffix_len;
+            audit.started_at_ms = suffix.first().expect("checker suffix").started_at_ms;
+            audit.completed_at_ms = suffix.last().expect("checker suffix").ended_at_ms;
+            audit.history_prefix_sha256 =
+                checker::checker_history_records_sha256(&history[..prefix_len])
+                    .expect("checker prefix digest");
+            audit.history_suffix_sha256 =
+                checker::checker_history_records_sha256(suffix).expect("checker suffix digest");
+            audit.suffix_operations = checker::checker_operation_audits(suffix);
+            report.operation_cohorts = history[..prefix_len]
+                .iter()
+                .filter_map(|record| record.durability_cohort)
+                .fold(BTreeMap::new(), |mut counts, cohort| {
+                    *counts.entry(cohort.as_str().to_string()).or_insert(0) += 1;
+                    counts
+                });
+            report.fault_window_relations = history[..prefix_len]
+                .iter()
+                .filter_map(|record| record.fault_window_relation)
+                .fold(BTreeMap::new(), |mut counts, relation| {
+                    *counts.entry(relation.as_str().to_string()).or_insert(0) += 1;
+                    counts
+                });
+            report.committed_puts = committed_puts;
+            report.expected_live_objects = live_objects;
+            report.verified_live_objects = live_objects;
+            report.final_listed_objects = Some(live_objects);
+            write_json(
+                case_dir,
+                name,
+                &serde_json::to_value(report).expect("checker JSON"),
+            );
+        };
+        update_checker(
+            "checker-pre-recommit-report.json",
+            workload_prefix_len,
+            prechecker_suffix_len,
+            2,
+            2,
+        );
+        update_checker(
+            "checker-report.json",
+            final_prefix_len,
+            history.len() - final_prefix_len,
+            3,
+            3,
+        );
+        assert_eq!(recommit_start, workload_prefix_len + prechecker_suffix_len);
+    }
+
+    #[test]
+    fn failed_late_phases_validate_the_artifacts_available_at_termination() {
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        for stage in [
+            "recovery-health",
+            "recommit-unconfirmed",
+            "checker-final",
+            "fault-delete",
+            "runner",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_success_artifacts(dir.path(), "io-eio");
+            let case_dir = dir.path().join(case_name);
+            authenticate_success_fixture_mixed_workload(&case_dir);
+            if stage == "checker-final" {
+                fs::write(
+                    case_dir.join("checker-final-error.txt"),
+                    "checker request failed",
+                )
+                .expect("checker error");
+            }
+            let events = if matches!(stage, "recommit-unconfirmed" | "checker-final") {
+                let recovery =
+                    read_json::<RecoveryHealthReport>(&case_dir.join(RECOVERY_HEALTH_ARTIFACT))
+                        .expect("recovery health fixture");
+                let mut events = vec![
+                    json!({"at_ms":1,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"started","message":"started"}).to_string(),
+                    json!({"at_ms":6,"scenario":"io-eio","run_id":run_id,"stage":"recovery-health-baseline","status":"succeeded","message":"baseline","details":recovery.baseline}).to_string(),
+                    json!({"at_ms":70,"scenario":"io-eio","run_id":run_id,"stage":"recovery-evidence","status":"succeeded","message":"evidence persisted"}).to_string(),
+                    json!({"at_ms":71,"scenario":"io-eio","run_id":run_id,"stage":"post-recovery-write","status":"started","message":"probe started"}).to_string(),
+                    json!({"at_ms":200,"scenario":"io-eio","run_id":run_id,"stage":"post-recovery-write","status":"succeeded","message":"probe passed"}).to_string(),
+                    json!({"at_ms":201,"scenario":"io-eio","run_id":run_id,"stage":"checker-pre-recommit","status":"started","message":"checking"}).to_string(),
+                    json!({"at_ms":202,"scenario":"io-eio","run_id":run_id,"stage":"checker-pre-recommit","status":"succeeded","message":"checked"}).to_string(),
+                ];
+                if stage == "checker-final" {
+                    events.extend([
+                        json!({"at_ms":203,"scenario":"io-eio","run_id":run_id,"stage":"recommit-unconfirmed","status":"started","message":"recommitting"}).to_string(),
+                        json!({"at_ms":204,"scenario":"io-eio","run_id":run_id,"stage":"recommit-unconfirmed","status":"succeeded","message":"recommitted"}).to_string(),
+                    ]);
+                }
+                let failed_at = if stage == "checker-final" { 205 } else { 203 };
+                events.extend([
+                    json!({"at_ms":failed_at,"scenario":"io-eio","run_id":run_id,"stage":stage,"status":"failed","message":"terminated"}).to_string(),
+                    json!({"at_ms":failed_at + 1,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"failed","message":"run failed"}).to_string(),
+                ]);
+                events
+            } else {
+                vec![
+                    json!({"at_ms":1,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"started","message":"started"}).to_string(),
+                    json!({"at_ms":2,"scenario":"io-eio","run_id":run_id,"stage":stage,"status":"failed","message":"terminated"}).to_string(),
+                    json!({"at_ms":3,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"failed","message":"run failed"}).to_string(),
+                ]
+            };
+            fs::write(case_dir.join("run-events.jsonl"), events.join("\n")).expect("failed events");
+            let summary = FailureSummary::new("io-eio", stage, "test_or_environment", "terminated")
+                .expect("failure summary")
+                .with_run_id(run_id)
+                .with_case_name(case_name);
+            write_json(
+                &case_dir,
+                "failure-summary.json",
+                &serde_json::to_value(summary).expect("failure summary JSON"),
+            );
+
+            let report = validate_fault_artifacts(&success_options(dir.path()))
+                .unwrap_or_else(|error| panic!("{stage} partial validation failed: {error:#}"));
+            assert!(!report.run_succeeded);
+            assert_eq!(report.terminal_stage, stage);
+            match stage {
+                "recovery-health" => {
+                    fs::remove_file(case_dir.join("workload-summary.json"))
+                        .expect("remove workload summary");
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("recovery requires completed workload artifacts");
+                    assert!(error.to_string().contains("completed workload phase"));
+                }
+                "recommit-unconfirmed" => {
+                    let missing_prechecker = events
+                        .iter()
+                        .filter(|event| {
+                            !event.contains(
+                                "\"stage\":\"checker-pre-recommit\",\"status\":\"succeeded\"",
+                            )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    fs::write(
+                        case_dir.join("run-events.jsonl"),
+                        missing_prechecker.join("\n"),
+                    )
+                    .expect("events without prechecker success");
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("recommit requires a completed prechecker");
+                    assert!(error.to_string().contains("checker-pre-recommit succeeded"));
+                    fs::write(case_dir.join("run-events.jsonl"), events.join("\n"))
+                        .expect("restore events");
+                    fs::remove_file(case_dir.join("recommit-report.json"))
+                        .expect("remove recommit report");
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("recommit failure requires its completed report");
+                    assert!(error.to_string().contains("recommit-report.json"));
+                }
+                "checker-final" => {
+                    let missing_recommit = events
+                        .iter()
+                        .filter(|event| {
+                            !event.contains(
+                                "\"stage\":\"recommit-unconfirmed\",\"status\":\"succeeded\"",
+                            )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    fs::write(
+                        case_dir.join("run-events.jsonl"),
+                        missing_recommit.join("\n"),
+                    )
+                    .expect("events without recommit success");
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("final checker requires completed recommit");
+                    assert!(error.to_string().contains("recommit-unconfirmed succeeded"));
+                    fs::write(case_dir.join("run-events.jsonl"), events.join("\n"))
+                        .expect("restore events");
+                    fs::remove_file(case_dir.join(POST_RECOVERY_WRITE_REPORT_ARTIFACT))
+                        .expect("remove post-recovery report");
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("checker requires completed post-recovery probe");
+                    assert!(error.to_string().contains("post-recovery write probe"));
+                }
+                "fault-delete" => {
+                    fs::remove_file(case_dir.join("target-proof.json"))
+                        .expect("remove target proof");
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("fault deletion requires target proof");
+                    assert!(error.to_string().contains("target-proof.json"));
+                }
+                "runner" => {
+                    fs::remove_file(case_dir.join("preflight-summary.json"))
+                        .expect("remove preflight summary");
+                    fs::remove_file(case_dir.join("target-proof.json"))
+                        .expect("remove target proof");
+                    let report = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect("early runner failure does not require later phase artifacts");
+                    assert_eq!(report.terminal_stage, "runner");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn completed_mixed_workload_requires_nonempty_authenticated_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let case_dir = dir.path().join(case_name);
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms":1,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"started","message":"started"}).to_string(),
+                json!({"at_ms":2,"scenario":"io-eio","run_id":run_id,"stage":"mixed-workload","status":"succeeded","message":"completed"}).to_string(),
+                json!({"at_ms":3,"scenario":"io-eio","run_id":run_id,"stage":"recovery-health","status":"failed","message":"recovery failed"}).to_string(),
+                json!({"at_ms":4,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"failed","message":"run failed"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("failed events");
+        let summary = FailureSummary::new(
+            "io-eio",
+            "recovery-health",
+            "test_or_environment",
+            "recovery failed",
+        )
+        .expect("failure summary")
+        .with_run_id(run_id)
+        .with_case_name(case_name);
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &serde_json::to_value(summary).expect("failure summary JSON"),
+        );
+        fs::write(case_dir.join("history.jsonl"), "").expect("empty history");
+        for artifact in [
+            "checker-pre-recommit-report.json",
+            "checker-report.json",
+            "recommit-report.json",
+        ] {
+            fs::remove_file(case_dir.join(artifact)).expect("remove future artifact");
+        }
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("completed workload cannot use empty history");
+        assert!(
+            format!("{error:#}").contains("non-empty history.jsonl"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn completed_mixed_workload_requires_every_planned_operation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        authenticate_success_fixture_mixed_workload(&case_dir);
+        let history =
+            read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+        let plan = WorkloadPlan::seeded(42, 12, 4);
+        let mut workload_history = history
+            .iter()
+            .filter(|record| record.durability_cohort == Some(DurabilityCohort::FaultActive))
+            .collect::<Vec<_>>();
+        validate_primary_workload_history(
+            &workload_history,
+            &plan,
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect("complete deterministic workload");
+        workload_history.retain(|record| record.id != "mixed-delete");
+        let error = validate_primary_workload_history(
+            &workload_history,
+            &plan,
+            "run-00000000-0000-4000-8000-000000000001",
+        )
+        .expect_err("missing planned DELETE must be rejected");
+        assert!(error.to_string().contains("exact planned"));
+    }
+
+    #[test]
+    fn late_runner_and_cleanup_failures_require_completed_stage_artifacts() {
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        let prepare = |root: &std::path::Path, stage: &str| {
+            write_success_artifacts(root, "io-eio");
+            let case_dir = root.join(case_name);
+            authenticate_success_fixture_mixed_workload(&case_dir);
+            let events_path = case_dir.join("run-events.jsonl");
+            let mut events = read_jsonl::<RunEvent>(&events_path).expect("success events");
+            events.retain(|event| {
+                !(event.stage == "run" && event.status == RunEventStatus::Succeeded)
+            });
+            let failed_at_ms = events.last().expect("success event").at_ms + 1;
+            events.push(RunEvent {
+                at_ms: failed_at_ms,
+                scenario: "io-eio".to_string(),
+                run_id: run_id.to_string(),
+                stage: stage.to_string(),
+                status: RunEventStatus::Failed,
+                message: "terminated after completed checker".to_string(),
+                details: None,
+            });
+            events.push(RunEvent {
+                at_ms: failed_at_ms + 1,
+                scenario: "io-eio".to_string(),
+                run_id: run_id.to_string(),
+                stage: "run".to_string(),
+                status: RunEventStatus::Failed,
+                message: "run failed".to_string(),
+                details: None,
+            });
+            fs::write(
+                events_path,
+                events
+                    .iter()
+                    .map(|event| serde_json::to_string(event).expect("event JSON"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .expect("failed events");
+            let summary = FailureSummary::new("io-eio", stage, "test_or_environment", "terminated")
+                .expect("failure summary")
+                .with_run_id(run_id)
+                .with_case_name(case_name);
+            write_json(
+                &case_dir,
+                "failure-summary.json",
+                &serde_json::to_value(summary).expect("failure summary JSON"),
+            );
+        };
+
+        for stage in ["runner", "multipart-cleanup"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            prepare(dir.path(), stage);
+            validate_fault_artifacts(&success_options(dir.path())).unwrap_or_else(|error| {
+                panic!("{stage} completed-stage evidence failed: {error:#}")
+            });
+        }
+
+        for (artifact, expected_error) in [
+            ("target-proof.json", "target-proof.json"),
+            ("workload-summary.json", "completed workload phase"),
+            ("history.jsonl", "without history.jsonl"),
+            (RECOVERY_HEALTH_ARTIFACT, RECOVERY_HEALTH_ARTIFACT),
+            (
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                "post-recovery write probe artifacts",
+            ),
+            (
+                POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+                "post-recovery write probe artifacts",
+            ),
+            ("checker-pre-recommit-report.json", "checker-pre-recommit"),
+            ("recommit-report.json", "recommit-report.json"),
+            ("checker-report.json", "checker-final"),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            prepare(dir.path(), "runner");
+            fs::remove_file(dir.path().join(case_name).join(artifact))
+                .unwrap_or_else(|error| panic!("remove {artifact}: {error}"));
+            let error = match validate_fault_artifacts(&success_options(dir.path())) {
+                Ok(_) => panic!("late runner accepted missing {artifact}"),
+                Err(error) => error,
+            };
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "{artifact}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_late_runner_requires_history_without_mixed_workload_or_recommit_artifacts() {
+        assert!(completed_workload_evidence_present(true, false, true));
+        assert!(!completed_workload_evidence_present(true, false, false));
+        assert!(!partial_recommit_report_required(
+            true, "runner", false, true
+        ));
+        assert!(partial_recommit_report_required(
+            false, "runner", false, true
+        ));
+    }
+
+    #[test]
+    fn ack_partial_failures_require_artifacts_from_every_completed_boundary() {
+        let event = |stage: &str, status: RunEventStatus| RunEvent {
+            at_ms: 1,
+            scenario: "dm-drop-writes-after-ack-put".to_string(),
+            run_id: "run-1".to_string(),
+            stage: stage.to_string(),
+            status,
+            message: String::new(),
+            details: None,
+        };
+        let activated = ack_partial_artifact_requirements(
+            &[event("ack-trigger", RunEventStatus::Succeeded)],
+            false,
+        );
+        assert!(activated.validation_required);
+        assert!(!activated.boundary_required);
+        assert!(!activated.recovered_required);
+
+        let failed_boundary = ack_partial_artifact_requirements(
+            &[
+                event("crash-recovery-boundary", RunEventStatus::Started),
+                event("crash-recovery-boundary", RunEventStatus::Failed),
+            ],
+            false,
+        );
+        assert!(failed_boundary.validation_required);
+        assert!(!failed_boundary.boundary_required);
+        assert!(!failed_boundary.recovered_required);
+
+        let failed_recovery = ack_partial_artifact_requirements(
+            &[
+                event("crash-recovery-boundary", RunEventStatus::Succeeded),
+                event("fault-delete", RunEventStatus::Succeeded),
+                event("recovery-health", RunEventStatus::Started),
+                event("recovery-health", RunEventStatus::Failed),
+            ],
+            false,
+        );
+        assert!(failed_recovery.validation_required);
+        assert!(failed_recovery.boundary_required);
+        assert!(failed_recovery.recovered_required);
+    }
+
+    #[test]
+    fn checker_verdict_requires_an_authenticated_failing_report() {
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        for state in ["forged", "passing", "missing"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_success_artifacts(dir.path(), "io-eio");
+            let case_dir = dir.path().join(case_name);
+            authenticate_success_fixture_mixed_workload(&case_dir);
+
+            let events_path = case_dir.join("run-events.jsonl");
+            let mut events = read_jsonl::<RunEvent>(&events_path).expect("success events");
+            events.retain(|event| {
+                event.status != RunEventStatus::Succeeded
+                    || !matches!(event.stage.as_str(), "run" | "checker-final")
+            });
+            let failed_at_ms = events.last().expect("checker start event").at_ms + 1;
+            events.extend([
+                RunEvent {
+                    at_ms: failed_at_ms,
+                    scenario: "io-eio".to_string(),
+                    run_id: run_id.to_string(),
+                    stage: "checker-final".to_string(),
+                    status: RunEventStatus::Failed,
+                    message: "hash mismatch".to_string(),
+                    details: None,
+                },
+                RunEvent {
+                    at_ms: failed_at_ms + 1,
+                    scenario: "io-eio".to_string(),
+                    run_id: run_id.to_string(),
+                    stage: "checker-verdict".to_string(),
+                    status: RunEventStatus::Failed,
+                    message: "hash mismatch".to_string(),
+                    details: None,
+                },
+                RunEvent {
+                    at_ms: failed_at_ms + 2,
+                    scenario: "io-eio".to_string(),
+                    run_id: run_id.to_string(),
+                    stage: "run".to_string(),
+                    status: RunEventStatus::Failed,
+                    message: "run failed".to_string(),
+                    details: None,
+                },
+            ]);
+            fs::write(
+                events_path,
+                events
+                    .iter()
+                    .map(|event| serde_json::to_string(event).expect("event JSON"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .expect("verdict events");
+
+            let report_path = case_dir.join("checker-report.json");
+            if state == "forged" {
+                let mut report = read_json::<CheckerReport>(&report_path).expect("checker report");
+                report.passed = false;
+                report
+                    .hash_mismatches
+                    .push("key: expected sha256=a, observed sha256=b".to_string());
+                write_json(
+                    &case_dir,
+                    "checker-report.json",
+                    &serde_json::to_value(report).expect("checker report JSON"),
+                );
+            } else if state == "missing" {
+                fs::remove_file(&report_path).expect("remove checker report");
+            }
+            let summary = FailureSummary::from_checker(
+                "io-eio",
+                "checker-verdict",
+                RecoveryStabilityClassification::DataCorruption,
+                "hash mismatch",
+            )
+            .with_run_id(run_id)
+            .with_case_name(case_name);
+            write_json(
+                &case_dir,
+                "failure-summary.json",
+                &serde_json::to_value(summary).expect("failure summary JSON"),
+            );
+
+            match state {
+                "forged" => {
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("fabricated checker failure cannot support the verdict");
+                    assert!(
+                        error.to_string().contains("does not match history.jsonl"),
+                        "{error:#}"
+                    );
+                }
+                "passing" => {
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("passing checker report cannot support a failed verdict");
+                    assert!(
+                        error.to_string().contains("no failing observation"),
+                        "{error:#}"
+                    );
+                }
+                "missing" => {
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("checker verdict requires its report");
+                    assert!(
+                        error.to_string().contains("checker-report.json"),
+                        "{error:#}"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn prechecker_verdict_requires_authenticated_failure_and_recovery_evidence() {
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        for state in ["forged", "passing", "missing"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_success_artifacts(dir.path(), "io-eio");
+            let case_dir = dir.path().join(case_name);
+            authenticate_success_fixture_mixed_workload(&case_dir);
+
+            let events_path = case_dir.join("run-events.jsonl");
+            let mut events = read_jsonl::<RunEvent>(&events_path).expect("success events");
+            let checker_started = events
+                .iter()
+                .position(|event| {
+                    event.stage == "checker-pre-recommit" && event.status == RunEventStatus::Started
+                })
+                .expect("prechecker started");
+            events.truncate(checker_started + 1);
+            let failed_at_ms = events.last().expect("checker start event").at_ms + 1;
+            events.extend([
+                RunEvent {
+                    at_ms: failed_at_ms,
+                    scenario: "io-eio".to_string(),
+                    run_id: run_id.to_string(),
+                    stage: "checker-pre-recommit".to_string(),
+                    status: RunEventStatus::Failed,
+                    message: "hash mismatch".to_string(),
+                    details: None,
+                },
+                RunEvent {
+                    at_ms: failed_at_ms + 1,
+                    scenario: "io-eio".to_string(),
+                    run_id: run_id.to_string(),
+                    stage: "checker-pre-recommit-verdict".to_string(),
+                    status: RunEventStatus::Failed,
+                    message: "hash mismatch".to_string(),
+                    details: None,
+                },
+                RunEvent {
+                    at_ms: failed_at_ms + 2,
+                    scenario: "io-eio".to_string(),
+                    run_id: run_id.to_string(),
+                    stage: "run".to_string(),
+                    status: RunEventStatus::Failed,
+                    message: "run failed".to_string(),
+                    details: None,
+                },
+            ]);
+            fs::write(
+                events_path,
+                events
+                    .iter()
+                    .map(|event| serde_json::to_string(event).expect("event JSON"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .expect("prechecker verdict events");
+
+            let report_path = case_dir.join("checker-pre-recommit-report.json");
+            if state == "forged" {
+                let mut report = read_json::<CheckerReport>(&report_path).expect("checker report");
+                report.passed = false;
+                report
+                    .hash_mismatches
+                    .push("key: expected sha256=a, observed sha256=b".to_string());
+                write_json(
+                    &case_dir,
+                    "checker-pre-recommit-report.json",
+                    &serde_json::to_value(report).expect("checker report JSON"),
+                );
+            } else if state == "missing" {
+                fs::remove_file(&report_path).expect("remove checker report");
+            }
+            let mut recovery = RecoveryStabilityReport::harness_error(
+                "placeholder",
+                std::time::Duration::from_secs(60),
+            )
+            .with_identity("io-eio", run_id);
+            recovery.classification = RecoveryStabilityClassification::DataCorruption;
+            recovery.hash_mismatches = vec!["key: hash mismatch".to_string()];
+            recovery.harness_errors.clear();
+            write_json(
+                &case_dir,
+                "recovery-stability-report.json",
+                &serde_json::to_value(recovery).expect("recovery report JSON"),
+            );
+            let summary = FailureSummary::from_checker(
+                "io-eio",
+                "checker-pre-recommit-verdict",
+                RecoveryStabilityClassification::DataCorruption,
+                "hash mismatch",
+            )
+            .with_run_id(run_id)
+            .with_case_name(case_name);
+            write_json(
+                &case_dir,
+                "failure-summary.json",
+                &serde_json::to_value(summary).expect("failure summary JSON"),
+            );
+
+            match state {
+                "forged" => {
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("fabricated prechecker failure cannot support the verdict");
+                    assert!(
+                        error.to_string().contains("does not match history.jsonl"),
+                        "{error:#}"
+                    );
+                }
+                "passing" => {
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("passing prechecker report cannot support a failed verdict");
+                    assert!(
+                        error.to_string().contains("no failing observation"),
+                        "{error:#}"
+                    );
+                }
+                "missing" => {
+                    let error = validate_fault_artifacts(&success_options(dir.path()))
+                        .expect_err("prechecker verdict requires its report");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("checker-pre-recommit-report.json"),
+                        "{error:#}"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn failure_summary_cannot_skip_an_intervening_non_cleanup_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        let case_dir = dir.path().join(case_name);
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms":1,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"started","message":"started"}).to_string(),
+                json!({"at_ms":2,"scenario":"io-eio","run_id":run_id,"stage":"mixed-workload","status":"failed","message":"primary"}).to_string(),
+                json!({"at_ms":3,"scenario":"io-eio","run_id":run_id,"stage":"checker-final","status":"failed","message":"intervening"}).to_string(),
+                json!({"at_ms":4,"scenario":"io-eio","run_id":run_id,"stage":"mixed-workload","status":"failed","message":"forged duplicate"}).to_string(),
+                json!({"at_ms":5,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"failed","message":"run failed"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("failed events");
+        let summary =
+            FailureSummary::new("io-eio", "mixed-workload", "test_or_environment", "primary")
+                .expect("failure summary")
+                .with_run_id(run_id)
+                .with_case_name(case_name);
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &serde_json::to_value(summary).expect("failure summary JSON"),
+        );
+
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("duplicate stage failure cannot hide an intervening primary failure");
+        assert!(
+            error
+                .to_string()
+                .contains("does not identify the primary failed run stage"),
+            "{error:#}"
+        );
+
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms":1,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"started","message":"started"}).to_string(),
+                json!({"at_ms":2,"scenario":"io-eio","run_id":run_id,"stage":"fault-delete","status":"failed","message":"primary"}).to_string(),
+                json!({"at_ms":3,"scenario":"io-eio","run_id":run_id,"stage":"runner","status":"failed","message":"artifact capture failed"}).to_string(),
+                json!({"at_ms":4,"scenario":"io-eio","run_id":run_id,"stage":"run","status":"failed","message":"run failed"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("runner fallback events");
+        let runner_summary =
+            FailureSummary::new("io-eio", "runner", "test_or_environment", "capture failed")
+                .expect("runner summary")
+                .with_run_id(run_id)
+                .with_case_name(case_name);
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &serde_json::to_value(runner_summary).expect("runner summary JSON"),
+        );
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("runner fallback cannot hide an earlier fault failure");
+        assert!(
+            error
+                .to_string()
+                .contains("does not identify the primary failed run stage"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn validates_all_ack_triggered_mutation_shapes() {
         use crate::fault::acknowledged_mutation::AcknowledgedMutationKind;
         use crate::fault::history::OperationKind;
@@ -13814,6 +16629,11 @@ mod tests {
             value_sha256: None,
             size_bytes: None,
             version_id: None,
+            request_version_id: None,
+            is_delete_marker: None,
+            mutation_max_attempts: None,
+            mutation_attempts: None,
+            read_purpose: None,
             listed_keys: None,
             listed_versions: None,
             payload_ref: None,
@@ -15899,7 +18719,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_clean_checker_report_with_ambiguous_write_evidence() {
+    fn rejects_checker_materialization_without_authenticated_get_evidence() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_success_artifacts(dir.path(), "io-eio");
         let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
@@ -15921,9 +18741,14 @@ mod tests {
             expected_rustfs_volume_path: "/data/rustfs0".to_string(),
         };
 
-        let error = validate_fault_artifacts(&options).expect_err("ambiguous evidence mismatch");
-
-        assert!(error.to_string().contains("did not pass"));
+        let error = validate_fault_artifacts(&options)
+            .expect_err("unauthenticated ambiguous materialization must be rejected");
+        assert!(
+            format!("{error:#}").contains(
+                "timeout-write materialization evidence does not match authenticated GET history"
+            ),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -16552,8 +19377,13 @@ mod tests {
                 json!({"at_ms":70,"scenario":scenario,"run_id":run_id,"stage":"recovery-evidence","status":"succeeded","message":"fault-evidence.json persisted"}).to_string(),
                 json!({"at_ms":71,"scenario":scenario,"run_id":run_id,"stage":"post-recovery-write","status":"started","message":"probing fresh writes"}).to_string(),
                 json!({"at_ms":200,"scenario":scenario,"run_id":run_id,"stage":"post-recovery-write","status":"succeeded","message":"fresh writes succeeded"}).to_string(),
-                json!({"at_ms":2,"scenario":scenario,"run_id":run_id,"stage":"checker-final","status":"succeeded","message":"checked"}).to_string(),
-                json!({"at_ms":3,"scenario":scenario,"run_id":run_id,"stage":"run","status":"succeeded","message":"done"}).to_string(),
+                json!({"at_ms":201,"scenario":scenario,"run_id":run_id,"stage":"checker-pre-recommit","status":"started","message":"checking"}).to_string(),
+                json!({"at_ms":202,"scenario":scenario,"run_id":run_id,"stage":"checker-pre-recommit","status":"succeeded","message":"checked"}).to_string(),
+                json!({"at_ms":203,"scenario":scenario,"run_id":run_id,"stage":"recommit-unconfirmed","status":"started","message":"recommitting"}).to_string(),
+                json!({"at_ms":204,"scenario":scenario,"run_id":run_id,"stage":"recommit-unconfirmed","status":"succeeded","message":"recommitted"}).to_string(),
+                json!({"at_ms":205,"scenario":scenario,"run_id":run_id,"stage":"checker-final","status":"started","message":"checking"}).to_string(),
+                json!({"at_ms":206,"scenario":scenario,"run_id":run_id,"stage":"checker-final","status":"succeeded","message":"checked"}).to_string(),
+                json!({"at_ms":207,"scenario":scenario,"run_id":run_id,"stage":"run","status":"succeeded","message":"done"}).to_string(),
             ].join("\n"),
         ).expect("write events");
         write_json(
@@ -17618,9 +20448,9 @@ mod tests {
         let error = validate_fault_artifacts(&success_options(dir.path()))
             .expect_err("incomplete delete verification");
         assert!(
-            error
-                .to_string()
-                .contains("post-recovery-write-report.json did not pass"),
+            error.to_string().contains(
+                "write probe report counters, failures, or verdict do not match its history"
+            ),
             "{error:#}"
         );
 
@@ -17729,19 +20559,19 @@ mod tests {
                 records[failed_delete]["outcome"] = json!("failed");
                 records[failed_delete]["http_status"] = json!(503);
             },
-            "a passed probe has no failed requests",
+            "write probe contains extra requests",
         );
         // The verifying GET returned different bytes than the PUT sent.
         let verify_get = position("get", &format!("{prefix}object-000001"), "ok");
         reject(
             &|records| records[verify_get]["value_sha256"] = json!("tampered"),
-            "does not read back the acknowledged Put",
+            "write probe report counters, failures, or verdict do not match its history",
         );
         // The multipart completion was never read back with its bytes.
         let multipart_get = position("get", &format!("{prefix}object-000008"), "ok");
         reject(
             &|records| records[multipart_get]["size_bytes"] = json!(1),
-            "does not read back the acknowledged CompleteMultipartUpload",
+            "write probe contains extra requests",
         );
         // The live LIST omitted a probe object.
         let live_list = position("list", prefix, "ok");
@@ -17752,7 +20582,7 @@ mod tests {
                     .expect("listed keys")
                     .pop();
             },
-            "does not show exactly the live probe objects",
+            "write probe report counters, failures, or verdict do not match its history",
         );
         // The final LIST still advertised a deleted key.
         let empty_list = records.len() - 1;
@@ -17760,13 +20590,13 @@ mod tests {
             &|records| {
                 records[empty_list]["listed_keys"] = json!([format!("{prefix}object-000000")]);
             },
-            "does not prove the prefix empty",
+            "write probe report counters, failures, or verdict do not match its history",
         );
         // A DELETE the report claims is missing from history entirely.
         let missing_delete = position("delete", &format!("{prefix}object-000002"), "ok");
         reject(
             &|records| records[missing_delete]["kind"] = json!("head"),
-            "which the probe never issues",
+            "write probe has an unexpected or out-of-order request",
         );
         // The multipart abort was not evidenced.
         let abort = position(
@@ -17779,7 +20609,7 @@ mod tests {
                 records[abort]["kind"] = json!("upload_part");
                 records[abort]["key"] = json!(format!("{prefix}object-000008"));
             },
-            "exactly one acknowledged AbortMultipartUpload",
+            "write probe lacks AbortMultipartUpload",
         );
         // The post-delete GET did not observe absence.
         let absent_get = position("get", &format!("{prefix}object-000003"), "not_found");
@@ -17790,7 +20620,7 @@ mod tests {
                 records[absent_get]["value_sha256"] = json!("probe-sha-3");
                 records[absent_get]["size_bytes"] = json!(4096);
             },
-            "does not prove",
+            "write probe report counters, failures, or verdict do not match its history",
         );
 
         // Ordering tampers: the records stay individually valid but move.
@@ -17803,31 +20633,31 @@ mod tests {
         let verify_zero = position("get", &format!("{prefix}object-000000"), "ok");
         reject(
             &|records| move_record(records, delete_zero, verify_zero),
-            "did not follow its verified read",
+            "write probe has an unexpected or out-of-order request",
         );
         // The live LIST taken after the first DELETE.
         reject(
             &|records| move_record(records, live_list, delete_zero),
-            "does not show exactly the live probe objects",
+            "write probe has an unexpected or out-of-order request",
         );
         // The empty LIST taken before the last DELETE.
         let delete_last = position("delete", &format!("{prefix}object-000008"), "ok");
         reject(
             &|records| move_record(records, empty_list, delete_last),
-            "does not prove the prefix empty",
+            "write probe has an unexpected or out-of-order request",
         );
         // A third GET for one object.
         let mut duplicate_get = records[verify_zero].clone();
         duplicate_get["id"] = json!(format!("op-{:06}", records.len() + 1));
         reject(
             &|records| records.push(duplicate_get.clone()),
-            "exactly two GETs",
+            "write probe contains extra requests",
         );
         // A PUT that recorded no payload hash cannot be read back.
         let put_zero = position("put", &format!("{prefix}object-000000"), "ok");
         reject(
             &|records| records[put_zero]["value_sha256"] = json!(null),
-            "records no payload hash",
+            "write probe mutation lacks payload identity",
         );
 
         // The report's object count is bound to the workload plan.
@@ -18003,7 +20833,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("does not prove one successful post-recovery write probe"),
+                .contains("does not prove one Succeeded post-recovery write probe"),
             "{error:#}"
         );
     }
@@ -18272,7 +21102,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("commit probe verified 298 of 299")
+                .contains("verdict or violations do not match its observations")
         );
         report["commit_probe"]["verified"] = json!(299);
 
@@ -18318,7 +21148,12 @@ mod tests {
         report["min_success_percent"] = json!(100);
         let error = validate(&report, &lowered_metadata, &summary)
             .expect_err("a 100% floor tolerates no disruption");
-        assert!(error.to_string().contains("did not pass"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("verdict or violations do not match its observations"),
+            "{error:#}"
+        );
         report["min_success_percent"] = json!(99);
 
         report["read_probe"]["objects"] = json!(5);
@@ -18345,9 +21180,17 @@ mod tests {
         report["workload"][2] = family("delete", 100, 1);
         report["workload"][0] = family("put", 100, 2);
         report["workload"][1] = family("get", 200, 0);
-        let error = validate(&report, &metadata, &summary)
+        let below_floor = summary_with((98, 2), (200, 0), (99, 1));
+        report["commit_probe"]["objects"] = json!(198);
+        report["commit_probe"]["verified"] = json!(198);
+        let error = validate(&report, &metadata, &below_floor)
             .expect_err("a family below the floor cannot pass");
-        assert!(error.to_string().contains("did not pass"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("verdict or violations do not match its observations"),
+            "{error:#}"
+        );
 
         // Two failures moved from a 50-operation PUT family (where they break
         // the 99% floor) into a 1000-operation GET family (where they pass)
@@ -18370,7 +21213,12 @@ mod tests {
         report["workload"][1] = family("get", 1000, 1);
         let error = validate(&report, &metadata, &shifted_summary)
             .expect_err("the honest per-family numbers fail the floor");
-        assert!(error.to_string().contains("did not pass"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("verdict or violations do not match its observations"),
+            "{error:#}"
+        );
 
         // The floor itself is bound to run-metadata.json.
         report["workload"][0] = family("put", 200, 1);
@@ -18384,7 +21232,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("does not match run-metadata.json min_availability_percent 99"),
+                .contains("min_success_percent does not match run-metadata.json"),
             "{error:#}"
         );
         report["min_success_percent"] = json!(99);
@@ -18692,6 +21540,11 @@ mod tests {
                 value_sha256: None,
                 size_bytes: None,
                 version_id: None,
+                request_version_id: None,
+                is_delete_marker: None,
+                mutation_max_attempts: None,
+                mutation_attempts: None,
+                read_purpose: None,
                 listed_keys: None,
                 listed_versions: None,
                 payload_ref: None,
@@ -19372,6 +22225,237 @@ mod tests {
         assert_eq!(
             recursive_find(dir.path(), "checker-report.json").expect("find"),
             None
+        );
+    }
+    #[test]
+    fn failed_multipart_delete_keeps_plain_delete_count_and_requires_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let original = read_json::<super::PostRecoveryWriteReport>(
+            &case_dir.join(POST_RECOVERY_WRITE_REPORT_ARTIFACT),
+        )
+        .expect("report");
+        let mut history =
+            read_jsonl::<OperationRecord>(&case_dir.join(POST_RECOVERY_WRITE_HISTORY_ARTIFACT))
+                .expect("history");
+        let multipart_key = format!("{}object-{:06}", original.key_prefix, original.objects);
+        let delete = history
+            .iter_mut()
+            .find(|r| r.kind == OperationKind::Delete && r.key.as_deref() == Some(&multipart_key))
+            .expect("multipart DELETE");
+        delete.outcome = OperationOutcome::Failed;
+        delete.http_status = Some(400);
+        history.retain(|r| {
+            !(r.key.as_deref() == Some(&multipart_key)
+                && r.kind == OperationKind::Get
+                && r.outcome == OperationOutcome::NotFound)
+        });
+        let report = original
+            .rebuild_from_history(&history)
+            .expect("complete negative probe");
+        assert!(!report.passed);
+        assert_eq!(report.deletes_verified_absent, original.objects);
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure == &format!("delete {multipart_key}: Failed"))
+        );
+        super::validate_write_probe_history(&history, &report).expect("authenticated failure");
+        let mut forged = report;
+        forged.deletes_verified_absent -= 1;
+        assert!(super::validate_write_probe_history(&history, &forged).is_err());
+    }
+
+    #[test]
+    fn failed_write_probe_requires_reconstructed_history_and_classification() {
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        for tamper in [
+            "none",
+            "counter",
+            "missing-get",
+            "classification",
+            "missing-report",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_success_artifacts(dir.path(), "io-eio");
+            let case_dir = dir.path().join(case_name);
+            authenticate_success_fixture_mixed_workload(&case_dir);
+            let workload =
+                read_json::<WorkloadSummaryArtifact>(&case_dir.join("workload-summary.json"))
+                    .expect("workload");
+            let mut workload_history =
+                read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+            workload_history.truncate(
+                workload
+                    .recommit_candidates
+                    .as_ref()
+                    .expect("manifest")
+                    .history_record_count,
+            );
+            fs::write(
+                case_dir.join("history.jsonl"),
+                workload_history
+                    .iter()
+                    .map(|r| serde_json::to_string(r).expect("record"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .expect("truncate future-stage history");
+            let report_path = case_dir.join(POST_RECOVERY_WRITE_REPORT_ARTIFACT);
+            let original = read_json::<crate::fault::workload::execution::PostRecoveryWriteReport>(
+                &report_path,
+            )
+            .expect("probe report");
+            let history_path = case_dir.join(POST_RECOVERY_WRITE_HISTORY_ARTIFACT);
+            let mut records = read_jsonl::<OperationRecord>(&history_path).expect("probe history");
+            let get = records
+                .iter_mut()
+                .find(|r| r.kind == OperationKind::Get)
+                .expect("verify GET");
+            get.outcome = OperationOutcome::Failed;
+            get.http_status = Some(503);
+            get.value_sha256 = None;
+            get.size_bytes = None;
+            let mut report = original
+                .rebuild_from_history(&records)
+                .expect("negative observations");
+            assert!(!report.passed);
+            assert_eq!(report.puts_verified, original.objects - 1);
+            if tamper == "counter" {
+                report.puts_verified += 1;
+            }
+            if tamper == "missing-get" {
+                records.remove(1);
+            }
+            write_records_jsonl(&history_path, &records);
+            write_json(
+                &case_dir,
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                &serde_json::to_value(report).expect("report JSON"),
+            );
+            let mut events =
+                read_jsonl::<RunEvent>(&case_dir.join("run-events.jsonl")).expect("events");
+            let end = events
+                .iter()
+                .position(|event| {
+                    event.stage == "post-recovery-write"
+                        && event.status == RunEventStatus::Succeeded
+                })
+                .expect("probe terminal event");
+            events.truncate(end + 1);
+            events[end].status = RunEventStatus::Failed;
+            let mut terminal = events[end].clone();
+            terminal.stage = "run".into();
+            terminal.at_ms += 1;
+            events.push(terminal);
+            fs::write(
+                case_dir.join("run-events.jsonl"),
+                events
+                    .iter()
+                    .map(|event| serde_json::to_string(event).expect("event"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .expect("events");
+            let classification = if tamper == "classification" {
+                "test_or_environment"
+            } else {
+                "post_recovery_write_failed"
+            };
+            let summary = FailureSummary::new(
+                "io-eio",
+                "post-recovery-write",
+                classification,
+                "write probe failed",
+            )
+            .expect("summary")
+            .with_run_id(&original.run_id)
+            .with_case_name(case_name);
+            write_json(
+                &case_dir,
+                "failure-summary.json",
+                &serde_json::to_value(summary).expect("summary JSON"),
+            );
+            for artifact in [
+                "checker-pre-recommit-report.json",
+                "checker-report.json",
+                "recommit-report.json",
+                "recovery-stability-report.json",
+            ] {
+                let path = case_dir.join(artifact);
+                if path.exists() {
+                    fs::remove_file(path).expect("remove later artifact");
+                }
+            }
+            if tamper == "missing-report" {
+                fs::remove_file(report_path).expect("remove report");
+            }
+            let result = validate_fault_artifacts(&success_options(dir.path()));
+            if tamper == "none" {
+                assert!(!result.expect("authenticated failed probe").run_succeeded);
+            } else {
+                assert!(result.is_err(), "accepted {tamper}");
+            }
+        }
+    }
+
+    #[test]
+    fn runner_failure_after_recommit_started_requires_its_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join(case_name);
+        authenticate_success_fixture_mixed_workload(&case_dir);
+        let mut events =
+            read_jsonl::<RunEvent>(&case_dir.join("run-events.jsonl")).expect("events");
+        let started = events
+            .iter()
+            .position(|event| {
+                event.stage == "recommit-unconfirmed" && event.status == RunEventStatus::Started
+            })
+            .expect("recommit started");
+        events.truncate(started + 1);
+        let mut failure = events.last().expect("started event").clone();
+        failure.at_ms += 1;
+        failure.stage = "runner".into();
+        failure.status = RunEventStatus::Failed;
+        events.push(failure.clone());
+        failure.stage = "run".into();
+        failure.at_ms += 1;
+        events.push(failure.clone());
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            events
+                .iter()
+                .map(|event| serde_json::to_string(event).expect("event"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("events");
+        let summary = FailureSummary::new(
+            "io-eio",
+            "runner",
+            "test_or_environment",
+            "persist recommit report failed",
+        )
+        .expect("summary")
+        .with_run_id(&failure.run_id)
+        .with_case_name(case_name);
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &serde_json::to_value(summary).expect("summary JSON"),
+        );
+        fs::remove_file(case_dir.join("checker-report.json")).expect("remove final checker");
+        validate_fault_artifacts(&success_options(dir.path())).expect("complete recommit evidence");
+        fs::remove_file(case_dir.join("recommit-report.json")).expect("remove recommit report");
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("runner failure cannot bypass recommit evidence");
+        assert!(
+            error.to_string().contains("recommit-report.json"),
+            "{error:#}"
         );
     }
 }
