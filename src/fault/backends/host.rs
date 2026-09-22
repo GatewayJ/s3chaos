@@ -3378,10 +3378,14 @@ fn dm_helper_manifest(
     // Only stale-return helpers need direct access to the retained filesystem.
     let target_mount = target_path.map_or(
         "",
-        |_| "        - name: target-volume\n          mountPath: /target\n",
+        |_| {
+            "        - name: target-volume\n          mountPath: /target\n        - name: host-proc\n          mountPath: /host/proc\n          readOnly: true\n        - name: host-dev\n          mountPath: /host/dev\n          readOnly: true\n"
+        },
     );
     let target_volume = target_path.map_or_else(String::new, |path| {
-        format!("    - name: target-volume\n      hostPath:\n        path: {path}\n        type: Directory\n")
+        format!(
+            "    - name: target-volume\n      hostPath:\n        path: {path}\n        type: Directory\n    - name: host-proc\n      hostPath:\n        path: /proc\n        type: Directory\n    - name: host-dev\n      hostPath:\n        path: /dev\n        type: Directory\n"
+        )
     });
     format!(
         r#"apiVersion: v1
@@ -3609,12 +3613,34 @@ mod tests {
         assert!(manifest.contains("nodeName: worker-a"));
         assert!(manifest.contains("privileged: true"));
         assert!(manifest.contains("hostPID: true"));
-        assert!(!manifest.contains("mountPath: /host"));
+        assert!(manifest.contains("mountPath: /host/proc"));
+        assert!(manifest.contains("mountPath: /host/dev"));
         assert!(manifest.contains("mountPath: /target"));
         assert!(manifest.contains("path: /var/lib/rustfs-stale"));
         assert!(manifest.contains("mountPath: /journal"));
         assert!(manifest.contains("mountPath: /var/lock/s3chaos"));
         assert!(manifest.contains("s3chaos"));
+        let pod: serde_json::Value = serde_yaml_ng::from_str(&manifest).expect("helper manifest");
+        let mounts = pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("helper mounts");
+        for (name, path) in [("host-proc", "/host/proc"), ("host-dev", "/host/dev")] {
+            let mount = mounts
+                .iter()
+                .find(|mount| mount["name"] == name)
+                .expect("host generation mount");
+            assert_eq!(mount["mountPath"], path);
+            assert_eq!(mount["readOnly"], true);
+        }
+        let volumes = pod["spec"]["volumes"].as_array().expect("helper volumes");
+        for (name, path) in [("host-proc", "/proc"), ("host-dev", "/dev")] {
+            let volume = volumes
+                .iter()
+                .find(|volume| volume["name"] == name)
+                .expect("host generation volume");
+            assert_eq!(volume["hostPath"]["path"], path);
+            assert_eq!(volume["hostPath"]["type"], "Directory");
+        }
     }
 
     #[test]

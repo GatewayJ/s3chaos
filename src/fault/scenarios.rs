@@ -1375,7 +1375,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             "only one-volume-per-server topology with a dedicated object and host volume is qualified; unsupported layouts fail closed",
         ],
         validation: "corrupt shard reads are rejected or repaired without returning bad bytes, the selected heal mode repairs the shard, forced reads match committed object hashes, and committed versions remain readable after repair",
-        observability: "storage target proof, selection/mutation/corruption-window/heal/cleanup receipts, exact-cohort manifests and runtime records, workload history, checker reports, post-write report, RustFS logs",
+        observability: "storage target proof, selection/mutation/corruption-window/heal/cleanup receipts, durable heal progress and failure reasons, exact-cohort manifests, version/delete-marker sets, workload history, checker reports, post-write report, RustFS logs",
         conflict_domain: "dedicated host volume and object prefix owned by the test run; must never mutate shared data",
     },
     FaultScenarioSpec {

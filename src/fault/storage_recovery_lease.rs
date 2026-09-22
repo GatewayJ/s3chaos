@@ -269,7 +269,7 @@ impl StorageRecoveryCleanupProof {
         }
     }
 
-    fn completed_at_ms(&self) -> u64 {
+    pub(crate) fn completed_at_ms(&self) -> u64 {
         match self {
             Self::AbortedBeforeMutation { observed_at_ms } => *observed_at_ms,
             Self::BitrotRestored { restore_receipt }
@@ -411,46 +411,122 @@ impl KubernetesStorageLeaseAdapter {
     }
 
     pub async fn renew(&self, proof: &KubernetesLeaseProof) -> Result<KubernetesLeaseProof> {
+        self.renew_inner(proof, false).await
+    }
+
+    pub async fn renew_for_cleanup(
+        &self,
+        proof: &KubernetesLeaseProof,
+    ) -> Result<KubernetesLeaseProof> {
+        self.renew_inner(proof, true).await
+    }
+
+    async fn renew_inner(
+        &self,
+        proof: &KubernetesLeaseProof,
+        allow_expired_owned_generation: bool,
+    ) -> Result<KubernetesLeaseProof> {
         self.validate_proof_identity(proof)?;
-        let now_ms = now_ms()?;
-        ensure!(
-            now_ms < proof.expires_at_ms,
-            "storage-recovery Kubernetes Lease expired before renewal"
-        );
-        let existing = self
-            .api
-            .get(&self.name)
-            .await
-            .context("read storage-recovery Kubernetes Lease for renewal")?;
-        ensure!(
-            existing.uid().as_deref() == Some(proof.uid.as_str())
-                && existing.resource_version().as_deref() == Some(proof.resource_version.as_str()),
-            "storage-recovery Kubernetes Lease generation drifted before renewal"
-        );
-        let decision =
-            acquisition_decision(&existing, &self.scope_sha256, &self.holder_identity, now_ms)?;
-        let AcquisitionDecision::Renew {
-            acquired_at_ms,
-            transitions,
-        } = decision
-        else {
-            bail!("storage-recovery Kubernetes Lease is no longer renewable by this holder")
-        };
-        let renewed = self
-            .api
-            .replace(
-                &self.name,
-                &PostParams::default(),
-                &self.lease(
-                    existing.metadata.resource_version,
-                    acquired_at_ms,
-                    now_ms,
-                    transitions,
-                )?,
-            )
-            .await
-            .context("renew storage-recovery Kubernetes Lease")?;
-        self.proof(&renewed)
+        let mut renewal_base = proof.clone();
+        for _ in 0..3 {
+            let existing = self
+                .api
+                .get(&self.name)
+                .await
+                .context("read storage-recovery Kubernetes Lease for renewal")?;
+            let observed_at_ms = now_ms()?;
+            let existing_proof = self.proof(&existing)?;
+            if existing_proof.resource_version != renewal_base.resource_version {
+                validate_advanced_owned_renewal(
+                    &renewal_base,
+                    &existing_proof,
+                    observed_at_ms,
+                    allow_expired_owned_generation,
+                )?;
+                if observed_at_ms < existing_proof.expires_at_ms {
+                    return Ok(existing_proof);
+                }
+                renewal_base = existing_proof;
+            } else {
+                ensure!(
+                    existing_proof == renewal_base,
+                    "storage-recovery Kubernetes Lease generation drifted before renewal"
+                );
+            }
+            ensure!(
+                allow_expired_owned_generation || observed_at_ms < renewal_base.expires_at_ms,
+                "storage-recovery Kubernetes Lease expired before renewal"
+            );
+            let decision = acquisition_decision(
+                &existing,
+                &self.scope_sha256,
+                &self.holder_identity,
+                observed_at_ms,
+            )?;
+            let AcquisitionDecision::Renew {
+                acquired_at_ms,
+                transitions,
+            } = decision
+            else {
+                bail!("storage-recovery Kubernetes Lease is no longer renewable by this holder")
+            };
+            let replacement = self.lease(
+                existing.metadata.resource_version,
+                acquired_at_ms,
+                observed_at_ms.max(
+                    renewal_base
+                        .renew_at_ms
+                        .checked_add(1)
+                        .context("storage-recovery Lease renewal timestamp overflow")?,
+                ),
+                transitions,
+            )?;
+            match self
+                .api
+                .replace(&self.name, &PostParams::default(), &replacement)
+                .await
+            {
+                Ok(renewed) => {
+                    let renewed_proof = self.proof(&renewed)?;
+                    let returned_at_ms = now_ms()?;
+                    if returned_at_ms < renewed_proof.expires_at_ms {
+                        return Ok(renewed_proof);
+                    }
+                    ensure!(
+                        allow_expired_owned_generation,
+                        "storage-recovery Kubernetes Lease expired while renewal completed"
+                    );
+                    renewal_base = renewed_proof;
+                }
+                Err(first_error) => {
+                    let current = self.api.get(&self.name).await.with_context(|| {
+                        format!(
+                            "reconcile storage-recovery Lease renewal after first error: {first_error}"
+                        )
+                    })?;
+                    let current_proof = self.proof(&current)?;
+                    let reconciled_at_ms = now_ms()?;
+                    validate_advanced_owned_renewal(
+                        &renewal_base,
+                        &current_proof,
+                        reconciled_at_ms,
+                        allow_expired_owned_generation,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "storage-recovery Lease renewal failed before reconciliation: {first_error}"
+                        )
+                    })?;
+                    if reconciled_at_ms < current_proof.expires_at_ms {
+                        return Ok(current_proof);
+                    }
+                    renewal_base = current_proof;
+                }
+            }
+        }
+        bail!(
+            "storage-recovery Kubernetes Lease did not produce an active generation in three renewal attempts"
+        )
     }
 
     pub async fn release(
@@ -562,6 +638,27 @@ impl KubernetesStorageLeaseAdapter {
     }
 }
 
+fn validate_advanced_owned_renewal(
+    previous: &KubernetesLeaseProof,
+    current: &KubernetesLeaseProof,
+    now_ms: u64,
+    allow_expired_owned_generation: bool,
+) -> Result<()> {
+    ensure!(
+        current.name == previous.name
+            && current.uid == previous.uid
+            && current.resource_version != previous.resource_version
+            && current.holder_identity == previous.holder_identity
+            && current.scope_sha256 == previous.scope_sha256
+            && current.acquired_at_ms == previous.acquired_at_ms
+            && current.renew_at_ms > previous.renew_at_ms
+            && current.expires_at_ms > previous.expires_at_ms
+            && (allow_expired_owned_generation || now_ms < current.expires_at_ms),
+        "storage-recovery Kubernetes Lease does not prove an advanced renewal by this owner"
+    );
+    Ok(())
+}
+
 pub async fn require_current_lease(client: Client, context: &OwnedStorageContext) -> Result<()> {
     context.validate()?;
     let api: Api<Lease> = Api::namespaced(client, &context.volume.namespace);
@@ -586,28 +683,83 @@ pub async fn release_owned_lease(
     cleanup.validate_for(context)?;
     let proof = &context.exclusive_access.kubernetes_lease;
     let api: Api<Lease> = Api::namespaced(client, &context.volume.namespace);
+    ensure!(
+        cleanup.completed_at_ms() >= proof.acquired_at_ms,
+        "storage-recovery cleanup predates the Lease generation"
+    );
     let current = api
         .get(&proof.name)
         .await
         .context("re-read storage-recovery Kubernetes Lease before release")?;
     validate_current_lease(&current, proof, &context.scope_sha256, now_ms()?)?;
+    let delete_params = DeleteParams {
+        preconditions: Some(Preconditions {
+            resource_version: Some(proof.resource_version.clone()),
+            uid: Some(proof.uid.clone()),
+        }),
+        ..DeleteParams::default()
+    };
+    let first_error = match api.delete(&proof.name, &delete_params).await {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
+    let current = match api.get(&proof.name).await {
+        Ok(current) => current,
+        Err(kube::Error::Api(response)) if response.code == 404 => return Ok(()),
+        Err(error) => {
+            return Err(error).context(format!(
+                "reconcile storage-recovery Lease release after first error: {first_error}"
+            ));
+        }
+    };
+    validate_current_lease(&current, proof, &context.scope_sha256, now_ms()?)?;
+    match api.delete(&proof.name, &delete_params).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+        Err(error) => Err(error).context(format!(
+            "repeat storage-recovery Lease release after first error: {first_error}"
+        )),
+    }
+}
+
+pub async fn reconcile_owned_lease_release(
+    client: Client,
+    context: &OwnedStorageContext,
+    cleanup: &StorageRecoveryCleanupProof,
+) -> Result<()> {
+    context.validate()?;
+    cleanup.validate_for(context)?;
+    let proof = &context.exclusive_access.kubernetes_lease;
     ensure!(
         cleanup.completed_at_ms() >= proof.acquired_at_ms,
         "storage-recovery cleanup predates the Lease generation"
     );
-    api.delete(
-        &proof.name,
-        &DeleteParams {
-            preconditions: Some(Preconditions {
-                resource_version: Some(proof.resource_version.clone()),
-                uid: Some(proof.uid.clone()),
-            }),
-            ..DeleteParams::default()
-        },
-    )
-    .await
-    .context("release storage-recovery Kubernetes Lease")?;
-    Ok(())
+    let api: Api<Lease> = Api::namespaced(client, &context.volume.namespace);
+    let current = match api.get(&proof.name).await {
+        Ok(current) => current,
+        Err(kube::Error::Api(response)) if response.code == 404 => return Ok(()),
+        Err(error) => {
+            return Err(error).context("reconcile storage-recovery Kubernetes Lease release");
+        }
+    };
+    validate_owned_lease_generation(&current, proof, &context.scope_sha256)?;
+    match api
+        .delete(
+            &proof.name,
+            &DeleteParams {
+                preconditions: Some(Preconditions {
+                    resource_version: Some(proof.resource_version.clone()),
+                    uid: Some(proof.uid.clone()),
+                }),
+                ..DeleteParams::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+        Err(error) => Err(error).context("reconcile storage-recovery Kubernetes Lease deletion"),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -679,6 +831,19 @@ fn validate_current_lease(
     scope_sha256: &str,
     now_ms: u64,
 ) -> Result<()> {
+    validate_owned_lease_generation(lease, proof, scope_sha256)?;
+    ensure!(
+        now_ms < proof.expires_at_ms,
+        "storage-recovery Kubernetes Lease expiry has passed"
+    );
+    Ok(())
+}
+
+fn validate_owned_lease_generation(
+    lease: &Lease,
+    proof: &KubernetesLeaseProof,
+    scope_sha256: &str,
+) -> Result<()> {
     validate_scope(lease, scope_sha256)?;
     let spec = lease.spec.as_ref().context("Kubernetes Lease lacks spec")?;
     let acquired_at_ms = timestamp_ms(
@@ -702,9 +867,8 @@ fn validate_current_lease(
             && spec.holder_identity.as_deref() == Some(proof.holder_identity.as_str())
             && acquired_at_ms == proof.acquired_at_ms
             && renew_at_ms == proof.renew_at_ms
-            && expires_at_ms == proof.expires_at_ms
-            && now_ms < expires_at_ms,
-        "storage-recovery Kubernetes Lease ownership, generation, or expiry drifted"
+            && expires_at_ms == proof.expires_at_ms,
+        "storage-recovery Kubernetes Lease ownership or generation drifted"
     );
     Ok(())
 }
@@ -754,6 +918,13 @@ fn now_ms() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+
     use super::*;
 
     const SCOPE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -776,6 +947,52 @@ mod tests {
                 lease_transitions: Some(2),
                 renew_time: Some(micro_time(renew_at_ms).expect("renew time")),
             }),
+        }
+    }
+
+    #[derive(Clone)]
+    struct LeaseApiState {
+        lease: Arc<Mutex<Lease>>,
+        renewals: Arc<AtomicUsize>,
+        expire_first_committed_renewal: Arc<AtomicBool>,
+    }
+
+    async fn get_test_lease(State(state): State<LeaseApiState>) -> Json<Lease> {
+        Json(state.lease.lock().expect("Lease state").clone())
+    }
+
+    async fn replace_test_lease(
+        State(state): State<LeaseApiState>,
+        Json(mut lease): Json<Lease>,
+    ) -> std::result::Result<Json<Lease>, StatusCode> {
+        let current_version = state
+            .lease
+            .lock()
+            .expect("Lease state")
+            .metadata
+            .resource_version
+            .clone()
+            .expect("resourceVersion");
+        assert_eq!(
+            lease.metadata.resource_version.as_deref(),
+            Some(current_version.as_str())
+        );
+        let next_version = current_version.parse::<u64>().expect("numeric version") + 1;
+        lease.metadata.uid = Some("lease-uid".to_string());
+        lease.metadata.resource_version = Some(next_version.to_string());
+        let expire_response = state
+            .expire_first_committed_renewal
+            .swap(false, Ordering::SeqCst);
+        if expire_response {
+            lease.spec.as_mut().expect("Lease spec").renew_time =
+                Some(micro_time(now_ms().expect("current time") - 10_000).expect("renew time"));
+        }
+        *state.lease.lock().expect("Lease state") = lease.clone();
+        state.renewals.fetch_add(1, Ordering::SeqCst);
+        if expire_response {
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        } else {
+            Ok(Json(lease))
         }
     }
 
@@ -837,5 +1054,168 @@ mod tests {
             validate_current_lease(&lease("run/attempt", 10_000, 30), &proof, SCOPE, 40_000)
                 .expect_err("expired Lease must fail closed");
         assert!(error.to_string().contains("expiry"), "{error:#}");
+
+        validate_owned_lease_generation(&lease("run/attempt", 10_000, 30), &proof, SCOPE)
+            .expect("expired exact generation remains safe to delete with preconditions");
+        assert!(validate_owned_lease_generation(&stolen, &proof, SCOPE).is_err());
+    }
+
+    #[test]
+    fn lost_renew_response_adopts_only_the_advanced_owned_generation() {
+        let previous = KubernetesLeaseProof {
+            name: storage_lease_name(SCOPE).expect("name"),
+            uid: "lease-uid".to_string(),
+            resource_version: "20".to_string(),
+            holder_identity: "run/attempt".to_string(),
+            scope_sha256: SCOPE.to_string(),
+            acquired_at_ms: 9_000,
+            renew_at_ms: 10_000,
+            expires_at_ms: 40_000,
+        };
+        let mut advanced = previous.clone();
+        advanced.resource_version = "21".to_string();
+        advanced.renew_at_ms = 40_001;
+        advanced.expires_at_ms = 70_001;
+        validate_advanced_owned_renewal(&previous, &advanced, 40_100, false)
+            .expect("committed renewal response may be recovered");
+
+        validate_advanced_owned_renewal(&previous, &advanced, 70_001, true)
+            .expect("cleanup may recover an expired committed renewal");
+        assert!(validate_advanced_owned_renewal(&previous, &advanced, 70_001, false).is_err());
+
+        let mut foreign = advanced.clone();
+        foreign.holder_identity = "other/attempt".to_string();
+        assert!(validate_advanced_owned_renewal(&previous, &foreign, 40_100, true).is_err());
+        let mut replacement = advanced;
+        replacement.acquired_at_ms += 1;
+        assert!(validate_advanced_owned_renewal(&previous, &replacement, 40_100, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn cleanup_renews_an_expired_advanced_owned_generation() {
+        let observed_at_ms = now_ms().expect("current time");
+        let acquired_at_ms = observed_at_ms - 30_000;
+        let previous_renew_at_ms = observed_at_ms - 20_000;
+        let advanced_renew_at_ms = observed_at_ms - 10_000;
+        let name = storage_lease_name(SCOPE).expect("Lease name");
+        let mut advanced = lease("run/attempt", advanced_renew_at_ms, 5);
+        advanced.metadata.resource_version = Some("21".to_string());
+        advanced.spec.as_mut().expect("Lease spec").acquire_time =
+            Some(micro_time(acquired_at_ms).expect("acquire time"));
+        let state = LeaseApiState {
+            lease: Arc::new(Mutex::new(advanced)),
+            renewals: Arc::new(AtomicUsize::new(0)),
+            expire_first_committed_renewal: Arc::new(AtomicBool::new(false)),
+        };
+        let app = Router::new()
+            .route(
+                &format!("/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{name}"),
+                get(get_test_lease).put(replace_test_lease),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("Lease API server");
+        });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::try_from(kube::Config::new(
+            endpoint.parse().expect("Kubernetes API URI"),
+        ))
+        .expect("Kubernetes client");
+        let adapter = KubernetesStorageLeaseAdapter::new(
+            client,
+            "test-ns",
+            SCOPE,
+            "run",
+            "attempt",
+            Duration::from_secs(5),
+        )
+        .expect("Lease adapter");
+        let previous = KubernetesLeaseProof {
+            name,
+            uid: "lease-uid".to_string(),
+            resource_version: "20".to_string(),
+            holder_identity: "run/attempt".to_string(),
+            scope_sha256: SCOPE.to_string(),
+            acquired_at_ms,
+            renew_at_ms: previous_renew_at_ms,
+            expires_at_ms: previous_renew_at_ms + 5_000,
+        };
+
+        let renewed = adapter
+            .renew_for_cleanup(&previous)
+            .await
+            .expect("cleanup renewal");
+        assert_eq!(renewed.resource_version, "22");
+        assert!(renewed.expires_at_ms > now_ms().expect("current time"));
+        assert_eq!(state.renewals.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cleanup_retries_when_reconciled_renewal_has_already_expired() {
+        let observed_at_ms = now_ms().expect("current time");
+        let acquired_at_ms = observed_at_ms - 40_000;
+        let previous_renew_at_ms = observed_at_ms - 30_000;
+        let advanced_renew_at_ms = observed_at_ms - 20_000;
+        let name = storage_lease_name(SCOPE).expect("Lease name");
+        let mut advanced = lease("run/attempt", advanced_renew_at_ms, 5);
+        advanced.metadata.resource_version = Some("21".to_string());
+        advanced.spec.as_mut().expect("Lease spec").acquire_time =
+            Some(micro_time(acquired_at_ms).expect("acquire time"));
+        let state = LeaseApiState {
+            lease: Arc::new(Mutex::new(advanced)),
+            renewals: Arc::new(AtomicUsize::new(0)),
+            expire_first_committed_renewal: Arc::new(AtomicBool::new(true)),
+        };
+        let app = Router::new()
+            .route(
+                &format!("/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{name}"),
+                get(get_test_lease).put(replace_test_lease),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("Lease API server");
+        });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::try_from(kube::Config::new(
+            endpoint.parse().expect("Kubernetes API URI"),
+        ))
+        .expect("Kubernetes client");
+        let adapter = KubernetesStorageLeaseAdapter::new(
+            client,
+            "test-ns",
+            SCOPE,
+            "run",
+            "attempt",
+            Duration::from_secs(5),
+        )
+        .expect("Lease adapter");
+        let previous = KubernetesLeaseProof {
+            name,
+            uid: "lease-uid".to_string(),
+            resource_version: "20".to_string(),
+            holder_identity: "run/attempt".to_string(),
+            scope_sha256: SCOPE.to_string(),
+            acquired_at_ms,
+            renew_at_ms: previous_renew_at_ms,
+            expires_at_ms: previous_renew_at_ms + 5_000,
+        };
+
+        let renewed = adapter
+            .renew_for_cleanup(&previous)
+            .await
+            .expect("cleanup renewal");
+        assert_eq!(renewed.resource_version, "23");
+        assert!(renewed.expires_at_ms > now_ms().expect("current time"));
+        assert_eq!(state.renewals.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 }

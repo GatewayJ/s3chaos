@@ -882,6 +882,8 @@ pub struct FreshVolumeHostProbeRequest {
     pub host_dev_root: PathBuf,
     pub lock_path: PathBuf,
     pub require_format: bool,
+    #[serde(default)]
+    pub skip_format_read: bool,
     pub scan_empty: bool,
 }
 
@@ -904,6 +906,35 @@ pub struct FreshVolumeHostProbeResponse {
     pub data_entries: Vec<String>,
 }
 
+fn read_rustfs_drive_uuid(
+    format_path: &Path,
+    require_format: bool,
+    skip_format_read: bool,
+) -> Result<Option<String>> {
+    ensure!(
+        !(require_format && skip_format_read),
+        "required format.json cannot be skipped"
+    );
+    if skip_format_read {
+        return Ok(None);
+    }
+    match fs::read(format_path) {
+        Ok(bytes) => {
+            let value: Value = serde_json::from_slice(&bytes).context("decode format.json")?;
+            Ok(Some(
+                value
+                    .pointer("/xl/this")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .context("format.json lacks xl.this")?
+                    .to_string(),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !require_format => Ok(None),
+        Err(error) => Err(error).context("read target format.json"),
+    }
+}
+
 /// Closed host probe used by the dedicated helper image. It performs no
 /// mutation beyond creating the fixed run lock inode and never executes a
 /// caller-supplied command.
@@ -917,7 +948,8 @@ pub fn run_fresh_volume_host_probe(
             && request.volume_root.is_absolute()
             && request.host_proc_root.is_absolute()
             && request.host_dev_root.is_absolute()
-            && request.lock_path.is_absolute(),
+            && request.lock_path.is_absolute()
+            && !(request.require_format && request.skip_format_read),
         "fresh-volume host probe paths must be absolute and non-root"
     );
     let mut pids = Vec::new();
@@ -1020,24 +1052,11 @@ pub fn run_fresh_volume_host_probe(
     let [filesystem_uuid] = filesystem_uuids.as_slice() else {
         bail!("fresh-volume target device does not have exactly one filesystem UUID")
     };
-    let format_path = request.volume_root.join(".rustfs.sys/format.json");
-    let rustfs_drive_uuid = match fs::read(&format_path) {
-        Ok(bytes) => {
-            let value: Value = serde_json::from_slice(&bytes).context("decode format.json")?;
-            Some(
-                value
-                    .pointer("/xl/this")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .context("format.json lacks xl.this")?
-                    .to_string(),
-            )
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !request.require_format => {
-            None
-        }
-        Err(error) => return Err(error).context("read target format.json"),
-    };
+    let rustfs_drive_uuid = read_rustfs_drive_uuid(
+        &request.volume_root.join(".rustfs.sys/format.json"),
+        request.require_format,
+        request.skip_format_read,
+    )?;
     let data_entries = if request.scan_empty {
         exhaustive_entries(&request.volume_root)?
     } else {
@@ -3749,6 +3768,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             host_dev_root: PathBuf::from("/host/dev"),
             lock_path,
             require_format: true,
+            skip_format_read: false,
             scan_empty: false,
         };
         let (initial_probe, _) = probe_helper(
@@ -4296,6 +4316,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             host_dev_root: PathBuf::from("/host/dev"),
             lock_path: empty_lock,
             require_format: false,
+            skip_format_read: false,
             scan_empty: true,
         };
         let (empty_probe, _empty_probe_body) =
@@ -4435,6 +4456,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 self.run_id
             )),
             require_format: true,
+            skip_format_read: false,
             scan_empty: false,
         };
         let (adopted_probe, adopted_probe_body) =
@@ -5592,6 +5614,19 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn skipped_format_read_tolerates_an_eio_backed_volume() {
+        let unreadable = Path::new("/proc/self/mem");
+        assert_eq!(
+            read_rustfs_drive_uuid(unreadable, false, true).expect("skip format read"),
+            None
+        );
+        let error = read_rustfs_drive_uuid(unreadable, true, false)
+            .expect_err("required format read must surface EIO");
+        assert!(error.to_string().contains("read target format.json"));
+        assert!(read_rustfs_drive_uuid(unreadable, true, true).is_err());
     }
 
     #[test]

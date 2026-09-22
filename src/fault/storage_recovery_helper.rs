@@ -40,13 +40,15 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::fault::{
+    fresh_volume::{FreshVolumeHostProbeRequest, run_fresh_volume_host_probe},
     storage_recovery::{FragmentReferenceState, RustfsShardInventoryResponse, ShardInventoryEntry},
     storage_recovery_lease::StorageRecoveryCleanupProof,
     storage_recovery_runtime::{
-        DeviceMapperCommandReceipt, OwnedStorageContext, STORAGE_RECOVERY_HOST_LOCK_DIRECTORY,
-        StaleDeviceMapperAction, StaleDeviceMapperPlan, StaleDeviceMapperTransitionResponse,
-        StorageHelperInvocation, StorageRecoveryHostOperation, StorageRecoveryOperationReceipt,
-        context_sha256, host_generation_sha256, same_storage_volume_generation,
+        DeviceMapperCommandReceipt, HostGenerationIdentity, OwnedStorageContext,
+        STORAGE_RECOVERY_HOST_LOCK_DIRECTORY, StaleDeviceMapperAction, StaleDeviceMapperPlan,
+        StaleDeviceMapperTransitionResponse, StorageHelperInvocation, StorageRecoveryHostOperation,
+        StorageRecoveryOperationReceipt, context_sha256, host_generation_sha256,
+        same_storage_volume_generation,
     },
     xl2_inspector::{
         Xl2InventoryVersionKind, inspect_all_xl_meta, inspect_xl_meta, validate_format_json_drive,
@@ -74,6 +76,10 @@ pub struct StorageHelperRoots {
     pub volume: PathBuf,
     pub journal: PathBuf,
     pub lock: PathBuf,
+    pub host_proc: PathBuf,
+    pub host_dev: PathBuf,
+    #[cfg(test)]
+    pub trust_context_host_generation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -772,6 +778,10 @@ impl Default for StorageHelperRoots {
             volume: PathBuf::from(STORAGE_HELPER_VOLUME_ROOT),
             journal: PathBuf::from(STORAGE_HELPER_JOURNAL_ROOT),
             lock: PathBuf::from(STORAGE_RECOVERY_HOST_LOCK_DIRECTORY),
+            host_proc: PathBuf::from("/host/proc"),
+            host_dev: PathBuf::from("/host/dev"),
+            #[cfg(test)]
+            trust_context_host_generation: false,
         }
     }
 }
@@ -784,6 +794,14 @@ pub enum StorageHelperSessionRequest {
     },
     Execute {
         invocation: Box<StorageHelperInvocation>,
+    },
+    ExecuteMutation {
+        operation_id: String,
+        invocation: Box<StorageHelperInvocation>,
+    },
+    QueryMutation {
+        context: Box<OwnedStorageContext>,
+        operation_id: String,
     },
     StaleExecute {
         context: Box<OwnedStorageContext>,
@@ -803,6 +821,15 @@ pub enum StorageHelperSessionResponse {
     },
     Receipt {
         receipt: Box<StorageRecoveryOperationReceipt>,
+    },
+    MutationLookup {
+        lookup: Box<MutationJournalLookup>,
+    },
+    MutationJournalAbsent {
+        operation_id: String,
+    },
+    MutationRejectedBeforeJournal {
+        message: String,
     },
     StaleResponse {
         response: Box<StaleOfflineHelperResponse>,
@@ -824,6 +851,62 @@ enum JournalState {
     Restored,
     VerifiedSuperseded,
     Quarantined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MutationRecoveryState {
+    Prepared,
+    Mutated,
+    Restored,
+    VerifiedSuperseded,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MutationJournalLookup {
+    pub operation_id: String,
+    pub operation: StorageRecoveryHostOperation,
+    pub state: MutationRecoveryState,
+    pub receipt: Option<Box<StorageRecoveryOperationReceipt>>,
+    pub observed_at_ms: u64,
+}
+
+impl MutationJournalLookup {
+    pub fn validate_for(
+        &self,
+        context: &OwnedStorageContext,
+        operation_id: &str,
+        operation: &StorageRecoveryHostOperation,
+    ) -> Result<()> {
+        ensure!(
+            self.operation_id == operation_id
+                && self.operation == *operation
+                && matches!(operation, StorageRecoveryHostOperation::MutateShard { .. })
+                && self.observed_at_ms >= context.exclusive_access.kubernetes_lease.acquired_at_ms,
+            "mutation lookup does not match the owned operation"
+        );
+        if let Some(receipt) = &self.receipt {
+            receipt.validate_for(context, operation)?;
+            ensure!(
+                receipt.operation_id == operation_id
+                    && matches!(
+                        self.state,
+                        MutationRecoveryState::Mutated
+                            | MutationRecoveryState::Restored
+                            | MutationRecoveryState::VerifiedSuperseded
+                    ),
+                "mutation lookup receipt does not describe a completed mutation"
+            );
+        } else {
+            ensure!(
+                self.state == MutationRecoveryState::Prepared,
+                "mutation lookup omitted a receipt outside the prepared state"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -850,9 +933,13 @@ struct MutationJournal {
     mutated_sha256: Option<String>,
     reason: Option<String>,
     #[serde(default)]
+    terminal_post_inspection_operation_id: Option<String>,
+    #[serde(default)]
     response_body: Option<String>,
     #[serde(default)]
     response_sha256: Option<String>,
+    #[serde(default)]
+    started_at_ms: u64,
     updated_at_ms: u64,
 }
 
@@ -971,10 +1058,17 @@ pub struct OfflineShardRecoveryResponse {
 
 pub struct StorageHelperSession {
     owner: OwnedStorageContext,
+    roots: StorageHelperRoots,
     volume_root: File,
     journal_root: File,
     _lock: File,
     mutation_started: bool,
+}
+
+impl Drop for StorageHelperSession {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl StorageHelperSession {
@@ -1015,6 +1109,7 @@ impl StorageHelperSession {
         ensure_no_unresolved_journals(&journal_root, &context)?;
         Ok(Self {
             owner: context,
+            roots: roots.clone(),
             volume_root,
             journal_root,
             _lock: lock,
@@ -1026,19 +1121,89 @@ impl StorageHelperSession {
         &mut self,
         invocation: StorageHelperInvocation,
     ) -> Result<StorageRecoveryOperationReceipt> {
+        let operation_id = Uuid::new_v4().to_string();
+        self.execute_with_mutation_operation_id(invocation, &operation_id)
+    }
+
+    pub fn execute_mutation_with_id(
+        &mut self,
+        invocation: StorageHelperInvocation,
+        operation_id: &str,
+    ) -> Result<StorageRecoveryOperationReceipt> {
+        ensure!(
+            matches!(
+                invocation.operation,
+                StorageRecoveryHostOperation::MutateShard { .. }
+            ),
+            "explicit helper operationId is restricted to shard mutation"
+        );
+        self.execute_with_mutation_operation_id(invocation, operation_id)
+    }
+
+    fn execute_with_mutation_operation_id(
+        &mut self,
+        invocation: StorageHelperInvocation,
+        mutation_operation_id: &str,
+    ) -> Result<StorageRecoveryOperationReceipt> {
+        Uuid::parse_str(mutation_operation_id)
+            .context("storage helper mutation operationId is not a UUID")?;
         validate_session_context(&self.owner, &invocation.context)?;
         invocation.operation.validate()?;
         let started_at_ms = now_ms()?;
+        let is_shard_mutation = matches!(
+            &invocation.operation,
+            StorageRecoveryHostOperation::MutateShard { .. }
+        );
         if matches!(
             &invocation.operation,
             StorageRecoveryHostOperation::MutateShard { .. }
-                | StorageRecoveryHostOperation::PrepareFreshVolume { .. }
+                | StorageRecoveryHostOperation::RestoreShard { .. }
+                | StorageRecoveryHostOperation::VerifySupersededShard { .. }
+                | StorageRecoveryHostOperation::DetachDeviceMapper { .. }
+                | StorageRecoveryHostOperation::ReattachDeviceMapper { .. }
+        ) {
+            // The intentional EIO table blocks format.json until reattach.
+            // Mount, filesystem, DM UUID, and exact isolation-table identity
+            // still bind the operation to the sealed physical generation.
+            let format_readable = !matches!(
+                &invocation.operation,
+                StorageRecoveryHostOperation::ReattachDeviceMapper { .. }
+            );
+            let observed =
+                observe_current_host_generation(&invocation.context, &self.roots, format_readable)?;
+            let mut expected = invocation.context.host_generation.clone();
+            if let StorageRecoveryHostOperation::ReattachDeviceMapper {
+                isolation_table, ..
+            } = &invocation.operation
+            {
+                expected.device_mapper_table_sha256 =
+                    Some(sha256_bytes(canonical_table(isolation_table)?.as_bytes()));
+            }
+            ensure!(
+                observed == expected,
+                "storage helper host generation drifted before destructive operation"
+            );
+        }
+        if matches!(
+            &invocation.operation,
+            StorageRecoveryHostOperation::PrepareFreshVolume { .. }
                 | StorageRecoveryHostOperation::DetachDeviceMapper { .. }
                 | StorageRecoveryHostOperation::ReattachDeviceMapper { .. }
         ) {
             self.mutation_started = true;
         }
-        match &invocation.operation {
+        let result = match &invocation.operation {
+            StorageRecoveryHostOperation::InspectHostGeneration => {
+                let observed =
+                    observe_current_host_generation(&invocation.context, &self.roots, true)?;
+                completed_receipt(
+                    &invocation.context,
+                    &self.journal_root,
+                    invocation.operation.clone(),
+                    &observed,
+                    started_at_ms,
+                )
+            }
             StorageRecoveryHostOperation::InspectXlMeta {
                 object_directory,
                 bucket,
@@ -1067,6 +1232,7 @@ impl StorageHelperSession {
                 &self.volume_root,
                 &self.journal_root,
                 &invocation.operation,
+                mutation_operation_id,
                 started_at_ms,
             ),
             StorageRecoveryHostOperation::RestoreShard {
@@ -1109,6 +1275,97 @@ impl StorageHelperSession {
                     started_at_ms,
                 )
             }
+        };
+        if is_shard_mutation {
+            self.mutation_started = result.is_ok()
+                || self
+                    .mutation_journal_exists(mutation_operation_id)
+                    .unwrap_or(true);
+        }
+        result
+    }
+
+    pub fn query_mutation(
+        &self,
+        context: &OwnedStorageContext,
+        operation_id: &str,
+    ) -> Result<MutationJournalLookup> {
+        Uuid::parse_str(operation_id)
+            .context("storage helper mutation lookup operationId is not a UUID")?;
+        validate_session_context(&self.owner, context)?;
+        let journal = load_journal(&self.journal_root, operation_id)?;
+        ensure!(
+            journal.schema_version == 1
+                && journal.operation_id == operation_id
+                && journal.context_sha256 == context_sha256(context)?
+                && journal.scope_sha256 == context.scope_sha256
+                && journal.lease_uid == context.exclusive_access.kubernetes_lease.uid
+                && journal.lease_acquired_at_ms
+                    == context.exclusive_access.kubernetes_lease.acquired_at_ms
+                && journal.holder_identity
+                    == context.exclusive_access.kubernetes_lease.holder_identity
+                && matches!(
+                    journal.operation,
+                    StorageRecoveryHostOperation::MutateShard { .. }
+                ),
+            "mutation lookup journal belongs to another operation or context"
+        );
+        let state = match journal.state {
+            JournalState::Prepared => MutationRecoveryState::Prepared,
+            JournalState::Mutated => MutationRecoveryState::Mutated,
+            JournalState::Restored => MutationRecoveryState::Restored,
+            JournalState::VerifiedSuperseded => MutationRecoveryState::VerifiedSuperseded,
+            JournalState::Quarantined => MutationRecoveryState::Quarantined,
+            JournalState::Completed => bail!("mutation lookup journal has an invalid state"),
+        };
+        let receipt = if state == MutationRecoveryState::Prepared {
+            None
+        } else {
+            let response_body = required(&journal.response_body, "mutation response body")?;
+            ensure!(
+                journal.response_sha256.as_deref()
+                    == Some(sha256_bytes(response_body.as_bytes()).as_str()),
+                "mutation lookup response digest mismatch"
+            );
+            Some(Box::new(receipt(
+                context,
+                journal.operation.clone(),
+                operation_id.to_string(),
+                response_body.to_string(),
+                journal.started_at_ms,
+                journal.updated_at_ms,
+            )?))
+        };
+        let lookup = MutationJournalLookup {
+            operation_id: operation_id.to_string(),
+            operation: journal.operation,
+            state,
+            receipt,
+            observed_at_ms: now_ms()?,
+        };
+        lookup.validate_for(context, operation_id, &lookup.operation)?;
+        Ok(lookup)
+    }
+
+    pub fn mutation_journal_exists(&self, operation_id: &str) -> Result<bool> {
+        let name = CString::new(journal_name(operation_id)?)?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = unsafe {
+            libc::fstatat(
+                self.journal_root.as_raw_fd(),
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(false)
+        } else {
+            Err(error).context("inspect storage mutation journal after helper rejection")
         }
     }
 
@@ -1154,6 +1411,90 @@ impl StorageHelperSession {
         );
         cleanup.validate_for(context)
     }
+}
+
+fn observe_current_host_generation(
+    context: &OwnedStorageContext,
+    roots: &StorageHelperRoots,
+    require_format: bool,
+) -> Result<HostGenerationIdentity> {
+    #[cfg(test)]
+    if roots.trust_context_host_generation {
+        return Ok(context.host_generation.clone());
+    }
+
+    let probe = run_fresh_volume_host_probe(&FreshVolumeHostProbeRequest {
+        target_container_id: context.volume.rustfs_container_id.clone(),
+        target_mount_path: context.volume.mount_path.clone(),
+        volume_root: roots.volume.clone(),
+        host_proc_root: roots.host_proc.clone(),
+        host_dev_root: roots.host_dev.clone(),
+        lock_path: roots
+            .lock
+            .join(format!("storage-{}.lock", context.scope_sha256)),
+        require_format,
+        skip_format_read: !require_format,
+        scan_empty: false,
+    })?;
+    ensure!(
+        probe.canonical_device == context.volume.canonical_device,
+        "storage helper canonical device drifted"
+    );
+    let rustfs_drive_uuid = match probe.rustfs_drive_uuid {
+        Some(drive_uuid) => drive_uuid,
+        None if !require_format => context.host_generation.rustfs_drive_uuid.clone(),
+        None => bail!("storage helper format.json drive UUID is absent"),
+    };
+    let (device_mapper_uuid, device_mapper_table_sha256) =
+        if context.host_generation.device_mapper_uuid.is_some() {
+            let (major, minor) = probe
+                .device_major_minor
+                .split_once(':')
+                .context("storage helper device major:minor is malformed")?;
+            let info = run_dmsetup(&[
+                "info",
+                "--columns",
+                "--noheadings",
+                "--separator",
+                "|",
+                "--options",
+                "name,uuid",
+                "-j",
+                major,
+                "-m",
+                minor,
+            ])?;
+            require_dm_success(&info, "host generation query")?;
+            let lines = info.stdout.trim().lines().collect::<Vec<_>>();
+            ensure!(
+                lines.len() == 1,
+                "storage helper device-mapper identity is ambiguous"
+            );
+            let (mapping_name, uuid) = lines[0]
+                .split_once('|')
+                .context("storage helper device-mapper identity is malformed")?;
+            let mapping_name = mapping_name.trim();
+            let uuid = uuid.trim();
+            ensure!(
+                !mapping_name.is_empty() && !uuid.is_empty(),
+                "storage helper device-mapper identity is empty"
+            );
+            let table = run_dmsetup(&["table", "--showkeys", mapping_name])?;
+            require_dm_success(&table, "host generation table query")?;
+            let table = canonical_table(&table.stdout)?;
+            (Some(uuid.to_string()), Some(sha256_bytes(table.as_bytes())))
+        } else {
+            (None, None)
+        };
+    Ok(HostGenerationIdentity {
+        mount_id: probe.mount_id,
+        mount_namespace_id: probe.mount_namespace_id,
+        device_major_minor: probe.device_major_minor,
+        device_mapper_uuid,
+        device_mapper_table_sha256,
+        filesystem_uuid: probe.filesystem_uuid,
+        rustfs_drive_uuid,
+    })
 }
 
 fn transition_device_mapper(
@@ -1526,6 +1867,7 @@ fn mutate(
     volume_root: &File,
     journal_root: &File,
     operation: &StorageRecoveryHostOperation,
+    operation_id: &str,
     started_at_ms: u64,
 ) -> Result<StorageRecoveryOperationReceipt> {
     let StorageRecoveryHostOperation::MutateShard {
@@ -1615,11 +1957,10 @@ fn mutate(
         "controlled shard mutation would not change the shard digest"
     );
 
-    let operation_id = Uuid::new_v4().to_string();
     let prepared_at_ms = now_ms()?;
     let mut journal = MutationJournal {
         schema_version: 1,
-        operation_id: operation_id.clone(),
+        operation_id: operation_id.to_string(),
         context_sha256: context_sha256(context)?,
         scope_sha256: context.scope_sha256.clone(),
         lease_uid: context.exclusive_access.kubernetes_lease.uid.clone(),
@@ -1641,8 +1982,10 @@ fn mutate(
         original_sha256: Some(observed_original.clone()),
         mutated_sha256: Some(expected_mutated_sha256.clone()),
         reason: None,
+        terminal_post_inspection_operation_id: None,
         response_body: None,
         response_sha256: None,
+        started_at_ms,
         updated_at_ms: prepared_at_ms,
     };
     persist_journal(journal_root, &journal)?;
@@ -1669,7 +2012,7 @@ fn mutate(
         "mutated shard digest differs from the precomputed controlled mutation"
     );
     let response = OfflineShardMutationResponse {
-        journal_operation_id: operation_id.clone(),
+        journal_operation_id: operation_id.to_string(),
         relative_part_path: shard.relative_part_path.clone(),
         shard_device_id: shard.shard_device_id.clone(),
         shard_inode: shard.shard_inode,
@@ -1686,7 +2029,7 @@ fn mutate(
     receipt(
         context,
         operation.clone(),
-        operation_id,
+        operation_id.to_string(),
         response_body,
         started_at_ms,
         persisted_at_ms,
@@ -1705,15 +2048,43 @@ fn restore(
     ensure!(
         journal.schema_version == 1
             && journal.operation_id == mutation_operation_id
+            && journal.context_sha256 == context_sha256(context)?
             && journal.scope_sha256 == context.scope_sha256
             && journal.lease_uid == context.exclusive_access.kubernetes_lease.uid
             && journal.lease_acquired_at_ms
                 == context.exclusive_access.kubernetes_lease.acquired_at_ms
             && journal.holder_identity == context.exclusive_access.kubernetes_lease.holder_identity
             && matches!(
-                journal.state,
-                JournalState::Prepared | JournalState::Mutated
+                journal.operation,
+                StorageRecoveryHostOperation::MutateShard { .. }
             ),
+        "mutation journal is not owned by this exact context"
+    );
+    if matches!(
+        journal.state,
+        JournalState::Restored | JournalState::VerifiedSuperseded
+    ) {
+        let original_sha256 =
+            validate_terminal_repaired_shard(context, volume_root, journal_root, &journal)?;
+        let response = OfflineShardRecoveryResponse {
+            mutation_operation_id: mutation_operation_id.to_string(),
+            outcome: crate::fault::storage_recovery_runtime::RestoreOutcome::AlreadyRepaired,
+            observed_sha256: Some(original_sha256),
+        };
+        return completed_receipt_with_id(
+            context,
+            journal_root,
+            operation.clone(),
+            &response,
+            started_at_ms,
+            terminal_cleanup_operation_id(operation),
+        );
+    }
+    ensure!(
+        matches!(
+            journal.state,
+            JournalState::Prepared | JournalState::Mutated
+        ),
         "mutation journal is not recoverable by this exact context"
     );
     let path = required(&journal.relative_part_path, "journal shard path")?;
@@ -1820,12 +2191,13 @@ fn restore(
     };
     journal.updated_at_ms = now_ms()?;
     persist_journal(journal_root, &journal)?;
-    completed_receipt(
+    completed_receipt_with_id(
         context,
         journal_root,
         operation.clone(),
         &response,
         started_at_ms,
+        terminal_cleanup_operation_id(operation),
     )
 }
 
@@ -1847,6 +2219,7 @@ fn verify_superseded(
     ensure!(
         mutation.schema_version == 1
             && mutation.operation_id == *mutation_operation_id
+            && mutation.context_sha256 == context_sha256(context)?
             && mutation.scope_sha256 == context.scope_sha256
             && mutation.holder_identity
                 == context.exclusive_access.kubernetes_lease.holder_identity
@@ -1854,10 +2227,39 @@ fn verify_superseded(
             && mutation.lease_acquired_at_ms
                 == context.exclusive_access.kubernetes_lease.acquired_at_ms
             && matches!(
-                mutation.state,
-                JournalState::Mutated | JournalState::Quarantined
+                mutation.operation,
+                StorageRecoveryHostOperation::MutateShard { .. }
             ),
         "superseded-shard source mutation is absent or not owned by this attempt"
+    );
+    if mutation.state == JournalState::VerifiedSuperseded {
+        ensure!(
+            mutation.terminal_post_inspection_operation_id.as_deref()
+                == Some(post_inspection_operation_id.as_str()),
+            "terminal superseded-shard journal belongs to another post inspection"
+        );
+        let original_sha256 =
+            validate_terminal_repaired_shard(context, volume_root, journal_root, &mutation)?;
+        let response = OfflineShardRecoveryResponse {
+            mutation_operation_id: mutation_operation_id.clone(),
+            outcome: crate::fault::storage_recovery_runtime::RestoreOutcome::VerifiedSuperseded,
+            observed_sha256: Some(original_sha256),
+        };
+        return completed_receipt_with_id(
+            context,
+            journal_root,
+            operation.clone(),
+            &response,
+            started_at_ms,
+            terminal_cleanup_operation_id(operation),
+        );
+    }
+    ensure!(
+        matches!(
+            mutation.state,
+            JournalState::Mutated | JournalState::Quarantined
+        ),
+        "superseded-shard source mutation is not recoverable"
     );
     let StorageRecoveryHostOperation::MutateShard {
         inspection_operation_id,
@@ -1967,6 +2369,7 @@ fn verify_superseded(
     );
     mutation.state = JournalState::VerifiedSuperseded;
     mutation.reason = None;
+    mutation.terminal_post_inspection_operation_id = Some(post_inspection_operation_id.clone());
     mutation.updated_at_ms = now_ms()?;
     persist_journal(journal_root, &mutation)?;
     let response = OfflineShardRecoveryResponse {
@@ -1974,13 +2377,156 @@ fn verify_superseded(
         outcome: crate::fault::storage_recovery_runtime::RestoreOutcome::VerifiedSuperseded,
         observed_sha256: Some(post.selected_part.original_sha256),
     };
-    completed_receipt(
+    completed_receipt_with_id(
         context,
         journal_root,
         operation.clone(),
         &response,
         started_at_ms,
+        terminal_cleanup_operation_id(operation),
     )
+}
+
+fn validate_terminal_repaired_shard(
+    context: &OwnedStorageContext,
+    volume_root: &File,
+    journal_root: &File,
+    mutation: &MutationJournal,
+) -> Result<String> {
+    let original_sha256 = required(&mutation.original_sha256, "mutation original digest")?;
+    ensure!(
+        original_sha256.len() == 64 && original_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "terminal mutation journal has an invalid original digest"
+    );
+    match mutation.state {
+        JournalState::Restored => {
+            let path = required(&mutation.relative_part_path, "journal shard path")?;
+            let expected_device = required(&mutation.shard_device_id, "journal shard device")?;
+            let expected_inode = mutation.shard_inode.context("journal lacks shard inode")?;
+            let expected_size = mutation
+                .shard_size_bytes
+                .context("journal lacks shard size")?;
+            let part = open_beneath(volume_root, path, libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
+            validate_part_identity(&part, expected_device, expected_inode, expected_size)?;
+            ensure!(
+                hash_file(&part, None)? == original_sha256,
+                "terminal restored shard changed before cleanup receipt replay"
+            );
+        }
+        JournalState::VerifiedSuperseded => {
+            let StorageRecoveryHostOperation::MutateShard {
+                inspection_operation_id,
+                part_number,
+                ..
+            } = &mutation.operation
+            else {
+                bail!("terminal superseded-shard journal is not a mutation")
+            };
+            let post_operation_id = required(
+                &mutation.terminal_post_inspection_operation_id,
+                "terminal post inspection operationId",
+            )?;
+            let original = load_journal(journal_root, inspection_operation_id)?;
+            let post = load_journal(journal_root, post_operation_id)?;
+            ensure!(
+                original.schema_version == 1
+                    && original.state == JournalState::Completed
+                    && original.context_sha256 == context_sha256(context)?
+                    && original.scope_sha256 == context.scope_sha256
+                    && original.lease_uid == context.exclusive_access.kubernetes_lease.uid
+                    && original.lease_acquired_at_ms
+                        == context.exclusive_access.kubernetes_lease.acquired_at_ms
+                    && original.holder_identity
+                        == context.exclusive_access.kubernetes_lease.holder_identity
+                    && post.schema_version == 1
+                    && post.state == JournalState::Completed
+                    && post.context_sha256 == context_sha256(context)?
+                    && post.scope_sha256 == context.scope_sha256
+                    && post.lease_uid == context.exclusive_access.kubernetes_lease.uid
+                    && post.lease_acquired_at_ms
+                        == context.exclusive_access.kubernetes_lease.acquired_at_ms
+                    && post.holder_identity
+                        == context.exclusive_access.kubernetes_lease.holder_identity,
+                "terminal post inspection belongs to another context"
+            );
+            let original_response_body =
+                required(&original.response_body, "original inspection response body")?;
+            let response_body = required(&post.response_body, "post inspection response body")?;
+            ensure!(
+                original.response_sha256.as_deref()
+                    == Some(sha256_bytes(original_response_body.as_bytes()).as_str())
+                    && post.response_sha256.as_deref()
+                        == Some(sha256_bytes(response_body.as_bytes()).as_str()),
+                "terminal post inspection response digest mismatch"
+            );
+            let original_response: OfflineXl2InspectResponse =
+                serde_json::from_str(original_response_body)
+                    .context("decode terminal original inspection response")?;
+            let response: OfflineXl2InspectResponse = serde_json::from_str(response_body)
+                .context("decode terminal post inspection response")?;
+            let StorageRecoveryHostOperation::InspectXlMeta {
+                bucket: original_bucket,
+                object_key: original_key,
+                object_sha256: original_object_sha256,
+                version_id: original_version,
+                selected_part_number: original_part,
+                expected_mount_device_id: original_device,
+                expected_drive_uuid: original_drive,
+                ..
+            } = &original.operation
+            else {
+                bail!("terminal source inspection has the wrong operation")
+            };
+            let StorageRecoveryHostOperation::InspectXlMeta {
+                bucket: post_bucket,
+                object_key: post_key,
+                object_sha256: post_object_sha256,
+                version_id: post_version,
+                selected_part_number: post_part,
+                expected_mount_device_id: post_device,
+                expected_drive_uuid: post_drive,
+                ..
+            } = &post.operation
+            else {
+                bail!("terminal post inspection has the wrong operation")
+            };
+            ensure!(
+                original_bucket == post_bucket
+                    && original_key == post_key
+                    && original_object_sha256 == post_object_sha256
+                    && original_version == post_version
+                    && original_part == part_number
+                    && post_part == part_number
+                    && original_device == post_device
+                    && original_drive == post_drive
+                    && original_response.selected_part.part_number == *part_number
+                    && response.selected_part.part_number == *part_number
+                    && mutation
+                        .shard_inode
+                        .is_some_and(|inode| response.selected_part.shard_inode != inode)
+                    && response.selected_part.original_sha256 == original_sha256,
+                "terminal post inspection does not prove the exact superseding shard"
+            );
+            let part = open_beneath(
+                volume_root,
+                &response.selected_part.relative_part_path,
+                libc::O_RDONLY | libc::O_CLOEXEC,
+                0,
+            )?;
+            validate_part_identity(
+                &part,
+                &response.selected_part.shard_device_id,
+                response.selected_part.shard_inode,
+                response.selected_part.shard_size_bytes,
+            )?;
+            ensure!(
+                hash_file(&part, None)? == original_sha256,
+                "terminal superseding shard changed before cleanup receipt replay"
+            );
+        }
+        _ => bail!("mutation journal is not in a terminal repaired state"),
+    }
+    Ok(original_sha256.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2032,7 +2578,34 @@ fn completed_receipt(
     response: &impl Serialize,
     started_at_ms: u64,
 ) -> Result<StorageRecoveryOperationReceipt> {
-    let operation_id = Uuid::new_v4().to_string();
+    // Heartbeats only need their latest durable observation. Mutation and XL2
+    // receipts retain distinct IDs because later operations refer to them.
+    let operation_id = if matches!(
+        operation,
+        StorageRecoveryHostOperation::InspectHostGeneration
+    ) {
+        stable_operation_id(&format!("s3chaos-host-generation:{}", context.scope_sha256))
+    } else {
+        Uuid::new_v4().to_string()
+    };
+    completed_receipt_with_id(
+        context,
+        journal_root,
+        operation,
+        response,
+        started_at_ms,
+        operation_id,
+    )
+}
+
+fn completed_receipt_with_id(
+    context: &OwnedStorageContext,
+    journal_root: &File,
+    operation: StorageRecoveryHostOperation,
+    response: &impl Serialize,
+    started_at_ms: u64,
+    operation_id: String,
+) -> Result<StorageRecoveryOperationReceipt> {
     let persisted_at_ms = now_ms()?;
     let journal = MutationJournal {
         schema_version: 1,
@@ -2058,8 +2631,10 @@ fn completed_receipt(
         original_sha256: None,
         mutated_sha256: None,
         reason: None,
+        terminal_post_inspection_operation_id: None,
         response_body: Some(serde_json::to_string(response)?),
         response_sha256: None,
+        started_at_ms,
         updated_at_ms: persisted_at_ms,
     };
     let mut journal = journal;
@@ -2077,6 +2652,29 @@ fn completed_receipt(
         started_at_ms,
         persisted_at_ms,
     )
+}
+
+fn terminal_cleanup_operation_id(operation: &StorageRecoveryHostOperation) -> String {
+    let identity = match operation {
+        StorageRecoveryHostOperation::RestoreShard {
+            mutation_operation_id,
+        } => format!("restore:{mutation_operation_id}"),
+        StorageRecoveryHostOperation::VerifySupersededShard {
+            mutation_operation_id,
+            post_inspection_operation_id,
+        } => format!("verify:{mutation_operation_id}:{post_inspection_operation_id}"),
+        _ => unreachable!("terminal cleanup operation id requires a cleanup operation"),
+    };
+    stable_operation_id(&format!("s3chaos-bitrot-cleanup:{identity}"))
+}
+
+fn stable_operation_id(identity: &str) -> String {
+    let digest = Sha256::digest(identity.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes).to_string()
 }
 
 fn receipt(
@@ -2418,6 +3016,9 @@ mod tests {
             volume: temporary.path().join("volume"),
             journal: temporary.path().join("journal"),
             lock: temporary.path().join("lock"),
+            host_proc: temporary.path().join("host-proc"),
+            host_dev: temporary.path().join("host-dev"),
+            trust_context_host_generation: true,
         };
         (temporary, roots)
     }
@@ -2541,6 +3142,8 @@ mod tests {
         context.exclusive_access.kubernetes_lease.resource_version = "21".to_string();
         context.exclusive_access.kubernetes_lease.renew_at_ms += 1;
         context.exclusive_access.kubernetes_lease.expires_at_ms += 60_000;
+        context.observed_at_ms += 1;
+        context.volume.observed_at_ms = context.observed_at_ms;
         context
     }
 
@@ -2613,6 +3216,37 @@ mod tests {
             bucket: "bucket-stale-1".to_string(),
             operation,
         }
+    }
+
+    #[test]
+    fn host_generation_heartbeats_reuse_one_durable_journal() {
+        let (_directory, roots) = test_roots();
+        let context = context_for(&roots);
+        let journal = open_directory(&roots.journal, "journal root").expect("journal");
+        let mut ids = std::collections::BTreeSet::new();
+        for _ in 0..20 {
+            let observed_at = now_ms().expect("clock");
+            let receipt = completed_receipt(
+                &context,
+                &journal,
+                StorageRecoveryHostOperation::InspectHostGeneration,
+                &context.host_generation,
+                observed_at,
+            )
+            .expect("heartbeat");
+            receipt
+                .validate_for(&context, &receipt.operation)
+                .expect("durable receipt");
+            ids.insert(receipt.operation_id);
+        }
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            fs::read_dir(&roots.journal).expect("journal files").count(),
+            1
+        );
+        let persisted =
+            load_journal(&journal, ids.first().expect("operation id")).expect("latest journal");
+        assert_eq!(persisted.state, JournalState::Completed);
     }
 
     #[test]
@@ -2974,6 +3608,45 @@ mod tests {
     }
 
     #[test]
+    fn prejournal_mutation_rejection_allows_abort_and_has_no_journal() {
+        let (_temporary, roots) = test_roots();
+        let part_path = roots.volume.join("bucket/object/data-dir/part.1");
+        fs::create_dir_all(part_path.parent().expect("part parent")).expect("part parent");
+        fs::write(&part_path, b"original shard payload").expect("part");
+        let context = context_for(&roots);
+        let operation = mutation(&context, &roots, part_path.to_str().expect("part path"));
+        let mut changed = fs::read(&part_path).expect("part body");
+        changed[0] ^= CONTROLLED_SHARD_XOR_MASK;
+        fs::write(&part_path, &changed).expect("change shard before mutation");
+        let operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab";
+        let mut session = StorageHelperSession::begin(context.clone(), &roots).expect("session");
+        let error = session
+            .execute_mutation_with_id(
+                StorageHelperInvocation {
+                    context: context.clone(),
+                    operation,
+                },
+                operation_id,
+            )
+            .expect_err("changed shard must reject before journal creation");
+        assert!(error.to_string().contains("hash drifted before mutation"));
+        assert!(
+            !session
+                .mutation_journal_exists(operation_id)
+                .expect("journal absence")
+        );
+        session
+            .finish(
+                &context,
+                &StorageRecoveryCleanupProof::AbortedBeforeMutation {
+                    observed_at_ms: now_ms().expect("now"),
+                },
+            )
+            .expect("pre-journal rejection releases helper ownership");
+        assert_eq!(fs::read(part_path).expect("part body"), changed);
+    }
+
+    #[test]
     fn fresh_volume_cleanup_requires_committed_physical_replacement() {
         let (_temporary, roots) = test_roots();
         let mut context = context_for(&roots);
@@ -3133,6 +3806,170 @@ mod tests {
     }
 
     #[test]
+    fn mutation_journal_lookup_recovers_a_lost_helper_response() {
+        let (_temporary, roots) = test_roots();
+        let part_path = roots.volume.join("bucket/object/data-dir/part.1");
+        fs::create_dir_all(part_path.parent().expect("part parent")).expect("part parent");
+        fs::write(&part_path, b"original shard payload").expect("part");
+        let context = context_for(&roots);
+        let operation = mutation(&context, &roots, part_path.to_str().expect("part path"));
+        let operation_id = "99999999-9999-9999-9999-999999999999";
+        let mut session = StorageHelperSession::begin(context.clone(), &roots).expect("session");
+        let lost_receipt = session
+            .execute_mutation_with_id(
+                StorageHelperInvocation {
+                    context: context.clone(),
+                    operation: operation.clone(),
+                },
+                operation_id,
+            )
+            .expect("durable mutation with a lost controller response");
+
+        let lookup = session
+            .query_mutation(&context, operation_id)
+            .expect("query durable mutation journal");
+        lookup
+            .validate_for(&context, operation_id, &operation)
+            .expect("receipt needed for emergency recovery");
+        assert_eq!(lookup.state, MutationRecoveryState::Mutated);
+        assert_eq!(
+            lookup
+                .receipt
+                .as_deref()
+                .map(|receipt| receipt.response_sha256.as_str()),
+            Some(lost_receipt.response_sha256.as_str())
+        );
+
+        let first_cleanup = session
+            .execute(StorageHelperInvocation {
+                context: context.clone(),
+                operation: StorageRecoveryHostOperation::RestoreShard {
+                    mutation_operation_id: operation_id.to_string(),
+                },
+            })
+            .expect("restore mutation after response recovery");
+        fs::write(&part_path, b"changed shard payload!").expect("change restored shard");
+        assert!(
+            session
+                .execute(StorageHelperInvocation {
+                    context: context.clone(),
+                    operation: StorageRecoveryHostOperation::RestoreShard {
+                        mutation_operation_id: operation_id.to_string(),
+                    },
+                })
+                .is_err()
+        );
+        fs::write(&part_path, b"original shard payload").expect("repair restored shard");
+        let replayed_cleanup = session
+            .execute(StorageHelperInvocation {
+                context,
+                operation: StorageRecoveryHostOperation::RestoreShard {
+                    mutation_operation_id: operation_id.to_string(),
+                },
+            })
+            .expect("replay terminal cleanup after helper termination");
+        assert_eq!(first_cleanup.operation_id, replayed_cleanup.operation_id);
+        assert_eq!(
+            fs::read(part_path).expect("restored part"),
+            b"original shard payload"
+        );
+    }
+
+    #[test]
+    fn verified_superseded_terminal_journal_replays_cleanup_receipt() {
+        let (_temporary, roots) = test_roots();
+        let part_path = roots.volume.join("bucket/object/data-dir/part.1");
+        fs::create_dir_all(part_path.parent().expect("part parent")).expect("part parent");
+        fs::write(&part_path, b"original shard payload").expect("part");
+        let context = context_for(&roots);
+        let operation = mutation(&context, &roots, part_path.to_str().expect("part path"));
+        let operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut session = StorageHelperSession::begin(context.clone(), &roots).expect("session");
+        session
+            .execute_mutation_with_id(
+                StorageHelperInvocation {
+                    context: context.clone(),
+                    operation,
+                },
+                operation_id,
+            )
+            .expect("mutation");
+        let superseded_path = part_path.with_extension("superseded");
+        fs::rename(&part_path, &superseded_path).expect("retain superseded shard inode");
+        fs::write(&part_path, b"original shard payload").expect("superseding repaired shard");
+        let post_inspection = mutation(&context, &roots, part_path.to_str().expect("part path"));
+        let StorageRecoveryHostOperation::MutateShard {
+            inspection_operation_id: post_inspection_operation_id,
+            ..
+        } = post_inspection
+        else {
+            unreachable!("post inspection fixture returns a mutation operation")
+        };
+        let journal_root = open_directory(&roots.journal, "journal root").expect("journal root");
+        let mut journal = load_journal(&journal_root, operation_id).expect("mutation journal");
+        journal.state = JournalState::VerifiedSuperseded;
+        journal.terminal_post_inspection_operation_id = Some(post_inspection_operation_id.clone());
+        journal.updated_at_ms = now_ms().expect("now");
+        persist_journal(&journal_root, &journal).expect("terminal journal");
+        let verify = StorageRecoveryHostOperation::VerifySupersededShard {
+            mutation_operation_id: operation_id.to_string(),
+            post_inspection_operation_id,
+        };
+        let first = session
+            .execute(StorageHelperInvocation {
+                context: context.clone(),
+                operation: verify.clone(),
+            })
+            .expect("rebuild cleanup receipt");
+        let second = session
+            .execute(StorageHelperInvocation {
+                context: context.clone(),
+                operation: verify,
+            })
+            .expect("replay rebuilt cleanup receipt");
+        assert_eq!(first.operation_id, second.operation_id);
+        assert!(
+            session
+                .execute(StorageHelperInvocation {
+                    context: context.clone(),
+                    operation: StorageRecoveryHostOperation::VerifySupersededShard {
+                        mutation_operation_id: operation_id.to_string(),
+                        post_inspection_operation_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+                            .to_string(),
+                    },
+                })
+                .is_err()
+        );
+        fs::write(&part_path, b"changed superseding shard").expect("change superseding shard");
+        assert!(
+            session
+                .execute(StorageHelperInvocation {
+                    context: context.clone(),
+                    operation: StorageRecoveryHostOperation::RestoreShard {
+                        mutation_operation_id: operation_id.to_string(),
+                    },
+                })
+                .is_err()
+        );
+        fs::write(&part_path, b"original shard payload").expect("repair superseding shard");
+        let restore = session
+            .execute(StorageHelperInvocation {
+                context,
+                operation: StorageRecoveryHostOperation::RestoreShard {
+                    mutation_operation_id: operation_id.to_string(),
+                },
+            })
+            .expect("recover terminal mutation through restore");
+        assert_ne!(restore.operation_id, first.operation_id);
+        let response: OfflineShardRecoveryResponse =
+            serde_json::from_str(&restore.response_body).expect("restore response");
+        assert_eq!(
+            response.outcome,
+            crate::fault::storage_recovery_runtime::RestoreOutcome::AlreadyRepaired
+        );
+    }
+
+    #[test]
     fn prepared_journal_recovers_after_helper_dies_post_mutation() {
         let (_temporary, roots) = test_roots();
         let part_path = roots.volume.join("bucket/object/data-dir/part.1");
@@ -3182,8 +4019,10 @@ mod tests {
             original_sha256: Some(original_sha256),
             mutated_sha256: Some(mutated_sha256),
             reason: None,
+            terminal_post_inspection_operation_id: None,
             response_body: None,
             response_sha256: None,
+            started_at_ms: now_ms().expect("now"),
             updated_at_ms: now_ms().expect("now"),
         };
         let journal_root = open_directory(&roots.journal, "journal root").expect("journal root");
