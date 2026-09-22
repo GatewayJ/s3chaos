@@ -176,8 +176,10 @@ guardrails when implementing the ordered TODO below.
   Meaning: current executable catalog scenarios still mostly cover
   inject-recover-verify faults. Fresh volume replacement, admin
   decommission/rebalance, on-disk bitrot, and stale disk with dangling cleanup
-  now have closed qualification workflows but remain Planned pending live
-  evidence. Long-run suite campaigns remain in the ordered TODO below.
+  have closed qualification workflows. Fresh-volume replacement and bitrot are
+  executable; admin topology and stale-disk return remain Planned. All still
+  require live qualification before release gating. Long-run suite campaigns
+  remain in the ordered TODO below.
 
 - [ ] PARTIAL: Keep admin operations as scenario-owned product/recovery steps.
   Meaning: decommission/rebalance now have a fault-owned narrow port, typed
@@ -456,8 +458,8 @@ guardrails when implementing the ordered TODO below.
   `host-storage-post-cleanup.json`. Failed mapper rollback attempts suspension
   and retains the helper and mutation marker for manual recovery. A filesystem
   check failure instead leaves the recovered mapper active, the filesystem
-  unmounted, and the node quarantined. PV replacement, bitrot, and stale-disk
-  flows remain qualification-only Planned entries; their adapters now apply
+  unmounted, and the node quarantined. PV replacement and bitrot are executable;
+  stale-disk return remains Planned. Their adapters apply
   scenario-specific PV, device, mutation, inventory, and rollback proofs and
   still require live qualification.
 
@@ -546,8 +548,8 @@ Reporting only projects this typed checker result into failure-summary fields.
   volumes, before declaring heal success. `ForceReadThroughProof` now rejects
   any artifact that does not leave exactly read quorum online or excludes the
   repaired shard. Fresh-volume and bitrot qualification drivers now execute
-  that exact-quorum targeting; live-cluster calibration remains before either
-  scenario can leave Planned status.
+  that exact-quorum targeting through executable scenarios; live-cluster
+  calibration remains required before release gating.
 
 - [ ] PARTIAL: Add `fresh-volume-replacement-heal`.
   Meaning: replace one PVC/PV with an empty volume, record original and
