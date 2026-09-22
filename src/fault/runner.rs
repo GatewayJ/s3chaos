@@ -30,10 +30,7 @@ use crate::{
         history::Recorder,
         plan::{ExecutionPlan, FaultPlan, FaultPlanOptions},
         preflight::{PreflightPhase, PreflightSummary, TargetProof},
-        reporting::{
-            FailureSummary, RunMetadata, write_failure_summary as persist_failure_summary,
-            write_failure_summary_if_absent,
-        },
+        reporting::{FailureSummary, RunMetadata, write_failure_summary_if_absent},
         scenarios::{self, FaultScenario, FaultScenarioSpec},
         spec::FaultRunSpec,
         suite_plan::fault_run_id,
@@ -52,6 +49,7 @@ mod ack;
 mod injection;
 mod node_down;
 mod post_recovery;
+mod quorum_activation;
 mod recovery;
 mod setup;
 pub(crate) mod targets;
@@ -221,15 +219,25 @@ async fn run_fault_case(
                     .run(run.prove_target(&prepared.endpoint, &mut preflight_phases))
                     .await?;
                 deadline.check()?;
-                let mut active = run.activate_fault(&target)?;
-                let mut workload = run
-                    .exercise_fault(&mut prepared, &target, &active, &staged_multipart_uploads)
-                    .await?;
-                deadline.check()?;
+                let mut active = run.activate_fault(&target).await?;
+                let skip_typed_oracle = active.quorum_activation.as_ref().is_some_and(|evidence| {
+                    evidence.evidence().disposition()
+                        == crate::fault::quorum::activation::QuorumActivationDisposition::SkipTypedOracleAndRecover
+                });
+                let mut workload = if skip_typed_oracle {
+                    run.skip_unqualified_quorum_workload(&active)?
+                } else {
+                    run.exercise_fault(&mut prepared, &target, &active, &staged_multipart_uploads)
+                        .await?
+                };
+                if !skip_typed_oracle {
+                    deadline.check()?;
+                }
                 run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
                 run.hold_node_down(&mut prepared, &target, &active.fault)
                     .await?;
                 let removal = run.remove_fault(&mut active.fault)?;
+                run.cleanup_quorum_activation_canaries(&mut active).await;
                 let recovered = run
                     .recover_access(&mut prepared, &target, &mut staged_multipart_uploads)
                     .await?;
@@ -250,7 +258,12 @@ async fn run_fault_case(
                 run.recommit(&prepared.s3, &mut workload.workload).await?;
                 deadline
                     .run(run.verify_final(&prepared.s3, &workload.workload, &mut evidence))
-                    .await
+                    .await?;
+                if let Some(reason) = active.deferred_failure.as_deref() {
+                    let error = anyhow::anyhow!(reason.to_string());
+                    return Err(error);
+                }
+                Ok(())
             }
             .await
         };
@@ -414,6 +427,8 @@ struct ProvenTarget {
 }
 
 struct ActiveFault {
+    // Field order is a cleanup invariant: the backend fault must be dropped
+    // before the canary guard performs its cancellation fallback.
     fault: AppliedFault,
     fault_prepare_started_at_ms: Option<u64>,
     fault_apply_started_at_ms: u64,
@@ -423,6 +438,8 @@ struct ActiveFault {
     active_partition_targets: BTreeSet<String>,
     active_fixed_volume_targets: BTreeSet<String>,
     active_fixed_volume_containers: BTreeMap<String, String>,
+    quorum_activation: Option<quorum_activation::QuorumCanaryCleanupGuard>,
+    deferred_failure: Option<String>,
 }
 
 struct FaultWorkload {
@@ -436,6 +453,7 @@ struct FaultWorkload {
     workload_fixed_volume_containers: BTreeMap<String, String>,
     quorum_health_before_workload: Option<QuorumHealthObservation>,
     quorum_health_after_workload: Option<QuorumHealthObservation>,
+    ran_under_fault: bool,
 }
 
 struct WorkloadTargetEvidence {
@@ -451,7 +469,7 @@ struct FaultRemoval {
 
 impl FaultRun<'_> {
     fn write_failure_summary(&self, summary: FailureSummary) -> Result<()> {
-        persist_failure_summary(
+        write_failure_summary_if_absent(
             self.collector,
             self.scenario.case_name,
             summary.with_run_id(&self.context.run_id),

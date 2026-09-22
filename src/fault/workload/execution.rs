@@ -1272,6 +1272,22 @@ pub(in crate::fault) struct MixedWorkloadResult {
 }
 
 impl MixedWorkloadResult {
+    pub(in crate::fault) fn skipped_after_unqualified_activation(
+        plan: &WorkloadPlan,
+        scenario: &str,
+        run_id: &str,
+    ) -> Self {
+        Self {
+            summary: WorkloadSummary::new(plan, scenario, run_id),
+            unconfirmed_puts: Vec::new(),
+            commit_probe: ReadProbeSummary {
+                objects: 0,
+                verified: 0,
+                failures: Vec::new(),
+            },
+        }
+    }
+
     pub(in crate::fault) fn seal_recommit_candidates(
         &mut self,
         s3: &S3WorkloadClient,

@@ -47,6 +47,7 @@ use crate::fault::{
         ExecutionKind, ExecutionPlan, FaultInjection, FaultInjectionParameters, FaultPlan,
         FaultSelection, FaultTarget, FaultWorkloadMode,
     },
+    quorum::QUORUM_FAULT_ACTIVATION_ARTIFACT,
     scenarios::{
         FRESH_VOLUME_REPLACEMENT_SCENARIO, FaultDetectorContract, FaultScenario, FaultScenarioSpec,
         acknowledged_mutation_kind, scenario_spec,
@@ -575,6 +576,13 @@ impl FaultRunArtifactSpec {
         }
         if crate::fault::scenarios::requires_quorum_edge_read_survival(scenario) {
             names.push(QUORUM_EDGE_READ_SURVIVAL_ARTIFACT.to_string());
+        }
+        if matches!(
+            scenario,
+            crate::fault::scenarios::QUORUM_P_IO_FAULT_SCENARIO
+                | crate::fault::scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        ) {
+            names.push(QUORUM_FAULT_ACTIVATION_ARTIFACT.to_string());
         }
         if crate::fault::scenarios::holds_node_down_after_crash(scenario) {
             names.extend(
