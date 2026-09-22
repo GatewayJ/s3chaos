@@ -26,6 +26,7 @@ pub const HOST_STORAGE_PROOF_MAX_AGE_MS: u64 = 60_000;
 
 const DM_FLAKEY_KIND: &str = "rustfs_block_device_flakey";
 const DM_DROP_WRITES_KIND: &str = "rustfs_block_device_drop_writes_crash";
+pub const DM_QUORUM_EIO_KIND: &str = "rustfs_block_device_quorum_eio";
 pub const DM_STALE_RETURN_KIND: &str = "rustfs_block_device_stale_return";
 const DM_CRASH_TAINT_KEY: &str = "s3chaos.rustfs.com/dm-crash";
 const READ_ONLY_PREFLIGHT_SCOPE: &str = "read-only Kubernetes and host metadata observation plus proof artifact write; no disk, PV, PVC, object, or power mutation";
@@ -581,7 +582,7 @@ fn canonical_table_contract(
             }
             expected
         }
-        DM_STALE_RETURN_KIND => {
+        DM_STALE_RETURN_KIND | DM_QUORUM_EIO_KIND => {
             let expected = format!(
                 "{} {} flakey {} {} 0 86400 2 error_reads error_writes",
                 recovery.start_sector,
@@ -861,7 +862,7 @@ fn canonical_recovery_contract(
     tables: &DeviceMapperTableContract,
 ) -> Result<HostStorageRecoveryContract> {
     let suspend_mode = match fault_kind {
-        DM_FLAKEY_KIND | DM_STALE_RETURN_KIND => "noflush",
+        DM_FLAKEY_KIND | DM_STALE_RETURN_KIND | DM_QUORUM_EIO_KIND => "noflush",
         DM_DROP_WRITES_KIND => "nolockfs",
         other => bail!("fault kind {other:?} is not a host-storage mutation"),
     };
@@ -929,7 +930,7 @@ fn ensure_sha256(label: &str, value: &str) -> Result<()> {
 
 fn ensure_supported_dm_kind(fault_kind: &str) -> Result<()> {
     match fault_kind {
-        DM_FLAKEY_KIND | DM_DROP_WRITES_KIND | DM_STALE_RETURN_KIND => Ok(()),
+        DM_FLAKEY_KIND | DM_DROP_WRITES_KIND | DM_STALE_RETURN_KIND | DM_QUORUM_EIO_KIND => Ok(()),
         other => bail!("fault kind {other:?} is not a supported device-mapper mutation"),
     }
 }
@@ -1295,6 +1296,27 @@ mod tests {
             "0 1024 linear /dev/loop0 0"
         );
         assert_eq!(proof.recovery.rollback.recovery_table_sha256.len(), 64);
+    }
+
+    #[test]
+    fn quorum_eio_table_has_no_healthy_interval_and_rejects_foreign_geometry() {
+        let mut request = intent();
+        request.fault_kind = super::DM_QUORUM_EIO_KIND.into();
+        request.fault_table = None;
+        let proof =
+            HostStorageMutationProof::prove_device_mapper(request.clone(), observation()).unwrap();
+        assert_eq!(
+            proof.tables.fault_table,
+            "0 1024 flakey /dev/loop0 0 0 86400 2 error_reads error_writes"
+        );
+        assert_eq!(proof.recovery.rollback.suspend_mode, "noflush");
+        proof.validate().unwrap();
+        let mut redirected = proof.clone();
+        redirected.target.persistent_volume = "foreign-pv".into();
+        assert!(redirected.validate().is_err());
+        request.fault_table =
+            Some("0 1024 flakey /dev/loop1 0 0 86400 2 error_reads error_writes".into());
+        assert!(HostStorageMutationProof::prove_device_mapper(request, observation()).is_err());
     }
 
     #[test]
