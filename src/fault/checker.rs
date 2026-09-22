@@ -25,10 +25,8 @@ use crate::fault::{
         ByteRange, ListedVersionEntry, OperationKind, OperationOutcome, OperationRecord,
         PayloadRef, Recorder, validate_history_phase_boundary, validate_history_scope_and_order,
     },
-    scenarios::acknowledged_mutation_kind,
     workload::{
-        GetObjectResult, ObjectSpec, ObjectVersionEntry, S3_WORKLOAD_MUTATION_MAX_ATTEMPTS,
-        S3WorkloadClient, seeded_bytes, sha256_hex,
+        GetObjectResult, ObjectSpec, ObjectVersionEntry, S3WorkloadClient, seeded_bytes, sha256_hex,
     },
 };
 
@@ -3031,7 +3029,7 @@ fn listed_version_lineage_conflicts<T: ListedVersionIdentity>(
         record.kind == OperationKind::Delete && record.request_version_id.is_none()
     }) {
         if let Some(key) = record.key.as_deref() {
-            let max_attempts = mutation_max_attempts(record);
+            let max_attempts = mutation_attempts(record);
             let budget = match record.outcome {
                 OperationOutcome::Ok => max_attempts.saturating_sub(1),
                 OperationOutcome::Timeout | OperationOutcome::Unknown => max_attempts,
@@ -4450,6 +4448,26 @@ pub(crate) fn recovery_key_sets_are_consistent(report: &RecoveryStabilityReport)
             .all(|key| still_unavailable.contains(key))
 }
 
+pub(crate) fn validate_recovery_stability_against_checker(
+    recovery: &RecoveryStabilityReport,
+    checker: &CheckerReport,
+) -> Result<()> {
+    ensure!(
+        recovery.immediate_passed == checker.passed
+            && recovery.final_list_warning_count == checker.final_list_warning_count
+            && recovery.list_warnings == checker.list_warnings,
+        "recovery-stability-report.json immediate verdict or LIST evidence does not match the checker"
+    );
+    validate_recovery_key_sets(recovery, checker)
+        .context("recovery-stability-report.json key evidence is not bound to checker evidence")?;
+    ensure!(
+        recovery.classification == classify_recovery_stability(recovery, checker),
+        "recovery-stability-report.json classification does not match its checker/recovery evidence: expected {}",
+        classify_recovery_stability(recovery, checker).as_str()
+    );
+    Ok(())
+}
+
 pub(crate) fn validate_recovery_key_sets(
     report: &RecoveryStabilityReport,
     immediate_report: &CheckerReport,
@@ -4621,7 +4639,7 @@ fn object_model(records: &[OperationRecord]) -> ObjectModel {
 }
 
 fn version_write_source_budget(record: &OperationRecord) -> usize {
-    let max_attempts = mutation_max_attempts(record);
+    let max_attempts = mutation_attempts(record);
     match (record.kind, record.outcome) {
         (OperationKind::Put, OperationOutcome::Ok) => max_attempts.saturating_sub(1),
         (OperationKind::Put, OperationOutcome::Timeout | OperationOutcome::Unknown) => max_attempts,
@@ -4629,7 +4647,7 @@ fn version_write_source_budget(record: &OperationRecord) -> usize {
         (
             OperationKind::CompleteMultipartUpload,
             OperationOutcome::Timeout | OperationOutcome::Unknown,
-        ) => 1,
+        ) => max_attempts.min(1),
         (
             OperationKind::CompleteMultipartUpload,
             OperationOutcome::Failed | OperationOutcome::NotFound,
@@ -4638,17 +4656,10 @@ fn version_write_source_budget(record: &OperationRecord) -> usize {
     }
 }
 
-fn mutation_max_attempts(record: &OperationRecord) -> usize {
-    record.mutation_max_attempts.map_or_else(
-        || {
-            if acknowledged_mutation_kind(&record.scenario).is_some() {
-                1
-            } else {
-                S3_WORKLOAD_MUTATION_MAX_ATTEMPTS as usize
-            }
-        },
-        |attempts| attempts as usize,
-    )
+fn mutation_attempts(record: &OperationRecord) -> usize {
+    // Legacy records cannot prove retries. One ambiguous request may explain
+    // one version, but a configured ceiling is never evidence of transmissions.
+    record.mutation_attempts.unwrap_or(1) as usize
 }
 
 fn record_version_write_source(model: &mut ObjectModel, record: &OperationRecord) {
@@ -4687,6 +4698,14 @@ fn record_version_write_source(model: &mut ObjectModel, record: &OperationRecord
 }
 
 fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
+    if record.mutation_attempts == Some(0)
+        && matches!(
+            record.kind,
+            OperationKind::Put | OperationKind::Delete | OperationKind::CompleteMultipartUpload
+        )
+    {
+        return;
+    }
     match record.kind {
         OperationKind::Put | OperationKind::CompleteMultipartUpload
             if record.outcome == OperationOutcome::Ok =>
@@ -4777,7 +4796,7 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
                 record.outcome,
                 OperationOutcome::Timeout | OperationOutcome::Unknown
             ) || (record.outcome == OperationOutcome::Failed
-                && mutation_max_attempts(record) > 1) =>
+                && mutation_attempts(record) > 1) =>
         {
             // An ambiguous delete of a committed object may or may not have
             // taken effect; mark it so a post-recovery 404 is tolerated instead
@@ -5612,6 +5631,8 @@ mod tests {
             request_version_id: None,
             is_delete_marker: None,
             mutation_max_attempts: None,
+            mutation_attempts: None,
+            read_purpose: None,
             payload_ref: None,
             range: None,
             started_sequence: None,
@@ -5681,6 +5702,8 @@ mod tests {
             request_version_id: None,
             is_delete_marker: None,
             mutation_max_attempts: None,
+            mutation_attempts: None,
+            read_purpose: None,
             listed_keys: Some(keys.iter().map(|key| key.to_string()).collect()),
             listed_versions: None,
             payload_ref: None,
@@ -5714,6 +5737,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recovery_failure_authentication_rejects_an_unrelated_reread() {
+        let mut immediate = empty_report();
+        immediate.passed = false;
+        immediate.unavailable_committed_objects.push(
+            "k: outcome=Timeout status=200 error=\"get body read timed out\""
+                .to_string()
+                .into(),
+        );
+        let mut recovery = recovery_report_with_attempted_key("k");
+        recovery.reread_recovered_keys.push("k".into());
+        finish_recovery_stability_report(&mut recovery, &immediate);
+        super::validate_recovery_stability_against_checker(&recovery, &immediate)
+            .expect("bound recovery");
+        recovery.reread_attempted_keys = vec!["unrelated".into()];
+        recovery.reread_recovered_keys = vec!["unrelated".into()];
+        assert!(super::validate_recovery_stability_against_checker(&recovery, &immediate).is_err());
+    }
+
+    #[test]
+    fn configured_retry_ceiling_does_not_authenticate_extra_versions() {
+        for kind in [
+            OperationKind::Put,
+            OperationKind::Delete,
+            OperationKind::CompleteMultipartUpload,
+        ] {
+            let mut rejected = record("rejected", kind, "k", "sha", OperationOutcome::Failed);
+            rejected.http_status = Some(400);
+            rejected.mutation_max_attempts = Some(3);
+            for attempts in [None, Some(1)] {
+                rejected.mutation_attempts = attempts;
+                let model = object_model(&[
+                    record("put", OperationKind::Put, "k", "old", OperationOutcome::Ok),
+                    rejected.clone(),
+                ]);
+                assert!(model.version_write_sources.is_empty());
+                assert!(model.unknown_writes.is_empty());
+                assert!(model.ambiguous_delete_pending.is_empty());
+            }
+        }
+        let mut unsent = record(
+            "unsent",
+            OperationKind::Put,
+            "k",
+            "sha",
+            OperationOutcome::Timeout,
+        );
+        unsent.mutation_attempts = Some(0);
+        let model = object_model(&[unsent]);
+        assert!(model.unknown_writes.is_empty() && model.version_write_sources.is_empty());
+    }
     #[test]
     fn corrupted_successful_get_is_hard_failure_input() {
         let records = vec![
@@ -5788,19 +5862,21 @@ mod tests {
     #[test]
     fn failed_delete_with_retries_marks_committed_key_pending() {
         let put = record("op-1", OperationKind::Put, "k", "v1", OperationOutcome::Ok);
-        let failed_delete = record(
+        let mut failed_delete = record(
             "op-2",
             OperationKind::Delete,
             "k",
             "",
             OperationOutcome::Failed,
         );
+        failed_delete.mutation_attempts = Some(3);
         let model = object_model(&[put.clone(), failed_delete.clone()]);
         assert!(model.live.contains_key("k"));
         assert!(model.ambiguous_delete_pending.contains("k"));
 
         let mut quiet_delete = failed_delete;
         quiet_delete.scenario = "dm-drop-writes-after-ack-delete-marker".to_string();
+        quiet_delete.mutation_attempts = Some(1);
         assert!(
             object_model(&[put, quiet_delete])
                 .ambiguous_delete_pending
@@ -6431,13 +6507,16 @@ mod tests {
                 "c",
                 OperationOutcome::Timeout,
             ),
-            record(
-                "op-5",
-                OperationKind::CompleteMultipartUpload,
-                "failed",
-                "d",
-                OperationOutcome::Failed,
-            ),
+            OperationRecord {
+                mutation_attempts: Some(3),
+                ..record(
+                    "op-5",
+                    OperationKind::CompleteMultipartUpload,
+                    "failed",
+                    "d",
+                    OperationOutcome::Failed,
+                )
+            },
         ]);
         assert_eq!(
             model.failed_writes.get("failed"),
@@ -6458,13 +6537,16 @@ mod tests {
 
     #[test]
     fn unexplained_listed_key_outcomes_split_ghost_tolerated_and_unexpected() {
-        let model = object_model(&[record(
-            "op-1",
-            OperationKind::Put,
-            "failed",
-            &sha256_hex(b"d"),
-            OperationOutcome::Failed,
-        )]);
+        let model = object_model(&[OperationRecord {
+            mutation_attempts: Some(3),
+            ..record(
+                "op-1",
+                OperationKind::Put,
+                "failed",
+                &sha256_hex(b"d"),
+                OperationOutcome::Failed,
+            )
+        }]);
         let readable = GetObjectResult {
             outcome: OperationOutcome::Ok,
             http_status: Some(200),
@@ -8031,13 +8113,14 @@ mod tests {
             OperationOutcome::Ok,
         );
         put.version_id = Some("version-1".to_string());
-        let timeout_delete = record(
+        let mut timeout_delete = record(
             "delete-timeout",
             OperationKind::Delete,
             "k",
             "",
             OperationOutcome::Timeout,
         );
+        timeout_delete.mutation_attempts = Some(3);
         let timeout_history = vec![put.clone(), timeout_delete];
         let timeout_lineage = super::committed_version_lineage(std::slice::from_ref(&put));
         let marker = |index: usize| ObjectVersionEntry {
@@ -8066,13 +8149,14 @@ mod tests {
             1
         );
 
-        let failed_delete = record(
+        let mut failed_delete = record(
             "delete-failed",
             OperationKind::Delete,
             "k",
             "",
             OperationOutcome::Failed,
         );
+        failed_delete.mutation_attempts = Some(3);
         let failed_history = vec![put.clone(), failed_delete];
         let two_markers = (1..=2).map(marker).collect::<Vec<_>>();
         assert!(
@@ -8101,6 +8185,7 @@ mod tests {
             "",
             OperationOutcome::Ok,
         );
+        committed_delete.mutation_attempts = Some(3);
         committed_delete.version_id = Some("marker-3".to_string());
         let success_history = vec![put, committed_delete];
         let success_lineage = super::committed_version_lineage(&success_history);
@@ -8126,6 +8211,7 @@ mod tests {
         let mut quiet_history = success_history;
         for record in &mut quiet_history {
             record.scenario = "dm-drop-writes-after-ack-delete-marker".to_string();
+            record.mutation_attempts = Some(1);
         }
         let quiet_lineage = super::committed_version_lineage(&quiet_history);
         assert_eq!(
@@ -8262,13 +8348,14 @@ mod tests {
 
     #[test]
     fn one_timeout_put_cannot_explain_more_versions_than_http_attempts() {
-        let timeout = record(
+        let mut timeout = record(
             "put-timeout",
             OperationKind::Put,
             "k",
             &sha256_hex(b"b"),
             OperationOutcome::Timeout,
         );
+        timeout.mutation_attempts = Some(3);
         let model = object_model(&[timeout]);
         let lineage = super::committed_version_lineage(&[]);
         let entries = (1..=4)
@@ -8317,6 +8404,7 @@ mod tests {
         );
         timeout.scenario = "stale-disk-return-detect".to_string();
         timeout.mutation_max_attempts = Some(1);
+        timeout.mutation_attempts = Some(1);
         let model = object_model(&[timeout]);
         let entries = (1..=2)
             .map(|index| ObjectVersionEntry {
@@ -8399,6 +8487,7 @@ mod tests {
             &sha256_hex(b"b"),
             OperationOutcome::Ok,
         );
+        committed.mutation_attempts = Some(3);
         committed.version_id = Some("version-final".to_string());
         let model = object_model(std::slice::from_ref(&committed));
         let actual = ExpectedObject {
@@ -8421,6 +8510,7 @@ mod tests {
             "the recorded successful response must remain newer than its earlier retries"
         );
         committed.scenario = "dm-drop-writes-after-ack-put".to_string();
+        committed.mutation_attempts = Some(1);
         assert!(
             object_model(&[committed]).version_write_sources.is_empty(),
             "quiet ACK mutations have no unrecorded retry-version budget"
@@ -8436,6 +8526,7 @@ mod tests {
             &sha256_hex(b"b"),
             OperationOutcome::Failed,
         );
+        failed.mutation_attempts = Some(3);
         let actual = ExpectedObject {
             sha256: sha256_hex(b"b"),
             size_bytes: 1,
@@ -8448,6 +8539,7 @@ mod tests {
         assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_none());
 
         failed.scenario = "dm-drop-writes-after-ack-put".to_string();
+        failed.mutation_attempts = Some(1);
         let quiet_model = object_model(&[failed]);
         assert!(
             quiet_model.version_write_sources.is_empty() && quiet_model.unknown_writes.is_empty(),
@@ -8464,13 +8556,14 @@ mod tests {
             &sha256_hex(b"a"),
             OperationOutcome::Ok,
         );
-        let failed = record(
+        let mut failed = record(
             "put-failed",
             OperationKind::Put,
             "k",
             &sha256_hex(b"b"),
             OperationOutcome::Failed,
         );
+        failed.mutation_attempts = Some(3);
         let model = object_model(&[baseline, failed]);
         let mut report = empty_report();
         super::evaluate_final_get(
@@ -8503,6 +8596,7 @@ mod tests {
                 &sha256_hex(b"b"),
                 outcome,
             );
+            terminal.mutation_attempts = Some(3);
             let model = object_model(std::slice::from_ref(&terminal));
             assert!(model.unknown_writes.contains_key("k"));
             let mut sources =
@@ -8511,6 +8605,7 @@ mod tests {
             assert!(super::take_version_write_source(&mut sources, "k", &actual, false).is_none());
 
             terminal.scenario = "dm-drop-writes-after-ack-multipart-complete".to_string();
+            terminal.mutation_attempts = Some(1);
             let quiet_model = object_model(&[terminal]);
             assert!(quiet_model.unknown_writes.is_empty());
             assert!(quiet_model.version_write_sources.is_empty());
@@ -9785,6 +9880,7 @@ mod tests {
             OperationOutcome::Failed,
         );
         failed.run_id = Some("run-1".to_string());
+        failed.mutation_attempts = Some(3);
         failed.http_status = Some(503);
         let mut live_get = record(
             "op-3",
@@ -10972,6 +11068,7 @@ mod tests {
             1,
             2,
         );
+        failed_put.mutation_attempts = Some(3);
         failed_put.http_status = Some(500);
         let mut listed_get = timed_record(
             "checker-listed-get",

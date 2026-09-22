@@ -140,6 +140,11 @@ pub struct OperationRecord {
     /// records set this at the client boundary; legacy records omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutation_max_attempts: Option<u32>,
+    /// HTTP transmissions observed for this request, including retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_purpose: Option<ReadPurpose>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listed_keys: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +172,26 @@ pub struct OperationRecord {
     pub durability_cohort: Option<DurabilityCohort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fault_window_relation: Option<FaultWindowRelation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadPurpose {
+    CohortProbe,
+    MutationVerification { operation_id: String },
+}
+
+impl OperationRecord {
+    pub(crate) fn verification_of(&self) -> Option<&str> {
+        match &self.read_purpose {
+            Some(ReadPurpose::MutationVerification { operation_id }) => Some(operation_id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_cohort_probe(&self) -> bool {
+        self.read_purpose == Some(ReadPurpose::CohortProbe)
+    }
 }
 
 pub(crate) fn validate_successful_version_identity_uniqueness<'a>(
@@ -265,6 +290,34 @@ fn validate_history_scope_and_order_mode(
             started_sequence < ended_sequence,
             "history contains an inverted recorder event sequence"
         );
+        if let Some(purpose) = &record.read_purpose {
+            ensure!(
+                record.kind == OperationKind::Get
+                    && record.range.is_none()
+                    && record.version_id.is_none(),
+                "history read purpose requires an unversioned full GET"
+            );
+            if let ReadPurpose::MutationVerification { operation_id } = purpose {
+                ensure!(
+                    !operation_id.trim().is_empty(),
+                    "history verification has an empty mutation id"
+                );
+            }
+        }
+        if let Some(attempts) = record.mutation_attempts {
+            ensure!(
+                matches!(
+                    record.kind,
+                    OperationKind::Put
+                        | OperationKind::Delete
+                        | OperationKind::CompleteMultipartUpload
+                ) && record
+                    .mutation_max_attempts
+                    .is_none_or(|maximum| attempts <= maximum)
+                    && (attempts > 0 || record.outcome != OperationOutcome::Ok),
+                "history mutation attempt count contradicts its operation, retry ceiling, or outcome"
+            );
+        }
         for sequence in [started_sequence, ended_sequence] {
             ensure!(
                 sequence > 0
@@ -406,6 +459,8 @@ impl Recorder {
             request_version_id: None,
             is_delete_marker: None,
             mutation_max_attempts: None,
+            mutation_attempts: None,
+            read_purpose: None,
             listed_keys: None,
             listed_versions: None,
             payload_ref: None,
@@ -558,6 +613,36 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn read_purpose_cannot_hide_a_mutation_from_workload_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Recorder::create(dir.path().join("history.jsonl"), "io-eio", "run-1")
+            .expect("recorder");
+        let mut record = recorder.begin(
+            OperationKind::Put,
+            "bucket",
+            Some("k".into()),
+            Some("sha".into()),
+            Some(1),
+        );
+        record.read_purpose = Some(super::ReadPurpose::CohortProbe);
+        recorder
+            .finish(record, OperationOutcome::Ok, Some(200), None)
+            .expect("record");
+        let error = super::validate_history_scope_and_order(
+            &recorder.records(),
+            "io-eio",
+            "run-1",
+            "bucket",
+        )
+        .expect_err("mutation cannot be a probe GET");
+        assert!(
+            error
+                .to_string()
+                .contains("read purpose requires an unversioned full GET")
+        );
+    }
+
+    #[test]
     fn recorder_writes_jsonl_records() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("history.jsonl");
@@ -612,6 +697,8 @@ mod tests {
         let legacy = r#"{"id":"op-000001","scenario":"io-eio","kind":"put","bucket":"bucket","key":"k","value_sha256":"abc","size_bytes":3,"started_at_ms":1,"ended_at_ms":2,"outcome":"ok","http_status":200,"error":null}"#;
 
         let record = serde_json::from_str::<super::OperationRecord>(legacy).expect("legacy record");
+        assert_eq!(record.mutation_attempts, None);
+        assert_eq!(record.read_purpose, None);
 
         assert_eq!(record.version_id, None);
         assert_eq!(record.request_version_id, None);

@@ -1314,14 +1314,14 @@ fn completed_workload_evidence_present(
 fn partial_recommit_report_required(
     ack_mutation: bool,
     terminal_stage: &str,
-    recommit_completed: bool,
+    recommit_reached: bool,
     final_checker_completed: bool,
 ) -> bool {
     !ack_mutation
         && (matches!(
             terminal_stage,
             "recommit-unconfirmed" | "checker-final" | "checker-verdict"
-        ) || recommit_completed
+        ) || recommit_reached
             || final_checker_completed)
 }
 
@@ -1764,17 +1764,18 @@ fn validate_partial_failed_injection_artifacts(
         );
         required_artifacts.push(name.to_string());
     }
-    let completed_workload_required = matches!(
-        terminal_phase,
-        FailurePhase::Recovery | FailurePhase::Checker
-    ) || terminal_stage == "fault-delete"
-        || workload_completed
-        || recovery_health_completed
-        || recovery_evidence_completed
-        || post_recovery_probe_completed
-        || pre_recommit_checker_completed
-        || recommit_completed
-        || final_checker_completed;
+    let completed_workload_required =
+        matches!(
+            terminal_phase,
+            FailurePhase::Recovery | FailurePhase::Checker
+        ) || matches!(terminal_stage.as_str(), "fault-delete" | "availability")
+            || workload_completed
+            || recovery_health_completed
+            || recovery_evidence_completed
+            || post_recovery_probe_completed
+            || pre_recommit_checker_completed
+            || recommit_completed
+            || final_checker_completed;
     ensure!(
         !completed_workload_required
             || completed_workload_evidence_present(
@@ -1807,11 +1808,37 @@ fn validate_partial_failed_injection_artifacts(
             &workload_plan,
             run_id,
         )?;
-        let workload_history = history
-            .iter()
-            .filter(|record| record.durability_cohort == Some(DurabilityCohort::FaultActive))
-            .collect::<Vec<_>>();
+        let workload_history = mixed_workload_history(history, DurabilityCohort::FaultActive);
         validate_primary_workload_history(&workload_history, &workload_plan, run_id)?;
+    }
+    if let Some(manifest) = workload_summary
+        .as_ref()
+        .and_then(|workload| workload.recommit_candidates.as_ref())
+    {
+        let records = history
+            .as_deref()
+            .context("sealed recommit candidates lack history.jsonl")?;
+        validate_recommit_candidate_manifest(
+            manifest,
+            &run_spec.metadata.bucket,
+            &metadata.scenario,
+            run_id,
+            records,
+        )?;
+        ensure!(
+            recommit_report_present
+                || !records[manifest.history_record_count..]
+                    .iter()
+                    .any(|record| {
+                        matches!(
+                            record.kind,
+                            OperationKind::Put
+                                | OperationKind::Delete
+                                | OperationKind::CompleteMultipartUpload
+                        )
+                    }),
+            "post-manifest mutation history lacks recommit-report.json"
+        );
     }
     if let Some(recommit) = recommit_report.as_ref() {
         let workload = workload_summary
@@ -1947,7 +1974,55 @@ fn validate_partial_failed_injection_artifacts(
         }
     }
 
-    let post_recovery_probe_required = matches!(terminal_phase, FailurePhase::Checker)
+    if terminal_stage == "availability"
+        || has_event(&events, "availability", RunEventStatus::Succeeded)
+    {
+        let path = locate_artifact(
+            &options.artifact_root,
+            case_name,
+            AVAILABILITY_REPORT_ARTIFACT,
+        )?;
+        let report = read_json::<AvailabilityReport>(&path)?;
+        validate_optional_identity_fields(
+            AVAILABILITY_REPORT_ARTIFACT,
+            Some(&report.scenario),
+            Some(&report.run_id),
+            &metadata,
+            identity,
+        )?;
+        let floor = scenarios::scenario_spec(&options.scenario)?
+            .impact_policy
+            .availability_floor_percent()
+            .context("availability verdict has no catalog contract")?;
+        let workload = workload_summary
+            .as_ref()
+            .context("availability verdict lacks workload summary")?;
+        validate_availability_report_content(
+            &report,
+            &metadata,
+            workload,
+            workload_plan.object_count,
+            floor,
+        )?;
+        report.authenticate_probes(
+            history
+                .as_deref()
+                .context("availability verdict lacks history")?,
+            workload_plan.object_count / 2,
+        )?;
+        ensure!(
+            if terminal_stage == "availability" {
+                !report.passed && summary.classification == "availability_regression"
+            } else {
+                report.passed
+            },
+            "availability failure classification contradicts the authenticated verdict"
+        );
+        required_artifacts.push(AVAILABILITY_REPORT_ARTIFACT.to_string());
+    }
+    let post_recovery_probe_required = (terminal_stage == "post-recovery-write"
+        && summary.classification == "post_recovery_write_failed")
+        || matches!(terminal_phase, FailurePhase::Checker)
         || terminal_stage == "recommit-unconfirmed"
         || post_recovery_probe_completed
         || pre_recommit_checker_completed
@@ -1962,21 +2037,36 @@ fn validate_partial_failed_injection_artifacts(
         let evidence = fault_evidence
             .as_ref()
             .context("completed post-recovery write probe lacks fault-evidence.json")?;
-        validate_post_recovery_write_artifacts(
+        validate_write_probe_artifacts_after(
+            POST_RECOVERY_WRITE_PROBE,
             &partial_artifacts,
             &metadata,
             identity,
-            evidence,
             &events,
             &run_spec.metadata.bucket,
             post_recovery_object_count(options.expected_workload_objects),
+            evidence
+                .recovery_ended_at_ms
+                .context("fault evidence lacks recovery boundary")?,
+            "recovery-evidence",
+            terminal_stage != "post-recovery-write",
         )?;
+    }
+    if terminal_stage == "post-recovery-write" && post_recovery_report_present {
+        let report = read_json::<PostRecoveryWriteReport>(required(
+            &partial_artifacts,
+            POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+        )?)?;
+        ensure!(
+            !report.passed && summary.classification == "post_recovery_write_failed",
+            "post-recovery failure classification does not match its probe verdict"
+        );
     }
     ensure!(
         !partial_recommit_report_required(
             ack_mutation,
             &terminal_stage,
-            recommit_completed,
+            recommit_reached,
             final_checker_completed,
         ) || recommit_report_present,
         "{terminal_stage} failure lacks recommit-report.json from the completed recommit phase"
@@ -2000,6 +2090,8 @@ fn validate_partial_failed_injection_artifacts(
             let recovery = recovery_stability_report
                 .as_ref()
                 .context("checker-pre-recommit-verdict lacks recovery-stability-report.json")?;
+            checker::validate_recovery_stability_against_checker(recovery, report)?;
+            validate_recovery_failure_summary_fields(&summary, recovery)?;
             ensure!(
                 !recovery.immediate_passed
                     && recovery.classification.as_str() == summary.classification,
@@ -3265,12 +3357,7 @@ fn validate_storage_recovery_execution_artifacts(
         }),
         "storage-recovery post-write history escaped its run prefix or report window"
     );
-    validate_write_probe_history(
-        POST_RECOVERY_WRITE_PROBE,
-        &post_write_history,
-        &post_write,
-        &metadata.run_id,
-    )?;
+    validate_write_probe_history(&post_write_history, &post_write)?;
 
     Ok(ArtifactValidationReport {
         scenario: options.scenario.clone(),
@@ -5935,6 +6022,7 @@ fn validate_post_recovery_write_artifacts_after(
         expected_objects,
         recovery_completed_at_ms,
         recovery_boundary_stage,
+        true,
     )
 }
 
@@ -5949,6 +6037,7 @@ fn validate_write_probe_artifacts_after(
     expected_objects: usize,
     boundary_at_ms: u64,
     boundary_stage: &str,
+    expected_passed: bool,
 ) -> Result<()> {
     let WriteProbeEvidence {
         report_artifact,
@@ -5973,9 +6062,15 @@ fn validate_write_probe_artifacts_after(
         "{report_artifact} probed {} objects but the workload plan sizes the probe at {expected_objects}",
         report.objects
     );
-    report
-        .require_success()
-        .with_context(|| format!("{report_artifact} did not pass"))?;
+    ensure!(
+        report.passed == expected_passed,
+        "{report_artifact} verdict contradicts the required probe outcome"
+    );
+    let expected_status = if expected_passed {
+        RunEventStatus::Succeeded
+    } else {
+        RunEventStatus::Failed
+    };
     ensure!(
         report.started_at_ms >= boundary_at_ms,
         "{report_artifact} started before {starts_after}"
@@ -5997,10 +6092,11 @@ fn validate_write_probe_artifacts_after(
         .enumerate()
         .skip(probe_started + 1)
         .find_map(|(index, event)| {
-            (event.stage == event_stage && event.status == RunEventStatus::Succeeded)
-                .then_some(index)
+            (event.stage == event_stage && event.status == expected_status).then_some(index)
         })
-        .with_context(|| format!("run-events.jsonl lacks a successful {event_stage} event"))?;
+        .with_context(|| {
+            format!("run-events.jsonl lacks a {event_stage} {expected_status:?} event")
+        })?;
     ensure!(
         boundary < probe_started,
         "{}",
@@ -6014,9 +6110,14 @@ fn validate_write_probe_artifacts_after(
         events[probe_started].at_ms <= report.started_at_ms
             && report.completed_at_ms <= events[probe_succeeded].at_ms
             && events.iter().all(|event| {
-                event.stage != event_stage || event.status != RunEventStatus::Failed
+                event.stage != event_stage
+                    || matches!(
+                        event.status,
+                        RunEventStatus::Started | RunEventStatus::Observed
+                    )
+                    || event.status == expected_status
             }),
-        "run-events.jsonl does not prove one successful {label} probe around its report interval"
+        "run-events.jsonl does not prove one {expected_status:?} {label} probe around its report interval"
     );
     let expected_prefix = probe.scope.key_prefix(&metadata.run_id);
     ensure!(
@@ -6051,196 +6152,19 @@ fn validate_write_probe_artifacts_after(
             record.id
         );
     }
-    validate_write_probe_history(probe, &history, &report, &metadata.run_id)
+    validate_write_probe_history(&history, &report)
 }
 
-/// Every counter the probe report claims must be evidenced by its dedicated
-/// history, in the order the probe issues its requests: each plain object a
-/// PUT ok, a hash- and size-matching GET, a DELETE ok, then a GET 404; the
-/// multipart key its completion, matching GET, DELETE, and 404; the abort
-/// key its abort; and exactly two prefix LISTs, the first returning every
-/// live probe key after the writes and before any DELETE, the second empty
-/// after the last DELETE. Records outside that shape are not tolerated.
+/// The workload owns the probe protocol and verdict. This boundary binds the
+/// persisted report to that same replay, including complete negative outcomes.
 fn validate_write_probe_history(
-    probe: WriteProbeEvidence,
     history: &[OperationRecord],
     report: &PostRecoveryWriteReport,
-    run_id: &str,
 ) -> Result<()> {
-    let artifact = probe.history_artifact;
-    let scope = probe.scope;
-    let prefix = scope.key_prefix(run_id);
-    let plain_keys = (0..report.objects)
-        .map(|index| scope.key(run_id, index))
-        .collect::<Vec<_>>();
-    let multipart_key = scope.key(run_id, report.objects);
-    let abort_key = scope.key(run_id, report.objects + 1);
-
-    for record in history {
-        let key = record.key.as_deref().unwrap_or_default();
-        let allowed = if key == prefix {
-            matches!(record.kind, OperationKind::List)
-        } else if key == multipart_key {
-            matches!(
-                record.kind,
-                OperationKind::CreateMultipartUpload
-                    | OperationKind::UploadPart
-                    | OperationKind::CompleteMultipartUpload
-                    | OperationKind::Get
-                    | OperationKind::Delete
-            )
-        } else if key == abort_key {
-            matches!(
-                record.kind,
-                OperationKind::CreateMultipartUpload | OperationKind::AbortMultipartUpload
-            )
-        } else if plain_keys.iter().any(|plain| plain == key) {
-            matches!(
-                record.kind,
-                OperationKind::Put | OperationKind::Get | OperationKind::Delete
-            )
-        } else {
-            false
-        };
-        ensure!(
-            allowed,
-            "{artifact} record {} is a {:?} on {key:?}, which the probe never issues",
-            record.id,
-            record.kind
-        );
-        ensure!(
-            record.outcome == OperationOutcome::Ok
-                || (record.kind == OperationKind::Get
-                    && record.outcome == OperationOutcome::NotFound),
-            "{artifact} record {} ({:?} {key:?}) ended {:?}; a passed probe has no failed requests",
-            record.id,
-            record.kind,
-            record.outcome
-        );
-    }
-
-    let sequences = |record: &OperationRecord| -> Result<(u64, u64)> {
-        Ok((
-            record.started_sequence.with_context(|| {
-                format!("{artifact} record {} has no start sequence", record.id)
-            })?,
-            record
-                .ended_sequence
-                .with_context(|| format!("{artifact} record {} has no end sequence", record.id))?,
-        ))
-    };
-    let records_for = |key: &str, kind: OperationKind| {
-        let mut records = history
-            .iter()
-            .filter(|record| record.kind == kind && record.key.as_deref() == Some(key))
-            .collect::<Vec<_>>();
-        records.sort_by_key(|record| record.started_sequence);
-        records
-    };
-    let exactly_one = |key: &str, kind: OperationKind| -> Result<&OperationRecord> {
-        let records = records_for(key, kind);
-        ensure!(
-            records.len() == 1,
-            "{artifact} must hold exactly one acknowledged {kind:?} for {key:?}, found {}",
-            records.len()
-        );
-        Ok(records[0])
-    };
-    // Returns the verify-GET end and the DELETE start/end sequences so the
-    // LISTs can be placed relative to the writes and deletes.
-    let object_lifecycle = |key: &str, write_kind: OperationKind| -> Result<(u64, u64, u64)> {
-        let write = exactly_one(key, write_kind)?;
-        let (_, write_ended) = sequences(write)?;
-        let written_sha256 = write.value_sha256.as_deref().with_context(|| {
-            format!("{artifact} {write_kind:?} for {key:?} records no payload hash")
-        })?;
-        let delete = exactly_one(key, OperationKind::Delete)?;
-        let (delete_started, delete_ended) = sequences(delete)?;
-        let gets = records_for(key, OperationKind::Get);
-        ensure!(
-            gets.len() == 2,
-            "{artifact} must hold exactly two GETs for {key:?} (verify, then absence), found {}",
-            gets.len()
-        );
-        let (verify, absent) = (gets[0], gets[1]);
-        let (verify_started, verify_ended) = sequences(verify)?;
-        ensure!(
-            verify.outcome == OperationOutcome::Ok
-                && verify.http_status == Some(200)
-                && verify.value_sha256.as_deref() == Some(written_sha256)
-                && verify.size_bytes == write.size_bytes
-                && verify_started > write_ended,
-            "{artifact} GET {} does not read back the acknowledged {write_kind:?} of {key:?} with its hash and size",
-            verify.id
-        );
-        ensure!(
-            delete_started > verify_ended,
-            "{artifact} DELETE {} of {key:?} did not follow its verified read",
-            delete.id
-        );
-        let (absent_started, _) = sequences(absent)?;
-        ensure!(
-            absent.outcome == OperationOutcome::NotFound
-                && absent.http_status == Some(404)
-                && absent_started > delete_ended,
-            "{artifact} GET {} does not prove {key:?} absent after its acknowledged DELETE",
-            absent.id
-        );
-        Ok((verify_ended, delete_started, delete_ended))
-    };
-
-    let mut last_verify_ended = 0;
-    let mut first_delete_started = u64::MAX;
-    let mut last_delete_ended = 0;
-    for key in plain_keys.iter().chain(std::iter::once(&multipart_key)) {
-        let write_kind = if key == &multipart_key {
-            OperationKind::CompleteMultipartUpload
-        } else {
-            OperationKind::Put
-        };
-        let (verify_ended, delete_started, delete_ended) = object_lifecycle(key, write_kind)?;
-        last_verify_ended = last_verify_ended.max(verify_ended);
-        first_delete_started = first_delete_started.min(delete_started);
-        last_delete_ended = last_delete_ended.max(delete_ended);
-    }
-    exactly_one(&multipart_key, OperationKind::CreateMultipartUpload)?;
-    exactly_one(&abort_key, OperationKind::CreateMultipartUpload)?;
-    exactly_one(&abort_key, OperationKind::AbortMultipartUpload)?;
-
-    let lists = records_for(&prefix, OperationKind::List);
+    let rebuilt = report.rebuild_from_history(history)?;
     ensure!(
-        lists.len() == 2,
-        "{artifact} must hold exactly two prefix LISTs, found {}",
-        lists.len()
-    );
-    let (live_list, empty_list) = (lists[0], lists[1]);
-    let mut expected_live = plain_keys.clone();
-    expected_live.push(multipart_key.clone());
-    expected_live.sort();
-    let mut listed = live_list
-        .listed_keys
-        .clone()
-        .with_context(|| format!("{artifact} LIST {} captured no keys", live_list.id))?;
-    listed.sort();
-    let (live_started, live_ended) = sequences(live_list)?;
-    ensure!(
-        live_list.http_status == Some(200)
-            && listed == expected_live
-            && live_started > last_verify_ended
-            && live_ended < first_delete_started,
-        "{artifact} LIST {} does not show exactly the live probe objects between the verified writes and the first DELETE",
-        live_list.id
-    );
-    let (empty_started, _) = sequences(empty_list)?;
-    ensure!(
-        empty_list.http_status == Some(200)
-            && empty_list
-                .listed_keys
-                .as_ref()
-                .is_some_and(|keys| keys.is_empty())
-            && empty_started > last_delete_ended,
-        "{artifact} LIST {} does not prove the prefix empty after the last DELETE",
-        empty_list.id
+        &rebuilt == report,
+        "write probe report counters, failures, or verdict do not match its history"
     );
     Ok(())
 }
@@ -6365,6 +6289,56 @@ fn validate_quorum_edge_read_survival_artifact(
     Ok(())
 }
 
+fn validate_availability_report_content(
+    report: &AvailabilityReport,
+    metadata: &RunMetadataArtifact,
+    summary: &WorkloadSummaryArtifact,
+    workload_object_count: usize,
+    catalog_floor_percent: u8,
+) -> Result<()> {
+    let configured_floor = metadata.min_availability_percent.context(
+        "run-metadata.json min_availability_percent is required for availability scenarios",
+    )?;
+    ensure!(
+        report.min_success_percent == configured_floor,
+        "availability-report.json min_success_percent does not match run-metadata.json"
+    );
+    ensure!(
+        configured_floor >= catalog_floor_percent,
+        "availability-report.json min_success_percent {configured_floor} is below the catalog availability floor {catalog_floor_percent}"
+    );
+    let commits = summary
+        .puts
+        .ok
+        .checked_add(summary.multipart_completes.ok)
+        .context("workload acknowledged commit count overflowed")?;
+    ensure!(
+        report.commit_probe.objects == commits,
+        "availability-report.json commit probe does not cover {commits} acknowledged mutations"
+    );
+    ensure!(
+        report.read_probe.objects == workload_object_count / 2,
+        "availability-report.json read probe did not cover the complete prefilled cohort"
+    );
+    let expected = summary.family_availability()?;
+    ensure!(
+        report.workload.len() == expected.len(),
+        "availability-report.json does not contain every workload family"
+    );
+    for (family, expected) in report.workload.iter().zip(expected) {
+        ensure!(
+            family == &expected,
+            "availability-report.json family does not match workload-summary.json {}",
+            expected.family
+        );
+    }
+    ensure!(
+        report == &report.rebuild_verdict(commits),
+        "availability-report.json verdict or violations do not match its observations"
+    );
+    Ok(())
+}
+
 fn validate_availability_artifact(
     artifacts: &BTreeMap<String, PathBuf>,
     metadata: &RunMetadataArtifact,
@@ -6378,91 +6352,24 @@ fn validate_availability_artifact(
         read_json::<AvailabilityReport>(required(artifacts, AVAILABILITY_REPORT_ARTIFACT)?)?;
     validate_optional_identity_fields(
         AVAILABILITY_REPORT_ARTIFACT,
-        Some(report.scenario.as_str()),
-        Some(report.run_id.as_str()),
+        Some(&report.scenario),
+        Some(&report.run_id),
         metadata,
         identity,
     )?;
-    // The floor the run was configured with is persisted in run-metadata.json
-    // and may only tighten the catalog floor; a report claiming a laxer floor
-    // than either is not evidence.
-    let configured_floor = metadata.min_availability_percent.context(
-        "run-metadata.json min_availability_percent is required for availability scenarios",
+    validate_availability_report_content(
+        &report,
+        metadata,
+        summary,
+        workload_object_count,
+        catalog_floor_percent,
     )?;
-    ensure!(
-        report.min_success_percent == configured_floor,
-        "{AVAILABILITY_REPORT_ARTIFACT} min_success_percent {} does not match run-metadata.json min_availability_percent {configured_floor}",
-        report.min_success_percent
-    );
-    ensure!(
-        report.min_success_percent >= catalog_floor_percent,
-        "{AVAILABILITY_REPORT_ARTIFACT} min_success_percent {} is below the catalog availability floor {catalog_floor_percent}",
-        report.min_success_percent
-    );
-    let acknowledged_commits = summary
-        .puts
-        .ok
-        .checked_add(summary.multipart_completes.ok)
-        .context("workload-summary.json acknowledged commit count overflowed")?;
-    ensure!(
-        report.commit_probe.objects == acknowledged_commits
-            && report.commit_probe.verified == report.commit_probe.objects
-            && report.commit_probe.failures.is_empty(),
-        "{AVAILABILITY_REPORT_ARTIFACT} commit probe verified {} of {} reported commits with {} failure(s), but workload-summary.json records {acknowledged_commits} acknowledged PUTs, overwrites, and multipart completions",
-        report.commit_probe.verified,
-        report.commit_probe.objects,
-        report.commit_probe.failures.len()
-    );
     report
         .require_success()
-        .with_context(|| format!("{AVAILABILITY_REPORT_ARTIFACT} did not pass"))?;
+        .context("availability-report.json did not pass")?;
     ensure!(
-        report.read_probe.objects == workload_object_count / 2
-            && report.read_probe.verified == report.read_probe.objects
-            && report.read_probe.failures.is_empty(),
-        "{AVAILABILITY_REPORT_ARTIFACT} read probe did not verify the complete prefilled cohort"
-    );
-    // Every family is recomputed from workload-summary.json and must equal
-    // the report's, so disruptions cannot be shifted from a small family
-    // that would violate the floor into a large one that tolerates them, and
-    // the floor verdict is re-derived rather than trusted.
-    let expected_families = summary.family_availability()?;
-    ensure!(
-        report.workload.len() == expected_families.len(),
-        "{AVAILABILITY_REPORT_ARTIFACT} lists {} workload families but workload-summary.json defines {}",
-        report.workload.len(),
-        expected_families.len()
-    );
-    for (family, expected) in report.workload.iter().zip(&expected_families) {
-        ensure!(
-            family == expected,
-            "{AVAILABILITY_REPORT_ARTIFACT} family {:?} ({} of {} disrupted, {}%) does not match workload-summary.json {} ({} of {} disrupted, {}%)",
-            family.family,
-            family.disrupted,
-            family.total,
-            family.success_percent,
-            expected.family,
-            expected.disrupted,
-            expected.total,
-            expected.success_percent
-        );
-        ensure!(
-            expected.meets_floor(report.min_success_percent),
-            "{AVAILABILITY_REPORT_ARTIFACT} family {} ({} of {} disrupted) does not meet the {}% floor recomputed from workload-summary.json",
-            expected.family,
-            expected.disrupted,
-            expected.total,
-            report.min_success_percent
-        );
-    }
-    let disrupted = expected_families
-        .iter()
-        .map(|family| family.disrupted)
-        .sum::<usize>();
-    ensure!(
-        disrupted == evidence.client_disruptions,
-        "{AVAILABILITY_REPORT_ARTIFACT} workload disruptions {disrupted} do not match fault-evidence.json client_disruptions {}",
-        evidence.client_disruptions
+        summary.disrupted()? == evidence.client_disruptions,
+        "availability-report.json workload disruptions do not match fault-evidence.json client_disruptions"
     );
     Ok(())
 }
@@ -7443,6 +7350,7 @@ fn validate_node_down_hold_artifacts(
         post_recovery_object_count(workload_object_count),
         hold.started_at_ms,
         "crash-recovery-boundary",
+        true,
     )?;
     let report = read_json::<PostRecoveryWriteReport>(required(
         artifacts,
@@ -7975,25 +7883,7 @@ fn validate_expected_failure_signal(
                     && recovery.run_id.as_deref() == Some(run_id),
                 "recovery-stability-report.json identity does not match the planned attempt"
             );
-            ensure!(
-                recovery.immediate_passed == checker.passed,
-                "recovery-stability-report.json immediate_passed does not match checker-pre-recommit-report.json"
-            );
-            ensure!(
-                recovery.final_list_warning_count == checker.final_list_warning_count
-                    && recovery.list_warnings == checker.list_warnings,
-                "recovery-stability-report.json LIST evidence does not match checker-pre-recommit-report.json"
-            );
-            checker::validate_recovery_key_sets(&recovery, &checker).context(
-                "recovery-stability-report.json key evidence is not bound to checker evidence",
-            )?;
-            let observed = checker::classify_recovery_stability(&recovery, &checker);
-            ensure!(
-                recovery.classification == observed,
-                "recovery-stability-report.json claims classification {:?}, but its checker/recovery evidence classifies as {:?}",
-                recovery.classification.as_str(),
-                observed.as_str()
-            );
+            checker::validate_recovery_stability_against_checker(&recovery, &checker)?;
             ensure!(
                 recovery.classification.as_str() == summary.classification,
                 "recovery-stability-report.json supports classification {:?}, not {:?}",
@@ -9049,16 +8939,20 @@ impl WorkloadSummaryArtifact {
         plan: &WorkloadPlan,
         run_id: &str,
     ) -> Result<()> {
+        if history.iter().any(OperationRecord::is_cohort_probe) {
+            crate::fault::workload::execution::cohort_probe_reads(
+                history,
+                plan.object_count / 2,
+                run_id,
+            )?;
+        }
         let mut projected = [
             OutcomeCountsArtifact::default(),
             OutcomeCountsArtifact::default(),
             OutcomeCountsArtifact::default(),
             OutcomeCountsArtifact::default(),
         ];
-        let workload_history = history
-            .iter()
-            .filter(|record| record.durability_cohort == Some(cohort))
-            .collect::<Vec<_>>();
+        let workload_history = mixed_workload_history(history, cohort);
         for record in &workload_history {
             ensure!(
                 record.scenario == scenario && record.bucket == bucket,
@@ -9260,6 +9154,16 @@ fn record_key_counts<'a>(
         *counts.entry(key.clone()).or_insert(0) += 1;
     }
     Ok(counts)
+}
+
+fn mixed_workload_history(
+    history: &[OperationRecord],
+    cohort: DurabilityCohort,
+) -> Vec<&OperationRecord> {
+    history
+        .iter()
+        .filter(|record| record.durability_cohort == Some(cohort) && !record.is_cohort_probe())
+        .collect()
 }
 
 fn validate_primary_workload_history(
@@ -10158,6 +10062,8 @@ mod tests {
             request_version_id: None,
             is_delete_marker: None,
             mutation_max_attempts: None,
+            mutation_attempts: None,
+            read_purpose: None,
             listed_keys: None,
             listed_versions: None,
             payload_ref: None,
@@ -10842,6 +10748,8 @@ mod tests {
                     request_version_id: None,
                     is_delete_marker: None,
                     mutation_max_attempts: None,
+                    mutation_attempts: None,
+                    read_purpose: None,
                     listed_keys,
                     listed_versions,
                     payload_ref: None,
@@ -12072,6 +11980,8 @@ mod tests {
                 request_version_id: None,
                 is_delete_marker: None,
                 mutation_max_attempts: None,
+                mutation_attempts: None,
+                read_purpose: None,
                 listed_keys: None,
                 listed_versions: None,
                 payload_ref: None,
@@ -12116,6 +12026,8 @@ mod tests {
                 request_version_id: None,
                 is_delete_marker: None,
                 mutation_max_attempts: None,
+                mutation_attempts: None,
+                read_purpose: None,
                 listed_keys: None,
                 listed_versions: None,
                 payload_ref: None,
@@ -14693,6 +14605,28 @@ mod tests {
             }
         }
 
+        let mut history =
+            read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+        let workload =
+            read_json::<WorkloadSummaryArtifact>(&case_dir.join("workload-summary.json"))
+                .expect("workload");
+        history.truncate(
+            workload
+                .recommit_candidates
+                .as_ref()
+                .expect("manifest")
+                .history_record_count,
+        );
+        fs::write(
+            case_dir.join("history.jsonl"),
+            history
+                .iter()
+                .map(|r| serde_json::to_string(r).expect("record"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("truncate future-stage history");
+
         let report = validate_fault_artifacts(&success_options(dir.path()))
             .expect("failed-stage artifacts remain structurally valid");
 
@@ -14780,6 +14714,8 @@ mod tests {
                 request_version_id: None,
                 is_delete_marker: None,
                 mutation_max_attempts: None,
+                mutation_attempts: None,
+                read_purpose: None,
                 listed_keys,
                 listed_versions: None,
                 payload_ref: None,
@@ -16429,6 +16365,8 @@ mod tests {
             request_version_id: None,
             is_delete_marker: None,
             mutation_max_attempts: None,
+            mutation_attempts: None,
+            read_purpose: None,
             listed_keys: None,
             listed_versions: None,
             payload_ref: None,
@@ -20243,9 +20181,9 @@ mod tests {
         let error = validate_fault_artifacts(&success_options(dir.path()))
             .expect_err("incomplete delete verification");
         assert!(
-            error
-                .to_string()
-                .contains("post-recovery-write-report.json did not pass"),
+            error.to_string().contains(
+                "write probe report counters, failures, or verdict do not match its history"
+            ),
             "{error:#}"
         );
 
@@ -20354,19 +20292,19 @@ mod tests {
                 records[failed_delete]["outcome"] = json!("failed");
                 records[failed_delete]["http_status"] = json!(503);
             },
-            "a passed probe has no failed requests",
+            "write probe contains extra requests",
         );
         // The verifying GET returned different bytes than the PUT sent.
         let verify_get = position("get", &format!("{prefix}object-000001"), "ok");
         reject(
             &|records| records[verify_get]["value_sha256"] = json!("tampered"),
-            "does not read back the acknowledged Put",
+            "write probe report counters, failures, or verdict do not match its history",
         );
         // The multipart completion was never read back with its bytes.
         let multipart_get = position("get", &format!("{prefix}object-000008"), "ok");
         reject(
             &|records| records[multipart_get]["size_bytes"] = json!(1),
-            "does not read back the acknowledged CompleteMultipartUpload",
+            "write probe contains extra requests",
         );
         // The live LIST omitted a probe object.
         let live_list = position("list", prefix, "ok");
@@ -20377,7 +20315,7 @@ mod tests {
                     .expect("listed keys")
                     .pop();
             },
-            "does not show exactly the live probe objects",
+            "write probe report counters, failures, or verdict do not match its history",
         );
         // The final LIST still advertised a deleted key.
         let empty_list = records.len() - 1;
@@ -20385,13 +20323,13 @@ mod tests {
             &|records| {
                 records[empty_list]["listed_keys"] = json!([format!("{prefix}object-000000")]);
             },
-            "does not prove the prefix empty",
+            "write probe report counters, failures, or verdict do not match its history",
         );
         // A DELETE the report claims is missing from history entirely.
         let missing_delete = position("delete", &format!("{prefix}object-000002"), "ok");
         reject(
             &|records| records[missing_delete]["kind"] = json!("head"),
-            "which the probe never issues",
+            "write probe has an unexpected or out-of-order request",
         );
         // The multipart abort was not evidenced.
         let abort = position(
@@ -20404,7 +20342,7 @@ mod tests {
                 records[abort]["kind"] = json!("upload_part");
                 records[abort]["key"] = json!(format!("{prefix}object-000008"));
             },
-            "exactly one acknowledged AbortMultipartUpload",
+            "write probe lacks AbortMultipartUpload",
         );
         // The post-delete GET did not observe absence.
         let absent_get = position("get", &format!("{prefix}object-000003"), "not_found");
@@ -20415,7 +20353,7 @@ mod tests {
                 records[absent_get]["value_sha256"] = json!("probe-sha-3");
                 records[absent_get]["size_bytes"] = json!(4096);
             },
-            "does not prove",
+            "write probe report counters, failures, or verdict do not match its history",
         );
 
         // Ordering tampers: the records stay individually valid but move.
@@ -20428,31 +20366,31 @@ mod tests {
         let verify_zero = position("get", &format!("{prefix}object-000000"), "ok");
         reject(
             &|records| move_record(records, delete_zero, verify_zero),
-            "did not follow its verified read",
+            "write probe has an unexpected or out-of-order request",
         );
         // The live LIST taken after the first DELETE.
         reject(
             &|records| move_record(records, live_list, delete_zero),
-            "does not show exactly the live probe objects",
+            "write probe has an unexpected or out-of-order request",
         );
         // The empty LIST taken before the last DELETE.
         let delete_last = position("delete", &format!("{prefix}object-000008"), "ok");
         reject(
             &|records| move_record(records, empty_list, delete_last),
-            "does not prove the prefix empty",
+            "write probe has an unexpected or out-of-order request",
         );
         // A third GET for one object.
         let mut duplicate_get = records[verify_zero].clone();
         duplicate_get["id"] = json!(format!("op-{:06}", records.len() + 1));
         reject(
             &|records| records.push(duplicate_get.clone()),
-            "exactly two GETs",
+            "write probe contains extra requests",
         );
         // A PUT that recorded no payload hash cannot be read back.
         let put_zero = position("put", &format!("{prefix}object-000000"), "ok");
         reject(
             &|records| records[put_zero]["value_sha256"] = json!(null),
-            "records no payload hash",
+            "write probe mutation lacks payload identity",
         );
 
         // The report's object count is bound to the workload plan.
@@ -20628,7 +20566,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("does not prove one successful post-recovery write probe"),
+                .contains("does not prove one Succeeded post-recovery write probe"),
             "{error:#}"
         );
     }
@@ -20897,7 +20835,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("commit probe verified 298 of 299")
+                .contains("verdict or violations do not match its observations")
         );
         report["commit_probe"]["verified"] = json!(299);
 
@@ -20943,7 +20881,12 @@ mod tests {
         report["min_success_percent"] = json!(100);
         let error = validate(&report, &lowered_metadata, &summary)
             .expect_err("a 100% floor tolerates no disruption");
-        assert!(error.to_string().contains("did not pass"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("verdict or violations do not match its observations"),
+            "{error:#}"
+        );
         report["min_success_percent"] = json!(99);
 
         report["read_probe"]["objects"] = json!(5);
@@ -20970,9 +20913,17 @@ mod tests {
         report["workload"][2] = family("delete", 100, 1);
         report["workload"][0] = family("put", 100, 2);
         report["workload"][1] = family("get", 200, 0);
-        let error = validate(&report, &metadata, &summary)
+        let below_floor = summary_with((98, 2), (200, 0), (99, 1));
+        report["commit_probe"]["objects"] = json!(198);
+        report["commit_probe"]["verified"] = json!(198);
+        let error = validate(&report, &metadata, &below_floor)
             .expect_err("a family below the floor cannot pass");
-        assert!(error.to_string().contains("did not pass"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("verdict or violations do not match its observations"),
+            "{error:#}"
+        );
 
         // Two failures moved from a 50-operation PUT family (where they break
         // the 99% floor) into a 1000-operation GET family (where they pass)
@@ -20995,7 +20946,12 @@ mod tests {
         report["workload"][1] = family("get", 1000, 1);
         let error = validate(&report, &metadata, &shifted_summary)
             .expect_err("the honest per-family numbers fail the floor");
-        assert!(error.to_string().contains("did not pass"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("verdict or violations do not match its observations"),
+            "{error:#}"
+        );
 
         // The floor itself is bound to run-metadata.json.
         report["workload"][0] = family("put", 200, 1);
@@ -21009,7 +20965,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("does not match run-metadata.json min_availability_percent 99"),
+                .contains("min_success_percent does not match run-metadata.json"),
             "{error:#}"
         );
         report["min_success_percent"] = json!(99);
@@ -21313,6 +21269,8 @@ mod tests {
                 request_version_id: None,
                 is_delete_marker: None,
                 mutation_max_attempts: None,
+                mutation_attempts: None,
+                read_purpose: None,
                 listed_keys: None,
                 listed_versions: None,
                 payload_ref: None,
@@ -21993,6 +21951,237 @@ mod tests {
         assert_eq!(
             recursive_find(dir.path(), "checker-report.json").expect("find"),
             None
+        );
+    }
+    #[test]
+    fn failed_multipart_delete_keeps_plain_delete_count_and_requires_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let original = read_json::<super::PostRecoveryWriteReport>(
+            &case_dir.join(POST_RECOVERY_WRITE_REPORT_ARTIFACT),
+        )
+        .expect("report");
+        let mut history =
+            read_jsonl::<OperationRecord>(&case_dir.join(POST_RECOVERY_WRITE_HISTORY_ARTIFACT))
+                .expect("history");
+        let multipart_key = format!("{}object-{:06}", original.key_prefix, original.objects);
+        let delete = history
+            .iter_mut()
+            .find(|r| r.kind == OperationKind::Delete && r.key.as_deref() == Some(&multipart_key))
+            .expect("multipart DELETE");
+        delete.outcome = OperationOutcome::Failed;
+        delete.http_status = Some(400);
+        history.retain(|r| {
+            !(r.key.as_deref() == Some(&multipart_key)
+                && r.kind == OperationKind::Get
+                && r.outcome == OperationOutcome::NotFound)
+        });
+        let report = original
+            .rebuild_from_history(&history)
+            .expect("complete negative probe");
+        assert!(!report.passed);
+        assert_eq!(report.deletes_verified_absent, original.objects);
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure == &format!("delete {multipart_key}: Failed"))
+        );
+        super::validate_write_probe_history(&history, &report).expect("authenticated failure");
+        let mut forged = report;
+        forged.deletes_verified_absent -= 1;
+        assert!(super::validate_write_probe_history(&history, &forged).is_err());
+    }
+
+    #[test]
+    fn failed_write_probe_requires_reconstructed_history_and_classification() {
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        for tamper in [
+            "none",
+            "counter",
+            "missing-get",
+            "classification",
+            "missing-report",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_success_artifacts(dir.path(), "io-eio");
+            let case_dir = dir.path().join(case_name);
+            authenticate_success_fixture_mixed_workload(&case_dir);
+            let workload =
+                read_json::<WorkloadSummaryArtifact>(&case_dir.join("workload-summary.json"))
+                    .expect("workload");
+            let mut workload_history =
+                read_jsonl::<OperationRecord>(&case_dir.join("history.jsonl")).expect("history");
+            workload_history.truncate(
+                workload
+                    .recommit_candidates
+                    .as_ref()
+                    .expect("manifest")
+                    .history_record_count,
+            );
+            fs::write(
+                case_dir.join("history.jsonl"),
+                workload_history
+                    .iter()
+                    .map(|r| serde_json::to_string(r).expect("record"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .expect("truncate future-stage history");
+            let report_path = case_dir.join(POST_RECOVERY_WRITE_REPORT_ARTIFACT);
+            let original = read_json::<crate::fault::workload::execution::PostRecoveryWriteReport>(
+                &report_path,
+            )
+            .expect("probe report");
+            let history_path = case_dir.join(POST_RECOVERY_WRITE_HISTORY_ARTIFACT);
+            let mut records = read_jsonl::<OperationRecord>(&history_path).expect("probe history");
+            let get = records
+                .iter_mut()
+                .find(|r| r.kind == OperationKind::Get)
+                .expect("verify GET");
+            get.outcome = OperationOutcome::Failed;
+            get.http_status = Some(503);
+            get.value_sha256 = None;
+            get.size_bytes = None;
+            let mut report = original
+                .rebuild_from_history(&records)
+                .expect("negative observations");
+            assert!(!report.passed);
+            assert_eq!(report.puts_verified, original.objects - 1);
+            if tamper == "counter" {
+                report.puts_verified += 1;
+            }
+            if tamper == "missing-get" {
+                records.remove(1);
+            }
+            write_records_jsonl(&history_path, &records);
+            write_json(
+                &case_dir,
+                POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+                &serde_json::to_value(report).expect("report JSON"),
+            );
+            let mut events =
+                read_jsonl::<RunEvent>(&case_dir.join("run-events.jsonl")).expect("events");
+            let end = events
+                .iter()
+                .position(|event| {
+                    event.stage == "post-recovery-write"
+                        && event.status == RunEventStatus::Succeeded
+                })
+                .expect("probe terminal event");
+            events.truncate(end + 1);
+            events[end].status = RunEventStatus::Failed;
+            let mut terminal = events[end].clone();
+            terminal.stage = "run".into();
+            terminal.at_ms += 1;
+            events.push(terminal);
+            fs::write(
+                case_dir.join("run-events.jsonl"),
+                events
+                    .iter()
+                    .map(|event| serde_json::to_string(event).expect("event"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .expect("events");
+            let classification = if tamper == "classification" {
+                "test_or_environment"
+            } else {
+                "post_recovery_write_failed"
+            };
+            let summary = FailureSummary::new(
+                "io-eio",
+                "post-recovery-write",
+                classification,
+                "write probe failed",
+            )
+            .expect("summary")
+            .with_run_id(&original.run_id)
+            .with_case_name(case_name);
+            write_json(
+                &case_dir,
+                "failure-summary.json",
+                &serde_json::to_value(summary).expect("summary JSON"),
+            );
+            for artifact in [
+                "checker-pre-recommit-report.json",
+                "checker-report.json",
+                "recommit-report.json",
+                "recovery-stability-report.json",
+            ] {
+                let path = case_dir.join(artifact);
+                if path.exists() {
+                    fs::remove_file(path).expect("remove later artifact");
+                }
+            }
+            if tamper == "missing-report" {
+                fs::remove_file(report_path).expect("remove report");
+            }
+            let result = validate_fault_artifacts(&success_options(dir.path()));
+            if tamper == "none" {
+                assert!(!result.expect("authenticated failed probe").run_succeeded);
+            } else {
+                assert!(result.is_err(), "accepted {tamper}");
+            }
+        }
+    }
+
+    #[test]
+    fn runner_failure_after_recommit_started_requires_its_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_name = "fault_io_eio_preserves_committed_objects";
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join(case_name);
+        authenticate_success_fixture_mixed_workload(&case_dir);
+        let mut events =
+            read_jsonl::<RunEvent>(&case_dir.join("run-events.jsonl")).expect("events");
+        let started = events
+            .iter()
+            .position(|event| {
+                event.stage == "recommit-unconfirmed" && event.status == RunEventStatus::Started
+            })
+            .expect("recommit started");
+        events.truncate(started + 1);
+        let mut failure = events.last().expect("started event").clone();
+        failure.at_ms += 1;
+        failure.stage = "runner".into();
+        failure.status = RunEventStatus::Failed;
+        events.push(failure.clone());
+        failure.stage = "run".into();
+        failure.at_ms += 1;
+        events.push(failure.clone());
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            events
+                .iter()
+                .map(|event| serde_json::to_string(event).expect("event"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("events");
+        let summary = FailureSummary::new(
+            "io-eio",
+            "runner",
+            "test_or_environment",
+            "persist recommit report failed",
+        )
+        .expect("summary")
+        .with_run_id(&failure.run_id)
+        .with_case_name(case_name);
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &serde_json::to_value(summary).expect("summary JSON"),
+        );
+        fs::remove_file(case_dir.join("checker-report.json")).expect("remove final checker");
+        validate_fault_artifacts(&success_options(dir.path())).expect("complete recommit evidence");
+        fs::remove_file(case_dir.join("recommit-report.json")).expect("remove recommit report");
+        let error = validate_fault_artifacts(&success_options(dir.path()))
+            .expect_err("runner failure cannot bypass recommit evidence");
+        assert!(
+            error.to_string().contains("recommit-report.json"),
+            "{error:#}"
         );
     }
 }

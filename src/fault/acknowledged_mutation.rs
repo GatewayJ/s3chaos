@@ -1018,6 +1018,8 @@ mod tests {
             request_version_id: None,
             is_delete_marker: None,
             mutation_max_attempts: None,
+            mutation_attempts: None,
+            read_purpose: None,
             listed_keys: None,
             listed_versions: None,
             payload_ref: None,
