@@ -269,7 +269,7 @@ impl StorageRecoveryCleanupProof {
         }
     }
 
-    fn completed_at_ms(&self) -> u64 {
+    pub(crate) fn completed_at_ms(&self) -> u64 {
         match self {
             Self::AbortedBeforeMutation { observed_at_ms } => *observed_at_ms,
             Self::BitrotRestored { restore_receipt }

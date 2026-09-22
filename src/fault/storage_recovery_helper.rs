@@ -2578,7 +2578,16 @@ fn completed_receipt(
     response: &impl Serialize,
     started_at_ms: u64,
 ) -> Result<StorageRecoveryOperationReceipt> {
-    let operation_id = Uuid::new_v4().to_string();
+    // Heartbeats only need their latest durable observation. Mutation and XL2
+    // receipts retain distinct IDs because later operations refer to them.
+    let operation_id = if matches!(
+        operation,
+        StorageRecoveryHostOperation::InspectHostGeneration
+    ) {
+        stable_operation_id(&format!("s3chaos-host-generation:{}", context.scope_sha256))
+    } else {
+        Uuid::new_v4().to_string()
+    };
     completed_receipt_with_id(
         context,
         journal_root,
@@ -2656,7 +2665,11 @@ fn terminal_cleanup_operation_id(operation: &StorageRecoveryHostOperation) -> St
         } => format!("verify:{mutation_operation_id}:{post_inspection_operation_id}"),
         _ => unreachable!("terminal cleanup operation id requires a cleanup operation"),
     };
-    let digest = Sha256::digest(format!("s3chaos-bitrot-cleanup:{identity}").as_bytes());
+    stable_operation_id(&format!("s3chaos-bitrot-cleanup:{identity}"))
+}
+
+fn stable_operation_id(identity: &str) -> String {
+    let digest = Sha256::digest(identity.as_bytes());
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -3203,6 +3216,37 @@ mod tests {
             bucket: "bucket-stale-1".to_string(),
             operation,
         }
+    }
+
+    #[test]
+    fn host_generation_heartbeats_reuse_one_durable_journal() {
+        let (_directory, roots) = test_roots();
+        let context = context_for(&roots);
+        let journal = open_directory(&roots.journal, "journal root").expect("journal");
+        let mut ids = std::collections::BTreeSet::new();
+        for _ in 0..20 {
+            let observed_at = now_ms().expect("clock");
+            let receipt = completed_receipt(
+                &context,
+                &journal,
+                StorageRecoveryHostOperation::InspectHostGeneration,
+                &context.host_generation,
+                observed_at,
+            )
+            .expect("heartbeat");
+            receipt
+                .validate_for(&context, &receipt.operation)
+                .expect("durable receipt");
+            ids.insert(receipt.operation_id);
+        }
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            fs::read_dir(&roots.journal).expect("journal files").count(),
+            1
+        );
+        let persisted =
+            load_journal(&journal, ids.first().expect("operation id")).expect("latest journal");
+        assert_eq!(persisted.state, JournalState::Completed);
     }
 
     #[test]

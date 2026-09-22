@@ -3083,6 +3083,15 @@ fn validate_failed_on_disk_bitrot_artifacts(
         "bitrot failure case differs from run-spec"
     );
     failure.validate(&metadata.run_id, case_name)?;
+    if let Some(context) = failure.context.as_deref() {
+        ensure!(
+            context.cluster_context == json_spec.cluster.context
+                && context.volume.namespace == json_spec.cluster.namespace
+                && context.volume.tenant == json_spec.cluster.tenant
+                && context.identity.bucket == json_spec.metadata.bucket,
+            "failed bitrot ownership does not match the planned cluster, tenant, and bucket"
+        );
+    }
 
     let events = read_jsonl::<RunEvent>(&artifact("run-events.jsonl")?)?;
     ensure!(
@@ -3110,6 +3119,7 @@ fn validate_failed_on_disk_bitrot_artifacts(
         .transpose()?;
     if let Some(selection) = &selection {
         selection.validate()?;
+        failure.validate_selection(selection)?;
         ensure!(
             selection.identity.run_id == metadata.run_id
                 && selection.identity.case_name == case_name
@@ -3126,6 +3136,7 @@ fn validate_failed_on_disk_bitrot_artifacts(
                 .as_ref()
                 .context("bitrot mutation artifact lacks selection evidence")?,
         )?;
+        failure.cleanup.validate_mutation_cleanup(Some(mutation))?;
     }
     let corruption = optional(BITROT_CORRUPTION_WINDOW_ARTIFACT)?
         .map(|path| read_json::<BitrotCorruptionWindowProof>(&path))
@@ -3218,6 +3229,8 @@ fn validate_failed_on_disk_bitrot_artifacts(
     )?;
 
     Ok(ArtifactValidationReport {
+        terminal_stage: failure.stage.clone(),
+        run_succeeded: false,
         scenario: options.scenario.clone(),
         case_name: case_name.to_string(),
         seed: workload.seed,

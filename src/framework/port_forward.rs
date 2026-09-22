@@ -17,7 +17,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::framework::{command::CommandSpec, kubectl::Kubectl};
@@ -37,6 +37,7 @@ pub struct PortForwardGuard {
     spec: PortForwardSpec,
     started_at_ms: u64,
     log_path: PathBuf,
+    log_start_offset: usize,
     command_display: String,
 }
 
@@ -136,6 +137,11 @@ impl PortForwardSpec {
     ) -> Result<PortForwardGuard> {
         let log_path = log_path.into();
         let command = self.command(kubectl);
+        let log_start_offset = fs::metadata(&log_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let log_start_offset =
+            usize::try_from(log_start_offset).context("port-forward log is too large")?;
         let started_at_ms = now_ms();
         let child = command.spawn_background_with_log(&log_path)?;
         Ok(PortForwardGuard {
@@ -144,6 +150,7 @@ impl PortForwardSpec {
             spec: self.clone(),
             started_at_ms,
             log_path,
+            log_start_offset,
             command_display: command.display(),
         })
     }
@@ -195,6 +202,9 @@ impl PortForwardGuard {
             kubectl: Kubectl::new(&crate::framework::config::E2eConfig::defaults()),
             spec: PortForwardSpec::tenant_io_with_local_port("test", "tenant", 0),
             started_at_ms: now_ms(),
+            log_start_offset: fs::metadata(&log_path)
+                .map(|metadata| metadata.len() as usize)
+                .unwrap_or(0),
             log_path,
             command_display: "test port-forward".to_string(),
         }
@@ -301,6 +311,36 @@ impl PortForwardGuard {
         Ok(())
     }
 
+    /// Wait for this child to bind before another forward selects a free port.
+    /// Logs are appended across restarts, so only this child's output qualifies.
+    pub(crate) async fn wait_ready(&mut self, timeout: Duration) -> Result<()> {
+        let ready_line = format!(
+            "Forwarding from 127.0.0.1:{} -> {}",
+            self.spec.local_port, self.spec.remote_port
+        );
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.ensure_running()?;
+            if self
+                .log_contents()
+                .get(self.log_start_offset..)
+                .unwrap_or_default()
+                .lines()
+                .any(|line| line.trim() == ready_line)
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "port-forward did not bind its local listener within {timeout:?}; log {}:\n{}",
+                    self.log_path.display(),
+                    self.log_contents()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     pub fn log_contents(&self) -> String {
         fs::read_to_string(&self.log_path).unwrap_or_else(|_| "<unavailable>".to_string())
     }
@@ -405,6 +445,42 @@ mod tests {
         assert!(
             slot.is_none(),
             "a failed start must not leave a killed forward behind as if it were running"
+        );
+    }
+
+    #[tokio::test]
+    async fn port_forward_waits_for_its_own_listener_notification() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().expect("log directory");
+        let log = directory.path().join("forward.log");
+        std::fs::write(&log, "Forwarding from 127.0.0.1:0 -> 9000\n").expect("stale listener log");
+        let child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("fake forward");
+        let mut guard = super::PortForwardGuard::for_test(child, log.clone());
+        assert!(
+            guard.wait_ready(std::time::Duration::ZERO).await.is_err(),
+            "old process readiness must not qualify the replacement"
+        );
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(log)
+                .expect("log");
+            writeln!(file, "Forwarding from 127.0.0.1:0 -> 9000").expect("current listener log");
+        });
+        guard
+            .wait_ready(std::time::Duration::from_secs(1))
+            .await
+            .expect("listener is ready");
+        writer.await.expect("log writer");
+        guard.child.kill().expect("stop fake forward");
+        guard.child.wait().expect("reap fake forward");
+        assert!(
+            guard.wait_ready(std::time::Duration::ZERO).await.is_err(),
+            "a ready log cannot hide an exited forward"
         );
     }
 

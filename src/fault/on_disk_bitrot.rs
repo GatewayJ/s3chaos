@@ -1683,7 +1683,8 @@ impl BitrotHealEvidence {
                         .response_body,
                 )?;
                 ensure!(
-                    final_response.selected_part.original_sha256 == selection.probe.expected_sha256,
+                    final_response.selected_part.original_sha256
+                        == selection.validate()?.selected_part.original_sha256,
                     "automatic scanner did not restore the selected shard bytes"
                 );
                 let body = serde_json::from_str::<ScannerStatusBody>(&status.response_body)
@@ -1828,6 +1829,47 @@ pub struct BitrotCleanupEvidence {
     pub completed_at_ms: u64,
 }
 
+fn terminal_shard_cleanup_receipt(
+    cleanup: &StorageRecoveryCleanupProof,
+) -> Result<&StorageRecoveryOperationReceipt> {
+    match cleanup {
+        StorageRecoveryCleanupProof::BitrotRestored { restore_receipt }
+        | StorageRecoveryCleanupProof::BitrotAlreadyRepaired { restore_receipt } => {
+            Ok(restore_receipt)
+        }
+        StorageRecoveryCleanupProof::BitrotVerifiedSuperseded {
+            verification_receipt,
+        } => Ok(verification_receipt),
+        _ => bail!("completed mutation requires a terminal shard cleanup receipt"),
+    }
+}
+
+fn validate_cleanup_mutation(
+    cleanup: &StorageRecoveryCleanupProof,
+    mutation: &OfflineShardMutationResponse,
+) -> Result<()> {
+    let receipt = terminal_shard_cleanup_receipt(cleanup)?;
+    let operation_id = match &receipt.operation {
+        StorageRecoveryHostOperation::RestoreShard {
+            mutation_operation_id,
+        }
+        | StorageRecoveryHostOperation::VerifySupersededShard {
+            mutation_operation_id,
+            ..
+        } => mutation_operation_id,
+        _ => bail!("bitrot cleanup receipt is not a shard recovery operation"),
+    };
+    let response: OfflineShardRecoveryResponse = serde_json::from_str(&receipt.response_body)
+        .context("decode terminal shard cleanup response")?;
+    ensure!(
+        operation_id == &mutation.journal_operation_id
+            && response.mutation_operation_id == mutation.journal_operation_id
+            && response.observed_sha256.as_deref() == Some(mutation.original_sha256.as_str()),
+        "bitrot cleanup does not prove restoration of the selected mutation's original shard"
+    );
+    Ok(())
+}
+
 impl BitrotCleanupEvidence {
     pub(crate) fn validate(
         &self,
@@ -1913,6 +1955,7 @@ impl BitrotCleanupEvidence {
             "post-heal version set or delete marker changed"
         );
         self.helper_cleanup.validate_for(&self.context)?;
+        validate_cleanup_mutation(&self.helper_cleanup, mutation)?;
         ensure!(
             self.post_inspection_receipt.completed_at_ms
                 < self.post_heal_exact_quorum.started_at_ms
@@ -1966,6 +2009,31 @@ impl BitrotEmergencyCleanupEvidence {
             && self.errors.is_empty()
     }
 
+    pub(crate) fn validate_mutation_cleanup(
+        &self,
+        mutation: Option<&BitrotMutationEvidence>,
+    ) -> Result<()> {
+        if !self.succeeded() {
+            return Ok(());
+        }
+        let cleanup = self
+            .cleanup_proof
+            .as_ref()
+            .context("successful mutation cleanup lacks a shard proof")?;
+        let receipt = terminal_shard_cleanup_receipt(cleanup)?;
+        if let Some(mutation) = mutation {
+            let response: OfflineShardMutationResponse =
+                serde_json::from_str(&mutation.mutation_receipt.response_body)?;
+            ensure!(
+                response.journal_operation_id == mutation.mutation_receipt.operation_id
+                    && receipt.started_at_ms >= mutation.mutation_receipt.completed_at_ms,
+                "bitrot cleanup precedes its mutation receipt"
+            );
+            validate_cleanup_mutation(cleanup, &response)?;
+        }
+        Ok(())
+    }
+
     fn validate_for(&self, context: Option<&OwnedStorageContext>) -> Result<()> {
         ensure!(
             self.attempted && self.completed_at_ms > 0,
@@ -1983,6 +2051,10 @@ impl BitrotEmergencyCleanupEvidence {
             "bitrot emergency cleanup lacks required admin heal cancellation evidence"
         );
         if let Some(context) = context {
+            ensure!(
+                !self.succeeded() || self.cleanup_proof.is_some(),
+                "successful owned bitrot cleanup lacks a shard cleanup proof"
+            );
             if let Some(receipt) = &self.admin_heal_cleanup {
                 receipt.validate("admin heal emergency cleanup")?;
                 let expected_path = format!("/rustfs/admin/v3/heal/{}", context.identity.bucket);
@@ -2074,6 +2146,10 @@ impl BitrotEmergencyCleanupEvidence {
             }
             if let Some(cleanup) = &self.cleanup_proof {
                 cleanup.validate_for(context)?;
+                ensure!(
+                    cleanup.completed_at_ms() <= self.completed_at_ms,
+                    "bitrot emergency cleanup precedes its terminal shard proof"
+                );
             }
         } else {
             ensure!(
@@ -2138,17 +2214,37 @@ impl BitrotFailureEvidence {
                 "bitrot failure context belongs to another run or case"
             );
         }
-        self.cleanup.validate_for(self.context.as_deref())
+        self.cleanup.validate_for(self.context.as_deref())?;
+        if !matches!(
+            self.stage.as_str(),
+            "target-proof" | "selection" | "mutation"
+        ) {
+            self.cleanup.validate_mutation_cleanup(None)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_selection(&self, selection: &BitrotSelectionEvidence) -> Result<()> {
+        let context = self
+            .context
+            .as_deref()
+            .context("bitrot selection lacks the failure ownership context")?;
+        ensure!(
+            context_sha256(context)? == context_sha256(&selection.context)?,
+            "bitrot failure cleanup and selection belong to different storage owners"
+        );
+        Ok(())
     }
 
     pub(crate) fn validate_progress_failure(
         &self,
         progress: &[BitrotHealProgressSample],
     ) -> Result<()> {
-        if let Some(last) = progress.last()
-            && last.state == HealProgressState::Failed
+        for failed in progress
+            .iter()
+            .filter(|sample| sample.state == HealProgressState::Failed)
         {
-            let detail = last
+            let detail = failed
                 .failure_detail
                 .as_deref()
                 .context("failed bitrot heal progress lacks its failure detail")?;
@@ -2834,9 +2930,7 @@ impl LiveOnDiskBitrotRuntime {
             &Kubectl::new(&config.cluster),
             case_dir.join("bitrot-port-forward.log"),
         )?;
-        port_forward.ensure_running()?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        port_forward.ensure_running()?;
+        port_forward.wait_ready(config.cluster.timeout).await?;
         let (access_key, secret_key) = resources::test_credentials();
         let s3 = S3WorkloadClient::new(
             endpoint.clone(),
@@ -2870,7 +2964,7 @@ impl LiveOnDiskBitrotRuntime {
                     &kubectl,
                     case_dir.join(scanner_port_forward_log_name(observer_index)),
                 )?;
-                guard.ensure_running()?;
+                guard.wait_ready(config.cluster.timeout).await?;
                 scanner_admin_nodes.push(ScannerAdminNode {
                     pod_name: pod_name.clone(),
                     pod_uid: pod_uid.clone(),
@@ -5424,7 +5518,7 @@ mod tests {
             bucket: "bucket".to_string(),
             object_key: "object".to_string(),
             version_id: VERSION.to_string(),
-            expected_sha256: ORIGINAL.to_string(),
+            expected_sha256: sha256_bytes(b"complete S3 object, not one physical shard"),
             size_bytes: MIN_NON_INLINE_PROBE_BYTES,
             committed_at_ms: 102,
             capability_sha256: capability.response_sha256.clone(),
@@ -5552,7 +5646,7 @@ mod tests {
             object_directory: "bucket/object".to_string(),
             bucket: "bucket".to_string(),
             object_key: "object".to_string(),
-            object_sha256: ORIGINAL.to_string(),
+            object_sha256: probe.expected_sha256.clone(),
             version_id: VERSION.to_string(),
             selected_part_number: 1,
             expected_mount_device_id: "259:0".to_string(),
@@ -5822,7 +5916,7 @@ mod tests {
                 object_directory: "bucket/object".to_string(),
                 bucket: "bucket".to_string(),
                 object_key: "object".to_string(),
-                object_sha256: ORIGINAL.to_string(),
+                object_sha256: selection.probe.expected_sha256.clone(),
                 version_id: VERSION.to_string(),
                 selected_part_number: 1,
                 expected_mount_device_id: "259:0".to_string(),
@@ -6304,6 +6398,11 @@ mod tests {
                     .as_ref()
                     .map(|_| usize::try_from(selection.probe.size_bytes).expect("probe size")),
                 version_id: Some(receipt.version_id.clone()),
+                request_version_id: None,
+                is_delete_marker: None,
+                mutation_max_attempts: None,
+                mutation_attempts: None,
+                read_purpose: None,
                 listed_keys: None,
                 listed_versions: None,
                 payload_ref: None,
@@ -6423,6 +6522,117 @@ mod tests {
     }
 
     #[test]
+    fn completed_mutation_requires_its_own_cleanup_receipt() {
+        let (selection, mutation, _, _, cleanup, _) = evidence_set();
+        let mut emergency = BitrotEmergencyCleanupEvidence {
+            attempted: true,
+            chaos_removed: true,
+            admin_heal_closed: true,
+            helper_closed: true,
+            admin_heal_cleanup_required: false,
+            admin_heal_cleanup: None,
+            mutation_lookup: None,
+            cleanup_proof: None,
+            errors: Vec::new(),
+            completed_at_ms: 1400,
+        };
+        assert!(emergency.validate_for(Some(&selection.context)).is_err());
+        assert!(
+            emergency
+                .validate_mutation_cleanup(Some(&mutation))
+                .is_err()
+        );
+        emergency.cleanup_proof = Some(StorageRecoveryCleanupProof::AbortedBeforeMutation {
+            observed_at_ms: 900,
+        });
+        assert!(
+            emergency
+                .validate_mutation_cleanup(Some(&mutation))
+                .is_err()
+        );
+        emergency.cleanup_proof = Some(cleanup.helper_cleanup);
+        emergency
+            .validate_mutation_cleanup(Some(&mutation))
+            .expect("matching terminal cleanup");
+        let mut wrong_bytes = emergency.clone();
+        let Some(StorageRecoveryCleanupProof::BitrotAlreadyRepaired { restore_receipt }) =
+            wrong_bytes.cleanup_proof.as_mut()
+        else {
+            panic!("fixture cleanup")
+        };
+        let mut response: OfflineShardRecoveryResponse =
+            serde_json::from_str(&restore_receipt.response_body).expect("response");
+        response.observed_sha256 = Some(MUTATED.to_string());
+        restore_receipt.response_body = serde_json::to_string(&response).expect("response");
+        restore_receipt.response_sha256 = sha256_bytes(restore_receipt.response_body.as_bytes());
+        assert!(
+            wrong_bytes
+                .validate_mutation_cleanup(Some(&mutation))
+                .is_err()
+        );
+
+        let mut foreign = mutation;
+        foreign.mutation_receipt.operation_id = "99999999-9999-4999-8999-999999999999".to_string();
+        assert!(emergency.validate_mutation_cleanup(Some(&foreign)).is_err());
+    }
+
+    #[test]
+    fn failed_scanner_leader_is_bound_even_when_followed_by_running_followers() {
+        let (selection, _, _, heal, _, _) = evidence_set();
+        let mut progress = heal.progress().to_vec();
+        progress[0].state = HealProgressState::Failed;
+        progress[0].failure_detail = Some("target shard remains corrupt".to_string());
+        assert_eq!(
+            progress.last().expect("follower").state,
+            HealProgressState::Running
+        );
+        let failure = BitrotFailureEvidence {
+            schema_version: BITROT_ARTIFACT_SCHEMA_VERSION,
+            run_id: "run-1".to_string(),
+            case: StorageRecoveryCase::OnDiskBitrotAutomaticScanner,
+            stage: "heal".to_string(),
+            primary_error: "unrelated error".to_string(),
+            diagnostics: Vec::new(),
+            context: None,
+            cleanup: BitrotEmergencyCleanupEvidence {
+                attempted: true,
+                chaos_removed: true,
+                admin_heal_closed: true,
+                helper_closed: true,
+                admin_heal_cleanup_required: false,
+                admin_heal_cleanup: None,
+                mutation_lookup: None,
+                cleanup_proof: None,
+                errors: Vec::new(),
+                completed_at_ms: 1000,
+            },
+            observed_at_ms: 1001,
+        };
+        assert!(failure.validate_progress_failure(&progress).is_err());
+        let matching = BitrotFailureEvidence {
+            primary_error: "heal failed: target shard remains corrupt".to_string(),
+            ..failure
+        };
+        matching
+            .validate_progress_failure(&progress)
+            .expect("leader reason preserved");
+        let mut owned = BitrotFailureEvidence {
+            context: Some(selection.context.clone()),
+            ..matching
+        };
+        owned
+            .validate_selection(&selection)
+            .expect("same storage owner");
+        owned
+            .context
+            .as_mut()
+            .expect("context")
+            .volume
+            .persistent_volume_uid = "another-pv-generation".to_string();
+        assert!(owned.validate_selection(&selection).is_err());
+    }
+
+    #[test]
     fn exact_scope_admin_cleanup_receipt_is_bound_to_the_run_bucket() {
         let mut cleanup_context = context();
         cleanup_context.case = StorageRecoveryCase::OnDiskBitrotAdminDeep;
@@ -6459,7 +6669,9 @@ mod tests {
             admin_heal_cleanup_required: true,
             admin_heal_cleanup: Some(receipt),
             mutation_lookup: None,
-            cleanup_proof: None,
+            cleanup_proof: Some(StorageRecoveryCleanupProof::AbortedBeforeMutation {
+                observed_at_ms: 121,
+            }),
             errors: Vec::new(),
             completed_at_ms: 122,
         };
@@ -6544,14 +6756,12 @@ mod tests {
                 attempted: true,
                 chaos_removed: true,
                 admin_heal_closed: true,
-                helper_closed: true,
+                helper_closed: false,
                 admin_heal_cleanup_required: false,
                 admin_heal_cleanup: None,
                 mutation_lookup: None,
-                cleanup_proof: Some(StorageRecoveryCleanupProof::AbortedBeforeMutation {
-                    observed_at_ms: 130,
-                }),
-                errors: Vec::new(),
+                cleanup_proof: None,
+                errors: vec!["restore selected shard failed".to_string()],
                 completed_at_ms: 131,
             },
             observed_at_ms: 132,
@@ -7053,7 +7263,7 @@ mod tests {
         let corrupt = runtime.reads.back_mut().expect("corruption read");
         corrupt.outcome = BitrotReadOutcome::ExpectedBytes;
         corrupt.http_status = Some(200);
-        corrupt.observed_sha256 = Some(ORIGINAL.to_string());
+        corrupt.observed_sha256 = Some(corrupt.expected_sha256.clone());
         corrupt.error = None;
         let error = execute_on_disk_bitrot(
             &mut runtime,
