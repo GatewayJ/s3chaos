@@ -95,6 +95,7 @@ use crate::fault::{
         PreflightStatus, PreflightSummary, TargetProof, TargetProofStatus,
         target_pod_has_bound_volume, target_pod_has_fixed_volume,
     },
+    quorum::activation::{QuorumCanaryCleanupOutcome, QuorumFaultActivationEvidence},
     quorum::{
         QUORUM_FAULT_ACTIVATION_ARTIFACT, QuorumHealthObservation, QuorumMutationClass,
         QuorumVolumeBoundary, require_fresh_runtime_observation,
@@ -104,7 +105,6 @@ use crate::fault::{
         readiness_proxy_path,
     },
     reporting::{FailurePhase, FailureSummary, FailureVerdict, validate_failure_summary_v2_fields},
-    runner::quorum_activation::{QuorumCanaryCleanupOutcome, QuorumFaultActivationEvidence},
     scenarios::{
         self, ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO,
         DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultScenario, acknowledged_mutation_kind,
@@ -1415,7 +1415,14 @@ fn validate_partial_failed_injection_artifacts(
         .iter()
         .skip(summary_failure_index + 1)
         .filter(|event| event.status == RunEventStatus::Failed && event.stage != "run")
-        .all(|event| FailurePhase::from_stage(&event.stage) == FailurePhase::Cleanup);
+        .all(|event| {
+            FailurePhase::from_stage(&event.stage) == FailurePhase::Cleanup
+                || (summary.stage == "quorum-fault-activation"
+                    && matches!(
+                        FailurePhase::from_stage(&event.stage),
+                        FailurePhase::Recovery | FailurePhase::Checker | FailurePhase::Runner
+                    ))
+        });
     ensure!(
         summary.scenario == options.scenario
             && summary.run_id.as_deref() == Some(run_id)
@@ -1765,6 +1772,88 @@ fn validate_partial_failed_injection_artifacts(
         );
         required_artifacts.push(name.to_string());
     }
+    let skipped_quorum_workload = if terminal_stage == "quorum-fault-activation"
+        || has_event(
+            &events,
+            "quorum-fault-activation",
+            RunEventStatus::Succeeded,
+        ) {
+        ensure!(
+            matches!(
+                options.scenario.as_str(),
+                scenarios::QUORUM_P_IO_FAULT_SCENARIO
+                    | scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            ) && (terminal_stage != "quorum-fault-activation"
+                || summary.classification == "fault_not_active"),
+            "quorum activation failure has an invalid scenario or classification"
+        );
+        let path = locate_artifact(
+            &options.artifact_root,
+            case_name,
+            QUORUM_FAULT_ACTIVATION_ARTIFACT,
+        )?;
+        partial_artifacts.insert(QUORUM_FAULT_ACTIVATION_ARTIFACT.to_string(), path);
+        let activation = read_json::<QuorumFaultActivationEvidence>(required(
+            &partial_artifacts,
+            QUORUM_FAULT_ACTIVATION_ARTIFACT,
+        )?)?;
+        activation.validate()?;
+        ensure!(
+            activation.qualified
+                == has_event(
+                    &events,
+                    "quorum-fault-activation",
+                    RunEventStatus::Succeeded
+                )
+                && (terminal_stage != "quorum-fault-activation" || !activation.qualified)
+                && activation.scenario == metadata.scenario
+                && activation.run_id == run_id,
+            "failed quorum activation evidence contradicts the primary failure"
+        );
+        let proof = read_json::<TargetProof>(required(&partial_artifacts, "target-proof.json")?)?;
+        if let Some(evidence) = fault_evidence.as_ref() {
+            validate_quorum_activation_binding(&activation, evidence, &proof, &run_spec)?;
+        }
+        required_artifacts.push(QUORUM_FAULT_ACTIVATION_ARTIFACT.to_string());
+        if !activation.qualified {
+            let skipped = events.iter().find(|event| {
+                event.stage == "mixed-workload"
+                    && event.status == RunEventStatus::Observed
+                    && event
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("recovery_will_continue"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            });
+            ensure!(
+                !workload_completed
+                    && events.iter().all(|event| event.stage != "mixed-workload"
+                        || event.status == RunEventStatus::Observed),
+                "unqualified quorum activation cannot run the typed workload"
+            );
+            if recovery_evidence_completed
+                || pre_recommit_checker_completed
+                || final_checker_completed
+            {
+                ensure!(
+                    skipped.is_some(),
+                    "quorum recovery lacks the explicit skipped workload event"
+                );
+            }
+        }
+        !activation.qualified
+    } else {
+        false
+    };
+    if skipped_quorum_workload
+        && let (Some(recovery), Some(checker)) = (
+            recovery_stability_report.as_ref(),
+            checker_reports.get("checker-pre-recommit-report.json"),
+        )
+    {
+        checker::validate_recovery_stability_against_checker(recovery, checker)?;
+    }
     let completed_workload_required =
         matches!(
             terminal_phase,
@@ -1798,19 +1887,23 @@ fn validate_partial_failed_injection_artifacts(
             workload.seed == workload_plan.seed
                 && workload.object_count == workload_plan.object_count
                 && workload.concurrency == workload_plan.concurrency
-                && workload.exercised_all_operation_families(),
+                && (skipped_quorum_workload || workload.exercised_all_operation_families()),
             "completed workload-summary.json does not match workload-plan.json"
         );
-        workload.require_history_matches(
-            history,
-            &options.scenario,
-            &run_spec.metadata.bucket,
-            DurabilityCohort::FaultActive,
-            &workload_plan,
-            run_id,
-        )?;
-        let workload_history = mixed_workload_history(history, DurabilityCohort::FaultActive);
-        validate_primary_workload_history(&workload_history, &workload_plan, run_id)?;
+        if skipped_quorum_workload {
+            validate_skipped_quorum_workload(workload, history)?;
+        } else {
+            workload.require_history_matches(
+                history,
+                &options.scenario,
+                &run_spec.metadata.bucket,
+                DurabilityCohort::FaultActive,
+                &workload_plan,
+                run_id,
+            )?;
+            let workload_history = mixed_workload_history(history, DurabilityCohort::FaultActive);
+            validate_primary_workload_history(&workload_history, &workload_plan, run_id)?;
+        }
     }
     if let Some(manifest) = workload_summary
         .as_ref()
@@ -1876,7 +1969,9 @@ fn validate_partial_failed_injection_artifacts(
         let evidence = fault_evidence
             .as_ref()
             .context("completed recovery evidence lacks fault-evidence.json")?;
-        if ack_mutation {
+        if skipped_quorum_workload {
+            validate_skipped_quorum_recovery(evidence)?;
+        } else if ack_mutation {
             ensure!(
                 evidence.injected && !evidence.active_during_workload && evidence.recovered,
                 "completed ACK-triggered fault-evidence.json does not prove injection and recovery"
@@ -2021,8 +2116,9 @@ fn validate_partial_failed_injection_artifacts(
         );
         required_artifacts.push(AVAILABILITY_REPORT_ARTIFACT.to_string());
     }
-    let post_recovery_probe_required = (terminal_stage == "post-recovery-write"
-        && summary.classification == "post_recovery_write_failed")
+    let post_recovery_probe_required = (skipped_quorum_workload && post_recovery_report_present)
+        || (terminal_stage == "post-recovery-write"
+            && summary.classification == "post_recovery_write_failed")
         || matches!(terminal_phase, FailurePhase::Checker)
         || terminal_stage == "recommit-unconfirmed"
         || post_recovery_probe_completed
@@ -2050,7 +2146,9 @@ fn validate_partial_failed_injection_artifacts(
                 .recovery_ended_at_ms
                 .context("fault evidence lacks recovery boundary")?,
             "recovery-evidence",
-            terminal_stage != "post-recovery-write",
+            terminal_stage != "post-recovery-write"
+                && !(skipped_quorum_workload
+                    && has_event(&events, "post-recovery-write", RunEventStatus::Failed)),
         )?;
     }
     if terminal_stage == "post-recovery-write" && post_recovery_report_present {
@@ -5026,6 +5124,38 @@ fn validate_fixed_volume_runtime_evidence(
     Ok(())
 }
 
+fn validate_skipped_quorum_recovery(evidence: &FaultEvidenceArtifact) -> Result<()> {
+    ensure!(
+        !evidence.injected && !evidence.active_during_workload && evidence.recovered,
+        "unqualified quorum recovery cannot claim injection or a typed workload"
+    );
+    validate_fault_window_evidence(evidence)
+}
+
+fn validate_skipped_quorum_workload(
+    workload: &WorkloadSummaryArtifact,
+    history: &[OperationRecord],
+) -> Result<()> {
+    ensure!(
+        [
+            &workload.puts,
+            &workload.gets,
+            &workload.deletes,
+            &workload.lists,
+            &workload.multipart_completes,
+            &workload.multipart_aborts
+        ]
+        .iter()
+        .all(|counts| **counts == OutcomeCountsArtifact::default())
+            && workload.recommitted_after_recovery == 0
+            && !history
+                .iter()
+                .any(|record| record.durability_cohort == Some(DurabilityCohort::FaultActive)),
+        "skipped quorum workload contains mixed-workload counters or fault-active requests"
+    );
+    Ok(())
+}
+
 fn validate_quorum_fault_activation_evidence(
     artifacts: &BTreeMap<String, PathBuf>,
     evidence: &FaultEvidenceArtifact,
@@ -5043,6 +5173,22 @@ fn validate_quorum_fault_activation_evidence(
             && activation.cleanup_failure_reason.is_none(),
         "quorum activation evidence did not independently prove every target"
     );
+    ensure!(
+        activation.targets.iter().all(|target| target
+            .cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.outcome == QuorumCanaryCleanupOutcome::Removed)),
+        "qualified quorum activation lacks successful cleanup"
+    );
+    validate_quorum_activation_binding(&activation, evidence, proof, spec)
+}
+
+fn validate_quorum_activation_binding(
+    activation: &QuorumFaultActivationEvidence,
+    evidence: &FaultEvidenceArtifact,
+    proof: &TargetProof,
+    spec: &FaultRunSpec,
+) -> Result<()> {
     ensure!(
         activation.scenario == spec.scenario.name
             && activation.run_id == spec.metadata.run_id
@@ -5078,7 +5224,8 @@ fn validate_quorum_fault_activation_evidence(
         .context("runtime quorum target proof has no volume bindings")?;
     ensure!(
         activation.expected_targets == volume_quorum.target_count
-            && activation.targets.len() == usize::try_from(volume_quorum.target_count)?,
+            && (!activation.qualified
+                || activation.targets.len() == usize::try_from(volume_quorum.target_count)?),
         "quorum activation evidence does not cover the proven target count"
     );
     let selected_names = evidence
@@ -5092,7 +5239,7 @@ fn validate_quorum_fault_activation_evidence(
         .map(|binding| (binding.pod_name.as_str(), binding))
         .collect::<BTreeMap<_, _>>();
     ensure!(
-        selected_names.len() == activation.targets.len()
+        (!activation.qualified || selected_names.len() == activation.targets.len())
             && activation
                 .targets
                 .iter()
@@ -5125,8 +5272,8 @@ fn validate_quorum_fault_activation_evidence(
             )
         })?;
         ensure!(
-            cleanup.outcome == QuorumCanaryCleanupOutcome::Removed
-                && cleanup.exit_code == Some(0)
+            (cleanup.outcome == QuorumCanaryCleanupOutcome::Removed)
+                == (cleanup.exit_code == Some(0))
                 && cleanup.started_at_ms >= fault_delete_started_at_ms
                 && cleanup.started_at_ms <= cleanup.completed_at_ms
                 && cleanup.completed_at_ms <= recovery_ended_at_ms,
@@ -5148,6 +5295,45 @@ fn validate_quorum_fault_activation_evidence(
     let snapshot_resource = snapshot
         .get("chaos_status")
         .context("fault-evidence.json active IOChaos snapshot lacks its resource")?;
+    let fault = fixed_volume_fault(spec).context("quorum activation lacks a volume fault")?;
+    ensure!(
+        fault.target.path.as_deref() == Some(activation.volume_path.as_str()),
+        "quorum activation volume path differs from run-spec.json"
+    );
+    let injection = fixed_volume_injection_from_run_spec(fault, volume_quorum.target_count)?;
+    let runtime = crate::fault::backends::chaos_mesh::volume_fault_runtime_contract(&injection)?;
+    let candidates = volume_quorum
+        .candidates
+        .iter()
+        .map(|binding| format!("{}/{}", proof.namespace, binding.pod_name))
+        .collect();
+    let controller_targets = validate_fixed_volume_snapshot(
+        snapshot_resource,
+        &VolumeTargetEvidenceContract {
+            chaos_namespace: &spec.cluster.chaos_namespace,
+            target_namespace: &spec.cluster.namespace,
+            tenant: &spec.cluster.tenant,
+            run_id: &spec.metadata.run_id,
+            scenario: &spec.scenario.name,
+            volume_path: &activation.volume_path,
+            expected_targets: volume_quorum.target_count,
+            candidate_pod_ids: &candidates,
+            runtime: &runtime,
+        },
+    );
+    let proven = controller_targets
+        .as_ref()
+        .is_ok_and(|targets| *targets == activation.selected_record_ids())
+        && activation.targets.len() == usize::try_from(volume_quorum.target_count)?
+        && activation.targets.iter().all(|target| {
+            target.outcome == crate::fault::quorum::activation::QuorumCanaryOutcome::IoErrorObserved
+        });
+    ensure!(
+        activation.qualified == proven,
+        "quorum activation verdict differs from controller and remote write evidence: controller={controller_targets:?}, canaries={:?}, expected={}",
+        activation.selected_record_ids(),
+        volume_quorum.target_count
+    );
     let snapshot_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(snapshot_resource)?));
     ensure!(
         activation.iochaos_snapshot_sha256 == snapshot_sha256,
@@ -9712,6 +9898,10 @@ mod tests {
             TargetPersistentVolumeProof, TargetProof, TargetResolvedPodProof,
             TargetVolumeMountProof,
         },
+        quorum::activation::{
+            QuorumCanaryCleanupEvidence, QuorumCanaryCleanupOutcome, QuorumCanaryOutcome,
+            QuorumFaultActivationEvidence, QuorumFaultActivationTargetEvidence,
+        },
         quorum::{
             ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape,
             QUORUM_FAULT_ACTIVATION_ARTIFACT, QuorumCaseClass, QuorumDriveHealth,
@@ -9721,10 +9911,6 @@ mod tests {
         reporting::{
             AvailabilityStatus, DataCorrectnessStatus, FailurePhase, FailureSeverity,
             FailureVerdict, ResponsibilityDomain,
-        },
-        runner::quorum_activation::{
-            QuorumCanaryCleanupEvidence, QuorumCanaryCleanupOutcome, QuorumCanaryOutcome,
-            QuorumFaultActivationEvidence, QuorumFaultActivationTargetEvidence,
         },
         scenarios::ADMIN_DECOMMISSION_SCENARIO,
         scenarios::{
@@ -13189,9 +13375,13 @@ mod tests {
         let iochaos_resource = json!({
             "apiVersion": "chaos-mesh.org/v1alpha1",
             "kind": "IOChaos",
-            "metadata": {"name": iochaos_resource_name},
+            "metadata": {"name": iochaos_resource_name, "namespace": run_spec.cluster.chaos_namespace,
+                "labels": {"rustfs-fault-test/run-id": run_spec.metadata.run_id, "rustfs-fault-test/scenario": run_spec.scenario.name, "app.kubernetes.io/managed-by": "s3chaos"}},
+            "spec": {"action":"fault", "errno":5, "mode":"fixed", "value":"3", "selector":{"namespaces":[run_spec.cluster.namespace], "labelSelectors":{"rustfs.tenant":run_spec.cluster.tenant}},
+                "containerNames":["rustfs"], "volumePath":"/data/rustfs0", "path":"/data/rustfs0/**/*", "methods":["READ", "WRITE"], "percent":100, "duration":format!("{}s", scenario.duration.as_secs())},
             "status": {
-                "experiment": {
+                "conditions":[{"type":"Selected","status":"True"},{"type":"AllInjected","status":"True"},{"type":"AllRecovered","status":"False"}],
+                "experiment": {"desiredPhase":"Run",
                     "containerRecords": (0..3).map(|index| json!({
                         "id": format!("{}/rustfs-{index}/rustfs", run_spec.cluster.namespace),
                         "selectorKey": ".",
@@ -13208,7 +13398,7 @@ mod tests {
             "chaos_status": iochaos_resource.clone()
         })];
         let activation = QuorumFaultActivationEvidence {
-            schema_version: 1,
+            schema_version: 2,
             scenario: run_spec.scenario.name.clone(),
             run_id: run_spec.metadata.run_id.clone(),
             backend: "chaos-mesh-iochaos".to_string(),
@@ -13237,12 +13427,23 @@ mod tests {
                         "{}/rustfs-{index}/rustfs",
                         run_spec.cluster.namespace
                     ),
-                    canary_path: format!("/data/rustfs0/.s3chaos-quorum-run1-rustfs-{index}"),
+                    canary_path: crate::fault::quorum::activation::quorum_canary_path(
+                        "/data/rustfs0",
+                        &format!("rustfs-{index}"),
+                        &run_spec.metadata.run_id,
+                    ),
                     started_at_ms: 206,
                     completed_at_ms: 208,
                     outcome: QuorumCanaryOutcome::IoErrorObserved,
                     exit_code: Some(1),
-                    stdout: String::new(),
+                    stdout: format!(
+                        "s3chaos-canary-write-v1:{}:1\n",
+                        crate::fault::quorum::activation::quorum_canary_path(
+                            "/data/rustfs0",
+                            &format!("rustfs-{index}"),
+                            &run_spec.metadata.run_id
+                        )
+                    ),
                     stderr: "write error: Input/output error".to_string(),
                     cleanup: Some(QuorumCanaryCleanupEvidence {
                         started_at_ms: 351,
@@ -13271,6 +13472,57 @@ mod tests {
             &run_spec,
         )
         .expect("bound quorum activation evidence");
+
+        let mut unqualified = activation.clone();
+        unqualified.targets[0].outcome = QuorumCanaryOutcome::TransportFailure;
+        unqualified.targets[0].stdout.clear();
+        unqualified.targets[0].stderr =
+            "error: unable to upgrade connection: backend i/o error".into();
+        unqualified.qualified = false;
+        unqualified.failure_reasons = vec!["canary transport failed".into()];
+        unqualified
+            .validate()
+            .expect("transport failure is diagnostic evidence");
+        super::validate_quorum_activation_binding(
+            &unqualified,
+            &health_evidence,
+            &proof,
+            &run_spec,
+        )
+        .expect("authenticated failed activation");
+        unqualified.qualified = true;
+        unqualified.failure_reasons.clear();
+        assert!(unqualified.validate().is_err());
+        let mut forged_failure = activation.clone();
+        forged_failure.qualified = false;
+        forged_failure.failure_reasons = vec!["invented failure".into()];
+        assert!(
+            super::validate_quorum_activation_binding(
+                &forged_failure,
+                &health_evidence,
+                &proof,
+                &run_spec
+            )
+            .is_err()
+        );
+
+        let mut skipped_lifecycle = health_evidence.clone();
+        skipped_lifecycle.injected = false;
+        skipped_lifecycle.active_during_workload = false;
+        skipped_lifecycle.fault_apply_started_at_ms = Some(195);
+        skipped_lifecycle.recovery_started_at_ms = Some(360);
+        super::validate_skipped_quorum_recovery(&skipped_lifecycle)
+            .expect("non-ACK skipped lifecycle");
+        skipped_lifecycle.active_during_workload = true;
+        assert!(super::validate_skipped_quorum_recovery(&skipped_lifecycle).is_err());
+
+        let skipped = crate::fault::workload::execution::MixedWorkloadResult::skipped_after_unqualified_activation(&run_spec.workload.plan, &run_spec.scenario.name, &run_spec.metadata.run_id);
+        let mut skipped_summary: WorkloadSummaryArtifact =
+            serde_json::from_value(serde_json::to_value(&skipped.summary).expect("summary JSON"))
+                .expect("summary");
+        super::validate_skipped_quorum_workload(&skipped_summary, &[]).expect("no typed workload");
+        skipped_summary.puts.ok = 1;
+        assert!(super::validate_skipped_quorum_workload(&skipped_summary, &[]).is_err());
 
         let mut cleanup_failed = activation.clone();
         cleanup_failed.cleanup_failure_reason = Some("cleanup failed".to_string());

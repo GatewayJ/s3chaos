@@ -30,10 +30,7 @@ use crate::{
         history::Recorder,
         plan::{ExecutionPlan, FaultPlan, FaultPlanOptions},
         preflight::{PreflightPhase, PreflightSummary, TargetProof},
-        reporting::{
-            FailureSummary, RunMetadata, write_failure_summary as persist_failure_summary,
-            write_failure_summary_if_absent,
-        },
+        reporting::{FailureSummary, RunMetadata, write_failure_summary_if_absent},
         scenarios::{self, FaultScenario, FaultScenarioSpec},
         spec::FaultRunSpec,
         suite_plan::fault_run_id,
@@ -52,7 +49,7 @@ mod ack;
 mod injection;
 mod node_down;
 mod post_recovery;
-pub(crate) mod quorum_activation;
+mod quorum_activation;
 mod recovery;
 mod setup;
 pub(crate) mod targets;
@@ -225,7 +222,7 @@ async fn run_fault_case(
                 let mut active = run.activate_fault(&target).await?;
                 let skip_typed_oracle = active.quorum_activation.as_ref().is_some_and(|evidence| {
                     evidence.evidence().disposition()
-                        == quorum_activation::QuorumActivationDisposition::SkipTypedOracleAndRecover
+                        == crate::fault::quorum::activation::QuorumActivationDisposition::SkipTypedOracleAndRecover
                 });
                 let mut workload = if skip_typed_oracle {
                     run.skip_unqualified_quorum_workload(&active)?
@@ -264,18 +261,6 @@ async fn run_fault_case(
                     .await?;
                 if let Some(reason) = active.deferred_failure.as_deref() {
                     let error = anyhow::anyhow!(reason.to_string());
-                    run.record_failure(
-                        "quorum-fault-activation",
-                        "fault_not_active",
-                        &error,
-                        Some(serde_json::json!({
-                            "artifact": crate::fault::quorum::QUORUM_FAULT_ACTIVATION_ARTIFACT,
-                            "recovery_completed": true,
-                            "recommit_completed": true,
-                            "checker_completed": true,
-                        })),
-                        None,
-                    )?;
                     return Err(error);
                 }
                 Ok(())
@@ -484,7 +469,7 @@ struct FaultRemoval {
 
 impl FaultRun<'_> {
     fn write_failure_summary(&self, summary: FailureSummary) -> Result<()> {
-        persist_failure_summary(
+        write_failure_summary_if_absent(
             self.collector,
             self.scenario.case_name,
             summary.with_run_id(&self.context.run_id),

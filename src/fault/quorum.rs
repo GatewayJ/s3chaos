@@ -16,6 +16,8 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) mod activation;
+
 pub const RUNTIME_TOPOLOGY_MAX_AGE_MS: u64 = 5_000;
 pub const MAX_ERASURE_SET_SHARDS: u32 = 16;
 pub const QUORUM_FAULT_ACTIVATION_ARTIFACT: &str = "quorum-fault-activation.json";

@@ -22,7 +22,6 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, ensure};
 use futures::future::join_all;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     fault::{
@@ -32,268 +31,31 @@ use crate::{
         reporting::FaultStatusSnapshot,
         workload::sha256_hex,
     },
-    framework::{
-        artifacts::ArtifactCollector, command::CommandOutput, config::ClusterTestConfig,
-        kubectl::Kubectl,
-    },
+    framework::{artifacts::ArtifactCollector, config::ClusterTestConfig, kubectl::Kubectl},
 };
 
 use super::now_ms;
 
-const ACTIVATION_SCHEMA_VERSION: u8 = 1;
 const RUSTFS_CONTAINER: &str = "rustfs";
 const CANARY_SCRIPT: &str = r#"export LC_ALL=C
 target=$1
-(umask 077; printf 's3chaos-quorum-canary\n' > "$target")
+write_error=$( (umask 077; set -C; printf 's3chaos-quorum-canary\n' > "$target") 2>&1)
 status=$?
-if [ "$status" -eq 0 ]; then
-    rm -f -- "$target"
-fi
+printf '%s\n' "$write_error" >&2
+# Remote exec may outlive a cancelled kubectl connection. Remove the file
+# here as well as in the caller's guard after fault removal.
+rm -f -- "$target" 2>/dev/null || :
+printf 's3chaos-canary-write-v1:%s:%s\n' "$target" "$status"
 exit "$status""#;
 const CLEANUP_SCRIPT: &str = r#"target=$1
 rm -f -- "$target""#;
 const CLEANUP_FAILURE_ARTIFACT: &str = "quorum-canary-cleanup-error.txt";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum QuorumCanaryOutcome {
-    NotRun,
-    IoErrorObserved,
-    WriteSucceeded,
-    UnexpectedFailure,
-    TransportFailure,
-    TimedOut,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum QuorumCanaryCleanupOutcome {
-    Removed,
-    Failed,
-    TimedOut,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum QuorumActivationDisposition {
-    RunTypedOracle,
-    SkipTypedOracleAndRecover,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct QuorumCanaryCleanupEvidence {
-    pub(crate) started_at_ms: u64,
-    pub(crate) completed_at_ms: u64,
-    pub(crate) outcome: QuorumCanaryCleanupOutcome,
-    pub(crate) exit_code: Option<i32>,
-    pub(crate) stderr: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct QuorumFaultActivationTargetEvidence {
-    pub(crate) pod_name: String,
-    pub(crate) pod_uid: String,
-    pub(crate) container_id: String,
-    pub(crate) persistent_volume_claim: String,
-    pub(crate) persistent_volume: String,
-    pub(crate) mount_path: String,
-    pub(crate) drive_uuid: String,
-    pub(crate) controller_record_id: String,
-    pub(crate) canary_path: String,
-    pub(crate) started_at_ms: u64,
-    pub(crate) completed_at_ms: u64,
-    pub(crate) outcome: QuorumCanaryOutcome,
-    pub(crate) exit_code: Option<i32>,
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) cleanup: Option<QuorumCanaryCleanupEvidence>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct QuorumFaultActivationEvidence {
-    pub(crate) schema_version: u8,
-    pub(crate) scenario: String,
-    pub(crate) run_id: String,
-    pub(crate) backend: String,
-    pub(crate) iochaos_resource_name: String,
-    pub(crate) iochaos_snapshot_sha256: String,
-    pub(crate) volume_path: String,
-    pub(crate) expected_targets: u32,
-    pub(crate) controller_records: usize,
-    pub(crate) started_at_ms: u64,
-    pub(crate) completed_at_ms: u64,
-    pub(crate) qualified: bool,
-    pub(crate) failure_reasons: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) cleanup_failure_reason: Option<String>,
-    pub(crate) targets: Vec<QuorumFaultActivationTargetEvidence>,
-}
-
-impl QuorumFaultActivationEvidence {
-    pub(super) fn disposition(&self) -> QuorumActivationDisposition {
-        if self.qualified {
-            QuorumActivationDisposition::RunTypedOracle
-        } else {
-            QuorumActivationDisposition::SkipTypedOracleAndRecover
-        }
-    }
-
-    pub(crate) fn validate(&self) -> Result<()> {
-        ensure!(
-            self.schema_version == ACTIVATION_SCHEMA_VERSION,
-            "quorum activation evidence uses an unsupported schema version"
-        );
-        ensure!(
-            !self.scenario.trim().is_empty()
-                && !self.run_id.trim().is_empty()
-                && self.backend == "chaos-mesh-iochaos"
-                && self.volume_path.starts_with('/')
-                && self.expected_targets > 0
-                && self.started_at_ms > 0
-                && self.started_at_ms <= self.completed_at_ms,
-            "quorum activation evidence identity or timing is invalid"
-        );
-        if self.qualified {
-            ensure!(
-                !self.iochaos_resource_name.trim().is_empty()
-                    && self.iochaos_snapshot_sha256.len() == 64,
-                "qualified quorum activation evidence lacks its IOChaos identity"
-            );
-        }
-        ensure!(
-            self.targets.iter().all(|target| {
-                !target.pod_name.trim().is_empty()
-                    && !target.pod_uid.trim().is_empty()
-                    && !target.container_id.trim().is_empty()
-                    && !target.persistent_volume_claim.trim().is_empty()
-                    && !target.persistent_volume.trim().is_empty()
-                    && target.mount_path == self.volume_path
-                    && !target.drive_uuid.trim().is_empty()
-                    && !target.controller_record_id.trim().is_empty()
-                    && target
-                        .canary_path
-                        .starts_with(&format!("{}/", self.volume_path.trim_end_matches('/')))
-                    && target.started_at_ms >= self.started_at_ms
-                    && target.started_at_ms <= target.completed_at_ms
-                    && target.completed_at_ms <= self.completed_at_ms
-            }),
-            "quorum activation target identity, path, or timing is invalid"
-        );
-        for values in [
-            self.targets
-                .iter()
-                .map(|target| target.pod_name.as_str())
-                .collect::<Vec<_>>(),
-            self.targets
-                .iter()
-                .map(|target| target.pod_uid.as_str())
-                .collect(),
-            self.targets
-                .iter()
-                .map(|target| target.container_id.as_str())
-                .collect(),
-            self.targets
-                .iter()
-                .map(|target| target.persistent_volume_claim.as_str())
-                .collect(),
-            self.targets
-                .iter()
-                .map(|target| target.persistent_volume.as_str())
-                .collect(),
-            self.targets
-                .iter()
-                .map(|target| target.drive_uuid.as_str())
-                .collect(),
-            self.targets
-                .iter()
-                .map(|target| target.controller_record_id.as_str())
-                .collect(),
-            self.targets
-                .iter()
-                .map(|target| target.canary_path.as_str())
-                .collect(),
-        ] {
-            ensure!(
-                values
-                    .iter()
-                    .copied()
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    == values.len(),
-                "quorum activation evidence contains duplicate target identities"
-            );
-        }
-        let independently_proven = self.targets.len() == usize::try_from(self.expected_targets)?
-            && self.controller_records == usize::try_from(self.expected_targets)?
-            && self
-                .targets
-                .iter()
-                .all(|target| target.outcome == QuorumCanaryOutcome::IoErrorObserved);
-        ensure!(
-            self.qualified == (self.failure_reasons.is_empty() && independently_proven),
-            "quorum activation qualification is inconsistent with its controller and canary evidence"
-        );
-        ensure!(
-            self.cleanup_failure_reason
-                .as_deref()
-                .is_none_or(|reason| !reason.trim().is_empty()),
-            "quorum activation cleanup failure reason is empty"
-        );
-        for target in &self.targets {
-            match target.outcome {
-                QuorumCanaryOutcome::NotRun => ensure!(
-                    target.exit_code.is_none(),
-                    "quorum activation canary pending result contains a remote exit code"
-                ),
-                QuorumCanaryOutcome::IoErrorObserved => ensure!(
-                    target.exit_code.is_some_and(|code| code != 0) && io_error_text(&target.stderr),
-                    "quorum activation canary claims EIO without an EIO process result"
-                ),
-                QuorumCanaryOutcome::WriteSucceeded => ensure!(
-                    target.exit_code == Some(0),
-                    "quorum activation canary claims success with a failed process result"
-                ),
-                QuorumCanaryOutcome::UnexpectedFailure => ensure!(
-                    target.exit_code.is_some_and(|code| code != 0)
-                        && !io_error_text(&target.stderr),
-                    "quorum activation canary unexpected failure result is inconsistent"
-                ),
-                QuorumCanaryOutcome::TransportFailure | QuorumCanaryOutcome::TimedOut => ensure!(
-                    target.exit_code.is_none(),
-                    "quorum activation canary transport result contains a remote exit code"
-                ),
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn failure_reason(&self) -> Option<String> {
-        (!self.qualified).then(|| {
-            if self.failure_reasons.is_empty() {
-                "fault activation was not independently proven".to_string()
-            } else {
-                self.failure_reasons.join("; ")
-            }
-        })
-    }
-
-    pub(super) fn selected_record_ids(&self) -> std::collections::BTreeSet<String> {
-        self.targets
-            .iter()
-            .map(|target| target.controller_record_id.clone())
-            .collect()
-    }
-
-    pub(super) fn selected_containers(&self) -> BTreeMap<String, String> {
-        self.targets
-            .iter()
-            .map(|target| (target.pod_name.clone(), target.container_id.clone()))
-            .collect()
-    }
-}
+use crate::fault::quorum::activation::{
+    ACTIVATION_SCHEMA_VERSION, QuorumCanaryCleanupEvidence, QuorumCanaryCleanupOutcome,
+    QuorumCanaryOutcome, QuorumFaultActivationEvidence, QuorumFaultActivationTargetEvidence,
+    classify_canary_result, quorum_canary_path,
+};
 
 #[cfg(test)]
 type TestCleanupRunner =
@@ -544,34 +306,8 @@ fn injected_controller_records(snapshot: &serde_json::Value) -> Result<Vec<Strin
         .collect())
 }
 
-fn io_error_text(stderr: &str) -> bool {
-    let stderr = stderr.to_ascii_lowercase();
-    stderr.contains("input/output error")
-        || stderr.contains("i/o error")
-        || stderr.contains("os error 5")
-        || stderr.contains("errno 5")
-}
-
-fn io_error_observed(output: &CommandOutput) -> bool {
-    if output.code == Some(0) {
-        return false;
-    }
-    io_error_text(&output.stderr)
-}
-
 fn canary_path(binding: &QuorumVolumeBinding, run_id: &str) -> String {
-    let suffix = run_id
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .take(20)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    format!(
-        "{}/.s3chaos-quorum-{}-{}",
-        binding.mount_path.trim_end_matches('/'),
-        suffix,
-        binding.pod_name
-    )
+    quorum_canary_path(&binding.mount_path, &binding.pod_name, run_id)
 }
 
 async fn run_canary(
@@ -601,26 +337,8 @@ async fn run_canary(
         .await;
     let completed_at_ms = now_ms();
     let (outcome, exit_code, stdout, stderr) = match result {
-        Ok(output) if io_error_observed(&output) => (
-            QuorumCanaryOutcome::IoErrorObserved,
-            output.code,
-            output.stdout,
-            output.stderr,
-        ),
-        Ok(output) if output.code == Some(0) => (
-            QuorumCanaryOutcome::WriteSucceeded,
-            output.code,
-            output.stdout,
-            output.stderr,
-        ),
-        Ok(output) if output.code.is_none() => (
-            QuorumCanaryOutcome::TransportFailure,
-            None,
-            output.stdout,
-            output.stderr,
-        ),
         Ok(output) => (
-            QuorumCanaryOutcome::UnexpectedFailure,
+            classify_canary_result(output.code, &output.stdout, &output.stderr, &path),
             output.code,
             output.stdout,
             output.stderr,
@@ -721,14 +439,21 @@ pub(super) fn prepare_quorum_fault_activation(
             .push("IOChaos activation snapshot contains duplicate controller records".to_string());
     }
     let mut attempts = Vec::new();
+    let mut selected_pods = std::collections::BTreeSet::new();
     for record_id in unique_records {
         let binding = iochaos_record_pod_id(&record_id)
             .ok()
             .and_then(|pod_id| pod_id.rsplit_once('/').map(|(_, pod)| pod.to_string()))
             .and_then(|pod| bindings.get(&pod).cloned());
         match binding {
-            Some(binding) => attempts.push((binding, record_id)),
-            None => failure_reasons.push(format!(
+            Some(binding)
+                if record_id
+                    == format!("{}/{}/rustfs", target_proof.namespace, binding.pod_name)
+                    && selected_pods.insert(binding.pod_name.clone()) =>
+            {
+                attempts.push((binding, record_id))
+            }
+            _ => failure_reasons.push(format!(
                 "IOChaos controller record {record_id:?} does not resolve to a proven quorum volume"
             )),
         }
@@ -819,17 +544,10 @@ pub(super) async fn qualify_prepared_quorum_fault_activation(
     failure_reasons.dedup();
     let completed_at_ms = now_ms();
     let mut evidence = activation.evidence().clone();
-    let qualified = failure_reasons.is_empty()
-        && targets.len() == usize::try_from(evidence.expected_targets).unwrap_or(usize::MAX)
-        && evidence.controller_records
-            == usize::try_from(evidence.expected_targets).unwrap_or(usize::MAX)
-        && targets
-            .iter()
-            .all(|target| target.outcome == QuorumCanaryOutcome::IoErrorObserved);
     evidence.completed_at_ms = completed_at_ms;
-    evidence.qualified = qualified;
     evidence.failure_reasons = failure_reasons;
     evidence.targets = targets;
+    evidence.qualified = evidence.qualification();
     activation.replace_evidence(evidence);
 }
 
@@ -909,6 +627,7 @@ pub(super) async fn cleanup_quorum_canaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fault::quorum::activation::QuorumActivationDisposition;
     use std::sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -925,12 +644,15 @@ mod tests {
             mount_path: "/data/rustfs0".to_string(),
             drive_uuid: format!("drive-{index}"),
             controller_record_id: format!("faults/rustfs-{index}/rustfs"),
-            canary_path: format!("/data/rustfs0/.s3chaos-quorum-run-rustfs-{index}"),
+            canary_path: quorum_canary_path("/data/rustfs0", &format!("rustfs-{index}"), "run-1"),
             started_at_ms: 110 + index as u64,
             completed_at_ms: 120 + index as u64,
             outcome,
             exit_code: Some(1),
-            stdout: String::new(),
+            stdout: format!(
+                "s3chaos-canary-write-v1:{}:1\n",
+                quorum_canary_path("/data/rustfs0", &format!("rustfs-{index}"), "run-1")
+            ),
             stderr: "sh: write error: Input/output error".to_string(),
             cleanup: None,
         }
@@ -983,6 +705,31 @@ mod tests {
     }
 
     #[test]
+    fn canary_shell_returns_a_bound_write_receipt_and_removes_its_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("canary");
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", CANARY_SCRIPT, "canary-test"])
+            .arg(&path)
+            .output()
+            .expect("shell");
+        assert!(output.status.success());
+        assert_eq!(
+            classify_canary_result(
+                output.status.code(),
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+                path.to_str().expect("path")
+            ),
+            QuorumCanaryOutcome::WriteSucceeded
+        );
+        assert!(
+            !path.exists(),
+            "late remote completion must remove its own file"
+        );
+    }
+
+    #[test]
     fn complete_independent_eio_evidence_qualifies_activation() {
         let evidence = evidence(
             2,
@@ -1025,6 +772,10 @@ mod tests {
             vec!["canary did not observe EIO".to_string()],
         );
         evidence.targets[0].exit_code = Some(0);
+        evidence.targets[0].stdout = format!(
+            "s3chaos-canary-write-v1:{}:0\n",
+            evidence.targets[0].canary_path
+        );
         evidence.targets[0].stderr.clear();
 
         evidence
@@ -1041,6 +792,7 @@ mod tests {
             vec!["canary timed out".to_string()],
         );
         evidence.targets[0].exit_code = None;
+        evidence.targets[0].stdout.clear();
         evidence.targets[0].stderr = "command timed out".to_string();
 
         evidence
@@ -1069,6 +821,10 @@ mod tests {
             vec!["canary did not observe EIO".to_string()],
         );
         evidence.targets[0].exit_code = Some(0);
+        evidence.targets[0].stdout = format!(
+            "s3chaos-canary-write-v1:{}:0\n",
+            evidence.targets[0].canary_path
+        );
         evidence.targets[0].stderr.clear();
 
         assert_eq!(

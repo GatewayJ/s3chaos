@@ -321,6 +321,14 @@ impl FaultRun<'_> {
                 &serde_json::to_string_pretty(evidence)?,
             )?;
             let failure = evidence.failure_reason();
+            if let Some(reason) = &failure {
+                self.write_failure_summary(crate::fault::reporting::FailureSummary::new(
+                    &self.scenario.name,
+                    "quorum-fault-activation",
+                    "fault_not_active",
+                    reason.clone(),
+                )?)?;
+            }
             events.record(
                 "quorum-fault-activation",
                 if failure.is_some() {
@@ -861,6 +869,18 @@ impl FaultRun<'_> {
             }
             Err(error) => {
                 let reason = format!("quorum activation canary cleanup failed: {error:#}");
+                if let Err(persistence) = self.write_failure_summary(
+                    crate::fault::reporting::FailureSummary::new(
+                        &self.scenario.name,
+                        "quorum-canary-cleanup",
+                        "test_or_environment",
+                        reason.clone(),
+                    )
+                    .expect("known cleanup classification"),
+                ) {
+                    eprintln!("persist quorum canary cleanup failure: {persistence:#}");
+                }
+
                 active.deferred_failure = Some(match active.deferred_failure.take() {
                     Some(primary) => format!("{primary}; {reason}"),
                     None => reason.clone(),
