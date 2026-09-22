@@ -1,9 +1,7 @@
 # Durability live qualification
 
 A calibration result belongs to one detector, candidate image digest, workload,
-and storage layout. Catalog `gate-candidate` is not evidence of calibration.
-Fresh-volume replacement and bitrot remain Planned until their supported
-variants have separate live evidence.
+and storage layout.
 
 ## ACK positive and negative controls
 
@@ -65,7 +63,7 @@ and seed, ACK timing, recovery policy, EC geometry, cluster/storage class, and
 pre-crash filesystem/mount options. Host kernel writeback settings and image
 provenance must additionally be preserved in the operator's lab report; the
 analyzer does not attest those external settings. Its output is evidence for
-this pair, not automatic catalog promotion or proof of physical power loss.
+this pair.
 
 Repeat with individually reviewed single-attempt suites for overwrite,
 delete-marker, zero-byte PUT and multipart completion. Choose the exact expected
@@ -75,21 +73,40 @@ other mutation types.
 
 ## Fresh-volume and bitrot variants
 
-Use the existing supervised qualification entrypoint and its exact target JSON,
-helper image, dedicated Local-PV configuration and identity checks. See
-`make fault-qualify-list` and the matching manifests under `fault/planned/`.
-Preflight requires an explicit context, namespace and Tenant; it must succeed
-before any host mutation. Run only one of these commands per fresh prepared
-fixture, preserving and analyzing its evidence before the next:
+[PR #99](https://github.com/rustfs/s3chaos/pull/99) enables ordinary execution
+of fresh-volume replacement and bitrot, including their four recovery variants.
+It also provides the corresponding single-attempt suites under `fault/examples/`:
+`fresh-volume-replacement-automatic.yaml`,
+`fresh-volume-replacement-admin-deep.yaml`, `on-disk-bitrot.yaml`, and
+`on-disk-bitrot-admin-deep.yaml`.
+
+Prepare the exact target JSON, helper image, dedicated Local-PV configuration,
+context, namespace and Tenant before running. Set
+`RUSTFS_FAULT_TEST_DESTRUCTIVE=1` and select one explicit recovery case:
 
 ```bash
-make fault-qualify QUALIFICATION_CASE=fresh-volume-replacement-automatic-replacement
-make fault-qualify QUALIFICATION_CASE=fresh-volume-replacement-admin-deep
-make fault-qualify QUALIFICATION_CASE=on-disk-bitrot-automatic-scanner
-make fault-qualify QUALIFICATION_CASE=on-disk-bitrot-admin-deep
+RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=fresh-volume-replacement-automatic-replacement \
+  make fault-run SCENARIO=fresh-volume-replacement
+RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=fresh-volume-replacement-admin-deep \
+  make fault-run SCENARIO=fresh-volume-replacement
+RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=on-disk-bitrot-automatic-scanner \
+  make fault-run SCENARIO=on-disk-bitrot
+RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=on-disk-bitrot-admin-deep \
+  make fault-run SCENARIO=on-disk-bitrot
 ```
 
-These are four separate supervised runs, not a batch script. After each run:
+Run one command per prepared fixture. The existing
+`make fault-qualify QUALIFICATION_CASE=<case>` entrypoint remains available for
+each of these four case names; `make fault-qualify-list` describes its contract.
+
+Validate an ordinary run using its exact emitted artifact root and scenario:
+
+```bash
+cargo run --quiet --bin s3chaos -- fault-validate-artifacts \
+  '<scenario>' '<exact emitted artifact root>'
+```
+
+For a run started through `fault-qualify`, use its qualification run root:
 
 ```bash
 make fault-qualify-analyze RUN_ROOT='<exact emitted qualification run root>'
@@ -102,9 +119,3 @@ Bitrot also needs the actual mutation receipt and matching checksum detection
 within the corruption window. Missing detection, background-repair races,
 unsupported diagnostics and incomplete restore are unqualified or failed, never
 PASS. Stop on an unexpected failure and preserve live evidence before cleanup.
-
-The earlier external replacement versioned-marker PASS recorded in backlog
-#2347 does not qualify its unversioned branch or both current K8s variants. Each
-current variant requires its own complete run on the selected image. Promote a
-Planned scenario only after all advertised variants have valid live receipts,
-static gates and independent review; retain unresolved product defects.
