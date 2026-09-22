@@ -3337,12 +3337,23 @@ fn validate_storage_recovery_execution_artifacts(
         &artifacts,
         FORCE_READ_PROOF_ARTIFACT,
     )?)?;
-    read_proof.validate_chain(&mappings, &replacement, &summary, &progress, &proof_history)?;
+    let original_target_proof = fs::read_to_string(required(&artifacts, "target-proof.json")?)?;
+    read_proof.validate_chain(
+        &mappings,
+        &replacement,
+        &summary,
+        &progress,
+        &proof_history,
+        &original_target_proof,
+    )?;
     ensure!(
-        replacement.identity.run_id == metadata.run_id
+        read_proof.chaos_namespace() == json_spec.cluster.chaos_namespace
+            && replacement.replacement.namespace == json_spec.cluster.namespace
+            && replacement.replacement.tenant == json_spec.cluster.tenant
+            && replacement.identity.run_id == metadata.run_id
             && replacement.identity.case_name == case_name
             && replacement.identity.bucket == json_spec.metadata.bucket,
-        "storage-recovery proof identity does not match metadata"
+        "fresh-volume proof identity or cluster scope does not match run-spec"
     );
 
     let fixture = read_json::<Value>(required(&artifacts, FRESH_VOLUME_FIXTURE_ARTIFACT)?)?;
@@ -5110,6 +5121,8 @@ fn validate_fixed_volume_runtime_evidence(
                 run_id: &spec.metadata.run_id,
                 scenario: &spec.scenario.name,
                 volume_path,
+                path: None,
+                exact_pod_names: None,
                 expected_targets: expected_target_count,
                 candidate_pod_ids: &candidate_pod_ids,
                 runtime: &runtime_contract,
@@ -5316,6 +5329,8 @@ fn validate_quorum_activation_binding(
             run_id: &spec.metadata.run_id,
             scenario: &spec.scenario.name,
             volume_path: &activation.volume_path,
+            path: None,
+            exact_pod_names: None,
             expected_targets: volume_quorum.target_count,
             candidate_pod_ids: &candidates,
             runtime: &runtime,

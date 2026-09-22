@@ -39,13 +39,13 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::fault::{
-    backends::{chaos_mesh, lifecycle, runtime as fault_runtime},
+    backends::{chaos_mesh, lifecycle},
     checker,
     config::FaultTestConfig,
     events::{RunEventRecorder, RunEventStatus},
     fixture,
     history::{OperationKind, OperationOutcome, Recorder},
-    plan::{FaultInjection, FaultKind, FaultSelection, FaultTarget, StorageRecoveryExecutionPlan},
+    plan::{FaultKind, StorageRecoveryExecutionPlan},
     pods::{RustfsTargetInventory, rustfs_target_inventory},
     preflight::{
         PreflightCheck, PreflightPhase, PreflightSummary, TargetErasureSetProof, TargetProof,
@@ -54,7 +54,7 @@ use crate::fault::{
         ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape, QuorumCaseClass,
         QuorumVolumeBinding, QuorumVolumeBoundary, QuorumVolumeTargetProof,
     },
-    reporting::{ResponsibilityDomain, RunMetadata},
+    reporting::{FaultStatusSnapshot, ResponsibilityDomain, RunMetadata},
     runner::access::{
         ensure_s3_access, s3_access, wait_for_ready_tenant, wait_for_stable_rustfs_pods,
     },
@@ -69,7 +69,10 @@ use crate::fault::{
         ShardMappingSource, StorageRecoveryArtifactIdentity, StorageRecoveryCase,
         StorageVolumeIdentity, VERSION_SHARD_MAPPING_ARTIFACT, VersionShardMappingObservation,
     },
-    storage_recovery_helper::{STORAGE_HELPER_JOURNAL_ROOT, STORAGE_HELPER_VOLUME_ROOT},
+    storage_recovery_helper::{
+        FreshVolumeShardInspectionRequest, FreshVolumeShardInspectionResponse,
+        STORAGE_HELPER_JOURNAL_ROOT, STORAGE_HELPER_VOLUME_ROOT,
+    },
     storage_recovery_lease::{
         KubernetesStorageLeaseAdapter, StorageRecoveryCleanupProof, release_owned_lease,
     },
@@ -115,19 +118,20 @@ pub(crate) const FRESH_VOLUME_HEAL_START_ARTIFACT: &str = "fresh-volume-heal-sta
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct QuorumReadTrialEvidence {
+struct ControllerSnapshotEvidence {
     phase: String,
-    target_proof_sha256: String,
-    target_proof_body: String,
-    fault_snapshot_sha256: String,
-    fault_snapshot_body: String,
-    selected_targets: Vec<String>,
-    unavailable_drive_uuids: Vec<String>,
-    fault_active_at_ms: u64,
-    read_started_at_ms: u64,
-    read_ended_at_ms: u64,
-    fault_delete_started_at_ms: u64,
+    observed_at_ms: u64,
+    sha256: String,
+    body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionReadEvidence {
+    phase: String,
     operation_id: String,
+    started_at_ms: u64,
+    ended_at_ms: u64,
     outcome: OperationOutcome,
     http_status: Option<u16>,
     observed_sha256: Option<String>,
@@ -135,9 +139,50 @@ struct QuorumReadTrialEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ReplacementShardInspectionEvidence {
+    captured_at_ms: u64,
+    helper_pod: String,
+    target_pod: String,
+    target_pod_uid: String,
+    target_container_id: String,
+    mount_path: String,
+    request: crate::fault::storage_recovery_helper::FreshVolumeShardInspectionRequest,
+    response_sha256: String,
+    response: crate::fault::storage_recovery_helper::FreshVolumeShardInspectionResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SiblingReadFaultEvidence {
+    target_proof_sha256: String,
+    target_proof_body: String,
+    selected_targets: Vec<String>,
+    unavailable_drive_uuids: Vec<String>,
+    active_at_ms: u64,
+    delete_started_at_ms: u64,
+    deleted_at_ms: u64,
+    snapshots: Vec<ControllerSnapshotEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplacementPathFaultEvidence {
+    exact_container_path: String,
+    manifest_sha256: String,
+    manifest_body: String,
+    selected_target: String,
+    active_at_ms: u64,
+    delete_started_at_ms: u64,
+    deleted_at_ms: u64,
+    snapshots: Vec<ControllerSnapshotEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct FreshVolumeReadMatrixEvidence {
     schema_version: u8,
     identity: StorageRecoveryArtifactIdentity,
+    chaos_namespace: String,
     shape: ErasureSetShape,
     membership: ErasureSetMembership,
     repaired_drive_uuid: String,
@@ -145,8 +190,155 @@ pub(crate) struct FreshVolumeReadMatrixEvidence {
     version_id: String,
     expected_sha256: String,
     ordinary_get_operation_id: String,
-    missing: QuorumReadTrialEvidence,
-    repaired: QuorumReadTrialEvidence,
+    shard_before_fault: ReplacementShardInspectionEvidence,
+    shard_after_fault: ReplacementShardInspectionEvidence,
+    sibling_fault: SiblingReadFaultEvidence,
+    replacement_path_fault: ReplacementPathFaultEvidence,
+    replacement_available: VersionReadEvidence,
+    replacement_blocked: VersionReadEvidence,
+    replacement_restored: VersionReadEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplacementTargetFingerprint<'a> {
+    helper_pod: &'a str,
+    target_pod: &'a str,
+    target_pod_uid: &'a str,
+    target_container_id: &'a str,
+    mount_path: &'a str,
+    relative_part_path: &'a str,
+    shard_device_id: &'a str,
+    shard_inode: u64,
+    shard_size_bytes: u64,
+    shard_sha256: &'a str,
+}
+
+impl<'a> From<&'a ReplacementShardInspectionEvidence> for ReplacementTargetFingerprint<'a> {
+    fn from(evidence: &'a ReplacementShardInspectionEvidence) -> Self {
+        let shard = &evidence.response.inspection.selected_part;
+        Self {
+            helper_pod: &evidence.helper_pod,
+            target_pod: &evidence.target_pod,
+            target_pod_uid: &evidence.target_pod_uid,
+            target_container_id: &evidence.target_container_id,
+            mount_path: &evidence.mount_path,
+            relative_part_path: &shard.relative_part_path,
+            shard_device_id: &shard.shard_device_id,
+            shard_inode: shard.shard_inode,
+            shard_size_bytes: shard.shard_size_bytes,
+            shard_sha256: &shard.original_sha256,
+        }
+    }
+}
+
+fn validate_replacement_part_path(
+    bucket: &str,
+    object_key: &str,
+    part_number: u32,
+    path: &str,
+) -> Result<()> {
+    ensure!(
+        part_number > 0
+            && path.starts_with(&format!("{bucket}/{object_key}/"))
+            && path.ends_with(&format!("/part.{part_number}"))
+            && !path.contains(".metadata.bin")
+            && path
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".."),
+        "replacement shard path is not the selected exact part file"
+    );
+    Ok(())
+}
+
+fn validate_version_binding(expected: &str, requested: &str, inspected: &str) -> Result<()> {
+    ensure!(
+        !expected.trim().is_empty() && requested == expected && inspected == expected,
+        "replacement shard inspection version differs from the sealed version"
+    );
+    Ok(())
+}
+
+fn validate_target_continuity(
+    before: ReplacementTargetFingerprint<'_>,
+    after: ReplacementTargetFingerprint<'_>,
+) -> Result<()> {
+    ensure!(
+        before == after,
+        "replacement shard target changed during the causal read proof"
+    );
+    Ok(())
+}
+
+fn validate_replacement_membership(
+    original: &ErasureSetMembership,
+    current: &ErasureSetMembership,
+    old_volume: &StorageVolumeIdentity,
+    new_volume: &StorageVolumeIdentity,
+) -> Result<()> {
+    let mut expected = original.clone();
+    let target = expected
+        .members
+        .iter_mut()
+        .find(|member| member.pod_name == old_volume.pod)
+        .context("original volume is outside pre-replacement membership")?;
+    ensure!(
+        target.shard_ids.as_slice() == [old_volume.rustfs_drive_uuid.as_str()],
+        "original volume does not own the mapped shard"
+    );
+    target.pod_name = new_volume.pod.clone();
+    target.shard_ids = vec![new_volume.rustfs_drive_uuid.clone()];
+    ensure!(
+        expected == *current,
+        "runtime membership changed outside the replacement slot"
+    );
+    Ok(())
+}
+
+fn validate_rebuilt_shard(
+    original: &crate::fault::storage_recovery_helper::OfflineXl2InspectResponse,
+    rebuilt: &crate::fault::storage_recovery_helper::OfflineXl2InspectResponse,
+) -> Result<()> {
+    ensure!(
+        original.layout == rebuilt.layout
+            && original.selected_part.part_number == rebuilt.selected_part.part_number
+            && original.selected_part.relative_part_path
+                == rebuilt.selected_part.relative_part_path
+            && original.selected_part.shard_size_bytes == rebuilt.selected_part.shard_size_bytes
+            && original.selected_part.original_sha256 == rebuilt.selected_part.original_sha256,
+        "replacement shard differs from the sealed pre-replacement shard"
+    );
+    Ok(())
+}
+
+fn validate_read_result(
+    outcome: OperationOutcome,
+    http_status: Option<u16>,
+    observed_sha256: Option<&str>,
+    expected_sha256: &str,
+    succeeds: bool,
+) -> Result<()> {
+    if succeeds {
+        ensure!(
+            outcome == OperationOutcome::Ok && observed_sha256 == Some(expected_sha256),
+            "replacement-dependent GET did not return the sealed bytes"
+        );
+    } else {
+        ensure!(
+            outcome == OperationOutcome::Failed
+                && http_status.is_some_and(|status| status >= 500)
+                && observed_sha256.is_none(),
+            "replacement part READ EIO did not make the exact version unavailable"
+        );
+    }
+    Ok(())
+}
+
+fn validate_causal_timeline(points: [u64; 11]) -> Result<()> {
+    ensure!(
+        points.windows(2).all(|window| window[0] <= window[1]),
+        "fresh-volume causal read phases are out of order"
+    );
+    Ok(())
 }
 
 impl FreshVolumeReadMatrixEvidence {
@@ -155,7 +347,7 @@ impl FreshVolumeReadMatrixEvidence {
         records: &[crate::fault::history::OperationRecord],
     ) -> Result<()> {
         ensure!(
-            self.schema_version == 1,
+            self.schema_version == 3,
             "unsupported fresh-volume read proof schema"
         );
         self.shape.validate()?;
@@ -163,6 +355,7 @@ impl FreshVolumeReadMatrixEvidence {
         ensure!(
             self.identity.scenario == "fresh-volume-replacement"
                 && !self.identity.run_id.trim().is_empty()
+                && !self.chaos_namespace.trim().is_empty()
                 && !self.object_key.trim().is_empty()
                 && !self.version_id.trim().is_empty()
                 && self.version_id != "null"
@@ -180,175 +373,9 @@ impl FreshVolumeReadMatrixEvidence {
             all_drives.contains(&self.repaired_drive_uuid),
             "repaired drive is outside runtime membership"
         );
-        let tolerance = usize::try_from(self.shape.payload_quorum()?.read_tolerance)?;
-        for (trial, expect_success) in [(&self.missing, false), (&self.repaired, true)] {
-            ensure!(
-                trial.target_proof_sha256 == sha256_text(&trial.target_proof_body)
-                    && trial.fault_snapshot_sha256 == sha256_text(&trial.fault_snapshot_body)
-                    && trial.selected_targets.len() == tolerance
-                    && trial.unavailable_drive_uuids.len() == tolerance
-                    && trial
-                        .unavailable_drive_uuids
-                        .iter()
-                        .collect::<BTreeSet<_>>()
-                        .len()
-                        == tolerance
-                    && trial
-                        .unavailable_drive_uuids
-                        .iter()
-                        .all(|drive| all_drives.contains(drive))
-                    && !trial
-                        .unavailable_drive_uuids
-                        .contains(&self.repaired_drive_uuid)
-                    && trial.fault_active_at_ms <= trial.read_started_at_ms
-                    && trial.read_started_at_ms < trial.read_ended_at_ms
-                    && trial.read_ended_at_ms <= trial.fault_delete_started_at_ms,
-                "fresh-volume trial is not an exact-quorum read through the replacement drive"
-            );
-            let target_proof: TargetProof = serde_json::from_str(&trial.target_proof_body)
-                .context("decode fresh-volume trial target proof")?;
-            ensure!(
-                target_proof.status == crate::fault::preflight::TargetProofStatus::Satisfied
-                    && target_proof.scenario == self.identity.scenario
-                    && target_proof.run_id == self.identity.run_id,
-                "fresh-volume trial target proof is not bound to this run"
-            );
-            let erasure = target_proof
-                .faults
-                .first()
-                .and_then(|fault| fault.erasure_set.as_ref())
-                .context("fresh-volume target proof lacks erasure membership")?;
-            ensure!(
-                erasure.shape.as_ref() == Some(&self.shape)
-                    && erasure.membership.as_ref() == Some(&self.membership)
-                    && erasure.volume_quorum.is_some(),
-                "fresh-volume target proof geometry differs from the read matrix"
-            );
-            let selected_drives = trial
-                .selected_targets
-                .iter()
-                .map(|record| {
-                    let pod_id = chaos_mesh::iochaos_record_pod_id(record)?;
-                    let pod = pod_id
-                        .strip_prefix(&format!("{}/", target_proof.namespace))
-                        .context("fresh-volume IOChaos selected another namespace")?;
-                    let member = self
-                        .membership
-                        .members
-                        .iter()
-                        .find(|member| member.pod_name == pod)
-                        .context("fresh-volume IOChaos selected outside runtime membership")?;
-                    let [drive] = member.shard_ids.as_slice() else {
-                        bail!("fresh-volume selected Pod does not own exactly one shard")
-                    };
-                    Ok(drive.clone())
-                })
-                .collect::<Result<BTreeSet<_>>>()?;
-            ensure!(
-                selected_drives == trial.unavailable_drive_uuids.iter().cloned().collect(),
-                "fresh-volume unavailable drives do not match selected controller Pods"
-            );
-            let snapshot: Value = serde_json::from_str(&trial.fault_snapshot_body)
-                .context("decode fresh-volume trial fault snapshot")?;
-            for pointer in ["/active", "/afterRead"] {
-                let phase_snapshot = snapshot
-                    .pointer(pointer)
-                    .context("fresh-volume trial lacks an active boundary snapshot")?;
-                let resource = phase_snapshot
-                    .get("chaos_status")
-                    .context("fresh-volume trial lacks a controller-proven IOChaos object")?;
-                let fault = target_proof
-                    .faults
-                    .first()
-                    .context("fresh-volume target proof lacks its exact-quorum fault")?;
-                ensure!(
-                    target_proof.faults.len() == 1
-                        && phase_snapshot.get("resource_kind").and_then(Value::as_str)
-                            == Some("iochaos")
-                        && fault.kind == FaultKind::RustfsVolumeIoError.as_str(),
-                    "fresh-volume trial does not describe one EIO IOChaos fault"
-                );
-                let volume_path = fault
-                    .volume_path
-                    .as_deref()
-                    .context("fresh-volume target proof lacks its volume path")?;
-                let duration_seconds = resource
-                    .pointer("/spec/duration")
-                    .and_then(Value::as_str)
-                    .and_then(|duration| duration.strip_suffix('s'))
-                    .and_then(|seconds| seconds.parse::<u64>().ok())
-                    .context("fresh-volume IOChaos duration is not an exact second value")?;
-                let injection = FaultInjection::new(
-                    FaultKind::RustfsVolumeIoError,
-                    FaultBackend::ChaosMeshIoChaos,
-                    FaultTarget::RustfsVolume {
-                        path: volume_path.to_string(),
-                    },
-                    FaultSelection::FixedTargets(u32::try_from(tolerance)?),
-                    Duration::from_secs(duration_seconds),
-                )?;
-                let runtime = chaos_mesh::volume_fault_runtime_contract(&injection)?;
-                let candidate_pod_ids = self
-                    .membership
-                    .members
-                    .iter()
-                    .map(|member| format!("{}/{}", target_proof.namespace, member.pod_name))
-                    .collect::<BTreeSet<_>>();
-                let chaos_namespace = resource
-                    .pointer("/metadata/namespace")
-                    .and_then(Value::as_str)
-                    .context("fresh-volume IOChaos lacks its namespace")?;
-                let selected = chaos_mesh::validate_fixed_volume_snapshot(
-                    resource,
-                    &chaos_mesh::VolumeTargetEvidenceContract {
-                        chaos_namespace,
-                        target_namespace: &target_proof.namespace,
-                        tenant: &target_proof.tenant,
-                        run_id: &self.identity.run_id,
-                        scenario: &self.identity.scenario,
-                        volume_path,
-                        expected_targets: u32::try_from(tolerance)?,
-                        candidate_pod_ids: &candidate_pod_ids,
-                        runtime: &runtime,
-                    },
-                )?;
-                ensure!(
-                    selected == trial.selected_targets.iter().cloned().collect(),
-                    "fresh-volume trial target list does not match controller records"
-                );
-            }
-            let matching = records
-                .iter()
-                .filter(|record| record.id == trial.operation_id)
-                .collect::<Vec<_>>();
-            let [record] = matching.as_slice() else {
-                bail!("fresh-volume trial operation id is missing or duplicate")
-            };
-            ensure!(
-                record.kind == OperationKind::Get
-                    && record.key.as_deref() == Some(self.object_key.as_str())
-                    && record.version_id.as_deref() == Some(self.version_id.as_str())
-                    && record.started_at_ms == trial.read_started_at_ms
-                    && record.ended_at_ms == trial.read_ended_at_ms
-                    && record.outcome == trial.outcome
-                    && record.http_status == trial.http_status
-                    && record.value_sha256 == trial.observed_sha256,
-                "fresh-volume trial does not match its versionId GET history record"
-            );
-            if expect_success {
-                ensure!(
-                    trial.phase == "repaired"
-                        && trial.outcome == OperationOutcome::Ok
-                        && trial.observed_sha256.as_deref() == Some(self.expected_sha256.as_str()),
-                    "post-heal exact-quorum GET did not return the sealed bytes"
-                );
-            } else {
-                ensure!(
-                    trial.phase == "missing" && trial.outcome != OperationOutcome::Ok,
-                    "pre-heal exact-quorum GET did not prove the replacement shard was missing"
-                );
-            }
-        }
+        self.validate_replacement_shard()?;
+        self.validate_faults(&all_drives)?;
+        self.validate_reads(records)?;
         let ordinary = records
             .iter()
             .filter(|record| record.id == self.ordinary_get_operation_id)
@@ -362,8 +389,380 @@ impl FreshVolumeReadMatrixEvidence {
                 && ordinary.version_id.as_deref() == Some(self.version_id.as_str())
                 && ordinary.outcome == OperationOutcome::Ok
                 && ordinary.value_sha256.as_deref() == Some(self.expected_sha256.as_str())
-                && ordinary.ended_at_ms <= self.missing.fault_active_at_ms,
-            "ordinary post-replacement GET does not prove the sealed version was available before exact-quorum isolation"
+                && ordinary.ended_at_ms <= self.shard_before_fault.captured_at_ms,
+            "ordinary replacement GET does not precede the causal read proof"
+        );
+        Ok(())
+    }
+
+    fn validate_replacement_shard(&self) -> Result<()> {
+        let expected_phases = [&self.shard_before_fault, &self.shard_after_fault];
+        for evidence in expected_phases {
+            let encoded = serde_json::to_string(&evidence.response)?;
+            let inspection = &evidence.response.inspection;
+            ensure!(
+                evidence.captured_at_ms > 0
+                    && evidence.response.observed_at_ms > 0
+                    && evidence.response_sha256 == sha256_text(&encoded)
+                    && evidence.request.bucket == self.identity.bucket
+                    && evidence.request.object_key == self.object_key
+                    && evidence.request.object_sha256 == self.expected_sha256
+                    && evidence.request.drive_uuid == self.repaired_drive_uuid
+                    && evidence.request.selected_part_number == 1
+                    && evidence.target_pod
+                        == self
+                            .membership
+                            .members
+                            .iter()
+                            .find(|member| {
+                                member.shard_ids.as_slice() == [self.repaired_drive_uuid.as_str()]
+                            })
+                            .context("replacement drive has no unique runtime member")?
+                            .pod_name
+                    && !evidence.target_pod_uid.trim().is_empty()
+                    && !evidence.target_container_id.trim().is_empty()
+                    && evidence.mount_path.starts_with('/')
+                    && inspection.drive_uuid == evidence.request.drive_uuid
+                    && inspection.mount_device_id == evidence.request.mount_device_id
+                    && inspection.layout.erasure_data_shards == self.shape.payload_data_shards
+                    && inspection.layout.erasure_parity_shards == self.shape.payload_parity_shards
+                    && inspection.layout.erasure_index > 0
+                    && inspection.layout.erasure_index <= self.shape.total_shards
+                    && inspection.selected_part.part_number == 1
+                    && inspection.selected_part.shard_device_id == evidence.request.mount_device_id
+                    && inspection.selected_part.shard_inode > 0
+                    && inspection.selected_part.shard_size_bytes > 0,
+                "replacement shard inspection is not bound to the sealed version and runtime generation"
+            );
+            validate_version_binding(
+                &self.version_id,
+                &evidence.request.version_id,
+                &inspection.layout.version_id,
+            )?;
+            validate_replacement_part_path(
+                &self.identity.bucket,
+                &self.object_key,
+                evidence.request.selected_part_number,
+                &inspection.selected_part.relative_part_path,
+            )?;
+        }
+        ensure!(
+            self.shard_before_fault.request == self.shard_after_fault.request
+                && self.shard_before_fault.response.inspection.layout
+                    == self.shard_after_fault.response.inspection.layout,
+            "replacement shard inspection request changed during the causal read proof"
+        );
+        validate_target_continuity(
+            ReplacementTargetFingerprint::from(&self.shard_before_fault),
+            ReplacementTargetFingerprint::from(&self.shard_after_fault),
+        )?;
+        Ok(())
+    }
+
+    fn validate_faults(&self, all_drives: &BTreeSet<&String>) -> Result<()> {
+        let tolerance = usize::try_from(self.shape.payload_quorum()?.read_tolerance)?;
+        let target_proof: TargetProof = serde_json::from_str(&self.sibling_fault.target_proof_body)
+            .context("decode fresh-volume sibling target proof")?;
+        ensure!(
+            self.sibling_fault.target_proof_sha256
+                == sha256_text(&self.sibling_fault.target_proof_body)
+                && target_proof.status == crate::fault::preflight::TargetProofStatus::Satisfied
+                && target_proof.scenario == self.identity.scenario
+                && target_proof.run_id == self.identity.run_id
+                && !target_proof.namespace.trim().is_empty()
+                && !target_proof.tenant.trim().is_empty()
+                && self.sibling_fault.selected_targets.len() == tolerance
+                && self.sibling_fault.unavailable_drive_uuids.len() == tolerance
+                && self
+                    .sibling_fault
+                    .unavailable_drive_uuids
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    == tolerance
+                && self
+                    .sibling_fault
+                    .unavailable_drive_uuids
+                    .iter()
+                    .all(|drive| all_drives.contains(drive))
+                && !self
+                    .sibling_fault
+                    .unavailable_drive_uuids
+                    .contains(&self.repaired_drive_uuid),
+            "sibling fault is not bound to the exact runtime read tolerance"
+        );
+        let erasure = target_proof
+            .faults
+            .first()
+            .and_then(|fault| fault.erasure_set.as_ref())
+            .context("fresh-volume target proof lacks erasure membership")?;
+        ensure!(
+            target_proof.faults.len() == 1
+                && erasure.shape.as_ref() == Some(&self.shape)
+                && erasure.membership.as_ref() == Some(&self.membership)
+                && erasure.volume_quorum.is_some(),
+            "fresh-volume target proof geometry differs from the read proof"
+        );
+        let candidate_pod_ids = self
+            .membership
+            .members
+            .iter()
+            .map(|member| format!("{}/{}", target_proof.namespace, member.pod_name))
+            .collect::<BTreeSet<_>>();
+        let sibling_pod_names = self
+            .sibling_fault
+            .selected_targets
+            .iter()
+            .map(|record| {
+                chaos_mesh::iochaos_record_pod_id(record).and_then(|pod_id| {
+                    pod_id
+                        .strip_prefix(&format!("{}/", target_proof.namespace))
+                        .map(str::to_string)
+                        .context("sibling IOChaos selected another namespace")
+                })
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let selected_drives = sibling_pod_names
+            .iter()
+            .map(|pod| {
+                let member = self
+                    .membership
+                    .members
+                    .iter()
+                    .find(|member| member.pod_name == *pod)
+                    .context("sibling IOChaos selected outside runtime membership")?;
+                let [drive] = member.shard_ids.as_slice() else {
+                    bail!("sibling IOChaos selected a Pod without one runtime shard")
+                };
+                Ok(drive.clone())
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        ensure!(
+            selected_drives
+                == self
+                    .sibling_fault
+                    .unavailable_drive_uuids
+                    .iter()
+                    .cloned()
+                    .collect(),
+            "sibling IOChaos targets do not match unavailable drive identities"
+        );
+        let sibling_runtime = chaos_mesh::IoChaosRuntimeContract {
+            action: chaos_mesh::IoChaosAction::Fault { errno: 5 },
+            methods: vec!["READ".to_string()],
+            io_sampling_percent: 100,
+            duration_seconds: self.snapshot_duration(&self.sibling_fault.snapshots)?,
+        };
+        let sibling_contract = chaos_mesh::VolumeTargetEvidenceContract {
+            chaos_namespace: &self.chaos_namespace,
+            target_namespace: &target_proof.namespace,
+            tenant: &target_proof.tenant,
+            run_id: &self.identity.run_id,
+            scenario: &self.identity.scenario,
+            volume_path: &self.shard_before_fault.mount_path,
+            path: None,
+            exact_pod_names: Some(&sibling_pod_names),
+            expected_targets: u32::try_from(tolerance)?,
+            candidate_pod_ids: &candidate_pod_ids,
+            runtime: &sibling_runtime,
+        };
+        ensure!(
+            self.sibling_fault
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.phase.as_str())
+                .eq([
+                    "siblings-active",
+                    "after-replacement-available",
+                    "replacement-path-active",
+                    "after-replacement-path-removed",
+                    "after-replacement-restored",
+                ]),
+            "sibling controller snapshots have an invalid phase sequence"
+        );
+        for snapshot in &self.sibling_fault.snapshots {
+            ensure!(
+                snapshot.observed_at_ms > 0,
+                "sibling IOChaos snapshot lacks a timestamp"
+            );
+            let selected = self.validate_snapshot(snapshot, &sibling_contract)?;
+            ensure!(
+                selected
+                    == self
+                        .sibling_fault
+                        .selected_targets
+                        .iter()
+                        .cloned()
+                        .collect(),
+                "sibling controller target set changed during the causal read proof"
+            );
+        }
+        let exact_path = format!(
+            "{}/{}",
+            self.shard_before_fault.mount_path.trim_end_matches('/'),
+            self.shard_before_fault
+                .response
+                .inspection
+                .selected_part
+                .relative_part_path
+        );
+        ensure!(
+            self.replacement_path_fault.exact_container_path == exact_path
+                && self.replacement_path_fault.manifest_sha256
+                    == sha256_text(&self.replacement_path_fault.manifest_body)
+                && self
+                    .replacement_path_fault
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.phase.as_str())
+                    .eq(["replacement-path-active", "after-replacement-blocked",]),
+            "replacement path fault does not target the inspected part file"
+        );
+        let exact_runtime = chaos_mesh::IoChaosRuntimeContract {
+            action: chaos_mesh::IoChaosAction::Fault { errno: 5 },
+            methods: vec!["READ".to_string()],
+            io_sampling_percent: 100,
+            duration_seconds: self.snapshot_duration(&self.replacement_path_fault.snapshots)?,
+        };
+        let replacement_candidate = [format!(
+            "{}/{}",
+            target_proof.namespace, self.shard_before_fault.target_pod
+        )]
+        .into_iter()
+        .collect();
+        let replacement_pod_names = [self.shard_before_fault.target_pod.clone()]
+            .into_iter()
+            .collect();
+        let exact_contract = chaos_mesh::VolumeTargetEvidenceContract {
+            chaos_namespace: &self.chaos_namespace,
+            target_namespace: &target_proof.namespace,
+            tenant: &target_proof.tenant,
+            run_id: &self.identity.run_id,
+            scenario: &self.identity.scenario,
+            volume_path: &self.shard_before_fault.mount_path,
+            path: Some(&exact_path),
+            exact_pod_names: Some(&replacement_pod_names),
+            expected_targets: 1,
+            candidate_pod_ids: &replacement_candidate,
+            runtime: &exact_runtime,
+        };
+        for snapshot in &self.replacement_path_fault.snapshots {
+            ensure!(
+                snapshot.observed_at_ms > 0,
+                "replacement path IOChaos snapshot lacks a timestamp"
+            );
+            let selected = self.validate_snapshot(snapshot, &exact_contract)?;
+            ensure!(
+                selected.len() == 1
+                    && selected.contains(&self.replacement_path_fault.selected_target),
+                "replacement path fault selected another runtime target"
+            );
+        }
+        Ok(())
+    }
+
+    fn snapshot_duration(&self, snapshots: &[ControllerSnapshotEvidence]) -> Result<u64> {
+        let first = snapshots
+            .first()
+            .context("IOChaos snapshot list is empty")?;
+        let snapshot: Value = serde_json::from_str(&first.body)?;
+        snapshot
+            .get("chaos_status")
+            .and_then(|resource| resource.pointer("/spec/duration"))
+            .and_then(Value::as_str)
+            .and_then(|duration| duration.strip_suffix('s'))
+            .and_then(|seconds| seconds.parse().ok())
+            .context("IOChaos duration is not an exact second value")
+    }
+
+    fn validate_snapshot(
+        &self,
+        snapshot: &ControllerSnapshotEvidence,
+        contract: &chaos_mesh::VolumeTargetEvidenceContract<'_>,
+    ) -> Result<BTreeSet<String>> {
+        ensure!(
+            snapshot.sha256 == sha256_text(&snapshot.body),
+            "IOChaos snapshot digest changed"
+        );
+        let snapshot: Value = serde_json::from_str(&snapshot.body)?;
+        ensure!(
+            snapshot.get("resource_kind").and_then(Value::as_str) == Some("iochaos"),
+            "fresh-volume snapshot is not IOChaos"
+        );
+        let resource = snapshot
+            .get("chaos_status")
+            .context("fresh-volume snapshot lacks controller status")?;
+        chaos_mesh::validate_fixed_volume_snapshot(resource, contract)
+    }
+
+    fn validate_reads(&self, records: &[crate::fault::history::OperationRecord]) -> Result<()> {
+        for (trial, phase, succeeds) in [
+            (&self.replacement_available, "replacement-available", true),
+            (&self.replacement_blocked, "replacement-blocked", false),
+            (&self.replacement_restored, "replacement-restored", true),
+        ] {
+            let matching = records
+                .iter()
+                .filter(|record| record.id == trial.operation_id)
+                .collect::<Vec<_>>();
+            let [record] = matching.as_slice() else {
+                bail!("fresh-volume causal read operation id is missing or duplicate")
+            };
+            ensure!(
+                trial.phase == phase
+                    && record.kind == OperationKind::Get
+                    && record.key.as_deref() == Some(self.object_key.as_str())
+                    && record.version_id.as_deref() == Some(self.version_id.as_str())
+                    && record.started_at_ms == trial.started_at_ms
+                    && record.ended_at_ms == trial.ended_at_ms
+                    && record.outcome == trial.outcome
+                    && record.http_status == trial.http_status
+                    && record.value_sha256 == trial.observed_sha256,
+                "fresh-volume causal read does not match its versionId GET history record"
+            );
+            validate_read_result(
+                trial.outcome,
+                trial.http_status,
+                trial.observed_sha256.as_deref(),
+                &self.expected_sha256,
+                succeeds,
+            )?;
+        }
+        validate_causal_timeline([
+            self.shard_before_fault.captured_at_ms,
+            self.sibling_fault.active_at_ms,
+            self.replacement_available.started_at_ms,
+            self.replacement_available.ended_at_ms,
+            self.replacement_path_fault.active_at_ms,
+            self.replacement_blocked.started_at_ms,
+            self.replacement_blocked.ended_at_ms,
+            self.replacement_path_fault.delete_started_at_ms,
+            self.replacement_path_fault.deleted_at_ms,
+            self.replacement_restored.started_at_ms,
+            self.replacement_restored.ended_at_ms,
+        ])?;
+        let siblings = &self.sibling_fault.snapshots;
+        let exact = &self.replacement_path_fault.snapshots;
+        ensure!(
+            self.sibling_fault.active_at_ms <= siblings[0].observed_at_ms
+                && siblings[0].observed_at_ms <= self.replacement_available.started_at_ms
+                && self.replacement_available.ended_at_ms <= siblings[1].observed_at_ms
+                && siblings[1].observed_at_ms <= self.replacement_path_fault.active_at_ms
+                && self.replacement_path_fault.active_at_ms <= siblings[2].observed_at_ms
+                && siblings[2].observed_at_ms <= exact[0].observed_at_ms
+                && exact[0].observed_at_ms <= self.replacement_blocked.started_at_ms
+                && self.replacement_blocked.ended_at_ms <= exact[1].observed_at_ms
+                && exact[1].observed_at_ms <= self.replacement_path_fault.delete_started_at_ms
+                && self.replacement_path_fault.deleted_at_ms <= siblings[3].observed_at_ms
+                && siblings[3].observed_at_ms <= self.replacement_restored.started_at_ms
+                && self.replacement_restored.ended_at_ms <= siblings[4].observed_at_ms,
+            "controller snapshots do not bracket the causal reads"
+        );
+        ensure!(
+            self.replacement_restored.ended_at_ms <= self.sibling_fault.delete_started_at_ms
+                && self.sibling_fault.delete_started_at_ms <= self.sibling_fault.deleted_at_ms
+                && self.sibling_fault.deleted_at_ms <= self.shard_after_fault.captured_at_ms,
+            "fresh-volume cleanup and final shard inspection are out of order"
         );
         Ok(())
     }
@@ -375,17 +774,79 @@ impl FreshVolumeReadMatrixEvidence {
         summary: &HealSummary,
         progress: &[HealProgressSample],
         records: &[crate::fault::history::OperationRecord],
+        original_target_proof_body: &str,
     ) -> Result<()> {
         self.validate(records)?;
         replacement.validate()?;
+        let target_proof: TargetProof =
+            serde_json::from_str(&self.sibling_fault.target_proof_body)?;
         ensure!(
             self.identity == replacement.identity
                 && self.identity == summary.identity
                 && self.repaired_drive_uuid == replacement.replacement.rustfs_drive_uuid
-                && mappings.len() == 1,
+                && target_proof.namespace == replacement.replacement.namespace
+                && target_proof.tenant == replacement.replacement.tenant
+                && mappings.len() == 1
+                && self.shard_before_fault.request.deployment_id
+                    == replacement.replacement.rustfs_deployment_id
+                && self.shard_before_fault.request.drive_uuid
+                    == replacement.replacement.rustfs_drive_uuid,
             "fresh-volume evidence identities or mapping cardinality do not match"
         );
-        let mapping = mappings[0].validated_mapping(&self.membership, &self.shape)?;
+        let original_proof: TargetProof = serde_json::from_str(original_target_proof_body)?;
+        let original_erasure = original_proof
+            .faults
+            .first()
+            .and_then(|fault| fault.erasure_set.as_ref())
+            .context("original target proof lacks erasure membership")?;
+        let original_membership = original_erasure
+            .membership
+            .as_ref()
+            .context("original target proof lacks runtime members")?;
+        original_membership.validate(&self.shape)?;
+        ensure!(
+            original_proof.status == crate::fault::preflight::TargetProofStatus::Satisfied
+                && original_proof.scenario == self.identity.scenario
+                && original_proof.run_id == self.identity.run_id
+                && original_proof.namespace == replacement.original.namespace
+                && original_proof.tenant == replacement.original.tenant
+                && original_erasure.shape.as_ref() == Some(&self.shape)
+                && sha256_text(original_target_proof_body) == mappings[0].target_proof_sha256
+                && mappings[0].identity == self.identity
+                && mappings[0].source == ShardMappingSource::OfflineXl2Inspector,
+            "original shard mapping is not bound to its pre-replacement target proof"
+        );
+        let original = mappings[0]
+            .offline_evidence
+            .as_ref()
+            .context("original shard mapping lacks its offline inspection")?;
+        ensure!(
+            original.context.volume == replacement.original,
+            "original shard inspection belongs to another storage generation"
+        );
+        validate_replacement_membership(
+            original_membership,
+            &self.membership,
+            &replacement.original,
+            &replacement.replacement,
+        )?;
+        let mapping = mappings[0].validated_mapping(original_membership, &self.shape)?;
+        let original_shard: crate::fault::storage_recovery_helper::OfflineXl2InspectResponse =
+            serde_json::from_str(&mappings[0].response_body)?;
+        validate_rebuilt_shard(
+            &original_shard,
+            &self.shard_before_fault.response.inspection,
+        )?;
+        ensure!(
+            self.shard_before_fault.target_pod == replacement.replacement.pod
+                && self.shard_before_fault.target_pod_uid == replacement.replacement.pod_uid
+                && self.shard_before_fault.target_container_id
+                    == replacement.replacement.rustfs_container_id
+                && self.shard_before_fault.mount_path == replacement.replacement.mount_path
+                && replacement.replacement.observed_at_ms <= self.shard_before_fault.captured_at_ms
+                && summary.completed_at_ms <= self.shard_before_fault.captured_at_ms,
+            "replacement shard inspection is not bound to the adopted and healed storage generation"
+        );
         ensure!(
             mapping.bucket == self.identity.bucket
                 && mapping.object_key == self.object_key
@@ -404,6 +865,10 @@ impl FreshVolumeReadMatrixEvidence {
                 replacement.replacement.set_index,
             )),
         )
+    }
+
+    pub(crate) fn chaos_namespace(&self) -> &str {
+        &self.chaos_namespace
     }
 }
 
@@ -895,6 +1360,28 @@ fn probe_helper(
     let response = serde_json::from_str(&output.stdout)
         .context("decode typed fresh-volume host probe response")?;
     Ok((response, output.stdout))
+}
+
+fn inspect_replacement_shard_helper(
+    config: &FaultTestConfig,
+    helper_pod: &str,
+    request: &FreshVolumeShardInspectionRequest,
+) -> Result<FreshVolumeShardInspectionResponse> {
+    let body = serde_json::to_string(request)?;
+    let output = Kubectl::new(&config.cluster)
+        .namespaced(&config.cluster.test_namespace)
+        .command([
+            "exec",
+            "-i",
+            helper_pod,
+            "--",
+            "/usr/local/bin/s3chaos-storage-helper",
+            "inspect-fresh-volume-shard",
+        ])
+        .stdin(body)
+        .run_checked()
+        .context("run typed replacement shard inspection")?;
+    serde_json::from_str(&output.stdout).context("decode replacement shard inspection response")
 }
 
 fn get_raw_json(kubectl: &Kubectl, kind: &str, name: &str) -> Result<String> {
@@ -1841,14 +2328,14 @@ struct FreshVolumeDriverState {
     ownership_checkpoint: Option<FreshVolumeOwnershipCheckpoint>,
     abort_before_mutation: Option<StorageRecoveryCleanupProof>,
     replacement_volume: Option<StorageVolumeIdentity>,
+    replacement_mount_device_id: Option<String>,
     prepare_receipt: Option<StorageRecoveryOperationReceipt>,
     old_device_absence_sha256: Option<String>,
     heal_adapter: Option<Arc<RustfsFreshHealAdapter>>,
     heal_started_at_ms: Option<u64>,
     heal_progress: Vec<HealProgressSample>,
     heal_summary: Option<HealSummary>,
-    missing_trial: Option<QuorumReadTrialEvidence>,
-    repaired_trial: Option<QuorumReadTrialEvidence>,
+    causal_read_proof: Option<FreshVolumeReadMatrixEvidence>,
     ordinary_after_replacement_operation_id: Option<String>,
     replacement_proof: Option<FreshVolumeReplacementProof>,
     cleanup_evidence: Option<Value>,
@@ -1881,6 +2368,41 @@ impl FreshVolumeOwnershipCheckpoint {
     fn permits_abort_before_mutation(self) -> bool {
         self != Self::VolumeMutationStarted
     }
+
+    fn begin_volume_mutation(checkpoint: &mut Option<Self>) -> Result<()> {
+        ensure!(
+            *checkpoint == Some(Self::InspectionCompleted),
+            "fresh-volume mutation must begin from the completed inspection checkpoint"
+        );
+        *checkpoint = Some(Self::VolumeMutationStarted);
+        Ok(())
+    }
+}
+
+fn prepare_volume_mutation_request<
+    Pause,
+    Command,
+    PauseFn,
+    RecordPauseFn,
+    CommandFn,
+    BeginMutationFn,
+>(
+    pause_operator: PauseFn,
+    record_pause: RecordPauseFn,
+    prepare_command: CommandFn,
+    begin_mutation: BeginMutationFn,
+) -> Result<Command>
+where
+    PauseFn: FnOnce() -> Result<Pause>,
+    RecordPauseFn: FnOnce(Pause) -> Result<()>,
+    CommandFn: FnOnce() -> Result<Command>,
+    BeginMutationFn: FnOnce() -> Result<()>,
+{
+    let pause = pause_operator()?;
+    record_pause(pause)?;
+    let command = prepare_command()?;
+    begin_mutation()?;
+    Ok(command)
 }
 
 impl OwnedHelperPodCleanup {
@@ -2042,14 +2564,14 @@ impl<'a> FreshVolumeDriver<'a> {
                 ownership_checkpoint: None,
                 abort_before_mutation: None,
                 replacement_volume: None,
+                replacement_mount_device_id: None,
                 prepare_receipt: None,
                 old_device_absence_sha256: None,
                 heal_adapter: None,
                 heal_started_at_ms: None,
                 heal_progress: Vec::new(),
                 heal_summary: None,
-                missing_trial: None,
-                repaired_trial: None,
+                causal_read_proof: None,
                 ordinary_after_replacement_operation_id: None,
                 replacement_proof: None,
                 cleanup_evidence: None,
@@ -2390,12 +2912,145 @@ impl<'a> FreshVolumeDriver<'a> {
         Ok(proof)
     }
 
-    async fn run_quorum_trial(
-        &self,
+    fn controller_snapshot(
+        guard: &chaos_mesh::ChaosGuard,
         phase: &str,
-        expect_success: bool,
-    ) -> Result<QuorumReadTrialEvidence> {
-        let (s3, history, sealed, target_pod, repaired_drive) = {
+    ) -> Result<ControllerSnapshotEvidence> {
+        let body = serde_json::to_string_pretty(&FaultStatusSnapshot {
+            stage: phase.to_string(),
+            resource_kind: Some(guard.kind().to_string()),
+            resource_name: Some(guard.name().to_string()),
+            chaos_status: Some(serde_json::from_str(&guard.json()?)?),
+            dm_status: None,
+            lifecycle_status: None,
+        })?;
+        Ok(ControllerSnapshotEvidence {
+            phase: phase.to_string(),
+            observed_at_ms: now_ms(),
+            sha256: sha256_text(&body),
+            body,
+        })
+    }
+
+    fn write_causal_checkpoint<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
+        self.collector
+            .write_text(
+                self.scenario.case_name,
+                name,
+                &serde_json::to_string_pretty(value)?,
+            )
+            .map(|_| ())
+    }
+
+    async fn inspect_replacement_shard(&self) -> Result<ReplacementShardInspectionEvidence> {
+        let (sealed, replacement, helper_pod, target_pod, mount_device_id) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+            (
+                state
+                    .session
+                    .as_ref()
+                    .context("fresh-volume workload session was not prepared")?
+                    .sealed
+                    .clone(),
+                state
+                    .replacement_volume
+                    .clone()
+                    .context("fresh-volume replacement identity was not observed")?,
+                state
+                    .replacement_helper_pod
+                    .as_ref()
+                    .context("replacement helper Pod is absent")?
+                    .name
+                    .clone(),
+                state
+                    .target_pod
+                    .clone()
+                    .context("fresh-volume target Pod is absent")?,
+                state
+                    .replacement_mount_device_id
+                    .clone()
+                    .context("replacement mount device identity is absent")?,
+            )
+        };
+        let (inventory, layout, shape, membership) = self.current_runtime_topology().await?;
+        let target = inventory
+            .pod_proofs
+            .iter()
+            .find(|pod| pod.name == target_pod)
+            .context("replacement target Pod is absent from runtime inventory")?;
+        let target_container_id = target
+            .rustfs_container_id
+            .clone()
+            .context("replacement target Pod lacks a RustFS container id")?;
+        ensure!(
+            layout.deployment_id == replacement.rustfs_deployment_id
+                && shape
+                    == self
+                        .state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+                        .shape
+                        .clone()
+                        .context("fresh-volume runtime shape is absent")?
+                && membership
+                    == self
+                        .state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+                        .membership
+                        .clone()
+                        .context("fresh-volume runtime membership is absent")?
+                && target.uid == replacement.pod_uid
+                && target_container_id == replacement.rustfs_container_id,
+            "replacement runtime target changed before shard inspection"
+        );
+        let request = FreshVolumeShardInspectionRequest {
+            volume_root: PathBuf::from(STORAGE_HELPER_VOLUME_ROOT),
+            deployment_id: replacement.rustfs_deployment_id,
+            drive_uuid: replacement.rustfs_drive_uuid,
+            mount_device_id,
+            object_directory: format!("{}/{}", self.scenario_bucket()?, sealed.key),
+            bucket: self.scenario_bucket()?,
+            object_key: sealed.key,
+            object_sha256: sealed.sha256,
+            version_id: sealed.version_id,
+            selected_part_number: 1,
+        };
+        let response = inspect_replacement_shard_helper(self.config, &helper_pod, &request)?;
+        let captured_at_ms = now_ms();
+        let response_sha256 = sha256_text(&serde_json::to_string(&response)?);
+        Ok(ReplacementShardInspectionEvidence {
+            captured_at_ms,
+            helper_pod,
+            target_pod,
+            target_pod_uid: target.uid.clone(),
+            target_container_id,
+            mount_path: self.config.rustfs_volume_path.clone(),
+            request,
+            response_sha256,
+            response,
+        })
+    }
+
+    fn scenario_bucket(&self) -> Result<String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+        Ok(state
+            .session
+            .as_ref()
+            .context("fresh-volume workload session was not prepared")?
+            .s3
+            .bucket()
+            .to_string())
+    }
+
+    async fn version_read(&self, phase: &str, expect_success: bool) -> Result<VersionReadEvidence> {
+        let (s3, history, sealed) = {
             let state = self
                 .state
                 .lock()
@@ -2404,200 +3059,447 @@ impl<'a> FreshVolumeDriver<'a> {
                 .session
                 .as_ref()
                 .context("fresh-volume workload session was not prepared")?;
-            let replacement = state
-                .replacement_volume
-                .as_ref()
-                .context("fresh-volume replacement identity was not observed")?;
             (
                 session.s3.clone(),
                 session.proof_history.clone(),
                 session.sealed.clone(),
-                state
-                    .target_pod
-                    .clone()
-                    .context("fresh-volume target Pod is absent")?,
-                replacement.rustfs_drive_uuid.clone(),
             )
         };
-        let (inventory, layout, shape, membership) = self.current_runtime_topology().await?;
-        ensure!(
-            membership.members.iter().any(|member| {
-                member.pod_name == target_pod
-                    && member.shard_ids.as_slice() == [repaired_drive.as_str()]
-            }),
-            "replacement drive is not the target Pod's sole runtime shard"
-        );
-        let target_count = shape.payload_quorum()?.read_tolerance;
-        let injection = FaultInjection::new(
-            FaultKind::RustfsVolumeIoError,
-            FaultBackend::ChaosMeshIoChaos,
-            FaultTarget::RustfsVolume {
-                path: self.config.rustfs_volume_path.clone(),
-            },
-            FaultSelection::FixedTargets(target_count),
-            self.config.duration,
-        )?;
-        let candidate_pod_ids = inventory
-            .pod_proofs
+        let before = history.records().len();
+        let result = s3
+            .get_object_version_result(&sealed.key, &sealed.version_id, &history)
+            .await?;
+        let records = history.records();
+        let matching = records[before..]
             .iter()
-            .map(|pod| format!("{}/{}", self.config.cluster.test_namespace, pod.name))
-            .collect::<BTreeSet<_>>();
-        let target_pod_id = format!("{}/{}", self.config.cluster.test_namespace, target_pod);
-        let runtime_contract = chaos_mesh::volume_fault_runtime_contract(&injection)?;
+            .filter(|record| {
+                record.kind == OperationKind::Get
+                    && record.key.as_deref() == Some(sealed.key.as_str())
+                    && record.version_id.as_deref() == Some(sealed.version_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let [record] = matching.as_slice() else {
+            bail!("causal versionId GET was not recorded exactly once")
+        };
+        let observed_sha256 = result
+            .body
+            .as_deref()
+            .map(crate::fault::workload::sha256_hex);
+        validate_read_result(
+            result.outcome,
+            result.http_status,
+            observed_sha256.as_deref(),
+            &sealed.sha256,
+            expect_success,
+        )?;
+        Ok(VersionReadEvidence {
+            phase: phase.to_string(),
+            operation_id: record.id.clone(),
+            started_at_ms: record.started_at_ms,
+            ended_at_ms: record.ended_at_ms,
+            outcome: record.outcome,
+            http_status: record.http_status,
+            observed_sha256,
+        })
+    }
 
-        for attempt in 0..12 {
-            let target_proof = self.trial_target_proof(&inventory, &layout, &shape, &membership)?;
-            let target_proof_body = serde_json::to_string_pretty(&target_proof)?;
-            let suffix = format!("-{phase}-{attempt}");
-            let mut fault = fault_runtime::apply_fault_named(
-                self.config,
-                self.collector,
-                self.scenario,
-                self.run_id,
-                &injection,
-                &format!("quorum-{phase}-{attempt}-manifest.yaml"),
-                &suffix,
-            )?;
-            let attempt_result: Result<Option<QuorumReadTrialEvidence>> = async {
-                fault.wait_active(self.config.cluster.timeout)?;
-                let active = fault.snapshot("active")?;
-                let resource = active
-                    .chaos_status
+    async fn run_causal_read_proof(&self) -> Result<FreshVolumeReadMatrixEvidence> {
+        let before = self.inspect_replacement_shard().await?;
+        self.write_causal_checkpoint("fresh-volume-replacement-shard-before.json", &before)?;
+        let (inventory, layout, shape, membership) = self.current_runtime_topology().await?;
+        let target_count = usize::try_from(shape.payload_quorum()?.read_tolerance)?;
+        let sibling_pods = membership
+            .members
+            .iter()
+            .filter(|member| member.pod_name != before.target_pod)
+            .take(target_count)
+            .map(|member| member.pod_name.clone())
+            .collect::<Vec<_>>();
+        ensure!(
+            sibling_pods.len() == target_count,
+            "runtime membership lacks enough sibling volumes for exact read tolerance"
+        );
+        let target_proof = self.trial_target_proof(&inventory, &layout, &shape, &membership)?;
+        let target_proof_body = serde_json::to_string_pretty(&target_proof)?;
+        let causal_fault_duration = self
+            .config
+            .duration
+            .max(self.config.cluster.timeout.saturating_mul(3));
+        let sibling_spec = chaos_mesh::IoChaosSpec::eio_on_rustfs_volume(
+            &self.config.cluster,
+            &self.config.chaos_namespace,
+            self.run_id,
+            &self.scenario.name,
+            &self.config.rustfs_volume_path,
+            100,
+            causal_fault_duration,
+        )?
+        .with_read_only()
+        .with_exact_pods(sibling_pods.clone())?
+        .with_name_suffix("-fresh-siblings");
+        self.collector.write_text(
+            self.scenario.case_name,
+            "fresh-volume-sibling-read-eio.yaml",
+            &sibling_spec.manifest(),
+        )?;
+        let mut sibling_guard = chaos_mesh::apply_iochaos(&self.config.cluster, &sibling_spec)?;
+        let attempt = async {
+            sibling_guard.wait_active(self.config.cluster.timeout)?;
+            let active_at_ms = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+                state
+                    .session
                     .as_ref()
-                    .context("exact-quorum IOChaos snapshot lacks the controller object")?;
-                let contract = chaos_mesh::VolumeTargetEvidenceContract {
+                    .context("fresh-volume workload session was not prepared")?
+                    .proof_history
+                    .mark_fault_active_now()
+            };
+            let sibling_active = Self::controller_snapshot(&sibling_guard, "siblings-active")?;
+            self.write_causal_checkpoint("fresh-volume-siblings-active.json", &sibling_active)?;
+            let active_resource: Value = serde_json::from_str(&sibling_active.body)?;
+            let selected = chaos_mesh::validate_fixed_volume_snapshot(
+                active_resource
+                    .get("chaos_status")
+                    .context("sibling IOChaos snapshot lacks controller status")?,
+                &chaos_mesh::VolumeTargetEvidenceContract {
                     chaos_namespace: &self.config.chaos_namespace,
                     target_namespace: &self.config.cluster.test_namespace,
                     tenant: &self.config.cluster.tenant_name,
                     run_id: self.run_id,
                     scenario: &self.scenario.name,
                     volume_path: &self.config.rustfs_volume_path,
-                    expected_targets: target_count,
-                    candidate_pod_ids: &candidate_pod_ids,
-                    runtime: &runtime_contract,
+                    path: None,
+                    exact_pod_names: Some(&sibling_pods.iter().cloned().collect()),
+                    expected_targets: u32::try_from(target_count)?,
+                    candidate_pod_ids: &inventory
+                        .pod_proofs
+                        .iter()
+                        .map(|pod| format!("{}/{}", self.config.cluster.test_namespace, pod.name))
+                        .collect(),
+                    runtime: &chaos_mesh::IoChaosRuntimeContract {
+                        action: chaos_mesh::IoChaosAction::Fault { errno: 5 },
+                        methods: vec!["READ".to_string()],
+                        io_sampling_percent: 100,
+                        duration_seconds: causal_fault_duration.as_secs(),
+                    },
+                },
+            )?;
+            let unavailable_drive_uuids = sibling_pods
+                .iter()
+                .map(|pod| {
+                    let member = membership
+                        .members
+                        .iter()
+                        .find(|member| member.pod_name == *pod)
+                        .context("sibling Pod is outside runtime membership")?;
+                    let [drive] = member.shard_ids.as_slice() else {
+                        bail!("sibling Pod does not own exactly one target-set drive")
+                    };
+                    Ok(drive.clone())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let replacement_available = self.version_read("replacement-available", true).await?;
+            let sibling_after_available =
+                Self::controller_snapshot(&sibling_guard, "after-replacement-available")?;
+            self.write_causal_checkpoint(
+                "fresh-volume-replacement-available.json",
+                &json!({
+                    "read": replacement_available,
+                    "siblingFault": sibling_after_available,
+                }),
+            )?;
+            let exact_path = format!(
+                "{}/{}",
+                before.mount_path.trim_end_matches('/'),
+                before.response.inspection.selected_part.relative_part_path
+            );
+            ensure!(
+                !exact_path.contains(".metadata.bin") && exact_path.ends_with("/part.1"),
+                "replacement path fault is not restricted to one part file"
+            );
+            let exact_spec = chaos_mesh::IoChaosSpec::eio_on_rustfs_volume(
+                &self.config.cluster,
+                &self.config.chaos_namespace,
+                self.run_id,
+                &self.scenario.name,
+                &self.config.rustfs_volume_path,
+                100,
+                causal_fault_duration,
+            )?
+            .with_read_only()
+            .with_exact_path(&exact_path)?
+            .with_exact_pods(vec![before.target_pod.clone()])?
+            .with_name_suffix("-fresh-replacement-part");
+            let manifest_body = exact_spec.manifest();
+            self.collector.write_text(
+                self.scenario.case_name,
+                "fresh-volume-replacement-part-read-eio.yaml",
+                &manifest_body,
+            )?;
+            let mut exact_guard = chaos_mesh::apply_iochaos(&self.config.cluster, &exact_spec)?;
+            let exact_attempt = async {
+                exact_guard.wait_active(self.config.cluster.timeout)?;
+                let exact_active_at_ms = now_ms();
+                let sibling_during_exact =
+                    Self::controller_snapshot(&sibling_guard, "replacement-path-active")?;
+                let exact_active =
+                    Self::controller_snapshot(&exact_guard, "replacement-path-active")?;
+                let exact_resource: Value = serde_json::from_str(&exact_active.body)?;
+                let exact_pod_names = [before.target_pod.clone()].into_iter().collect();
+                let exact_candidates = [format!(
+                    "{}/{}",
+                    self.config.cluster.test_namespace, before.target_pod
+                )]
+                .into_iter()
+                .collect();
+                let exact_selected = chaos_mesh::validate_fixed_volume_snapshot(
+                    exact_resource
+                        .get("chaos_status")
+                        .context("replacement part IOChaos snapshot lacks controller status")?,
+                    &chaos_mesh::VolumeTargetEvidenceContract {
+                        chaos_namespace: &self.config.chaos_namespace,
+                        target_namespace: &self.config.cluster.test_namespace,
+                        tenant: &self.config.cluster.tenant_name,
+                        run_id: self.run_id,
+                        scenario: &self.scenario.name,
+                        volume_path: &self.config.rustfs_volume_path,
+                        path: Some(&exact_path),
+                        exact_pod_names: Some(&exact_pod_names),
+                        expected_targets: 1,
+                        candidate_pod_ids: &exact_candidates,
+                        runtime: &chaos_mesh::IoChaosRuntimeContract {
+                            action: chaos_mesh::IoChaosAction::Fault { errno: 5 },
+                            methods: vec!["READ".to_string()],
+                            io_sampling_percent: 100,
+                            duration_seconds: causal_fault_duration.as_secs(),
+                        },
+                    },
+                )?;
+                let exact_selected = exact_selected.into_iter().collect::<Vec<_>>();
+                let [exact_selected_target] = exact_selected.as_slice() else {
+                    bail!("replacement part IOChaos did not select one controller target")
                 };
-                let selected = chaos_mesh::validate_fixed_volume_snapshot(resource, &contract)?;
-                let selected_pods = selected
-                    .iter()
-                    .map(|record| chaos_mesh::iochaos_record_pod_id(record))
-                    .collect::<Result<BTreeSet<_>>>()?;
-                if selected_pods.contains(&target_pod_id) {
-                    return Ok(None);
-                }
-                let unavailable_drive_uuids = selected_pods
-                    .iter()
-                    .map(|pod_id| {
-                        let pod = pod_id
-                            .strip_prefix(&format!("{}/", self.config.cluster.test_namespace))
-                            .context("IOChaos selected a Pod outside the test namespace")?;
-                        let member = membership
-                            .members
-                            .iter()
-                            .find(|member| member.pod_name == pod)
-                            .context("IOChaos selected a Pod outside runtime membership")?;
-                        let [drive] = member.shard_ids.as_slice() else {
-                            bail!("selected Pod does not own exactly one target-set drive")
-                        };
-                        Ok(drive.clone())
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                ensure!(
-                    unavailable_drive_uuids.len() == usize::try_from(target_count)?
-                        && !unavailable_drive_uuids.contains(&repaired_drive),
-                    "exact-quorum fault did not leave the replacement drive online"
-                );
-                let fault_active_at_ms = history.mark_fault_active_now();
-                let before = history.records().len();
-                let result = s3
-                    .get_object_version_result(&sealed.key, &sealed.version_id, &history)
-                    .await?;
-                let after_snapshot = fault.snapshot("after-read")?;
-                let after_resource = after_snapshot
-                    .chaos_status
-                    .as_ref()
-                    .context("post-read IOChaos snapshot lacks the controller object")?;
-                let selected_after =
-                    chaos_mesh::validate_fixed_volume_snapshot(after_resource, &contract)?;
-                ensure!(
-                    selected_after == selected,
-                    "exact-quorum target set changed during GET"
-                );
-                let fault_delete_started_at_ms = history.mark_fault_ended_now();
-                let records = history.records();
-                let matching = records[before..]
-                    .iter()
-                    .filter(|record| {
-                        record.kind == OperationKind::Get
-                            && record.key.as_deref() == Some(sealed.key.as_str())
-                            && record.version_id.as_deref() == Some(sealed.version_id.as_str())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let [record] = matching.as_slice() else {
-                    bail!("exact-quorum versionId GET was not recorded exactly once")
-                };
-                let observed_sha256 = result
-                    .body
-                    .as_deref()
-                    .map(crate::fault::workload::sha256_hex);
-                if expect_success {
-                    ensure!(
-                        result.outcome == OperationOutcome::Ok
-                            && observed_sha256.as_deref() == Some(sealed.sha256.as_str()),
-                        "post-heal exact-quorum versionId GET did not return the sealed bytes"
-                    );
-                } else if result.outcome == OperationOutcome::Ok {
-                    bail!(
-                        "harness_unqualified: replacement shard was already readable before the missing-shard proof"
-                    );
-                } else {
-                    ensure!(
-                        result.outcome == OperationOutcome::Failed
-                            && result.http_status.is_some_and(|status| status >= 500),
-                        "harness_unqualified: pre-heal exact-quorum GET did not return a definitive server failure"
-                    );
-                }
-                let fault_snapshot_body = serde_json::to_string_pretty(&json!({
-                    "active": active,
-                    "afterRead": after_snapshot,
-                }))?;
-                Ok(Some(QuorumReadTrialEvidence {
-                    phase: phase.to_string(),
-                    target_proof_sha256: sha256_text(&target_proof_body),
-                    target_proof_body,
-                    fault_snapshot_sha256: sha256_text(&fault_snapshot_body),
-                    fault_snapshot_body,
-                    selected_targets: selected.into_iter().collect(),
-                    unavailable_drive_uuids,
-                    fault_active_at_ms,
-                    read_started_at_ms: record.started_at_ms,
-                    read_ended_at_ms: record.ended_at_ms,
-                    fault_delete_started_at_ms,
-                    operation_id: record.id.clone(),
-                    outcome: record.outcome,
-                    http_status: record.http_status,
-                    observed_sha256,
-                }))
+                self.write_causal_checkpoint(
+                    "fresh-volume-replacement-path-active.json",
+                    &json!({
+                        "siblingFault": sibling_during_exact,
+                        "replacementPathFault": exact_active,
+                    }),
+                )?;
+                let replacement_blocked = self.version_read("replacement-blocked", false).await?;
+                let exact_after_blocked =
+                    Self::controller_snapshot(&exact_guard, "after-replacement-blocked")?;
+                self.write_causal_checkpoint(
+                    "fresh-volume-replacement-blocked.json",
+                    &json!({
+                        "read": replacement_blocked,
+                        "replacementPathFault": exact_after_blocked,
+                    }),
+                )?;
+                Ok((
+                    exact_active_at_ms,
+                    exact_selected_target.clone(),
+                    sibling_during_exact,
+                    exact_active,
+                    replacement_blocked,
+                    exact_after_blocked,
+                ))
             }
             .await;
-            let delete_result = fault
+            let exact_delete_started_at_ms = now_ms();
+            let exact_delete_result = exact_guard
                 .delete(self.config.cluster.timeout)
-                .context("remove exact-quorum IOChaos after read attempt");
-            match (attempt_result, delete_result) {
-                (Ok(Some(trial)), Ok(())) => return Ok(trial),
-                (Ok(None), Ok(())) => continue,
+                .context("remove replacement part IOChaos");
+            let exact_deleted_at_ms = now_ms();
+            let exact_cleanup_checkpoint = self.write_causal_checkpoint(
+                "fresh-volume-replacement-path-cleanup.json",
+                &json!({
+                    "deleteStartedAtMs": exact_delete_started_at_ms,
+                    "deletedAtMs": exact_deleted_at_ms,
+                    "succeeded": exact_delete_result.is_ok(),
+                    "error": exact_delete_result.as_ref().err().map(|error| format!("{error:#}")),
+                }),
+            );
+            let exact_delete = match (exact_delete_result, exact_cleanup_checkpoint) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                (Err(delete), Err(checkpoint)) => Err(delete.context(format!(
+                    "replacement part cleanup evidence also failed: {checkpoint:#}"
+                ))),
+            };
+            let (
+                exact_active_at_ms,
+                exact_selected_target,
+                sibling_during_exact,
+                exact_active,
+                replacement_blocked,
+                exact_after_blocked,
+            ) = match (exact_attempt, exact_delete) {
+                (Ok(evidence), Ok(())) => evidence,
                 (Err(primary), Ok(())) => return Err(primary),
                 (Err(primary), Err(cleanup)) => {
                     return Err(primary.context(format!(
-                        "exact-quorum IOChaos cleanup also failed: {cleanup:#}"
+                        "replacement part IOChaos cleanup also failed: {cleanup:#}"
                     )));
                 }
                 (Ok(_), Err(cleanup)) => return Err(cleanup),
-            }
+            };
+            sibling_guard.ensure_active("after replacement part IOChaos removal")?;
+            let sibling_after_exact =
+                Self::controller_snapshot(&sibling_guard, "after-replacement-path-removed")?;
+            let replacement_restored = self.version_read("replacement-restored", true).await?;
+            let sibling_after_restored =
+                Self::controller_snapshot(&sibling_guard, "after-replacement-restored")?;
+            self.write_causal_checkpoint(
+                "fresh-volume-replacement-restored.json",
+                &json!({
+                    "read": replacement_restored,
+                    "siblingFault": sibling_after_restored,
+                }),
+            )?;
+            Ok((
+                active_at_ms,
+                selected,
+                unavailable_drive_uuids,
+                vec![
+                    sibling_active,
+                    sibling_after_available,
+                    sibling_during_exact,
+                    sibling_after_exact,
+                    sibling_after_restored,
+                ],
+                replacement_available,
+                ReplacementPathFaultEvidence {
+                    exact_container_path: exact_path,
+                    manifest_sha256: sha256_text(&manifest_body),
+                    manifest_body,
+                    selected_target: exact_selected_target,
+                    active_at_ms: exact_active_at_ms,
+                    delete_started_at_ms: exact_delete_started_at_ms,
+                    deleted_at_ms: exact_deleted_at_ms,
+                    snapshots: vec![exact_active, exact_after_blocked],
+                },
+                replacement_blocked,
+                replacement_restored,
+            ))
         }
-        bail!(
-            "harness_unqualified: unable to select exact-quorum sibling shards without the replacement target"
-        )
+        .await;
+        let sibling_delete_started_at_ms = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+            state
+                .session
+                .as_ref()
+                .context("fresh-volume workload session was not prepared")?
+                .proof_history
+                .mark_fault_ended_now()
+        };
+        let sibling_delete_result = sibling_guard
+            .delete(self.config.cluster.timeout)
+            .context("remove sibling read IOChaos");
+        let sibling_deleted_at_ms = now_ms();
+        let sibling_cleanup_checkpoint = self.write_causal_checkpoint(
+            "fresh-volume-sibling-fault-cleanup.json",
+            &json!({
+                "deleteStartedAtMs": sibling_delete_started_at_ms,
+                "deletedAtMs": sibling_deleted_at_ms,
+                "succeeded": sibling_delete_result.is_ok(),
+                "error": sibling_delete_result.as_ref().err().map(|error| format!("{error:#}")),
+            }),
+        );
+        let sibling_delete = match (sibling_delete_result, sibling_cleanup_checkpoint) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(delete), Err(checkpoint)) => Err(delete.context(format!(
+                "sibling cleanup evidence also failed: {checkpoint:#}"
+            ))),
+        };
+        let (
+            active_at_ms,
+            selected,
+            unavailable_drive_uuids,
+            sibling_snapshots,
+            replacement_available,
+            replacement_path_fault,
+            replacement_blocked,
+            replacement_restored,
+        ) = match (attempt, sibling_delete) {
+            (Ok(evidence), Ok(())) => evidence,
+            (Err(primary), Ok(())) => return Err(primary),
+            (Err(primary), Err(cleanup)) => {
+                return Err(
+                    primary.context(format!("sibling IOChaos cleanup also failed: {cleanup:#}"))
+                );
+            }
+            (Ok(_), Err(cleanup)) => return Err(cleanup),
+        };
+        let after = self.inspect_replacement_shard().await?;
+        self.write_causal_checkpoint("fresh-volume-replacement-shard-after.json", &after)?;
+        let (identity, sealed, ordinary_get_operation_id, records, repaired_drive_uuid) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+            let session = state
+                .session
+                .as_ref()
+                .context("fresh-volume workload session was not prepared")?;
+            (
+                state
+                    .owned_context
+                    .as_ref()
+                    .context("fresh-volume ownership is absent")?
+                    .identity
+                    .clone(),
+                session.sealed.clone(),
+                state
+                    .ordinary_after_replacement_operation_id
+                    .clone()
+                    .context("ordinary replacement GET identity is absent")?,
+                session.proof_history.records(),
+                state
+                    .replacement_volume
+                    .as_ref()
+                    .context("fresh-volume replacement identity is absent")?
+                    .rustfs_drive_uuid
+                    .clone(),
+            )
+        };
+        let proof = FreshVolumeReadMatrixEvidence {
+            schema_version: 3,
+            identity,
+            chaos_namespace: self.config.chaos_namespace.clone(),
+            shape,
+            membership,
+            repaired_drive_uuid,
+            object_key: sealed.key,
+            version_id: sealed.version_id,
+            expected_sha256: sealed.sha256,
+            ordinary_get_operation_id,
+            shard_before_fault: before,
+            shard_after_fault: after,
+            sibling_fault: SiblingReadFaultEvidence {
+                target_proof_sha256: sha256_text(&target_proof_body),
+                target_proof_body,
+                selected_targets: selected.into_iter().collect(),
+                unavailable_drive_uuids,
+                active_at_ms,
+                delete_started_at_ms: sibling_delete_started_at_ms,
+                deleted_at_ms: sibling_deleted_at_ms,
+                snapshots: sibling_snapshots,
+            },
+            replacement_path_fault,
+            replacement_available,
+            replacement_blocked,
+            replacement_restored,
+        };
+        proof.validate(&records)?;
+        Ok(proof)
     }
 }
 
@@ -3278,23 +4180,41 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         let deployment = self.config.operator_deployment.as_deref().context(
             "RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT is required for fresh-volume qualification",
         )?;
-        self.state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
-            .ownership_checkpoint = Some(FreshVolumeOwnershipCheckpoint::VolumeMutationStarted);
-        let pause = lifecycle::OperatorPause::pause(
-            &self.config.cluster,
-            deployment,
-            &self.config.operator_image_match,
-            self.run_id,
-            self.config.cluster.timeout,
-        )?;
-        *self
-            .operator_pause
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fresh-volume operator pause lock poisoned"))? =
-            Some(pause);
-        lifecycle::kube::scale_statefulset_command(&self.config.cluster, &statefulset.name, 0)?
+        let scale_down =
+            prepare_volume_mutation_request(
+                || {
+                    lifecycle::OperatorPause::pause(
+                        &self.config.cluster,
+                        deployment,
+                        &self.config.operator_image_match,
+                        self.run_id,
+                        self.config.cluster.timeout,
+                    )
+                },
+                |pause| {
+                    *self.operator_pause.lock().map_err(|_| {
+                        anyhow::anyhow!("fresh-volume operator pause lock poisoned")
+                    })? = Some(pause);
+                    Ok(())
+                },
+                || {
+                    lifecycle::kube::scale_statefulset_command(
+                        &self.config.cluster,
+                        &statefulset.name,
+                        0,
+                    )
+                },
+                || {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+                    FreshVolumeOwnershipCheckpoint::begin_volume_mutation(
+                        &mut state.ownership_checkpoint,
+                    )
+                },
+            )?;
+        scale_down
             .run_checked()
             .context("scale owned RustFS StatefulSet to zero")?;
         wait_rustfs_pods_absent(self.config).await?;
@@ -3523,6 +4443,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             .rustfs_drive_uuid
             .clone()
             .context("adopted replacement lacks a RustFS drive UUID")?;
+        let replacement_mount_device_id = adopted_probe.device_major_minor.clone();
         ensure!(
             adopted_probe.canonical_device == empty_probe.canonical_device
                 && adopted_probe.filesystem_uuid == empty_probe.filesystem_uuid,
@@ -3658,6 +4579,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             state.shape = Some(shape);
             state.target_pod = Some(target_pod.name.clone());
             state.replacement_volume = Some(replacement_volume.clone());
+            state.replacement_mount_device_id = Some(replacement_mount_device_id);
             state.prepare_receipt = Some(prepare_receipt);
             state.old_device_absence_sha256 = Some(old_device_absence_sha256);
             state.replacement_proof = Some(proof);
@@ -3719,7 +4641,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         Ok(())
     }
 
-    async fn prove_missing_shard_under_exact_quorum(&self) -> Result<()> {
+    async fn verify_replacement_baseline(&self) -> Result<()> {
         let (s3, history, sealed) = {
             let state = self
                 .state
@@ -3761,13 +4683,11 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             bail!("post-replacement ordinary versionId GET was not recorded exactly once")
         };
         let ordinary_operation_id = ordinary_record.id.clone();
-        let trial = self.run_quorum_trial("missing", false).await?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
         state.ordinary_after_replacement_operation_id = Some(ordinary_operation_id);
-        state.missing_trial = Some(trial);
         Ok(())
     }
 
@@ -3903,11 +4823,13 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
     }
     async fn verify_recovery_and_post_write(&self) -> Result<()> {
         self.renew_owned_context().await?;
-        let repaired_trial = self.run_quorum_trial("repaired", true).await?;
+        let causal_read_proof = self
+            .with_lease_heartbeat(self.run_causal_read_proof())
+            .await?;
         self.state
             .lock()
             .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
-            .repaired_trial = Some(repaired_trial);
+            .causal_read_proof = Some(causal_read_proof);
         wait_for_stable_rustfs_pods(
             &self.config.cluster,
             self.config.expected_rustfs_pod_count,
@@ -4075,10 +4997,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             prepare_receipt,
             old_device_absence_sha256,
             replacement_proof,
-            missing,
-            repaired,
-            ordinary_after_replacement_operation_id,
-            sealed,
+            causal_read_proof,
             proof_history,
             helper_pod,
             replacement_helper_pod,
@@ -4098,10 +5017,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 state.prepare_receipt.clone(),
                 state.old_device_absence_sha256.clone(),
                 state.replacement_proof.clone(),
-                state.missing_trial.clone(),
-                state.repaired_trial.clone(),
-                state.ordinary_after_replacement_operation_id.clone(),
-                session.map(|session| session.sealed.clone()),
+                state.causal_read_proof.clone(),
                 session.map(|session| session.proof_history.clone()),
                 state.helper_pod.clone(),
                 state.replacement_helper_pod.clone(),
@@ -4159,61 +5075,12 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 &serde_json::to_string_pretty(summary)?,
             )?;
         }
-        if let (
-            Some(context),
-            Some(replacement),
-            Some(replacement_proof),
-            Some(missing),
-            Some(repaired),
-            Some(ordinary_get_operation_id),
-            Some(sealed),
-            Some(proof_history),
-        ) = (
-            context.as_ref(),
-            replacement.as_ref(),
-            replacement_proof.as_ref(),
-            missing,
-            repaired,
-            ordinary_after_replacement_operation_id,
-            sealed.as_ref(),
-            proof_history.as_ref(),
-        ) {
-            let (shape, membership) = {
-                let state = self
-                    .state
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
-                (
-                    state
-                        .shape
-                        .clone()
-                        .context("fresh-volume shape is absent")?,
-                    state
-                        .membership
-                        .clone()
-                        .context("fresh-volume membership is absent")?,
-                )
-            };
-            let proof = FreshVolumeReadMatrixEvidence {
-                schema_version: 1,
-                identity: context.identity.clone(),
-                shape,
-                membership,
-                repaired_drive_uuid: replacement.rustfs_drive_uuid.clone(),
-                object_key: sealed.key.clone(),
-                version_id: sealed.version_id.clone(),
-                expected_sha256: sealed.sha256.clone(),
-                ordinary_get_operation_id,
-                missing,
-                repaired,
-            };
-            proof.validate(&proof_history.records())?;
+        if let Some(causal_read_proof) = &causal_read_proof {
             self.collector.write_text(
                 self.scenario.case_name,
                 FRESH_VOLUME_READ_PROOF_ARTIFACT,
-                &serde_json::to_string_pretty(&proof)?,
+                &serde_json::to_string_pretty(causal_read_proof)?,
             )?;
-            replacement_proof.validate()?;
         }
         self.collector.write_text(
             self.scenario.case_name,
@@ -4252,6 +5119,27 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                     "membership": membership,
                     "observedAtMs": now_ms(),
                 }))?,
+            )?;
+        }
+        if let (Some(replacement_proof), Some(causal_read_proof), Some(proof_history)) = (
+            replacement_proof.as_ref(),
+            causal_read_proof.as_ref(),
+            proof_history.as_ref(),
+        ) {
+            let case_dir = self.collector.case_dir(self.scenario.case_name);
+            let mappings = serde_json::from_str::<Vec<VersionShardMappingObservation>>(
+                &fs::read_to_string(case_dir.join(VERSION_SHARD_MAPPING_ARTIFACT))?,
+            )?;
+            let original_target_proof = fs::read_to_string(case_dir.join("target-proof.json"))?;
+            causal_read_proof.validate_chain(
+                &mappings,
+                replacement_proof,
+                summary
+                    .as_ref()
+                    .context("causal read proof lacks completed heal evidence")?,
+                &progress,
+                &proof_history.records(),
+                &original_target_proof,
             )?;
         }
         Ok(())
@@ -4506,6 +5394,206 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
 mod tests {
     use super::*;
 
+    fn volume(generation: &str, observed_at_ms: u64) -> StorageVolumeIdentity {
+        StorageVolumeIdentity {
+            target_proof_sha256: "a".repeat(64),
+            host_storage_proof_sha256: "b".repeat(64),
+            rustfs_deployment_id: "deployment-1".to_string(),
+            namespace: "fault-run".to_string(),
+            tenant: "rustfs".to_string(),
+            pod: "rustfs-0".to_string(),
+            pod_uid: format!("pod-{generation}"),
+            rustfs_container_id: format!("containerd://{}", sha256_text(generation)),
+            volume_name: "data-0".to_string(),
+            persistent_volume_claim: "data-0-rustfs-0".to_string(),
+            persistent_volume_claim_uid: format!("pvc-{generation}"),
+            persistent_volume: format!("pv-{generation}"),
+            persistent_volume_uid: format!("pv-uid-{generation}"),
+            node: "worker-0".to_string(),
+            node_uid: "node-0".to_string(),
+            storage_class: "rustfs-local".to_string(),
+            local_volume_path: "/var/lib/rustfs/data0".to_string(),
+            mount_path: "/data0".to_string(),
+            canonical_device: format!("/dev/mapper/data-{generation}"),
+            target_mount_namespace_id: "mnt:[4026533000]".to_string(),
+            filesystem_uuid: format!("fs-{generation}"),
+            rustfs_drive_uuid: format!("drive-{generation}"),
+            pool_index: 0,
+            set_index: 0,
+            observed_at_ms,
+        }
+    }
+
+    #[test]
+    fn replacement_membership_binds_both_storage_generations() {
+        let mut old = volume("old", 100);
+        old.pod = "rustfs-0".to_string();
+        let mut new = volume("new", 300);
+        new.pod = old.pod.clone();
+        let original = ErasureSetMembership {
+            members: vec![
+                ErasureSetMember {
+                    pod_name: old.pod.clone(),
+                    server_endpoint: "server-0".to_string(),
+                    shard_ids: vec![old.rustfs_drive_uuid.clone()],
+                },
+                ErasureSetMember {
+                    pod_name: "rustfs-1".to_string(),
+                    server_endpoint: "server-1".to_string(),
+                    shard_ids: vec!["sibling".to_string()],
+                },
+            ],
+        };
+        let mut current = original.clone();
+        current.members[0].shard_ids = vec![new.rustfs_drive_uuid.clone()];
+        validate_replacement_membership(&original, &current, &old, &new)
+            .expect("replacement UUID may change");
+        let mut same_uuid = new.clone();
+        same_uuid.rustfs_drive_uuid = old.rustfs_drive_uuid.clone();
+        validate_replacement_membership(&original, &original, &old, &same_uuid)
+            .expect("format healing may preserve the slot UUID");
+        assert!(validate_replacement_membership(&current, &current, &old, &new).is_err());
+        current.members[1].shard_ids = vec!["foreign-sibling".to_string()];
+        assert!(validate_replacement_membership(&original, &current, &old, &new).is_err());
+    }
+
+    #[test]
+    fn rebuilt_shard_must_restore_the_sealed_shard_on_a_new_device() {
+        use crate::fault::storage_recovery_helper::{
+            OfflineInspectedShard, OfflineXl2InspectResponse,
+        };
+        use crate::fault::xl2_inspector::{
+            OFFLINE_XL2_INSPECTOR_REVISION, Xl2FormatProfile, Xl2ObjectVersionLayout,
+        };
+        let original = OfflineXl2InspectResponse {
+            mount_device_id: "8:1".to_string(),
+            drive_uuid: "old".to_string(),
+            format_json_sha256: "a".repeat(64),
+            xl_meta_sha256: "b".repeat(64),
+            layout: Xl2ObjectVersionLayout {
+                inspector_revision: OFFLINE_XL2_INSPECTOR_REVISION.to_string(),
+                profile: Xl2FormatProfile::LATEST_RUSTFS,
+                version_id: "version-1".to_string(),
+                data_directory: "data".to_string(),
+                erasure_data_shards: 2,
+                erasure_parity_shards: 2,
+                erasure_index: 1,
+                part_numbers: vec![1],
+                part_sizes: vec![1024],
+                relative_part_paths: vec!["bucket/key/data/part.1".to_string()],
+            },
+            selected_part: OfflineInspectedShard {
+                part_number: 1,
+                relative_part_path: "bucket/key/data/part.1".to_string(),
+                shard_device_id: "8:1".to_string(),
+                shard_inode: 42,
+                shard_size_bytes: 1024,
+                original_sha256: "c".repeat(64),
+            },
+        };
+        let mut rebuilt = original.clone();
+        rebuilt.mount_device_id = "8:2".to_string();
+        rebuilt.drive_uuid = "new".to_string();
+        rebuilt.format_json_sha256 = "d".repeat(64);
+        rebuilt.xl_meta_sha256 = "e".repeat(64);
+        rebuilt.selected_part.shard_device_id = "8:2".to_string();
+        rebuilt.selected_part.shard_inode = 99;
+        validate_rebuilt_shard(&original, &rebuilt)
+            .expect("physical and metadata generations may differ");
+        for corruption in ["bytes", "index", "version", "path", "size"] {
+            let mut altered = rebuilt.clone();
+            match corruption {
+                "bytes" => altered.selected_part.original_sha256 = "f".repeat(64),
+                "index" => altered.layout.erasure_index = 2,
+                "version" => altered.layout.version_id = "another-version".to_string(),
+                "path" => {
+                    altered.selected_part.relative_part_path = "bucket/key/other/part.1".to_string()
+                }
+                "size" => altered.selected_part.shard_size_bytes += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_rebuilt_shard(&original, &altered).is_err(),
+                "must reject changed {corruption}"
+            );
+        }
+    }
+
+    fn target_fingerprint(
+        pod_uid: &'static str,
+        relative_part_path: &'static str,
+        shard_sha256: &'static str,
+    ) -> ReplacementTargetFingerprint<'static> {
+        ReplacementTargetFingerprint {
+            helper_pod: "helper-1",
+            target_pod: "rustfs-0",
+            target_pod_uid: pod_uid,
+            target_container_id: "containerd://container-1",
+            mount_path: "/data",
+            relative_part_path,
+            shard_device_id: "8:1",
+            shard_inode: 42,
+            shard_size_bytes: 4096,
+            shard_sha256,
+        }
+    }
+
+    #[test]
+    fn causal_proof_rejects_the_wrong_shard_path() {
+        assert!(
+            validate_replacement_part_path("bucket", "key", 1, "bucket/key/data/part.2").is_err()
+        );
+    }
+
+    #[test]
+    fn causal_proof_rejects_the_wrong_version() {
+        assert!(validate_version_binding("version-1", "version-2", "version-1").is_err());
+        assert!(validate_version_binding("version-1", "version-1", "version-2").is_err());
+    }
+
+    #[test]
+    fn causal_proof_rejects_fault_removal_before_the_blocked_read() {
+        assert!(validate_causal_timeline([1, 2, 3, 4, 5, 6, 8, 7, 9, 10, 11]).is_err());
+    }
+
+    #[test]
+    fn causal_proof_rejects_metadata_paths() {
+        assert!(
+            validate_replacement_part_path("bucket", "key", 1, "bucket/key/data/.metadata.bin")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn causal_proof_rejects_runtime_target_drift() {
+        assert!(
+            validate_target_continuity(
+                target_fingerprint("pod-uid-1", "bucket/key/data/part.1", "abc"),
+                target_fingerprint("pod-uid-2", "bucket/key/data/part.1", "abc"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn causal_proof_rejects_an_invalid_response_sequence() {
+        assert!(validate_causal_timeline([1, 2, 3, 4, 5, 6, 7, 8, 10, 9, 11]).is_err());
+    }
+
+    #[test]
+    fn causal_proof_rejects_a_restored_hash_mismatch() {
+        assert!(
+            validate_read_result(
+                OperationOutcome::Ok,
+                Some(200),
+                Some("different"),
+                "expected",
+                true,
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn fresh_helper_mounts_match_session_roots() {
         let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
@@ -4604,6 +5692,106 @@ mod tests {
         }
         assert!(
             !FreshVolumeOwnershipCheckpoint::VolumeMutationStarted.permits_abort_before_mutation()
+        );
+    }
+
+    #[test]
+    fn volume_mutation_request_preserves_cleanup_boundary_on_prepare_failures() {
+        use std::{cell::RefCell, rc::Rc};
+
+        let checkpoint = Rc::new(RefCell::new(Some(
+            FreshVolumeOwnershipCheckpoint::InspectionCompleted,
+        )));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let pause_calls = calls.clone();
+        let result = prepare_volume_mutation_request(
+            move || {
+                pause_calls.borrow_mut().push("pause");
+                Err::<(), _>(anyhow::anyhow!("pause failed"))
+            },
+            |_| Ok(()),
+            || Ok("request"),
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.borrow().as_slice(), ["pause"]);
+        assert!(
+            checkpoint
+                .borrow()
+                .is_some_and(FreshVolumeOwnershipCheckpoint::permits_abort_before_mutation)
+        );
+
+        calls.borrow_mut().clear();
+        let pause_calls = calls.clone();
+        let record_calls = calls.clone();
+        let setup_calls = calls.clone();
+        let result = prepare_volume_mutation_request(
+            move || {
+                pause_calls.borrow_mut().push("pause");
+                Ok(())
+            },
+            move |_| {
+                record_calls.borrow_mut().push("record-pause");
+                Ok(())
+            },
+            move || {
+                setup_calls.borrow_mut().push("prepare-request");
+                Err::<&str, _>(anyhow::anyhow!("request setup failed"))
+            },
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            calls.borrow().as_slice(),
+            ["pause", "record-pause", "prepare-request"]
+        );
+        assert!(
+            checkpoint
+                .borrow()
+                .is_some_and(FreshVolumeOwnershipCheckpoint::permits_abort_before_mutation)
+        );
+
+        calls.borrow_mut().clear();
+        let pause_calls = calls.clone();
+        let record_calls = calls.clone();
+        let setup_calls = calls.clone();
+        let mutation_calls = calls.clone();
+        let mutation_checkpoint = checkpoint.clone();
+        let command = prepare_volume_mutation_request(
+            move || {
+                pause_calls.borrow_mut().push("pause");
+                Ok(())
+            },
+            move |_| {
+                record_calls.borrow_mut().push("record-pause");
+                Ok(())
+            },
+            move || {
+                setup_calls.borrow_mut().push("prepare-request");
+                Ok("request")
+            },
+            move || {
+                mutation_calls.borrow_mut().push("begin-mutation");
+                FreshVolumeOwnershipCheckpoint::begin_volume_mutation(
+                    &mut mutation_checkpoint.borrow_mut(),
+                )
+            },
+        )
+        .expect("prepare request");
+        calls.borrow_mut().push(command);
+        assert_eq!(
+            calls.borrow().as_slice(),
+            [
+                "pause",
+                "record-pause",
+                "prepare-request",
+                "begin-mutation",
+                "request"
+            ]
+        );
+        assert_eq!(
+            *checkpoint.borrow(),
+            Some(FreshVolumeOwnershipCheckpoint::VolumeMutationStarted)
         );
     }
 

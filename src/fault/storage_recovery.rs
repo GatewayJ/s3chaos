@@ -3414,6 +3414,8 @@ impl ForceReadThroughProof {
             run_id: &self.identity.run_id,
             scenario: &self.identity.scenario,
             volume_path: &target_proof.volume_path,
+            path: None,
+            exact_pod_names: None,
             expected_targets: target_proof.expected_targets,
             candidate_pod_ids: &candidate_pod_ids,
             runtime: &iochaos_runtime,
