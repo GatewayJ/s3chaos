@@ -107,7 +107,19 @@ fn load_control(root: &Path, mode: AckCalibrationMode) -> Result<Control> {
             },
         "calibration control has the wrong outcome"
     );
-    let case = fs::canonicalize(&attempt.artifacts.case_dir)?;
+    let relative_case = Path::new(&attempt.artifacts.case_dir)
+        .strip_prefix(&plan.artifact_root)
+        .context("calibration case is outside persisted suite root")?;
+    ensure!(
+        relative_case.components().count() == 2
+            && relative_case.file_name().and_then(|name| name.to_str())
+                == Some(attempt.case_name.as_str())
+            && relative_case
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "calibration case contains unsafe path components"
+    );
+    let case = fs::canonicalize(root.join(relative_case))?;
     ensure!(
         case.starts_with(&root),
         "calibration case escaped suite root"
@@ -128,9 +140,24 @@ fn load_control(root: &Path, mode: AckCalibrationMode) -> Result<Control> {
             == Some(mode),
         "calibration run spec lacks requested mode"
     );
+    ensure!(
+        spec.workload.mode == attempt.workload.mode
+            && spec.workload.object_count == attempt.workload.objects
+            && spec.workload.concurrency == attempt.workload.concurrency
+            && spec.workload.versioning == attempt.workload.versioning
+            && spec.workload.seed == attempt.workload.seed
+            && spec.workload.operation_mix == attempt.workload.operation_mix
+            && spec.workload.prefill_concurrency == attempt.workload.prefill_concurrency
+            && spec.workload.request_timeout_seconds == attempt.workload.request_timeout_seconds
+            && spec.cluster.rustfs_image == plan.cluster.rustfs_image,
+        "calibration workload or candidate image differs from suite plan"
+    );
     let options = ArtifactValidationOptions {
         scenario: attempt.scenario.clone(),
-        artifact_root: case.clone(),
+        artifact_root: case
+            .parent()
+            .context("calibration case lacks attempt root")?
+            .to_path_buf(),
         expected_workload_objects: spec.workload.object_count,
         expected_workload_concurrency: spec.workload.concurrency,
         expected_workload_versioning: spec.workload.versioning,
@@ -241,7 +268,8 @@ fn compare_controls(strict: Control, relaxed: Control) -> Result<AckCalibrationR
     );
     ensure!(
         strict.spec.cluster.context == relaxed.spec.cluster.context
-            && strict.spec.cluster.storage_class == relaxed.spec.cluster.storage_class,
+            && strict.spec.cluster.storage_class == relaxed.spec.cluster.storage_class
+            && strict.spec.cluster.rustfs_image == relaxed.spec.cluster.rustfs_image,
         "calibration controls use different cluster or storage classes"
     );
     let left = &strict.health.baseline;
@@ -299,7 +327,7 @@ fn compare_controls(strict: Control, relaxed: Control) -> Result<AckCalibrationR
             "ack-timing",
             "recovery-policy",
             "ec-geometry",
-            "cluster-and-storage-class",
+            "cluster-storage-class-and-pinned-image",
             "filesystem-and-mount-options",
         ],
         external_settings_not_attested: vec![
@@ -326,6 +354,7 @@ mod tests {
         let mut config = FaultTestConfig::for_test("lab", "dm-storage");
         config.scenario = "dm-drop-writes-after-ack-put".into();
         config.ack_calibration = Some(mode);
+        config.cluster.rustfs_image = format!("rustfs/rustfs@sha256:{}", "a".repeat(64));
         apply_catalog_defaults(&mut config).unwrap();
         let scenario = FaultScenario::from_config(&config).unwrap();
         let catalog = scenario_spec(&scenario.name).unwrap();
@@ -356,6 +385,7 @@ mod tests {
                     uid: "uid".into(),
                     image: "candidate".into(),
                     image_id: format!("containerd://sha256:{}", "a".repeat(64)),
+                    container_id: "containerd://process-1".into(),
                     process_mode: mode.as_str().into(),
                     new_bucket_mode: mode.as_str().into(),
                 }],
@@ -430,6 +460,7 @@ mod tests {
         let suite: FaultSuite = serde_yaml_ng::from_str(yaml).unwrap();
         let mut config = FaultTestConfig::for_test("lab", "dm-storage");
         config.cluster.artifacts_dir = base_dir.into();
+        config.cluster.rustfs_image = format!("rustfs/rustfs@sha256:{}", "a".repeat(64));
         let expansion = build_fault_suite_plan_expansion(
             suite.resolve().unwrap(),
             config,
@@ -455,6 +486,16 @@ mod tests {
         let mut fixture = control(mode);
         fixture.spec.metadata.run_id = attempt.run_id.clone().unwrap();
         fixture.spec.scenario.ack_trigger = attempt.ack_trigger.clone();
+        fixture.spec.workload.object_count = attempt.workload.objects;
+        fixture.spec.workload.concurrency = attempt.workload.concurrency;
+        fixture.spec.workload.seed = attempt.workload.seed;
+        fixture.spec.workload.plan = WorkloadPlan::seeded(
+            attempt.workload.seed,
+            attempt.workload.objects,
+            attempt.workload.concurrency,
+        );
+        fixture.spec.workload.prefill_concurrency = attempt.workload.prefill_concurrency;
+
         fs::write(
             case.join("run-spec.json"),
             serde_json::to_vec(&fixture.spec).unwrap(),

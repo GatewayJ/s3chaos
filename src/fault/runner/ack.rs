@@ -85,7 +85,14 @@ impl FaultRun<'_> {
             if let Some(pods) = calibration_pods {
                 ensure!(
                     pods.len() == target.pods_before.len()
-                        && pods.iter().all(|pod| target.pods_before.contains(pod)),
+                        && pods
+                            .iter()
+                            .all(|pod| target.target_proof.resolved_pods.iter().any(
+                                |proven| proven.name == pod.name
+                                    && proven.uid == pod.uid
+                                    && proven.rustfs_container_id.as_deref()
+                                        == Some(pod.container_id.as_str())
+                            )),
                     "calibration Pod identities changed before target proof"
                 );
             }
@@ -140,7 +147,7 @@ impl FaultRun<'_> {
     async fn observe_ack_calibration(
         &self,
         endpoint: &str,
-    ) -> Result<Vec<crate::fault::reporting::PodIdentity>> {
+    ) -> Result<Vec<crate::fault::acknowledged_mutation::AckCalibrationPod>> {
         use crate::fault::acknowledged_mutation::{
             ACK_CALIBRATION_ARTIFACT, AckBucketMode, AckCalibrationEvidence, calibration_pod,
         };
@@ -148,6 +155,9 @@ impl FaultRun<'_> {
             .config
             .ack_calibration
             .context("calibration mode missing")?;
+        crate::fault::acknowledged_mutation::require_calibration_image(
+            &self.config.cluster.rustfs_image,
+        )?;
         let kubectl = crate::framework::kubectl::Kubectl::new(&self.config.cluster)
             .namespaced(&self.config.cluster.test_namespace);
         let selector = format!("rustfs.tenant={}", self.config.cluster.tenant_name);
@@ -211,14 +221,7 @@ impl FaultRun<'_> {
             ACK_CALIBRATION_ARTIFACT,
             &serde_json::to_string_pretty(&evidence)?,
         )?;
-        Ok(evidence
-            .pods
-            .into_iter()
-            .map(|pod| crate::fault::reporting::PodIdentity {
-                name: pod.name,
-                uid: pod.uid,
-            })
-            .collect())
+        Ok(evidence.pods)
     }
 
     async fn prepare_quiet_mutation(

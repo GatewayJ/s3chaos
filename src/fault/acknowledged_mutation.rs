@@ -90,6 +90,19 @@ impl AckCalibrationMode {
     }
 }
 
+pub(crate) fn require_calibration_image(image: &str) -> Result<()> {
+    anyhow::ensure!(
+        image
+            .rsplit_once("@sha256:")
+            .is_some_and(|(name, digest)| !name.is_empty()
+                && !name.chars().any(char::is_whitespace)
+                && digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
+        "ACK calibration requires a RustFS image pinned as name@sha256:<64 hex digits>"
+    );
+    Ok(())
+}
+
 pub(crate) const ACK_CALIBRATION_ARTIFACT: &str = "ack-calibration-mode.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +112,7 @@ pub(crate) struct AckCalibrationPod {
     pub uid: String,
     pub image: String,
     pub image_id: String,
+    pub container_id: String,
     pub process_mode: String,
     pub new_bucket_mode: String,
 }
@@ -192,6 +206,11 @@ pub(crate) fn calibration_pod(
             .to_string(),
         image: image.to_string(),
         image_id: image_id.to_string(),
+        container_id: status["containerID"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .context("calibration Pod lacks containerID")?
+            .to_string(),
         process_mode: observed_mode("RUSTFS_DURABILITY_MODE")?,
         new_bucket_mode: observed_mode("RUSTFS_NEW_BUCKET_DURABILITY_MODE")?,
     })
@@ -699,6 +718,22 @@ mod tests {
     };
 
     #[test]
+    fn calibration_image_requires_an_immutable_digest_reference() {
+        assert!(
+            super::require_calibration_image(&format!("rustfs/rustfs@sha256:{}", "a".repeat(64)))
+                .is_ok()
+        );
+        for image in [
+            "rustfs/rustfs:latest",
+            "rustfs/rustfs@sha256:abc",
+            "@sha256:",
+            "rustfs/rustfs@sha512:abc",
+        ] {
+            assert!(super::require_calibration_image(image).is_err());
+        }
+    }
+
+    #[test]
     fn calibration_sets_both_modes_and_rejects_conflicting_or_duplicate_policy() {
         use super::AckCalibrationMode;
         for mode in [AckCalibrationMode::Strict, AckCalibrationMode::Relaxed] {
@@ -725,6 +760,7 @@ mod tests {
                 {"name": "RUSTFS_NEW_BUCKET_DURABILITY_MODE", "value": "strict"}
             ]}]},
             "status": {"containerStatuses": [{"name": "rustfs", "ready": true,
+                "containerID": "containerd://process-1",
                 "imageID": format!("containerd://sha256:{}", "a".repeat(64))}]}
         });
         assert!(calibration_pod(&pod, AckCalibrationMode::Strict, "candidate").is_ok());

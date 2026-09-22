@@ -767,6 +767,9 @@ fn scenario_config(
     config.qualify_planned_admin = false;
     config.ack_calibration = scenario.ack_calibration;
     if let Some(mode) = config.ack_calibration {
+        crate::fault::acknowledged_mutation::require_calibration_image(
+            &config.cluster.rustfs_image,
+        )?;
         mode.configure(&mut config.cluster.rustfs_env)?;
     }
     config.scenario = scenario.name.clone();

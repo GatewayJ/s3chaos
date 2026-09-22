@@ -9,7 +9,8 @@ variants have separate live evidence.
 
 Prepare an explicitly authorized dedicated DM lab using [DM_FLAKEY.md](DM_FLAKEY.md).
 Pin the context, namespace, Tenant, static PVs, node/device allowlist and candidate
-image. Keep the same image digest, EC geometry, filesystem, mount options and
+image as `name@sha256:<digest>`; mutable tags are rejected for calibration.
+Keep the same pinned image and observed runtime digest, EC geometry, filesystem, mount options and
 host writeback/journal settings for both controls. Record the RustFS, Operator,
 and S3Chaos commits and image digests with the lab report. Never run the pair in
 a loop: static volumes require supervised inspection and a fresh fixture between
