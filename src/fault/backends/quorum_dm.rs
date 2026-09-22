@@ -660,10 +660,7 @@ pub(crate) struct PreparedGroup {
 }
 
 impl PreparedGroup {
-    pub(crate) fn activate(
-        mut self,
-        target_proof: &TargetProof,
-    ) -> Result<(AppliedFault, Option<String>)> {
+    pub(crate) fn activate(mut self, target_proof: &TargetProof) -> Result<AppliedFault> {
         ensure!(
             self.group.run_id == target_proof.run_id,
             "foreign activation proof"
@@ -679,7 +676,7 @@ impl PreparedGroup {
             member.topology_observed_at_ms = observed_at_ms;
         }
         activate_all(&mut self.group.members, self.group.timeout)?;
-        Ok((Box::new(self.group), None))
+        Ok(Box::new(self.group))
     }
 }
 
@@ -848,6 +845,213 @@ mod tests {
             Ok(())
         }
     }
+    fn evidence_fixture() -> (TargetProof, QuorumDmStatusSnapshot) {
+        use crate::fault::host_storage::{DmVolumeMapping, helper_pod_name};
+        use crate::fault::quorum::{
+            ErasureSetMember, ErasureSetMembership, ErasureSetShape, QuorumVolumeBinding,
+            QuorumVolumeBoundary,
+        };
+        use serde_json::json;
+        let host: Vec<_> = (0..4)
+            .map(|index| {
+                crate::fault::host_storage::tests::quorum_eio_fixture(
+                    index,
+                    &child_run_id("parent", index),
+                )
+            })
+            .collect();
+        let shape = ErasureSetShape {
+            pool_index: 0,
+            set_index: 0,
+            server_count: 4,
+            volumes_per_server: 1,
+            total_shards: 4,
+            payload_data_shards: 2,
+            payload_parity_shards: 2,
+        };
+        let membership = ErasureSetMembership::from_runtime(
+            &shape,
+            host.iter()
+                .enumerate()
+                .map(|(i, p)| ErasureSetMember {
+                    pod_name: p.target.pod.clone(),
+                    server_endpoint: format!("http://rustfs-{i}:9000"),
+                    shard_ids: vec![format!("drive-{i}")],
+                })
+                .collect(),
+        )
+        .unwrap();
+        let candidates = host
+            .iter()
+            .enumerate()
+            .map(|(i, p)| QuorumVolumeBinding {
+                pod_name: p.target.pod.clone(),
+                pod_uid: p.target.pod_uid.clone(),
+                container_id: format!("container-{i}"),
+                mount_path: p.target.container_mount_path.clone(),
+                persistent_volume_claim: p.target.persistent_volume_claim.clone(),
+                persistent_volume: p.target.persistent_volume.clone(),
+                drive_uuid: format!("drive-{i}"),
+                pool_index: 0,
+                set_index: 0,
+            })
+            .collect();
+        let volumes = QuorumVolumeTargetProof::from_runtime(
+            &shape,
+            &membership,
+            QuorumVolumeBoundary {
+                class: QuorumCaseClass::Payload,
+                beyond_read_tolerance: false,
+            },
+            candidates,
+        )
+        .unwrap();
+        let target: TargetProof = serde_json::from_value(json!({
+            "schemaVersion":2,"status":"satisfied","proofLevel":"configured_host_target","generatedAtMs":200,
+            "scenario":"quorum-p-dm-eio","caseName":"case","runId":"parent","namespace":"rustfs-fault-test","tenant":"fault-test-tenant","requirements":[],
+            "resolvedPods":host.iter().map(|p| json!({"name":p.target.pod,"uid":p.target.pod_uid,"ready":true,"node":p.target.node})).collect::<Vec<_>>(),
+            "faults":[{"name":"quorum-dm-eio","kind":"rustfs_volume_io_error","backend":"device-mapper","targetKind":"volume","targetSummary":"two","selection":"two","conflictDomain":"volume",
+                "erasureSet":{"required":true,"resolved":true,"shape":shape,"membership":membership,"volumeQuorum":volumes,"observedAtMs":200,"note":"runtime"}}]
+        })).unwrap();
+        let targets = host
+            .into_iter()
+            .take(2)
+            .map(|proof| {
+                let p = &proof.target;
+                let status = DmStatusSnapshot {
+                    stage: "active".into(),
+                    mapper_name: p.mapper_name.clone(),
+                    canonical_device: p.canonical_device.clone(),
+                    suspended: false,
+                    observed_at_ms: 400,
+                    helper_pod: helper_pod_name(&proof.run_id),
+                    table: proof.tables.fault_table.clone(),
+                    status: "0 1024 flakey".into(),
+                    mapping: DmVolumeMapping {
+                        node: p.node.clone(),
+                        node_uid: p.node_uid.clone(),
+                        node_labels: p.node_labels.clone(),
+                        pod: p.pod.clone(),
+                        pod_uid: p.pod_uid.clone(),
+                        volume_name: p.volume_name.clone(),
+                        pvc: p.persistent_volume_claim.clone(),
+                        pvc_uid: p.persistent_volume_claim_uid.clone(),
+                        pvc_phase: p.persistent_volume_claim_phase.clone(),
+                        pv: p.persistent_volume.clone(),
+                        pv_uid: p.persistent_volume_uid.clone(),
+                        pv_phase: p.persistent_volume_phase.clone(),
+                        pv_claim_ref: p.persistent_volume_claim_ref.clone(),
+                        node_selector: p.node_selector.clone(),
+                        container_mount_path: p.container_mount_path.clone(),
+                        mount_path: p.persistent_volume_path.clone(),
+                    },
+                };
+                let baseline = DirectReadReceipt {
+                    device: p.canonical_device.clone(),
+                    run_id: proof.run_id.clone(),
+                    context: proof.context.clone(),
+                    namespace: proof.observer_namespace.clone(),
+                    pod: proof.observer_pod.clone(),
+                    node: p.node.clone(),
+                    started_at_ms: 50,
+                    completed_at_ms: 60,
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: "4096 bytes copied".into(),
+                    transport_error: None,
+                };
+                let probes = (0..3)
+                    .map(|i| {
+                        let mut before = status.clone();
+                        before.observed_at_ms = 500 + i * 1100;
+                        let mut after = before.clone();
+                        after.observed_at_ms += 20;
+                        let mut read = baseline.clone();
+                        read.namespace = proof.namespace.clone();
+                        read.pod = status.helper_pod.clone();
+                        read.started_at_ms = before.observed_at_ms + 1;
+                        read.completed_at_ms = before.observed_at_ms + 10;
+                        read.exit_code = Some(1);
+                        read.stderr = format!(
+                            "dd: error reading '{}': Input/output error\n0 bytes copied",
+                            p.canonical_device
+                        );
+                        DirectReadSample {
+                            before,
+                            read,
+                            after,
+                        }
+                    })
+                    .collect();
+                QuorumDmTargetEvidence {
+                    proof,
+                    baseline,
+                    activation_started_at_ms: 300,
+                    activated_at_ms: 350,
+                    status,
+                    probes,
+                    post_cleanup: None,
+                }
+            })
+            .collect();
+        (
+            target,
+            QuorumDmStatusSnapshot {
+                schema_version: 1,
+                run_id: "parent".into(),
+                stage: "active".into(),
+                targets,
+            },
+        )
+    }
+
+    #[test]
+    fn native_dm_evidence_chain_accepts_active_and_recovered_and_rejects_splices() {
+        use crate::fault::host_storage::HostStoragePostCleanupObservation;
+        let (target, active) = evidence_fixture();
+        validate_evidence(&active, &target, "parent").unwrap();
+        require_qualified(&active).unwrap();
+        let mut short = active.clone();
+        short.targets[1].probes.pop();
+        assert!(validate_evidence(&short, &target, "parent").is_err());
+        let mut spliced = active.clone();
+        spliced.targets[1].probes[0].read = active.targets[0].probes[0].read.clone();
+        assert!(validate_evidence(&spliced, &target, "parent").is_err());
+        let mut recovered = active.clone();
+        recovered.stage = "recovered".into();
+        for evidence in &mut recovered.targets {
+            let proof = &evidence.proof;
+            let p = &proof.target;
+            evidence.probes.clear();
+            evidence.status.stage = "recovered".into();
+            evidence.status.observed_at_ms = 5000;
+            evidence.status.table = proof.tables.recovery_table.clone();
+            evidence.post_cleanup = Some(HostStoragePostCleanupObservation {
+                schema_version: 1,
+                scenario: proof.scenario.clone(),
+                fault_name: proof.fault_name.clone(),
+                run_id: proof.run_id.clone(),
+                observed_at_ms: 5100,
+                node: p.node.clone(),
+                persistent_volume: p.persistent_volume.clone(),
+                mapper_name: p.mapper_name.clone(),
+                logical_device: p.logical_device.clone(),
+                canonical_device: p.canonical_device.clone(),
+                mount_canonical_source: p.mount_canonical_source.clone(),
+                filesystem_mounted: true,
+                node_quarantined: false,
+                recovery_table_sha256: p.recovery_table_sha256.clone(),
+            });
+        }
+        validate_evidence(&recovered, &target, "parent").unwrap();
+        recovered.targets[1]
+            .post_cleanup
+            .as_mut()
+            .unwrap()
+            .persistent_volume = "foreign".into();
+        assert!(validate_evidence(&recovered, &target, "parent").is_err());
+    }
+
     #[test]
     fn failed_second_activation_rolls_back_both_in_reverse_even_if_restore_fails() {
         let events = Arc::new(Mutex::new(Vec::new()));

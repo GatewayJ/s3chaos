@@ -124,9 +124,8 @@ impl FaultRun<'_> {
                 host_storage_proof.as_ref(),
                 execution_injection,
             )
-            .map(|fault| (fault, None))
         };
-        let (fault, initial_failure) = match applied {
+        let fault = match applied {
             Ok(fault) => fault,
             Err(error) => {
                 self.record_failure(
@@ -146,13 +145,8 @@ impl FaultRun<'_> {
             None,
         )?;
 
-        let mut active = self
-            .complete_fault_activation(target, fault, None, fault_apply_started_at_ms, None)
-            .await?;
-        if let Some(failure) = initial_failure {
-            active.deferred_failure.get_or_insert(failure);
-        }
-        Ok(active)
+        self.complete_fault_activation(target, fault, None, fault_apply_started_at_ms, None)
+            .await
     }
 
     pub(super) async fn complete_fault_activation(

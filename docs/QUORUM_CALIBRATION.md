@@ -81,20 +81,34 @@ Set `RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS` to an absolute JSON file:
 
 ```json
 {"targets":[
-  {"node":"worker-a","mapperName":"rustfs-a","mountPath":"/data/dm-a","persistentVolume":"pv-a","observerNamespace":"storage-observers","observerPod":"observer-a","stateFile":"/absolute/run/.host-mutation-a.json","stateToken":"qdm-a"},
-  {"node":"worker-b","mapperName":"rustfs-b","mountPath":"/data/dm-b","persistentVolume":"pv-b","observerNamespace":"storage-observers","observerPod":"observer-b","stateFile":"/absolute/run/.host-mutation-b.json","stateToken":"qdm-b"}
+  {"node":"worker-a","mapperName":"rustfs-a","mountPath":"/data/dm-a","persistentVolume":"pv-a","observerNamespace":"storage-observers","observerPod":"observer-a","stateFile":"/absolute/run/.host-mutation-qdm-a.json","stateToken":"qdm-a"},
+  {"node":"worker-b","mapperName":"rustfs-b","mountPath":"/data/dm-b","persistentVolume":"pv-b","observerNamespace":"storage-observers","observerPod":"observer-b","stateFile":"/absolute/run/.host-mutation-qdm-b.json","stateToken":"qdm-b"}
 ]}
 ```
 
-These are placeholders, not cluster defaults. Each state file must be inside the
-configured artifact root, absent before the run, and have a unique token. Set
-`RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST`, `RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST`
-and `RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST` to the exact comma-separated two-member
-sets; device entries use `/dev/mapper/<mapperName>`. Explicitly enable
-`RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE=1`. All existing context, namespace
-ownership, static storage and image prerequisites apply. Run it individually with
-`make -j2 fault-dm-run SCENARIO=quorum-p-dm-eio`; device-mapper execution remains
-excluded from the ordinary multi-attempt suite runner.
+These are placeholders, not cluster defaults. Pre-create an absolute run root
+and use an absolute target-file path. Each absent state file must be directly
+under that root (or its scenario artifact directory) and named
+`.host-mutation-<stateToken>.json`, with a unique token. After replacing the JSON
+identities with approved cluster targets, the corresponding environment is:
+
+```bash
+export RUSTFS_FAULT_TEST_RUN_ROOT=/absolute/run
+mkdir -p "$RUSTFS_FAULT_TEST_RUN_ROOT"
+export RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS=/absolute/quorum-dm-targets.json
+export RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST=worker-a,worker-b
+export RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST=/dev/mapper/rustfs-a,/dev/mapper/rustfs-b
+export RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST=pv-a,pv-b
+export RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE=1
+make -j2 fault-dm-run SCENARIO=quorum-p-dm-eio
+```
+
+The three allowlists must exactly match the two JSON members. All existing
+context, namespace ownership, static storage and image prerequisites apply.
+Device-mapper execution remains excluded from the ordinary multi-attempt suite
+runner. The wrapper persists its validated target JSON into this run before
+launching the fault process; cancellation checks the exact two recorded state
+file/token pairs before considering a hard kill.
 
 Before activation, both original healthy linear tables, mounted PV/device
 identities, uncached successful reads and ownership proofs are persisted. Runtime
