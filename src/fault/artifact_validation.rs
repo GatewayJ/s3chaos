@@ -7319,6 +7319,76 @@ fn validate_ack_triggered_dm_artifacts(
         require_boundary,
         require_recovered,
     } = context;
+    if let Some(mode) = run_spec
+        .scenario
+        .ack_trigger
+        .as_ref()
+        .and_then(|trigger| trigger.calibration_mode)
+    {
+        use crate::fault::acknowledged_mutation::{
+            ACK_CALIBRATION_ARTIFACT, AckCalibrationEvidence,
+        };
+        let calibration: AckCalibrationEvidence =
+            read_json(&locate_artifact(root, case_name, ACK_CALIBRATION_ARTIFACT)?)?;
+        ensure!(
+            calibration.scenario == scenario
+                && calibration.run_id == run_id
+                && calibration.mode == mode,
+            "ACK calibration identity differs from run spec"
+        );
+        ensure!(
+            calibration.bucket_response.bucket == bucket
+                && calibration.bucket_response.mode.as_deref() == Some(mode.as_str()),
+            "ACK calibration bucket override differs from requested mode"
+        );
+        let target: TargetProof =
+            read_json(&locate_artifact(root, case_name, "target-proof.json")?)?;
+        ensure!(
+            target.run_id == run_id && target.scenario == scenario,
+            "ACK calibration target identity differs from run"
+        );
+        ensure!(
+            !calibration.pods.is_empty() && calibration.pods.len() == target.resolved_pods.len(),
+            "ACK calibration must cover every proven Pod"
+        );
+        let identities = calibration
+            .pods
+            .iter()
+            .map(|pod| (&pod.name, &pod.uid))
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            identities.len() == calibration.pods.len()
+                && target
+                    .resolved_pods
+                    .iter()
+                    .all(|pod| identities.contains(&(&pod.name, &pod.uid))),
+            "ACK calibration Pod identities differ from target proof"
+        );
+        ensure!(
+            calibration
+                .pods
+                .iter()
+                .all(|pod| pod.image == run_spec.cluster.rustfs_image
+                    && pod.image_id == calibration.pods[0].image_id
+                    && pod
+                        .image_id
+                        .rsplit_once("sha256:")
+                        .is_some_and(|(_, digest)| digest.len() == 64
+                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                    && pod.process_mode == mode.as_str()
+                    && pod.new_bucket_mode == mode.as_str()),
+            "ACK calibration Pod mode or image identity differs from run spec"
+        );
+        ensure!(
+            calibration.observed_at_ms > 0
+                && events
+                    .iter()
+                    .find(|event| event.stage == "fault-prepare"
+                        && event.status == RunEventStatus::Started)
+                    .is_some_and(|event| calibration.observed_at_ms <= event.at_ms),
+            "ACK calibration mode was not observed before fault preparation"
+        );
+    }
     validate_history_scope_and_order(history, scenario, run_id, bucket)?;
     let preparation_started = events
         .iter()
@@ -14673,6 +14743,7 @@ mod tests {
 
         let mut ack_spec = run_spec.clone();
         ack_spec.scenario.ack_trigger = Some(crate::fault::spec::FaultRunAckTriggerSpec {
+            calibration_mode: None,
             mutation: crate::fault::acknowledged_mutation::AcknowledgedMutationKind::Put,
             operation_timeout_ms: 30_000,
             max_ack_to_fault_ms: 1_000,
@@ -16946,6 +17017,7 @@ mod tests {
         };
 
         let planned = FaultRunAckTriggerSpec {
+            calibration_mode: None,
             mutation: AcknowledgedMutationKind::Put,
             operation_timeout_ms: 30_000,
             max_ack_to_fault_ms: 5,

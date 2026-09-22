@@ -1,0 +1,109 @@
+# Durability live qualification
+
+A calibration result belongs to one detector, candidate image digest, workload,
+and storage layout. Catalog `gate-candidate` is not evidence of calibration.
+Fresh-volume replacement and bitrot remain Planned until their supported
+variants have separate live evidence.
+
+## ACK positive and negative controls
+
+Prepare an explicitly authorized dedicated DM lab using [DM_FLAKEY.md](DM_FLAKEY.md).
+Pin the context, namespace, Tenant, static PVs, node/device allowlist and candidate
+image. Keep the same image digest, EC geometry, filesystem, mount options and
+host writeback/journal settings for both controls. Record the RustFS, Operator,
+and S3Chaos commits and image digests with the lab report. Never run the pair in
+a loop: static volumes require supervised inspection and a fresh fixture between
+attempts.
+
+Use the same explicit seed for both controls:
+
+```bash
+export RUSTFS_FAULT_TEST_SEED=424242
+make fault-suite-validate SUITE=fault/examples/ack-put-strict.yaml
+make fault-suite-validate SUITE=fault/examples/ack-put-relaxed.yaml
+make fault-suite-run SUITE=fault/examples/ack-put-strict.yaml
+```
+
+`ackCalibration: strict` sets both `RUSTFS_DURABILITY_MODE=strict` and
+`RUSTFS_NEW_BUCKET_DURABILITY_MODE=strict`. The latter matters: newer RustFS
+builds seed newly created buckets with their own relaxed override by default.
+Conflicting or duplicate ambient entries in `RUSTFS_FAULT_TEST_SERVER_ENV` are
+rejected. The run records the actual Pod modes and resolved image identities,
+and requires the signed bucket-durability GET to return an explicit matching
+override before preparing the fault. An unsupported endpoint, inherited/null
+mode, wrong bucket, changed Pod UID or mixed image digest stops calibration.
+Only these two non-secret environment values are retained.
+
+Inspect and validate the exact emitted artifacts before cleanup. Confirm the
+recorded context, namespace and Tenant, pin
+`RUSTFS_FAULT_TEST_EXPECTED_CONTEXT`, and follow the DM recovery/cleanup runbook.
+After preparing a fresh approved fixture with matching lab settings, run:
+
+```bash
+make fault-suite-run SUITE=fault/examples/ack-put-relaxed.yaml
+```
+
+The relaxed control must produce the declared product failure tied to the
+acknowledged key/version. A timeout, backend failure, unrelated missing key,
+invalid artifact, or successful relaxed checker is not a detector hit. A single
+failed drive can be masked by EC redundancy; if both modes pass, this detector
+is unqualified for the tested layout. Do not weaken the oracle or report that
+pair as calibrated. Investigate the crash window and failure scope separately.
+
+After both supervised runs, compare their exact emitted suite roots:
+
+```bash
+cargo run --quiet --bin s3chaos -- fault-ack-calibration-analyze \
+  '<strict-suite-root>' '<relaxed-suite-root>'
+```
+
+The analyzer revalidates native artifacts rather than trusting prior validation
+reports or suite status. It requires strict PASS and relaxed observed ACK state
+loss, independent run identities, the same candidate digest, detector, payload
+and seed, ACK timing, recovery policy, EC geometry, cluster/storage class, and
+pre-crash filesystem/mount options. Host kernel writeback settings and image
+provenance must additionally be preserved in the operator's lab report; the
+analyzer does not attest those external settings. Its output is evidence for
+this pair, not automatic catalog promotion or proof of physical power loss.
+
+Repeat with individually reviewed single-attempt suites for overwrite,
+delete-marker, zero-byte PUT and multipart completion. Choose the exact expected
+loss classification before running the negative control. Do not change the
+expectation after seeing an unrelated failure. No result for PUT qualifies the
+other mutation types.
+
+## Fresh-volume and bitrot variants
+
+Use the existing supervised qualification entrypoint and its exact target JSON,
+helper image, dedicated Local-PV configuration and identity checks. See
+`make fault-qualify-list` and the matching manifests under `fault/planned/`.
+Preflight requires an explicit context, namespace and Tenant; it must succeed
+before any host mutation. Run only one of these commands per fresh prepared
+fixture, preserving and analyzing its evidence before the next:
+
+```bash
+make fault-qualify QUALIFICATION_CASE=fresh-volume-replacement-automatic-replacement
+make fault-qualify QUALIFICATION_CASE=fresh-volume-replacement-admin-deep
+make fault-qualify QUALIFICATION_CASE=on-disk-bitrot-automatic-scanner
+make fault-qualify QUALIFICATION_CASE=on-disk-bitrot-admin-deep
+```
+
+These are four separate supervised runs, not a batch script. After each run:
+
+```bash
+make fault-qualify-analyze RUN_ROOT='<exact emitted qualification run root>'
+```
+
+Retain the plan/result, pinned images/topology, full native artifact validation,
+old/new drive generation and emptiness evidence, matching heal operation and
+terminal state, exact-version mapping, and force-read isolation/restore proof.
+Bitrot also needs the actual mutation receipt and matching checksum detection
+within the corruption window. Missing detection, background-repair races,
+unsupported diagnostics and incomplete restore are unqualified or failed, never
+PASS. Stop on an unexpected failure and preserve live evidence before cleanup.
+
+The earlier external replacement versioned-marker PASS recorded in backlog
+#2347 does not qualify its unversioned branch or both current K8s variants. Each
+current variant requires its own complete run on the selected image. Promote a
+Planned scenario only after all advertised variants have valid live receipts,
+static gates and independent review; retain unresolved product defects.
