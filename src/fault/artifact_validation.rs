@@ -18159,7 +18159,7 @@ mod tests {
         preflight["phases"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"name":"host-storage-mutation-proof","status":"passed","checks":[]}));
+            .push(json!({"name":"host-storage-mutation-proof","status":"passed","checks":[{"name":"host_storage_proof","status":"passed","message":"dedicated target proven","responsibilityDomain":"harness"}]}));
         write_json(&case_dir, "preflight-summary.json", &preflight);
         let host_proof = HostStorageMutationProof::prove_device_mapper(
             HostStorageMutationIntent {
@@ -18361,6 +18361,15 @@ mod tests {
         }
         if relaxed {
             fixture.fail_data_version("trigger-version", true);
+            fixture.report.delete_marker_lineage_incomplete = vec![format!(
+                "{}: ListObjectVersions has no unique latest entry",
+                fixture.ack.trigger_key
+            )];
+            fixture.report.list_warnings = vec![format!(
+                "LIST prefix fault-test/{run_id}/ did not include expected live key {}",
+                fixture.ack.trigger_key
+            )];
+            fixture.report.final_list_warning_count = 1;
         }
         fixture.refresh_audit();
         fixture.report.operation_cohorts.clear();
@@ -18421,7 +18430,11 @@ mod tests {
             (201, "checker-pre-recommit", "started"),
             (220, "checker-pre-recommit", "succeeded"),
             (230, "checker-final", "started"),
-            (250, "checker-final", "succeeded"),
+            (
+                250,
+                "checker-final",
+                if relaxed { "failed" } else { "succeeded" },
+            ),
         ] {
             let mut event = json!({"at_ms":at,"scenario":scenario.name,"run_id":run_id,"stage":stage,"status":status,"message":"fixture"});
             if stage == "recovery-health-baseline" {
@@ -18464,6 +18477,8 @@ mod tests {
                 .with_case_name(scenario.case_name),
             )
             .unwrap();
+            failure["final_list_warning_count"] = json!(fixture.report.final_list_warning_count);
+            failure["list_warnings"] = json!(fixture.report.list_warnings);
             failure["observed_at_ms"] = json!(251);
             failure["primary_evidence_refs"] = json!(
                 [
