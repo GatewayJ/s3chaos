@@ -29,16 +29,21 @@ use crate::fault::{
 
 pub const IO_EIO_SCENARIO: &str = "io-eio";
 pub const POD_KILL_ONE_SCENARIO: &str = "pod-kill-one";
+pub const POD_RESTART_STORM_SCENARIO: &str = "pod-restart-storm";
 pub const NETWORK_PARTITION_ONE_SCENARIO: &str = "network-partition-one";
 pub const NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO: &str =
     "network-partition-write-quorum-loss";
 pub const NETWORK_DELAY_SCENARIO: &str = "network-delay";
 pub const NETWORK_LOSS_SCENARIO: &str = "network-loss";
+pub const NETWORK_FLAKY_SCENARIO: &str = "network-flaky";
+pub const NETWORK_ASYMMETRIC_PARTITION_SCENARIO: &str = "network-asymmetric-partition";
 pub const NETWORK_CORRUPT_SCENARIO: &str = "network-corrupt";
 pub const NETWORK_DUPLICATE_SCENARIO: &str = "network-duplicate";
 pub const IO_READ_MISTAKE_SCENARIO: &str = "io-read-mistake";
 pub const IO_LATENCY_SCENARIO: &str = "io-latency";
 pub const DISK_FULL_SCENARIO: &str = "disk-full";
+pub const IO_READ_ONLY_SCENARIO: &str = "io-read-only";
+pub const IO_EIO_DURING_MULTIPART_SCENARIO: &str = "io-eio-during-multipart";
 pub const POD_FAILURE_SCENARIO: &str = "pod-failure";
 pub const POD_FAILURE_QUORUM_EDGE_SCENARIO: &str = "pod-failure-quorum-edge";
 pub const STRESS_CPU_SCENARIO: &str = "stress-cpu";
@@ -67,6 +72,12 @@ pub const STALE_DISK_RETURN_DETECT_SCENARIO: &str = "stale-disk-return-detect";
 pub const POD_GRACEFUL_RESTART_ONE_SCENARIO: &str = "pod-graceful-restart-one";
 pub const ROLLING_RESTART_ALL_SCENARIO: &str = "rolling-restart-all";
 pub const CLUSTER_COLD_RESTART_SCENARIO: &str = "cluster-cold-restart";
+pub const IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO: &str = "io-eio-same-pod-two-volumes";
+pub const NETWORK_PARTITION_DURING_HEAL_SCENARIO: &str = "network-partition-during-heal";
+pub const CLOCK_SKEW_SCENARIO: &str = "clock-skew";
+pub const CREDENTIAL_ROTATION_MID_LOAD_SCENARIO: &str = "credential-rotation-mid-load";
+pub const NETWORK_SPLIT_BRAIN_SCENARIO: &str = "network-split-brain";
+pub const METADATA_SHARD_CORRUPTION_SCENARIO: &str = "metadata-shard-corruption";
 
 const IOCHAOS_CRD: &str = "iochaos.chaos-mesh.org";
 const PODCHAOS_CRD: &str = "podchaos.chaos-mesh.org";
@@ -95,6 +106,7 @@ pub enum FaultScenarioWorkloadProfile {
     Default,
     VersionedHotMutations,
     AckTriggeredQuietMutation,
+    MultipartDuringFault,
 }
 
 impl FaultScenarioWorkloadProfile {
@@ -103,6 +115,7 @@ impl FaultScenarioWorkloadProfile {
             Self::Default => "default",
             Self::VersionedHotMutations => "versioned-hot-mutations",
             Self::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
+            Self::MultipartDuringFault => "multipart-during-fault",
         }
     }
 
@@ -136,6 +149,19 @@ impl FaultScenarioWorkloadProfile {
             }
             Self::AckTriggeredQuietMutation => {
                 config.workload_versioning = true;
+            }
+            Self::MultipartDuringFault => {
+                // Every weight stays in 1..=100. Multipart is 10/15 of the
+                // mixed phase so the fault window overlaps multipart PUTs
+                // without dropping the other families the checker requires.
+                config.workload_operation_mix = WorkloadOperationMix {
+                    put: 1,
+                    overwrite: 1,
+                    get: 1,
+                    list: 1,
+                    delete: 1,
+                    multipart: 10,
+                };
             }
         }
     }
@@ -240,6 +266,9 @@ pub enum FaultParameterSchema {
     NetworkLoss,
     NetworkCorrupt,
     NetworkDuplicate,
+    /// Bursty correlated loss. Correlation is pinned high so a suite cannot
+    /// collapse this scenario into steady `network-loss`.
+    NetworkFlaky,
     StressCpu,
     StressMemory,
 }
@@ -443,12 +472,48 @@ impl FaultScenarioSpec {
         matches!(
             self.scenario,
             IO_EIO_SCENARIO
+                | IO_EIO_DURING_MULTIPART_SCENARIO
                 | NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
                 | POD_FAILURE_QUORUM_EDGE_SCENARIO
                 | QUORUM_P_IO_FAULT_SCENARIO
                 | QUORUM_P_DM_EIO_SCENARIO
                 | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
         )
+    }
+}
+
+/// Single-volume EIO scenarios whose live proof must show the fault stays
+/// inside read and write quorum. `percent` on these scenarios is the IOChaos
+/// sampling rate, not a count of volumes.
+pub fn proves_single_volume_eio_tolerance(scenario: &str) -> bool {
+    matches!(scenario, IO_EIO_SCENARIO | IO_EIO_DURING_MULTIPART_SCENARIO)
+}
+
+/// Fail closed unless two data mounts on one Pod are known to share an
+/// erasure set. The current drive-to-volume binder only accepts
+/// `volumesPerServer == 1`, so `shared_erasure_set: None` is the closed
+/// result until that binder can name both mounts.
+pub fn assess_same_pod_two_volume_geometry(
+    volumes_per_server: u32,
+    distinct_data_mounts_on_pod: usize,
+    shared_erasure_set: Option<bool>,
+) -> Result<()> {
+    ensure!(
+        volumes_per_server >= 2,
+        "same-pod two-volume fault fail-closed: tenant volumesPerServer is {volumes_per_server}; two volumes on one Pod are impossible"
+    );
+    ensure!(
+        distinct_data_mounts_on_pod >= 2,
+        "same-pod two-volume fault fail-closed: selected Pod exposes {distinct_data_mounts_on_pod} data mounts"
+    );
+    match shared_erasure_set {
+        Some(true) => Ok(()),
+        Some(false) => bail!(
+            "same-pod two-volume fault fail-closed: the two volumes are not in one erasure set"
+        ),
+        None => bail!(
+            "same-pod two-volume fault fail-closed: drive-to-volume binding cannot prove the two mounts share an erasure set"
+        ),
     }
 }
 
@@ -519,6 +584,32 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         conflict_domain: "fresh Tenant/PVC/PV fixture and run-scoped IOChaos cleanup",
     },
     FaultScenarioSpec {
+        scenario: IO_EIO_DURING_MULTIPART_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
+        case_name: "fault_io_eio_during_multipart_preserves_committed_objects",
+        description: "Inject Chaos Mesh IOChaos EIO into one RustFS data volume while the mixed phase is multipart-majority, and verify a faulted part upload cannot become a successful short object.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::ChaosMeshIoChaos,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::MultipartDuringFault,
+        isolation: FaultIsolation::FreshTenant,
+        crds: &[IOCHAOS_CRD],
+        required_tools: &[],
+        percent_supported: true,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
+        boundary: "rustfs-workload/multipart-during-io-fault",
+        ci_phase: "faults",
+        target: "one RustFS container data volume selected by tenant label and configured RustFS volume path, exercised by multipart PUT/complete traffic",
+        target_proof: DEFAULT_TARGET_PROOF,
+        validation: "prefill succeeds before injection, every committed object remains readable while IOChaos is active, the mixed workload meets the availability floor, multipart completions that succeed still GET+sha256 verify, and a failed part upload is not readable as a complete object",
+        observability: "history.jsonl, workload-summary.json, checker-report.json, chaos-manifest.yaml, chaos-describe*.txt, Kubernetes snapshot artifacts",
+        conflict_domain: "fresh Tenant/PVC/PV fixture and run-scoped IOChaos cleanup",
+    },
+    FaultScenarioSpec {
         scenario: POD_KILL_ONE_SCENARIO,
         detector: FaultDetectorSpec::gate_candidate(&[
             DurabilityBugFamily::DataShardLoss,
@@ -545,6 +636,36 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         conflict_domain: "run-scoped PodChaos resource and one target Pod; can reuse a ready Tenant after the prior scenario has cleaned up",
     },
     FaultScenarioSpec {
+        scenario: POD_RESTART_STORM_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
+        case_name: "fault_pod_restart_storm_preserves_committed_objects",
+        description: "Hold a Chaos Mesh Schedule that SIGKILLs the highest-ordinal RustFS Pod every 15 seconds while the workload runs, and verify peers keep serving committed objects.",
+        priority: FaultPriority::P1,
+        backend: FaultBackend::ChaosMeshPodChaos,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[PODCHAOS_CRD, "schedules.chaos-mesh.org"],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
+        boundary: "rustfs-workload/pod-restart-storm",
+        ci_phase: "faults",
+        target: "the highest-ordinal RustFS Pod, killed with gracePeriod 0 on a 15s Schedule for the fault window; mode one is pinned to that Pod so the port-forward target is not the victim",
+        target_proof: &[
+            "the Schedule manifest names exactly one RustFS Pod ordinal",
+            "activation waits until that Pod's UID disappears at least once and the Schedule status field time is set",
+            "the Schedule object remains armed for the workload; individual later kills are not counted",
+        ],
+        validation: "at least one kill of the selected Pod is observed before the workload, the Schedule stays armed while the mixed workload runs, every committed object remains readable and the workload meets the availability floor, and after the Schedule is deleted the Tenant returns Ready with committed objects intact",
+        observability: "history.jsonl, workload-summary.json, checker-report.json, schedule manifest/describe/yaml, Pod UIDs, RustFS logs",
+        conflict_domain: "run-scoped Schedule and the PodChaos children it owns; can reuse a ready Tenant after cleanup",
+    },
+    FaultScenarioSpec {
         scenario: NETWORK_PARTITION_ONE_SCENARIO,
         detector: FaultDetectorSpec::gate_candidate(&[
             DurabilityBugFamily::RecoveryAvailabilityRegression,
@@ -567,6 +688,32 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target: "one RustFS Pod selected by tenant label with peer traffic disrupted inside the e2e namespace",
         target_proof: DEFAULT_TARGET_PROOF,
         validation: "network disruption is active during workload, every committed object remains readable with its hash from the surviving peers and the mixed workload meets the availability floor, successful reads never return wrong hashes, committed PUTs remain readable after heal, RustFS reports every drive ok and every Pod ready, fresh post-recovery writes succeed, and Tenant recovers Ready",
+        observability: "history.jsonl, workload-summary.json, checker-report.json, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
+        conflict_domain: "run-scoped NetworkChaos resource; must not overlap with PodChaos or IOChaos in the same Tenant",
+    },
+    FaultScenarioSpec {
+        scenario: NETWORK_ASYMMETRIC_PARTITION_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
+        case_name: "fault_network_asymmetric_partition_preserves_committed_objects",
+        description: "Inject Chaos Mesh NetworkChaos partition with direction to, so packets from one RustFS Pod toward its peers are dropped while the reverse path stays open.",
+        priority: FaultPriority::P1,
+        backend: FaultBackend::ChaosMeshNetworkChaos,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[NETWORKCHAOS_CRD],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
+        boundary: "rustfs-workload/network-asymmetric-partition",
+        ci_phase: "faults",
+        target: "one RustFS Pod selected by tenant label; only source-to-peer packets are partitioned",
+        target_proof: DEFAULT_TARGET_PROOF,
+        validation: "the rendered NetworkChaos uses direction to rather than both, every committed object remains readable with its hash while the one-way partition is active, the mixed workload meets the availability floor, successful reads never return wrong hashes, and Tenant recovers Ready after the partition is removed",
         observability: "history.jsonl, workload-summary.json, checker-report.json, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
         conflict_domain: "run-scoped NetworkChaos resource; must not overlap with PodChaos or IOChaos in the same Tenant",
     },
@@ -648,6 +795,32 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target: "one RustFS Pod selected by tenant label with lossy peer traffic inside the e2e namespace",
         target_proof: DEFAULT_TARGET_PROOF,
         validation: "successful reads match a committed value, failed operations are explainable, and recovery preserves the object model",
+        observability: "history.jsonl, checker reports, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
+        conflict_domain: "run-scoped NetworkChaos resource; must not overlap with other network faults in the same Tenant",
+    },
+    FaultScenarioSpec {
+        scenario: NETWORK_FLAKY_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
+        case_name: "fault_network_flaky_preserves_object_model",
+        description: "Inject bursty NetworkChaos packet loss. Correlation is required to stay at or above 75 so the loss comes in bursts, which steady network-loss does not require. One NetworkChaos accepts a single action, so this scenario does not also corrupt packets or toggle a timed on/off gate.",
+        priority: FaultPriority::P1,
+        backend: FaultBackend::ChaosMeshNetworkChaos,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[NETWORKCHAOS_CRD],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::NetworkFlaky,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-workload/network-flaky",
+        ci_phase: "faults",
+        target: "one RustFS Pod selected by tenant label with bursty lossy peer traffic inside the e2e namespace",
+        target_proof: DEFAULT_TARGET_PROOF,
+        validation: "loss correlation is at least 75 and loss stays at or below 40 percent, successful reads match a committed value, and recovery preserves the object model",
         observability: "history.jsonl, checker reports, networkchaos manifest/describe/yaml, endpoints, events, and RustFS logs",
         conflict_domain: "run-scoped NetworkChaos resource; must not overlap with other network faults in the same Tenant",
     },
@@ -771,6 +944,32 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         validation: "new writes may fail with ENOSPC, but previously committed PUTs remain readable after IOChaos recovery",
         observability: "history.jsonl, checker-report.json, fault-evidence.json, IOChaos manifest/status, events, RustFS logs",
         conflict_domain: "fresh Tenant/PVC/PV fixture and run-scoped IOChaos cleanup without consuming node disk capacity",
+    },
+    FaultScenarioSpec {
+        scenario: IO_READ_ONLY_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::DataShardLoss,
+        ]),
+        case_name: "fault_io_read_only_preserves_committed_objects",
+        description: "Inject IOChaos EROFS on writes to one RustFS data volume. This is the Chaos Mesh stand-in for a read-only disk; it does not remount the volume.",
+        priority: FaultPriority::P1,
+        backend: FaultBackend::ChaosMeshIoChaos,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::FreshTenant,
+        crds: &[IOCHAOS_CRD],
+        required_tools: &[],
+        percent_supported: true,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
+        boundary: "rustfs-workload/read-only-volume",
+        ci_phase: "faults",
+        target: "one RustFS data volume selected by tenant label with WRITE operations returning EROFS",
+        target_proof: DEFAULT_TARGET_PROOF,
+        validation: "writes to the selected volume fail with EROFS, previously committed PUTs remain readable during the fault and after recovery, and the mixed workload meets the availability floor",
+        observability: "history.jsonl, checker-report.json, fault-evidence.json, IOChaos manifest/status, events, RustFS logs",
+        conflict_domain: "fresh Tenant/PVC/PV fixture and run-scoped IOChaos cleanup; does not remount a host filesystem",
     },
     FaultScenarioSpec {
         scenario: POD_FAILURE_SCENARIO,
@@ -1186,7 +1385,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target: "RustFS S3 endpoint under an explicitly selected fault backend",
         target_proof: DEFAULT_TARGET_PROOF,
         validation: "Warp throughput or latency changes are reported separately; correctness still comes only from history and checker reports",
-        observability: "warp report, history.jsonl, checker-report.json, selected chaos manifest/describe/yaml, RustFS logs",
+        observability: "warp-powerloss-metrics.json, warp report, history.jsonl, checker-report.json, selected chaos manifest/describe/yaml, RustFS logs",
         conflict_domain: "performance-only run with isolated bucket prefix and no shared correctness threshold",
     },
     FaultScenarioSpec {
@@ -1289,19 +1488,19 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::HealRegression,
         ]),
         case_name: "fault_fresh_volume_replacement_heals_empty_disk",
-        description: "Planned fresh-volume replacement flow: replace one RustFS volume with a proven empty generation, observe RustFS automatic replacement or admin-deep heal, and force reads through the replacement.",
+        description: "Fresh-volume replacement flow: replace one RustFS volume with a proven empty generation, observe RustFS automatic replacement or admin-deep heal, and force reads through the replacement.",
         priority: FaultPriority::P0,
         backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
+        status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
-        isolation: FaultIsolation::FreshTenant,
+        isolation: FaultIsolation::DedicatedLinuxBlockDevice,
         crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-reliability/volume-replacement",
-        ci_phase: "planned",
+        ci_phase: "faults",
         target: "one RustFS PVC/PV replaced by a fresh empty volume and the owning Pod restarted",
         target_proof: &[
             "artifact must prove old PVC/PV identity and replacement PVC/PV identity",
@@ -1385,10 +1584,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::HealRegression,
         ]),
         case_name: "fault_on_disk_bitrot_is_rejected_and_healed",
-        description: "Planned on-disk bitrot flow: inspect one non-inline shard through the fenced storage helper, apply a receipt-derived reversible mutation, verify corrupt bytes are rejected, observe scanner or admin-deep heal, and require the repaired shard for the final read.",
+        description: "On-disk bitrot flow: inspect one non-inline shard through the fenced storage helper, apply a receipt-derived reversible mutation, verify corrupt bytes are rejected, observe scanner or admin-deep heal, and require the repaired shard for the final read.",
         priority: FaultPriority::P0,
         backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
+        status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
         isolation: FaultIsolation::DedicatedLinuxBlockDevice,
         crds: &[IOCHAOS_CRD],
@@ -1397,7 +1596,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-reliability/on-disk-bitrot",
-        ci_phase: "planned",
+        ci_phase: "faults",
         target: "one shard file on one dedicated host volume, selected after mapping an object version to its on-disk shard",
         target_proof: &[
             "target proof must bind Tenant/PV/Pod/node/drive identity, the Kubernetes Lease generation, and the long-lived host flock before inspection or mutation",
@@ -1533,6 +1732,177 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         observability: "pod-lifecycle-evidence.json, pod-lifecycle-watch.json, history.jsonl, workload-summary.json, checker-report.json, recovery-health.json, StatefulSet, Pod and operator Deployment snapshots, RustFS logs",
         conflict_domain: "the whole Tenant StatefulSet plus the RustFS operator Deployment while paused; nothing else may reconcile the Tenant during the run",
     },
+    FaultScenarioSpec {
+        scenario: IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::QuorumViolation,
+        ]),
+        case_name: "fault_io_eio_same_pod_two_volumes_fail_closed_on_geometry",
+        description: "Planned same-Pod two-volume EIO. The geometry gate fails closed unless volumesPerServer is at least 2, the selected Pod has two data mounts, and those mounts are proven to share one erasure set.",
+        priority: FaultPriority::P1,
+        backend: FaultBackend::PlannedReliabilityWorkflow,
+        status: FaultScenarioStatus::Planned,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::FreshTenant,
+        crds: &[IOCHAOS_CRD],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-reliability/same-pod-two-volumes",
+        ci_phase: "planned",
+        target: "two data volumes on one RustFS Pod inside one erasure set",
+        target_proof: &[
+            "fail closed when volumesPerServer is below 2",
+            "fail closed when the selected Pod does not expose two data mounts",
+            "fail closed when drive-to-volume binding cannot prove both mounts share one erasure set; the current binder accepts only one volume per server",
+        ],
+        validation: "do not inject until assess_same_pod_two_volume_geometry accepts the live Tenant; a one-volume or cross-set selection is a failed run, not a narrower fault",
+        observability: "target-proof.json must record the rejected geometry; no IOChaos is applied on the closed path",
+        conflict_domain: "fresh Tenant geometry; must not be treated as two Pods or as quorum-p targeting",
+    },
+    FaultScenarioSpec {
+        scenario: NETWORK_PARTITION_DURING_HEAL_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[DurabilityBugFamily::HealRegression]),
+        case_name: "fault_network_partition_during_heal_requires_observable_progress",
+        description: "Planned network partition while a heal or rebuild is active. Heal progress is produced by the fresh-volume and bitrot storage-recovery workflows, which are not composable with NetworkChaos.",
+        priority: FaultPriority::P1,
+        backend: FaultBackend::PlannedReliabilityWorkflow,
+        status: FaultScenarioStatus::Planned,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::FreshTenant,
+        crds: &[NETWORKCHAOS_CRD],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-reliability/partition-during-heal",
+        ci_phase: "planned",
+        target: "the Pod observed to be healing, partitioned only after heal progress is already moving",
+        target_proof: &[
+            "a heal-progress sample from before the partition must show in-flight rebuild work",
+            "fresh-volume and bitrot heal transcripts do not provide a trigger for a concurrent NetworkChaos",
+        ],
+        validation: "blocked until an executable scenario can observe heal progress on a healthy cluster and then apply a scoped NetworkChaos without inventing a second harness",
+        observability: "heal-progress.jsonl before, during, and after the partition",
+        conflict_domain: "must not run beside another heal or network fault in the same Tenant",
+    },
+    FaultScenarioSpec {
+        scenario: CLOCK_SKEW_SCENARIO,
+        detector: FaultDetectorSpec::diagnostic_only(&[
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
+        case_name: "fault_clock_skew_has_no_wired_actuator",
+        description: "Planned clock skew between RustFS nodes. Chaos Mesh TimeChaos is not wired, and changing the node clock is not a safe actuator.",
+        priority: FaultPriority::P2,
+        backend: FaultBackend::PlannedReliabilityWorkflow,
+        status: FaultScenarioStatus::Planned,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-workload/clock-skew",
+        ci_phase: "planned",
+        target: "one RustFS Pod clock, offset without touching the Kubernetes node clock",
+        target_proof: &[
+            "the actuator must prove the offset applies to the already-running RustFS process",
+            "the node and control-plane clocks stay unchanged",
+        ],
+        validation: "blocked until a TimeChaos or equivalent adapter can skew only the selected Pod and restore it",
+        observability: "clock offset evidence, auth and heal logs, checker reports",
+        conflict_domain: "one Pod clock; never the host or API server clock",
+    },
+    FaultScenarioSpec {
+        scenario: CREDENTIAL_ROTATION_MID_LOAD_SCENARIO,
+        detector: FaultDetectorSpec::diagnostic_only(&[
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+        ]),
+        case_name: "fault_credential_rotation_mid_load_has_no_actuator",
+        description: "Planned credential or TLS rotation while a workload is in flight. The fault backends have no admin credential or certificate actuator.",
+        priority: FaultPriority::P2,
+        backend: FaultBackend::PlannedReliabilityWorkflow,
+        status: FaultScenarioStatus::Planned,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::FreshTenant,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-workload/credential-rotation",
+        ci_phase: "planned",
+        target: "the fresh Tenant access keys or serving certificate, rotated under load",
+        target_proof: &[
+            "rotation evidence must bind the old and new credential identities",
+            "the workload must overlap the rotation window",
+        ],
+        validation: "blocked until a scenario-owned admin rotation step can prove bounded auth errors and post-rotation success without a second harness",
+        observability: "rotation transcript, 401/403 counts, post-rotation PUT/GET sample",
+        conflict_domain: "fresh Tenant credentials; must not rotate shared or operator secrets",
+    },
+    FaultScenarioSpec {
+        scenario: NETWORK_SPLIT_BRAIN_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::QuorumViolation,
+            DurabilityBugFamily::CommitMetadataLoss,
+        ]),
+        case_name: "fault_network_split_brain_needs_complement_selectors",
+        description: "Planned dual partition that keeps two pairs internally connected while cutting traffic between the pairs. The current NetworkChaos renderer uses one overlapping all-peer target selector, which isolates selected Pods from each other instead of forming two live sides.",
+        priority: FaultPriority::P1,
+        backend: FaultBackend::PlannedReliabilityWorkflow,
+        status: FaultScenarioStatus::Planned,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::ReusableTenant,
+        crds: &[NETWORKCHAOS_CRD],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        boundary: "rustfs-workload/network-split-brain",
+        ci_phase: "planned",
+        target: "two disjoint RustFS Pod pairs, with intra-pair traffic left intact",
+        target_proof: &[
+            "source and target selectors must be complements proven from the live Ready Pod set",
+            "intra-pair connectivity must be shown separately from the cut",
+        ],
+        validation: "blocked until the NetworkChaos renderer can apply a complement selector without also partitioning Pods inside a side",
+        observability: "networkchaos manifest with disjoint selectors, per-side write outcomes, checker reports after heal",
+        conflict_domain: "run-scoped NetworkChaos; must not overlap the single-Pod or write-quorum partition scenarios",
+    },
+    FaultScenarioSpec {
+        scenario: METADATA_SHARD_CORRUPTION_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
+        case_name: "fault_metadata_shard_corruption_has_no_safe_actuator",
+        description: "Planned corruption of RustFS metadata on one drive. on-disk-bitrot covers object-shard bytes and is still Planned; metadata paths are not a separate safe actuator.",
+        priority: FaultPriority::P1,
+        backend: FaultBackend::PlannedReliabilityWorkflow,
+        status: FaultScenarioStatus::Planned,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::DedicatedLinuxBlockDevice,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        boundary: "rustfs-reliability/metadata-shard-corruption",
+        ci_phase: "planned",
+        target: "one metadata file on one dedicated host volume, never an arbitrary operator-supplied path",
+        target_proof: &[
+            "selection must bind a version and an xl metadata receipt before any byte change",
+            "the mutation must be journaled and reversible",
+            "object-shard bitrot must not be reused as proof that metadata was the target",
+        ],
+        validation: "blocked until the bitrot inspector can select a metadata shard and fail closed on any other path",
+        observability: "selection, mutation, and cleanup receipts distinct from object-shard bitrot",
+        conflict_domain: "dedicated host volume owned by the run; must not mutate shared metadata",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1554,19 +1924,30 @@ impl FaultScenario {
             !(config.qualify_planned_admin && config.qualify_planned_storage),
             "planned admin and storage qualification cannot be enabled together"
         );
-        if config.qualify_planned_storage {
+        if config.qualify_planned_storage
+            || matches!(
+                config.scenario.as_str(),
+                FRESH_VOLUME_REPLACEMENT_SCENARIO | ON_DISK_BITROT_SCENARIO
+            )
+        {
             ensure!(
                 config.destructive_enabled,
-                "planned storage qualification requires RUSTFS_FAULT_TEST_DESTRUCTIVE=1"
+                "storage recovery requires RUSTFS_FAULT_TEST_DESTRUCTIVE=1"
             );
-            let case = config.storage_recovery_case.context(
-                "planned storage qualification requires RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE",
-            )?;
+            let case = config
+                .storage_recovery_case
+                .context("storage recovery requires RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE")?;
             ensure!(
                 case.scenario() == config.scenario,
                 "planned storage qualification case {} does not belong to exact scenario {}",
                 case.as_str(),
                 config.scenario
+            );
+        }
+        if config.scenario == ON_DISK_BITROT_SCENARIO {
+            ensure!(
+                config.storage_recovery_target_config.is_some(),
+                "on-disk-bitrot requires RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG"
             );
         }
         Self::from_config_with_planned_qualification(
@@ -1582,6 +1963,17 @@ impl FaultScenario {
         allow_planned_storage: bool,
     ) -> Result<Self> {
         let spec = scenario_spec(&config.scenario)?;
+        if matches!(
+            spec.scenario,
+            FRESH_VOLUME_REPLACEMENT_SCENARIO | ON_DISK_BITROT_SCENARIO
+        ) {
+            ensure!(
+                config
+                    .storage_recovery_case
+                    .is_some_and(|case| case.scenario() == spec.scenario),
+                "storage recovery requires an exact matching RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE"
+            );
+        }
         let admin_qualification_allowed = allow_planned_admin
             && matches!(
                 spec.scenario,
@@ -1755,9 +2147,8 @@ fn planned_qualification_catalog() -> Result<Vec<PlannedQualificationCaseSpec>> 
     for qualification in &cases {
         let scenario = scenario_spec(qualification.scenario)?;
         ensure!(
-            scenario.status == FaultScenarioStatus::Planned
-                && scenario.backend == FaultBackend::PlannedReliabilityWorkflow,
-            "qualification case {:?} is not bound to a Planned reliability scenario",
+            scenario.backend == FaultBackend::PlannedReliabilityWorkflow,
+            "qualification case {:?} is not bound to a reliability workflow scenario",
             qualification.qualification_case
         );
     }
@@ -1879,17 +2270,19 @@ mod tests {
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO,
         DetectorQualification, DurabilityBugFamily, FRESH_VOLUME_REPLACEMENT_SCENARIO,
         FaultDetectorContract, FaultParameterSchema, FaultScenario, FaultScenarioStatus,
-        FaultScenarioWorkloadProfile, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IOCHAOS_CRD,
-        NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
-        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, ON_DISK_BITROT_SCENARIO,
-        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO, POD_FAILURE_SCENARIO,
-        POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_DM_EIO_SCENARIO,
+        FaultScenarioWorkloadProfile, IO_EIO_DURING_MULTIPART_SCENARIO, IO_EIO_SCENARIO,
+        IO_LATENCY_SCENARIO, IO_READ_ONLY_SCENARIO, IOCHAOS_CRD,
+        NETWORK_ASYMMETRIC_PARTITION_SCENARIO, NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO,
+        NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+        ON_DISK_BITROT_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
+        POD_FAILURE_QUORUM_EDGE_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
+        POD_KILL_ONE_SCENARIO, POD_RESTART_STORM_SCENARIO, QUORUM_P_DM_EIO_SCENARIO,
         QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
         ROLLING_RESTART_ALL_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO,
-        acknowledged_mutation_kind, apply_catalog_defaults, executable_scenario_catalog,
-        expected_workload_versioning_for_scenario, planned_qualification_catalog_json,
-        requires_prefault_multipart_staging, scenario_catalog, scenario_catalog_json,
-        scenario_spec,
+        acknowledged_mutation_kind, apply_catalog_defaults, assess_same_pod_two_volume_geometry,
+        executable_scenario_catalog, expected_workload_versioning_for_scenario,
+        planned_qualification_catalog_json, requires_prefault_multipart_staging, scenario_catalog,
+        scenario_catalog_json, scenario_spec,
     };
     use crate::fault::acknowledged_mutation::AcknowledgedMutationKind;
     use crate::fault::config::{FaultTestConfig, FaultWorkloadProfile};
@@ -1958,6 +2351,9 @@ mod tests {
         for spec in executable_scenario_catalog() {
             let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
             config.scenario = spec.scenario.to_string();
+            config.storage_recovery_case = crate::fault::storage_recovery::StorageRecoveryCase::ALL
+                .into_iter()
+                .find(|case| case.scenario() == spec.scenario);
             apply_catalog_defaults(&mut config).expect("catalog defaults");
 
             assert_eq!(spec.status, FaultScenarioStatus::Executable);
@@ -1968,14 +2364,14 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 31);
-        assert_eq!(scenario_catalog().len(), 36);
+        assert_eq!(executable_scenario_catalog().count(), 38);
+        assert_eq!(scenario_catalog().len(), 47);
         assert_eq!(
             scenario_catalog()
                 .iter()
                 .filter(|scenario| scenario.status == FaultScenarioStatus::Planned)
                 .count(),
-            5
+            9
         );
     }
 
@@ -2024,7 +2420,7 @@ mod tests {
             crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
         );
 
-        assert!(FaultScenario::from_config(&config).is_err());
+        assert!(FaultScenario::from_config(&config).is_ok());
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
         config.destructive_enabled = true;
         assert!(FaultScenario::from_config_for_execution(&config).is_ok());
@@ -2032,6 +2428,31 @@ mod tests {
         config.storage_recovery_case =
             Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAdminDeep);
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
+    }
+
+    #[test]
+    fn executable_storage_cases_keep_exact_case_and_destructive_gates() {
+        for case in crate::fault::storage_recovery::StorageRecoveryCase::ALL {
+            if case.scenario() == STALE_DISK_RETURN_DETECT_SCENARIO {
+                continue;
+            }
+            let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+            config.scenario = case.scenario().to_string();
+            assert!(FaultScenario::from_config(&config).is_err());
+            config.storage_recovery_case = Some(case);
+            assert!(FaultScenario::from_config(&config).is_ok());
+            assert!(FaultScenario::from_config_for_execution(&config).is_err());
+            config.destructive_enabled = true;
+            assert!(!config.qualify_planned_storage);
+            if case.scenario() == ON_DISK_BITROT_SCENARIO {
+                assert!(FaultScenario::from_config_for_execution(&config).is_err());
+                config.storage_recovery_target_config = Some("/secure/target.json".into());
+            }
+            assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+            config.storage_recovery_case =
+                Some(crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn);
+            assert!(FaultScenario::from_config_for_execution(&config).is_err());
+        }
     }
 
     #[test]
@@ -2120,7 +2541,7 @@ mod tests {
         config.storage_recovery_case =
             Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAutomaticScanner);
 
-        assert!(FaultScenario::from_config(&config).is_err());
+        assert!(FaultScenario::from_config(&config).is_ok());
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
         config.destructive_enabled = true;
         assert!(FaultScenario::from_config_for_execution(&config).is_ok());
@@ -2371,6 +2792,24 @@ mod tests {
     }
 
     #[test]
+    fn same_pod_two_volume_geometry_fails_closed() {
+        assert!(assess_same_pod_two_volume_geometry(1, 2, Some(true)).is_err());
+        assert!(assess_same_pod_two_volume_geometry(2, 1, Some(true)).is_err());
+        assert!(assess_same_pod_two_volume_geometry(2, 2, Some(false)).is_err());
+        assert!(assess_same_pod_two_volume_geometry(2, 2, None).is_err());
+        assert!(assess_same_pod_two_volume_geometry(2, 2, Some(true)).is_ok());
+    }
+
+    #[test]
+    fn multipart_fault_profile_weights_multipart_without_dropping_families() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = IO_EIO_DURING_MULTIPART_SCENARIO.to_string();
+        apply_catalog_defaults(&mut config).expect("catalog defaults");
+        assert_eq!(config.workload_operation_mix.multipart, 10);
+        assert!(config.workload_operation_mix.total_weight() > 10);
+    }
+
+    #[test]
     fn catalog_explicitly_identifies_erasure_set_proof_scenarios() {
         let requiring_proof = scenario_catalog()
             .iter()
@@ -2382,6 +2821,7 @@ mod tests {
             requiring_proof,
             vec![
                 IO_EIO_SCENARIO,
+                IO_EIO_DURING_MULTIPART_SCENARIO,
                 NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
                 POD_FAILURE_QUORUM_EDGE_SCENARIO,
                 QUORUM_P_DM_EIO_SCENARIO,
@@ -2423,9 +2863,13 @@ mod tests {
     fn single_component_faults_require_availability() {
         for name in [
             IO_EIO_SCENARIO,
+            IO_EIO_DURING_MULTIPART_SCENARIO,
+            IO_READ_ONLY_SCENARIO,
             POD_KILL_ONE_SCENARIO,
+            POD_RESTART_STORM_SCENARIO,
             POD_FAILURE_SCENARIO,
             NETWORK_PARTITION_ONE_SCENARIO,
+            NETWORK_ASYMMETRIC_PARTITION_SCENARIO,
             NETWORK_CORRUPT_SCENARIO,
             DISK_FULL_SCENARIO,
         ] {
