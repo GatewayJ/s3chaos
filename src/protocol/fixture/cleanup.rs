@@ -973,7 +973,7 @@ mod tests {
         ) -> std::result::Result<bool, ProtocolAdminError> {
             Ok(self
                 .attachment_visibility
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok())
@@ -986,7 +986,7 @@ mod tests {
         ) -> std::result::Result<bool, ProtocolAdminError> {
             Ok(self
                 .membership_visibility
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok())
@@ -999,7 +999,7 @@ mod tests {
         ) -> std::result::Result<Vec<String>, ProtocolAdminError> {
             if self
                 .session_visibility
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()
@@ -1041,7 +1041,7 @@ mod tests {
         ) -> std::result::Result<Vec<String>, ProtocolS3Error> {
             if self
                 .bucket_visibility
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()
@@ -1197,7 +1197,7 @@ mod tests {
                 .push(format!("delete-policy:{bucket}"));
             if self
                 .policy_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()

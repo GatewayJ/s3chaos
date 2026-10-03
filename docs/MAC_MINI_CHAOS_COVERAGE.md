@@ -27,8 +27,8 @@ time-to-baseline are what `warp-powerloss-metrics.json` records.
 | C-PWR-02 graceful stop | `pod-graceful-restart-one` | Covered |
 | C-PWR-03 VM / PSU hard stop | none | Deferred. `docs/DURABILITY_FAULT_TESTING_TODO.md` §13. |
 | C-DISK-01 detach | `io-eio` and other volume faults | Partial. IOChaos EIO is not a device detach. |
-| C-DISK-02 empty replace | `fresh-volume-replacement` | Planned qualification case |
-| C-DISK-03 bitrot | `on-disk-bitrot` | Planned qualification case. Object shards, not metadata. |
+| C-DISK-02 empty replace | `fresh-volume-replacement` | Executable storage-recovery case; requires an exact recovery case and dedicated storage |
+| C-DISK-03 bitrot | `on-disk-bitrot` | Executable storage-recovery case for object shards; requires an exact recovery case and dedicated storage |
 | C-DISK-04 full | `disk-full` | Covered |
 | C-DISK-05 remount read-only | `io-read-only` | Partial. IOChaos returns `EROFS` (errno 30) on `WRITE`. It does not remount the volume. |
 | C-DISK-06 slow disk | `io-latency` | Covered |
@@ -43,10 +43,10 @@ time-to-baseline are what `warp-powerloss-metrics.json` records.
 | C-TOPO-02 rolling restart | `rolling-restart-all` | Covered |
 | C-TOPO-03 2/4 quorum loss | `pod-failure-quorum-edge`, `network-partition-write-quorum-loss` | Covered |
 | C-TOPO-04 cold restart | `cluster-cold-restart` | Covered |
-| C-META-01/02/03 metadata corruption | `metadata-shard-corruption` | Planned. Distinct from planned object-shard `on-disk-bitrot`. |
+| C-META-01/02/03 metadata corruption | `metadata-shard-corruption` | Planned. Distinct from object-shard `on-disk-bitrot`. |
 | C-LOAD-01 Warp under power loss | `warp-under-chaos` | Partial. `warp-powerloss-metrics.json` records in-run baseline ops/s, degraded ops/s, drop percent, fault-window error percent, and time-to-baseline (REACHED or NOT_REACHED). Node ready lag is `NOT_APPLICABLE` because the campaign is IOChaos EIO, not a node stop. Peer compare is `not-in-ci`. `NOT_REACHED` does not fail the run. |
 | C-LOAD-02 disk fault during multipart PUT | `io-eio-during-multipart` | Covered. Same single-volume EIO proof as `io-eio`, with the multipart-heavy workload profile. |
-| C-LOAD-03 partition during heal | `network-partition-during-heal` | Planned. Heal progress is only recorded inside qualification workflows and is not composable with NetworkChaos. |
+| C-LOAD-03 partition during heal | `network-partition-during-heal` | Planned. Heal progress is recorded inside storage-recovery workflows and is not composable with NetworkChaos. |
 
 `fault/examples/warp-powerloss.yaml` is the suite that runs `warp-under-chaos`
 for the metrics artifact. `fault/examples/chaos-mesh.yaml` includes the new

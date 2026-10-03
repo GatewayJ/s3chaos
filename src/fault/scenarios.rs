@@ -1455,19 +1455,19 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::HealRegression,
         ]),
         case_name: "fault_fresh_volume_replacement_heals_empty_disk",
-        description: "Planned fresh-volume replacement flow: replace one RustFS volume with a proven empty generation, observe RustFS automatic replacement or admin-deep heal, and force reads through the replacement.",
+        description: "Fresh-volume replacement flow: replace one RustFS volume with a proven empty generation, observe RustFS automatic replacement or admin-deep heal, and force reads through the replacement.",
         priority: FaultPriority::P0,
         backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
+        status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
-        isolation: FaultIsolation::FreshTenant,
+        isolation: FaultIsolation::DedicatedLinuxBlockDevice,
         crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-reliability/volume-replacement",
-        ci_phase: "planned",
+        ci_phase: "faults",
         target: "one RustFS PVC/PV replaced by a fresh empty volume and the owning Pod restarted",
         target_proof: &[
             "artifact must prove old PVC/PV identity and replacement PVC/PV identity",
@@ -1551,10 +1551,10 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::HealRegression,
         ]),
         case_name: "fault_on_disk_bitrot_is_rejected_and_healed",
-        description: "Planned on-disk bitrot flow: inspect one non-inline shard through the fenced storage helper, apply a receipt-derived reversible mutation, verify corrupt bytes are rejected, observe scanner or admin-deep heal, and require the repaired shard for the final read.",
+        description: "On-disk bitrot flow: inspect one non-inline shard through the fenced storage helper, apply a receipt-derived reversible mutation, verify corrupt bytes are rejected, observe scanner or admin-deep heal, and require the repaired shard for the final read.",
         priority: FaultPriority::P0,
         backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
+        status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
         isolation: FaultIsolation::DedicatedLinuxBlockDevice,
         crds: &[IOCHAOS_CRD],
@@ -1563,7 +1563,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-reliability/on-disk-bitrot",
-        ci_phase: "planned",
+        ci_phase: "faults",
         target: "one shard file on one dedicated host volume, selected after mapping an object version to its on-disk shard",
         target_proof: &[
             "target proof must bind Tenant/PV/Pod/node/drive identity, the Kubernetes Lease generation, and the long-lived host flock before inspection or mutation",
@@ -1733,7 +1733,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         scenario: NETWORK_PARTITION_DURING_HEAL_SCENARIO,
         detector: FaultDetectorSpec::gate_candidate(&[DurabilityBugFamily::HealRegression]),
         case_name: "fault_network_partition_during_heal_requires_observable_progress",
-        description: "Planned network partition while a heal or rebuild is active. Heal progress is only produced by the qualification-only fresh-volume and bitrot workflows, which are themselves Planned and are not composable with NetworkChaos.",
+        description: "Planned network partition while a heal or rebuild is active. Heal progress is produced by the fresh-volume and bitrot storage-recovery workflows, which are not composable with NetworkChaos.",
         priority: FaultPriority::P1,
         backend: FaultBackend::PlannedReliabilityWorkflow,
         status: FaultScenarioStatus::Planned,
@@ -1749,7 +1749,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target: "the Pod observed to be healing, partitioned only after heal progress is already moving",
         target_proof: &[
             "a heal-progress sample from before the partition must show in-flight rebuild work",
-            "fresh-volume and bitrot heal transcripts are qualification-only and cannot be started from an executable suite",
+            "fresh-volume and bitrot heal transcripts do not provide a trigger for a concurrent NetworkChaos",
         ],
         validation: "blocked until an executable scenario can observe heal progress on a healthy cluster and then apply a scoped NetworkChaos without inventing a second harness",
         observability: "heal-progress.jsonl before, during, and after the partition",
@@ -1891,19 +1891,30 @@ impl FaultScenario {
             !(config.qualify_planned_admin && config.qualify_planned_storage),
             "planned admin and storage qualification cannot be enabled together"
         );
-        if config.qualify_planned_storage {
+        if config.qualify_planned_storage
+            || matches!(
+                config.scenario.as_str(),
+                FRESH_VOLUME_REPLACEMENT_SCENARIO | ON_DISK_BITROT_SCENARIO
+            )
+        {
             ensure!(
                 config.destructive_enabled,
-                "planned storage qualification requires RUSTFS_FAULT_TEST_DESTRUCTIVE=1"
+                "storage recovery requires RUSTFS_FAULT_TEST_DESTRUCTIVE=1"
             );
-            let case = config.storage_recovery_case.context(
-                "planned storage qualification requires RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE",
-            )?;
+            let case = config
+                .storage_recovery_case
+                .context("storage recovery requires RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE")?;
             ensure!(
                 case.scenario() == config.scenario,
                 "planned storage qualification case {} does not belong to exact scenario {}",
                 case.as_str(),
                 config.scenario
+            );
+        }
+        if config.scenario == ON_DISK_BITROT_SCENARIO {
+            ensure!(
+                config.storage_recovery_target_config.is_some(),
+                "on-disk-bitrot requires RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG"
             );
         }
         Self::from_config_with_planned_qualification(
@@ -1919,6 +1930,17 @@ impl FaultScenario {
         allow_planned_storage: bool,
     ) -> Result<Self> {
         let spec = scenario_spec(&config.scenario)?;
+        if matches!(
+            spec.scenario,
+            FRESH_VOLUME_REPLACEMENT_SCENARIO | ON_DISK_BITROT_SCENARIO
+        ) {
+            ensure!(
+                config
+                    .storage_recovery_case
+                    .is_some_and(|case| case.scenario() == spec.scenario),
+                "storage recovery requires an exact matching RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE"
+            );
+        }
         let admin_qualification_allowed = allow_planned_admin
             && matches!(
                 spec.scenario,
@@ -2092,9 +2114,8 @@ fn planned_qualification_catalog() -> Result<Vec<PlannedQualificationCaseSpec>> 
     for qualification in &cases {
         let scenario = scenario_spec(qualification.scenario)?;
         ensure!(
-            scenario.status == FaultScenarioStatus::Planned
-                && scenario.backend == FaultBackend::PlannedReliabilityWorkflow,
-            "qualification case {:?} is not bound to a Planned reliability scenario",
+            scenario.backend == FaultBackend::PlannedReliabilityWorkflow,
+            "qualification case {:?} is not bound to a reliability workflow scenario",
             qualification.qualification_case
         );
     }
@@ -2294,6 +2315,9 @@ mod tests {
         for spec in executable_scenario_catalog() {
             let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
             config.scenario = spec.scenario.to_string();
+            config.storage_recovery_case = crate::fault::storage_recovery::StorageRecoveryCase::ALL
+                .into_iter()
+                .find(|case| case.scenario() == spec.scenario);
             apply_catalog_defaults(&mut config).expect("catalog defaults");
 
             assert_eq!(spec.status, FaultScenarioStatus::Executable);
@@ -2304,14 +2328,14 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 35);
+        assert_eq!(executable_scenario_catalog().count(), 37);
         assert_eq!(scenario_catalog().len(), 46);
         assert_eq!(
             scenario_catalog()
                 .iter()
                 .filter(|scenario| scenario.status == FaultScenarioStatus::Planned)
                 .count(),
-            11
+            9
         );
     }
 
@@ -2360,7 +2384,7 @@ mod tests {
             crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
         );
 
-        assert!(FaultScenario::from_config(&config).is_err());
+        assert!(FaultScenario::from_config(&config).is_ok());
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
         config.destructive_enabled = true;
         assert!(FaultScenario::from_config_for_execution(&config).is_ok());
@@ -2368,6 +2392,31 @@ mod tests {
         config.storage_recovery_case =
             Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAdminDeep);
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
+    }
+
+    #[test]
+    fn executable_storage_cases_keep_exact_case_and_destructive_gates() {
+        for case in crate::fault::storage_recovery::StorageRecoveryCase::ALL {
+            if case.scenario() == STALE_DISK_RETURN_DETECT_SCENARIO {
+                continue;
+            }
+            let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+            config.scenario = case.scenario().to_string();
+            assert!(FaultScenario::from_config(&config).is_err());
+            config.storage_recovery_case = Some(case);
+            assert!(FaultScenario::from_config(&config).is_ok());
+            assert!(FaultScenario::from_config_for_execution(&config).is_err());
+            config.destructive_enabled = true;
+            assert!(!config.qualify_planned_storage);
+            if case.scenario() == ON_DISK_BITROT_SCENARIO {
+                assert!(FaultScenario::from_config_for_execution(&config).is_err());
+                config.storage_recovery_target_config = Some("/secure/target.json".into());
+            }
+            assert!(FaultScenario::from_config_for_execution(&config).is_ok());
+            config.storage_recovery_case =
+                Some(crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn);
+            assert!(FaultScenario::from_config_for_execution(&config).is_err());
+        }
     }
 
     #[test]
@@ -2456,7 +2505,7 @@ mod tests {
         config.storage_recovery_case =
             Some(crate::fault::storage_recovery::StorageRecoveryCase::OnDiskBitrotAutomaticScanner);
 
-        assert!(FaultScenario::from_config(&config).is_err());
+        assert!(FaultScenario::from_config(&config).is_ok());
         assert!(FaultScenario::from_config_for_execution(&config).is_err());
         config.destructive_enabled = true;
         assert!(FaultScenario::from_config_for_execution(&config).is_ok());
