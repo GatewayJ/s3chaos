@@ -83,11 +83,19 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
 pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()> {
     scenarios::apply_catalog_defaults(&mut config)?;
     let reference_root = config.cluster.artifacts_dir.clone();
+    let deadline = if matches!(
+        config.scenario.as_str(),
+        scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO | scenarios::ON_DISK_BITROT_SCENARIO
+    ) {
+        RunDeadline::new(Some(config.duration.as_secs()))?
+    } else {
+        RunDeadline::default()
+    };
     run_prepared_scenario_with_config_and_reference_root(
         config,
         reference_root,
         fault_run_id(),
-        RunDeadline::default(),
+        deadline,
     )
     .await
 }
@@ -215,12 +223,31 @@ async fn run_fault_case(
             async {
                 run.stage_uploads(&prepared.s3, &mut staged_multipart_uploads)
                     .await?;
-                let target = deadline
+                let mut target = deadline
                     .run(run.prove_target(&prepared.endpoint, &mut preflight_phases))
                     .await?;
+                let dm_prepared = if plan.scenario == scenarios::QUORUM_P_DM_EIO_SCENARIO {
+                    context.events.record("quorum-dm-preflight", RunEventStatus::Started, "proving both devices before mutation", None)?;
+                    let group = crate::fault::backends::quorum_dm::prepare(config, collector, scenario, &context.run_id, &target.target_proof)?;
+                    context.events.record("quorum-dm-preflight", RunEventStatus::Succeeded, "both device ownership and baseline read proofs persisted", None)?;
+                    target = deadline.run(run.prove_target(&prepared.endpoint, &mut preflight_phases)).await?;
+                    Some(group)
+                } else { None };
+                let mut probe_fixtures = if injection::requires_independent_quorum_probe(&plan.scenario) {
+                    let fixtures = quorum_activation::QuorumProbeFixtures::stage(&config.cluster, &config.chaos_namespace, &context.run_id, &target.target_proof, collector, scenario.case_name).await?;
+                    let refreshed = deadline.run(run.prove_target(&prepared.endpoint, &mut preflight_phases)).await?;
+                    anyhow::ensure!(target.pods_before == refreshed.pods_before, "RustFS Pod generations changed while staging quorum probes");
+                    fixtures.require_matches(&context.run_id, &refreshed.target_proof)?;
+                    target = refreshed;
+                    target.quorum_probe_fixtures = fixtures.fixtures.clone();
+                    Some(fixtures)
+                } else { None };
                 deadline.check()?;
-                let mut active = run.activate_fault(&target).await?;
-                let skip_typed_oracle = active.quorum_activation.as_ref().is_some_and(|evidence| {
+                if plan.workload_mode.runs_warp() {
+                    run.capture_warp_baseline(&prepared)?;
+                }
+                let mut active = run.activate_fault(&target, dm_prepared).await?;
+                let skip_typed_oracle = (plan.scenario == scenarios::QUORUM_P_DM_EIO_SCENARIO && active.deferred_failure.is_some()) || active.quorum_activation.as_ref().is_some_and(|evidence| {
                     evidence.evidence().disposition()
                         == crate::fault::quorum::activation::QuorumActivationDisposition::SkipTypedOracleAndRecover
                 });
@@ -232,15 +259,44 @@ async fn run_fault_case(
                 };
                 if !skip_typed_oracle {
                     deadline.check()?;
+                    if plan.scenario == scenarios::QUORUM_P_DM_EIO_SCENARIO {
+                        let calibrated = workload.workload_snapshots.first().and_then(|snapshot| snapshot.quorum_dm_status.as_ref()).context("missing post-workload dm calibration").and_then(crate::fault::backends::quorum_dm::require_qualified);
+                        if let Err(error) = calibrated {
+                            run.record_failure("fault-evidence", "fault_not_active", &error, None, None)?;
+                            active.deferred_failure.get_or_insert_with(|| format!("fault_activation_unproven: {error:#}"));
+                        }
+                    }
+                }
+                if !skip_typed_oracle
+                    && let Some(activation) = active.quorum_activation.as_mut()
+                    && let Err(error) = quorum_activation::verify_quorum_continuity(&config.cluster, activation).await {
+                    run.record_failure("fault-evidence", "fault_not_active", &error, None, None)?;
+                    active.deferred_failure.get_or_insert_with(|| format!("{error:#}"));
                 }
                 run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
                 run.hold_node_down(&mut prepared, &target, &active.fault)
                     .await?;
                 let removal = run.remove_fault(&mut active.fault)?;
                 run.cleanup_quorum_activation_canaries(&mut active).await;
+                if let Some(fixtures) = probe_fixtures.as_mut() {
+                    if let Some(activation) = &active.quorum_activation {
+                        for target in &activation.evidence().targets {
+                            if target.probe_cleanup.as_ref().is_some_and(|cleanup| cleanup.outcome == crate::fault::quorum::activation::QuorumCanaryCleanupOutcome::Removed) {
+                                fixtures.fixtures.remove(&target.pod_name);
+                            }
+                        }
+                    }
+                    if let Err(error) = fixtures.cleanup().await {
+                        collector.write_text(scenario.case_name, "quorum-probe-cleanup-error.txt", &format!("{error:#}"))?;
+                        active.deferred_failure.get_or_insert_with(|| format!("quorum probe cleanup failed: {error:#}"));
+                    }
+                }
                 let recovered = run
                     .recover_access(&mut prepared, &target, &mut staged_multipart_uploads)
                     .await?;
+                if plan.workload_mode.runs_warp() {
+                    run.capture_warp_recovery(&prepared)?;
+                }
                 // A fault whose evidence can still change after removal (a
                 // lifecycle replacement that crashes after Ready) is re-read once
                 // the recovery gate has passed.
@@ -416,6 +472,7 @@ struct PreparedWorkload {
 }
 
 struct ProvenTarget {
+    quorum_probe_fixtures: BTreeMap<String, crate::fault::quorum::probe::ProbeFixture>,
     pods_before: Vec<PodIdentity>,
     target_proof: TargetProof,
     topology_observed_at_ms: Option<u64>,
@@ -638,6 +695,14 @@ fn now_ms() -> u64 {
 
 fn warp_bucket_name(run_id: &str) -> String {
     format!("{}-warp", bucket_name(run_id))
+}
+
+fn warp_baseline_bucket_name(run_id: &str) -> String {
+    format!("{}-warp-base", bucket_name(run_id))
+}
+
+fn warp_recovery_bucket_name(run_id: &str) -> String {
+    format!("{}-warp-recv", bucket_name(run_id))
 }
 
 #[cfg(test)]

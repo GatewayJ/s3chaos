@@ -460,6 +460,7 @@ mod tests {
         let suite: FaultSuite = serde_yaml_ng::from_str(yaml).unwrap();
         let mut config = FaultTestConfig::for_test("lab", "dm-storage");
         config.cluster.artifacts_dir = base_dir.into();
+        config.workload_seed = Some(42);
         config.cluster.rustfs_image = format!("rustfs/rustfs@sha256:{}", "a".repeat(64));
         let expansion = build_fault_suite_plan_expansion(
             suite.resolve().unwrap(),

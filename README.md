@@ -82,28 +82,46 @@ Use `make fault-chaos-plan` only when reviewing the resolved plan without
 starting the suite. Override the canonical suite with
 `CHAOS_SUITE=/path/to/suite.yaml`; `fault-chaos-run` rejects static storage and
 Warp plans. The generic `fault-suite-*` targets remain available for custom
-non-static suites and the separate Warp campaign.
+non-static suites, single-attempt storage-recovery suites, and the separate Warp campaign.
 
-Runnable scenario families (28 executable entries): I/O faults (`io-eio`,
-`io-read-mistake`, `io-latency`, `disk-full`, `dm-flakey*`, and the five
-typed `dm-drop-writes-after-ack-*` cases), network faults
-(`network-partition-one`, `network-partition-write-quorum-loss`,
-`network-delay/loss/corrupt/duplicate`), pod faults (`pod-kill-one`,
-`pod-failure`, `pod-crash-versioned-hot`), kubectl-driven lifecycle restarts
-(`pod-graceful-restart-one`, `rolling-restart-all`, `cluster-cold-restart`),
-stress (`stress-cpu`, `stress-memory`), typed volume quorum
-(`quorum-p-io-fault`, `quorum-p-plus-one-io-fault`), and the
-`warp-under-chaos` benchmark campaign.
+Runnable scenario families (37 executable entries): I/O faults (`io-eio`,
+`io-eio-during-multipart`, `io-read-mistake`, `io-read-only`, `io-latency`,
+`disk-full`, `dm-flakey*`, and the five typed `dm-drop-writes-after-ack-*`
+cases), network faults (`network-partition-one`,
+`network-asymmetric-partition`, `network-partition-write-quorum-loss`,
+`network-delay/loss/flaky/corrupt/duplicate`), pod faults (`pod-kill-one`,
+`pod-restart-storm`, `pod-failure`, `pod-crash-versioned-hot`),
+kubectl-driven lifecycle restarts (`pod-graceful-restart-one`,
+`rolling-restart-all`, `cluster-cold-restart`), stress (`stress-cpu`,
+`stress-memory`), typed volume quorum (`quorum-p-io-fault`,
+`quorum-p-plus-one-io-fault`), the `warp-under-chaos` benchmark campaign,
+fresh-volume replacement, and on-disk bitrot.
 Each typed volume quorum run captures bounded RustFS admin health samples before
 its probes/workload and after the workload/controller recheck; both samples
 require every non-target drive to be healthy and do not claim continuous health.
-A further five catalog entries remain qualification-only with status `Planned`
-(`fresh-volume-replacement`, admin decommission and
-rebalance, `on-disk-bitrot`, `stale-disk-return-detect`): they appear in
-`cargo run --bin s3chaos -- fault-catalog-json` but are filtered out of
-`make fault-list` and rejected by ordinary preflight and suite validation.
-Their concrete drivers are reachable only through the closed local
-qualification workflow described below.
+Three catalog entries remain qualification-only with status `Planned`:
+`admin-decommission`, `admin-rebalance`, and `stale-disk-return-detect`.
+Fresh-volume replacement and bitrot are executable through `fault-run` or a
+single-attempt `fault-suite-run`, with an explicit recovery case. Their four
+suite examples are in `fault/examples/`; each still requires dedicated storage,
+target proofs, destructive authorization, and the existing cleanup contracts.
+The existing `fault-qualify` interface remains available for all seven cases.
+
+```bash
+# After preparing the dedicated target and environment described below:
+export RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=fresh-volume-replacement-automatic-replacement
+make fault-run SCENARIO=fresh-volume-replacement
+# Or select the recovery case in a single-attempt suite:
+make fault-suite-run SUITE=fault/examples/on-disk-bitrot-admin-deep.yaml
+```
+
+Six further `Planned` entries record Mac Mini families that have no safe
+actuator yet (`io-eio-same-pod-two-volumes`, `network-partition-during-heal`,
+`clock-skew`, `credential-rotation-mid-load`, `network-split-brain`,
+`metadata-shard-corruption`). They are catalog-only and are not qualification
+cases. The coverage matrix is
+[`docs/MAC_MINI_CHAOS_COVERAGE.md`](docs/MAC_MINI_CHAOS_COVERAGE.md).
+
 Heal is a recovery mode of replacement and bitrot rather than a standalone
 healthy-cluster scenario. Long-running campaigns remain suite orchestration,
 not a fault backend or scenario family.
@@ -112,8 +130,11 @@ The ordered durability work queue and its safety prerequisites remain in
 Volume-quorum runs require matching RustFS non-target drive-health observations
 before and after the workload. These endpoint guards are not continuous health
 monitoring; live qualification is still required before release gating.
+The [independent calibration guide](docs/QUORUM_CALIBRATION.md) describes the
+required native helper image, multi-operation IOChaos probes, and dedicated
+`quorum-p-dm-eio` block-layer reference.
 
-### Planned reliability qualification
+### Reliability qualification
 
 List the seven closed qualification cases, derived from the Rust typed catalog,
 and run exactly one through the same health watcher, evidence capture, artifact
@@ -160,20 +181,25 @@ make fault-console-serve CONSOLE_ROOT='<printed-run-root>'
 ```
 
 Inspect and validate the captured run before setting its recorded context,
-namespace, and Tenant for `make fault-cleanup`. Planned qualification remains a
-single-run workflow and is intentionally unavailable through FaultSuite.
+namespace, and Tenant for `make fault-cleanup`. The three Planned scenarios
+remain unavailable through FaultSuite. Executable
+storage-recovery suites require exactly one scenario with one repetition and
+an explicit `budgets.maxDuration`.
+Single-scenario storage recovery uses `RUSTFS_FAULT_TEST_DURATION_SECONDS` as
+its total deadline; suites use their `budgets.maxDuration`.
 
 Ready-to-run suites under [`fault/examples/`](fault/examples/) keep different
 execution environments and verdicts separate:
 
 | Suite | Scope | Additional requirement |
 | --- | --- | --- |
-| `chaos-mesh.yaml` | Canonical 20-attempt correctness run: smoke, regression, four typed quorum checks, and the two-Pod quorum edge | Dedicated cluster with Chaos Mesh; reference four-server single-erasure-set topology for the write-quorum boundary |
+| `chaos-mesh.yaml` | Canonical 25-attempt correctness run: smoke, regression, four typed quorum checks, and the two-Pod quorum edge | Dedicated cluster with Chaos Mesh; reference four-server single-erasure-set topology for the write-quorum boundary. `pod-restart-storm` also needs the Chaos Mesh Schedule CRD |
 | `smoke.yaml` | Six short correctness and recovery checks across I/O, pod, and network faults | Dedicated cluster with Chaos Mesh |
-| `regression.yaml` | Remaining ordinary Chaos Mesh scenarios, including the write-quorum boundary | Reference four-server single-erasure-set topology for `network-partition-write-quorum-loss` |
+| `regression.yaml` | Remaining ordinary Chaos Mesh scenarios, including the write-quorum boundary, one-way partition, bursty loss, read-only IOChaos, multipart EIO, and the pod-kill schedule | Reference four-server single-erasure-set topology for `network-partition-write-quorum-loss` |
 | `quorum-reliability.yaml` | Four payload/metadata checks at the P and P+1 volume boundaries, plus the two-Pod quorum edge | Reference four-server single-erasure-set topology |
 | `restart.yaml` | Graceful single-Pod restart, ordered rolling restart, and held cold restart driven through kubectl (no Chaos Mesh, so run it with `make fault-suite-run`; `fault-chaos-run` rejects it) | StatefulSet-managed Tenant; `cluster-cold-restart` also needs `RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT` naming the RustFS operator Deployment it pauses |
-| `warp-performance.yaml` | Performance-only Warp-under-chaos campaign; correctness still comes from the normal checker | `warp` on `PATH`; Warp defaults to 60 seconds |
+| `warp-performance.yaml` | Performance-only Warp-under-chaos campaign; correctness still comes from the normal checker | `warp` on `PATH`; Warp defaults to 60 seconds. Writes `warp-powerloss-metrics.json` |
+| `warp-powerloss.yaml` | Same Warp campaign, named for the power-loss metrics artifact | `warp` on `PATH`. Peer A/B is offline only; see `docs/MAC_MINI_CHAOS_COVERAGE.md` |
 
 The Rust runner owns `budgets.maxDuration` for both `make fault-suite-run`
 and direct `s3chaos fault-suite-run` invocations. Expiration fails the suite,

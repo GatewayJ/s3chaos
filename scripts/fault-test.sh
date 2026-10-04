@@ -48,6 +48,9 @@ ACTIVE_SCOPE=""
 ACTIVE_NAME=""
 ACTIVE_HOST_MUTATION_STATE_FILE=""
 ACTIVE_HOST_MUTATION_STATE_TOKEN=""
+ACTIVE_QUORUM_DM_STATE_FILES=()
+ACTIVE_QUORUM_DM_STATE_TOKENS=()
+QUORUM_DM_TARGETS_JSON=""
 ACTIVE_QUALIFICATION_ROOT=""
 ACTIVE_QUALIFICATION_CASE=""
 FAULT_TEST_BINARY=""
@@ -64,22 +67,24 @@ Commands:
   chaos-plan <file>     Plan an ordinary Chaos Mesh-only suite.
   chaos-run <file>      Run an ordinary Chaos Mesh-only suite.
   dm-run <scenario>     Run exactly one supervised device-mapper scenario.
+  ack-calibration-run <file>
+                        Run one supervised strict or relaxed ACK control.
   list                  List catalog scenarios.
-  qualify-list          List closed planned-qualification cases.
-  qualify <case>        Run one supervised planned qualification.
+  qualify-list          List closed reliability qualification cases.
+  qualify <case>        Run one supervised reliability qualification.
   qualify-analyze <run-root>
                         Render machine-readable analysis for one qualification.
   suite-template        Print a YAML FaultSuite template.
   suite-validate <file> Validate a YAML FaultSuite contract.
   suite-plan <file>     Render the resolved destructive FaultSuite plan.
-  suite-run <file>      Run a non-static YAML FaultSuite sequentially.
+  suite-run <file>      Run a YAML suite; storage recovery requires one attempt.
   dashboard-install     Install/upgrade Chaos Mesh with Dashboard enabled.
   dashboard-port-forward [port]
                         Port-forward the Chaos Mesh Dashboard locally.
   cleanup               Remove managed Chaos and the owned fault namespace.
 
-RUSTFS_FAULT_TEST_EXPECTED_CONTEXT is optional for ordinary runs. Planned
-qualification requires an explicit expected context, namespace, and Tenant.
+RUSTFS_FAULT_TEST_EXPECTED_CONTEXT is optional for ordinary injection runs.
+Storage recovery and qualification require an explicit context, namespace, and Tenant.
 RUSTFS_FAULT_TEST_PROCESS_TERMINATION_GRACE_SECONDS controls the graceful
 shutdown window before non-storage runs are escalated to SIGKILL (default: 60).
 EOF
@@ -418,7 +423,7 @@ validate_qualification_env_contract() {
         stale-disk-return-detect)
           ;;
         *)
-          die "unsupported planned storage scenario: $scenario"
+          die "unsupported storage-recovery scenario: $scenario"
           ;;
       esac
       ;;
@@ -428,9 +433,67 @@ validate_qualification_env_contract() {
   esac
 }
 
+validate_quorum_dm_env_contract() {
+  require_nonempty_env RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS
+  require_nonempty_env RUSTFS_FAULT_TEST_RUN_ROOT
+  require_nonempty_env RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST
+  local opt_in root index node mapper mount pv observer_ns observer_pod state_file token parent
+  opt_in="$(printf '%s' "$RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE" | tr '[:upper:]' '[:lower:]')"
+  [[ "$opt_in" == 1 || "$opt_in" == true || "$opt_in" == yes ]] || die "quorum dm requires explicit destructive opt-in"
+  root="$(cd "$RUSTFS_FAULT_TEST_RUN_ROOT" && pwd -P)" || die "quorum dm run root must exist"
+  QUORUM_DM_TARGETS_JSON="$(cat "$RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS")" || die "cannot read quorum dm target file"
+  jq -e --arg nodes "$RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST" --arg devices "$RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST" --arg pvs "$RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST" '
+    def allowlist: split(",") | map(gsub("^\\s+|\\s+$"; "")) | sort;
+    type == "object" and (keys == ["targets"]) and (.targets | type == "array" and length == 2)
+    and all(.targets[]; (keys | sort) == (["node","mapperName","mountPath","persistentVolume","observerNamespace","observerPod","stateFile","stateToken"] | sort)
+      and all(.[]; type == "string" and length > 0))
+    and ([.targets[].node] | unique | length == 2)
+    and ([.targets[].persistentVolume] | unique | length == 2)
+    and ([.targets[].stateFile] | unique | length == 2)
+    and ([.targets[].stateToken] | unique | length == 2)
+    and ([.targets[].node] | sort) == ($nodes | allowlist)
+    and ([.targets[] | "/dev/mapper/" + .mapperName] | sort) == ($devices | allowlist)
+    and ([.targets[].persistentVolume] | sort) == ($pvs | allowlist)
+  ' <<<"$QUORUM_DM_TARGETS_JSON" >/dev/null || die "quorum dm requires exactly two closed targets matching node/device/PV allowlists"
+  ACTIVE_QUORUM_DM_STATE_FILES=()
+  ACTIVE_QUORUM_DM_STATE_TOKENS=()
+  for index in 0 1; do
+    node="$(jq -r ".targets[$index].node" <<<"$QUORUM_DM_TARGETS_JSON")"
+    mapper="$(jq -r ".targets[$index].mapperName" <<<"$QUORUM_DM_TARGETS_JSON")"
+    mount="$(jq -r ".targets[$index].mountPath" <<<"$QUORUM_DM_TARGETS_JSON")"
+    pv="$(jq -r ".targets[$index].persistentVolume" <<<"$QUORUM_DM_TARGETS_JSON")"
+    observer_ns="$(jq -r ".targets[$index].observerNamespace" <<<"$QUORUM_DM_TARGETS_JSON")"
+    observer_pod="$(jq -r ".targets[$index].observerPod" <<<"$QUORUM_DM_TARGETS_JSON")"
+    state_file="$(jq -r ".targets[$index].stateFile" <<<"$QUORUM_DM_TARGETS_JSON")"
+    token="$(jq -r ".targets[$index].stateToken" <<<"$QUORUM_DM_TARGETS_JSON")"
+    require_safe_node_name node "$node"
+    require_safe_dm_name mapper "$mapper"
+    require_absolute_non_root_path mount "$mount"
+    require_safe_node_name pv "$pv"
+    require_safe_node_name observerNamespace "$observer_ns"
+    require_safe_node_name observerPod "$observer_pod"
+    [[ "$observer_ns" != "$FAULT_NAMESPACE" ]] || die "quorum dm observers must be outside the disposable namespace"
+    [[ "$token" =~ ^[a-zA-Z0-9._-]{1,128}$ ]] || die "invalid quorum dm state token"
+    parent="$(dirname "$state_file")"
+    [[ "$parent" == "$root" || "$parent" == "$root/quorum-p-dm-eio" ]] || die "quorum dm state file must be inside this run artifact root"
+    [[ "$state_file" == "$parent/.host-mutation-$token.json" ]] || die "quorum dm state filename must match its token"
+    [[ ! -e "$state_file" && ! -L "$state_file" ]] || die "unresolved quorum dm state exists: $state_file"
+    [[ ! -L "$parent" ]] || die "quorum dm state directory must not be a symlink"
+    ACTIVE_QUORUM_DM_STATE_FILES+=("$state_file")
+    ACTIVE_QUORUM_DM_STATE_TOKENS+=("$token")
+  done
+}
+
 validate_dm_env_contract() {
   local scenario="$1"
   local dm_opt_in
+  if [[ "$scenario" == "quorum-p-dm-eio" ]]; then
+    validate_quorum_dm_env_contract
+    return
+  fi
   require_nonempty_env RUSTFS_FAULT_TEST_DM_NAME
   require_nonempty_env RUSTFS_FAULT_TEST_DM_NODE
   require_nonempty_env RUSTFS_FAULT_TEST_DM_MOUNT_PATH
@@ -659,6 +722,16 @@ preflight() {
   if [[ "$mode" == "qualification" ]]; then
     validate_qualification_env_contract \
       "$qualification_case" "$scenario" "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
+  elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+    require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE
+    qualification_case="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE"
+    local contract case_scenario case_kind storage_case
+    contract="$(qualification_case_contract "$qualification_case")" \
+      || die "unknown storage-recovery case: $qualification_case"
+    IFS=$'\t' read -r case_scenario case_kind storage_case <<<"$contract"
+    [[ "$case_scenario" == "$scenario" && "$case_kind" == "storage" ]] \
+      || die "storage-recovery case does not match scenario $scenario"
+    validate_qualification_env_contract "$qualification_case" "$scenario" storage "$storage_case"
   fi
   require_nonempty_env RUSTFS_FAULT_TEST_SERVER_IMAGE
 
@@ -689,7 +762,7 @@ preflight() {
   for tool in $(scenario_required_tools "$scenario"); do
     require_command "$tool"
   done
-  if [[ "$scenario" == "on-disk-bitrot" && "$mode" == "qualification" ]]; then
+  if [[ "$scenario" == "on-disk-bitrot" ]]; then
     target_config="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG"
     target_namespace="$(jq -er '.volume.namespace | strings | select(length > 0)' "$target_config")" \
       || die "bitrot target config lacks volume.namespace"
@@ -703,18 +776,30 @@ preflight() {
       || die "on-disk-bitrot requires a pre-created owned fault namespace with privileged Pod Security"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
       || die "on-disk-bitrot requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
+  elif [[ "$scenario" == "fresh-volume-replacement" ]]; then
+    kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 \
+      || die "$scenario requires a pre-created owned privileged namespace"
+    [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
+      || die "$scenario requires pod-security.kubernetes.io/enforce=privileged"
   elif scenario_requires_static_storage "$scenario"; then
     validate_dm_env_contract "$scenario"
-    kubectl_cluster -n "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE" \
-      get pod "$RUSTFS_FAULT_TEST_DM_OBSERVER_POD" >/dev/null \
-      || die "$scenario requires the configured pre-provisioned host observer Pod"
+    if [[ "$scenario" == "quorum-p-dm-eio" ]]; then
+      local index observer_ns observer_pod observer_node expected_node
+      for index in 0 1; do
+        observer_ns="$(jq -r ".targets[$index].observerNamespace" <<<"$QUORUM_DM_TARGETS_JSON")"
+        observer_pod="$(jq -r ".targets[$index].observerPod" <<<"$QUORUM_DM_TARGETS_JSON")"
+        expected_node="$(jq -r ".targets[$index].node" <<<"$QUORUM_DM_TARGETS_JSON")"
+        observer_node="$(kubectl_cluster -n "$observer_ns" get pod "$observer_pod" -o jsonpath='{.spec.nodeName}')" || die "quorum dm observer missing"
+        [[ "$observer_node" == "$expected_node" ]] || die "quorum dm observer is bound to another node"
+      done
+    else
+      kubectl_cluster -n "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE" \
+        get pod "$RUSTFS_FAULT_TEST_DM_OBSERVER_POD" >/dev/null \
+        || die "$scenario requires the configured pre-provisioned host observer Pod"
+    fi
     kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 || die "$scenario requires a pre-created owned fault namespace with privileged Pod Security"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] || die "$scenario requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
-  elif [[ "$qualification_case" == fresh-volume-replacement-* ]]; then
-    kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 \
-      || die "$qualification_case requires a pre-created owned fault namespace with privileged Pod Security"
-    [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
-      || die "$qualification_case requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
+
   fi
 
   echo "preflight passed: context=$FAULT_CONTEXT scenario=$scenario nodes=$ready_nodes storageClass=${RUSTFS_FAULT_TEST_STORAGE_CLASS} objects=$WORKLOAD_OBJECTS concurrency=$WORKLOAD_CONCURRENCY pods=$RUSTFS_POD_COUNT volume=$RUSTFS_VOLUME_PATH"
@@ -804,6 +889,25 @@ process_descends_from() {
 }
 
 host_storage_mutation_active() {
+  local parent="$1" state_file="$2" state_token="$3" index marker
+  for ((index=0; index<${#ACTIVE_QUORUM_DM_STATE_FILES[@]}; index++)); do
+    marker="${ACTIVE_QUORUM_DM_STATE_FILES[$index]}"
+    if [[ -e "$marker" || -L "$marker" ]]; then
+      # A malformed, foreign, or prepared marker is unresolved, not proof that
+      # either device is safe. Only removal after proven rollback releases KILL.
+      if ! jq -e --arg token "${ACTIVE_QUORUM_DM_STATE_TOKENS[$index]}" '
+        .schemaVersion == 1 and .token == $token and (.ownerPid | type == "number" and . > 0)
+        and (.phase == "prepared" or .phase == "activating" or .phase == "active" or .phase == "rollback")
+      ' "$marker" >/dev/null 2>&1; then
+        echo "warning: retaining process group for unresolved quorum dm marker: $marker" >&2
+      fi
+      return 0
+    fi
+  done
+  host_storage_single_mutation_active "$parent" "$state_file" "$state_token"
+}
+
+host_storage_single_mutation_active() {
   local parent="$1" state_file="$2" state_token="$3" owner phase token schema
   [[ -n "$state_file" && -n "$state_token" && -f "$state_file" ]] || return 1
   schema="$(jq -r '.schemaVersion // empty' "$state_file" 2>/dev/null)" || return 1
@@ -827,6 +931,15 @@ cleanup_host_mutation_state() {
   if [[ -n "$ACTIVE_HOST_MUTATION_STATE_FILE" && -e "$ACTIVE_HOST_MUTATION_STATE_FILE" ]]; then
     echo "warning: preserving unresolved host mutation state at $ACTIVE_HOST_MUTATION_STATE_FILE; verify device recovery before removing it" >&2
   fi
+  local marker index
+  for ((index=0; index<${#ACTIVE_QUORUM_DM_STATE_FILES[@]}; index++)); do
+    marker="${ACTIVE_QUORUM_DM_STATE_FILES[$index]}"
+    if [[ -e "$marker" || -L "$marker" ]]; then
+      echo "warning: preserving unresolved quorum dm state at $marker" >&2
+    fi
+  done
+  ACTIVE_QUORUM_DM_STATE_FILES=()
+  ACTIVE_QUORUM_DM_STATE_TOKENS=()
   ACTIVE_HOST_MUTATION_STATE_FILE=""
   ACTIVE_HOST_MUTATION_STATE_TOKEN=""
 }
@@ -1185,10 +1298,15 @@ run_scenario() {
   local -a qualification_env
   case "$qualification_kind" in
     ordinary)
+      storage_case=""
+      if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+        storage_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-}"
+        [[ -n "$storage_case" ]] || die "storage recovery requires an exact case"
+      fi
       qualification_env=(
         RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=
         RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=
-        RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=
+        "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=$storage_case"
       )
       ;;
     admin)
@@ -1222,6 +1340,11 @@ run_scenario() {
   fi
   capture_cluster_snapshot "$artifacts" before
   prepare_host_mutation_state "$artifacts"
+  if [[ "$scenario" == "quorum-p-dm-eio" ]]; then
+    [[ -n "$QUORUM_DM_TARGETS_JSON" && "${#ACTIVE_QUORUM_DM_STATE_FILES[@]}" == 2 ]] || die "quorum dm targets were not validated"
+    printf '%s\n' "$QUORUM_DM_TARGETS_JSON" >"$artifacts/quorum-dm-targets.json"
+    export RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS="$artifacts/quorum-dm-targets.json"
+  fi
 
   echo "starting scenario=$scenario artifacts=$artifacts"
   ACTIVE_ARTIFACTS="$artifacts"
@@ -1335,7 +1458,9 @@ run_one() {
   initialize_summary "$run_root"
   run_root="$(cd "$run_root" && pwd -P)"
   build_fault_binary "$run_root" "scenario=$scenario"
-  if [[ "$mode" == "dm" ]]; then
+  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+    require_supported_scenario "$scenario"
+  elif [[ "$mode" == "dm" ]]; then
     require_dm_scenario "$scenario"
   else
     require_non_dm_scenario "$scenario"
@@ -1465,10 +1590,8 @@ run_qualification() {
   write_qualification_plan \
     "$run_root" "$qualification_case" "$QUALIFICATION_SCENARIO" \
     "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
-  is_planned_scenario "$QUALIFICATION_SCENARIO" \
-    || die "qualification scenario is no longer Planned: $QUALIFICATION_SCENARIO"
   preflight "$QUALIFICATION_SCENARIO" qualification "$qualification_case"
-  echo "s3chaos planned qualification binary ready: case=$qualification_case"
+  echo "s3chaos qualification binary ready: case=$qualification_case"
 
   rc=0
   if run_scenario \
@@ -1595,12 +1718,18 @@ preflight_suite() {
   s3chaos_cli fault-suite-plan "$suite" >"$plan_path"
   if [[ "$mode" == "chaos" ]]; then
     require_ordinary_chaos_suite_plan "$plan_path"
+  elif [[ "$mode" == "ack-calibration" ]]; then
+    require_ack_calibration_suite_plan "$plan_path"
   else
     require_non_static_suite_plan "$plan_path"
   fi
   scenario="$(jq -r '.attempts[0].scenario // empty' "$plan_path")"
   [[ -n "$scenario" ]] || die "fault suite plan contains no attempts: $suite"
-  preflight "$scenario"
+  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+    RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE="$(jq -er '.attempts[0].execution.case' "$plan_path")" preflight "$scenario"
+  else
+    preflight "$scenario"
+  fi
   while IFS= read -r crd; do
     [[ -n "$crd" ]] || continue
     kubectl_cluster get crd "$crd" >/dev/null
@@ -1628,7 +1757,10 @@ is_ordinary_chaos_suite_plan() {
 
 require_non_static_suite_plan() {
   local plan_path="$1"
-  jq -e '.requiresStaticStorage == false' "$plan_path" >/dev/null \
+  jq -e '.requiresStaticStorage == false or
+    ((.attempts | length) == 1 and
+     (.attempts[0].scenario == "fresh-volume-replacement" or .attempts[0].scenario == "on-disk-bitrot") and
+     .attempts[0].execution.type == "storage-recovery")' "$plan_path" >/dev/null \
     || die "fault-suite-run does not execute device-mapper suites; run exactly one scenario in the foreground with make fault-dm-run SCENARIO=<name>"
 }
 
@@ -1636,6 +1768,25 @@ require_ordinary_chaos_suite_plan() {
   local plan_path="$1"
   is_ordinary_chaos_suite_plan "$plan_path" \
     || die "fault-chaos-run accepts only ordinary Chaos Mesh scenarios; use fault-suite-run for Warp or fault-dm-run for one device-mapper scenario"
+}
+
+require_ack_calibration_suite_plan() {
+  local plan_path="$1"
+  jq -e '
+    .requiresStaticStorage == true
+    and .requiresChaosMesh == false
+    and .budgets.stopOnFirstFailure == true
+    and .budgets.continueOnSeverities == []
+    and (.attempts | length == 1)
+    and (.attempts[0] |
+      .expectedBackend == "device-mapper"
+      and .requiresStaticStorage == true
+      and .requiresChaosMesh == false
+      and .execution.type == "injection"
+      and .workload.mode == "ack-triggered-quiet-mutation"
+      and (.ackTrigger.calibration_mode == "strict" or .ackTrigger.calibration_mode == "relaxed"))
+  ' "$plan_path" >/dev/null \
+    || die "ACK calibration requires exactly one strict or relaxed device-mapper ACK attempt with stop-on-failure supervision"
 }
 
 plan_chaos_suite() {
@@ -1871,6 +2022,11 @@ case "${1:-help}" in
     [[ -n "${2:-}" ]] || die "device-mapper scenario is required"
     [[ -z "${3:-}" ]] || die "dm-run accepts exactly one scenario"
     run_dm "$2"
+    ;;
+  ack-calibration-run)
+    [[ -n "${2:-}" ]] || die "ACK calibration suite yaml path is required"
+    [[ -z "${3:-}" ]] || die "ack-calibration-run accepts exactly one suite yaml path"
+    run_suite "$2" ack-calibration
     ;;
   list)
     [[ -z "${2:-}" ]] || die "list does not accept arguments; run a named scenario with: fault-test.sh run <scenario>"

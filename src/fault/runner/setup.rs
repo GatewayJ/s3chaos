@@ -25,10 +25,10 @@ use crate::{
         preflight::{PreflightCheck, PreflightPhase, TargetProof},
         reporting::FailureSummary,
         scenarios::{
-            FaultBackend, IO_EIO_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
-            POD_FAILURE_QUORUM_EDGE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+            FaultBackend, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+            POD_FAILURE_QUORUM_EDGE_SCENARIO, QUORUM_P_DM_EIO_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
             QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, acknowledged_mutation_kind,
-            requires_prefault_multipart_staging,
+            proves_single_volume_eio_tolerance, requires_prefault_multipart_staging,
         },
         workload::S3WorkloadClient,
     },
@@ -589,7 +589,7 @@ impl FaultRun<'_> {
         )?;
         let mut topology_observed_at_ms = None;
         let mut execution_injection = plan.fault().clone();
-        if plan.scenario == IO_EIO_SCENARIO {
+        if proves_single_volume_eio_tolerance(&plan.scenario) {
             events.record(
                 "volume-availability-topology-proof",
                 RunEventStatus::Started,
@@ -704,7 +704,9 @@ impl FaultRun<'_> {
         }
         if matches!(
             plan.scenario.as_str(),
-            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            QUORUM_P_IO_FAULT_SCENARIO
+                | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+                | QUORUM_P_DM_EIO_SCENARIO
         ) {
             events.record(
                 "volume-quorum-topology-proof",
@@ -840,6 +842,7 @@ impl FaultRun<'_> {
             None,
         )?;
         Ok(ProvenTarget {
+            quorum_probe_fixtures: BTreeMap::new(),
             pods_before,
             target_proof,
             topology_observed_at_ms,
@@ -858,10 +861,11 @@ impl FaultRun<'_> {
         let plan = self.plan;
         let run_id = &self.context.run_id;
         let events = &self.context.events;
-        let host_storage_required = plan
-            .faults()
-            .iter()
-            .any(|fault| fault.backend() == FaultBackend::DeviceMapper);
+        let host_storage_required = plan.scenario != QUORUM_P_DM_EIO_SCENARIO
+            && plan
+                .faults()
+                .iter()
+                .any(|fault| fault.backend() == FaultBackend::DeviceMapper);
         if host_storage_required {
             events.record(
                 "host-storage-mutation-preflight",

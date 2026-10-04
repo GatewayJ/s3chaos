@@ -27,7 +27,10 @@ use crate::{
         },
         host_storage::HostStorageMutationProof,
         plan::{FaultInjection, FaultKind, FaultPlan},
-        pods::{wait_for_rustfs_pod_deletion, wait_for_rustfs_pod_replacement},
+        pods::{
+            pod_deletion_observed, rustfs_pod_identities, wait_for_rustfs_pod_deletion,
+            wait_for_rustfs_pod_replacement,
+        },
         reporting::{FaultStatusSnapshot, PodIdentity},
         scenarios::{FaultBackend, FaultScenario},
     },
@@ -38,15 +41,19 @@ use crate::{
         kubectl::Kubectl,
     },
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 pub(in crate::fault) fn require_fault_backends(
     config: &FaultTestConfig,
     plan: &FaultPlan,
 ) -> Result<()> {
+    if plan.scenario == crate::fault::scenarios::QUORUM_P_DM_EIO_SCENARIO {
+        return super::quorum_dm::validate_config(config);
+    }
     require_fault_backend(config, plan.fault().backend(), plan.fault().kind())?;
     for fault in plan
         .faults()
@@ -67,7 +74,9 @@ pub(in crate::fault) fn preflight_host_storage_mutation(
     run_id: &str,
 ) -> Result<Option<HostStorageMutationProof>> {
     let injection = plan.fault();
-    if injection.backend() != FaultBackend::DeviceMapper {
+    if injection.backend() != FaultBackend::DeviceMapper
+        || scenario.name == crate::fault::scenarios::QUORUM_P_DM_EIO_SCENARIO
+    {
         return Ok(None);
     }
     let fault_name = format!("{}-00-{}", scenario.name, injection.kind().as_str());
@@ -93,7 +102,13 @@ fn require_fault_backend(
             chaos_mesh::require_iochaos_crd(cluster)?;
             require_tool("warp", ["--help"])
         }
-        FaultBackend::ChaosMeshPodChaos => chaos_mesh::require_podchaos_crd(cluster),
+        FaultBackend::ChaosMeshPodChaos => {
+            chaos_mesh::require_podchaos_crd(cluster)?;
+            if kind == FaultKind::RustfsServerPodKillStorm {
+                chaos_mesh::require_schedule_crd(cluster)?;
+            }
+            Ok(())
+        }
         FaultBackend::ChaosMeshNetworkChaos => chaos_mesh::require_networkchaos_crd(cluster),
         FaultBackend::ChaosMeshStressChaos => chaos_mesh::require_stresschaos_crd(cluster),
         FaultBackend::DeviceMapper => Ok(()),
@@ -167,6 +182,13 @@ struct ChaosFaultHandle {
 struct PodKillFaultHandle {
     guard: Box<ChaosGuard>,
     before_pods: Vec<PodIdentity>,
+    config: Box<ClusterTestConfig>,
+}
+
+struct PodKillStormFaultHandle {
+    guard: Box<ChaosGuard>,
+    before_pods: Vec<PodIdentity>,
+    victim: PodIdentity,
     config: Box<ClusterTestConfig>,
 }
 
@@ -291,6 +313,16 @@ fn apply_chaos_mesh_fault_backend(request: &FaultApplyRequest<'_>) -> Result<App
                 config: Box::new(request.config.cluster.clone()),
             }))
         }
+        chaos_mesh::AppliedFault::PodKillStorm {
+            guard,
+            before_pods,
+            victim,
+        } => Ok(Box::new(PodKillStormFaultHandle {
+            guard: Box::new(guard),
+            before_pods,
+            victim,
+            config: Box::new(request.config.cluster.clone()),
+        })),
     }
 }
 
@@ -373,6 +405,78 @@ impl FaultLifecyclePort for ChaosFaultHandle {
     }
 }
 
+impl FaultFailureArtifactSource for PodKillStormFaultHandle {
+    fn collect_failure_artifacts(
+        &self,
+        collector: &ArtifactCollector,
+        case_name: &str,
+        suffix: &str,
+    ) -> Result<()> {
+        collect_chaos_failure_artifacts(self.guard.as_ref(), collector, case_name, suffix)
+    }
+}
+
+impl FaultLifecyclePort for PodKillStormFaultHandle {
+    fn wait_active(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut last_status;
+        loop {
+            let armed = match self.guard.json() {
+                Ok(status) => {
+                    let armed = chaos_mesh::chaos_schedule_is_armed(&status)?;
+                    last_status = status;
+                    armed
+                }
+                Err(error) => {
+                    last_status = format!("failed to read schedule status: {error}");
+                    false
+                }
+            };
+            let victim_gone = match rustfs_pod_identities(&self.config) {
+                Ok(current) => pod_deletion_observed(std::slice::from_ref(&self.victim), &current),
+                Err(error) => {
+                    last_status = format!("{last_status}\npod inventory: {error}");
+                    false
+                }
+            };
+            if armed && victim_gone {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "timed out waiting for schedule/{name} to kill {} after {timeout:?}\nlast status:\n{last_status}",
+                    self.victim.name,
+                    name = self.guard.name(),
+                );
+            }
+            sleep(Duration::from_secs(1));
+        }
+    }
+
+    fn ensure_active(&self, stage: &str) -> Result<()> {
+        let status = self.guard.json()?;
+        ensure!(
+            chaos_mesh::chaos_schedule_is_armed(&status)?,
+            "schedule/{name} is not armed at {stage}; one kill was the activation proof and later kills are not counted\nstatus:\n{status}",
+            name = self.guard.name(),
+        );
+        Ok(())
+    }
+
+    fn delete(&mut self, timeout: Duration) -> Result<()> {
+        self.guard.delete(timeout)?;
+        wait_for_rustfs_pod_replacement(&self.config, &self.before_pods, timeout)
+    }
+
+    fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot> {
+        chaos_fault_snapshot(self.guard.as_ref(), stage)
+    }
+
+    fn failure_artifacts(&self) -> Option<&dyn FaultFailureArtifactSource> {
+        Some(self)
+    }
+}
+
 impl FaultFailureArtifactSource for PodKillFaultHandle {
     fn collect_failure_artifacts(
         &self,
@@ -439,6 +543,7 @@ impl FaultLifecyclePort for DmFlakeyFaultHandle {
                 "active" | "after-workload" => self.guard.ensure_active(stage)?,
                 _ => self.guard.snapshot(stage)?,
             }),
+            quorum_dm_status: None,
             lifecycle_status: None,
         })
     }
@@ -455,6 +560,7 @@ fn chaos_fault_snapshot(guard: &ChaosGuard, stage: &str) -> Result<FaultStatusSn
         resource_name: Some(guard.name().to_string()),
         chaos_status: Some(serde_json::from_str(&guard.json()?)?),
         dm_status: None,
+        quorum_dm_status: None,
         lifecycle_status: None,
     })
 }
@@ -1177,6 +1283,7 @@ mod tests {
                 resource_name: Some(self.name.to_string()),
                 chaos_status: None,
                 dm_status: None,
+                quorum_dm_status: None,
                 lifecycle_status: None,
             })
         }

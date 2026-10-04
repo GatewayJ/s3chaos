@@ -142,6 +142,7 @@ pub struct FaultTestConfig {
     /// Substring a container image of that Deployment must contain before
     /// it is paused, so a mistyped name can never scale a foreign workload.
     pub operator_image_match: String,
+    pub quorum_dm_targets: Option<PathBuf>,
     pub dm_name: Option<String>,
     pub dm_node: Option<String>,
     pub dm_mount_path: Option<String>,
@@ -413,6 +414,8 @@ impl FaultTestConfig {
                 );
                 percent
             },
+            quorum_dm_targets: env_optional(&get_env, "RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS")
+                .map(PathBuf::from),
             dm_name: env_optional(&get_env, "RUSTFS_FAULT_TEST_DM_NAME"),
             dm_node: env_optional(&get_env, "RUSTFS_FAULT_TEST_DM_NODE"),
             dm_mount_path: env_optional(&get_env, "RUSTFS_FAULT_TEST_DM_MOUNT_PATH"),
@@ -513,7 +516,11 @@ impl FaultTestConfig {
 }
 
 pub fn default_percent_for_scenario(scenario: &str) -> u8 {
-    if scenario == "disk-full" { 100 } else { 20 }
+    if scenario == "disk-full" || scenario == "io-read-only" {
+        100
+    } else {
+        20
+    }
 }
 
 pub(crate) fn validate_rustfs_volume_path(value: &str) -> Result<()> {

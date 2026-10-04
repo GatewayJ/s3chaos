@@ -20,7 +20,7 @@ Use the same explicit seed for both controls:
 export RUSTFS_FAULT_TEST_SEED=424242
 make fault-suite-validate SUITE=fault/examples/ack-put-strict.yaml
 make fault-suite-validate SUITE=fault/examples/ack-put-relaxed.yaml
-make fault-suite-run SUITE=fault/examples/ack-put-strict.yaml
+make fault-ack-calibration-run SUITE=fault/examples/ack-put-strict.yaml
 ```
 
 `ackCalibration: strict` sets both `RUSTFS_DURABILITY_MODE=strict` and
@@ -39,7 +39,7 @@ recorded context, namespace and Tenant, pin
 After preparing a fresh approved fixture with matching lab settings, run:
 
 ```bash
-make fault-suite-run SUITE=fault/examples/ack-put-relaxed.yaml
+make fault-ack-calibration-run SUITE=fault/examples/ack-put-relaxed.yaml
 ```
 
 The relaxed control must produce the declared product failure tied to the
@@ -49,7 +49,13 @@ failed drive can be masked by EC redundancy; if both modes pass, this detector
 is unqualified for the tested layout. Do not weaken the oracle or report that
 pair as calibrated. Investigate the crash window and failure scope separately.
 
-After both supervised runs, compare their exact emitted suite roots:
+The calibration entrypoint accepts exactly one ACK control with an explicit seed,
+`stopOnFirstFailure: true`, and no `continueOnSeverities`. It uses the device-mapper
+preflight, health watcher, process-group supervision and active rollback protection.
+
+After both supervised runs, compare the directories containing `suite-plan.json`
+and `suite-summary.json`. They are under the wrapper's emitted artifact root at
+`<suite-name>/suite-<id>`; the exact paths also appear in `suite.log`:
 
 ```bash
 cargo run --quiet --bin s3chaos -- fault-ack-calibration-analyze \
