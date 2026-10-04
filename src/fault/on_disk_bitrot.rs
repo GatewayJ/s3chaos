@@ -6401,6 +6401,8 @@ mod tests {
                 version_id: Some(receipt.version_id.clone()),
                 request_version_id: None,
                 is_delete_marker: None,
+                request_id: None,
+                extended_request_id: None,
                 mutation_max_attempts: None,
                 mutation_attempts: None,
                 read_purpose: None,

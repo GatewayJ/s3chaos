@@ -87,14 +87,30 @@ pub(crate) struct IoChaosRuntimeContract {
     pub duration_seconds: u64,
 }
 
+fn quorum_eio_methods(scenario: &str) -> Vec<String> {
+    if matches!(
+        scenario,
+        crate::fault::scenarios::QUORUM_P_IO_FAULT_SCENARIO
+            | crate::fault::scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+    ) {
+        ["READ", "WRITE", "FSYNC", "RENAME", "UNLINK"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    } else {
+        vec!["READ".to_string(), "WRITE".to_string()]
+    }
+}
+
 pub(crate) fn volume_fault_runtime_contract(
     injection: &FaultInjection,
+    scenario: &str,
 ) -> Result<IoChaosRuntimeContract> {
     let targeting = injection.volume_targeting()?;
     let (action, methods) = match injection.kind() {
         FaultKind::RustfsVolumeIoError => (
             IoChaosAction::Fault { errno: 5 },
-            vec!["READ".to_string(), "WRITE".to_string()],
+            quorum_eio_methods(scenario),
         ),
         FaultKind::RustfsVolumeEnospc => (
             IoChaosAction::Fault { errno: 28 },
@@ -1274,6 +1290,7 @@ impl IoChaosSpec {
         let short_run_id = run_id.chars().take(12).collect::<String>();
         let scenario = scenario.into();
 
+        let methods = quorum_eio_methods(&scenario);
         Ok(Self {
             name: format!("rustfs-fault-io-eio-{short_run_id}"),
             namespace: chaos_namespace.into(),
@@ -1284,7 +1301,7 @@ impl IoChaosSpec {
             container_name: "rustfs".to_string(),
             volume_path: volume_path.into(),
             path: None,
-            methods: vec!["READ".to_string(), "WRITE".to_string()],
+            methods,
             action: IoChaosAction::Fault { errno: 5 },
             percent,
             targets: None,
@@ -2445,7 +2462,8 @@ mod tests {
         .expect("fixed volume injection");
         let spec = build_fault_spec(&config, &scenario, &injection, "run-1", "", None)
             .expect("fault spec");
-        let runtime_contract = volume_fault_runtime_contract(&injection).expect("runtime contract");
+        let runtime_contract =
+            volume_fault_runtime_contract(&injection, &scenario.name).expect("runtime contract");
         let FaultSpec::Io(spec) = spec else {
             panic!("expected IOChaos spec")
         };
@@ -2585,8 +2603,8 @@ mod tests {
             },
         )
         .expect("latency injection");
-        let latency_runtime =
-            volume_fault_runtime_contract(&latency_injection).expect("latency runtime contract");
+        let latency_runtime = volume_fault_runtime_contract(&latency_injection, "io-latency")
+            .expect("latency runtime contract");
         let latency_contract = VolumeTargetEvidenceContract {
             runtime: &latency_runtime,
             ..contract
@@ -2613,8 +2631,8 @@ mod tests {
             Duration::from_secs(60),
         )
         .expect("mistake injection");
-        let mistake_runtime =
-            volume_fault_runtime_contract(&mistake_injection).expect("mistake runtime contract");
+        let mistake_runtime = volume_fault_runtime_contract(&mistake_injection, "io-corrupt-read")
+            .expect("mistake runtime contract");
         let mistake_contract = VolumeTargetEvidenceContract {
             runtime: &mistake_runtime,
             ..contract
