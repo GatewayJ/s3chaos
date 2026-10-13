@@ -25,6 +25,9 @@ workloadProfiles:
   network-clock:
     objects: 300
     concurrency: 12
+  bounded:
+    objects: 600
+    concurrency: 30
 scenarios:
   - name: io-eio
     faultDuration: 8m
@@ -169,3 +172,9 @@ scenarios:
     params:
       kind: clockSkew
       offsetSeconds: -120
+  - name: io-eio-same-pod-two-volumes
+    workloadProfile: bounded
+    params:
+      kind: samePodIo
+      secondVolumePath: /data/rustfs1
+    faultDuration: 8m

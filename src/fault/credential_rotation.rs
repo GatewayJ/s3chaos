@@ -625,6 +625,7 @@ impl LiveCredentialRotationDriver {
         crate::fault::runner::access::prepare_fault_fixture(
             &self.config.cluster,
             self.context.spec.isolation,
+            1,
         )?;
         let tenant = wait_for_ready_tenant(&self.config.cluster).await?;
         let tenant_uid = tenant.metadata.uid.context("rotation Tenant has no UID")?;

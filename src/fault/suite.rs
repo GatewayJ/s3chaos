@@ -1004,6 +1004,10 @@ scenarios:
                 "../../fault/examples/network-clock.yaml"
             ))
             .expect("network clock suite yaml"),
+            serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+                "../../fault/examples/io-eio-same-pod-two-volumes.yaml"
+            ))
+            .expect("same-Pod volume suite yaml"),
         ];
         let expected_profiles = focused
             .iter()
@@ -1024,7 +1028,7 @@ scenarios:
                 .iter()
                 .map(|scenario| scenario.repetitions)
                 .sum::<usize>(),
-            28
+            29
         );
         assert!(
             suite.scenarios.iter().all(|scenario| {

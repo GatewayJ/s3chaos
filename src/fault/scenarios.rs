@@ -2195,12 +2195,8 @@ pub fn planned_qualification_catalog_json() -> Result<String> {
 pub fn apply_catalog_defaults(config: &mut FaultTestConfig) -> Result<()> {
     let spec = scenario_spec(&config.scenario)?;
     spec.workload_profile.apply_to_config(config);
-    if matches!(
-        config.scenario.as_str(),
-        CREDENTIAL_ROTATION_MID_LOAD_SCENARIO | METADATA_SHARD_CORRUPTION_SCENARIO
-    ) {
-        config.workload_versioning = true;
-    }
+    config.workload_versioning =
+        expected_workload_versioning_for_scenario(&config.scenario, config.workload_versioning)?;
     if let Some(case) = StorageRecoveryCase::default_for_scenario(&config.scenario) {
         config.storage_recovery_case.get_or_insert(case);
     }
@@ -2219,7 +2215,6 @@ pub fn apply_catalog_defaults(config: &mut FaultTestConfig) -> Result<()> {
         config.scenario.as_str(),
         QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO | QUORUM_P_DM_EIO_SCENARIO
     ) {
-        config.workload_versioning = true;
         match config.scenario_parameters {
             FaultInjectionParameters::QuorumIo {
                 class: QuorumCaseClass::Payload,
@@ -2263,6 +2258,7 @@ pub fn expected_workload_versioning_for_scenario(scenario: &str, env_value: bool
                 | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
                 | QUORUM_P_DM_EIO_SCENARIO
                 | CREDENTIAL_ROTATION_MID_LOAD_SCENARIO
+                | METADATA_SHARD_CORRUPTION_SCENARIO
         ))
 }
 
@@ -2721,6 +2717,28 @@ mod tests {
                 .workload_profile,
             FaultScenarioWorkloadProfile::VersionedHotMutations
         );
+    }
+
+    #[test]
+    fn catalog_defaults_and_offline_versioning_agree_for_every_scenario() {
+        for scenario in super::FAULT_SCENARIO_CATALOG {
+            for env_value in [false, true] {
+                let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+                config.scenario = scenario.scenario.to_string();
+                config.workload_versioning = env_value;
+                apply_catalog_defaults(&mut config).expect("catalog defaults");
+                assert_eq!(
+                    config.workload_versioning,
+                    expected_workload_versioning_for_scenario(scenario.scenario, env_value)
+                        .expect("offline versioning"),
+                    "scenario {} with environment versioning {env_value}",
+                    scenario.scenario
+                );
+                if scenario.scenario == super::METADATA_SHARD_CORRUPTION_SCENARIO {
+                    assert!(config.workload_versioning);
+                }
+            }
+        }
     }
 
     #[test]

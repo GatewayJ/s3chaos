@@ -219,7 +219,8 @@ impl HealPartitionEvidence {
                 .pointer("/metadata/uid")
                 .and_then(Value::as_str)
                 .filter(|uid| !uid.trim().is_empty())
-                .context("partition controller snapshot lacks a resource UID")?;
+                .context("partition controller snapshot lacks a resource UID")?
+                .to_owned();
             ensure!(
                 resource_uid
                     .as_ref()
@@ -283,6 +284,15 @@ impl HealPartitionEvidence {
         for sample in before.into_iter().chain(active.iter().copied()) {
             validate_raw_heal_sample(sample, transcript, &self.identity.bucket, &self.replacement)?;
         }
+        validate_raw_heal_response(
+            progress
+                .last()
+                .context("owned heal has no terminal sample")?,
+            transcript,
+            &self.identity.bucket,
+            &self.replacement,
+            HealProgressState::Completed,
+        )?;
         let HealObserverIdentity::AdminOperation { operation_id } = &summary.observer else {
             anyhow::bail!("heal partition has another observer kind")
         };
@@ -372,6 +382,22 @@ pub(crate) fn validate_raw_heal_sample(
     bucket: &str,
     replacement: &StorageVolumeIdentity,
 ) -> Result<()> {
+    validate_raw_heal_response(
+        sample,
+        transcript,
+        bucket,
+        replacement,
+        HealProgressState::Running,
+    )
+}
+
+fn validate_raw_heal_response(
+    sample: &HealProgressSample,
+    transcript: &[HealWireReceipt],
+    bucket: &str,
+    replacement: &StorageVolumeIdentity,
+    expected_state: HealProgressState,
+) -> Result<()> {
     let HealObserverIdentity::AdminOperation { operation_id } = &sample.observer else {
         anyhow::bail!("partition requires an owned AdminDeep heal operation")
     };
@@ -394,8 +420,13 @@ pub(crate) fn validate_raw_heal_sample(
         "heal sample did not come from the exact owned-token status request"
     );
     let raw: Value = serde_json::from_str(&receipt.response_body)?;
+    let expected_summary = match expected_state {
+        HealProgressState::Running => "running",
+        HealProgressState::Completed => "finished",
+        _ => anyhow::bail!("partition status requires running or completed evidence"),
+    };
     ensure!(
-        raw.get("summary").and_then(Value::as_str) == Some("running")
+        raw.get("summary").and_then(Value::as_str) == Some(expected_summary)
             && raw
                 .pointer("/progress/objectsScanned")
                 .and_then(Value::as_u64)
@@ -409,8 +440,8 @@ pub(crate) fn validate_raw_heal_sample(
                 .and_then(Value::as_u64)
                 == Some(0)
             && sample.failed == 0
-            && sample.state == HealProgressState::Running,
-        "partition trigger is not derived from explicit nonterminal RustFS progress counters"
+            && sample.state == expected_state,
+        "partition status is not derived from the explicit owned RustFS state and progress counters"
     );
     let normalized: RustfsHealStatusResponse = serde_json::from_str(
         &sample
@@ -883,6 +914,32 @@ mod tests {
         body["chaos_status"]["metadata"]["uid"] = serde_json::json!("replacement-controller");
         snapshot.body = body.to_string();
         snapshot.sha256 = crate::fault::workload::sha256_hex(snapshot.body.as_bytes());
+        assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn heal_partition_completion_requires_the_owned_terminal_wire_receipt() {
+        let mut changed = chain_fixture();
+        changed.transcript.iter_mut().find(|receipt| receipt.observed_at_ms == 15000).unwrap().response_body =
+            r#"{"summary":"running","progress":{"objectsScanned":5,"objectsHealed":5,"objectsFailed":0}}"#.to_string();
+        assert!(changed.validate().is_err());
+        let mut changed = chain_fixture();
+        changed
+            .transcript
+            .retain(|receipt| receipt.observed_at_ms != 15000);
+        assert!(changed.validate().is_err());
+        let mut changed = chain_fixture();
+        changed
+            .transcript
+            .iter_mut()
+            .find(|receipt| receipt.observed_at_ms == 15000)
+            .unwrap()
+            .query
+            .insert("clientToken".to_string(), "foreign-token".to_string());
+        assert!(changed.validate().is_err());
+        let mut changed = chain_fixture();
+        changed.transcript.iter_mut().find(|receipt| receipt.observed_at_ms == 15000).unwrap().response_body =
+            r#"{"summary":"finished","progress":{"objectsScanned":5,"objectsHealed":4,"objectsFailed":0}}"#.to_string();
         assert!(changed.validate().is_err());
     }
 }

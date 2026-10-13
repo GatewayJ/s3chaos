@@ -1919,7 +1919,7 @@ scenarios:
             build_fault_suite_plan_expansion(suite, base, "chaos-suite-test".to_string())
                 .expect("canonical Chaos Mesh suite plan");
 
-        assert_eq!(expansion.plan.attempts.len(), 28);
+        assert_eq!(expansion.plan.attempts.len(), 29);
         assert!(expansion.plan.requires_chaos_mesh);
         assert!(!expansion.plan.requires_static_storage);
         assert!(expansion.plan.required_tools.is_empty());

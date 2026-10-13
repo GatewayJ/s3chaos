@@ -84,16 +84,7 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
 pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()> {
     scenarios::apply_catalog_defaults(&mut config)?;
     let reference_root = config.cluster.artifacts_dir.clone();
-    let deadline = if matches!(
-        config.scenario.as_str(),
-        scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO
-            | scenarios::ON_DISK_BITROT_SCENARIO
-            | scenarios::NETWORK_PARTITION_DURING_HEAL_SCENARIO
-    ) {
-        RunDeadline::new(Some(config.duration.as_secs()))?
-    } else {
-        RunDeadline::default()
-    };
+    let deadline = standalone_run_deadline(&config)?;
     run_prepared_scenario_with_config_and_reference_root(
         config,
         reference_root,
@@ -101,6 +92,13 @@ pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()>
         deadline,
     )
     .await
+}
+
+fn standalone_run_deadline(config: &FaultTestConfig) -> Result<RunDeadline> {
+    let bounded = config
+        .storage_recovery_case
+        .is_some_and(|case| case.is_fresh_volume_replacement() || case.is_corruption_recovery());
+    RunDeadline::new(bounded.then_some(config.duration.as_secs()))
 }
 
 pub(crate) async fn run_prepared_scenario_with_config_and_reference_root(
@@ -742,6 +740,27 @@ fn warp_recovery_bucket_name(run_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn standalone_replacement_and_corruption_cases_have_expiring_deadlines() {
+        let mut deadlines = Vec::new();
+        for case in crate::fault::storage_recovery::StorageRecoveryCase::ALL {
+            if case == crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn {
+                continue;
+            }
+            let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+            config.scenario = case.scenario().to_string();
+            config.storage_recovery_case = Some(case);
+            config.duration = std::time::Duration::from_secs(1);
+            deadlines.push(standalone_run_deadline(&config).unwrap());
+        }
+        let ordinary =
+            standalone_run_deadline(&FaultTestConfig::for_test("real-cluster", "fast-csi"))
+                .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert!(deadlines.iter().all(|deadline| deadline.check().is_err()));
+        assert!(ordinary.check().is_ok());
+    }
 
     #[test]
     fn fault_bucket_name_is_s3_compatible_and_run_scoped() {

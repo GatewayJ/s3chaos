@@ -1212,7 +1212,8 @@ impl PodFaultEvidence {
                 spec.workload.seed,
             );
             ensure!(
-                write.bucket == bucket
+                write.kind == OperationKind::Put
+                    && write.bucket == bucket
                     && write.started_at_ms >= side.started_at_ms
                     && write.ended_at_ms <= side.completed_at_ms
                     && write.key.as_deref() == Some(expected_object.spec.key.as_str())
@@ -1252,6 +1253,7 @@ mod tests {
         config::{FaultTestConfig, FaultWorkloadProfile},
         plan::FaultPlan,
         preflight::TargetResolvedPodProof,
+        quorum::{ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape},
         scenarios::{FaultScenario, scenario_spec},
         workload::WorkloadPlan,
     };
@@ -1524,6 +1526,381 @@ mod tests {
         require_blocked_write(&timeout).expect("sent request timed out");
         timeout.mutation_attempts = Some(0);
         assert!(require_blocked_write(&timeout).is_err());
+    }
+
+    struct SplitBrainChainFixture {
+        evidence: PodFaultEvidence,
+        proof: TargetProof,
+        spec: FaultRunSpec,
+        history: Vec<OperationRecord>,
+        side_history: Vec<OperationRecord>,
+        recovery_history: Vec<OperationRecord>,
+    }
+
+    fn split_brain_chain_fixture() -> SplitBrainChainFixture {
+        let (mut evidence, _, recovery_history) = split_brain_recovery_fixture(true, true);
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = NETWORK_SPLIT_BRAIN_SCENARIO.to_string();
+        config.duration = Duration::from_secs(120);
+        config.workload = FaultWorkloadProfile::new(40, 2).expect("workload");
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario(&scenario, catalog).expect("plan");
+        let shape = ErasureSetShape::from_runtime_single_set(4, 1, &[1], &[4], 2)
+            .expect("read quorum in both isolated pairs");
+        let membership = ErasureSetMembership::from_runtime(
+            &shape,
+            evidence
+                .pods
+                .iter()
+                .map(|pod| ErasureSetMember {
+                    pod_name: pod.name.clone(),
+                    server_endpoint: format!("http://{}.rustfs:9000", pod.name),
+                    shard_ids: vec![format!("drive-{}", pod.name)],
+                })
+                .collect(),
+        )
+        .expect("runtime membership");
+        let proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, &evidence.run_id)
+            .with_resolved_pod_proofs(evidence.pods.iter().map(|pod| {
+                let mut proof = TargetResolvedPodProof::new(&pod.name, &pod.uid)
+                    .with_ready(true)
+                    .with_node(&pod.node);
+                proof.rustfs_container_id = Some(pod.container_id.clone());
+                proof
+            }))
+            .with_erasure_set_topology_proven(
+                shape,
+                ErasureSetHealth::from_runtime(4, 4, 0, 0).expect("health"),
+                membership,
+                "deployment-split",
+                900,
+            )
+            .expect("topology proof");
+        let spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &WorkloadPlan::seeded(42, 40, 2),
+            &evidence.run_id,
+            "bucket",
+        );
+        evidence.source_pod_names = evidence.pods[..2]
+            .iter()
+            .map(|pod| pod.name.clone())
+            .collect();
+        evidence.peer_pod_names = evidence.pods[2..]
+            .iter()
+            .map(|pod| pod.name.clone())
+            .collect();
+        let mut controller: Value = serde_yaml_ng::from_str(
+            &chaos_mesh::NetworkChaosSpec::partition_between_rustfs_pods(
+                &config.cluster,
+                &evidence.chaos_namespace,
+                &evidence.run_id,
+                &evidence.scenario,
+                config.duration,
+                &evidence.source_pod_names,
+                &evidence.peer_pod_names,
+            )
+            .expect("scoped partition")
+            .manifest(),
+        )
+        .expect("manifest");
+        controller["metadata"]["uid"] = serde_json::json!("split-controller-generation");
+        let records = evidence
+            .pods
+            .iter()
+            .enumerate()
+            .map(|(index, pod)| {
+                serde_json::json!({"id": format!("{}/{}", pod.namespace, pod.name),
+                "selectorKey": if index < 2 { "." } else { ".Target" },
+                "phase": "Injected", "injectedCount": 1})
+            })
+            .collect::<Vec<_>>();
+        controller["status"] = serde_json::json!({"conditions": [
+            {"type": "Selected", "status": "True"}, {"type": "AllInjected", "status": "True"}],
+            "experiment": {"desiredPhase": "Run", "containerRecords": records}});
+        let matrix = |started_at_ms, active| {
+            evidence
+                .pods
+                .iter()
+                .flat_map(|source| {
+                    evidence
+                        .pods
+                        .iter()
+                        .filter(move |target| source != *target)
+                        .map(move |target| {
+                            let blocked = active
+                                && (source.name.as_str() < "rustfs-2")
+                                    != (target.name.as_str() < "rustfs-2");
+                            PodConnectivityObservation {
+                                source: source.clone(),
+                                target: target.clone(),
+                                started_at_ms,
+                                completed_at_ms: started_at_ms + 50,
+                                exit_code: Some(if blocked { 28 } else { 0 }),
+                                http_status: Some(if blocked { 0 } else { 200 }),
+                                connect_seconds: Some(if blocked { 0.0 } else { 0.001 }),
+                                remote_ip: (!blocked).then(|| target.pod_ip.clone()),
+                                stdout: if blocked {
+                                    "000\t0.000000\t".to_string()
+                                } else {
+                                    format!("200\t0.001000\t{}", target.pod_ip)
+                                },
+                                stderr: String::new(),
+                            }
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        evidence.observations = [
+            ObservationPhase::Baseline,
+            ObservationPhase::Active,
+            ObservationPhase::AfterWorkload,
+            ObservationPhase::Restored,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, phase)| {
+            let active = matches!(
+                phase,
+                ObservationPhase::Active | ObservationPhase::AfterWorkload
+            );
+            let started_at_ms = (index as u64 + 1) * 1_000;
+            PodFaultObservation {
+                phase,
+                started_at_ms,
+                completed_at_ms: started_at_ms + 100,
+                controller_before: active.then(|| controller.clone()),
+                controller_after: active.then(|| controller.clone()),
+                connectivity: matrix(started_at_ms, active),
+                clocks: Vec::new(),
+            }
+        })
+        .collect();
+        let temp = tempfile::tempdir().expect("temp");
+        let committed = Recorder::create(
+            temp.path().join("committed.jsonl"),
+            &evidence.scenario,
+            &evidence.run_id,
+        )
+        .expect("committed recorder");
+        let objects = (0..3)
+            .map(|index| ObjectSpec::prepare_seeded(&evidence.run_id, index, 4, 42))
+            .collect::<Vec<_>>();
+        for object in &objects {
+            let record = committed.begin(
+                OperationKind::Put,
+                "bucket",
+                Some(object.spec.key.clone()),
+                Some(object.spec.sha256.clone()),
+                Some(4),
+            );
+            committed
+                .finish(record, OperationOutcome::Ok, Some(200), None)
+                .expect("committed PUT");
+        }
+        let mut history = committed.records();
+        for (index, record) in history.iter_mut().enumerate() {
+            record.started_at_ms = 100 + index as u64 * 10;
+            record.ended_at_ms = record.started_at_ms + 1;
+        }
+        let sides = Recorder::create(
+            temp.path().join("sides.jsonl"),
+            &evidence.scenario,
+            &evidence.run_id,
+        )
+        .expect("side recorder");
+        sides.set_durability_cohort(DurabilityCohort::FaultActive);
+        for index in 0..2 {
+            let mut read_operation_ids = Vec::new();
+            for object in &objects {
+                let record = sides.begin(
+                    OperationKind::Get,
+                    "bucket",
+                    Some(object.spec.key.clone()),
+                    Some(object.spec.sha256.clone()),
+                    Some(4),
+                );
+                read_operation_ids.push(
+                    sides
+                        .finish(record, OperationOutcome::Ok, Some(200), None)
+                        .expect("committed GET")
+                        .id,
+                );
+            }
+            let object = ObjectSpec::prepare_write_probe(
+                WriteProbeScope::SplitBrain,
+                &evidence.run_id,
+                index,
+                4096,
+                42,
+            );
+            let mut write = sides.begin(
+                OperationKind::Put,
+                "bucket",
+                Some(object.spec.key),
+                Some(object.spec.sha256),
+                Some(object.spec.size_bytes),
+            );
+            write.mutation_max_attempts = Some(1);
+            write.mutation_attempts = Some(1);
+            let write = sides
+                .finish(
+                    write,
+                    if index == 0 {
+                        OperationOutcome::Timeout
+                    } else {
+                        OperationOutcome::Failed
+                    },
+                    if index == 0 { None } else { Some(503) },
+                    None,
+                )
+                .expect("blocked PUT");
+            let started_at_ms = 2_200 + index as u64 * 300;
+            evidence.sides.push(SplitBrainSideObservation {
+                pod: evidence.pods[index * 2].clone(),
+                started_at_ms,
+                completed_at_ms: started_at_ms + 100,
+                read_operation_ids,
+                write_operation_id: write.id,
+                controller_before: controller.clone(),
+                controller_after: controller.clone(),
+                proof_completed_at_ms: started_at_ms + 200,
+                connectivity_after: matrix(started_at_ms + 110, true),
+            });
+        }
+        let mut side_history = sides.records();
+        for (index, record) in side_history.iter_mut().enumerate() {
+            record.started_at_ms = 2_210 + (index / 4) as u64 * 300 + (index % 4) as u64 * 10;
+            record.ended_at_ms = record.started_at_ms + 1;
+        }
+        SplitBrainChainFixture {
+            evidence,
+            proof,
+            spec,
+            history,
+            side_history,
+            recovery_history,
+        }
+    }
+
+    #[test]
+    fn split_brain_complete_chain_distinguishes_blocked_writes_from_quorum_violations() {
+        let mut fixture = split_brain_chain_fixture();
+        fixture
+            .evidence
+            .validate(
+                &fixture.proof,
+                &fixture.spec,
+                &fixture.history,
+                &fixture.side_history,
+            )
+            .expect("complete isolated pairs with no ACK");
+        assert!(
+            fixture
+                .evidence
+                .validate_quorum_violation(
+                    &fixture.proof,
+                    &fixture.spec,
+                    &fixture.history,
+                    &fixture.side_history
+                )
+                .is_err()
+        );
+        fixture
+            .evidence
+            .validate_recovered_probes(&fixture.recovery_history, "bucket", 42)
+            .expect("unconfirmed writes materialized with exact generated bytes");
+        let write = fixture
+            .side_history
+            .iter_mut()
+            .find(|record| record.kind == OperationKind::Put)
+            .expect("side PUT");
+        write.outcome = OperationOutcome::Ok;
+        write.http_status = Some(200);
+        assert!(
+            fixture
+                .evidence
+                .validate(
+                    &fixture.proof,
+                    &fixture.spec,
+                    &fixture.history,
+                    &fixture.side_history
+                )
+                .is_err()
+        );
+        fixture
+            .evidence
+            .validate_quorum_violation(
+                &fixture.proof,
+                &fixture.spec,
+                &fixture.history,
+                &fixture.side_history,
+            )
+            .expect("ACK under the proved quorum cut");
+        for kind in [
+            OperationKind::Delete,
+            OperationKind::CompleteMultipartUpload,
+        ] {
+            let mut wrong_kind = fixture.side_history.clone();
+            wrong_kind
+                .iter_mut()
+                .find(|record| record.kind == OperationKind::Put)
+                .expect("side PUT")
+                .kind = kind;
+            assert!(
+                fixture
+                    .evidence
+                    .validate_quorum_violation(
+                        &fixture.proof,
+                        &fixture.spec,
+                        &fixture.history,
+                        &wrong_kind
+                    )
+                    .is_err()
+            );
+        }
+        let mut wrong_selector = fixture.evidence.clone();
+        wrong_selector.sides[0].controller_after["spec"]["selector"]["pods"] =
+            serde_json::json!({fixture.evidence.namespace.clone(): ["rustfs-0"]});
+        assert!(
+            wrong_selector
+                .validate_quorum_violation(
+                    &fixture.proof,
+                    &fixture.spec,
+                    &fixture.history,
+                    &fixture.side_history
+                )
+                .is_err()
+        );
+        let mut changed_generation = fixture.evidence.clone();
+        changed_generation.sides[0].pod.container_id = "replacement-container".to_string();
+        assert!(
+            changed_generation
+                .validate_quorum_violation(
+                    &fixture.proof,
+                    &fixture.spec,
+                    &fixture.history,
+                    &fixture.side_history
+                )
+                .is_err()
+        );
+        let mut wrong_reads = fixture.side_history.clone();
+        wrong_reads[0].value_sha256 = Some("f".repeat(64));
+        assert!(
+            fixture
+                .evidence
+                .validate_quorum_violation(
+                    &fixture.proof,
+                    &fixture.spec,
+                    &fixture.history,
+                    &wrong_reads
+                )
+                .is_err()
+        );
     }
 
     fn split_brain_recovery_fixture(
