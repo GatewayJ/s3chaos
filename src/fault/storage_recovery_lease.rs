@@ -79,6 +79,7 @@ impl StorageRecoveryCleanupProof {
                         context.case,
                         StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement
                             | StorageRecoveryCase::FreshVolumeReplacementAdminDeep
+                            | StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal
                             | StorageRecoveryCase::OnDiskBitrotAutomaticScanner
                             | StorageRecoveryCase::OnDiskBitrotAdminDeep
                             | StorageRecoveryCase::StaleDiskReturn
@@ -227,11 +228,7 @@ impl StorageRecoveryCleanupProof {
                 observed_at_ms,
             } => {
                 ensure!(
-                    matches!(
-                        context.case,
-                        StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement
-                            | StorageRecoveryCase::FreshVolumeReplacementAdminDeep
-                    ),
+                    context.case.is_fresh_volume_replacement(),
                     "fresh-volume cleanup proof is bound to another recovery case"
                 );
                 validate_receipt_operation(

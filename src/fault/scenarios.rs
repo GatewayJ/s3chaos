@@ -1765,27 +1765,29 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
     FaultScenarioSpec {
         scenario: NETWORK_PARTITION_DURING_HEAL_SCENARIO,
         detector: FaultDetectorSpec::gate_candidate(&[DurabilityBugFamily::HealRegression]),
-        case_name: "fault_network_partition_during_heal_requires_observable_progress",
-        description: "Planned network partition while a heal or rebuild is active. Heal progress is produced by the fresh-volume and bitrot storage-recovery workflows, which are not composable with NetworkChaos.",
+        case_name: "fault_network_partition_during_heal_recovers_replacement",
+        description: "Replace one run-owned Local PV, start a scoped AdminDeep heal, observe progressing nonterminal work, partition the replacement Pod from its peers, restore connectivity, and prove heal convergence and repaired-drive-dependent version reads.",
         priority: FaultPriority::P1,
         backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
-        workload_profile: FaultScenarioWorkloadProfile::Default,
-        isolation: FaultIsolation::FreshTenant,
-        crds: &[NETWORKCHAOS_CRD],
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
+        isolation: FaultIsolation::DedicatedLinuxBlockDevice,
+        crds: &[IOCHAOS_CRD, NETWORKCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
         boundary: "rustfs-reliability/partition-during-heal",
-        ci_phase: "planned",
-        target: "the Pod observed to be healing, partitioned only after heal progress is already moving",
+        ci_phase: "faults",
+        target: "the replacement Pod in a run-owned Local-PV Tenant, isolated from its exact complementary peer set only while the owned heal is progressing",
         target_proof: &[
             "a heal-progress sample from before the partition must show in-flight rebuild work",
-            "fresh-volume and bitrot heal transcripts do not provide a trigger for a concurrent NetworkChaos",
+            "the empty replacement generation and owned AdminDeep token must bind the progressing heal to the target drive and erasure set",
+            "pinned disjoint source/peer selectors, controller snapshots and Pod-network probes must prove the partition and subsequent restoration on unchanged Pod generations",
+            "a nonterminal heal response and exact-version S3 probes must overlap the active partition; an already completed or zero-progress heal fails qualification",
         ],
-        validation: "blocked until an executable scenario can observe heal progress on a healthy cluster and then apply a scoped NetworkChaos without inventing a second harness",
-        observability: "heal-progress.jsonl before, during, and after the partition",
+        validation: "owned heal progresses before and remains active during the proved partition, then reaches successful completion after connectivity is restored; repaired-drive-dependent reads, all committed versions and post-recovery writes pass",
+        observability: "heal-partition-proof.json, raw owned heal transcript, heal-progress.jsonl, generation/mapping/force-read receipts, network controller and connectivity observations, history and final checker",
         conflict_domain: "must not run beside another heal or network fault in the same Tenant",
     },
     FaultScenarioSpec {
@@ -1929,7 +1931,9 @@ impl FaultScenario {
         if config.qualify_planned_storage
             || matches!(
                 config.scenario.as_str(),
-                FRESH_VOLUME_REPLACEMENT_SCENARIO | ON_DISK_BITROT_SCENARIO
+                FRESH_VOLUME_REPLACEMENT_SCENARIO
+                    | ON_DISK_BITROT_SCENARIO
+                    | NETWORK_PARTITION_DURING_HEAL_SCENARIO
             )
         {
             ensure!(
@@ -1967,7 +1971,9 @@ impl FaultScenario {
         let spec = scenario_spec(&config.scenario)?;
         if matches!(
             spec.scenario,
-            FRESH_VOLUME_REPLACEMENT_SCENARIO | ON_DISK_BITROT_SCENARIO
+            FRESH_VOLUME_REPLACEMENT_SCENARIO
+                | ON_DISK_BITROT_SCENARIO
+                | NETWORK_PARTITION_DURING_HEAL_SCENARIO
         ) {
             ensure!(
                 config
@@ -1987,6 +1993,7 @@ impl FaultScenario {
                 spec.scenario,
                 FRESH_VOLUME_REPLACEMENT_SCENARIO
                     | ON_DISK_BITROT_SCENARIO
+                    | NETWORK_PARTITION_DURING_HEAL_SCENARIO
                     | STALE_DISK_RETURN_DETECT_SCENARIO
             )
             && config
@@ -2515,6 +2522,12 @@ mod tests {
                     "scenario": "fresh-volume-replacement",
                     "kind": "storage",
                     "storageRecoveryCase": "fresh-volume-replacement-admin-deep"
+                },
+                {
+                    "qualificationCase": "network-partition-during-heal-admin-deep",
+                    "scenario": "network-partition-during-heal",
+                    "kind": "storage",
+                    "storageRecoveryCase": "network-partition-during-heal-admin-deep"
                 },
                 {
                     "qualificationCase": "on-disk-bitrot-automatic-scanner",

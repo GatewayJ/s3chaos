@@ -2314,7 +2314,11 @@ fn validate_fault_artifacts_with_identity(
     ) {
         return validate_admin_execution_artifacts(options, identity, scenario_spec.case_name);
     }
-    if options.scenario == scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO {
+    if matches!(
+        options.scenario.as_str(),
+        scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO
+            | scenarios::NETWORK_PARTITION_DURING_HEAL_SCENARIO
+    ) {
         return validate_storage_recovery_execution_artifacts(
             options,
             identity,
@@ -3909,6 +3913,13 @@ fn validate_storage_recovery_execution_artifacts(
         &proof_history,
         &original_target_proof,
     )?;
+    if case == crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal {
+        let partition = read_json::<crate::fault::heal_partition::HealPartitionEvidence>(required(
+            &artifacts, crate::fault::heal_partition::HEAL_PARTITION_PROOF_ARTIFACT,
+        )?)?;
+        let transcript = read_json::<Vec<HealWireReceipt>>(required(&artifacts, FRESH_VOLUME_HEAL_TRANSCRIPT_ARTIFACT)?)?;
+        partition.validate_chain(&replacement, &summary, &progress, &history, &transcript, &read_proof)?;
+    }
     ensure!(
         read_proof.chaos_namespace() == json_spec.cluster.chaos_namespace
             && replacement.replacement.namespace == json_spec.cluster.namespace

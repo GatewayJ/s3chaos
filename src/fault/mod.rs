@@ -30,6 +30,7 @@ mod fault_artifacts;
 mod fault_lifecycle;
 pub mod fixture;
 pub mod fresh_volume;
+pub(crate) mod heal_partition;
 pub mod history;
 pub(crate) mod host_storage;
 pub(crate) mod node_down;

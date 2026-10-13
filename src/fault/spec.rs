@@ -543,7 +543,11 @@ impl FaultRunArtifactSpec {
             .into_iter()
             .map(str::to_string)
             .collect()
-        } else if scenario == FRESH_VOLUME_REPLACEMENT_SCENARIO {
+        } else if matches!(
+            scenario,
+            FRESH_VOLUME_REPLACEMENT_SCENARIO
+                | crate::fault::scenarios::NETWORK_PARTITION_DURING_HEAL_SCENARIO
+        ) {
             [
                 "run-spec.yaml",
                 "run-spec.json",
@@ -674,6 +678,9 @@ impl FaultRunArtifactSpec {
                 ]
                 .map(str::to_string),
             );
+        }
+        if scenario == crate::fault::scenarios::NETWORK_PARTITION_DURING_HEAL_SCENARIO {
+            names.push(crate::fault::heal_partition::HEAL_PARTITION_PROOF_ARTIFACT.to_string());
         }
         if scenario_spec(scenario).is_ok_and(|spec| {
             spec.backend == crate::fault::scenarios::FaultBackend::KubernetesLifecycle

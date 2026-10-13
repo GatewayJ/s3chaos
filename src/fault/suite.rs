@@ -529,6 +529,7 @@ impl ResolvedFaultSuiteScenario {
                 == matches!(
                     scenario.name.as_str(),
                     crate::fault::scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO
+                        | crate::fault::scenarios::NETWORK_PARTITION_DURING_HEAL_SCENARIO
                         | ON_DISK_BITROT_SCENARIO
                 ),
             "scenario {} requires storageRecoveryCase exactly for storage recovery",
@@ -2050,6 +2051,10 @@ scenarios:
             (
                 "fault/examples/fresh-volume-replacement-admin-deep.yaml",
                 crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
+            ),
+            (
+                "fault/examples/network-partition-during-heal.yaml",
+                crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal,
             ),
         ] {
             let suite = FaultSuite::from_yaml_path(path)

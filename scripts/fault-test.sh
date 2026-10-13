@@ -399,7 +399,7 @@ validate_qualification_env_contract() {
     storage)
       [[ "$storage_case" != "-" ]] || die "$qualification_case lacks its storage-recovery case"
       case "$scenario" in
-        fresh-volume-replacement)
+        fresh-volume-replacement|network-partition-during-heal)
           require_nonempty_env RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON
           require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_HELPER_IMAGE
           require_nonempty_env RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT
@@ -681,7 +681,7 @@ require_storage_class() {
   provisioner="$(kubectl_cluster get storageclass "$storage_class" -o json | jq -r '.provisioner // ""')"
   [[ -n "$provisioner" ]] || die "StorageClass $storage_class has no provisioner"
 
-  if [[ "$qualification_case" == fresh-volume-replacement-* ]]; then
+  if [[ "$qualification_case" == fresh-volume-replacement-* || "$scenario" == "network-partition-during-heal" ]]; then
     [[ "$provisioner" == "kubernetes.io/no-provisioner" ]] || die "$qualification_case requires a no-provisioner StorageClass"
   elif scenario_requires_static_storage "$scenario"; then
     [[ "$provisioner" == "kubernetes.io/no-provisioner" ]] || die "$scenario requires a no-provisioner StorageClass"
@@ -722,9 +722,13 @@ preflight() {
   if [[ "$mode" == "qualification" ]]; then
     validate_qualification_env_contract \
       "$qualification_case" "$scenario" "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
-  elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
-    require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE
-    qualification_case="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE"
+  elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" ]]; then
+    if [[ "$scenario" == "network-partition-during-heal" ]]; then
+      qualification_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-network-partition-during-heal-admin-deep}"
+    else
+      require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE
+      qualification_case="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE"
+    fi
     local contract case_scenario case_kind storage_case
     contract="$(qualification_case_contract "$qualification_case")" \
       || die "unknown storage-recovery case: $qualification_case"
@@ -776,7 +780,7 @@ preflight() {
       || die "on-disk-bitrot requires a pre-created owned fault namespace with privileged Pod Security"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
       || die "on-disk-bitrot requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
-  elif [[ "$scenario" == "fresh-volume-replacement" ]]; then
+  elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "network-partition-during-heal" ]]; then
     kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 \
       || die "$scenario requires a pre-created owned privileged namespace"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
@@ -1299,7 +1303,9 @@ run_scenario() {
   case "$qualification_kind" in
     ordinary)
       storage_case=""
-      if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+      if [[ "$scenario" == "network-partition-during-heal" ]]; then
+        storage_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-network-partition-during-heal-admin-deep}"
+      elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
         storage_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-}"
         [[ -n "$storage_case" ]] || die "storage recovery requires an exact case"
       fi
@@ -1458,7 +1464,7 @@ run_one() {
   initialize_summary "$run_root"
   run_root="$(cd "$run_root" && pwd -P)"
   build_fault_binary "$run_root" "scenario=$scenario"
-  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" ]]; then
     require_supported_scenario "$scenario"
   elif [[ "$mode" == "dm" ]]; then
     require_dm_scenario "$scenario"
@@ -1725,7 +1731,7 @@ preflight_suite() {
   fi
   scenario="$(jq -r '.attempts[0].scenario // empty' "$plan_path")"
   [[ -n "$scenario" ]] || die "fault suite plan contains no attempts: $suite"
-  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" ]]; then
     RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE="$(jq -er '.attempts[0].execution.case' "$plan_path")" preflight "$scenario"
   else
     preflight "$scenario"
@@ -1759,7 +1765,7 @@ require_non_static_suite_plan() {
   local plan_path="$1"
   jq -e '.requiresStaticStorage == false or
     ((.attempts | length) == 1 and
-     (.attempts[0].scenario == "fresh-volume-replacement" or .attempts[0].scenario == "on-disk-bitrot") and
+     (.attempts[0].scenario == "fresh-volume-replacement" or .attempts[0].scenario == "on-disk-bitrot" or .attempts[0].scenario == "network-partition-during-heal") and
      .attempts[0].execution.type == "storage-recovery")' "$plan_path" >/dev/null \
     || die "fault-suite-run does not execute device-mapper suites; run exactly one scenario in the foreground with make fault-dm-run SCENARIO=<name>"
 }

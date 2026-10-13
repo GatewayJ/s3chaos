@@ -85,7 +85,9 @@ pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()>
     let reference_root = config.cluster.artifacts_dir.clone();
     let deadline = if matches!(
         config.scenario.as_str(),
-        scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO | scenarios::ON_DISK_BITROT_SCENARIO
+        scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO
+            | scenarios::ON_DISK_BITROT_SCENARIO
+            | scenarios::NETWORK_PARTITION_DURING_HEAL_SCENARIO
     ) {
         RunDeadline::new(Some(config.duration.as_secs()))?
     } else {
