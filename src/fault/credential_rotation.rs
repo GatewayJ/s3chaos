@@ -36,11 +36,11 @@ use crate::{
         config::FaultTestConfig,
         events::RunEventStatus,
         history::{
-            DurabilityCohort, OperationKind, OperationOutcome, OperationRecord,
+            DurabilityCohort, OperationKind, OperationOutcome, OperationRecord, Recorder,
             validate_history_scope_and_order,
         },
         plan::{CredentialRotationExecutionPlan, ExecutionPlan},
-        pods::rustfs_pod_identities,
+        pods::{fixed_volume_container_ids, rustfs_pod_identities, rustfs_target_inventory},
         preflight::{PreflightCheck, PreflightPhase},
         recovery_health::{RECOVERY_HEALTH_ARTIFACT, RecoveryHealthBaseline},
         reporting::{PodIdentity, ResponsibilityDomain},
@@ -59,7 +59,10 @@ use crate::{
         port_forward::{PortForwardGuard, PortForwardSpec},
         resources,
     },
-    rustfs::{RustfsAdminTransport, SecretString, identity_admin::RustfsIdentityAdminClient},
+    rustfs::{
+        RustfsAdminTransport, SecretString,
+        identity_admin::{RustfsIdentityAdminClient, RustfsIdentityInventory},
+    },
 };
 
 pub(crate) const CREDENTIAL_ROTATION_ARTIFACT: &str = "credential-rotation.json";
@@ -129,9 +132,65 @@ pub(crate) struct PodCredentialProof {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CredentialCleanupEvidence {
     pub attempted: bool,
+    pub started_at_ms: Option<u64>,
+    pub removal_acknowledged_at_ms: Option<u64>,
+    pub pods: Vec<PodIdentityCleanupProof>,
     pub user_absent: bool,
     pub policy_absent: bool,
     pub completed_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CredentialPodGeneration {
+    pub pod_name: String,
+    pub pod_uid: String,
+    pub rustfs_container_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PodGenerationReceipt {
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+    pub response_body_sha256: String,
+    // Only metadata and runtime status are retained; Pod environment values
+    // can include credentials unrelated to the run-owned identity.
+    pub response: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct IdentityInventoryReceipt {
+    pub method: String,
+    pub path: String,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+    pub http_status: u16,
+    pub request_id: Option<String>,
+    pub response_body_sha256: String,
+    pub name_sha256: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CredentialCleanupAuthReceipt {
+    pub credential: CredentialIdentityProof,
+    pub operation: OperationRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PodIdentityCleanupProof {
+    pub pod: CredentialPodGeneration,
+    pub endpoint: String,
+    pub port_forward_command: String,
+    pub before: PodGenerationReceipt,
+    pub users: IdentityInventoryReceipt,
+    pub policies: IdentityInventoryReceipt,
+    pub old_auth: CredentialCleanupAuthReceipt,
+    pub new_auth: CredentialCleanupAuthReceipt,
+    pub after: PodGenerationReceipt,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +210,9 @@ pub(crate) struct CredentialRotationEvidence {
     pub identity_absent_before_create: bool,
     pub policy_absent_before_create: bool,
     pub policy_sha256: String,
+    pub policy_name_sha256: String,
     pub pods_before: Vec<PodIdentity>,
+    pub pod_generations_before: Vec<CredentialPodGeneration>,
     pub old_prefill_operation_ids: Vec<String>,
     pub old_workload_operation_ids: Vec<String>,
     pub rotation: Option<SecretRotationReceipt>,
@@ -196,6 +257,7 @@ impl CredentialRotationEvidence {
         ensure!(
             self.identity_absent_before_create
                 && self.policy_absent_before_create
+                && is_sha256(&self.policy_name_sha256)
                 && self.policy_sha256 == sha256_hex(bucket_policy(&self.bucket)?.as_bytes()),
             "credential fixture ownership or bucket policy proof is invalid"
         );
@@ -294,6 +356,7 @@ impl CredentialRotationEvidence {
             !expected_pods.is_empty() && expected_pods.len() == self.pods_before.len(),
             "credential rotation has an empty or duplicate Pod target set"
         );
+        self.validate_original_generations()?;
         let observed_pods = self
             .pod_auth
             .iter()
@@ -395,6 +458,170 @@ impl CredentialRotationEvidence {
         );
         Ok(())
     }
+
+    fn validate_original_generations(&self) -> Result<()> {
+        let mut names = BTreeSet::new();
+        let mut uids = BTreeSet::new();
+        let mut containers = BTreeSet::new();
+        for pod in &self.pod_generations_before {
+            ensure!(
+                !pod.pod_name.trim().is_empty()
+                    && !pod.pod_uid.trim().is_empty()
+                    && !pod.rustfs_container_id.trim().is_empty()
+                    && names.insert(&pod.pod_name)
+                    && uids.insert(&pod.pod_uid)
+                    && containers.insert(&pod.rustfs_container_id),
+                "credential rotation has an empty or duplicate original Pod generation"
+            );
+        }
+        ensure!(
+            !names.is_empty()
+                && self.pods_before.len() == names.len()
+                && self
+                    .pod_generations_before
+                    .iter()
+                    .map(|pod| (&pod.pod_name, &pod.pod_uid))
+                    .collect::<BTreeSet<_>>()
+                    == self
+                        .pods_before
+                        .iter()
+                        .map(|pod| (&pod.name, &pod.uid))
+                        .collect::<BTreeSet<_>>(),
+            "credential rotation original container generations do not cover the Pod set"
+        );
+        Ok(())
+    }
+
+    fn validate_cleanup_pods(&self, history: &[OperationRecord]) -> Result<()> {
+        self.validate_original_generations()?;
+        let started = self
+            .cleanup
+            .started_at_ms
+            .context("IAM cleanup has no start receipt")?;
+        let removed = self
+            .cleanup
+            .removal_acknowledged_at_ms
+            .context("IAM cleanup has no acknowledged removal receipt")?;
+        ensure!(
+            self.cleanup.attempted
+                && started > 0
+                && removed >= started
+                && history.iter().all(|record| record.ended_at_ms <= started),
+            "IAM cleanup removal interval is invalid"
+        );
+        ensure!(
+            self.cleanup.pods.len() == self.pod_generations_before.len(),
+            "IAM cleanup does not cover every original Pod generation"
+        );
+        let probe_key = cleanup_probe_key(self, history);
+        let mut seen = BTreeSet::new();
+        let mut auth_history = Vec::new();
+        for proof in &self.cleanup.pods {
+            ensure!(
+                seen.insert(&proof.pod.pod_name),
+                "IAM cleanup repeats a Pod"
+            );
+            self.validate_cleanup_pod(proof, &probe_key, removed)?;
+            auth_history.extend([
+                proof.old_auth.operation.clone(),
+                proof.new_auth.operation.clone(),
+            ]);
+        }
+        validate_history_scope_and_order(&auth_history, &self.scenario, &self.run_id, &self.bucket)
+    }
+
+    fn validate_cleanup_pod(
+        &self,
+        proof: &PodIdentityCleanupProof,
+        probe_key: &str,
+        removed_at_ms: u64,
+    ) -> Result<()> {
+        ensure!(
+            self.pod_generations_before.contains(&proof.pod),
+            "IAM cleanup contains a foreign or changed Pod generation"
+        );
+        let endpoint =
+            reqwest::Url::parse(&proof.endpoint).context("invalid IAM cleanup endpoint")?;
+        let port = endpoint
+            .port()
+            .context("IAM cleanup endpoint has no explicit port")?;
+        ensure!(
+            endpoint.scheme() == "http"
+                && endpoint.host_str() == Some("127.0.0.1")
+                && endpoint.path() == "/"
+                && endpoint.username().is_empty()
+                && endpoint.password().is_none()
+                && endpoint.query().is_none()
+                && endpoint.fragment().is_none()
+                && port > 0
+                && proof.port_forward_command
+                    == format!(
+                        "kubectl --context {} -n {} port-forward pod/{} {port}:9000",
+                        self.context, self.namespace, proof.pod.pod_name
+                    ),
+            "IAM cleanup is not bound to the original Pod's direct endpoint"
+        );
+        for capture in [&proof.before, &proof.after] {
+            ensure!(
+                capture.started_at_ms >= removed_at_ms
+                    && capture.ended_at_ms >= capture.started_at_ms
+                    && is_sha256(&capture.response_body_sha256)
+                    && pod_generation(&capture.response, &self.namespace, &self.tenant)?
+                        == proof.pod,
+                "IAM cleanup Pod UID or RustFS container generation changed"
+            );
+        }
+        let inventories = [
+            (
+                &proof.users,
+                "/rustfs/admin/v3/list-users",
+                &self.old_credential.principal_sha256,
+            ),
+            (
+                &proof.policies,
+                "/rustfs/admin/v3/list-canned-policies",
+                &self.policy_name_sha256,
+            ),
+        ];
+        for (receipt, path, identity) in inventories {
+            ensure!(
+                receipt.method == "GET"
+                    && receipt.path == path
+                    && receipt.http_status == 200
+                    && receipt.started_at_ms >= proof.before.ended_at_ms
+                    && receipt.ended_at_ms >= receipt.started_at_ms
+                    && receipt.ended_at_ms <= proof.after.started_at_ms
+                    && is_sha256(&receipt.response_body_sha256)
+                    && receipt.name_sha256.iter().all(|name| is_sha256(name))
+                    && receipt.name_sha256.iter().collect::<BTreeSet<_>>().len()
+                        == receipt.name_sha256.len()
+                    && !receipt.name_sha256.contains(identity),
+                "IAM cleanup found a stale user/policy cache or invalid inventory response"
+            );
+        }
+        for (auth, credential) in [
+            (&proof.old_auth, &self.old_credential),
+            (&proof.new_auth, &self.new_credential),
+        ] {
+            let record = &auth.operation;
+            ensure!(
+                &auth.credential == credential
+                    && record.scenario == self.scenario
+                    && record.run_id.as_deref() == Some(self.run_id.as_str())
+                    && record.bucket == self.bucket
+                    && record.key.as_deref() == Some(probe_key)
+                    && record.kind == OperationKind::Get
+                    && record.version_id.is_none()
+                    && record.range.is_none()
+                    && record.started_at_ms >= proof.before.ended_at_ms
+                    && record.ended_at_ms >= record.started_at_ms
+                    && record.ended_at_ms <= proof.after.started_at_ms
+                    && is_auth_rejection(record),
+                "IAM cleanup lacks rejected old/new credentials on the original Pod"
+            );
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn validate_credential_rotation_evidence(
@@ -413,6 +640,14 @@ pub(crate) fn validate_credential_rotation_evidence(
                 .completed_at_ms
                 .is_some_and(|value| value > 0),
         "credential rotation lacks successful verification or IAM fixture cleanup"
+    );
+    evidence.validate_cleanup_pods(history)?;
+    ensure!(
+        evidence.cleanup.pods.iter().all(|proof| evidence
+            .cleanup
+            .completed_at_ms
+            .is_some_and(|completed| completed >= proof.after.ended_at_ms)),
+        "IAM cleanup completion predates a Pod response receipt"
     );
     ensure!(
         checker.scenario == evidence.scenario
@@ -450,6 +685,71 @@ fn require_committed_put(record: &OperationRecord) -> Result<()> {
 
 fn is_auth_rejection(record: &OperationRecord) -> bool {
     record.outcome == OperationOutcome::Failed && matches!(record.http_status, Some(401 | 403))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn cleanup_probe_key(evidence: &CredentialRotationEvidence, history: &[OperationRecord]) -> String {
+    history
+        .iter()
+        .find(|record| {
+            evidence.old_prefill_operation_ids.first() == Some(&record.id)
+                || (evidence.old_prefill_operation_ids.is_empty()
+                    && record.kind == OperationKind::Put
+                    && record.outcome == OperationOutcome::Ok)
+        })
+        .and_then(|record| record.key.clone())
+        .unwrap_or_else(|| ObjectSpec::seeded_key(&evidence.run_id, 0))
+}
+
+fn pod_generation(
+    response: &serde_json::Value,
+    namespace: &str,
+    tenant: &str,
+) -> Result<CredentialPodGeneration> {
+    let text = |path: &str| -> Result<String> {
+        response
+            .pointer(path)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .with_context(|| format!("IAM cleanup Pod response lacks {path}"))
+    };
+    ensure!(
+        text("/metadata/namespace")? == namespace
+            && text("/metadata/labels/rustfs.tenant")? == tenant
+            && crate::fault::pods::pod_is_ready(response),
+        "IAM cleanup Pod is unready or belongs to another namespace/Tenant"
+    );
+    let statuses = response
+        .pointer("/status/containerStatuses")
+        .and_then(serde_json::Value::as_array)
+        .context("IAM cleanup Pod lacks container status")?;
+    let mut rustfs = statuses
+        .iter()
+        .filter(|status| status.get("name").and_then(serde_json::Value::as_str) == Some("rustfs"));
+    let status = rustfs
+        .next()
+        .context("IAM cleanup Pod lacks RustFS container")?;
+    ensure!(
+        rustfs.next().is_none()
+            && status
+                .pointer("/state/running")
+                .is_some_and(serde_json::Value::is_object),
+        "IAM cleanup RustFS container is not uniquely running"
+    );
+    let id = status
+        .get("containerID")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .context("IAM cleanup Pod lacks RustFS container ID")?;
+    Ok(CredentialPodGeneration {
+        pod_name: text("/metadata/name")?,
+        pod_uid: text("/metadata/uid")?,
+        rustfs_container_id: id.to_string(),
+    })
 }
 
 fn bucket_policy(bucket: &str) -> Result<String> {
@@ -531,6 +831,7 @@ impl LiveCredentialRotationDriver {
             admin_access,
             admin_secret,
         ])?;
+        let policy_name = format!("rotation-policy-{}", Uuid::new_v4().simple());
         let evidence = CredentialRotationEvidence {
             schema_version: 1,
             scenario: scenario.name.clone(),
@@ -546,7 +847,9 @@ impl LiveCredentialRotationDriver {
             identity_absent_before_create: false,
             policy_absent_before_create: false,
             policy_sha256: sha256_hex(bucket_policy(&context.bucket)?.as_bytes()),
+            policy_name_sha256: sha256_hex(policy_name.as_bytes()),
             pods_before: Vec::new(),
+            pod_generations_before: Vec::new(),
             old_prefill_operation_ids: Vec::new(),
             old_workload_operation_ids: Vec::new(),
             rotation: None,
@@ -568,7 +871,7 @@ impl LiveCredentialRotationDriver {
             deadline,
             old,
             new,
-            policy_name: format!("rotation-policy-{}", Uuid::new_v4().simple()),
+            policy_name,
             evidence: Arc::new(Mutex::new(evidence)),
             state: tokio::sync::Mutex::new(RotationState {
                 identity_guard: None,
@@ -635,7 +938,24 @@ impl LiveCredentialRotationDriver {
             self.config.rustfs_pod_stable_window,
         )
         .await?;
-        let pods = rustfs_pod_identities(&self.config.cluster)?;
+        let inventory = rustfs_target_inventory(&self.config.cluster, false, false)?;
+        let containers = fixed_volume_container_ids(
+            &inventory.pod_proofs,
+            &inventory
+                .identities
+                .iter()
+                .map(|pod| pod.name.clone())
+                .collect(),
+        )?;
+        let generations = inventory
+            .identities
+            .iter()
+            .map(|pod| CredentialPodGeneration {
+                pod_name: pod.name.clone(),
+                pod_uid: pod.uid.clone(),
+                rustfs_container_id: containers[&pod.name].clone(),
+            })
+            .collect();
         let (endpoint, forward) = s3_access(&self.config)?;
         self.state.lock().await.port_forward = forward;
         {
@@ -671,7 +991,9 @@ impl LiveCredentialRotationDriver {
             let mut evidence = self.evidence();
             evidence.tenant_uid = tenant_uid;
             evidence.deployment_id = layout.deployment_id.clone();
-            evidence.pods_before = pods;
+            evidence.pods_before = inventory.identities;
+            evidence.pod_generations_before = generations;
+            evidence.validate_original_generations()?;
             evidence.identity_absent_before_create = true;
             evidence.policy_absent_before_create = true;
         }
@@ -679,9 +1001,20 @@ impl LiveCredentialRotationDriver {
         // Arm before the first mutation: losing a create response still owns
         // this unique, previously absent identity and requires removal.
         let guard = IdentityCleanupGuard {
-            admin: admin.clone(),
-            access_key: SecretString::new(self.old.access_key())?,
-            policy_name: self.policy_name.clone(),
+            port: Arc::new(LiveIdentityCleanupPort {
+                config: self.config.clone(),
+                admin: admin.clone(),
+                old: self.old.clone(),
+                new: self.new.clone(),
+                policy_name: self.policy_name.clone(),
+                bucket: self.context.bucket.clone(),
+            }),
+            history: self.context.history.clone(),
+            timeout: self
+                .config
+                .cluster
+                .timeout
+                .min(CANCELLATION_CLEANUP_TIMEOUT),
             collector: self.collector.clone(),
             case_name: self.scenario.case_name,
             evidence: self.evidence.clone(),
@@ -1218,10 +1551,231 @@ impl AdminCaseDriver for LiveCredentialRotationDriver {
     }
 }
 
-struct IdentityCleanupGuard {
+#[async_trait]
+trait IdentityCleanupPort: Send + Sync {
+    fn redact_history(&self, history: &Recorder) -> Result<()>;
+    async fn remove_identity(&self) -> Result<()>;
+    async fn verify_pod(
+        &self,
+        pod: &CredentialPodGeneration,
+        key: &str,
+        history: &Recorder,
+        deadline: Instant,
+    ) -> Result<PodIdentityCleanupProof>;
+}
+
+struct LiveIdentityCleanupPort {
+    config: FaultTestConfig,
     admin: Arc<RustfsIdentityAdminClient>,
-    access_key: SecretString,
+    old: RotationCredential,
+    new: RotationCredential,
     policy_name: String,
+    bucket: String,
+}
+
+impl LiveIdentityCleanupPort {
+    async fn capture_pod(
+        &self,
+        pod: &CredentialPodGeneration,
+        deadline: Instant,
+    ) -> Result<PodGenerationReceipt> {
+        let started_at_ms = now_ms();
+        let output = Kubectl::new(&self.config.cluster)
+            .namespaced(&self.config.cluster.test_namespace)
+            .command(["get", "pod", &pod.pod_name, "-o", "json"])
+            .run_bounded(cleanup_remaining(deadline)?)
+            .await?;
+        let ended_at_ms = now_ms();
+        ensure!(output.code == Some(0), "IAM cleanup Pod query failed");
+        let raw: serde_json::Value =
+            serde_json::from_str(&output.stdout).context("parse IAM cleanup Pod query response")?;
+        let mut metadata = serde_json::json!({
+            "name": raw.pointer("/metadata/name"),
+            "uid": raw.pointer("/metadata/uid"),
+            "namespace": raw.pointer("/metadata/namespace"),
+            "labels": { "rustfs.tenant": raw.pointer("/metadata/labels/rustfs.tenant") }
+        });
+        if let Some(deletion) = raw
+            .pointer("/metadata/deletionTimestamp")
+            .filter(|value| !value.is_null())
+        {
+            metadata["deletionTimestamp"] = deletion.clone();
+        }
+        let response = serde_json::json!({
+            "metadata": metadata,
+            "status": {
+                "conditions": raw.pointer("/status/conditions").and_then(serde_json::Value::as_array)
+                    .into_iter().flatten().map(|condition| serde_json::json!({
+                        "type": condition.get("type"), "status": condition.get("status")
+                    })).collect::<Vec<_>>(),
+                "containerStatuses": raw.pointer("/status/containerStatuses").and_then(serde_json::Value::as_array)
+                    .into_iter().flatten().map(|container| serde_json::json!({
+                        "name": container.get("name"), "containerID": container.get("containerID"),
+                        "state": { "running": container.pointer("/state/running") }
+                    })).collect::<Vec<_>>()
+            }
+        });
+        Ok(PodGenerationReceipt {
+            started_at_ms,
+            ended_at_ms,
+            response_body_sha256: sha256_hex(output.stdout.as_bytes()),
+            response,
+        })
+    }
+
+    async fn auth_receipt(
+        &self,
+        endpoint: &str,
+        credential: &RotationCredential,
+        key: &str,
+        history: &Recorder,
+        deadline: Instant,
+    ) -> Result<CredentialCleanupAuthReceipt> {
+        let s3 = S3WorkloadClient::new_without_retries(
+            endpoint,
+            &self.bucket,
+            credential.access_key(),
+            credential.secret_key(),
+            self.config
+                .request_timeout
+                .min(cleanup_remaining(deadline)?),
+        )
+        .await?
+        .with_request_deadline(deadline);
+        let result = s3.get_object_recorded_result(key, history).await?;
+        let operation = history
+            .records()
+            .into_iter()
+            .find(|record| record.id == result.operation_id)
+            .context("IAM cleanup authentication response record is absent")?;
+        Ok(CredentialCleanupAuthReceipt {
+            credential: credential.artifact(),
+            operation,
+        })
+    }
+}
+
+#[async_trait]
+impl IdentityCleanupPort for LiveIdentityCleanupPort {
+    fn redact_history(&self, history: &Recorder) -> Result<()> {
+        let (access, secret) = resources::test_credentials();
+        history.redact_secrets(&[
+            self.old.access_key(),
+            self.old.secret_key(),
+            self.new.secret_key(),
+            access,
+            secret,
+        ])
+    }
+
+    async fn remove_identity(&self) -> Result<()> {
+        let user = self.admin.remove_user(self.old.access_key()).await;
+        let policy = self.admin.remove_policy(&self.policy_name).await;
+        user.and(policy).map_err(Into::into)
+    }
+
+    async fn verify_pod(
+        &self,
+        pod: &CredentialPodGeneration,
+        key: &str,
+        history: &Recorder,
+        deadline: Instant,
+    ) -> Result<PodIdentityCleanupProof> {
+        cleanup_remaining(deadline)?;
+        let spec = PortForwardSpec::pod_on_available_port(
+            &self.config.cluster.test_namespace,
+            &pod.pod_name,
+            9000,
+        )?;
+        let endpoint = spec.local_base_url();
+        let mut forward = spec.start_with_temp_log(&Kubectl::new(&self.config.cluster))?;
+        wait_for_tenant_s3(&mut forward, &endpoint, cleanup_remaining(deadline)?).await?;
+        let before = self.capture_pod(pod, deadline).await?;
+        ensure!(
+            pod_generation(
+                &before.response,
+                &self.config.cluster.test_namespace,
+                &self.config.cluster.tenant_name
+            )? == *pod,
+            "IAM cleanup Pod generation changed before authenticated requests"
+        );
+        let (access, secret) = resources::test_credentials();
+        let admin = RustfsIdentityAdminClient::from_transport(RustfsAdminTransport::new(
+            &endpoint,
+            "us-east-1",
+            access,
+            secret,
+            None,
+            "s3chaos-fault-identity-cleanup",
+        )?);
+        let started = now_ms();
+        let users = inventory_receipt(
+            admin.users_inventory().await?,
+            "/rustfs/admin/v3/list-users",
+            started,
+        );
+        let started = now_ms();
+        let policies = inventory_receipt(
+            admin.policies_inventory().await?,
+            "/rustfs/admin/v3/list-canned-policies",
+            started,
+        );
+        let old_auth = self
+            .auth_receipt(&endpoint, &self.old, key, history, deadline)
+            .await?;
+        let new_auth = self
+            .auth_receipt(&endpoint, &self.new, key, history, deadline)
+            .await?;
+        let after = self.capture_pod(pod, deadline).await?;
+        forward.ensure_running()?;
+        Ok(PodIdentityCleanupProof {
+            pod: pod.clone(),
+            endpoint,
+            port_forward_command: forward.command_display().to_string(),
+            before,
+            users,
+            policies,
+            old_auth,
+            new_auth,
+            after,
+        })
+    }
+}
+
+fn inventory_receipt(
+    inventory: RustfsIdentityInventory,
+    path: &str,
+    started_at_ms: u64,
+) -> IdentityInventoryReceipt {
+    IdentityInventoryReceipt {
+        method: "GET".to_string(),
+        path: path.to_string(),
+        started_at_ms,
+        ended_at_ms: now_ms(),
+        http_status: inventory.response.status,
+        request_id: inventory.response.request_id,
+        response_body_sha256: sha256_hex(&inventory.response.body),
+        name_sha256: inventory
+            .names
+            .iter()
+            .map(|name| sha256_hex(name.as_bytes()))
+            .collect(),
+    }
+}
+
+fn cleanup_remaining(deadline: Instant) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    ensure!(
+        !remaining.is_zero(),
+        "IAM identity cleanup exceeded its timeout"
+    );
+    Ok(remaining)
+}
+
+struct IdentityCleanupGuard {
+    port: Arc<dyn IdentityCleanupPort>,
+    history: Recorder,
+    timeout: Duration,
     collector: ArtifactCollector,
     case_name: &'static str,
     evidence: Arc<Mutex<CredentialRotationEvidence>>,
@@ -1231,9 +1785,9 @@ struct IdentityCleanupGuard {
 impl IdentityCleanupGuard {
     async fn cleanup(&self) -> Result<()> {
         cleanup_identity(
-            &self.admin,
-            self.access_key.expose(),
-            &self.policy_name,
+            self.port.as_ref(),
+            &self.history,
+            self.timeout,
             &self.collector,
             self.case_name,
             &self.evidence,
@@ -1247,9 +1801,9 @@ impl Drop for IdentityCleanupGuard {
         if !self.armed {
             return;
         }
-        let admin = self.admin.clone();
-        let access_key = self.access_key.clone();
-        let policy_name = self.policy_name.clone();
+        let port = self.port.clone();
+        let history = self.history.clone();
+        let timeout = self.timeout;
         let collector = self.collector.clone();
         let case_name = self.case_name;
         let evidence = self.evidence.clone();
@@ -1261,19 +1815,15 @@ impl Drop for IdentityCleanupGuard {
                     .build()
                     .context("build identity cleanup runtime")?;
                 runtime.block_on(async {
-                    tokio::time::timeout(
-                        CANCELLATION_CLEANUP_TIMEOUT,
-                        cleanup_identity(
-                            &admin,
-                            access_key.expose(),
-                            &policy_name,
-                            &collector,
-                            case_name,
-                            &evidence,
-                        ),
+                    cleanup_identity(
+                        port.as_ref(),
+                        &history,
+                        timeout,
+                        &collector,
+                        case_name,
+                        &evidence,
                     )
                     .await
-                    .context("identity cancellation cleanup exceeded its timeout")?
                 })
             });
         match thread {
@@ -1291,42 +1841,87 @@ impl Drop for IdentityCleanupGuard {
 }
 
 async fn cleanup_identity(
-    admin: &RustfsIdentityAdminClient,
-    access_key: &str,
-    policy_name: &str,
+    port: &dyn IdentityCleanupPort,
+    history: &Recorder,
+    timeout: Duration,
     collector: &ArtifactCollector,
     case_name: &str,
     evidence: &Arc<Mutex<CredentialRotationEvidence>>,
 ) -> Result<()> {
-    evidence
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .cleanup
-        .attempted = true;
-    write_evidence(collector, case_name, evidence)?;
-    let result = async {
-        admin.remove_user(access_key).await?;
-        let user_absent = admin.users_with_prefix(access_key).await?.is_empty();
-        evidence
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("IAM cleanup deadline overflow")?;
+    let (pods, probe_key, recorder) = {
+        let mut value = evidence
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .cleanup
-            .user_absent = user_absent;
-        ensure!(user_absent, "run-owned IAM user removal did not converge");
-        admin.remove_policy(policy_name).await?;
-        let policy_absent = admin.policies_with_prefix(policy_name).await?.is_empty();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        value.cleanup = CredentialCleanupEvidence {
+            attempted: true,
+            started_at_ms: Some(now_ms()),
+            ..Default::default()
+        };
+        let recorder = Recorder::create(
+            collector
+                .case_dir(case_name)
+                .join("credential-cleanup-history.jsonl"),
+            &value.scenario,
+            &value.run_id,
+        )?;
+        (
+            value.pod_generations_before.clone(),
+            cleanup_probe_key(&value, &history.records()),
+            recorder,
+        )
+    };
+    // The cleanup recorder has a separate read-only history so the final
+    // data checker continues to audit precisely the workload it verified.
+    port.redact_history(&recorder)?;
+    write_evidence(collector, case_name, evidence)?;
+    let result = tokio::time::timeout_at(deadline, async {
+        port.remove_identity().await?;
+        {
+            let mut value = evidence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            value.cleanup.removal_acknowledged_at_ms = Some(now_ms());
+            value.validate_original_generations()?;
+        }
+        write_evidence(collector, case_name, evidence)?;
+        for pod in &pods {
+            let proof = port
+                .verify_pod(pod, &probe_key, &recorder, deadline)
+                .await?;
+            {
+                let mut value = evidence
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                value.cleanup.pods.push(proof.clone());
+            }
+            write_evidence(collector, case_name, evidence)?;
+            let value = evidence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            value.validate_cleanup_pod(
+                &proof,
+                &probe_key,
+                value
+                    .cleanup
+                    .removal_acknowledged_at_ms
+                    .context("IAM removal acknowledgement is absent")?,
+            )?;
+        }
         let mut evidence = evidence
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        evidence.cleanup.policy_absent = policy_absent;
-        ensure!(
-            policy_absent,
-            "run-owned IAM policy removal did not converge"
-        );
+        evidence.validate_cleanup_pods(&history.records())?;
+        evidence.cleanup.user_absent = true;
+        evidence.cleanup.policy_absent = true;
         evidence.cleanup.completed_at_ms = Some(now_ms());
         Ok(())
-    }
-    .await;
+    })
+    .await
+    .context("IAM identity cleanup exceeded its timeout")
+    .and_then(|result| result);
     let persisted = write_evidence(collector, case_name, evidence);
     result.and(persisted)
 }
@@ -1439,6 +2034,187 @@ mod tests {
             .expect("get")
     }
 
+    fn generation_receipt(
+        evidence: &CredentialRotationEvidence,
+        pod: &CredentialPodGeneration,
+    ) -> PodGenerationReceipt {
+        let response = serde_json::json!({
+            "metadata": { "name": pod.pod_name, "uid": pod.pod_uid,
+                "namespace": evidence.namespace, "labels": { "rustfs.tenant": evidence.tenant } },
+            "status": { "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{ "name": "rustfs", "containerID": pod.rustfs_container_id,
+                    "state": { "running": { "startedAt": "2026-10-14T00:00:00Z" } } }] }
+        });
+        PodGenerationReceipt {
+            started_at_ms: now_ms(),
+            ended_at_ms: now_ms(),
+            response_body_sha256: sha256_hex(
+                serde_json::to_string(&response)
+                    .expect("response")
+                    .as_bytes(),
+            ),
+            response,
+        }
+    }
+
+    fn cleanup_proof(
+        evidence: &CredentialRotationEvidence,
+        pod: &CredentialPodGeneration,
+        key: &str,
+        history: &Recorder,
+    ) -> PodIdentityCleanupProof {
+        let before = generation_receipt(evidence, pod);
+        let inventory = |path: &str| IdentityInventoryReceipt {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            started_at_ms: now_ms(),
+            ended_at_ms: now_ms(),
+            http_status: 200,
+            request_id: Some(Uuid::new_v4().to_string()),
+            response_body_sha256: sha256_hex(b"{}"),
+            name_sha256: Vec::new(),
+        };
+        let users = inventory("/rustfs/admin/v3/list-users");
+        let policies = inventory("/rustfs/admin/v3/list-canned-policies");
+        let old_auth = CredentialCleanupAuthReceipt {
+            credential: evidence.old_credential.clone(),
+            operation: get(history, key, None, 403),
+        };
+        let new_auth = CredentialCleanupAuthReceipt {
+            credential: evidence.new_credential.clone(),
+            operation: get(history, key, None, 403),
+        };
+        let after = generation_receipt(evidence, pod);
+        PodIdentityCleanupProof {
+            pod: pod.clone(),
+            endpoint: "http://127.0.0.1:19000".to_string(),
+            port_forward_command: format!(
+                "kubectl --context {} -n {} port-forward pod/{} 19000:9000",
+                evidence.context, evidence.namespace, pod.pod_name
+            ),
+            before,
+            users,
+            policies,
+            old_auth,
+            new_auth,
+            after,
+        }
+    }
+
+    struct TestIdentityCleanupPort {
+        fixture: CredentialRotationEvidence,
+        stale_peer: bool,
+        blocked_peer: bool,
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl IdentityCleanupPort for TestIdentityCleanupPort {
+        fn redact_history(&self, history: &Recorder) -> Result<()> {
+            history.redact_secrets(&["owned-user", "admin-secret"])
+        }
+
+        async fn remove_identity(&self) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push("remove-user-and-policy".to_string());
+            Ok(())
+        }
+
+        async fn verify_pod(
+            &self,
+            pod: &CredentialPodGeneration,
+            key: &str,
+            history: &Recorder,
+            _deadline: Instant,
+        ) -> Result<PodIdentityCleanupProof> {
+            self.calls.lock().expect("calls").push(pod.pod_name.clone());
+            if self.blocked_peer && pod.pod_name == "rustfs-1" {
+                std::future::pending::<()>().await;
+            }
+            let mut proof = cleanup_proof(&self.fixture, pod, key, history);
+            if self.stale_peer && pod.pod_name == "rustfs-1" {
+                proof
+                    .users
+                    .name_sha256
+                    .push(self.fixture.old_credential.principal_sha256.clone());
+                proof
+                    .policies
+                    .name_sha256
+                    .push(self.fixture.policy_name_sha256.clone());
+                proof.new_auth.operation.outcome = OperationOutcome::Ok;
+                proof.new_auth.operation.http_status = Some(200);
+            }
+            Ok(proof)
+        }
+    }
+
+    struct CleanupTestFixture {
+        _directory: tempfile::TempDir,
+        history: Recorder,
+        collector: ArtifactCollector,
+        evidence: Arc<Mutex<CredentialRotationEvidence>>,
+        port: Arc<TestIdentityCleanupPort>,
+    }
+
+    impl CleanupTestFixture {
+        fn new(stale_peer: bool, blocked_peer: bool) -> Self {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let history = Recorder::create(
+                directory.path().join("history.jsonl"),
+                CREDENTIAL_ROTATION_MID_LOAD_SCENARIO,
+                "run-1",
+            )
+            .expect("history");
+            committed_write(
+                &history,
+                &ObjectSpec::prepare_seeded("run-1", 0, 16, 7),
+                "v1",
+            );
+            let (mut fixture, _) = valid_history();
+            fixture.cleanup = CredentialCleanupEvidence::default();
+            let port = Arc::new(TestIdentityCleanupPort {
+                fixture: fixture.clone(),
+                stale_peer,
+                blocked_peer,
+                calls: Mutex::new(Vec::new()),
+            });
+            let collector = ArtifactCollector::new(directory.path());
+            Self {
+                _directory: directory,
+                history,
+                collector,
+                evidence: Arc::new(Mutex::new(fixture)),
+                port,
+            }
+        }
+
+        async fn cleanup(&self, timeout: Duration) -> Result<()> {
+            cleanup_identity(
+                self.port.as_ref(),
+                &self.history,
+                timeout,
+                &self.collector,
+                "rotation-case",
+                &self.evidence,
+            )
+            .await
+        }
+
+        fn persisted(&self) -> CredentialRotationEvidence {
+            serde_json::from_str(
+                &std::fs::read_to_string(
+                    self.collector
+                        .case_dir("rotation-case")
+                        .join(CREDENTIAL_ROTATION_ARTIFACT),
+                )
+                .expect("artifact"),
+            )
+            .expect("evidence")
+        }
+    }
+
     fn valid_history() -> (CredentialRotationEvidence, Vec<OperationRecord>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let history = Recorder::create(
@@ -1527,7 +2303,7 @@ mod tests {
             .finish(delete, OperationOutcome::Ok, Some(204), None)
             .expect("delete");
         let deleted_get = get(&history, &new_object.spec.key, None, 404);
-        let evidence = CredentialRotationEvidence {
+        let mut evidence = CredentialRotationEvidence {
             schema_version: 1,
             scenario: CREDENTIAL_ROTATION_MID_LOAD_SCENARIO.to_string(),
             run_id: "run-1".to_string(),
@@ -1542,6 +2318,15 @@ mod tests {
             identity_absent_before_create: true,
             policy_absent_before_create: true,
             policy_sha256: sha256_hex(bucket_policy("bucket").expect("policy").as_bytes()),
+            policy_name_sha256: sha256_hex(b"owned-policy"),
+            pod_generations_before: pods_before
+                .iter()
+                .map(|pod| CredentialPodGeneration {
+                    pod_name: pod.name.clone(),
+                    pod_uid: pod.uid.clone(),
+                    rustfs_container_id: format!("containerd://{}", pod.uid),
+                })
+                .collect(),
             pods_before,
             old_prefill_operation_ids: vec![baseline.id, second.id],
             old_workload_operation_ids: vec![load.id, rejected.id],
@@ -1561,12 +2346,29 @@ mod tests {
             new_delete_operation_id: Some(delete.id),
             new_deleted_get_operation_id: Some(deleted_get.id),
             verified: true,
-            cleanup: CredentialCleanupEvidence {
-                attempted: true,
-                user_absent: true,
-                policy_absent: true,
-                completed_at_ms: Some(now_ms()),
-            },
+            cleanup: CredentialCleanupEvidence::default(),
+        };
+        let cleanup_history = Recorder::create(
+            dir.path().join("cleanup.jsonl"),
+            CREDENTIAL_ROTATION_MID_LOAD_SCENARIO,
+            "run-1",
+        )
+        .expect("cleanup recorder");
+        let started = now_ms();
+        let key = cleanup_probe_key(&evidence, &history.records());
+        let pods = evidence
+            .pod_generations_before
+            .iter()
+            .map(|pod| cleanup_proof(&evidence, pod, &key, &cleanup_history))
+            .collect();
+        evidence.cleanup = CredentialCleanupEvidence {
+            attempted: true,
+            started_at_ms: Some(started),
+            removal_acknowledged_at_ms: Some(started),
+            pods,
+            user_absent: true,
+            policy_absent: true,
+            completed_at_ms: Some(now_ms()),
         };
         (evidence, history.records())
     }
@@ -1766,140 +2568,239 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_guard_removes_owned_identity_before_transport_is_released() {
-        use axum::{Router, http::StatusCode, routing::any};
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let observed = calls.clone();
-        let app = Router::new().fallback(any(move |request: axum::extract::Request| {
-            let observed = observed.clone();
-            async move {
-                observed
-                    .lock()
-                    .expect("calls")
-                    .push((request.method().clone(), request.uri().path().to_string()));
-                (StatusCode::OK, "{}")
-            }
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("server") });
-        let transport = RustfsAdminTransport::new(
-            &endpoint,
-            "us-east-1",
-            "admin-access",
-            "admin-secret",
-            None,
-            "cleanup-test",
-        )
-        .expect("transport");
-        let admin = Arc::new(RustfsIdentityAdminClient::from_transport(transport));
-        let (mut fixture, _) = valid_history();
-        fixture.cleanup = CredentialCleanupEvidence::default();
-        let evidence = Arc::new(Mutex::new(fixture));
-        let dir = tempfile::tempdir().expect("tempdir");
-        let collector = ArtifactCollector::new(dir.path());
+        let fixture = CleanupTestFixture::new(false, false);
         let guard = IdentityCleanupGuard {
-            admin,
-            access_key: SecretString::new("owned-user").expect("identity"),
-            policy_name: "owned-policy".to_string(),
-            collector: collector.clone(),
+            port: fixture.port.clone(),
+            history: fixture.history.clone(),
+            timeout: Duration::from_secs(1),
+            collector: fixture.collector.clone(),
             case_name: "rotation-case",
-            evidence: evidence.clone(),
+            evidence: fixture.evidence.clone(),
             armed: true,
         };
         drop(guard);
-        let persisted: CredentialRotationEvidence = serde_json::from_str(
-            &std::fs::read_to_string(
-                collector
-                    .case_dir("rotation-case")
-                    .join(CREDENTIAL_ROTATION_ARTIFACT),
-            )
-            .expect("artifact"),
-        )
-        .expect("evidence");
+        let persisted = fixture.persisted();
         assert!(
             persisted.cleanup.attempted
                 && persisted.cleanup.user_absent
                 && persisted.cleanup.policy_absent
         );
         assert!(persisted.cleanup.completed_at_ms.is_some());
+        persisted
+            .validate_cleanup_pods(&fixture.history.records())
+            .expect("complete coverage");
         assert_eq!(
-            *calls.lock().expect("calls"),
-            [
-                (
-                    http::Method::DELETE,
-                    "/rustfs/admin/v3/remove-user".to_string()
-                ),
-                (http::Method::GET, "/rustfs/admin/v3/list-users".to_string()),
-                (
-                    http::Method::DELETE,
-                    "/rustfs/admin/v3/remove-canned-policy".to_string()
-                ),
-                (
-                    http::Method::GET,
-                    "/rustfs/admin/v3/list-canned-policies".to_string()
-                ),
-            ]
+            *fixture.port.calls.lock().expect("calls"),
+            ["remove-user-and-policy", "rustfs-0", "rustfs-1"]
         );
         let raw = serde_json::to_string(&persisted).expect("artifact");
         assert!(!raw.contains("owned-user") && !raw.contains("admin-secret"));
-        server.abort();
     }
 
     #[tokio::test]
     async fn timed_out_cleanup_preserves_an_incomplete_identity_receipt() {
-        use axum::{Router, http::StatusCode, routing::any};
-        let app = Router::new().fallback(any(|| async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            (StatusCode::OK, "{}")
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("server") });
-        let transport = RustfsAdminTransport::new(
-            &endpoint,
-            "us-east-1",
-            "admin-access",
-            "admin-secret",
-            None,
-            "cleanup-test",
-        )
-        .expect("transport");
-        let admin = RustfsIdentityAdminClient::from_transport(transport);
-        let (mut fixture, _) = valid_history();
-        fixture.cleanup = CredentialCleanupEvidence::default();
-        let evidence = Arc::new(Mutex::new(fixture));
-        let dir = tempfile::tempdir().expect("tempdir");
-        let collector = ArtifactCollector::new(dir.path());
-        let result = tokio::time::timeout(
-            Duration::from_millis(10),
-            cleanup_identity(
-                &admin,
-                "owned-user",
-                "owned-policy",
-                &collector,
-                "rotation-case",
-                &evidence,
-            ),
-        )
-        .await;
+        let fixture = CleanupTestFixture::new(false, true);
+        let result = fixture.cleanup(Duration::from_millis(30)).await;
         assert!(result.is_err());
-        let persisted: CredentialRotationEvidence = serde_json::from_str(
-            &std::fs::read_to_string(
-                collector
-                    .case_dir("rotation-case")
-                    .join(CREDENTIAL_ROTATION_ARTIFACT),
-            )
-            .expect("artifact"),
-        )
-        .expect("evidence");
+        let persisted = fixture.persisted();
         assert!(persisted.cleanup.attempted);
+        assert!(persisted.cleanup.removal_acknowledged_at_ms.is_some());
+        assert_eq!(persisted.cleanup.pods.len(), 1);
         assert!(!persisted.cleanup.user_absent && !persisted.cleanup.policy_absent);
         assert!(persisted.cleanup.completed_at_ms.is_none());
-        server.abort();
+        assert!(
+            persisted
+                .validate_cleanup_pods(&fixture.history.records())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_delete_success_with_a_stale_peer_keeps_cleanup_incomplete() {
+        let fixture = CleanupTestFixture::new(true, false);
+        let error = fixture
+            .cleanup(Duration::from_secs(1))
+            .await
+            .expect_err("stale peer");
+        assert!(
+            error.to_string().contains("stale user/policy cache"),
+            "{error:#}"
+        );
+        let persisted = fixture.persisted();
+        assert!(persisted.cleanup.removal_acknowledged_at_ms.is_some());
+        assert_eq!(persisted.cleanup.pods.len(), 2);
+        assert_eq!(
+            persisted.cleanup.pods[1].new_auth.operation.http_status,
+            Some(200)
+        );
+        assert!(!persisted.cleanup.user_absent && !persisted.cleanup.policy_absent);
+        assert!(persisted.cleanup.completed_at_ms.is_none());
+        assert!(
+            persisted
+                .validate_cleanup_pods(&fixture.history.records())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_duplicate_and_foreign_cleanup_coverage_are_rejected() {
+        let (evidence, history) = valid_history();
+        evidence
+            .validate_cleanup_pods(&history)
+            .expect("complete coverage");
+        let mut wrong = evidence.clone();
+        wrong.cleanup.pods.pop();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.cleanup.pods[1] = wrong.cleanup.pods[0].clone();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence;
+        wrong.cleanup.pods[1].pod.pod_name = "foreign-pod".to_string();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+    }
+
+    #[test]
+    fn cleanup_requires_nonempty_exact_original_container_coverage() {
+        let (evidence, history) = valid_history();
+        let mut wrong = evidence.clone();
+        wrong.pod_generations_before.clear();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.pod_generations_before[1] = wrong.pod_generations_before[0].clone();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.pod_generations_before[1].pod_name = "foreign-pod".to_string();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence;
+        wrong.pod_generations_before[1].rustfs_container_id.clear();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+    }
+
+    #[test]
+    fn cleanup_requires_unchanged_uid_and_container_generation_on_both_sides() {
+        let (evidence, history) = valid_history();
+        for before in [false, true] {
+            for container in [false, true] {
+                let mut wrong = evidence.clone();
+                let proof = &mut wrong.cleanup.pods[0];
+                let capture = if before {
+                    &mut proof.before
+                } else {
+                    &mut proof.after
+                };
+                if container {
+                    capture.response["status"]["containerStatuses"][0]["containerID"] =
+                        "containerd://restart".into();
+                } else {
+                    capture.response["metadata"]["uid"] = "replacement-uid".into();
+                }
+                assert!(wrong.validate_cleanup_pods(&history).is_err());
+            }
+        }
+        let mut wrong = evidence;
+        wrong.pod_generations_before[0].rustfs_container_id = "containerd://other".to_string();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+    }
+
+    #[test]
+    fn cleanup_inventory_and_credential_response_proofs_cannot_be_substituted() {
+        let (evidence, history) = valid_history();
+        let mut wrong = evidence.clone();
+        wrong.cleanup.pods[0]
+            .users
+            .name_sha256
+            .push(wrong.old_credential.principal_sha256.clone());
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.cleanup.pods[0]
+            .policies
+            .name_sha256
+            .push(wrong.policy_name_sha256.clone());
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.cleanup.pods[0].users.http_status = 503;
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.cleanup.pods[0].new_auth = wrong.cleanup.pods[0].old_auth.clone();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.cleanup.pods[0].new_auth.operation.http_status = Some(500);
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.cleanup.pods[0].new_auth.operation.run_id = Some("other-run".to_string());
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence;
+        wrong.cleanup.pods[0].port_forward_command =
+            "kubectl port-forward svc/tenant-io 19000:9000".to_string();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+    }
+
+    #[test]
+    fn cleanup_rejects_accepted_credentials_foreign_scope_and_unbounded_receipts() {
+        let (evidence, history) = valid_history();
+        for old in [false, true] {
+            let mut wrong = evidence.clone();
+            let proof = &mut wrong.cleanup.pods[0];
+            let auth = if old {
+                &mut proof.old_auth
+            } else {
+                &mut proof.new_auth
+            };
+            auth.operation.outcome = OperationOutcome::Ok;
+            auth.operation.http_status = Some(200);
+            assert!(wrong.validate_cleanup_pods(&history).is_err());
+        }
+        let mut wrong = evidence.clone();
+        wrong.cleanup.pods[0].after.response["metadata"]["namespace"] = "foreign-namespace".into();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.cleanup.pods[0].before.response["metadata"]["labels"]["rustfs.tenant"] =
+            "foreign-tenant".into();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.cleanup.pods[0].users.ended_at_ms = wrong.cleanup.pods[0].after.started_at_ms + 1;
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.cleanup.removal_acknowledged_at_ms = None;
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence.clone();
+        wrong.cleanup.started_at_ms = Some(1);
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+        let mut wrong = evidence;
+        wrong.cleanup.pods[0].after.response_body_sha256.clear();
+        assert!(wrong.validate_cleanup_pods(&history).is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_retry_clears_previous_completion_and_coverage() {
+        let fixture = CleanupTestFixture::new(false, true);
+        fixture.evidence.lock().expect("evidence").cleanup = valid_history().0.cleanup;
+        fixture
+            .cleanup(Duration::from_millis(30))
+            .await
+            .expect_err("blocked peer");
+        let persisted = fixture.persisted();
+        assert_eq!(persisted.cleanup.pods.len(), 1);
+        assert!(persisted.cleanup.completed_at_ms.is_none());
+        assert!(!persisted.cleanup.user_absent && !persisted.cleanup.policy_absent);
+    }
+
+    #[tokio::test]
+    async fn cancelled_cleanup_preserves_partial_peer_coverage_without_completion() {
+        let fixture = CleanupTestFixture::new(false, true);
+        {
+            let cleanup = fixture.cleanup(Duration::from_secs(1));
+            tokio::pin!(cleanup);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut cleanup)
+                    .await
+                    .is_err()
+            );
+        }
+        let persisted = fixture.persisted();
+        assert_eq!(persisted.cleanup.pods.len(), 1);
+        assert!(persisted.cleanup.completed_at_ms.is_none());
+        assert!(!persisted.cleanup.user_absent && !persisted.cleanup.policy_absent);
     }
 
     #[test]

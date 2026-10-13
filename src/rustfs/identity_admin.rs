@@ -105,6 +105,11 @@ pub(crate) struct RustfsIdentityAdminClient {
     transport: RustfsAdminTransport,
 }
 
+pub(crate) struct RustfsIdentityInventory {
+    pub names: Vec<String>,
+    pub response: RustfsAdminResponse,
+}
+
 impl RustfsIdentityAdminClient {
     pub(crate) fn from_transport(transport: RustfsAdminTransport) -> Self {
         Self { transport }
@@ -126,18 +131,37 @@ impl RustfsIdentityAdminClient {
     }
 
     pub(crate) async fn users_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
-        let response = self
-            .request(Method::GET, "/list-users", &[], Vec::new(), None)
-            .await?;
-        let value: Value = serde_json::from_slice(&response)
-            .map_err(|_| RustfsAdminError::protocol("InvalidListUsersResponse"))?;
-        Ok(value
-            .as_object()
-            .ok_or_else(|| RustfsAdminError::protocol("InvalidListUsersResponse"))?
-            .keys()
+        Ok(self
+            .users_inventory()
+            .await?
+            .names
+            .into_iter()
             .filter(|name| name.starts_with(prefix))
-            .cloned()
             .collect())
+    }
+
+    pub(crate) async fn users_inventory(&self) -> AdminResult<RustfsIdentityInventory> {
+        self.inventory("/list-users", "InvalidListUsersResponse")
+            .await
+    }
+
+    async fn inventory(
+        &self,
+        path: &str,
+        invalid_response: &str,
+    ) -> AdminResult<RustfsIdentityInventory> {
+        let response =
+            checked_admin_request(&self.transport, Method::GET, path, &[], Vec::new(), None)
+                .await?;
+        let value: Value = serde_json::from_slice(&response.body)
+            .map_err(|_| RustfsAdminError::protocol(invalid_response))?;
+        let names = value
+            .as_object()
+            .ok_or_else(|| RustfsAdminError::protocol(invalid_response))?
+            .keys()
+            .cloned()
+            .collect();
+        Ok(RustfsIdentityInventory { names, response })
     }
 
     pub(crate) async fn create_user(&self, access_key: &str, secret_key: &str) -> AdminResult<()> {
@@ -190,18 +214,18 @@ impl RustfsIdentityAdminClient {
     }
 
     pub(crate) async fn policies_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
-        let response = self
-            .request(Method::GET, "/list-canned-policies", &[], Vec::new(), None)
-            .await?;
-        let value: Value = serde_json::from_slice(&response)
-            .map_err(|_| RustfsAdminError::protocol("InvalidListPoliciesResponse"))?;
-        Ok(value
-            .as_object()
-            .ok_or_else(|| RustfsAdminError::protocol("InvalidListPoliciesResponse"))?
-            .keys()
+        Ok(self
+            .policies_inventory()
+            .await?
+            .names
+            .into_iter()
             .filter(|name| name.starts_with(prefix))
-            .cloned()
             .collect())
+    }
+
+    pub(crate) async fn policies_inventory(&self) -> AdminResult<RustfsIdentityInventory> {
+        self.inventory("/list-canned-policies", "InvalidListPoliciesResponse")
+            .await
     }
 
     pub(crate) async fn create_policy(&self, name: &str, document: &str) -> AdminResult<()> {
@@ -428,6 +452,91 @@ mod tests {
         assert!(!error.transient);
         assert!(!format!("{error:#}").contains("private-secret"));
         assert!(!format!("{client:?}").contains("admin-secret"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn identity_inventory_keeps_response_receipts_and_exact_local_names() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let observed = paths.clone();
+        let app = Router::new().fallback(any(move |request: axum::extract::Request| {
+            let observed = observed.clone();
+            async move {
+                assert_eq!(request.method(), Method::GET);
+                assert!(request.headers().contains_key("authorization"));
+                let path = request.uri().path().to_string();
+                observed.lock().expect("paths").push(path.clone());
+                let body = if path.ends_with("list-users") {
+                    r#"{"owned-user":{"status":"enabled"},"owned-user-other":{"status":"disabled"}}"#
+                } else {
+                    r#"{"owned-policy":{"Version":"2012-10-17"}}"#
+                };
+                (StatusCode::OK, [("x-amz-request-id", "local-pod-request")], body)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("server") });
+        let transport = RustfsAdminTransport::new(
+            &endpoint,
+            "us-east-1",
+            "admin-access",
+            "admin-secret",
+            None,
+            "inventory-test",
+        )
+        .expect("transport");
+        let client = RustfsIdentityAdminClient::from_transport(transport);
+        let users = client.users_inventory().await.expect("users");
+        assert_eq!(users.names, ["owned-user", "owned-user-other"]);
+        assert_eq!(users.response.status, 200);
+        assert_eq!(
+            users.response.request_id.as_deref(),
+            Some("local-pod-request")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&users.response.body).expect("body")["owned-user"]["status"],
+            "enabled"
+        );
+        let policies = client.policies_inventory().await.expect("policies");
+        assert_eq!(policies.names, ["owned-policy"]);
+        assert_eq!(
+            *paths.lock().expect("paths"),
+            [
+                "/rustfs/admin/v3/list-users",
+                "/rustfs/admin/v3/list-canned-policies"
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn malformed_successful_inventory_response_does_not_prove_absence() {
+        let app = Router::new().fallback(any(|| async { (StatusCode::OK, "[]") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("server") });
+        let transport = RustfsAdminTransport::new(
+            &endpoint,
+            "us-east-1",
+            "admin-access",
+            "admin-secret",
+            None,
+            "inventory-test",
+        )
+        .expect("transport");
+        let client = RustfsIdentityAdminClient::from_transport(transport);
+        let error = client
+            .users_inventory()
+            .await
+            .err()
+            .expect("malformed response");
+        assert_eq!(error.code, "InvalidListUsersResponse");
+        assert!(client.policies_inventory().await.is_err());
         server.abort();
     }
 }
