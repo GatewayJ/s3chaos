@@ -897,18 +897,11 @@ impl LiveCredentialRotationDriver {
     }
 
     fn redact(&self, error: anyhow::Error) -> anyhow::Error {
-        let (access, secret) = resources::test_credentials();
-        let mut message = format!("{error:#}");
-        for value in [
-            self.old.access_key(),
-            self.old.secret_key(),
-            self.new.secret_key(),
-            access,
-            secret,
-        ] {
-            message = message.replace(value, "[REDACTED]");
-        }
-        anyhow!(message)
+        anyhow!(
+            self.collector
+                .redact_text(&format!("{error:#}"))
+                .into_owned()
+        )
     }
 
     async fn preserve<T>(&self, result: Result<T>) -> Result<T> {

@@ -476,8 +476,10 @@ list_qualification_cases
             "admin-rebalance\tadmin-rebalance\tadmin\t-\n",
             "fresh-volume-replacement-automatic-replacement\tfresh-volume-replacement\tstorage\tfresh-volume-replacement-automatic-replacement\n",
             "fresh-volume-replacement-admin-deep\tfresh-volume-replacement\tstorage\tfresh-volume-replacement-admin-deep\n",
+            "network-partition-during-heal-admin-deep\tnetwork-partition-during-heal\tstorage\tnetwork-partition-during-heal-admin-deep\n",
             "on-disk-bitrot-automatic-scanner\ton-disk-bitrot\tstorage\ton-disk-bitrot-automatic-scanner\n",
             "on-disk-bitrot-admin-deep\ton-disk-bitrot\tstorage\ton-disk-bitrot-admin-deep\n",
+            "metadata-shard-corruption-admin-deep\tmetadata-shard-corruption\tstorage\tmetadata-shard-corruption-admin-deep\n",
             "stale-disk-return\tstale-disk-return-detect\tstorage\tstale-disk-return\n",
         )
     );
