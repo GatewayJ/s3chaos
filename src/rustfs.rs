@@ -24,6 +24,29 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime};
 
+pub(crate) mod identity_admin;
+
+#[derive(Clone)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub(crate) fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        ensure!(!value.is_empty(), "secret value must not be empty");
+        Ok(Self(value))
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 const ADMIN_INFO_PATH: &str = "/rustfs/admin/v3/info";
 
 #[derive(Clone)]

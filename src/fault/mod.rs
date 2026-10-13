@@ -23,6 +23,7 @@ pub mod backends;
 pub mod checker;
 pub mod config;
 pub mod console;
+pub mod credential_rotation;
 pub mod diagnostics;
 pub mod events;
 mod fault_artifacts;

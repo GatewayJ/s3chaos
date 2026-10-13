@@ -90,6 +90,9 @@ pub enum FaultRunExecutionSpec {
         topology: AdminTopologyPlan,
         operation_timeout_seconds: u64,
     },
+    CredentialRotation {
+        operation_timeout_seconds: u64,
+    },
     StorageRecovery {
         case: crate::fault::storage_recovery::StorageRecoveryCase,
         operation_timeout_seconds: u64,
@@ -339,7 +342,9 @@ impl FaultRunSpec {
                 expected_rustfs_pod_count: config.expected_rustfs_pod_count,
                 stable_pod_window_seconds: config.rustfs_pod_stable_window.as_secs(),
                 recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
-                recommit_unconfirmed_writes: acknowledged_mutation_kind(&scenario.name).is_none(),
+                recommit_unconfirmed_writes: acknowledged_mutation_kind(&scenario.name).is_none()
+                    && scenario.name
+                        != crate::fault::scenarios::CREDENTIAL_ROTATION_MID_LOAD_SCENARIO,
             },
             execution: Some(match plan {
                 ExecutionPlan::Injection(_) => FaultRunExecutionSpec::Injection,
@@ -347,6 +352,11 @@ impl FaultRunSpec {
                     topology: plan.topology.clone(),
                     operation_timeout_seconds: plan.operation_timeout.as_secs(),
                 },
+                ExecutionPlan::CredentialRotation(plan) => {
+                    FaultRunExecutionSpec::CredentialRotation {
+                        operation_timeout_seconds: plan.operation_timeout.as_secs(),
+                    }
+                }
                 ExecutionPlan::StorageRecovery(plan) => FaultRunExecutionSpec::StorageRecovery {
                     case: plan.case,
                     operation_timeout_seconds: plan.operation_timeout.as_secs(),
@@ -390,6 +400,18 @@ impl FaultRunSpec {
                     "admin run-spec operation timeout must be positive"
                 );
                 Ok(ExecutionKind::Admin)
+            }
+            Some(FaultRunExecutionSpec::CredentialRotation {
+                operation_timeout_seconds,
+            }) => {
+                ensure!(
+                    self.faults.is_empty()
+                        && *operation_timeout_seconds > 0
+                        && self.scenario.name
+                            == crate::fault::scenarios::CREDENTIAL_ROTATION_MID_LOAD_SCENARIO,
+                    "credential rotation run-spec has invalid scenario, timeout, or injections"
+                );
+                Ok(ExecutionKind::CredentialRotation)
             }
             Some(FaultRunExecutionSpec::StorageRecovery {
                 case,
@@ -450,6 +472,24 @@ impl FaultRunArtifactSpec {
     }
 
     pub fn required_names_for_scenario(scenario: &str) -> Vec<String> {
+        if scenario == crate::fault::scenarios::CREDENTIAL_ROTATION_MID_LOAD_SCENARIO {
+            return [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "checker-report.json",
+                ADMIN_WORKFLOW_ARTIFACT,
+                crate::fault::credential_rotation::CREDENTIAL_ROTATION_ARTIFACT,
+                RECOVERY_HEALTH_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        }
         let mut names = if scenario == crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO {
             [
                 "run-spec.yaml",
@@ -740,6 +780,7 @@ fn workload_mode_name(mode: FaultWorkloadMode) -> &'static str {
         FaultWorkloadMode::S3Mixed => "s3-mixed",
         FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
         FaultWorkloadMode::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
+        FaultWorkloadMode::CredentialRotation => "credential-rotation",
     }
 }
 

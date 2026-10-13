@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use anyhow::{Context, Result, ensure};
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::framework::{command::CommandSpec, config::ClusterTestConfig, kubectl::Kubectl};
 
@@ -34,6 +36,7 @@ struct SnapshotCommand {
 pub struct ArtifactCollector {
     root: PathBuf,
     reference_root: PathBuf,
+    redactions: Arc<Mutex<Vec<crate::rustfs::SecretString>>>,
 }
 
 impl ArtifactCollector {
@@ -42,6 +45,7 @@ impl ArtifactCollector {
         Self {
             reference_root: root.clone(),
             root,
+            redactions: Arc::default(),
         }
     }
 
@@ -60,6 +64,7 @@ impl ArtifactCollector {
         Ok(Self {
             root,
             reference_root,
+            redactions: Arc::default(),
         })
     }
 
@@ -71,12 +76,39 @@ impl ArtifactCollector {
         let dir = self.case_dir(case_name);
         fs::create_dir_all(&dir)?;
         let path = dir.join(file_name);
-        fs::write(&path, content)?;
+        fs::write(&path, self.redact_text(content).as_bytes())?;
         Ok(path)
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn redact_secrets(&self, secrets: &[&str]) -> Result<()> {
+        let values = secrets
+            .iter()
+            .map(|value| crate::rustfs::SecretString::new(*value))
+            .collect::<Result<Vec<_>>>()?;
+        self.redactions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(values);
+        Ok(())
+    }
+
+    fn redact_text<'a>(&self, content: &'a str) -> Cow<'a, str> {
+        let values = self
+            .redactions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !values.iter().any(|value| content.contains(value.expose())) {
+            return Cow::Borrowed(content);
+        }
+        let mut redacted = content.to_string();
+        for value in values.iter() {
+            redacted = redacted.replace(value.expose(), "[REDACTED]");
+        }
+        Cow::Owned(redacted)
     }
 
     pub(crate) fn reference_path(&self, path: &Path) -> Result<PathBuf> {
@@ -120,12 +152,12 @@ impl ArtifactCollector {
                 stdout = output.stdout,
                 stderr = output.stderr
             );
-            combined_output.push_str(&content);
+            combined_output.push_str(&self.redact_text(&content));
             combined_output.push('\n');
             self.write_text(case_name, &file_name, &content)?;
         }
 
-        let diagnosis = diagnose(&combined_output);
+        let diagnosis = self.redact_text(&diagnose(&combined_output)).into_owned();
         self.write_text(case_name, "diagnosis.txt", &diagnosis)?;
 
         Ok(SnapshotReport {
@@ -257,6 +289,33 @@ fn sanitize_case_name(case_name: &str) -> String {
 mod tests {
     use super::{ArtifactCollector, generic_diagnosis, kubernetes_snapshot_commands};
     use crate::framework::config::E2eConfig;
+
+    #[test]
+    fn run_owned_redactions_survive_collector_clones_and_cover_diagnostic_logs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector = ArtifactCollector::new(dir.path());
+        let failure_collector = collector.clone();
+        collector
+            .redact_secrets(&["generated-access-key", "generated-secret"])
+            .expect("redactions");
+        drop(collector);
+        let path = failure_collector
+            .write_text(
+                "rotation",
+                "rustfs-pods-current.log",
+                "accessKey=generated-access-key secret=generated-secret",
+            )
+            .expect("artifact");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("log"),
+            "accessKey=[REDACTED] secret=[REDACTED]"
+        );
+        let diagnosis =
+            failure_collector.redact_text("failed generated-access-key generated-secret");
+        assert_eq!(diagnosis, "failed [REDACTED] [REDACTED]");
+        let debug = format!("{failure_collector:?}");
+        assert!(!debug.contains("generated-access-key") && !debug.contains("generated-secret"));
+    }
 
     #[test]
     fn artifact_paths_are_case_scoped_and_sanitized() {

@@ -136,6 +136,18 @@ pub(crate) async fn run_prepared_scenario_with_config_and_reference_root(
             )
             .await
         }
+        ExecutionPlan::CredentialRotation(rotation_plan) => {
+            crate::fault::credential_rotation::run_credential_rotation_case(
+                &config,
+                &collector,
+                &scenario,
+                &plan,
+                rotation_plan,
+                &run_id,
+                deadline,
+            )
+            .await
+        }
         ExecutionPlan::StorageRecovery(storage_plan) => {
             crate::fault::storage_recovery_runner::run_storage_recovery_case(
                 &config,

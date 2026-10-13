@@ -23,7 +23,8 @@ use crate::fault::{
     quorum::{ErasureSetShape, MAX_ERASURE_SET_SHARDS, QuorumCaseClass, QuorumVolumeBoundary},
     scenarios::{
         ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, CLUSTER_COLD_RESTART_SCENARIO,
-        DISK_FULL_SCENARIO, DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+        CREDENTIAL_ROTATION_MID_LOAD_SCENARIO, DISK_FULL_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_SCENARIO,
@@ -58,6 +59,7 @@ pub enum FaultWorkloadMode {
     S3Mixed,
     S3MixedWithWarp,
     AckTriggeredQuietMutation,
+    CredentialRotation,
 }
 
 /// The top-level execution route for a fault-test scenario.
@@ -69,6 +71,7 @@ pub enum FaultWorkloadMode {
 pub enum ExecutionPlan {
     Injection(FaultPlan),
     Admin(AdminExecutionPlan),
+    CredentialRotation(CredentialRotationExecutionPlan),
     StorageRecovery(StorageRecoveryExecutionPlan),
 }
 
@@ -77,6 +80,7 @@ pub enum ExecutionPlan {
 pub enum ExecutionKind {
     Injection,
     Admin,
+    CredentialRotation,
     StorageRecovery,
 }
 
@@ -85,6 +89,7 @@ impl ExecutionKind {
         match self {
             Self::Injection => "injection",
             Self::Admin => "admin",
+            Self::CredentialRotation => "credential-rotation",
             Self::StorageRecovery => "storage-recovery",
         }
     }
@@ -97,6 +102,13 @@ pub struct AdminExecutionPlan {
     pub workload_mode: FaultWorkloadMode,
     pub operation_timeout: Duration,
     pub topology: AdminTopologyPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRotationExecutionPlan {
+    pub scenario: String,
+    pub case_name: &'static str,
+    pub operation_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +127,26 @@ impl ExecutionPlan {
         options: FaultPlanOptions,
     ) -> Result<Self> {
         match scenario.name.as_str() {
+            CREDENTIAL_ROTATION_MID_LOAD_SCENARIO => {
+                ensure!(
+                    spec.scenario == scenario.name
+                        && spec.backend == FaultBackend::PlannedReliabilityWorkflow
+                        && matches!(
+                            options.scenario_parameters,
+                            FaultInjectionParameters::Default
+                        ),
+                    "credential rotation requires its exact scenario and default parameters"
+                );
+                ensure!(
+                    scenario.object_count >= 4,
+                    "credential rotation requires at least four workload objects"
+                );
+                Ok(Self::CredentialRotation(CredentialRotationExecutionPlan {
+                    scenario: scenario.name.clone(),
+                    case_name: scenario.case_name,
+                    operation_timeout: scenario.duration,
+                }))
+            }
             FRESH_VOLUME_REPLACEMENT_SCENARIO
             | ON_DISK_BITROT_SCENARIO
             | STALE_DISK_RETURN_DETECT_SCENARIO => {
@@ -186,6 +218,7 @@ impl ExecutionPlan {
         match self {
             Self::Injection(_) => ExecutionKind::Injection,
             Self::Admin(_) => ExecutionKind::Admin,
+            Self::CredentialRotation(_) => ExecutionKind::CredentialRotation,
             Self::StorageRecovery(_) => ExecutionKind::StorageRecovery,
         }
     }
@@ -194,6 +227,7 @@ impl ExecutionPlan {
         match self {
             Self::Injection(plan) => &plan.scenario,
             Self::Admin(plan) => &plan.scenario,
+            Self::CredentialRotation(plan) => &plan.scenario,
             Self::StorageRecovery(plan) => &plan.scenario,
         }
     }
@@ -202,6 +236,7 @@ impl ExecutionPlan {
         match self {
             Self::Injection(plan) => plan.case_name,
             Self::Admin(plan) => plan.case_name,
+            Self::CredentialRotation(plan) => plan.case_name,
             Self::StorageRecovery(plan) => plan.case_name,
         }
     }
@@ -210,6 +245,7 @@ impl ExecutionPlan {
         match self {
             Self::Injection(plan) => plan.workload_mode,
             Self::Admin(plan) => plan.workload_mode,
+            Self::CredentialRotation(_) => FaultWorkloadMode::CredentialRotation,
             Self::StorageRecovery(plan) => plan.workload_mode,
         }
     }
@@ -217,7 +253,7 @@ impl ExecutionPlan {
     pub fn injection(&self) -> Option<&FaultPlan> {
         match self {
             Self::Injection(plan) => Some(plan),
-            Self::Admin(_) | Self::StorageRecovery(_) => None,
+            Self::Admin(_) | Self::CredentialRotation(_) | Self::StorageRecovery(_) => None,
         }
     }
 
@@ -226,13 +262,14 @@ impl ExecutionPlan {
             Self::Injection(_) => None,
             Self::Admin(plan) => Some(plan),
             Self::StorageRecovery(_) => None,
+            Self::CredentialRotation(_) => None,
         }
     }
 
     pub fn storage_recovery(&self) -> Option<&StorageRecoveryExecutionPlan> {
         match self {
             Self::StorageRecovery(plan) => Some(plan),
-            Self::Injection(_) | Self::Admin(_) => None,
+            Self::Injection(_) | Self::Admin(_) | Self::CredentialRotation(_) => None,
         }
     }
 
@@ -246,9 +283,11 @@ impl ExecutionPlan {
     pub fn backend_summary(&self) -> String {
         match self {
             Self::Injection(plan) => plan.backend_summary(),
-            Self::Admin(_) | Self::StorageRecovery(_) => FaultBackend::PlannedReliabilityWorkflow
-                .as_str()
-                .to_string(),
+            Self::Admin(_) | Self::CredentialRotation(_) | Self::StorageRecovery(_) => {
+                FaultBackend::PlannedReliabilityWorkflow
+                    .as_str()
+                    .to_string()
+            }
         }
     }
 
@@ -268,6 +307,7 @@ impl ExecutionPlan {
             Self::StorageRecovery(plan) => {
                 format!("owned storage recovery case {}", plan.case.as_str())
             }
+            Self::CredentialRotation(_) => "owned built-in IAM user secret".to_string(),
         }
     }
 }
@@ -1762,6 +1802,12 @@ mod tests {
                 );
                 assert!(execution.requires_static_storage());
                 assert!(execution.injection().is_none());
+            } else if spec.scenario
+                == crate::fault::scenarios::CREDENTIAL_ROTATION_MID_LOAD_SCENARIO
+            {
+                assert_eq!(execution.kind(), ExecutionKind::CredentialRotation);
+                assert!(execution.injection().is_none());
+                assert!(!execution.requires_static_storage());
             } else {
                 let plan = execution.injection().expect("injection plan");
                 assert_eq!(

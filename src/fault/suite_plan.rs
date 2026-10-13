@@ -448,6 +448,19 @@ impl FaultSuitePlan {
                         attempt.scenario
                     );
                 }
+                Some(FaultRunExecutionSpec::CredentialRotation {
+                    operation_timeout_seconds,
+                }) => {
+                    ensure!(
+                        attempt.faults.is_empty()
+                            && attempt.scenario
+                                == crate::fault::scenarios::CREDENTIAL_ROTATION_MID_LOAD_SCENARIO
+                            && *operation_timeout_seconds > 0
+                            && attempt.workload.versioning
+                            && attempt.workload.objects >= 4,
+                        "fault suite plan has an invalid credential-rotation execution"
+                    );
+                }
             }
             let run_id = attempt.run_id.as_deref().with_context(|| {
                 format!(
@@ -613,6 +626,11 @@ impl FaultSuitePlanAttempt {
                     topology: plan.topology.clone(),
                     operation_timeout_seconds: plan.operation_timeout.as_secs(),
                 },
+                ExecutionPlan::CredentialRotation(plan) => {
+                    FaultRunExecutionSpec::CredentialRotation {
+                        operation_timeout_seconds: plan.operation_timeout.as_secs(),
+                    }
+                }
                 ExecutionPlan::StorageRecovery(plan) => FaultRunExecutionSpec::StorageRecovery {
                     case: plan.case,
                     operation_timeout_seconds: plan.operation_timeout.as_secs(),
@@ -926,6 +944,7 @@ fn workload_mode_name(mode: FaultWorkloadMode) -> &'static str {
         FaultWorkloadMode::S3Mixed => "s3-mixed",
         FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
         FaultWorkloadMode::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
+        FaultWorkloadMode::CredentialRotation => "credential-rotation",
     }
 }
 

@@ -1821,11 +1821,11 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         detector: FaultDetectorSpec::diagnostic_only(&[
             DurabilityBugFamily::RecoveryAvailabilityRegression,
         ]),
-        case_name: "fault_credential_rotation_mid_load_has_no_actuator",
-        description: "Planned credential or TLS rotation while a workload is in flight. The fault backends have no admin credential or certificate actuator.",
+        case_name: "fault_credential_rotation_mid_load_preserves_committed_versions",
+        description: "Rotate a fresh run-owned built-in IAM user's secret during bounded S3 writes, prove old-secret rejection and new-secret access on every RustFS Pod, and verify committed versions. Requires the RustFS set-user-secret-key admin API.",
         priority: FaultPriority::P2,
         backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
+        status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::Default,
         isolation: FaultIsolation::FreshTenant,
         crds: &[],
@@ -1834,15 +1834,17 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
         boundary: "rustfs-workload/credential-rotation",
-        ci_phase: "planned",
-        target: "the fresh Tenant access keys or serving certificate, rotated under load",
+        ci_phase: "faults",
+        target: "one newly created built-in IAM user with a policy limited to the run-owned bucket",
         target_proof: &[
-            "rotation evidence must bind the old and new credential identities",
-            "the workload must overlap the rotation window",
+            "the IAM user and bucket policy are absent before creation and belong to the fresh Tenant",
+            "old and new credential aliases share one generated access key; secrets remain in memory",
+            "S3 request history overlaps the actual set-user-secret-key request interval",
+            "each RustFS Pod rejects the old secret and serves matching bytes with the new secret",
         ],
-        validation: "blocked until a scenario-owned admin rotation step can prove bounded auth errors and post-rotation success without a second harness",
-        observability: "rotation transcript, 401/403 counts, post-rotation PUT/GET sample",
-        conflict_domain: "fresh Tenant credentials; must not rotate shared or operator secrets",
+        validation: "actual secret rotation overlaps bounded S3 requests, old credentials are rejected on every Pod, new credentials commit PUT/GET/overwrite/DELETE probes, every committed version and delete marker passes the existing checker, and owned IAM fixtures are removed",
+        observability: "credential-rotation.json, history.jsonl, admin-workflow.json, recovery-health.json, checker-report.json",
+        conflict_domain: "fresh Tenant and one run-owned IAM identity; no shared credentials are modified",
     },
     FaultScenarioSpec {
         scenario: NETWORK_SPLIT_BRAIN_SCENARIO,
@@ -2172,6 +2174,9 @@ pub fn planned_qualification_catalog_json() -> Result<String> {
 pub fn apply_catalog_defaults(config: &mut FaultTestConfig) -> Result<()> {
     let spec = scenario_spec(&config.scenario)?;
     spec.workload_profile.apply_to_config(config);
+    if config.scenario == CREDENTIAL_ROTATION_MID_LOAD_SCENARIO {
+        config.workload_versioning = true;
+    }
     if matches!(
         config.scenario.as_str(),
         QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO | QUORUM_P_DM_EIO_SCENARIO
@@ -2230,6 +2235,7 @@ pub fn expected_workload_versioning_for_scenario(scenario: &str, env_value: bool
             QUORUM_P_IO_FAULT_SCENARIO
                 | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
                 | QUORUM_P_DM_EIO_SCENARIO
+                | CREDENTIAL_ROTATION_MID_LOAD_SCENARIO
         ))
 }
 
@@ -2364,14 +2370,14 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 38);
+        assert_eq!(executable_scenario_catalog().count(), 39);
         assert_eq!(scenario_catalog().len(), 47);
         assert_eq!(
             scenario_catalog()
                 .iter()
                 .filter(|scenario| scenario.status == FaultScenarioStatus::Planned)
                 .count(),
-            9
+            8
         );
     }
 

@@ -2305,6 +2305,9 @@ fn validate_fault_artifacts_with_identity(
     identity: ArtifactIdentityPolicy<'_>,
 ) -> Result<ArtifactValidationReport> {
     let scenario_spec = scenarios::scenario_spec(&options.scenario)?;
+    if options.scenario == scenarios::CREDENTIAL_ROTATION_MID_LOAD_SCENARIO {
+        return validate_credential_rotation_artifacts(options, identity, scenario_spec.case_name);
+    }
     if matches!(
         options.scenario.as_str(),
         scenarios::ADMIN_DECOMMISSION_SCENARIO | scenarios::ADMIN_REBALANCE_SCENARIO
@@ -3362,6 +3365,161 @@ fn validate_bitrot_failure_event(
     Ok(())
 }
 
+fn validate_credential_rotation_artifacts(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+    case_name: &str,
+) -> Result<ArtifactValidationReport> {
+    use crate::fault::credential_rotation::{
+        CREDENTIAL_ROTATION_ARTIFACT, CredentialRotationEvidence,
+        validate_credential_rotation_evidence,
+    };
+    let artifacts =
+        locate_required_artifacts(&options.artifact_root, case_name, &options.scenario)?;
+    let metadata = read_json::<RunMetadataArtifact>(required(&artifacts, "run-metadata.json")?)?;
+    let json_spec = read_json::<FaultRunSpec>(required(&artifacts, "run-spec.json")?)?;
+    let yaml_spec = read_yaml::<FaultRunSpec>(required(&artifacts, "run-spec.yaml")?)?;
+    ensure!(
+        json_spec == yaml_spec,
+        "credential rotation JSON/YAML run specs differ"
+    );
+    validate_run_spec(&json_spec, options)?;
+    ensure!(
+        json_spec.execution_kind()? == ExecutionKind::CredentialRotation
+            && metadata.scenario == options.scenario
+            && metadata.run_id == json_spec.metadata.run_id
+            && metadata.workload_objects == options.expected_workload_objects
+            && metadata.workload_concurrency == options.expected_workload_concurrency
+            && json_spec.metadata.name == case_name
+            && metadata.context == json_spec.cluster.context
+            && metadata.namespace == json_spec.cluster.namespace
+            && metadata.tenant == json_spec.cluster.tenant,
+        "credential rotation metadata does not match its run spec or selected workload"
+    );
+    if let Some(run_id) = identity.planned_run_id() {
+        ensure!(
+            metadata.run_id == run_id,
+            "credential rotation does not match the planned attempt"
+        );
+    }
+    let workload = read_json::<WorkloadPlan>(required(&artifacts, "workload-plan.json")?)?;
+    let workload_identity =
+        read_json::<ArtifactIdentity>(required(&artifacts, "workload-plan.json")?)?;
+    validate_optional_artifact_identity(
+        "workload-plan.json",
+        &workload_identity,
+        &metadata,
+        identity,
+    )?;
+    ensure!(
+        workload == json_spec.workload.plan,
+        "credential rotation workload plan differs from the run spec"
+    );
+    let preflight = read_json::<PreflightSummary>(required(&artifacts, "preflight-summary.json")?)?;
+    ensure!(
+        preflight.schema_version == 1
+            && preflight.status == PreflightStatus::Passed
+            && preflight.run_id.as_deref() == Some(metadata.run_id.as_str())
+            && preflight.scenario_set == [options.scenario.clone()]
+            && preflight.context == metadata.context
+            && preflight.namespace == metadata.namespace
+            && preflight.tenant == metadata.tenant
+            && preflight
+                .phases
+                .iter()
+                .any(|phase| phase.name == "credential-rotation-fixture"
+                    && phase.status == PreflightStatus::Passed
+                    && !phase.checks.is_empty()
+                    && phase
+                        .checks
+                        .iter()
+                        .all(|check| check.status == PreflightStatus::Passed)),
+        "credential rotation preflight lacks the exact owned fixture proof"
+    );
+    let evidence = read_json::<CredentialRotationEvidence>(required(
+        &artifacts,
+        CREDENTIAL_ROTATION_ARTIFACT,
+    )?)?;
+    ensure!(
+        evidence.run_id == metadata.run_id
+            && evidence.scenario == options.scenario
+            && evidence.bucket == json_spec.metadata.bucket
+            && evidence.context == metadata.context
+            && evidence.namespace == metadata.namespace
+            && evidence.tenant == metadata.tenant
+            && evidence.pods_before.len() == options.expected_rustfs_pod_count
+            && evidence.old_prefill_operation_ids.len() == workload.object_count / 2
+            && evidence.old_workload_operation_ids.len()
+                == workload.object_count - workload.object_count / 2,
+        "credential rotation identity, Pod coverage, or finite workload count is invalid"
+    );
+    let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
+    let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
+    validate_credential_rotation_evidence(&evidence, &history, &checker)?;
+    let workflow =
+        read_json::<AdminWorkflowEvidence>(required(&artifacts, ADMIN_WORKFLOW_ARTIFACT)?)?;
+    workflow.validate()?;
+    ensure!(
+        workflow.completed
+            && workflow.cleanup_succeeded
+            && workflow.scenario == options.scenario
+            && workflow.run_id == metadata.run_id,
+        "credential rotation lifecycle did not complete"
+    );
+    let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
+    ensure!(
+        events
+            .iter()
+            .all(|event| event.scenario == options.scenario && event.run_id == metadata.run_id)
+            && has_event(&events, "credential-rotation", RunEventStatus::Succeeded)
+            && has_event(&events, "checker-final", RunEventStatus::Succeeded)
+            && has_event(&events, "run", RunEventStatus::Succeeded),
+        "credential rotation run events do not prove successful completion"
+    );
+    let (recovery, baseline) =
+        validate_recovery_health_report(&artifacts, &metadata, identity, &events)?;
+    let rotation = evidence
+        .rotation
+        .as_ref()
+        .context("rotation receipt is absent")?;
+    ensure!(
+        recovery.baseline.deployment_id == evidence.deployment_id
+            && baseline.at_ms <= rotation.started_at_ms
+            && recovery.started_at_ms >= rotation.ended_at_ms
+            && recovery
+                .readiness
+                .iter()
+                .map(|probe| probe.pod_name.as_str())
+                .collect::<BTreeSet<_>>()
+                == evidence
+                    .pods_before
+                    .iter()
+                    .map(|pod| pod.name.as_str())
+                    .collect::<BTreeSet<_>>()
+            && recovery.readiness.len() == evidence.pods_before.len(),
+        "credential rotation recovery health does not cover its original RustFS deployment"
+    );
+    Ok(ArtifactValidationReport {
+        scenario: options.scenario.clone(),
+        case_name: case_name.to_string(),
+        terminal_stage: "checker-final".to_string(),
+        run_succeeded: true,
+        seed: workload.seed,
+        client_disruptions: evidence
+            .old_workload_operation_ids
+            .iter()
+            .filter(|id| {
+                history
+                    .iter()
+                    .any(|record| &record.id == *id && record.outcome != OperationOutcome::Ok)
+            })
+            .count(),
+        recommitted: 0,
+        committed: checker.committed_puts,
+        required_artifacts: json_spec.artifacts.required,
+    })
+}
+
 fn validate_admin_execution_artifacts(
     options: &ArtifactValidationOptions,
     identity: ArtifactIdentityPolicy<'_>,
@@ -4037,6 +4195,9 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
             ExecutionKind::Injection => {
                 bail!("planned run-spec cannot use the injection execution route")
             }
+            ExecutionKind::CredentialRotation => {
+                bail!("credential rotation must use its executable catalog entry")
+            }
         }
     }
     validate_run_spec_catalog_contract(spec, options)?;
@@ -4229,6 +4390,20 @@ fn validate_run_spec_catalog_contract(
                 None,
             )
         }
+        ExecutionKind::CredentialRotation => {
+            let Some(crate::fault::spec::FaultRunExecutionSpec::CredentialRotation {
+                operation_timeout_seconds,
+            }) = &spec.execution
+            else {
+                unreachable!("execution_kind validated the credential rotation shape")
+            };
+            (
+                *operation_timeout_seconds,
+                1,
+                FaultInjectionParameters::Default,
+                None,
+            )
+        }
         ExecutionKind::StorageRecovery => {
             let (case, operation_timeout_seconds) = match &spec.execution {
                 Some(crate::fault::spec::FaultRunExecutionSpec::StorageRecovery {
@@ -4286,6 +4461,7 @@ fn validate_run_spec_catalog_contract(
         FaultWorkloadMode::S3Mixed => "s3-mixed",
         FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
         FaultWorkloadMode::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
+        FaultWorkloadMode::CredentialRotation => "credential-rotation",
     };
     ensure!(
         spec.workload.mode == expected_mode,

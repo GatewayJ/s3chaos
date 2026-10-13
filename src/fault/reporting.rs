@@ -43,7 +43,7 @@ pub(crate) struct FaultStatusSnapshot {
     pub(crate) quorum_dm_status: Option<crate::fault::backends::quorum_dm::QuorumDmStatusSnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub(crate) struct PodIdentity {
     pub(crate) name: String,
     pub(crate) uid: String,
