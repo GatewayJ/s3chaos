@@ -704,6 +704,19 @@ impl FaultRunArtifactSpec {
         if scenario == crate::fault::scenarios::WARP_UNDER_CHAOS_SCENARIO {
             names.push(crate::fault::warp_metrics::WARP_POWERLOSS_METRICS_ARTIFACT.to_string());
         }
+        if scenario == crate::fault::scenarios::NETWORK_SPLIT_BRAIN_SCENARIO {
+            names.extend(
+                [
+                    crate::fault::runner::pod_faults::NETWORK_SPLIT_BRAIN_ARTIFACT,
+                    crate::fault::runner::pod_faults::SPLIT_BRAIN_S3_HISTORY_ARTIFACT,
+                    crate::fault::runner::pod_faults::SPLIT_BRAIN_RECOVERY_HISTORY_ARTIFACT,
+                ]
+                .map(str::to_string),
+            );
+        }
+        if scenario == crate::fault::scenarios::CLOCK_SKEW_SCENARIO {
+            names.push(crate::fault::runner::pod_faults::CLOCK_SKEW_ARTIFACT.to_string());
+        }
         names
     }
 }

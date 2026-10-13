@@ -82,6 +82,7 @@ pub const METADATA_SHARD_CORRUPTION_SCENARIO: &str = "metadata-shard-corruption"
 const IOCHAOS_CRD: &str = "iochaos.chaos-mesh.org";
 const PODCHAOS_CRD: &str = "podchaos.chaos-mesh.org";
 const NETWORKCHAOS_CRD: &str = "networkchaos.chaos-mesh.org";
+const TIMECHAOS_CRD: &str = "timechaos.chaos-mesh.org";
 const STRESSCHAOS_CRD: &str = "stresschaos.chaos-mesh.org";
 const DEFAULT_TARGET_PROOF: &[&str] = &[
     "run artifacts must include the selected Kubernetes object or host device identity before the fault is activated",
@@ -227,6 +228,7 @@ pub enum FaultBackend {
     ChaosMeshIoChaos,
     ChaosMeshPodChaos,
     ChaosMeshNetworkChaos,
+    ChaosMeshTimeChaos,
     ChaosMeshStressChaos,
     DeviceMapper,
     MinioWarpWithChaos,
@@ -243,6 +245,7 @@ impl FaultBackend {
             Self::ChaosMeshIoChaos => "chaos-mesh-io-chaos",
             Self::ChaosMeshPodChaos => "chaos-mesh-pod-chaos",
             Self::ChaosMeshNetworkChaos => "chaos-mesh-network-chaos",
+            Self::ChaosMeshTimeChaos => "chaos-mesh-time-chaos",
             Self::ChaosMeshStressChaos => "chaos-mesh-stress-chaos",
             Self::DeviceMapper => "device-mapper",
             Self::MinioWarpWithChaos => "minio-warp-with-chaos",
@@ -270,6 +273,7 @@ pub enum FaultParameterSchema {
     /// Bursty correlated loss. Correlation is pinned high so a suite cannot
     /// collapse this scenario into steady `network-loss`.
     NetworkFlaky,
+    ClockSkew,
     StressCpu,
     StressMemory,
 }
@@ -476,6 +480,7 @@ impl FaultScenarioSpec {
                 | IO_EIO_DURING_MULTIPART_SCENARIO
                 | IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO
                 | NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+                | NETWORK_SPLIT_BRAIN_SCENARIO
                 | POD_FAILURE_QUORUM_EDGE_SCENARIO
                 | QUORUM_P_IO_FAULT_SCENARIO
                 | QUORUM_P_DM_EIO_SCENARIO
@@ -1796,27 +1801,27 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         detector: FaultDetectorSpec::diagnostic_only(&[
             DurabilityBugFamily::RecoveryAvailabilityRegression,
         ]),
-        case_name: "fault_clock_skew_has_no_wired_actuator",
-        description: "Planned clock skew between RustFS nodes. Chaos Mesh TimeChaos is not wired, and changing the node clock is not a safe actuator.",
+        case_name: "fault_clock_skew_preserves_committed_objects",
+        description: "Shift CLOCK_REALTIME in one running RustFS container through TimeChaos, prove the process clock changed through fresh direct HTTP responses, and verify committed state after restoration.",
         priority: FaultPriority::P2,
-        backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
+        backend: FaultBackend::ChaosMeshTimeChaos,
+        status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::Default,
         isolation: FaultIsolation::ReusableTenant,
-        crds: &[],
+        crds: &[TIMECHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
-        param_schema: FaultParameterSchema::None,
+        param_schema: FaultParameterSchema::ClockSkew,
         impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
         boundary: "rustfs-workload/clock-skew",
-        ci_phase: "planned",
+        ci_phase: "faults",
         target: "one RustFS Pod clock, offset without touching the Kubernetes node clock",
         target_proof: &[
             "the actuator must prove the offset applies to the already-running RustFS process",
             "the node and control-plane clocks stay unchanged",
         ],
-        validation: "blocked until a TimeChaos or equivalent adapter can skew only the selected Pod and restore it",
-        observability: "clock offset evidence, auth and heal logs, checker reports",
+        validation: "the exact RustFS container remains running with its original UID and containerID, fresh HTTP Date observations match the bounded offset during load and return to baseline after deletion, a control Pod clock stays unchanged, and the common recovery health and object checker pass",
+        observability: "clock-skew.json, timechaos controller snapshots, direct Pod HTTP Date observations, history.jsonl, recovery-health.json, checker reports",
         conflict_domain: "one Pod clock; never the host or API server clock",
     },
     FaultScenarioSpec {
@@ -1855,11 +1860,11 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::QuorumViolation,
             DurabilityBugFamily::CommitMetadataLoss,
         ]),
-        case_name: "fault_network_split_brain_needs_complement_selectors",
-        description: "Planned dual partition that keeps two pairs internally connected while cutting traffic between the pairs. The current NetworkChaos renderer uses one overlapping all-peer target selector, which isolates selected Pods from each other instead of forming two live sides.",
+        case_name: "fault_network_split_brain_preserves_committed_state",
+        description: "Partition four runtime-proven symmetric RustFS servers into two internally connected pairs, prove the bidirectional cut with container network probes, and check per-side S3 outcomes and recovery consistency.",
         priority: FaultPriority::P1,
-        backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
+        backend: FaultBackend::ChaosMeshNetworkChaos,
+        status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::Default,
         isolation: FaultIsolation::ReusableTenant,
         crds: &[NETWORKCHAOS_CRD],
@@ -1868,14 +1873,14 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-workload/network-split-brain",
-        ci_phase: "planned",
+        ci_phase: "faults",
         target: "two disjoint RustFS Pod pairs, with intra-pair traffic left intact",
         target_proof: &[
             "source and target selectors must be complements proven from the live Ready Pod set",
             "intra-pair connectivity must be shown separately from the cut",
         ],
-        validation: "blocked until the NetworkChaos renderer can apply a complement selector without also partitioning Pods inside a side",
-        observability: "networkchaos manifest with disjoint selectors, per-side write outcomes, checker reports after heal",
+        validation: "live erasure membership proves both pairs retain read quorum and lose write quorum, every ordered intra-pair TCP/HTTP probe succeeds and cross-pair TCP connections time out under the controller-proven fault, each pair is exercised through a pinned S3 endpoint, all acknowledged reads match committed bytes, and recovery health plus the common object checker pass",
+        observability: "network-split-brain.json, networkchaos manifest and controller snapshots, per-side S3 operation IDs in history.jsonl, recovery-health.json, checker reports",
         conflict_domain: "run-scoped NetworkChaos; must not overlap the single-Pod or write-quorum partition scenarios",
     },
     FaultScenarioSpec {
@@ -2265,6 +2270,7 @@ pub(in crate::fault) fn requires_prefault_multipart_staging(scenario: &str) -> b
     matches!(
         scenario,
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+            | NETWORK_SPLIT_BRAIN_SCENARIO
             | POD_FAILURE_QUORUM_EDGE_SCENARIO
             | QUORUM_P_IO_FAULT_SCENARIO
             | QUORUM_P_DM_EIO_SCENARIO
@@ -2290,6 +2296,7 @@ pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
 
 #[cfg(test)]
 mod tests {
+    use super::NETWORK_SPLIT_BRAIN_SCENARIO;
     use super::{
         ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, CLUSTER_COLD_RESTART_SCENARIO,
         DISK_FULL_SCENARIO, DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
@@ -2392,14 +2399,14 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 42);
+        assert_eq!(executable_scenario_catalog().count(), 44);
         assert_eq!(scenario_catalog().len(), 47);
         assert_eq!(
             scenario_catalog()
                 .iter()
                 .filter(|scenario| scenario.status == FaultScenarioStatus::Planned)
                 .count(),
-            5
+            3
         );
     }
 
@@ -2871,6 +2878,7 @@ mod tests {
                 QUORUM_P_IO_FAULT_SCENARIO,
                 QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
                 super::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO,
+                NETWORK_SPLIT_BRAIN_SCENARIO,
             ]
         );
     }

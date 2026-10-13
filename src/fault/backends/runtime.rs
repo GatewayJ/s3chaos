@@ -110,6 +110,7 @@ fn require_fault_backend(
             Ok(())
         }
         FaultBackend::ChaosMeshNetworkChaos => chaos_mesh::require_networkchaos_crd(cluster),
+        FaultBackend::ChaosMeshTimeChaos => chaos_mesh::require_timechaos_crd(cluster),
         FaultBackend::ChaosMeshStressChaos => chaos_mesh::require_stresschaos_crd(cluster),
         FaultBackend::DeviceMapper => Ok(()),
         FaultBackend::PlannedReliabilityWorkflow => {
@@ -149,6 +150,7 @@ fn cleanup_fault_backend(
         | FaultBackend::MinioWarpWithChaos
         | FaultBackend::ChaosMeshPodChaos
         | FaultBackend::ChaosMeshNetworkChaos
+        | FaultBackend::ChaosMeshTimeChaos
         | FaultBackend::ChaosMeshStressChaos => {
             // Sweep every managed chaos kind, not just this plan's backend: a
             // chaos CR leaked by a prior run or a prior suite attempt of a
@@ -343,6 +345,7 @@ fn apply_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> 
         FaultBackend::ChaosMeshIoChaos
         | FaultBackend::ChaosMeshPodChaos
         | FaultBackend::ChaosMeshNetworkChaos
+        | FaultBackend::ChaosMeshTimeChaos
         | FaultBackend::ChaosMeshStressChaos
         | FaultBackend::MinioWarpWithChaos => apply_chaos_mesh_fault_backend(request),
         FaultBackend::PlannedReliabilityWorkflow => {

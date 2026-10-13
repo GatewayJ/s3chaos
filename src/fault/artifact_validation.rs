@@ -541,6 +541,41 @@ fn validate_failed_attempt_disruption_evidence(
             expected_mutation,
         )?;
     }
+    if scenario == scenarios::NETWORK_SPLIT_BRAIN_SCENARIO {
+        let summary =
+            read_json::<FailureSummary>(&bound_case_artifact(&case_dir, "failure-summary.json")?)?;
+        if summary.classification == "quorum_violation" {
+            use crate::fault::runner::pod_faults::{
+                NETWORK_SPLIT_BRAIN_ARTIFACT, PodFaultEvidence,
+                SPLIT_BRAIN_RECOVERY_HISTORY_ARTIFACT, SPLIT_BRAIN_S3_HISTORY_ARTIFACT,
+            };
+            summary.validate_classification_projection()?;
+            let spec = read_json::<FaultRunSpec>(&run_spec_path)?;
+            let proof =
+                read_json::<TargetProof>(&bound_case_artifact(&case_dir, "target-proof.json")?)?;
+            let pod_evidence = read_json::<PodFaultEvidence>(&bound_case_artifact(
+                &case_dir,
+                NETWORK_SPLIT_BRAIN_ARTIFACT,
+            )?)?;
+            let history =
+                read_jsonl::<OperationRecord>(&bound_case_artifact(&case_dir, "history.jsonl")?)?;
+            let side_history = read_jsonl::<OperationRecord>(&bound_case_artifact(
+                &case_dir,
+                SPLIT_BRAIN_S3_HISTORY_ARTIFACT,
+            )?)?;
+            pod_evidence.validate_quorum_violation(&proof, &spec, &history, &side_history)?;
+            let recovery_history = read_jsonl::<OperationRecord>(&bound_case_artifact(
+                &case_dir,
+                SPLIT_BRAIN_RECOVERY_HISTORY_ARTIFACT,
+            )?)?;
+            pod_evidence.validate_recovered_probes(
+                &recovery_history,
+                &spec.metadata.bucket,
+                spec.workload.seed,
+            )?;
+            validate_pod_fault_runtime_evidence(&pod_evidence, &evidence)?;
+        }
+    }
     ensure!(
         has_event(&events, "run", RunEventStatus::Started)
             && (has_event(&events, "run", RunEventStatus::Failed)
@@ -2560,6 +2595,39 @@ fn validate_fault_artifacts_with_identity(
             &json_spec,
             QuorumEdgeRuntimeKind::NetworkPartition,
         )?;
+    }
+    if matches!(
+        options.scenario.as_str(),
+        scenarios::CLOCK_SKEW_SCENARIO | scenarios::NETWORK_SPLIT_BRAIN_SCENARIO
+    ) {
+        use crate::fault::runner::pod_faults::{
+            CLOCK_SKEW_ARTIFACT, NETWORK_SPLIT_BRAIN_ARTIFACT, PodFaultEvidence,
+            SPLIT_BRAIN_RECOVERY_HISTORY_ARTIFACT, SPLIT_BRAIN_S3_HISTORY_ARTIFACT,
+        };
+        let name = if options.scenario == scenarios::CLOCK_SKEW_SCENARIO {
+            CLOCK_SKEW_ARTIFACT
+        } else {
+            NETWORK_SPLIT_BRAIN_ARTIFACT
+        };
+        let pod_evidence = read_json::<PodFaultEvidence>(required(&artifacts, name)?)?;
+        let side_history = if options.scenario == scenarios::NETWORK_SPLIT_BRAIN_SCENARIO {
+            read_jsonl::<OperationRecord>(required(&artifacts, SPLIT_BRAIN_S3_HISTORY_ARTIFACT)?)?
+        } else {
+            Vec::new()
+        };
+        pod_evidence.validate(&target_proof, &json_spec, &history, &side_history)?;
+        if options.scenario == scenarios::NETWORK_SPLIT_BRAIN_SCENARIO {
+            let recovery_history = read_jsonl::<OperationRecord>(required(
+                &artifacts,
+                SPLIT_BRAIN_RECOVERY_HISTORY_ARTIFACT,
+            )?)?;
+            pod_evidence.validate_recovered_probes(
+                &recovery_history,
+                &json_spec.metadata.bucket,
+                json_spec.workload.seed,
+            )?;
+        }
+        validate_pod_fault_runtime_evidence(&pod_evidence, &evidence)?;
     }
     if options.scenario == scenarios::POD_FAILURE_QUORUM_EDGE_SCENARIO {
         validate_write_quorum_runtime_evidence(
@@ -7805,6 +7873,105 @@ fn validate_pod_lifecycle_artifact(
             }
         }
     }
+    Ok(())
+}
+
+fn validate_pod_fault_runtime_evidence(
+    pod_evidence: &crate::fault::runner::pod_faults::PodFaultEvidence,
+    evidence: &FaultEvidenceArtifact,
+) -> Result<()> {
+    let phases = &pod_evidence.observations;
+    ensure!(
+        phases.len() == 4,
+        "Pod fault runtime evidence lacks its four observation phases"
+    );
+    if pod_evidence.scenario == scenarios::CLOCK_SKEW_SCENARIO {
+        ensure!(
+            pod_evidence
+                .clock_workload_endpoint
+                .as_ref()
+                .context("clock fault has no pinned mixed workload endpoint")?
+                .established_at_ms
+                <= evidence
+                    .fault_apply_started_at_ms
+                    .context("clock fault lacks apply timestamp")?,
+            "clock workload endpoint was established after fault injection started"
+        );
+    } else {
+        ensure!(
+            pod_evidence
+                .probe_recovery
+                .as_ref()
+                .context("split-brain lacks recovered probe state")?
+                .started_at_ms
+                >= evidence
+                    .recovery_ended_at_ms
+                    .context("split-brain lacks completed recovery timestamp")?,
+            "split-brain probes were inspected before healthy recovery completed"
+        );
+    }
+    let controller = phases[1]
+        .controller_before
+        .as_ref()
+        .context("Pod fault controller is missing")?;
+    ensure!(
+        evidence.active_snapshots.len() == 1 && evidence.workload_snapshots.len() == 1,
+        "Pod faults require one active and one post-workload runtime snapshot"
+    );
+    for snapshot in evidence
+        .active_snapshots
+        .iter()
+        .chain(&evidence.workload_snapshots)
+    {
+        let resource = snapshot
+            .get("chaos_status")
+            .context("Pod fault runtime snapshot has no controller resource")?;
+        pod_evidence.validate_controller(resource)?;
+        ensure!(
+            resource.pointer("/metadata/uid") == controller.pointer("/metadata/uid")
+                && resource.pointer("/metadata/name") == controller.pointer("/metadata/name")
+                && resource.pointer("/metadata/name").and_then(Value::as_str)
+                    == snapshot.get("resource_name").and_then(Value::as_str)
+                && snapshot.get("resource_kind").and_then(Value::as_str)
+                    == Some(if pod_evidence.scenario == scenarios::CLOCK_SKEW_SCENARIO {
+                        "timechaos"
+                    } else {
+                        "networkchaos"
+                    }),
+            "Pod observations and fault-evidence.json identify different controller resources"
+        );
+    }
+    ensure!(
+        phases[0].completed_at_ms
+            <= evidence
+                .fault_apply_started_at_ms
+                .context("Pod fault lacks apply timestamp")?
+            && phases[1].started_at_ms
+                >= evidence
+                    .fault_active_at_ms
+                    .context("Pod fault lacks active timestamp")?
+            && phases[1].completed_at_ms
+                <= evidence
+                    .workload_started_at_ms
+                    .context("Pod fault lacks workload start timestamp")?
+            && phases[2].started_at_ms
+                >= evidence
+                    .workload_ended_at_ms
+                    .context("Pod fault lacks workload end timestamp")?
+            && phases[2].completed_at_ms
+                <= evidence
+                    .fault_delete_started_at_ms
+                    .context("Pod fault lacks deletion timestamp")?
+            && phases[3].started_at_ms
+                >= evidence
+                    .recovery_started_at_ms
+                    .context("Pod fault lacks recovery start timestamp")?
+            && phases[3].completed_at_ms
+                <= evidence
+                    .recovery_ended_at_ms
+                    .context("Pod fault lacks recovery end timestamp")?,
+        "Pod observations are outside the persisted baseline/fault/workload/recovery phases"
+    );
     Ok(())
 }
 

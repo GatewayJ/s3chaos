@@ -36,6 +36,7 @@ pub(crate) mod host_storage;
 pub(crate) mod node_down;
 pub mod on_disk_bitrot;
 pub mod plan;
+pub(crate) mod pod_network;
 pub mod pods;
 pub mod preflight;
 pub mod quorum;

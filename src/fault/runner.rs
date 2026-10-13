@@ -48,6 +48,7 @@ pub(in crate::fault) mod access;
 mod ack;
 mod injection;
 mod node_down;
+pub(crate) mod pod_faults;
 mod post_recovery;
 mod quorum_activation;
 mod recovery;
@@ -260,7 +261,17 @@ async fn run_fault_case(
                 if plan.workload_mode.runs_warp() {
                     run.capture_warp_baseline(&prepared)?;
                 }
+                let mut pod_observations = deadline.run(run.prepare_pod_fault_observations(&target)).await?;
+                if let Some(evidence) = pod_observations.as_mut() {
+                    deadline.run(run.pin_clock_workload_endpoint(&mut prepared, evidence)).await?;
+                }
                 let mut active = run.activate_fault(&target, dm_prepared).await?;
+                if let Some(evidence) = pod_observations.as_mut() {
+                    deadline.run(run.observe_pod_fault(evidence, pod_faults::ObservationPhase::Active, Some(&active))).await?;
+                    if let Some(reason) = run.probe_split_brain_sides(evidence, &prepared, &active).await? {
+                        active.deferred_failure.get_or_insert(reason);
+                    }
+                }
                 let skip_typed_oracle = (plan.scenario == scenarios::QUORUM_P_DM_EIO_SCENARIO && active.deferred_failure.is_some()) || active.quorum_activation.as_ref().is_some_and(|evidence| {
                     evidence.evidence().disposition()
                         == crate::fault::quorum::activation::QuorumActivationDisposition::SkipTypedOracleAndRecover
@@ -287,10 +298,16 @@ async fn run_fault_case(
                     run.record_failure("fault-evidence", "fault_not_active", &error, None, None)?;
                     active.deferred_failure.get_or_insert_with(|| format!("{error:#}"));
                 }
+                if let Some(evidence) = pod_observations.as_mut() {
+                    deadline.run(run.observe_pod_fault(evidence, pod_faults::ObservationPhase::AfterWorkload, Some(&active))).await?;
+                }
                 run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
                 run.hold_node_down(&mut prepared, &target, &active.fault)
                     .await?;
                 let removal = run.remove_fault(&mut active.fault)?;
+                if let Some(evidence) = pod_observations.as_mut() {
+                    deadline.run(run.observe_pod_fault(evidence, pod_faults::ObservationPhase::Restored, None)).await?;
+                }
                 run.cleanup_quorum_activation_canaries(&mut active).await;
                 if let Some(fixtures) = probe_fixtures.as_mut() {
                     if let Some(activation) = &active.quorum_activation {
@@ -321,6 +338,9 @@ async fn run_fault_case(
                 // suite's failed-attempt accounting.
                 let mut evidence =
                     run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
+                if let Some(observations) = pod_observations.as_mut() {
+                    deadline.run(run.verify_split_brain_probe_recovery(observations, &prepared.s3)).await?;
+                }
                 run.probe_post_recovery_writes(&prepared.s3).await?;
                 deadline
                     .run(run.verify_recovered(&prepared.s3, &mut workload.workload))

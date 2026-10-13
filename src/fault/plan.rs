@@ -22,8 +22,8 @@ use crate::fault::{
     config::{DEFAULT_RUSTFS_VOLUME_PATH, FaultTestConfig, validate_rustfs_volume_path},
     quorum::{ErasureSetShape, MAX_ERASURE_SET_SHARDS, QuorumCaseClass, QuorumVolumeBoundary},
     scenarios::{
-        ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, CLUSTER_COLD_RESTART_SCENARIO,
-        CREDENTIAL_ROTATION_MID_LOAD_SCENARIO, DISK_FULL_SCENARIO,
+        ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, CLOCK_SKEW_SCENARIO,
+        CLUSTER_COLD_RESTART_SCENARIO, CREDENTIAL_ROTATION_MID_LOAD_SCENARIO, DISK_FULL_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
@@ -35,8 +35,8 @@ use crate::fault::{
         NETWORK_ASYMMETRIC_PARTITION_SCENARIO, NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO,
         NETWORK_DUPLICATE_SCENARIO, NETWORK_FLAKY_SCENARIO, NETWORK_LOSS_SCENARIO,
         NETWORK_PARTITION_DURING_HEAL_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
-        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, NODE_CRASH_PROXY_SCENARIO,
-        ON_DISK_BITROT_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
+        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, NETWORK_SPLIT_BRAIN_SCENARIO,
+        NODE_CRASH_PROXY_SCENARIO, ON_DISK_BITROT_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
         POD_FAILURE_QUORUM_EDGE_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
         POD_KILL_ONE_SCENARIO, POD_RESTART_STORM_SCENARIO, QUORUM_P_DM_EIO_SCENARIO,
         QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
@@ -333,6 +333,8 @@ pub enum FaultKind {
     RustfsServerPodKillStorm,
     RustfsServerPodFailure,
     RustfsServerNetworkPartition,
+    RustfsServerNetworkSplitBrain,
+    RustfsServerClockSkew,
     RustfsServerNetworkAsymmetricPartition,
     RustfsServerNetworkDelay,
     RustfsServerNetworkLoss,
@@ -360,6 +362,8 @@ impl FaultKind {
             Self::RustfsServerPodKillStorm => "rustfs_server_pod_kill_storm",
             Self::RustfsServerPodFailure => "rustfs_server_pod_failure",
             Self::RustfsServerNetworkPartition => "rustfs_server_network_partition",
+            Self::RustfsServerNetworkSplitBrain => "rustfs_server_network_split_brain",
+            Self::RustfsServerClockSkew => "rustfs_server_clock_skew",
             Self::RustfsServerNetworkAsymmetricPartition => {
                 "rustfs_server_network_asymmetric_partition"
             }
@@ -549,6 +553,10 @@ pub enum FaultInjectionParameters {
         #[serde(rename = "correlationPercent")]
         correlation_percent: u8,
     },
+    ClockSkew {
+        #[serde(rename = "offsetSeconds")]
+        offset_seconds: i64,
+    },
     StressCpu {
         workers: u32,
         load: u8,
@@ -606,6 +614,7 @@ impl FaultInjectionParameters {
             FaultParameterSchema::NetworkCorrupt => FaultKind::RustfsServerNetworkCorrupt,
             FaultParameterSchema::NetworkDuplicate => FaultKind::RustfsServerNetworkDuplicate,
             FaultParameterSchema::NetworkFlaky => FaultKind::RustfsServerNetworkFlaky,
+            FaultParameterSchema::ClockSkew => FaultKind::RustfsServerClockSkew,
             FaultParameterSchema::StressCpu => FaultKind::RustfsServerCpuStress,
             FaultParameterSchema::StressMemory => FaultKind::RustfsServerMemoryStress,
             FaultParameterSchema::None => bail!("scenario does not support typed params yet"),
@@ -691,6 +700,13 @@ impl FaultInjectionParameters {
         }
     }
 
+    pub fn clock_offset_seconds(&self) -> Result<i64> {
+        match self {
+            Self::ClockSkew { offset_seconds } => Ok(*offset_seconds),
+            other => bail!("expected clockSkew parameters, got {:?}", other),
+        }
+    }
+
     pub fn stress_memory(&self) -> Result<(u32, String)> {
         match self {
             Self::StressMemory { workers, size } => Ok((*workers, size.clone())),
@@ -725,6 +741,9 @@ impl FaultInjectionParameters {
                 loss_percent: 10,
                 correlation_percent: 90,
             },
+            FaultKind::RustfsServerClockSkew => Self::ClockSkew {
+                offset_seconds: 120,
+            },
             FaultKind::RustfsServerCpuStress => Self::StressCpu {
                 workers: 1,
                 load: 80,
@@ -739,6 +758,13 @@ impl FaultInjectionParameters {
 
     fn validate_for_kind(&self, kind: FaultKind) -> Result<()> {
         match (kind, self) {
+            (FaultKind::RustfsServerClockSkew, Self::ClockSkew { offset_seconds }) => {
+                ensure!(
+                    (60..=600).contains(&offset_seconds.unsigned_abs()),
+                    "params.offsetSeconds must have an absolute value between 60 and 600"
+                );
+                Ok(())
+            }
             (_, Self::Default) => Ok(()),
             (FaultKind::RustfsVolumeIoError, Self::SamePodIo { second_volume_path }) => {
                 validate_rustfs_volume_path(second_volume_path)
@@ -1012,6 +1038,9 @@ impl FaultInjection {
         {
             return format!("two RustFS volumes at {path} and {second_volume_path} on one Pod");
         }
+        if self.kind == FaultKind::RustfsServerNetworkSplitBrain {
+            return "two internally connected RustFS Pod pairs".to_string();
+        }
         match (&self.target, self.selection) {
             (FaultTarget::RustfsVolume { path }, FaultSelection::FixedTargets(count)) => {
                 format!("{count} RustFS volume target(s) at {path}")
@@ -1140,6 +1169,7 @@ fn fault_kind_accepts_backend(kind: FaultKind, backend: FaultBackend) -> bool {
             FaultBackend::ChaosMeshPodChaos
         ) | (
             FaultKind::RustfsServerNetworkPartition
+                | FaultKind::RustfsServerNetworkSplitBrain
                 | FaultKind::RustfsServerNetworkAsymmetricPartition
                 | FaultKind::RustfsServerNetworkDelay
                 | FaultKind::RustfsServerNetworkLoss
@@ -1147,6 +1177,9 @@ fn fault_kind_accepts_backend(kind: FaultKind, backend: FaultBackend) -> bool {
                 | FaultKind::RustfsServerNetworkCorrupt
                 | FaultKind::RustfsServerNetworkDuplicate,
             FaultBackend::ChaosMeshNetworkChaos
+        ) | (
+            FaultKind::RustfsServerClockSkew,
+            FaultBackend::ChaosMeshTimeChaos
         ) | (
             FaultKind::RustfsServerCpuStress | FaultKind::RustfsServerMemoryStress,
             FaultBackend::ChaosMeshStressChaos
@@ -1185,6 +1218,7 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
             FaultSelection::Percent(_) => false,
             FaultSelection::RuntimeQuorum(_) => false,
         },
+        FaultKind::RustfsServerNetworkSplitBrain => selection == FaultSelection::FixedTargets(2),
         // PodChaos pod-failure renders the declared count, so the quorum-edge
         // scenario can take P servers offline at the same instant. The cap is
         // a sanity bound; which counts actually cross the quorum boundary is
@@ -1199,6 +1233,7 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         // declare an n-pod blast radius that the backend silently narrows to
         // one — a weaker fault than requested, i.e. a false sense of coverage.
         FaultKind::RustfsServerPodKill
+        | FaultKind::RustfsServerClockSkew
         | FaultKind::RustfsServerPodKillStorm
         | FaultKind::RustfsServerNetworkAsymmetricPartition
         | FaultKind::RustfsServerNetworkDelay
@@ -1234,11 +1269,13 @@ fn fault_kind_accepts_target(kind: FaultKind, target: &FaultTarget) -> bool {
         | FaultKind::RustfsVolumeEnospc
         | FaultKind::RustfsVolumeErofs => matches!(target, FaultTarget::RustfsVolume { .. }),
         FaultKind::RustfsServerPodKill
+        | FaultKind::RustfsServerClockSkew
         | FaultKind::RustfsServerPodKillStorm
         | FaultKind::RustfsServerPodFailure => {
             matches!(target, FaultTarget::RustfsServerPod)
         }
         FaultKind::RustfsServerNetworkPartition
+        | FaultKind::RustfsServerNetworkSplitBrain
         | FaultKind::RustfsServerNetworkAsymmetricPartition
         | FaultKind::RustfsServerNetworkDelay
         | FaultKind::RustfsServerNetworkLoss
@@ -1416,6 +1453,21 @@ impl FaultPlan {
                 FaultTarget::RustfsServerPeerNetwork,
                 FaultSelection::FixedTargets(1),
                 scenario.duration,
+            )?,
+            NETWORK_SPLIT_BRAIN_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsServerNetworkSplitBrain,
+                spec.backend,
+                FaultTarget::RustfsServerPeerNetwork,
+                FaultSelection::FixedTargets(2),
+                scenario.duration,
+            )?,
+            CLOCK_SKEW_SCENARIO => FaultInjection::new_with_parameters(
+                FaultKind::RustfsServerClockSkew,
+                spec.backend,
+                FaultTarget::RustfsServerPod,
+                FaultSelection::FixedTargets(1),
+                scenario.duration,
+                options.scenario_parameters.clone(),
             )?,
             NETWORK_ASYMMETRIC_PARTITION_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsServerNetworkAsymmetricPartition,
@@ -1678,6 +1730,7 @@ mod tests {
         FaultInjectionParameters, FaultKind, FaultPlan, FaultPlanOptions, FaultSelection,
         FaultTarget, FaultWorkloadMode,
     };
+    use crate::fault::scenarios::{CLOCK_SKEW_SCENARIO, NETWORK_SPLIT_BRAIN_SCENARIO};
     use crate::fault::{
         config::FaultTestConfig,
         quorum::{ErasureSetShape, QuorumCaseClass, QuorumVolumeBoundary},
@@ -2283,5 +2336,79 @@ mod tests {
         .expect_err("admin plan must not hide injection parameters");
 
         assert!(error.to_string().contains("does not accept"));
+    }
+
+    #[test]
+    fn clock_skew_parameters_and_scope_are_bounded_before_rendering() {
+        for offset in [-600, -120, -60, 60, 120, 600] {
+            FaultInjectionParameters::ClockSkew {
+                offset_seconds: offset,
+            }
+            .validate_for_scenario(CLOCK_SKEW_SCENARIO)
+            .expect("bounded offset");
+        }
+        for offset in [i64::MIN, -601, -59, 0, 59, 601] {
+            assert!(
+                FaultInjectionParameters::ClockSkew {
+                    offset_seconds: offset
+                }
+                .validate_for_scenario(CLOCK_SKEW_SCENARIO)
+                .is_err()
+            );
+        }
+        assert!(
+            FaultInjectionParameters::ClockSkew {
+                offset_seconds: 120
+            }
+            .validate_for_scenario(NETWORK_SPLIT_BRAIN_SCENARIO)
+            .is_err()
+        );
+        let injection = FaultInjection::new(
+            FaultKind::RustfsServerClockSkew,
+            FaultBackend::ChaosMeshTimeChaos,
+            FaultTarget::RustfsServerPod,
+            FaultSelection::FixedTargets(1),
+            Duration::from_secs(60),
+        )
+        .expect("clock injection");
+        assert_eq!(
+            injection
+                .parameters()
+                .clock_offset_seconds()
+                .expect("offset"),
+            120
+        );
+        for count in [0, 2, 4] {
+            assert!(
+                FaultInjection::new(
+                    FaultKind::RustfsServerClockSkew,
+                    FaultBackend::ChaosMeshTimeChaos,
+                    FaultTarget::RustfsServerPod,
+                    FaultSelection::FixedTargets(count),
+                    Duration::from_secs(60)
+                )
+                .is_err()
+            );
+        }
+        let json = serde_json::to_value(FaultInjectionParameters::ClockSkew {
+            offset_seconds: -120,
+        })
+        .expect("json");
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "clockSkew", "offsetSeconds": -120})
+        );
+        for count in [1, 3, 4] {
+            assert!(
+                FaultInjection::new(
+                    FaultKind::RustfsServerNetworkSplitBrain,
+                    FaultBackend::ChaosMeshNetworkChaos,
+                    FaultTarget::RustfsServerPeerNetwork,
+                    FaultSelection::FixedTargets(count),
+                    Duration::from_secs(60)
+                )
+                .is_err()
+            );
+        }
     }
 }

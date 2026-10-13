@@ -287,6 +287,8 @@ pub(crate) enum WriteProbeScope {
     PostRecovery,
     /// While a crashed node is still held down.
     NodeDown,
+    /// While two server groups cannot reach each other.
+    SplitBrain,
 }
 
 impl WriteProbeScope {
@@ -294,6 +296,7 @@ impl WriteProbeScope {
         match self {
             Self::PostRecovery => format!("fault-test-post-recovery/{run_id}/"),
             Self::NodeDown => format!("fault-test-node-down/{run_id}/"),
+            Self::SplitBrain => format!("fault-test-split-brain/{run_id}/"),
         }
     }
 

@@ -1000,6 +1000,10 @@ scenarios:
                 "../../fault/examples/quorum-reliability.yaml"
             ))
             .expect("quorum suite yaml"),
+            serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+                "../../fault/examples/network-clock.yaml"
+            ))
+            .expect("network clock suite yaml"),
         ];
         let expected_profiles = focused
             .iter()
@@ -1020,7 +1024,7 @@ scenarios:
                 .iter()
                 .map(|scenario| scenario.repetitions)
                 .sum::<usize>(),
-            25
+            28
         );
         assert!(
             suite.scenarios.iter().all(|scenario| {

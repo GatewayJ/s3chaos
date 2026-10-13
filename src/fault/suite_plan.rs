@@ -1919,7 +1919,7 @@ scenarios:
             build_fault_suite_plan_expansion(suite, base, "chaos-suite-test".to_string())
                 .expect("canonical Chaos Mesh suite plan");
 
-        assert_eq!(expansion.plan.attempts.len(), 25);
+        assert_eq!(expansion.plan.attempts.len(), 28);
         assert!(expansion.plan.requires_chaos_mesh);
         assert!(!expansion.plan.requires_static_storage);
         assert!(expansion.plan.required_tools.is_empty());
@@ -1930,6 +1930,32 @@ scenarios:
                     .budgets
                     .max_duration_seconds
                     .expect("canonical suite maxDuration")
+        );
+    }
+
+    #[test]
+    fn network_clock_example_fits_its_budget() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+            "../../fault/examples/network-clock.yaml"
+        ))
+        .expect("network/clock example")
+        .resolve()
+        .expect("resolved network/clock example");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(42);
+        let expansion =
+            build_fault_suite_plan_expansion(suite, base, "network-clock-test".to_string())
+                .expect("network/clock suite plan");
+        assert_eq!(expansion.plan.attempts.len(), 3);
+        assert!(expansion.plan.requires_chaos_mesh);
+        assert!(!expansion.plan.requires_static_storage);
+        assert!(
+            expansion.plan.budgets.minimum_required_seconds
+                <= expansion
+                    .plan
+                    .budgets
+                    .max_duration_seconds
+                    .expect("max duration")
         );
     }
 

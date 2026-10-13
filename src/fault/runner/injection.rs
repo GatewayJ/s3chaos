@@ -501,11 +501,18 @@ impl FaultRun<'_> {
                 "checking S3 access while faults are active",
                 Some(serde_json::json!({ "endpoint": endpoint })),
             )?;
-            if let Err(error) = self
-                .deadline
-                .run(ensure_s3_access(port_forward, cluster, endpoint))
-                .await
-            {
+            let access = async {
+                if plan.scenario == crate::fault::scenarios::CLOCK_SKEW_SCENARIO {
+                    let guard = port_forward
+                        .as_mut()
+                        .context("clock workload lost its direct Pod forward")?;
+                    guard.ensure_running()?;
+                    wait_for_tenant_s3(guard, endpoint, cluster.timeout).await
+                } else {
+                    ensure_s3_access(port_forward, cluster, endpoint).await
+                }
+            };
+            if let Err(error) = self.deadline.run(access).await {
                 self.record_failure(
                     "s3-access-under-fault",
                     "environment_or_workload",
@@ -729,14 +736,24 @@ impl FaultRun<'_> {
             "workload-summary.json",
             &serde_json::to_string_pretty(&workload.summary)?,
         )?;
-        let require_client_disruption = self.require_workload_impact(
-            &workload,
-            target,
-            fault,
-            prefilled,
-            active.fault_active_at_ms,
-            workload_started_at_ms,
-        )?;
+        let require_client_disruption = if plan.scenario
+            == crate::fault::scenarios::NETWORK_SPLIT_BRAIN_SCENARIO
+            && active.deferred_failure.is_some()
+        {
+            // The independently proved S3 defect already fails this run.
+            // Preserve the configured impact policy while completing recovery.
+            self.config.require_client_disruption
+                || self.context.spec.impact_policy.requires_client_disruption()
+        } else {
+            self.require_workload_impact(
+                &workload,
+                target,
+                fault,
+                prefilled,
+                active.fault_active_at_ms,
+                workload_started_at_ms,
+            )?
+        };
         self.require_availability(&workload, fault, availability_read_probe, served_by_pod)?;
         events.record(
             "fault-snapshot-after-workload",
