@@ -96,6 +96,7 @@ impl StorageRecoveryArtifactIdentity {
 pub enum StorageRecoveryCase {
     FreshVolumeReplacementAutomaticReplacement,
     FreshVolumeReplacementAdminDeep,
+    #[serde(rename = "network-partition-during-heal-admin-deep")]
     FreshVolumeReplacementPartitionDuringHeal,
     OnDiskBitrotAutomaticScanner,
     OnDiskBitrotAdminDeep,
@@ -6372,7 +6373,16 @@ mod tests {
 
     #[test]
     fn storage_recovery_case_matrix_preserves_distinct_recovery_variants() {
-        assert_eq!(StorageRecoveryCase::ALL.len(), 6);
+        assert_eq!(StorageRecoveryCase::ALL.len(), 7);
+        for case in StorageRecoveryCase::ALL {
+            let value = serde_json::to_value(case).expect("serialized case");
+            assert_eq!(value.as_str(), Some(case.as_str()));
+            assert_eq!(
+                serde_json::from_value::<StorageRecoveryCase>(value).unwrap(),
+                case
+            );
+            assert_eq!(StorageRecoveryCase::parse(case.as_str()).unwrap(), case);
+        }
         assert_eq!(
             StorageRecoveryCase::ALL
                 .iter()
@@ -6390,6 +6400,10 @@ mod tests {
         assert_eq!(StorageRecoveryCase::StaleDiskReturn.heal_mode(), None);
         assert_eq!(
             StorageRecoveryCase::MetadataShardCorruptionAdminDeep.heal_mode(),
+            Some(HealMode::AdminDeep)
+        );
+        assert_eq!(
+            StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal.heal_mode(),
             Some(HealMode::AdminDeep)
         );
         assert_eq!(

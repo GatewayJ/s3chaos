@@ -1626,6 +1626,7 @@ scenarios:
             "fresh-volume-replacement-automatic",
             "on-disk-bitrot",
             "metadata-shard-corruption",
+            "network-partition-during-heal",
         ] {
             let suite =
                 FaultSuite::from_yaml_path(format!("fault/examples/{name}.yaml")).expect("suite");

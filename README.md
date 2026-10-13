@@ -123,6 +123,8 @@ case; static validation is available without a cluster. The
 See [network and clock faults](docs/NETWORK_CLOCK_FAULTS.md),
 [credential rotation](docs/CREDENTIAL_ROTATION.md), and
 [partition during heal](docs/HEAL_PARTITION.md) for prerequisites and evidence.
+The [storage-fault guide](docs/STORAGE_FAULT_SCENARIOS.md) covers same-Pod EIO
+and the prepared metadata-corruption target.
 Credential rotation covers a run-owned IAM access key; TLS certificate rotation
 has no executor. New executors require live qualification before release gating.
 
