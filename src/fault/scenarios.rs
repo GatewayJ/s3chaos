@@ -261,6 +261,7 @@ impl FaultBackend {
 pub enum FaultParameterSchema {
     None,
     QuorumIo,
+    SamePodIo,
     IoLatency,
     NetworkDelay,
     NetworkLoss,
@@ -473,6 +474,7 @@ impl FaultScenarioSpec {
             self.scenario,
             IO_EIO_SCENARIO
                 | IO_EIO_DURING_MULTIPART_SCENARIO
+                | IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO
                 | NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
                 | POD_FAILURE_QUORUM_EDGE_SCENARIO
                 | QUORUM_P_IO_FAULT_SCENARIO
@@ -489,10 +491,8 @@ pub fn proves_single_volume_eio_tolerance(scenario: &str) -> bool {
     matches!(scenario, IO_EIO_SCENARIO | IO_EIO_DURING_MULTIPART_SCENARIO)
 }
 
-/// Fail closed unless two data mounts on one Pod are known to share an
-/// erasure set. The current drive-to-volume binder only accepts
-/// `volumesPerServer == 1`, so `shared_erasure_set: None` is the closed
-/// result until that binder can name both mounts.
+/// Fail closed unless two data mounts on one Pod are proven to share one
+/// runtime erasure set.
 pub fn assess_same_pod_two_volume_geometry(
     volumes_per_server: u32,
     distinct_data_mounts_on_pod: usize,
@@ -1738,28 +1738,29 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::DataShardLoss,
             DurabilityBugFamily::QuorumViolation,
         ]),
-        case_name: "fault_io_eio_same_pod_two_volumes_fail_closed_on_geometry",
-        description: "Planned same-Pod two-volume EIO. The geometry gate fails closed unless volumesPerServer is at least 2, the selected Pod has two data mounts, and those mounts are proven to share one erasure set.",
+        case_name: "fault_io_eio_same_pod_two_volumes_preserves_committed_objects",
+        description: "Inject sustained EIO into two distinct PVC-backed data mounts on one RustFS Pod, after authenticated runtime drive paths prove both mounts belong to one erasure set with sufficient read and write redundancy, and verify committed objects remain available and survive recovery.",
         priority: FaultPriority::P1,
-        backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
+        backend: FaultBackend::ChaosMeshIoChaos,
+        status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::Default,
         isolation: FaultIsolation::FreshTenant,
         crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
-        param_schema: FaultParameterSchema::None,
-        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        param_schema: FaultParameterSchema::SamePodIo,
+        impact_policy: FaultImpactPolicy::AvailabilityRequired,
         boundary: "rustfs-reliability/same-pod-two-volumes",
-        ci_phase: "planned",
+        ci_phase: "faults",
         target: "two data volumes on one RustFS Pod inside one erasure set",
         target_proof: &[
             "fail closed when volumesPerServer is below 2",
             "fail closed when the selected Pod does not expose two data mounts",
-            "fail closed when drive-to-volume binding cannot prove both mounts share one erasure set; the current binder accepts only one volume per server",
+            "authenticated RustFS drive paths bind both distinct mounts and PVC/PVs to distinct healthy UUIDs in the same erasure set",
+            "two IOChaos resources name the same proven Pod and each volume independently returns read/write/fsync/rename/unlink EIO",
         ],
-        validation: "do not inject until assess_same_pod_two_volume_geometry accepts the live Tenant; a one-volume or cross-set selection is a failed run, not a narrower fault",
-        observability: "target-proof.json must record the rejected geometry; no IOChaos is applied on the closed path",
+        validation: "two proven same-Pod volumes remain unavailable throughout the workload; every committed object remains readable, the mixed workload meets its availability floor, both IOChaos resources and owned probes are cleaned up, recovered drives are healthy, fresh writes succeed, and all committed objects pass the final checker",
+        observability: "target-proof.json, two IOChaos manifests and runtime snapshots, quorum-fault-activation.json, quorum-runtime-provenance.json, independent filesystem probe receipts, availability-report.json, recovery-health.json, checker-report.json",
         conflict_domain: "fresh Tenant geometry; must not be treated as two Pods or as quorum-p targeting",
     },
     FaultScenarioSpec {
@@ -1883,28 +1884,28 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::CommitMetadataLoss,
             DurabilityBugFamily::SilentDataCorruption,
         ]),
-        case_name: "fault_metadata_shard_corruption_has_no_safe_actuator",
-        description: "Planned corruption of RustFS metadata on one drive. on-disk-bitrot covers object-shard bytes and is still Planned; metadata paths are not a separate safe actuator.",
+        case_name: "fault_metadata_shard_corruption_recovers_exact_version_metadata",
+        description: "Corrupt the XL2 header of the receipt-selected object xl.meta on one owned drive, require an exact read-quorum GET to reject the corruption, and prove admin deep heal repairs the metadata and preserves object versions and delete markers.",
         priority: FaultPriority::P1,
         backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
+        status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::Default,
         isolation: FaultIsolation::DedicatedLinuxBlockDevice,
-        crds: &[],
+        crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
         param_schema: FaultParameterSchema::None,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-reliability/metadata-shard-corruption",
-        ci_phase: "planned",
+        ci_phase: "storage-recovery",
         target: "one metadata file on one dedicated host volume, never an arbitrary operator-supplied path",
         target_proof: &[
             "selection must bind a version and an xl metadata receipt before any byte change",
             "the mutation must be journaled and reversible",
-            "object-shard bitrot must not be reused as proof that metadata was the target",
+            "the metadata receipt must name xl.meta and bind its device, inode, size, and original digest; selected object part bytes must remain unchanged",
         ],
-        validation: "blocked until the bitrot inspector can select a metadata shard and fail closed on any other path",
-        observability: "selection, mutation, and cleanup receipts distinct from object-shard bitrot",
+        validation: "a fixed header-byte mutation must survive fsync and readback, an exact-quorum read must cleanly reject the confirmed version while corruption is active, admin deep heal must repair the original metadata digest, the selected object part remains unchanged, final exact-version reads and full version/delete-marker checks succeed, and receipt-bound helper cleanup releases the owned Lease",
+        observability: "metadata-selection.json, metadata-mutation.json, metadata-corruption-window.json, metadata-heal.json, metadata-heal-progress.jsonl, metadata-cleanup.json, metadata-workflow.json, final checker and post-recovery write reports",
         conflict_domain: "dedicated host volume owned by the run; must not mutate shared metadata",
     },
 ];
@@ -1934,6 +1935,7 @@ impl FaultScenario {
                 FRESH_VOLUME_REPLACEMENT_SCENARIO
                     | ON_DISK_BITROT_SCENARIO
                     | NETWORK_PARTITION_DURING_HEAL_SCENARIO
+                    | METADATA_SHARD_CORRUPTION_SCENARIO
             )
         {
             ensure!(
@@ -1950,7 +1952,10 @@ impl FaultScenario {
                 config.scenario
             );
         }
-        if config.scenario == ON_DISK_BITROT_SCENARIO {
+        if matches!(
+            config.scenario.as_str(),
+            ON_DISK_BITROT_SCENARIO | METADATA_SHARD_CORRUPTION_SCENARIO
+        ) {
             ensure!(
                 config.storage_recovery_target_config.is_some(),
                 "on-disk-bitrot requires RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG"
@@ -1974,6 +1979,7 @@ impl FaultScenario {
             FRESH_VOLUME_REPLACEMENT_SCENARIO
                 | ON_DISK_BITROT_SCENARIO
                 | NETWORK_PARTITION_DURING_HEAL_SCENARIO
+                | METADATA_SHARD_CORRUPTION_SCENARIO
         ) {
             ensure!(
                 config
@@ -1994,13 +2000,16 @@ impl FaultScenario {
                 FRESH_VOLUME_REPLACEMENT_SCENARIO
                     | ON_DISK_BITROT_SCENARIO
                     | NETWORK_PARTITION_DURING_HEAL_SCENARIO
+                    | METADATA_SHARD_CORRUPTION_SCENARIO
                     | STALE_DISK_RETURN_DETECT_SCENARIO
             )
             && config
                 .storage_recovery_case
                 .is_some_and(|case| case.scenario() == spec.scenario)
-            && (spec.scenario != ON_DISK_BITROT_SCENARIO
-                || config.storage_recovery_target_config.is_some())
+            && (!matches!(
+                spec.scenario,
+                ON_DISK_BITROT_SCENARIO | METADATA_SHARD_CORRUPTION_SCENARIO
+            ) || config.storage_recovery_target_config.is_some())
             && spec.backend == FaultBackend::PlannedReliabilityWorkflow;
         if allow_planned_admin {
             ensure!(
@@ -2181,8 +2190,14 @@ pub fn planned_qualification_catalog_json() -> Result<String> {
 pub fn apply_catalog_defaults(config: &mut FaultTestConfig) -> Result<()> {
     let spec = scenario_spec(&config.scenario)?;
     spec.workload_profile.apply_to_config(config);
-    if config.scenario == CREDENTIAL_ROTATION_MID_LOAD_SCENARIO {
+    if matches!(
+        config.scenario.as_str(),
+        CREDENTIAL_ROTATION_MID_LOAD_SCENARIO | METADATA_SHARD_CORRUPTION_SCENARIO
+    ) {
         config.workload_versioning = true;
+    }
+    if let Some(case) = StorageRecoveryCase::default_for_scenario(&config.scenario) {
+        config.storage_recovery_case.get_or_insert(case);
     }
     if matches!(
         config.scenario.as_str(),
@@ -2377,14 +2392,14 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 39);
+        assert_eq!(executable_scenario_catalog().count(), 42);
         assert_eq!(scenario_catalog().len(), 47);
         assert_eq!(
             scenario_catalog()
                 .iter()
                 .filter(|scenario| scenario.status == FaultScenarioStatus::Planned)
                 .count(),
-            8
+            5
         );
     }
 
@@ -2457,7 +2472,10 @@ mod tests {
             assert!(FaultScenario::from_config_for_execution(&config).is_err());
             config.destructive_enabled = true;
             assert!(!config.qualify_planned_storage);
-            if case.scenario() == ON_DISK_BITROT_SCENARIO {
+            if matches!(
+                case.scenario(),
+                ON_DISK_BITROT_SCENARIO | super::METADATA_SHARD_CORRUPTION_SCENARIO
+            ) {
                 assert!(FaultScenario::from_config_for_execution(&config).is_err());
                 config.storage_recovery_target_config = Some("/secure/target.json".into());
             }
@@ -2540,6 +2558,12 @@ mod tests {
                     "scenario": "on-disk-bitrot",
                     "kind": "storage",
                     "storageRecoveryCase": "on-disk-bitrot-admin-deep"
+                },
+                {
+                    "qualificationCase": "metadata-shard-corruption-admin-deep",
+                    "scenario": "metadata-shard-corruption",
+                    "kind": "storage",
+                    "storageRecoveryCase": "metadata-shard-corruption-admin-deep"
                 },
                 {
                     "qualificationCase": "stale-disk-return",
@@ -2846,6 +2870,7 @@ mod tests {
                 QUORUM_P_DM_EIO_SCENARIO,
                 QUORUM_P_IO_FAULT_SCENARIO,
                 QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+                super::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO,
             ]
         );
     }
@@ -2866,7 +2891,10 @@ mod tests {
             assert_eq!(
                 scenario.percent_supported,
                 scenario.backend.accepts_percent()
-                    && scenario.param_schema != FaultParameterSchema::QuorumIo
+                    && !matches!(
+                        scenario.param_schema,
+                        FaultParameterSchema::QuorumIo | FaultParameterSchema::SamePodIo
+                    )
             );
             assert!(!scenario.boundary.is_empty());
             assert!(!scenario.ci_phase.is_empty());

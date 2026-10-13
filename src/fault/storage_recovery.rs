@@ -99,16 +99,18 @@ pub enum StorageRecoveryCase {
     FreshVolumeReplacementPartitionDuringHeal,
     OnDiskBitrotAutomaticScanner,
     OnDiskBitrotAdminDeep,
+    MetadataShardCorruptionAdminDeep,
     StaleDiskReturn,
 }
 
 impl StorageRecoveryCase {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::FreshVolumeReplacementAutomaticReplacement,
         Self::FreshVolumeReplacementAdminDeep,
         Self::FreshVolumeReplacementPartitionDuringHeal,
         Self::OnDiskBitrotAutomaticScanner,
         Self::OnDiskBitrotAdminDeep,
+        Self::MetadataShardCorruptionAdminDeep,
         Self::StaleDiskReturn,
     ];
 
@@ -118,6 +120,7 @@ impl StorageRecoveryCase {
             | Self::FreshVolumeReplacementAdminDeep => "fresh-volume-replacement",
             Self::FreshVolumeReplacementPartitionDuringHeal => "network-partition-during-heal",
             Self::OnDiskBitrotAutomaticScanner | Self::OnDiskBitrotAdminDeep => "on-disk-bitrot",
+            Self::MetadataShardCorruptionAdminDeep => "metadata-shard-corruption",
             Self::StaleDiskReturn => "stale-disk-return-detect",
         }
     }
@@ -133,6 +136,7 @@ impl StorageRecoveryCase {
             }
             Self::OnDiskBitrotAutomaticScanner => "on-disk-bitrot-automatic-scanner",
             Self::OnDiskBitrotAdminDeep => "on-disk-bitrot-admin-deep",
+            Self::MetadataShardCorruptionAdminDeep => "metadata-shard-corruption-admin-deep",
             Self::StaleDiskReturn => "stale-disk-return",
         }
     }
@@ -146,6 +150,7 @@ impl StorageRecoveryCase {
             "network-partition-during-heal" => {
                 Some(Self::FreshVolumeReplacementPartitionDuringHeal)
             }
+            "metadata-shard-corruption" => Some(Self::MetadataShardCorruptionAdminDeep),
             _ => None,
         }
     }
@@ -158,7 +163,8 @@ impl StorageRecoveryCase {
             Self::OnDiskBitrotAutomaticScanner => Some(HealMode::AutomaticScanner),
             Self::FreshVolumeReplacementAdminDeep
             | Self::FreshVolumeReplacementPartitionDuringHeal
-            | Self::OnDiskBitrotAdminDeep => Some(HealMode::AdminDeep),
+            | Self::OnDiskBitrotAdminDeep
+            | Self::MetadataShardCorruptionAdminDeep => Some(HealMode::AdminDeep),
             Self::StaleDiskReturn => None,
         }
     }
@@ -176,6 +182,15 @@ impl StorageRecoveryCase {
             Self::FreshVolumeReplacementAutomaticReplacement
                 | Self::FreshVolumeReplacementAdminDeep
                 | Self::FreshVolumeReplacementPartitionDuringHeal
+        )
+    }
+
+    pub fn is_corruption_recovery(self) -> bool {
+        matches!(
+            self,
+            Self::OnDiskBitrotAutomaticScanner
+                | Self::OnDiskBitrotAdminDeep
+                | Self::MetadataShardCorruptionAdminDeep
         )
     }
 }
@@ -6356,8 +6371,8 @@ mod tests {
     }
 
     #[test]
-    fn storage_recovery_case_matrix_has_five_distinct_qualified_variants() {
-        assert_eq!(StorageRecoveryCase::ALL.len(), 5);
+    fn storage_recovery_case_matrix_preserves_distinct_recovery_variants() {
+        assert_eq!(StorageRecoveryCase::ALL.len(), 6);
         assert_eq!(
             StorageRecoveryCase::ALL
                 .iter()
@@ -6373,6 +6388,10 @@ mod tests {
             2
         );
         assert_eq!(StorageRecoveryCase::StaleDiskReturn.heal_mode(), None);
+        assert_eq!(
+            StorageRecoveryCase::MetadataShardCorruptionAdminDeep.heal_mode(),
+            Some(HealMode::AdminDeep)
+        );
         assert_eq!(
             StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement.heal_mode(),
             Some(HealMode::AutomaticReplacement)

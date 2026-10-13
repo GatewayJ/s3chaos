@@ -577,7 +577,11 @@ impl FaultRunArtifactSpec {
             .into_iter()
             .map(str::to_string)
             .collect()
-        } else if scenario == crate::fault::scenarios::ON_DISK_BITROT_SCENARIO {
+        } else if matches!(
+            scenario,
+            crate::fault::scenarios::ON_DISK_BITROT_SCENARIO
+                | crate::fault::scenarios::METADATA_SHARD_CORRUPTION_SCENARIO
+        ) {
             [
                 "run-spec.yaml",
                 "run-spec.json",
@@ -598,7 +602,7 @@ impl FaultRunArtifactSpec {
                 BITROT_WORKFLOW_ARTIFACT,
             ]
             .into_iter()
-            .map(str::to_string)
+            .map(|name| crate::fault::on_disk_bitrot::corruption_artifact_name(scenario, name))
             .collect()
         } else if acknowledged_mutation_kind(scenario).is_none() {
             Self::required_names()
@@ -666,6 +670,16 @@ impl FaultRunArtifactSpec {
                 [
                     ADMIN_REBALANCE_OVERLAP_ARTIFACT,
                     ADMIN_REBALANCE_TRANSCRIPT_ARTIFACT,
+                ]
+                .map(str::to_string),
+            );
+        }
+        if scenario == crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO {
+            names.extend(
+                [
+                    crate::fault::quorum::QUORUM_FAULT_ACTIVATION_ARTIFACT,
+                    "quorum-runtime-provenance.json",
+                    "quorum-probe-fixtures.json",
                 ]
                 .map(str::to_string),
             );

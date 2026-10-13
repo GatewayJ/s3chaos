@@ -92,6 +92,7 @@ fn quorum_eio_methods(scenario: &str) -> Vec<String> {
         scenario,
         crate::fault::scenarios::QUORUM_P_IO_FAULT_SCENARIO
             | crate::fault::scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            | crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO
     ) {
         ["READ", "WRITE", "FSYNC", "RENAME", "UNLINK"]
             .into_iter()
@@ -312,6 +313,96 @@ pub(crate) fn validate_fixed_volume_snapshot(
         );
     }
     Ok(record_ids)
+}
+
+pub(crate) fn validate_same_pod_volume_resources(
+    resources: &[&Value],
+    volumes: &crate::fault::quorum::SamePodVolumeTargetProof,
+    contract: &VolumeTargetEvidenceContract<'_>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    ensure!(
+        resources.len() == 2,
+        "same-Pod volume fault requires two IOChaos resources"
+    );
+    let pod = volumes.bindings[0].pod_name.clone();
+    let exact_pods = BTreeSet::from([pod]);
+    let candidates = BTreeSet::from([format!(
+        "{}/{}",
+        contract.target_namespace, volumes.bindings[0].pod_name
+    )]);
+    let mut selected = std::collections::BTreeMap::new();
+    let mut resource_uids = BTreeSet::new();
+    let mut resource_names = BTreeSet::new();
+    for resource in resources {
+        let path = resource
+            .pointer("/spec/volumePath")
+            .and_then(Value::as_str)
+            .context("same-Pod IOChaos lacks its volume path")?;
+        ensure!(
+            volumes
+                .bindings
+                .iter()
+                .any(|binding| binding.mount_path == path),
+            "same-Pod IOChaos selects an unproved volume path"
+        );
+        let uid = resource
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .filter(|uid| !uid.is_empty())
+            .context("same-Pod IOChaos lacks its resource UID")?;
+        let name = resource
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("same-Pod IOChaos lacks its resource name")?;
+        ensure!(
+            resource_uids.insert(uid) && resource_names.insert(name),
+            "same-Pod IOChaos resources must have distinct identities"
+        );
+        let records = validate_fixed_volume_snapshot(
+            resource,
+            &VolumeTargetEvidenceContract {
+                chaos_namespace: contract.chaos_namespace,
+                target_namespace: contract.target_namespace,
+                tenant: contract.tenant,
+                run_id: contract.run_id,
+                scenario: contract.scenario,
+                volume_path: path,
+                path: None,
+                exact_pod_names: Some(&exact_pods),
+                expected_targets: 1,
+                candidate_pod_ids: &candidates,
+                runtime: contract.runtime,
+            },
+        )?;
+        let record = records
+            .first()
+            .context("same-Pod IOChaos has no injected controller record")?;
+        ensure!(
+            selected
+                .insert(
+                    path.to_string(),
+                    same_pod_volume_record_id(resource, record)?
+                )
+                .is_none(),
+            "same-Pod resources selected the same mount twice"
+        );
+    }
+    Ok(selected)
+}
+
+pub(crate) fn same_pod_volume_record_id(resource: &Value, record: &str) -> Result<String> {
+    let name = resource
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("same-Pod IOChaos resource name missing")?;
+    let uid = resource
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("same-Pod IOChaos resource UID missing")?;
+    Ok(format!("{name}/{uid}:{record}"))
 }
 
 fn validate_iochaos_behavior(resource: &Value, expected: &IoChaosRuntimeContract) -> Result<()> {
@@ -2347,7 +2438,7 @@ mod tests {
         build_fault_spec, chaos_schedule_is_armed, highest_ordinal_pod_name,
         runtime::chaos_experiment_is_active, validate_fixed_volume_snapshot,
         validate_network_partition_snapshot, validate_pod_failure_snapshot,
-        volume_fault_runtime_contract,
+        validate_same_pod_volume_resources, volume_fault_runtime_contract,
     };
     use crate::fault::config::FaultTestConfig;
     use crate::fault::plan::{
@@ -2720,6 +2811,103 @@ mod tests {
             spec.manifest()
                 .contains("\n  mode: fixed\n  value: \"9\"\n")
         );
+    }
+
+    #[test]
+    fn same_pod_resources_require_two_paths_and_exact_container_records() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let (_, _, volumes) = crate::fault::quorum::same_pod_volume_proof_fixture();
+        let scenario = crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO;
+        let injection = FaultInjection::new_with_parameters(
+            FaultKind::RustfsVolumeIoError,
+            FaultBackend::ChaosMeshIoChaos,
+            FaultTarget::RustfsVolume {
+                path: "/data/rustfs0".to_string(),
+            },
+            FaultSelection::FixedTargets(1),
+            Duration::from_secs(60),
+            FaultInjectionParameters::SamePodIo {
+                second_volume_path: "/data/rustfs1".to_string(),
+            },
+        )
+        .expect("same-Pod injection");
+        let runtime =
+            volume_fault_runtime_contract(&injection, scenario).expect("five-method EIO contract");
+        let resources = volumes.bindings.iter().enumerate().map(|(index, binding)| {
+            let spec = IoChaosSpec::eio_on_rustfs_volume(
+                &config.cluster, "chaos-mesh", "run-1", scenario,
+                &binding.mount_path, 100, Duration::from_secs(60),
+            ).expect("volume spec").with_exact_pods(vec![binding.pod_name.clone()]).expect("exact Pod");
+            let mut resource: serde_json::Value = serde_yaml_ng::from_str(&spec.manifest()).expect("manifest");
+            resource["metadata"]["name"] = serde_json::json!(format!("same-pod-{index}"));
+            resource["metadata"]["uid"] = serde_json::json!(format!("iochaos-uid-{index}"));
+            resource["status"] = serde_json::json!({
+                "conditions": [{"type":"Selected", "status":"True"}, {"type":"AllInjected", "status":"True"}, {"type":"AllRecovered", "status":"False"}],
+                "experiment": {"desiredPhase":"Run", "containerRecords":[{
+                    "id":format!("{}/{}/rustfs", config.cluster.test_namespace, binding.pod_name),
+                    "selectorKey":".", "phase":"Injected", "injectedCount":1
+                }]}
+            });
+            resource
+        }).collect::<Vec<_>>();
+        let contract = VolumeTargetEvidenceContract {
+            chaos_namespace: "chaos-mesh",
+            target_namespace: &config.cluster.test_namespace,
+            tenant: &config.cluster.tenant_name,
+            run_id: "run-1",
+            scenario,
+            volume_path: "/data/rustfs0",
+            path: None,
+            exact_pod_names: None,
+            expected_targets: 1,
+            candidate_pod_ids: &BTreeSet::new(),
+            runtime: &runtime,
+        };
+        let records = validate_same_pod_volume_resources(
+            &resources.iter().collect::<Vec<_>>(),
+            &volumes,
+            &contract,
+        )
+        .expect("both volumes");
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records["/data/rustfs0"],
+            format!(
+                "same-pod-0/iochaos-uid-0:{}/rustfs-3/rustfs",
+                config.cluster.test_namespace
+            )
+        );
+        assert!(validate_same_pod_volume_resources(&[&resources[0]], &volumes, &contract).is_err());
+        for (pointer, value) in [
+            ("/metadata/uid", serde_json::json!("iochaos-uid-0")),
+            ("/metadata/name", serde_json::json!("same-pod-0")),
+            ("/spec/volumePath", serde_json::json!("/data/rustfs0")),
+            (
+                "/spec/path",
+                serde_json::json!("/data/rustfs1/another/**/*"),
+            ),
+            (
+                "/spec/selector/pods/rustfs-fault-test",
+                serde_json::json!(["rustfs-2"]),
+            ),
+            (
+                "/status/experiment/containerRecords/0/id",
+                serde_json::json!("rustfs-fault-test/rustfs-2/rustfs"),
+            ),
+            ("/spec/methods", serde_json::json!(["READ", "WRITE"])),
+        ] {
+            let mut changed = resources.clone();
+            *changed[1].pointer_mut(pointer).expect("fixture field") = value;
+            assert!(
+                validate_same_pod_volume_resources(
+                    &changed.iter().collect::<Vec<_>>(),
+                    &volumes,
+                    &contract
+                )
+                .is_err(),
+                "changed {pointer}"
+            );
+        }
     }
 
     #[test]

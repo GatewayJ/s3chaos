@@ -3351,6 +3351,7 @@ impl<'a> FreshVolumeDriver<'a> {
                 }),
                 membership: Some(membership.clone()),
                 volume_quorum: Some(volume_quorum),
+                same_pod_volumes: None,
                 observed_at_ms: now_ms(),
                 note: "exact-quorum siblings bound to live one-volume RustFS servers".to_string(),
             },
@@ -3974,7 +3975,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         );
         self.ensure_fixture_pvs_absent()?;
         fixture::reset_tenant_resources(&self.config.cluster)?;
-        fixture::apply_tenant_resources(&self.config.cluster)?;
+        fixture::apply_tenant_resources(&self.config.cluster, 1)?;
         let kubectl = Kubectl::new(&self.config.cluster);
         for volume in self.fixture.initial() {
             kubectl
@@ -4285,6 +4286,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             }),
             membership: Some(membership.clone()),
             volume_quorum: None,
+            same_pod_volumes: None,
             observed_at_ms: now_ms(),
             note: "single-set runtime membership bound to the run-owned Local PV fixture"
                 .to_string(),
@@ -5924,6 +5926,7 @@ mod tests {
             OFFLINE_XL2_INSPECTOR_REVISION, Xl2FormatProfile, Xl2ObjectVersionLayout,
         };
         let original = OfflineXl2InspectResponse {
+            selected_metadata: None,
             mount_device_id: "8:1".to_string(),
             drive_uuid: "old".to_string(),
             format_json_sha256: "a".repeat(64),

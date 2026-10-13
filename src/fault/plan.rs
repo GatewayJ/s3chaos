@@ -30,7 +30,8 @@ use crate::fault::{
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_SCENARIO,
         DM_FLAKEY_VERSIONED_HOT_SCENARIO, FRESH_VOLUME_REPLACEMENT_SCENARIO, FaultBackend,
         FaultParameterSchema, FaultScenario, FaultScenarioSpec, IO_EIO_DURING_MULTIPART_SCENARIO,
-        IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, IO_READ_ONLY_SCENARIO,
+        IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO,
+        IO_READ_MISTAKE_SCENARIO, IO_READ_ONLY_SCENARIO, METADATA_SHARD_CORRUPTION_SCENARIO,
         NETWORK_ASYMMETRIC_PARTITION_SCENARIO, NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO,
         NETWORK_DUPLICATE_SCENARIO, NETWORK_FLAKY_SCENARIO, NETWORK_LOSS_SCENARIO,
         NETWORK_PARTITION_DURING_HEAL_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
@@ -151,6 +152,7 @@ impl ExecutionPlan {
             FRESH_VOLUME_REPLACEMENT_SCENARIO
             | ON_DISK_BITROT_SCENARIO
             | NETWORK_PARTITION_DURING_HEAL_SCENARIO
+            | METADATA_SHARD_CORRUPTION_SCENARIO
             | STALE_DISK_RETURN_DETECT_SCENARIO => {
                 ensure!(
                     spec.backend == FaultBackend::PlannedReliabilityWorkflow,
@@ -509,6 +511,10 @@ pub enum FaultInjectionParameters {
     QuorumIo {
         class: QuorumCaseClass,
     },
+    SamePodIo {
+        #[serde(rename = "secondVolumePath")]
+        second_volume_path: String,
+    },
     IoLatency {
         delay: String,
         methods: Vec<IoMethod>,
@@ -587,6 +593,12 @@ impl FaultInjectionParameters {
                     "quorum IO scenarios require params.kind=quorumIo"
                 );
                 return Ok(());
+            }
+            FaultParameterSchema::SamePodIo => {
+                let Self::SamePodIo { second_volume_path } = self else {
+                    bail!("same-Pod IO scenario requires params.kind=samePodIo")
+                };
+                return validate_rustfs_volume_path(second_volume_path);
             }
             FaultParameterSchema::IoLatency => FaultKind::RustfsVolumeLatency,
             FaultParameterSchema::NetworkDelay => FaultKind::RustfsServerNetworkDelay,
@@ -728,6 +740,9 @@ impl FaultInjectionParameters {
     fn validate_for_kind(&self, kind: FaultKind) -> Result<()> {
         match (kind, self) {
             (_, Self::Default) => Ok(()),
+            (FaultKind::RustfsVolumeIoError, Self::SamePodIo { second_volume_path }) => {
+                validate_rustfs_volume_path(second_volume_path)
+            }
             (FaultKind::RustfsVolumeIoError, Self::QuorumIo { .. }) => Ok(()),
             (FaultKind::RustfsVolumeLatency, Self::IoLatency { delay, methods }) => {
                 validate_duration_token("params.delay", delay, false, 60_000)?;
@@ -908,6 +923,7 @@ pub struct FaultInjection {
     duration: Duration,
     parameters: FaultInjectionParameters,
     volume_targeting: Option<VolumeFaultTargeting>,
+    pinned_pod: Option<String>,
 }
 
 impl FaultInjection {
@@ -974,6 +990,7 @@ impl FaultInjection {
             duration,
             parameters,
             volume_targeting,
+            pinned_pod: None,
         })
     }
 
@@ -990,6 +1007,11 @@ impl FaultInjection {
     }
 
     pub fn target_summary(&self) -> String {
+        if let FaultInjectionParameters::SamePodIo { second_volume_path } = &self.parameters
+            && let FaultTarget::RustfsVolume { path } = &self.target
+        {
+            return format!("two RustFS volumes at {path} and {second_volume_path} on one Pod");
+        }
         match (&self.target, self.selection) {
             (FaultTarget::RustfsVolume { path }, FaultSelection::FixedTargets(count)) => {
                 format!("{count} RustFS volume target(s) at {path}")
@@ -1045,6 +1067,40 @@ impl FaultInjection {
                 other
             ),
         }
+    }
+
+    pub(crate) fn pin_same_pod(&self, pod: &str) -> Result<Self> {
+        ensure!(
+            matches!(self.parameters, FaultInjectionParameters::SamePodIo { .. })
+                && !pod.is_empty(),
+            "same-Pod volume injection lacks its typed target"
+        );
+        let mut resolved = self.clone();
+        resolved.pinned_pod = Some(pod.to_string());
+        Ok(resolved)
+    }
+
+    pub(crate) fn pinned_pod(&self) -> Option<&str> {
+        self.pinned_pod.as_deref()
+    }
+
+    pub(crate) fn same_pod_volume_paths(&self) -> Result<[&str; 2]> {
+        let FaultInjectionParameters::SamePodIo { second_volume_path } = &self.parameters else {
+            bail!("same-Pod volume injection lacks its two paths")
+        };
+        let first = self.rustfs_volume_path()?;
+        ensure!(
+            first != second_volume_path,
+            "same-Pod volume paths must be distinct"
+        );
+        ensure!(
+            [first, second_volume_path.as_str()].iter().all(|path| path
+                .split('/')
+                .skip(1)
+                .all(|component| !component.is_empty() && component != "." && component != "..")),
+            "same-Pod volume paths must be normalized mount paths"
+        );
+        Ok([first, second_volume_path])
     }
 
     pub fn resolve_runtime_quorum(&self, shape: &ErasureSetShape) -> Result<Self> {
@@ -1290,6 +1346,31 @@ impl FaultPlan {
                 FaultWorkloadMode::S3Mixed
             };
         let fault = match scenario.name.as_str() {
+            IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO => {
+                let parameters = if matches!(
+                    options.scenario_parameters,
+                    FaultInjectionParameters::Default
+                ) {
+                    FaultInjectionParameters::SamePodIo {
+                        second_volume_path: "/data/rustfs1".to_string(),
+                    }
+                } else {
+                    options.scenario_parameters.clone()
+                };
+                parameters.validate_for_schema(FaultParameterSchema::SamePodIo)?;
+                let fault = FaultInjection::new_with_parameters(
+                    FaultKind::RustfsVolumeIoError,
+                    spec.backend,
+                    FaultTarget::RustfsVolume {
+                        path: options.rustfs_volume_path.clone(),
+                    },
+                    FaultSelection::FixedTargets(1),
+                    scenario.duration,
+                    parameters,
+                )?;
+                fault.same_pod_volume_paths()?;
+                fault
+            }
             IO_EIO_SCENARIO | IO_EIO_DURING_MULTIPART_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeIoError,
                 spec,

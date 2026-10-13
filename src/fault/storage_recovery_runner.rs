@@ -402,7 +402,8 @@ pub(crate) async fn run_storage_recovery_case(
     );
     match plan.case {
         StorageRecoveryCase::OnDiskBitrotAutomaticScanner
-        | StorageRecoveryCase::OnDiskBitrotAdminDeep => {
+        | StorageRecoveryCase::OnDiskBitrotAdminDeep
+        | StorageRecoveryCase::MetadataShardCorruptionAdminDeep => {
             return crate::fault::on_disk_bitrot::run_on_disk_bitrot_case(
                 config,
                 collector,

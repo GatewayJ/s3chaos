@@ -413,7 +413,7 @@ validate_qualification_env_contract() {
             <<<"$RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON" >/dev/null \
             || die "RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON must contain exactly $expected_local_pvs Local PV entries"
           ;;
-        on-disk-bitrot)
+        on-disk-bitrot|metadata-shard-corruption)
           require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG
           target_config="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG"
           require_absolute_non_root_path RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG "$target_config"
@@ -722,9 +722,11 @@ preflight() {
   if [[ "$mode" == "qualification" ]]; then
     validate_qualification_env_contract \
       "$qualification_case" "$scenario" "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
-  elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" ]]; then
+  elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" || "$scenario" == "metadata-shard-corruption" ]]; then
     if [[ "$scenario" == "network-partition-during-heal" ]]; then
       qualification_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-network-partition-during-heal-admin-deep}"
+    elif [[ "$scenario" == "metadata-shard-corruption" ]]; then
+      qualification_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-metadata-shard-corruption-admin-deep}"
     else
       require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE
       qualification_case="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE"
@@ -766,7 +768,7 @@ preflight() {
   for tool in $(scenario_required_tools "$scenario"); do
     require_command "$tool"
   done
-  if [[ "$scenario" == "on-disk-bitrot" ]]; then
+  if [[ "$scenario" == "on-disk-bitrot" || "$scenario" == "metadata-shard-corruption" ]]; then
     target_config="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG"
     target_namespace="$(jq -er '.volume.namespace | strings | select(length > 0)' "$target_config")" \
       || die "bitrot target config lacks volume.namespace"
@@ -775,11 +777,11 @@ preflight() {
     [[ "$target_namespace" == "$FAULT_NAMESPACE" ]] \
       || die "bitrot target config belongs to another namespace: $target_namespace"
     kubectl_ns "$target_namespace" get pod "$target_helper_pod" >/dev/null \
-      || die "on-disk-bitrot requires its configured storage helper Pod"
+      || die "$scenario requires its configured storage helper Pod"
     kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 \
-      || die "on-disk-bitrot requires a pre-created owned fault namespace with privileged Pod Security"
+      || die "$scenario requires a pre-created owned fault namespace with privileged Pod Security"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
-      || die "on-disk-bitrot requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
+      || die "$scenario requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
   elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "network-partition-during-heal" ]]; then
     kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 \
       || die "$scenario requires a pre-created owned privileged namespace"
@@ -1305,6 +1307,8 @@ run_scenario() {
       storage_case=""
       if [[ "$scenario" == "network-partition-during-heal" ]]; then
         storage_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-network-partition-during-heal-admin-deep}"
+      elif [[ "$scenario" == "metadata-shard-corruption" ]]; then
+        storage_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-metadata-shard-corruption-admin-deep}"
       elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
         storage_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-}"
         [[ -n "$storage_case" ]] || die "storage recovery requires an exact case"
@@ -1464,7 +1468,7 @@ run_one() {
   initialize_summary "$run_root"
   run_root="$(cd "$run_root" && pwd -P)"
   build_fault_binary "$run_root" "scenario=$scenario"
-  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" ]]; then
+  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" || "$scenario" == "metadata-shard-corruption" ]]; then
     require_supported_scenario "$scenario"
   elif [[ "$mode" == "dm" ]]; then
     require_dm_scenario "$scenario"
@@ -1731,7 +1735,7 @@ preflight_suite() {
   fi
   scenario="$(jq -r '.attempts[0].scenario // empty' "$plan_path")"
   [[ -n "$scenario" ]] || die "fault suite plan contains no attempts: $suite"
-  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" ]]; then
+  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" || "$scenario" == "metadata-shard-corruption" ]]; then
     RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE="$(jq -er '.attempts[0].execution.case' "$plan_path")" preflight "$scenario"
   else
     preflight "$scenario"
@@ -1765,7 +1769,7 @@ require_non_static_suite_plan() {
   local plan_path="$1"
   jq -e '.requiresStaticStorage == false or
     ((.attempts | length) == 1 and
-     (.attempts[0].scenario == "fresh-volume-replacement" or .attempts[0].scenario == "on-disk-bitrot" or .attempts[0].scenario == "network-partition-during-heal") and
+     (.attempts[0].scenario == "fresh-volume-replacement" or .attempts[0].scenario == "on-disk-bitrot" or .attempts[0].scenario == "network-partition-during-heal" or .attempts[0].scenario == "metadata-shard-corruption") and
      .attempts[0].execution.type == "storage-recovery")' "$plan_path" >/dev/null \
     || die "fault-suite-run does not execute device-mapper suites; run exactly one scenario in the foreground with make fault-dm-run SCENARIO=<name>"
 }

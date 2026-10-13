@@ -218,6 +218,7 @@ pub(crate) struct RustfsServerLayout {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RustfsDriveLayout {
     pub uuid: String,
+    pub path: String,
     pub state: String,
     pub pool_index: i32,
     pub set_index: i32,
@@ -262,6 +263,8 @@ struct ServerInfoServer {
 #[derive(Debug, Deserialize)]
 struct ServerInfoDrive {
     uuid: String,
+    #[serde(default)]
+    path: String,
     state: String,
     pool_index: i32,
     set_index: i32,
@@ -375,6 +378,7 @@ fn parse_erasure_layout(response: &[u8]) -> Result<RustfsErasureLayout> {
                 .into_iter()
                 .map(|drive| RustfsDriveLayout {
                     uuid: drive.uuid,
+                    path: drive.path,
                     state: drive.state,
                     pool_index: drive.pool_index,
                     set_index: drive.set_index,

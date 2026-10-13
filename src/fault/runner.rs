@@ -296,7 +296,7 @@ async fn run_fault_case(
                     if let Some(activation) = &active.quorum_activation {
                         for target in &activation.evidence().targets {
                             if target.probe_cleanup.as_ref().is_some_and(|cleanup| cleanup.outcome == crate::fault::quorum::activation::QuorumCanaryCleanupOutcome::Removed) {
-                                fixtures.fixtures.remove(&target.pod_name);
+                                fixtures.fixtures.remove(&quorum_activation::probe_fixture_key(&target.pod_name, &target.mount_path));
                             }
                         }
                     }

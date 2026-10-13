@@ -222,7 +222,9 @@ impl FaultRun<'_> {
             };
         let volume_quorum_scenario = matches!(
             plan.scenario.as_str(),
-            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            QUORUM_P_IO_FAULT_SCENARIO
+                | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+                | crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO
         );
         let (fixed_volume_targets, quorum_activation, activation_plan) = if volume_quorum_scenario {
             events.record(
@@ -251,10 +253,10 @@ impl FaultRun<'_> {
             let pods = evidence
                 .targets
                 .iter()
-                .map(|target| PodIdentity {
-                    name: target.pod_name.clone(),
-                    uid: target.pod_uid.clone(),
-                })
+                .map(|target| (target.pod_name.clone(), target.pod_uid.clone()))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(name, uid)| PodIdentity { name, uid })
                 .collect();
             let fixed_volume_targets = FixedVolumeTargets {
                 pods,
@@ -742,10 +744,7 @@ impl FaultRun<'_> {
             "capturing fault status snapshots after workload",
             None,
         )?;
-        let workload_snapshots = match fault
-            .snapshot("after-workload")
-            .map(|snapshot| vec![snapshot])
-        {
+        let workload_snapshots = match fault.snapshots("after-workload") {
             Ok(snapshots) => snapshots,
             Err(error) => {
                 self.record_failure(
@@ -860,8 +859,7 @@ impl FaultRun<'_> {
         )?;
         let workload_snapshots = active
             .fault
-            .snapshot("after-workload")
-            .map(|snapshot| vec![snapshot])
+            .snapshots("after-workload")
             .unwrap_or_else(|error| {
                 self.context
                     .events
@@ -1357,7 +1355,7 @@ impl FaultRun<'_> {
             "capturing active fault status snapshots",
             None,
         )?;
-        let active_snapshots = match fault.snapshot("active").map(|snapshot| vec![snapshot]) {
+        let active_snapshots = match fault.snapshots("active") {
             Ok(snapshots) => snapshots,
             Err(error) => {
                 self.record_failure(
@@ -2090,7 +2088,9 @@ mod availability_endpoint_tests {
 pub(super) fn requires_independent_quorum_probe(scenario: &str) -> bool {
     matches!(
         scenario,
-        QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        QUORUM_P_IO_FAULT_SCENARIO
+            | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            | crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO
     )
 }
 
