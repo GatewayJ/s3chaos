@@ -42,7 +42,7 @@ use crate::{
         plan::{CredentialRotationExecutionPlan, ExecutionPlan},
         pods::{fixed_volume_container_ids, rustfs_pod_identities, rustfs_target_inventory},
         preflight::{PreflightCheck, PreflightPhase},
-        recovery_health::{RECOVERY_HEALTH_ARTIFACT, RecoveryHealthBaseline},
+        recovery_health::{RECOVERY_HEALTH_ARTIFACT, RecoveryHealthBaseline, RecoveryHealthReport},
         reporting::{PodIdentity, ResponsibilityDomain},
         runner::{
             FaultRunContext, ensure_s3_access, initialize_fault_run, observe_recovery_health,
@@ -1431,13 +1431,7 @@ impl LiveCredentialRotationDriver {
             },
         )
         .await?;
-        recovery.require_success()?;
-        self.context.events.record(
-            "recovery-health",
-            RunEventStatus::Succeeded,
-            "RustFS remained healthy after IAM secret rotation",
-            None,
-        )?;
+        self.complete_recovery_health(&recovery)?;
         let checker_start = self.context.history.records().len();
         let report = checker::check_s3_history(
             &s3,
@@ -1476,6 +1470,22 @@ impl LiveCredentialRotationDriver {
         self.context.events.record("checker-final", RunEventStatus::Succeeded,
             "all committed versions, historical bytes, and delete markers passed the existing checker", None)?;
         Ok(())
+    }
+
+    fn complete_recovery_health(&self, report: &RecoveryHealthReport) -> Result<()> {
+        // The observer checkpoints each attempt before setting its terminal verdict.
+        self.collector.write_text(
+            self.scenario.case_name,
+            RECOVERY_HEALTH_ARTIFACT,
+            &serde_json::to_string_pretty(report)?,
+        )?;
+        report.require_success()?;
+        self.context.events.record(
+            "recovery-health",
+            RunEventStatus::Succeeded,
+            "RustFS remained healthy after IAM secret rotation",
+            None,
+        )
     }
 }
 
@@ -1975,7 +1985,27 @@ pub(crate) async fn run_credential_rotation_case(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fault::{history::Recorder, plan::ExecutionKind, scenarios};
+    use crate::fault::{
+        admin_runner::{
+            ADMIN_WORKFLOW_ARTIFACT, AdminWorkflowEvidence, AdminWorkflowPhaseEvidence,
+            AdminWorkflowPhaseStatus,
+        },
+        artifact_validation::{
+            ArtifactValidationOptions, validate_fault_artifacts,
+            validate_fault_artifacts_and_write_report,
+        },
+        checker::{
+            CheckerAudit, CheckerDataVersionAudit, CheckerDeleteMarkerAudit,
+            checker_expected_current_get_keys, checker_expected_live_keys,
+            checker_expected_version_listing, checker_history_records_sha256,
+            checker_operation_audits,
+        },
+        events::RunEvent,
+        history::Recorder,
+        plan::{ExecutionKind, FaultPlanOptions},
+        recovery_health::{PodReadinessProbe, RecoveryDriveState, RecoveryHealthObservation},
+        scenarios,
+    };
 
     fn committed_write(
         history: &Recorder,
@@ -1997,13 +2027,14 @@ mod tests {
 
     fn get(
         history: &Recorder,
+        bucket: &str,
         key: &str,
         source: Option<&OperationRecord>,
         status: u16,
     ) -> OperationRecord {
         let mut record = history.begin(
             OperationKind::Get,
-            "bucket",
+            bucket,
             Some(key.to_string()),
             None,
             None,
@@ -2071,11 +2102,11 @@ mod tests {
         let policies = inventory("/rustfs/admin/v3/list-canned-policies");
         let old_auth = CredentialCleanupAuthReceipt {
             credential: evidence.old_credential.clone(),
-            operation: get(history, key, None, 403),
+            operation: get(history, &evidence.bucket, key, None, 403),
         };
         let new_auth = CredentialCleanupAuthReceipt {
             credential: evidence.new_credential.clone(),
-            operation: get(history, key, None, 403),
+            operation: get(history, &evidence.bucket, key, None, 403),
         };
         let after = generation_receipt(evidence, pod);
         PodIdentityCleanupProof {
@@ -2091,6 +2122,29 @@ mod tests {
             old_auth,
             new_auth,
             after,
+        }
+    }
+
+    fn completed_cleanup(
+        evidence: &CredentialRotationEvidence,
+        history: &[OperationRecord],
+        recorder: &Recorder,
+    ) -> CredentialCleanupEvidence {
+        let started = now_ms();
+        let key = cleanup_probe_key(evidence, history);
+        let pods = evidence
+            .pod_generations_before
+            .iter()
+            .map(|pod| cleanup_proof(evidence, pod, &key, recorder))
+            .collect();
+        CredentialCleanupEvidence {
+            attempted: true,
+            started_at_ms: Some(started),
+            removal_acknowledged_at_ms: Some(started),
+            pods,
+            user_absent: true,
+            policy_absent: true,
+            completed_at_ms: Some(now_ms()),
         }
     }
 
@@ -2209,6 +2263,12 @@ mod tests {
     }
 
     fn valid_history() -> (CredentialRotationEvidence, Vec<OperationRecord>) {
+        valid_history_with_object_count(4)
+    }
+
+    fn valid_history_with_object_count(
+        object_count: usize,
+    ) -> (CredentialRotationEvidence, Vec<OperationRecord>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let history = Recorder::create(
             dir.path().join("history.jsonl"),
@@ -2220,13 +2280,19 @@ mod tests {
         let new = RotationCredential::generated("run-owned-user").expect("new credential");
         let baseline_object = ObjectSpec::prepare_seeded("run-1", 0, 16, 7);
         let baseline = committed_write(&history, &baseline_object, "prefill-v1");
-        let second = committed_write(
-            &history,
-            &ObjectSpec::prepare_seeded("run-1", 1, 16, 7),
-            "prefill-v2",
-        );
+        let mut prefill_ids = vec![baseline.id.clone()];
+        for index in 1..object_count / 2 {
+            prefill_ids.push(
+                committed_write(
+                    &history,
+                    &ObjectSpec::prepare_seeded("run-1", index, 16, 7),
+                    &format!("prefill-v{}", index + 1),
+                )
+                .id,
+            );
+        }
         history.mark_fault_active_now();
-        let load_object = ObjectSpec::prepare_seeded("run-1", 2, 16, 7);
+        let load_object = ObjectSpec::prepare_seeded("run-1", object_count / 2, 16, 7);
         let mut load = history.begin(
             OperationKind::Put,
             "bucket",
@@ -2243,7 +2309,7 @@ mod tests {
         let rejected = history.begin(
             OperationKind::Put,
             "bucket",
-            Some(ObjectSpec::seeded_key("run-1", 3)),
+            Some(ObjectSpec::seeded_key("run-1", object_count / 2 + 1)),
             Some(sha256_hex(b"failed-write")),
             Some(12),
         );
@@ -2255,6 +2321,17 @@ mod tests {
                 Some("SignatureDoesNotMatch".to_string()),
             )
             .expect("rejection");
+        let mut workload_ids = vec![load.id.clone(), rejected.id];
+        for index in object_count / 2 + 2..object_count {
+            workload_ids.push(
+                committed_write(
+                    &history,
+                    &ObjectSpec::prepare_seeded("run-1", index, 16, 7),
+                    &format!("load-v{index}"),
+                )
+                .id,
+            );
+        }
         let rotation_ended_at = now_ms();
         let rotation_ended_sequence = history.next_event_sequence();
         history.mark_fault_ended_now();
@@ -2270,8 +2347,14 @@ mod tests {
             },
         ];
         for pod in &pods_before {
-            let old = get(&history, &baseline_object.spec.key, None, 403);
-            let new = get(&history, &baseline_object.spec.key, Some(&baseline), 200);
+            let old = get(&history, "bucket", &baseline_object.spec.key, None, 403);
+            let new = get(
+                &history,
+                "bucket",
+                &baseline_object.spec.key,
+                Some(&baseline),
+                200,
+            );
             pod_auth.push(PodCredentialProof {
                 pod_name: pod.name.clone(),
                 pod_uid: pod.uid.clone(),
@@ -2279,9 +2362,15 @@ mod tests {
                 new_operation_id: new.id,
             });
         }
-        let new_object = ObjectSpec::prepare_seeded("run-1", 4, 16, 7);
+        let new_object = ObjectSpec::prepare_seeded("run-1", object_count, 16, 7);
         let new_put = committed_write(&history, &new_object, "new-v1");
-        let new_get = get(&history, &new_object.spec.key, Some(&new_put), 200);
+        let new_get = get(
+            &history,
+            "bucket",
+            &new_object.spec.key,
+            Some(&new_put),
+            200,
+        );
         let overwrite = committed_write(&history, &new_object.spec.prepare_overwrite(1), "new-v2");
         let mut delete = history.begin(
             OperationKind::Delete,
@@ -2295,7 +2384,7 @@ mod tests {
         let delete = history
             .finish(delete, OperationOutcome::Ok, Some(204), None)
             .expect("delete");
-        let deleted_get = get(&history, &new_object.spec.key, None, 404);
+        let deleted_get = get(&history, "bucket", &new_object.spec.key, None, 404);
         let mut evidence = CredentialRotationEvidence {
             schema_version: 1,
             scenario: CREDENTIAL_ROTATION_MID_LOAD_SCENARIO.to_string(),
@@ -2321,8 +2410,8 @@ mod tests {
                 })
                 .collect(),
             pods_before,
-            old_prefill_operation_ids: vec![baseline.id, second.id],
-            old_workload_operation_ids: vec![load.id, rejected.id],
+            old_prefill_operation_ids: prefill_ids,
+            old_workload_operation_ids: workload_ids,
             rotation: Some(SecretRotationReceipt {
                 method: "PUT".to_string(),
                 path: ROTATION_PATH.to_string(),
@@ -2347,23 +2436,574 @@ mod tests {
             "run-1",
         )
         .expect("cleanup recorder");
-        let started = now_ms();
-        let key = cleanup_probe_key(&evidence, &history.records());
-        let pods = evidence
-            .pod_generations_before
-            .iter()
-            .map(|pod| cleanup_proof(&evidence, pod, &key, &cleanup_history))
-            .collect();
-        evidence.cleanup = CredentialCleanupEvidence {
-            attempted: true,
-            started_at_ms: Some(started),
-            removal_acknowledged_at_ms: Some(started),
-            pods,
-            user_absent: true,
-            policy_absent: true,
-            completed_at_ms: Some(now_ms()),
-        };
+        evidence.cleanup = completed_cleanup(&evidence, &history.records(), &cleanup_history);
         (evidence, history.records())
+    }
+
+    fn rotation_checker_report(history: &mut Vec<OperationRecord>) -> CheckerReport {
+        let prefix = history.clone();
+        let live = checker_expected_live_keys(&prefix);
+        let versions = checker_expected_version_listing(&prefix);
+        let started_at_ms = now_ms();
+        let template = prefix
+            .iter()
+            .find(|record| {
+                record.kind == OperationKind::Get && record.outcome == OperationOutcome::Ok
+            })
+            .expect("successful GET")
+            .clone();
+        let mut suffix = Vec::new();
+        let mut append = |mut record: OperationRecord| {
+            let index = prefix.len() + suffix.len();
+            record.id = format!("checker-{index}");
+            record.started_sequence = Some(index as u64 * 2 + 1);
+            record.ended_sequence = Some(index as u64 * 2 + 2);
+            record.started_at_ms = started_at_ms;
+            record.ended_at_ms = started_at_ms;
+            suffix.push(record);
+        };
+        for key in checker_expected_current_get_keys(&prefix) {
+            let mut record = template.clone();
+            record.key = Some(key.clone());
+            if live.contains(&key) {
+                let source = prefix
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        record.kind == OperationKind::Put
+                            && record.outcome == OperationOutcome::Ok
+                            && record.key.as_ref() == Some(&key)
+                    })
+                    .expect("live commit");
+                record.value_sha256 = source.value_sha256.clone();
+                record.size_bytes = source.size_bytes;
+            } else {
+                record.value_sha256 = None;
+                record.size_bytes = None;
+                record.outcome = OperationOutcome::NotFound;
+                record.http_status = Some(404);
+            }
+            append(record);
+        }
+        let mut listing = template.clone();
+        listing.kind = OperationKind::List;
+        listing.key = Some(ObjectSpec::key_prefix("run-1"));
+        listing.value_sha256 = None;
+        listing.size_bytes = None;
+        listing.listed_keys = Some(live.iter().cloned().collect());
+        append(listing.clone());
+        listing.kind = OperationKind::ListVersions;
+        listing.listed_keys = None;
+        listing.listed_versions = Some(versions.iter().cloned().collect());
+        append(listing);
+        let mut data_version_checks = Vec::new();
+        let mut delete_marker_checks = Vec::new();
+        for version in &versions {
+            let version_id = version.version_id.as_ref().expect("version identity");
+            if version.is_delete_marker {
+                delete_marker_checks.push(CheckerDeleteMarkerAudit {
+                    key: version.key.clone(),
+                    version_id: version_id.clone(),
+                    visible_in_list_object_versions: true,
+                });
+                continue;
+            }
+            let source = prefix
+                .iter()
+                .find(|record| {
+                    record.kind == OperationKind::Put
+                        && record.outcome == OperationOutcome::Ok
+                        && record.key.as_ref() == Some(&version.key)
+                        && record.version_id.as_ref() == Some(version_id)
+                })
+                .expect("committed version");
+            let mut record = template.clone();
+            record.key = Some(version.key.clone());
+            record.version_id = Some(version_id.clone());
+            record.value_sha256 = source.value_sha256.clone();
+            record.size_bytes = source.size_bytes;
+            data_version_checks.push(CheckerDataVersionAudit {
+                key: version.key.clone(),
+                version_id: version_id.clone(),
+                expected_sha256: source.value_sha256.clone().expect("committed digest"),
+                observed_sha256: record.value_sha256.clone(),
+                outcome: record.outcome,
+                http_status: record.http_status,
+            });
+            append(record);
+        }
+        data_version_checks.sort_by(|left, right| {
+            (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id))
+        });
+        delete_marker_checks.sort_by(|left, right| {
+            (&left.key, &left.version_id).cmp(&(&right.key, &right.version_id))
+        });
+        let mut cohorts = BTreeMap::<String, usize>::new();
+        let mut relations = BTreeMap::<String, usize>::new();
+        for record in &prefix {
+            if let Some(cohort) = record.durability_cohort {
+                *cohorts.entry(cohort.as_str().to_string()).or_default() += 1;
+            }
+            if let Some(relation) = record.fault_window_relation {
+                *relations.entry(relation.as_str().to_string()).or_default() += 1;
+            }
+        }
+        let report: CheckerReport = serde_json::from_value(serde_json::json!({
+            "scenario": CREDENTIAL_ROTATION_MID_LOAD_SCENARIO, "run_id": "run-1",
+            "committed_puts": data_version_checks.len(),
+            "expected_live_objects": live.len(), "verified_live_objects": live.len(),
+            "missing_committed_objects": [], "unavailable_committed_objects": [],
+            "unknown_committed_read_failures": [], "hash_mismatches": [],
+            "successful_corrupted_reads": [], "unexpected_visible_deleted_objects": [],
+            "list_history_warning_count": 0, "final_list_warning_count": 0,
+            "list_history_warnings": [], "list_warnings": [], "final_listed_objects": live.len(),
+            "versioning_expected": true,
+            "expected_committed_versions": data_version_checks.len(),
+            "verified_committed_versions": data_version_checks.len(),
+            "operation_cohorts": cohorts, "fault_window_relations": relations,
+            "tenant_recovered": true, "passed": true,
+            "audit": CheckerAudit {
+                bucket: template.bucket,
+                started_at_ms,
+                completed_at_ms: started_at_ms,
+                history_prefix_record_count: prefix.len(),
+                history_prefix_sha256: checker_history_records_sha256(&prefix).expect("prefix digest"),
+                history_suffix_record_count: suffix.len(),
+                history_suffix_sha256: checker_history_records_sha256(&suffix).expect("suffix digest"),
+                suffix_operations: checker_operation_audits(&suffix),
+                data_version_checks,
+                delete_marker_checks,
+                list_object_versions_completed: Some(true),
+            }
+        })).expect("checker report");
+        history.extend(suffix);
+        report
+    }
+
+    struct RotationArtifactFixture {
+        _directory: tempfile::TempDir,
+        driver: LiveCredentialRotationDriver,
+        report: RecoveryHealthReport,
+        options: ArtifactValidationOptions,
+    }
+
+    impl RotationArtifactFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let collector = ArtifactCollector::new(directory.path());
+            let mut config = FaultTestConfig::for_test("context", "fast-csi");
+            config.scenario = CREDENTIAL_ROTATION_MID_LOAD_SCENARIO.to_string();
+            config.cluster.test_namespace = "namespace".to_string();
+            config.cluster.tenant_name = "tenant".to_string();
+            scenarios::apply_catalog_defaults(&mut config).expect("catalog defaults");
+            config.workload =
+                crate::fault::config::FaultWorkloadProfile::new(12, 2).expect("workload");
+            config.workload_seed = Some(7);
+            config.workload_payload_distribution =
+                Some(crate::fault::workload::WorkloadPayloadDistribution {
+                    classes: vec![crate::fault::workload::WorkloadPayloadClass {
+                        size_bytes: 16,
+                        weight: 1,
+                    }],
+                });
+            config.expected_rustfs_pod_count = 2;
+            let scenario = FaultScenario::from_config(&config).expect("scenario");
+            let execution = ExecutionPlan::from_scenario_with_options(
+                &scenario,
+                scenarios::scenario_spec(&scenario.name).expect("catalog"),
+                FaultPlanOptions::from_config(&config),
+            )
+            .expect("execution plan");
+            let ExecutionPlan::CredentialRotation(plan) = &execution else {
+                panic!("rotation plan");
+            };
+            let driver = LiveCredentialRotationDriver::new(
+                &config,
+                &collector,
+                &scenario,
+                &execution,
+                plan,
+                "run-1",
+                RunDeadline::default(),
+            )
+            .expect("driver");
+            let baseline = RecoveryHealthBaseline {
+                observed_at_ms: now_ms(),
+                deployment_id: "deployment".to_string(),
+                standard_parity: 1,
+                total_sets: vec![1],
+                drives_per_set: vec![2],
+                server_endpoints: vec![
+                    "http://rustfs-0:9000".to_string(),
+                    "http://rustfs-1:9000".to_string(),
+                ],
+                drive_uuids: vec!["drive-0".to_string(), "drive-1".to_string()],
+            };
+            driver
+                .context
+                .events
+                .record(
+                    "recovery-health-baseline",
+                    RunEventStatus::Succeeded,
+                    "captured healthy layout",
+                    Some(serde_json::to_value(&baseline).expect("baseline")),
+                )
+                .expect("baseline event");
+            let (mut evidence, mut history) = valid_history_with_object_count(12);
+            evidence.bucket.clone_from(&driver.context.bucket);
+            evidence.policy_sha256 =
+                sha256_hex(bucket_policy(&evidence.bucket).expect("policy").as_bytes());
+            for record in &mut history {
+                record.bucket.clone_from(&evidence.bucket);
+            }
+            let observed_at_ms = now_ms();
+            let report = RecoveryHealthReport {
+                scenario: scenario.name.clone(),
+                run_id: "run-1".to_string(),
+                baseline: baseline.clone(),
+                started_at_ms: observed_at_ms,
+                completed_at_ms: observed_at_ms,
+                timeout_seconds: config.cluster.timeout.as_secs(),
+                attempts: 1,
+                first_healthy_at_ms: Some(observed_at_ms),
+                observation: Some(RecoveryHealthObservation {
+                    started_at_ms: observed_at_ms,
+                    completed_at_ms: observed_at_ms,
+                    deployment_id: baseline.deployment_id.clone(),
+                    standard_parity: 1,
+                    total_sets: vec![1],
+                    drives_per_set: vec![2],
+                    online_drives: 2,
+                    offline_drives: 0,
+                    unknown_drives: 0,
+                    drives: (0..2)
+                        .map(|index| RecoveryDriveState {
+                            server_endpoint: baseline.server_endpoints[index].clone(),
+                            drive_uuid: baseline.drive_uuids[index].clone(),
+                            state: "ok".to_string(),
+                            pool_index: 0,
+                            set_index: 0,
+                        })
+                        .collect(),
+                }),
+                readiness: evidence
+                    .pods_before
+                    .iter()
+                    .map(|pod| PodReadinessProbe {
+                        pod_name: pod.name.clone(),
+                        proxy_path: crate::fault::recovery_health::readiness_proxy_path(
+                            "namespace",
+                            &pod.name,
+                        ),
+                        ready: true,
+                        observed_at_ms,
+                        detail: None,
+                    })
+                    .collect(),
+                violations: Vec::new(),
+                passed: true,
+            };
+            driver
+                .context
+                .events
+                .record(
+                    "recovery-health",
+                    RunEventStatus::Started,
+                    "checking recovered layout",
+                    None,
+                )
+                .expect("recovery event");
+            let checker = rotation_checker_report(&mut history);
+            let cleanup_history = Recorder::create(
+                collector
+                    .case_dir(scenario.case_name)
+                    .join("credential-cleanup-history.jsonl"),
+                &scenario.name,
+                "run-1",
+            )
+            .expect("cleanup recorder");
+            evidence.cleanup = completed_cleanup(&evidence, &history, &cleanup_history);
+            *driver.evidence() = evidence.clone();
+            driver.persist().expect("credential evidence");
+            validate_credential_rotation_evidence(&evidence, &history, &checker)
+                .expect("complete credential proof");
+            let lines = history
+                .iter()
+                .map(|record| serde_json::to_string(record).expect("record") + "\n")
+                .collect::<String>();
+            collector
+                .write_text(scenario.case_name, "history.jsonl", &lines)
+                .expect("history");
+            collector
+                .write_text(
+                    scenario.case_name,
+                    "checker-report.json",
+                    &serde_json::to_string_pretty(&checker).expect("checker"),
+                )
+                .expect("checker artifact");
+            write_preflight_summary(
+                &collector,
+                &scenario,
+                &config,
+                "run-1",
+                &[PreflightPhase::new(
+                    "credential-rotation-fixture",
+                    vec![PreflightCheck::passed(
+                        "owned-identity",
+                        "validated owned IAM fixture",
+                        ResponsibilityDomain::Harness,
+                    )],
+                )],
+            )
+            .expect("preflight");
+            let workflow = AdminWorkflowEvidence {
+                schema_version: 1,
+                scenario: scenario.name.clone(),
+                run_id: "run-1".to_string(),
+                phases: ["start", "operation-workload-overlap", "verify", "cleanup"]
+                    .into_iter()
+                    .map(|phase| AdminWorkflowPhaseEvidence {
+                        phase: phase.to_string(),
+                        status: AdminWorkflowPhaseStatus::Succeeded,
+                        started_at_ms: observed_at_ms,
+                        ended_at_ms: observed_at_ms,
+                        error: None,
+                    })
+                    .collect(),
+                completed: true,
+                cancel_attempted: false,
+                cleanup_succeeded: true,
+            };
+            collector
+                .write_text(
+                    scenario.case_name,
+                    ADMIN_WORKFLOW_ARTIFACT,
+                    &serde_json::to_string_pretty(&workflow).expect("workflow"),
+                )
+                .expect("workflow artifact");
+            for stage in ["credential-rotation", "checker-final", "run"] {
+                driver
+                    .context
+                    .events
+                    .record(stage, RunEventStatus::Succeeded, "completed", None)
+                    .expect("completion event");
+            }
+            let options = ArtifactValidationOptions {
+                scenario: scenario.name,
+                artifact_root: directory.path().to_path_buf(),
+                expected_workload_objects: config.workload.object_count,
+                expected_workload_concurrency: config.workload.concurrency,
+                expected_workload_versioning: config.workload_versioning,
+                expected_rustfs_pod_count: config.expected_rustfs_pod_count,
+                expected_stable_window_seconds: config.rustfs_pod_stable_window.as_secs(),
+                expected_recovery_stability_reread_seconds: config
+                    .recovery_stability_reread
+                    .as_secs(),
+                expected_rustfs_volume_path: config.rustfs_volume_path,
+            };
+            let fixture = Self {
+                _directory: directory,
+                driver,
+                report,
+                options,
+            };
+            let mut checkpoint = fixture.report.clone();
+            checkpoint.passed = false;
+            checkpoint.first_healthy_at_ms = None;
+            fixture.write_report(&checkpoint);
+            fixture
+        }
+
+        fn write_report(&self, report: &RecoveryHealthReport) {
+            self.driver
+                .collector
+                .write_text(
+                    self.driver.scenario.case_name,
+                    RECOVERY_HEALTH_ARTIFACT,
+                    &serde_json::to_string_pretty(report).expect("report"),
+                )
+                .expect("recovery artifact");
+        }
+
+        fn persisted_report(&self) -> RecoveryHealthReport {
+            serde_json::from_str(
+                &std::fs::read_to_string(
+                    self.driver
+                        .collector
+                        .case_dir(self.driver.scenario.case_name)
+                        .join(RECOVERY_HEALTH_ARTIFACT),
+                )
+                .expect("recovery artifact"),
+            )
+            .expect("recovery report")
+        }
+
+        fn recovery_succeeded(&self) -> bool {
+            std::fs::read_to_string(
+                self.driver
+                    .collector
+                    .case_dir(self.driver.scenario.case_name)
+                    .join("run-events.jsonl"),
+            )
+            .expect("events")
+            .lines()
+            .map(|line| serde_json::from_str::<RunEvent>(line).expect("event"))
+            .any(|event| {
+                event.stage == "recovery-health" && event.status == RunEventStatus::Succeeded
+            })
+        }
+    }
+
+    #[test]
+    fn complete_recovery_health_persists_terminal_report_for_full_artifact_validation() {
+        let fixture = RotationArtifactFixture::new();
+        let checkpoint = fixture.persisted_report();
+        assert!(!checkpoint.passed);
+        assert_eq!(checkpoint.first_healthy_at_ms, None);
+        let error =
+            validate_fault_artifacts(&fixture.options).expect_err("intermediate checkpoint");
+        assert!(
+            error
+                .to_string()
+                .contains("recovery-health.json did not pass"),
+            "{error:#}"
+        );
+        fixture
+            .driver
+            .complete_recovery_health(&fixture.report)
+            .expect("terminal recovery");
+        assert_eq!(fixture.persisted_report(), fixture.report);
+        assert!(fixture.recovery_succeeded());
+        let validation = validate_fault_artifacts_and_write_report(&fixture.options)
+            .expect("complete rotation artifacts");
+        assert!(validation.run_succeeded);
+        assert_eq!(validation.terminal_stage, "checker-final");
+        assert!(validation.committed > 0);
+        assert_eq!(validation.client_disruptions, 1);
+        for artifact in validation.required_artifacts {
+            assert!(
+                fixture
+                    .driver
+                    .collector
+                    .case_dir(fixture.driver.scenario.case_name)
+                    .join(artifact)
+                    .is_file()
+            );
+        }
+    }
+
+    #[test]
+    fn full_rotation_artifacts_reject_incomplete_or_degraded_recovery_report() {
+        let fixture = RotationArtifactFixture::new();
+        fixture
+            .driver
+            .complete_recovery_health(&fixture.report)
+            .expect("terminal recovery");
+        validate_fault_artifacts(&fixture.options).expect("healthy artifacts");
+        for mutation in 0..9 {
+            let mut report = fixture.report.clone();
+            match mutation {
+                0 => report.passed = false,
+                1 => report.first_healthy_at_ms = None,
+                2 => report.first_healthy_at_ms = Some(report.started_at_ms - 1),
+                3 => {
+                    report.observation.as_mut().expect("observation").drives[0].state =
+                        "offline".to_string()
+                }
+                4 => report.readiness[0].ready = false,
+                5 => report.run_id = "foreign-run".to_string(),
+                6 => {
+                    report.readiness.pop();
+                }
+                7 => report.baseline.observed_at_ms += 1,
+                8 => {
+                    report.started_at_ms = fixture
+                        .driver
+                        .evidence()
+                        .rotation
+                        .as_ref()
+                        .expect("rotation")
+                        .ended_at_ms
+                        - 1
+                }
+                _ => unreachable!(),
+            }
+            fixture.write_report(&report);
+            assert!(
+                validate_fault_artifacts(&fixture.options).is_err(),
+                "mutation {mutation} must fail closed"
+            );
+        }
+        fixture.write_report(&fixture.report);
+        validate_fault_artifacts(&fixture.options).expect("restored healthy artifacts");
+        std::fs::remove_file(
+            fixture
+                .driver
+                .collector
+                .case_dir(fixture.driver.scenario.case_name)
+                .join(RECOVERY_HEALTH_ARTIFACT),
+        )
+        .expect("remove fixture report");
+        assert!(validate_fault_artifacts(&fixture.options).is_err());
+    }
+
+    #[test]
+    fn full_rotation_artifacts_require_every_declared_artifact() {
+        let fixture = RotationArtifactFixture::new();
+        fixture
+            .driver
+            .complete_recovery_health(&fixture.report)
+            .expect("terminal recovery");
+        let validation = validate_fault_artifacts(&fixture.options).expect("complete artifacts");
+        let case_dir = fixture
+            .driver
+            .collector
+            .case_dir(fixture.driver.scenario.case_name);
+        for artifact in validation.required_artifacts {
+            let path = case_dir.join(&artifact);
+            let saved = case_dir.join(format!("{artifact}.saved"));
+            std::fs::rename(&path, &saved).expect("retain fixture artifact");
+            let result = validate_fault_artifacts(&fixture.options);
+            std::fs::rename(&saved, &path).expect("restore fixture artifact");
+            assert!(result.is_err(), "missing {artifact} must fail closed");
+        }
+        validate_fault_artifacts(&fixture.options).expect("restored complete artifacts");
+    }
+
+    #[test]
+    fn complete_recovery_health_preserves_failed_report_without_success_event() {
+        let fixture = RotationArtifactFixture::new();
+        let mut failed = fixture.report.clone();
+        failed.passed = false;
+        failed.first_healthy_at_ms = None;
+        failed.attempts = 2;
+        failed
+            .violations
+            .push("drive-0 remains offline".to_string());
+        failed.observation.as_mut().expect("observation").drives[0].state = "offline".to_string();
+        assert!(fixture.driver.complete_recovery_health(&failed).is_err());
+        assert_eq!(fixture.persisted_report(), failed);
+        assert!(!fixture.recovery_succeeded());
+        assert!(validate_fault_artifacts(&fixture.options).is_err());
+    }
+
+    #[test]
+    fn complete_recovery_health_propagates_persistence_failure_without_success_event() {
+        let fixture = RotationArtifactFixture::new();
+        let path = fixture
+            .driver
+            .collector
+            .case_dir(fixture.driver.scenario.case_name)
+            .join(RECOVERY_HEALTH_ARTIFACT);
+        std::fs::remove_file(&path).expect("remove fixture checkpoint");
+        std::fs::create_dir(&path).expect("block report destination");
+        assert!(
+            fixture
+                .driver
+                .complete_recovery_health(&fixture.report)
+                .is_err()
+        );
+        assert!(!fixture.recovery_succeeded());
     }
 
     #[test]
